@@ -599,7 +599,9 @@ impl SupertableReader {
         if let Some(vit) = self.vector_index_table() {
             let vit_reader = vit.reader();
             let vit_manifest = vit_reader.manifest();
-            if !vit_manifest.superfiles.is_empty() {
+            let has_data =
+                !vit_manifest.superfiles.is_empty() || vit_manifest.get_num_parts() > 0;
+            if has_data {
                 let vit_metric = vit_manifest
                     .options
                     .vector_columns
@@ -607,20 +609,23 @@ impl SupertableReader {
                     .find(|vc| vc.column == column)
                     .map(|vc| vc.metric)
                     .unwrap_or(Metric::L2Sq);
-                let cell_superfiles = match vit_manifest.get_partition_strategy() {
+                let selected = match vit_manifest.get_partition_strategy() {
                     crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                         clusters,
                         ..
                     } => {
-                        let routed = select_routed_vector_cells(
+                        let mut routed = select_routed_vector_cells(
                             &clusters,
                             vit_metric,
                             query,
                             options.nprobe,
                         );
-                        if vit_manifest.superfiles.is_empty()
-                            && vit_manifest.get_num_parts() > 0
-                        {
+                        // Always scan the "incoming" append region in addition
+                        // to the nprobe-routed cells: those rows have not been
+                        // distributed into cells by maintenance yet, so routing
+                        // by centroid can't see them.
+                        routed.push(crate::supertable::handle::INCOMING_VECTOR_CELL);
+                        if vit_manifest.superfiles.is_empty() {
                             vit_manifest
                                 .superfiles_for_routed_cells(&routed)
                                 .await
@@ -630,9 +635,7 @@ impl SupertableReader {
                         }
                     }
                     _ => {
-                        if vit_manifest.superfiles.is_empty()
-                            && vit_manifest.get_num_parts() > 0
-                        {
+                        if vit_manifest.superfiles.is_empty() {
                             let part_ids: Vec<_> = vit_manifest
                                 .get_all_list_entries()
                                 .iter()
@@ -649,22 +652,32 @@ impl SupertableReader {
                         }
                     }
                 };
-                if !cell_superfiles.is_empty() {
-                    if vit_manifest.options.vector_layout == VectorLayout::CellPosting {
-                        return vit_reader
-                            .fanout_cell_postings(&cell_superfiles, query, k)
-                            .await;
+                if !selected.is_empty() {
+                    // The hidden index holds two superfile shapes: per-cell
+                    // CellPosting "cell superfiles" (the sorted base) and IVF
+                    // "incoming" superfiles (recent appends not yet split into
+                    // cells). Fan each out with its matching kernel and merge to
+                    // a single global top-k.
+                    let (cell_sfs, ivf_sfs): (Vec<_>, Vec<_>) = selected
+                        .into_iter()
+                        .partition(|e| e.vector_layout == VectorLayout::CellPosting);
+                    let mut groups: Vec<Vec<SuperfileHit>> = Vec::with_capacity(2);
+                    if !cell_sfs.is_empty() {
+                        groups
+                            .push(vit_reader.fanout_cell_postings(&cell_sfs, query, k).await?);
                     }
-                    return vit_reader
-                        .fanout_vector_clusters(
-                            &cell_superfiles,
-                            column,
-                            query,
-                            k,
-                            vit_metric,
-                            options,
-                        )
-                        .await;
+                    if !ivf_sfs.is_empty() {
+                        groups.push(
+                            vit_reader
+                                .fanout_vector_clusters(
+                                    &ivf_sfs, column, query, k, vit_metric, options,
+                                )
+                                .await?,
+                        );
+                    }
+                    if !groups.is_empty() {
+                        return Ok(top_k_ascending(groups, k));
+                    }
                 }
             }
         }

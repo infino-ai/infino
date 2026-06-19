@@ -740,6 +740,15 @@ impl Supertable {
 /// Default number of global vector-index cells for routed search.
 pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
+/// Reserved VectorCell partition id for the hidden index's "incoming" append
+/// region. Each hidden commit writes one IVF superfile under this sentinel
+/// partition holding that whole batch (all cells mixed, unsorted). Queries
+/// always scan the incoming superfiles in addition to the nprobe-routed cell
+/// superfiles; background SPFresh maintenance later drains incoming into the
+/// per-cell CellPosting superfiles and deletes it. `u32::MAX` is out of the
+/// valid cell range `0..n_cent`, so it never collides with a real cell.
+pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
+
 /// Lloyd iterations when folding per-superfile cluster centroids into the
 /// global cell grid at open/create time.
 pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
@@ -755,19 +764,6 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
     crate::config::CompactionSettings {
         target_superfile_size_mb: 8,
         min_fill_percent: 40,
-        max_memory_mb: 512,
-    }
-}
-
-/// Fast post-commit hidden-vector maintenance profile.
-///
-/// This is the Level-1 SPFresh-style collapse: after append-only hidden ingest,
-/// quickly merge tiny per-cell deltas so queries don't fan out across many
-/// files while the heavier periodic compaction remains on the normal profile.
-pub(crate) fn hidden_vector_index_spfresh_compaction_settings() -> crate::config::CompactionSettings {
-    crate::config::CompactionSettings {
-        target_superfile_size_mb: 8,
-        min_fill_percent: 1,
         max_memory_mb: 512,
     }
 }

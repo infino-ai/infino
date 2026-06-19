@@ -261,20 +261,17 @@ fn append_batch_rows(rows: &mut Vec<(i128, Vec<f32>)>, batches: &[BufferedBatch]
 }
 
 
-struct HiddenCellPostingRowsPrep {
-    pending: Vec<(u32, Vec<(i128, Vec<f32>)>)>,
-    cell_updates: HashMap<u32, u32>,
+/// One commit's drained hidden-index batch, ready to build into a single
+/// "incoming" IVF superfile. No per-cell split happens here — that is deferred
+/// to background SPFresh maintenance.
+struct HiddenIncomingPlan {
+    buffer: Vec<BufferedBatch>,
     clusters: crate::supertable::manifest::ClusterCentroids,
     column: String,
 }
 
-struct HiddenCellPostingBuildPlan {
-    build_tasks: Vec<CellBuildTask>,
-    cell_updates: HashMap<u32, u32>,
-    clusters: crate::supertable::manifest::ClusterCentroids,
-    column: String,
-}
-
+/// One per-cell build task. Produced by SPFresh maintenance when it splits an
+/// incoming IVF superfile into per-cell CellPosting "cell superfiles".
 #[derive(Clone)]
 struct CellBuildTask {
     cell_id: u32,
@@ -301,41 +298,55 @@ fn build_cell_posting_task(
     })
 }
 
-fn execute_hidden_cell_posting_plan_in_scope(
+/// Build ONE "incoming" IVF superfile from a commit's drained hidden batch,
+/// tagged with the reserved incoming partition. This reuses the standard IVF
+/// superfile writer (`build_one_shard`) verbatim — no per-cell work. Queries
+/// always scan incoming superfiles; background SPFresh maintenance later splits
+/// this into per-cell CellPosting superfiles and deletes it.
+fn execute_hidden_incoming_plan_in_scope(
     inner: &SupertableInner,
-    plan: &HiddenCellPostingBuildPlan,
+    plan: HiddenIncomingPlan,
 ) -> Result<HiddenCellPostingPrepare, BuildError> {
-    let vec_dim = inner
-        .options
-        .vector_columns
-        .first()
-        .map(|vc| vc.dim)
-        .unwrap_or(0);
-    if plan.build_tasks.is_empty() {
+    let HiddenIncomingPlan {
+        buffer,
+        clusters,
+        column,
+    } = plan;
+    let empty_batch = SuperfilePublishBatch {
+        new_entries: Vec::new(),
+        to_remove: Vec::new(),
+        pending_storage_writes: Vec::new(),
+        pending_cache_inserts: Vec::new(),
+    };
+    if buffer.is_empty() {
         return Ok(HiddenCellPostingPrepare {
-            batch: SuperfilePublishBatch {
-                new_entries: Vec::new(),
-                to_remove: Vec::new(),
-                pending_storage_writes: Vec::new(),
-                pending_cache_inserts: Vec::new(),
-            },
-            cell_updates: plan.cell_updates.clone(),
-            clusters: plan.clusters.clone(),
-            column: plan.column.clone(),
+            batch: empty_batch,
+            cell_updates: HashMap::new(),
+            clusters,
+            column,
         });
     }
-    let options = Arc::clone(&inner.options);
-    let prepared: Vec<PreparedSuperfile> = plan
-        .build_tasks
-        .par_iter()
-        .map(|task| build_cell_posting_task(inner, &options, vec_dim, task.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let batch = collect_prepared_superfiles(inner, prepared)?;
+    // Normal IVF layout, exactly like a user-table vector superfile. The hidden
+    // table's own default layout is CellPosting (the cell superfiles), so
+    // override to Ivf for this incoming append.
+    let shard = build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf)?;
+    let prepared = prepare_superfile(inner, shard)?
+        .ok_or_else(|| BuildError::Store("hidden incoming superfile unexpectedly empty".into()))?;
+    let entry =
+        finish_superfile_entry(inner, prepared.entry, Some(super::handle::INCOMING_VECTOR_CELL))?;
+    let prepared = PreparedSuperfile {
+        entry,
+        bytes_for_store: prepared.bytes_for_store,
+        bytes_for_storage: prepared.bytes_for_storage,
+        bytes_for_cache: prepared.bytes_for_cache,
+    };
+    let batch = collect_prepared_superfiles(inner, vec![prepared])?;
     Ok(HiddenCellPostingPrepare {
         batch,
-        cell_updates: plan.cell_updates.clone(),
-        clusters: plan.clusters.clone(),
-        column: plan.column.clone(),
+        // Counts are bumped by maintenance when rows actually land in cells.
+        cell_updates: HashMap::new(),
+        clusters,
+        column,
     })
 }
 
@@ -1201,21 +1212,21 @@ impl SupertableWriter {
     /// delta cell-posting superfile per touched cell. Per-cell collapse is
     /// compaction's job (`compaction/mod.rs`), not inline merge here.
 
-    fn prepare_hidden_cell_posting_rows(
-        &mut self,
-    ) -> Result<HiddenCellPostingRowsPrep, BuildError> {
-        let empty = HiddenCellPostingRowsPrep {
-            pending: Vec::new(),
-            cell_updates: HashMap::new(),
+    /// Drain the hidden writer's buffered vectors into a plan for ONE incoming
+    /// IVF superfile. Bootstraps the global cell centroids from the first batch
+    /// if they don't exist yet (routing and maintenance both need them), but
+    /// does NOT split by cell and does NOT touch per-cell counts — that is
+    /// deferred to background SPFresh maintenance, which is when the rows
+    /// actually land in cells.
+    fn plan_hidden_cell_posting(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
+        let empty = HiddenIncomingPlan {
+            buffer: Vec::new(),
             clusters: crate::supertable::manifest::ClusterCentroids::default(),
             column: String::new(),
         };
         if self.buffer.is_empty() {
             return Ok(empty);
         }
-        let buffer = std::mem::take(&mut self.buffer);
-        self.buffer_bytes = 0;
-
         super::handle::apply_pending_partition_strategy(&self.inner);
         let vec_dim = self
             .inner
@@ -1227,13 +1238,6 @@ impl SupertableWriter {
         if vec_dim == 0 {
             return Ok(empty);
         }
-        let metric = self
-            .inner
-            .options
-            .vector_columns
-            .first()
-            .map(|vc| vc.metric)
-            .unwrap_or(crate::superfile::vector::distance::Metric::L2Sq);
         let column = self
             .inner
             .options
@@ -1242,6 +1246,9 @@ impl SupertableWriter {
             .map(|vc| vc.column.clone())
             .unwrap_or_default();
 
+        // Ensure the global cell grid exists (bootstrap once from the first
+        // batch). Counts are left untouched — maintenance bumps them when it
+        // moves incoming rows into cells.
         let mut strategy = self.inner.manifest.load().get_partition_strategy();
         let clusters = match &strategy {
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -1249,7 +1256,7 @@ impl SupertableWriter {
             } if clusters.n_cent > 0 && clusters.dim > 0 => clusters.clone(),
             _ => {
                 let boot = bootstrap_centroids_from_batch(
-                    &buffer,
+                    &self.buffer,
                     vec_dim,
                     super::handle::GLOBAL_VECTOR_CELL_COUNT,
                 )
@@ -1270,50 +1277,12 @@ impl SupertableWriter {
             }
         };
 
-        let cell_shards = split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
-        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-        let mut pending: Vec<(u32, Vec<(i128, Vec<f32>)>)> =
-            Vec::with_capacity(cell_shards.len());
-        for (cell_id, batches) in &cell_shards {
-            let mut rows = Vec::new();
-            append_batch_rows(&mut rows, batches, vec_dim);
-            rows.sort_by_key(|(id, _)| *id);
-            if rows.is_empty() {
-                continue;
-            }
-            // Append-only: bump the cell's indexed count so routing never
-            // treats a populated cell as empty. Centroids are bootstrapped
-            // once and rebalanced by compaction/SPFresh - never recomputed
-            // here. No fp32 centroid math in the writer.
-            let new_count = clusters
-                .counts
-                .get(*cell_id as usize)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(rows.len() as u32);
-            cell_updates.insert(*cell_id, new_count);
-            pending.push((*cell_id, rows));
-        }
-        Ok(HiddenCellPostingRowsPrep {
-            pending,
-            cell_updates,
+        let buffer = std::mem::take(&mut self.buffer);
+        self.buffer_bytes = 0;
+        Ok(HiddenIncomingPlan {
+            buffer,
             clusters,
             column,
-        })
-    }
-
-    fn plan_hidden_cell_posting(&mut self) -> Result<HiddenCellPostingBuildPlan, BuildError> {
-        let prep = self.prepare_hidden_cell_posting_rows()?;
-        let build_tasks = prep
-            .pending
-            .into_iter()
-            .map(|(cell_id, rows)| CellBuildTask { cell_id, rows })
-            .collect();
-        Ok(HiddenCellPostingBuildPlan {
-            build_tasks,
-            cell_updates: prep.cell_updates,
-            clusters: prep.clusters,
-            column: prep.column,
         })
     }
 
@@ -1325,7 +1294,7 @@ impl SupertableWriter {
         self.inner
             .options
             .writer_pool
-            .install(|| execute_hidden_cell_posting_plan_in_scope(&inner, &plan))
+            .install(|| execute_hidden_incoming_plan_in_scope(&inner, plan))
     }
 
     fn commit_cell_posting_internal(&mut self) -> Result<(), BuildError> {
@@ -1487,7 +1456,7 @@ impl SupertableWriter {
                             })?;
                             prepare_user_superfile_batch_in_scope(&user_inner, outputs, hints)
                         },
-                        || execute_hidden_cell_posting_plan_in_scope(&hidden_inner, &plan),
+                        || execute_hidden_incoming_plan_in_scope(&hidden_inner, plan),
                     );
                     Ok((
                         user_batch?,
@@ -1514,15 +1483,6 @@ impl SupertableWriter {
                         .ok_or_else(|| {
                             BuildError::Store("hidden cell posting commit requires storage".into())
                         })?;
-                    // Capture the cells this commit appended deltas to before
-                    // `prep` is consumed, so light maintenance can target only
-                    // those partitions.
-                    let touched_partitions: std::collections::HashSet<Vec<u8>> = prep
-                        .batch
-                        .new_entries
-                        .iter()
-                        .map(|e| e.partition_key.clone())
-                        .collect();
                     let (user_res, hidden_res) = tokio::join!(
                         persist_superfile_publish_batch_async(&user_inner, user_batch),
                         publish_hidden_cell_posting_async(Arc::clone(&hidden_inner), hidden_storage, prep),
@@ -1530,10 +1490,7 @@ impl SupertableWriter {
                     user_res?;
                     match hidden_res {
                         Ok(()) => {
-                            spawn_hidden_spfresh_maintenance(
-                                Arc::clone(&hidden_inner),
-                                touched_partitions,
-                            );
+                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
                         },
                         Err(e) => {
                             tracing::warn!(
@@ -1612,7 +1569,20 @@ fn build_one_shard(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
 ) -> Result<ShardOutput, BuildError> {
-    let mut builder = SuperfileBuilder::new(options.builder_options())?;
+    build_one_shard_with_layout(slice, options, options.vector_layout)
+}
+
+/// Same as [`build_one_shard`] but with an explicit vector layout override.
+/// The hidden index's "incoming" append superfile is built in IVF layout even
+/// though the hidden table's default layout is CellPosting (its cell
+/// superfiles).
+fn build_one_shard_with_layout(
+    slice: &[BufferedBatch],
+    options: &SupertableOptions,
+    vector_layout: crate::superfile::vector::layout::VectorLayout,
+) -> Result<ShardOutput, BuildError> {
+    let mut builder =
+        SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
 
     let scalar_schema = options.scalar_schema();
     // The supertable always prepends the id column at index 0
@@ -2263,32 +2233,173 @@ where
     }
 }
 
-/// Light post-commit SPFresh maintenance: collapse only the delta superfiles
-/// of the cells this commit just appended to (`touched_partitions`), and only
-/// once a cell has built up a small run of deltas. This is the design's step 3
-/// done lightly — bounded per-commit work over the just-appended blobs, not a
-/// whole-index scan. The heavier cross-run packing toward one base per cell
-/// stays on the explicit `compact()`.
-fn spawn_hidden_spfresh_maintenance(
-    inner: Arc<SupertableInner>,
-    touched_partitions: std::collections::HashSet<Vec<u8>>,
-) {
-    if touched_partitions.is_empty() {
-        return;
-    }
+/// Minimum number of accumulated "incoming" IVF superfiles before background
+/// maintenance drains them into per-cell CellPosting superfiles. Amortizes the
+/// per-cell build so it isn't paid on every commit; until a drain fires the
+/// incoming superfiles are simply scanned by queries (recall is unaffected).
+const INCOMING_DRAIN_THRESHOLD: usize = 4;
+
+/// Background SPFresh maintenance: drain the hidden index's "incoming" IVF
+/// superfiles into per-cell CellPosting "cell superfiles" and delete the
+/// incoming ones. Runs off the commit path (`spawn_blocking`), and only once
+/// enough incoming superfiles have accumulated so the per-cell build amortizes.
+fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
     let rt = inner.query_runtime();
     rt.spawn_blocking(move || {
-        let hidden = Supertable::from_inner(inner);
-        let cfg = super::handle::hidden_vector_index_spfresh_compaction_settings();
-        if let Err(e) = hidden.compact_cells(&cfg, &touched_partitions) {
-            match e {
-                crate::supertable::error::CompactionError::AlreadyCompacting => {}
-                other => tracing::warn!(
-                    "supertable: hidden SPFresh maintenance failed: {other}"
-                ),
-            }
+        let runtime = inner.query_runtime();
+        if let Err(e) = runtime.block_on(drain_incoming_into_cells(Arc::clone(&inner))) {
+            tracing::warn!(
+                "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
+            );
         }
     });
+}
+
+/// Read each accumulated incoming IVF superfile back to `(_id, vector)` rows,
+/// assign every row to its nearest global cell, build one CellPosting superfile
+/// per touched cell, then publish those cell superfiles and remove the drained
+/// incoming superfiles in one OCC commit. This is the design's step 3: the
+/// incoming append region is "shifted" into the sorted per-cell base.
+async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
+    use std::sync::atomic::Ordering;
+
+    // Single-flight: skip if another drain/compaction is already running.
+    if inner
+        .compaction_outstanding
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Ok(());
+    }
+    struct Slot<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Slot<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _slot = Slot(&inner.compaction_outstanding);
+
+    let manifest = inner.manifest.load_full();
+    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
+        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
+            super::handle::INCOMING_VECTOR_CELL,
+        ),
+    );
+    let incoming: Vec<Arc<SuperfileEntry>> = manifest
+        .get_all_superfiles()
+        .iter()
+        .filter(|e| e.partition_key == incoming_key)
+        .cloned()
+        .collect();
+    if incoming.len() < INCOMING_DRAIN_THRESHOLD {
+        return Ok(());
+    }
+
+    let (clusters, column) = match manifest.get_partition_strategy() {
+        crate::supertable::manifest::list::PartitionStrategy::VectorCell { clusters, column } => {
+            (clusters, column)
+        }
+        _ => return Ok(()),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(());
+    }
+    let Some(vec_col) = inner.options.vector_columns.first().cloned() else {
+        return Ok(());
+    };
+    let vec_dim = vec_col.dim;
+    let metric = vec_col.metric;
+
+    let store = inner.options.store.clone();
+    let disk_cache = inner.options.disk_cache.clone();
+    let storage_opt = inner.options.storage.clone();
+    let storage = storage_opt
+        .clone()
+        .ok_or_else(|| BuildError::Store("incoming drain requires storage".into()))?;
+
+    // Reconstruct (_id, vector) rows from each incoming IVF superfile.
+    let mut buffer: Vec<BufferedBatch> = Vec::with_capacity(incoming.len());
+    for entry in &incoming {
+        let reader = crate::supertable::query::dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage_opt.as_ref(),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        let scalar = reader
+            .get_record_batch(None)
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let vec_reader = reader
+            .vec()
+            .ok_or_else(|| BuildError::Store("incoming superfile missing vector index".into()))?;
+        let vecs = vec_reader
+            .get_vectors_fp32(&column)
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let flat: Vec<f32> = vecs.into_iter().flatten().collect();
+        buffer.push(BufferedBatch {
+            scalar,
+            vectors: vec![Arc::new(Float32Array::from(flat))],
+        });
+    }
+
+    // Assign rows to cells; build one CellPosting superfile per touched cell.
+    let cell_shards = split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
+    let mut prepared: Vec<PreparedSuperfile> = Vec::new();
+    let mut cell_updates: HashMap<u32, u32> = HashMap::new();
+    for (cell_id, batches) in &cell_shards {
+        let mut rows = Vec::new();
+        append_batch_rows(&mut rows, batches, vec_dim);
+        rows.sort_by_key(|(id, _)| *id);
+        if rows.is_empty() {
+            continue;
+        }
+        let added = rows.len() as u32;
+        let task = CellBuildTask {
+            cell_id: *cell_id,
+            rows,
+        };
+        let p = build_cell_posting_task(&inner, &inner.options, vec_dim, task)?;
+        let base = clusters.counts.get(*cell_id as usize).copied().unwrap_or(0);
+        cell_updates.insert(*cell_id, base.saturating_add(added));
+        prepared.push(p);
+    }
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let batch = collect_prepared_superfiles(&inner, prepared)?;
+
+    // Bump per-cell counts so routing sees the now-populated cells.
+    let updated_clusters = super::spfresh::apply_cell_count_updates(&clusters, &cell_updates);
+    inner.manifest.store(Arc::new(
+        inner.manifest.load().with_partition_strategy(
+            crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                column,
+                clusters: updated_clusters,
+            },
+        ),
+    ));
+
+    // Publish: add the cell superfiles, remove the drained incoming superfiles.
+    let new_manifest = persist_commit_async(
+        &inner,
+        Arc::clone(&storage),
+        batch.new_entries,
+        &incoming,
+        batch.pending_storage_writes,
+        Vec::new(),
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    inner.manifest.store(Arc::new(new_manifest));
+
+    // Delete the drained incoming superfile bytes from object storage.
+    for entry in &incoming {
+        let path = superfile_storage_path(&entry.uri);
+        let _ = storage.delete(&path).await;
+    }
+    Ok(())
 }
 
 async fn publish_hidden_cell_posting_async(
