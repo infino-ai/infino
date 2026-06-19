@@ -80,7 +80,7 @@ Performance *and* cost are first-class acceptance criteria for every change. A P
 One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) drives the whole suite; all measurement logic lives in the `infino-bench-utils` crate under `benches/utils/`. Selection is positional: `cargo bench --bench bench -- [tier] [modality] [phase ...]` with tier `superfile` | `supertable`, modality `fts` | `vector` | `sql`, phase `build` | `warm` | `cold` (omitted ⇒ all). A bare `cargo bench` runs every tier × modality. See `benches/README.md` for the full invocation guide and recorded result tables.
 
 - `**superfile` tier** — single-superfile, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
-- `**supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
+- `**supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, local RustFS daemon by default): the warm/cold table paths for FTS, vector, and SQL.
 
 Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_SUPERFILE_DOCS` / `INFINO_BENCH_SUPERTABLE_DOCS` (plain integers, per tier) and `INFINO_BENCH_WRITERS`.
 

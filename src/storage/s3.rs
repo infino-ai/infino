@@ -177,6 +177,18 @@ impl S3StorageProvider {
         }
     }
 
+    /// [`Self::from_object_store`] with a logical table prefix,
+    /// mirroring [`Self::new_with_prefix`].
+    pub fn from_object_store_with_prefix(
+        bucket: impl Into<String>,
+        store: AmazonS3,
+        prefix: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::from_object_store(bucket, store);
+        provider.prefix = normalize_prefix(prefix);
+        provider
+    }
+
     /// S3 bucket this provider is scoped to.
     pub fn bucket(&self) -> &str {
         &self.bucket

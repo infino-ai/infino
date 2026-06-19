@@ -6,9 +6,10 @@
 //! - **Warm**: `Supertable::open` from object storage + `DiskCacheStore` (local cache hits).
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
-//! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`s3s_fs` default |
-//! `s3` | `azure`) — never inferred from which credential is set. `s3` reads
-//! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
+//! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`rustfs` default |
+//! `s3s_fs` | `s3` | `azure`) — never inferred from which credential is set.
+//! `s3` reads `INFINO_REAL_S3_BUCKET`, `azure` reads
+//! `INFINO_REAL_AZURE_CONTAINER`.
 
 use std::{
     net::SocketAddr,
@@ -29,6 +30,8 @@ use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, runtime::Runtime};
+
+use crate::rustfs_server::{self, RUSTFS_BENCH_BUCKET, RustFsHandle};
 
 const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -86,17 +89,18 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
-    /// `true` for a real remote backend (S3 or Azure), `false` for the
-    /// in-process s3s-fs emulator.
+    /// `true` for a real remote backend (S3 or Azure), `false` for local
+    /// emulators (RustFS or s3s-fs).
     pub remote: bool,
     /// Remote prefix to delete when the run finishes (`None` for the
-    /// auto-cleaned s3s-fs tempdir, or when `INFINO_BENCH_KEEP_TABLE` is set).
+    /// auto-cleaned emulator tempdirs, or when `INFINO_BENCH_KEEP_TABLE` is set).
     pub cleanup: Option<PrefixCleanup>,
     _keepalive: StorageKeepalive,
 }
 
 enum StorageKeepalive {
     S3sFs { _fs_root: TempDir },
+    RustFs { _server: Box<RustFsHandle> },
     Remote,
 }
 
@@ -217,10 +221,12 @@ fn keep_table() -> bool {
 }
 
 /// The object-store backend a run targets, chosen explicitly by
-/// `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`) — never inferred
+/// `INFINO_BENCH_STORE` (`rustfs` default | `s3s_fs` | `s3` | `azure`) — never inferred
 /// from which credential happens to be set.
 #[derive(Debug, PartialEq, Eq)]
 enum Backend {
+    /// Local RustFS daemon (HTTPS S3 wire path).
+    RustFs,
     /// In-process s3s-fs emulator (no creds, no network).
     S3sFs,
     /// Real AWS S3.
@@ -231,7 +237,7 @@ enum Backend {
 
 impl Backend {
     fn from_env() -> Result<Self, String> {
-        let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
+        let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "rustfs".into());
         Self::parse(&store, real_s3_bucket_env(), azure_container_env())
     }
 
@@ -243,6 +249,7 @@ impl Backend {
         azure_container: Option<String>,
     ) -> Result<Self, String> {
         match store {
+            "rustfs" => Ok(Self::RustFs),
             "s3s_fs" => Ok(Self::S3sFs),
             "s3" => s3_bucket
                 .map(|bucket| Self::S3 { bucket })
@@ -253,13 +260,14 @@ impl Backend {
                     "INFINO_BENCH_STORE=azure requires INFINO_REAL_AZURE_CONTAINER".to_string()
                 }),
             other => Err(format!(
-                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure)"
+                "unknown INFINO_BENCH_STORE={other} (want rustfs|s3s_fs|s3|azure)"
             )),
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
+            Self::RustFs => "rustfs",
             Self::S3sFs => "s3s_fs",
             Self::S3 { .. } => "s3",
             Self::Azure { .. } => "azure",
@@ -269,17 +277,17 @@ impl Backend {
     /// Namespace root under the bucket/container for this run's objects.
     fn prefix_root(&self, default: &str) -> String {
         match self {
-            Self::S3sFs => default.to_string(),
+            Self::RustFs | Self::S3sFs => default.to_string(),
             Self::S3 { .. } => real_s3_prefix_root(default),
             Self::Azure { .. } => azure_prefix_root(default),
         }
     }
 
-    /// Provider for a real backend, scoped to `prefix`. `None` for s3s-fs
-    /// (spawned separately). `prefix = ""` gives the bucket/container root.
+    /// Provider for a real backend, scoped to `prefix`. `None` for local
+    /// emulators (spawned separately). `prefix = ""` gives the bucket/container root.
     fn provider(&self, prefix: &str) -> Option<Arc<dyn StorageProvider>> {
         match self {
-            Self::S3sFs => None,
+            Self::RustFs | Self::S3sFs => None,
             Self::S3 { bucket } => Some(Arc::new(
                 S3StorageProvider::new_with_prefix(bucket, prefix).expect("real S3 provider"),
             )),
@@ -291,9 +299,9 @@ impl Backend {
     }
 }
 
-/// Pre-flight for the supertable bench: it needs a real object store (`s3`
-/// or `azure`) for the multi-commit OCC. `Ok` when one is selected + ready,
-/// `Err(reason)` otherwise (default s3s-fs, missing creds, unknown store).
+/// Pre-flight for the supertable bench: it needs RustFS, real S3, or Azure for
+/// the multi-commit OCC. `Ok` when one is selected + ready, `Err(reason)`
+/// otherwise (s3s-fs lacks conditional If-Match PUTs).
 pub fn supertable_backend_check() -> Result<(), String> {
     match Backend::from_env()? {
         Backend::S3sFs => Err(SUPERTABLE_REQUIRES_REAL_OBJECT_STORE.to_string()),
@@ -377,11 +385,16 @@ fn remote_fixture(backend: Backend, prefix_default: &str) -> StorageFixture {
     }
 }
 
-async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture {
+async fn backing_store(bucket: &str, prefix_default: &str) -> StorageFixture {
     let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
-    let Backend::S3sFs = backend else {
-        return remote_fixture(backend, prefix_default);
-    };
+    match backend {
+        Backend::S3sFs => s3s_fs_fixture(bucket).await,
+        Backend::RustFs => rustfs_fixture(bucket, prefix_default, false).await,
+        backend => remote_fixture(backend, prefix_default),
+    }
+}
+
+async fn s3s_fs_fixture(s3s_bucket: &str) -> StorageFixture {
     let (addr, fs_root) = spawn_s3s_fs(s3s_bucket).await;
     let endpoint = format!("http://{addr}");
     let storage: Arc<dyn StorageProvider> = Arc::new(
@@ -399,8 +412,8 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
          ################################################################################\n\
          ##  WARNING: INFINO_BENCH_STORE=s3s_fs — in-process emulator, NOT a real store.##\n\
          ##  It reproduces request count and byte volume, not network latency, so       ##\n\
-         ##  warm/cold timings here are not representative. Set INFINO_BENCH_STORE=s3    ##\n\
-         ##  (+ INFINO_REAL_S3_BUCKET) or =azure (+ INFINO_REAL_AZURE_CONTAINER) for real.##\n\
+         ##  warm/cold timings here are not representative. Set INFINO_BENCH_STORE=rustfs ##\n\
+         ##  (default), =s3 (+ INFINO_REAL_S3_BUCKET), or =azure for real object storage. ##\n\
          ################################################################################\n\
          [tiers] s3s-fs endpoint={endpoint}  storage_label=s3s_fs  (NOT a real store)\n"
     );
@@ -413,41 +426,97 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
     }
 }
 
+async fn rustfs_fixture(bucket: &str, prefix_default: &str, supertable_shaped: bool) -> StorageFixture {
+    let handle = tokio::task::spawn_blocking({
+        let bucket = bucket.to_string();
+        move || rustfs_server::spawn_rustfs(&bucket)
+    })
+    .await
+    .expect("rustfs spawn_blocking join")
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    let prefix = if supertable_shaped {
+        unique_bench_prefix(&Backend::RustFs.prefix_root(prefix_default))
+    } else {
+        String::new()
+    };
+    if supertable_shaped {
+        eprintln!("[tiers] rustfs prefix={prefix}");
+    }
+    let storage = rustfs_server::rustfs_s3_provider(&handle, &prefix)
+        .unwrap_or_else(|e| panic!("rustfs provider: {e}"));
+
+    StorageFixture {
+        storage,
+        storage_label: "rustfs",
+        remote: false,
+        cleanup: None,
+        _keepalive: StorageKeepalive::RustFs {
+            _server: Box::new(handle),
+        },
+    }
+}
+
 /// Error string for the supertable backend guard. A constant so the `run()`
 /// pre-flight ([`supertable_backend_check`]) and this fixture agree.
 pub const SUPERTABLE_REQUIRES_REAL_OBJECT_STORE: &str = "\
-the supertable object-store bench requires a real object store. Set \
-INFINO_BENCH_STORE=s3 (+ INFINO_REAL_S3_BUCKET + AWS creds) or =azure (+ \
-INFINO_REAL_AZURE_CONTAINER + AZURE_STORAGE_ACCOUNT_NAME/_KEY). The s3s-fs \
-emulator is not usable here: it does not implement conditional If-Match PUTs, \
+the supertable object-store bench requires RustFS, real S3, or Azure. Set \
+INFINO_BENCH_STORE=rustfs (default), =s3 (+ INFINO_REAL_S3_BUCKET + AWS creds), \
+or =azure (+ INFINO_REAL_AZURE_CONTAINER + AZURE_STORAGE_ACCOUNT_NAME/_KEY). The \
+s3s-fs emulator is not usable here: it does not implement conditional If-Match PUTs, \
 which the supertable's multi-commit OCC requires, so every commit after the \
 first would lose the CAS.";
 
 /// Supertable-shaped backing store (multi-superfile, multi-commit benches).
 ///
-/// **Real object store only** (S3 or Azure). The supertable build commits
-/// many times, so its OCC pointer update rides on the conditional `If-Match`
-/// PUT. The in-process `s3s-fs` emulator does not implement those (every
-/// commit after the first loses the CAS), so this fixture rejects it and
+/// **RustFS, S3, or Azure** — the supertable build commits many times, so its
+/// OCC pointer update rides on the conditional `If-Match` PUT. The in-process
+/// `s3s-fs` emulator does not implement those, so this fixture rejects it and
 /// panics with [`SUPERTABLE_REQUIRES_REAL_OBJECT_STORE`]. The returned fixture
-/// carries a [`PrefixCleanup`] so the caller can delete the unique prefix when
-/// the run finishes.
+/// carries a [`PrefixCleanup`] on real backends so the caller can delete the
+/// unique prefix when the run finishes.
 pub async fn supertable_storage_fixture() -> StorageFixture {
     match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
         Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
+        Backend::RustFs => {
+            rustfs_fixture(RUSTFS_BENCH_BUCKET, "infino-supertable-bench", true).await
+        }
         backend => remote_fixture(backend, "infino-supertable-bench"),
     }
 }
 
 /// Storage for a prepared dataset at a fixed prefix — no unique suffix, no
 /// cleanup, so the data persists across runs. `subdir` namespaces the modality
-/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. Real backend only,
-/// same as [`supertable_storage_fixture`].
+/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. RustFS, S3, or
+/// Azure only — same as [`supertable_storage_fixture`].
 pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
     let backend = match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
         Backend::S3sFs => panic!("{SUPERTABLE_REQUIRES_REAL_OBJECT_STORE}"),
         backend => backend,
     };
+    if matches!(backend, Backend::RustFs) {
+        let base = crate::dataset::dataset_prefix()
+            .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
+        let prefix = format!("{}/{subdir}", base.trim_matches('/'));
+        let handle = tokio::task::spawn_blocking(|| {
+            rustfs_server::spawn_rustfs(RUSTFS_BENCH_BUCKET)
+        })
+        .await
+        .expect("rustfs spawn_blocking join")
+        .unwrap_or_else(|e| panic!("{e}"));
+        let storage = rustfs_server::rustfs_s3_provider(&handle, &prefix)
+            .unwrap_or_else(|e| panic!("rustfs dataset provider: {e}"));
+        eprintln!("[tiers] dataset rustfs prefix={prefix}");
+        return StorageFixture {
+            storage,
+            storage_label: "rustfs",
+            remote: false,
+            cleanup: None,
+            _keepalive: StorageKeepalive::RustFs {
+                _server: Box::new(handle),
+            },
+        };
+    }
     let base = crate::dataset::dataset_prefix()
         .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
     let prefix = format!("{}/{subdir}", base.trim_matches('/'));
@@ -527,8 +596,9 @@ pub async fn commit_superfile(bytes: &Bytes) -> SuperfileCommitted {
 
 /// Backing object store for superfile-shaped warm/cold benches (1M).
 ///
-/// Unlike [`supertable_storage_fixture`], this allows the default `s3s_fs`
-/// emulator because superfile-shaped benches do not rely on multi-commit OCC.
+/// Unlike [`supertable_storage_fixture`], this allows the default `rustfs`
+/// or `s3s_fs` emulators because superfile-shaped benches do not rely on
+/// multi-commit OCC.
 pub async fn superfile_storage_fixture() -> StorageFixture {
     backing_store(SUPERFILE_S3S_BUCKET, "infino-superfile-bench").await
 }
@@ -716,7 +786,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_defaults_to_s3s_fs() {
+    fn parse_defaults_to_rustfs() {
+        assert_eq!(Backend::parse("rustfs", None, None), Ok(Backend::RustFs));
+    }
+
+    #[test]
+    fn parse_s3s_fs_explicit() {
         assert_eq!(Backend::parse("s3s_fs", None, None), Ok(Backend::S3sFs));
     }
 
@@ -744,6 +819,10 @@ mod tests {
 
     #[test]
     fn parse_does_not_infer_from_creds() {
+        assert_eq!(
+            Backend::parse("rustfs", Some("bkt".into()), Some("c".into())),
+            Ok(Backend::RustFs)
+        );
         // Creds present but store=s3s_fs → still the emulator.
         assert_eq!(
             Backend::parse("s3s_fs", Some("bkt".into()), Some("c".into())),
@@ -758,6 +837,7 @@ mod tests {
 
     #[test]
     fn labels_match_backend() {
+        assert_eq!(Backend::RustFs.label(), "rustfs");
         assert_eq!(Backend::S3sFs.label(), "s3s_fs");
         assert_eq!(Backend::S3 { bucket: "b".into() }.label(), "s3");
         assert_eq!(

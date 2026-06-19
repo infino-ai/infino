@@ -20,6 +20,7 @@ pub mod markdown;
 pub mod report;
 pub mod rss;
 pub mod storage_meter;
+pub mod rustfs_server;
 pub mod tiers;
 
 pub mod superfile;
