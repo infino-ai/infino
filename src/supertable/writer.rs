@@ -1522,9 +1522,7 @@ impl SupertableWriter {
                     match hidden_res {
                         Ok(()) => {
                             #[cfg(not(test))]
-                            if std::env::var_os("INFINO_HIDDEN_SPFRESH_MAINTENANCE").is_some() {
-                                spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
-                            }
+                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
                         },
                         Err(e) => {
                             tracing::warn!(
