@@ -813,3 +813,67 @@ pub fn build_combined_on_storage() -> IngestResult {
     let corpus = prepare_corpus(Modality::Combined);
     build_on_storage(Modality::Combined, &corpus)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure-function coverage for the ingest layer. The build loop itself
+    //! needs a real object store (the s3s-fs emulator lacks the conditional
+    //! PUTs multi-commit OCC requires), so it is exercised end-to-end only on
+    //! a real backend; here we cover the chunk-assembly and accounting that
+    //! run identically on every backend.
+    use super::*;
+
+    /// Doc count for the assembly tests — small, just enough rows to confirm
+    /// shape; the columns are pure functions of `doc_id`.
+    const TEST_DOCS: usize = 64;
+
+    fn title_array(len: usize) -> LargeStringArray {
+        LargeStringArray::from_iter_values((0..len).map(|i| format!("doc{i:07}")))
+    }
+
+    fn vec_flat(len: usize) -> Vec<f32> {
+        (0..len * DIM).map(|i| i as f32).collect()
+    }
+
+    /// `corpus_byte_size` reports text bytes for text modalities and raw
+    /// `f32` bytes for vector modalities, summing both for `Combined`.
+    #[test]
+    fn corpus_byte_size_per_modality() {
+        let n = 1000;
+        let text = corpus::text_corpus_bytes(n);
+        let vec = (n * DIM * std::mem::size_of::<f32>()) as u64;
+        assert_eq!(corpus_byte_size(Modality::Fts, n), text);
+        assert_eq!(corpus_byte_size(Modality::Sql, n), text);
+        assert_eq!(corpus_byte_size(Modality::Vector, n), vec);
+        assert_eq!(corpus_byte_size(Modality::Combined, n), text + vec);
+    }
+
+    /// `assemble_batch` lays columns out in schema order for every modality:
+    /// the batch must build (column types match the schema) with one column
+    /// per field and `len` rows. Covers `push_sql_columns` + `fsl_column` too.
+    #[test]
+    fn assemble_batch_matches_schema_per_modality() {
+        let len = TEST_DOCS;
+        for modality in [
+            Modality::Fts,
+            Modality::Vector,
+            Modality::Sql,
+            Modality::Combined,
+        ] {
+            let schema = if modality.has_sql() {
+                sql_schema()
+            } else {
+                schema_for(modality)
+            };
+            let title = modality.has_text().then(|| title_array(len));
+            let vectors = modality.has_vector().then(|| vec_flat(len));
+            let batch = assemble_batch(modality, &schema, title, vectors, 0, len, len);
+            assert_eq!(batch.num_rows(), len, "{modality:?} row count");
+            assert_eq!(
+                batch.num_columns(),
+                schema.fields().len(),
+                "{modality:?} column count"
+            );
+        }
+    }
+}

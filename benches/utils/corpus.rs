@@ -1496,6 +1496,23 @@ mod tests {
         assert_eq!(flat.as_slice(), disk.as_slice(), "streamed vectors differ");
     }
 
+    /// Serving the vector stream in uneven `next_flat` slices yields the same
+    /// rows as one whole pull — exercises the carry/compact path across serve
+    /// boundaries (mirrors the text uneven-split test).
+    #[test]
+    fn streaming_vector_uneven_splits_are_stable() {
+        let mut whole =
+            StreamingVectorCorpus::new(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
+        let whole = whole.next_flat(STREAM_TEST_DOCS);
+        let mut split =
+            StreamingVectorCorpus::new(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
+        let mut pieced = Vec::new();
+        for len in [333, 1000, 1, 2762] {
+            pieced.extend(split.next_flat(len));
+        }
+        assert_eq!(pieced, whole);
+    }
+
     /// `text_corpus_bytes` (the analytic size streaming reports) must equal the
     /// bytes the disk corpus actually writes — both go through `doc_len`, so a
     /// divergence means the shared layout was forked. Spans the doc-id digit
