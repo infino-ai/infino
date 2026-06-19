@@ -1,7 +1,8 @@
-"""Shared helpers for the Infino RAG examples.
+"""Shared helpers for the Infino examples.
 
 Kept tiny and dependency-light so each example stays focused on Infino,
-not boilerplate. Imported by every notebook in this directory.
+not boilerplate. Lives at the examples root and is imported by notebooks
+across every category (e.g. ``rag/``), which add this root to ``sys.path``.
 """
 
 import warnings
