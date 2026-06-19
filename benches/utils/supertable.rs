@@ -1004,6 +1004,11 @@ pub mod vector {
                 consumer
                     .wait_until_warm(Duration::from_secs(600))
                     .expect("supertable warm promotion");
+                if let Some((total, max_per_cell)) = consumer.hidden_vector_superfile_stats() {
+                    eprintln!(
+                        "[supertable_vector] hidden vector index at warm open: {total} superfiles, max {max_per_cell} per cell"
+                    );
+                }
             }
 
             let title = format!(

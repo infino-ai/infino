@@ -141,6 +141,42 @@ pub async fn seal(
 /// iterate the returned `Vec` lazily; the bitmap inside the
 /// sidecar is small (Roaring is sparse) so the wall-clock cost
 /// is dominated by the iteration, not the GET.
+/// Remove the compaction seal from a sidecar when a merge attempt
+/// fails after sealing but before commit. Idempotent when the sidecar
+/// is already unsealed or absent. Only succeeds when the existing seal
+/// matches `compaction_id` (the caller's own failed attempt).
+pub async fn unseal(
+    wal_store: &WalStore,
+    superfile_id: Uuid,
+    compaction_id: Uuid,
+) -> Result<(), TombstonesAdminError> {
+    let (existing, etag_opt) = match wal_store.get_tombstones(superfile_id).await? {
+        Some((sc, etag)) => (sc, Some(etag)),
+        None => return Ok(()),
+    };
+    let Some(seal) = existing.seal.as_ref() else {
+        return Ok(());
+    };
+    if seal.compaction_id != compaction_id {
+        return Err(TombstonesAdminError::AlreadySealed {
+            superfile_id,
+            existing_compaction_id: seal.compaction_id,
+        });
+    }
+    let unsealed = TombstonesSidecar {
+        seal: None,
+        bitmap: existing.bitmap,
+    };
+    match wal_store
+        .put_tombstones(superfile_id, etag_opt.as_ref(), &unsealed)
+        .await
+    {
+        Ok(_new_etag) => Ok(()),
+        Err(WalStoreError::CasFailed { .. }) => Err(TombstonesAdminError::CasLost { superfile_id }),
+        Err(other) => Err(other.into()),
+    }
+}
+
 pub async fn live_rows(
     wal_store: &WalStore,
     superfile_id: Uuid,
@@ -229,6 +265,17 @@ mod tests {
             again.seal.as_ref().expect("set").compaction_id
         );
         assert_eq!(first.bitmap, again.bitmap);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unseal_clears_seal_for_matching_compaction_id() {
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x300);
+        let cid = Uuid::from_u128(0xBEEF);
+        seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        unseal(&ws, sf, cid).await.expect("unseal");
+        let (post, _etag) = ws.get_tombstones(sf).await.expect("get").expect("present");
+        assert!(post.seal.is_none(), "seal cleared");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

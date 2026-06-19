@@ -22,7 +22,8 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, prepare_superfile, try_commit_attempt,
+            PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
+            prepare_superfile, try_commit_attempt,
         },
     },
 };
@@ -345,18 +346,12 @@ impl Supertable {
         let manifest = { self.inner().manifest.load().clone() };
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
-        let storage = manifest.options.storage.clone();
+        let storage = manifest
+            .options
+            .storage
+            .clone()
+            .ok_or_else(|| BuildError::Store("cell posting compaction requires storage".into()))?;
         let tombstone_cache = self.inner().tombstone_cache.clone();
-
-        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
-        for entry in superfiles {
-            let open_fut = async {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
-                (entry.superfile_id, r)
-            };
-            superfile_readers_fut.push(open_fut);
-        }
-        let readers = futures::future::join_all(superfile_readers_fut).await;
 
         let now = std::time::Instant::now();
         if let Some(tombstone_cache) = &tombstone_cache {
@@ -367,24 +362,47 @@ impl Supertable {
             tombstone_cache.prefetch(&superfile_ids, now).await;
         }
 
-        let mut readers_with_tombstones = Vec::with_capacity(readers.len());
-        let mut blobs = Vec::with_capacity(readers.len());
-        let storage_ref = storage.as_ref();
-        for (entry, (superfile_id, reader)) in superfiles.iter().zip(readers) {
+        let mut readers_with_tombstones = Vec::with_capacity(superfiles.len());
+        let mut blobs = Vec::with_capacity(superfiles.len());
+        for entry in superfiles {
             let bitmap = tombstone_cache
                 .as_ref()
-                .map(|t| t.bitmap_for(superfile_id, now))
+                .map(|t| t.bitmap_for(entry.superfile_id, now))
                 .transpose()
                 .map_err(|e| BuildError::Store(e.to_string()))?;
 
-            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
-            let blob = crate::supertable::query::vector::fetch_cell_posting_blob(
-                storage_ref.ok_or_else(|| BuildError::Store("cell posting compaction requires storage".into()))?,
-                disk_cache.as_ref(),
-                entry,
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            // Resident mmap-backed reader from the local disk cache (insert_warm
+            // at commit). The lazy query open path leaves `reader.bytes == None`,
+            // which breaks `get_record_batch` during merge.
+            let reader = if let Some(cache) = disk_cache.as_ref() {
+                cache
+                    .reader_synchronous_with_storage(&entry.uri, Arc::clone(&storage))
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?
+            } else {
+                open_reader(&store, None, Some(&storage), entry)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?
+            };
+
+            let offsets = entry.subsection_offsets.as_ref().ok_or_else(|| {
+                BuildError::Store(format!(
+                    "cell posting superfile {:?} missing subsection_offsets",
+                    entry.uri
+                ))
+            })?;
+            let (off, len) = offsets.vec.ok_or_else(|| {
+                BuildError::Store(format!(
+                    "cell posting superfile {:?} missing vec subsection",
+                    entry.uri
+                ))
+            })?;
+            let blob = reader
+                .byte_source()
+                .range(off, len)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+
             readers_with_tombstones.push((reader.clone(), bitmap.clone()));
             blobs.push((blob, bitmap));
         }
@@ -495,12 +513,30 @@ impl Supertable {
         // vec blob (the CellPosting reader exposes no fp32 vectors), publishing
         // a vec-less superfile the query layer then can't read.
         let is_cell_posting = self.inner().options.vector_layout == VectorLayout::CellPosting;
-        let merged_segment = if is_cell_posting {
+        let merged_segment = match if is_cell_posting {
             self.merge_cell_posting_superfiles(&inputs).await
         } else {
             self.merge_superfiles(&inputs).await
-        }
-        .map_err(|e| CompactionError::Build(e.to_string()))?;
+        } {
+            Ok(segment) => segment,
+            Err(e) => {
+                for entry in &inputs {
+                    if let Err(unseal_err) = tombstones_admin::unseal(
+                        &wal_store,
+                        entry.superfile_id,
+                        compaction_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            superfile_id = %entry.superfile_id,
+                            "compaction merge failed; unseal also failed: {unseal_err}"
+                        );
+                    }
+                }
+                return Err(CompactionError::Build(e.to_string()));
+            }
+        };
 
         let partition_key = job.partition_key.clone();
         let partition_hint = inputs.first().and_then(|e| e.partition_hint);
@@ -569,7 +605,22 @@ impl Supertable {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(new_manifest) => {
+                    inner.manifest.store(Arc::new(new_manifest));
+                    let pending_cache_inserts = merged_segment
+                        .bytes_for_cache
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    finalize_compaction_commit(
+                        inner,
+                        &storage,
+                        &new_entries,
+                        &entries_to_remove,
+                        pending_cache_inserts,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     self.refresh()
                         .await

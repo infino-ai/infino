@@ -390,6 +390,11 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         .map(|off| off.total_size)
         .sum();
     drop(reader);
+    if let Some((total, max_per_cell)) = st.hidden_vector_superfile_stats() {
+        eprintln!(
+            "[supertable_ingest] hidden vector index at ingest end: {total} superfiles, max {max_per_cell} per cell"
+        );
+    }
     drop(st);
     drop(cache);
     drop(cache_dir);

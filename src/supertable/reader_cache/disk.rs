@@ -816,6 +816,18 @@ impl DiskCacheStore {
         Ok(())
     }
 
+    /// Drop a cached superfile from the local disk cache (unmap +
+    /// unlink). Used after compaction removes superseded inputs.
+    /// No-op when `uri` is not cached.
+    pub fn evict_warm(&self, uri: &SuperfileUri) {
+        if let Some((_, entry)) = self.cached.remove(uri) {
+            self.current_bytes
+                .fetch_sub(entry.size_bytes, Ordering::Release);
+            let _ = std::fs::remove_file(self.cache_path(uri));
+        }
+        self.coordinators.remove(uri);
+    }
+
     /// Replace a cached superfile's bytes. Used when a fixed URI is
     /// read-merge-write-replaced (cell-posting cells); [`insert_warm`]
     /// would no-op and leave a stale reader.
@@ -824,12 +836,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         bytes: Bytes,
     ) -> Result<(), DiskCacheError> {
-        if let Some((_, entry)) = self.cached.remove(uri) {
-            self.current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
-            let _ = std::fs::remove_file(self.cache_path(uri));
-        }
-        self.coordinators.remove(uri);
+        self.evict_warm(uri);
         self.insert_warm(uri, bytes).await
     }
 

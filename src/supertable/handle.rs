@@ -666,6 +666,30 @@ impl Supertable {
         }
     }
 
+    /// Diagnostic: `(total_hidden_superfiles, max_superfiles_in_one_cell)` for
+    /// the hidden vector-index table, or `None` when there is no hidden table.
+    /// Used by benches to observe how compacted the hidden cell index is.
+    pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
+        let hidden = self.inner.vector_index_table.as_ref()?;
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        let mut by_cell: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
+        for entry in manifest.superfiles.iter() {
+            *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+        }
+        let total = manifest.superfiles.len();
+        let max_per_cell = by_cell.values().copied().max().unwrap_or(0);
+        Some((total, max_per_cell))
+    }
+
+    /// Superfile count of *this* table's current manifest snapshot. Used by
+    /// hidden maintenance to compact-to-stable (stop when a pass no longer
+    /// reduces the count).
+    pub(crate) fn hidden_self_superfile_count(&self) -> Option<usize> {
+        Some(self.reader().manifest().superfiles.len())
+    }
+
     /// Internal accessor used by the writer module. Not part of
     /// the public API.
     pub(super) fn inner(&self) -> &Arc<SupertableInner> {

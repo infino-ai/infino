@@ -1948,10 +1948,10 @@ pub(super) fn prepare_superfile_with_uri(
     // a cache-attached producer keeps superfile bytes out of the unbounded
     // in-memory store regardless of whether we pre-populate the disk cache.
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
-    // Pre-populating the disk cache is opt-out: a write-only producer that
-    // drops the cache right after ingest skips this wasted warm-fill.
-    let bytes_for_cache =
-        (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
+    // Always warm-fill the disk cache when attached: commits are durable in
+    // object storage first, then mirrored locally so maintenance/compaction
+    // can merge from mmap-resident bytes without re-fetching whole objects.
+    let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
 
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached
@@ -2448,8 +2448,7 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         let path = superfile_storage_path(&entry.uri);
         let _ = storage.delete(&path).await;
     }
-    Ok(())
-}
+    Ok(())}
 
 async fn publish_hidden_cell_posting_async(
     inner: Arc<SupertableInner>,
@@ -2992,17 +2991,48 @@ async fn put_superfile_multipart(
     Ok(())
 }
 
+/// After a successful compaction manifest commit: delete superseded
+/// superfile objects from object storage and warm-insert the merged
+/// output into the disk cache. Superseded cache entries are left to
+/// the LRU — they are no longer manifest-visible and will age out.
+pub(in crate::supertable) async fn finalize_compaction_commit(
+    inner: &SupertableInner,
+    storage: &Arc<dyn crate::storage::StorageProvider>,
+    new_entries: &[Arc<SuperfileEntry>],
+    entries_to_remove: &[Arc<SuperfileEntry>],
+    pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
+) {
+    let new_uris: std::collections::HashSet<_> =
+        new_entries.iter().map(|e| e.uri.clone()).collect();
+    for entry in entries_to_remove {
+        if new_uris.contains(&entry.uri) {
+            continue;
+        }
+        let path = superfile_storage_path(&entry.uri);
+        let _ = storage.delete(&path).await;
+    }
+    if !pending_cache_inserts.is_empty()
+        && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
+    {
+        warm_cache_after_commit(inner, &cache, pending_cache_inserts);
+    }
+    if let (Some(cache), Some(budget)) = (
+        inner.options.disk_cache.as_ref(),
+        inner.options.memory_budget_bytes,
+    ) {
+        cache.sweep_for_budget(budget);
+    }
+}
+
 /// Drive `DiskCacheStore::insert_warm` for each
 /// just-published superfile via the same sync→async bridge
 /// the rest of the writer uses (`block_in_place +
 /// Handle::block_on` when an ambient runtime is present;
 /// `inner.query_runtime()` otherwise).
 ///
-/// Failures are swallowed with an `eprintln!` log line —
-/// the superfiles are already durable in storage and the
-/// manifest commit has succeeded, so the cache miss
-/// becomes a "warm load fails → next query cold-fetches"
-/// degradation, not a correctness break.
+/// Failures are swallowed with a tracing warning — the superfiles are
+/// already durable in storage and the manifest commit has succeeded, so
+/// the cache miss becomes a cold-fetch on first read, not a correctness break.
 fn warm_cache_after_commit(
     inner: &SupertableInner,
     cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
