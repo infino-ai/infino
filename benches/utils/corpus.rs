@@ -347,6 +347,13 @@ pub struct MmapTextCorpus {
 
 impl MmapTextCorpus {
     pub fn generate(n_docs: usize, seed: u64) -> Self {
+        Self::generate_with_chunk(n_docs, seed, TEXT_CORPUS_CHUNK_DOCS)
+    }
+
+    /// `chunk_docs` is a parameter only so tests can exercise the multi-chunk
+    /// reseed path cheaply; production always uses [`TEXT_CORPUS_CHUNK_DOCS`]
+    /// via [`MmapTextCorpus::generate`].
+    fn generate_with_chunk(n_docs: usize, seed: u64, chunk_docs: usize) -> Self {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
 
@@ -369,17 +376,17 @@ impl MmapTextCorpus {
         // rayon fans the chunks across all cores; each pwrites to its own
         // disjoint byte range (offsets are RNG-independent, computed above)
         // and draws from its own deterministic per-chunk RNG.
-        let n_chunks = n_docs.div_ceil(TEXT_CORPUS_CHUNK_DOCS).max(1);
+        let n_chunks = n_docs.div_ceil(chunk_docs).max(1);
         let offsets_ref = &offsets;
         let file_ref = &file;
         let zipf = ZipfDistribution::new(VOCAB_SIZE);
         let zipf_ref = &zipf;
         (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * TEXT_CORPUS_CHUNK_DOCS;
+            let start = c * chunk_docs;
             if start >= n_docs {
                 return;
             }
-            let end = ((c + 1) * TEXT_CORPUS_CHUNK_DOCS).min(n_docs);
+            let end = ((c + 1) * chunk_docs).min(n_docs);
             let base = offsets_ref[start];
             let cap = (offsets_ref[end] - base) as usize;
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
@@ -488,6 +495,9 @@ pub struct StreamingTextCorpus {
     seed: u64,
     zipf: ZipfDistribution,
     n_docs: usize,
+    /// Reseed/generation granularity; matches [`MmapTextCorpus`] so the bytes
+    /// agree. A field only so tests can shrink it (see `new_with_chunk_docs`).
+    chunk_docs: usize,
     /// Next generation chunk to produce.
     next_chunk: usize,
     /// Bytes of generated-but-unserved docs.
@@ -500,10 +510,15 @@ pub struct StreamingTextCorpus {
 
 impl StreamingTextCorpus {
     pub fn new(n_docs: usize, seed: u64) -> Self {
+        Self::new_with_chunk_docs(n_docs, seed, TEXT_CORPUS_CHUNK_DOCS)
+    }
+
+    fn new_with_chunk_docs(n_docs: usize, seed: u64, chunk_docs: usize) -> Self {
         Self {
             seed,
             zipf: ZipfDistribution::new(VOCAB_SIZE),
             n_docs,
+            chunk_docs,
             next_chunk: 0,
             buf: Vec::new(),
             offs: vec![0],
@@ -519,11 +534,11 @@ impl StreamingTextCorpus {
     /// Generate the next whole chunk into the carry. Returns false when the
     /// corpus is exhausted.
     fn gen_next_chunk(&mut self) -> bool {
-        let start = self.next_chunk * TEXT_CORPUS_CHUNK_DOCS;
+        let start = self.next_chunk * self.chunk_docs;
         if start >= self.n_docs {
             return false;
         }
-        let end = (start + TEXT_CORPUS_CHUNK_DOCS).min(self.n_docs);
+        let end = (start + self.chunk_docs).min(self.n_docs);
         let mut rng = StdRng::seed_from_u64(chunk_seed(self.seed, self.next_chunk));
         for doc_id in start..end {
             write_text_doc(&mut self.buf, doc_id, &mut rng, &self.zipf);
@@ -568,8 +583,8 @@ impl StreamingTextCorpus {
     /// RNG up to `doc_id` — only called once per prepare, so the replay is
     /// cheap relative to ingest.
     pub fn doc_at(&self, doc_id: usize) -> String {
-        let chunk = doc_id / TEXT_CORPUS_CHUNK_DOCS;
-        let chunk_start = chunk * TEXT_CORPUS_CHUNK_DOCS;
+        let chunk = doc_id / self.chunk_docs;
+        let chunk_start = chunk * self.chunk_docs;
         let mut rng = StdRng::seed_from_u64(chunk_seed(self.seed, chunk));
         let mut scratch = Vec::new();
         for d in chunk_start..=doc_id {
@@ -705,17 +720,29 @@ pub struct MmapVectorCorpus {
 
 impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
+        Self::generate_with_chunk(n_docs, n_cent, seed, normalize_each, VECTOR_CORPUS_CHUNK_DOCS)
+    }
+
+    /// `chunk_docs` is a parameter only so tests can exercise the multi-chunk
+    /// reseed path cheaply; production always uses [`VECTOR_CORPUS_CHUNK_DOCS`]
+    /// via [`MmapVectorCorpus::generate`].
+    fn generate_with_chunk(
+        n_docs: usize,
+        n_cent: usize,
+        seed: u64,
+        normalize_each: bool,
+        chunk_docs: usize,
+    ) -> Self {
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
 
-        // Centers are derived from `seed` exactly as the sequential
-        // builder did, so the planted IVF cluster structure — and hence
-        // the brute-force recall ground truth — is unchanged. Each row's
-        // cluster (`i % n_cent`) is a pure function of its index, also
-        // preserved. Only the per-doc Gaussian *noise* stream is drawn
-        // from a per-chunk RNG so generation parallelizes; recall is
-        // recomputed from the actual corpus, so an equivalent (not
-        // identical) noise realization is fine.
+        // Centers are derived deterministically from `seed`, so the planted IVF
+        // cluster structure — and hence the brute-force recall ground truth —
+        // is fixed. Each row's cluster (`i % n_cent`) is a pure function of its
+        // index. Only the per-doc Gaussian *noise* stream is drawn from a
+        // per-chunk RNG so generation parallelizes; recall is recomputed from
+        // the actual corpus, so an equivalent (not identical) noise realization
+        // is fine.
         let centers = make_centers(n_cent, seed);
 
         let row_bytes = DIM * std::mem::size_of::<f32>();
@@ -726,15 +753,15 @@ impl MmapVectorCorpus {
         // rayon fans the chunks across all cores; each writes a fixed-stride
         // row range via a positioned write and draws noise from its own
         // deterministic per-chunk RNG (shared centers keep clusters intact).
-        let n_chunks = n_docs.div_ceil(VECTOR_CORPUS_CHUNK_DOCS).max(1);
+        let n_chunks = n_docs.div_ceil(chunk_docs).max(1);
         let centers_ref = &centers;
         let file_ref = &file;
         (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * VECTOR_CORPUS_CHUNK_DOCS;
+            let start = c * chunk_docs;
             if start >= n_docs {
                 return;
             }
-            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
+            let end = ((c + 1) * chunk_docs).min(n_docs);
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
             let base = (start as u64) * (row_bytes as u64);
@@ -826,6 +853,9 @@ pub struct StreamingVectorCorpus {
     normalize_each: bool,
     centers: Vec<Vec<f32>>,
     n_docs: usize,
+    /// Reseed/generation granularity; matches [`MmapVectorCorpus`] so the bytes
+    /// agree. A field only so tests can shrink it (see `new_with_chunk_docs`).
+    chunk_docs: usize,
     /// Next generation chunk to produce.
     next_chunk: usize,
     /// Flat `f32` of generated-but-unserved rows.
@@ -836,12 +866,23 @@ pub struct StreamingVectorCorpus {
 
 impl StreamingVectorCorpus {
     pub fn new(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
+        Self::new_with_chunk_docs(n_docs, n_cent, seed, normalize_each, VECTOR_CORPUS_CHUNK_DOCS)
+    }
+
+    fn new_with_chunk_docs(
+        n_docs: usize,
+        n_cent: usize,
+        seed: u64,
+        normalize_each: bool,
+        chunk_docs: usize,
+    ) -> Self {
         Self {
             seed,
             n_cent,
             normalize_each,
             centers: make_centers(n_cent, seed),
             n_docs,
+            chunk_docs,
             next_chunk: 0,
             buf: Vec::new(),
             head: 0,
@@ -856,11 +897,11 @@ impl StreamingVectorCorpus {
     /// Generate the next whole chunk into the carry. Returns false when the
     /// corpus is exhausted.
     fn gen_next_chunk(&mut self) -> bool {
-        let start = self.next_chunk * VECTOR_CORPUS_CHUNK_DOCS;
+        let start = self.next_chunk * self.chunk_docs;
         if start >= self.n_docs {
             return false;
         }
-        let end = (start + VECTOR_CORPUS_CHUNK_DOCS).min(self.n_docs);
+        let end = (start + self.chunk_docs).min(self.n_docs);
         let mut rng = StdRng::seed_from_u64(chunk_seed(self.seed, self.next_chunk));
         let mut row = vec![0.0f32; DIM];
         for i in start..end {
@@ -1511,6 +1552,69 @@ mod tests {
             pieced.extend(split.next_flat(len));
         }
         assert_eq!(pieced, whole);
+    }
+
+    /// Tiny generation chunk so a few hundred docs cross several
+    /// `gen_next_chunk` boundaries — production's 2^19+ chunk needs millions
+    /// of docs to reach a second chunk, too heavy for a unit test.
+    const STREAM_TEST_CHUNK_DOCS: usize = 64;
+    /// Docs spanning several `STREAM_TEST_CHUNK_DOCS` chunks (with a partial
+    /// tail). `[10, 64, 1, 200, 25]` serve slices sum to this.
+    const STREAM_TEST_MULTI_DOCS: usize = 300;
+
+    /// `gen_next_chunk` across multiple chunks (text): streaming at a small
+    /// chunk must still match the disk corpus generated at the same chunk
+    /// size. Proves the per-chunk `chunk_seed` reseed and the carry across a
+    /// generation boundary, not just within the first chunk.
+    #[test]
+    fn streaming_text_matches_disk_across_chunks() {
+        let disk = MmapTextCorpus::generate_with_chunk(
+            STREAM_TEST_MULTI_DOCS,
+            STREAM_TEST_SEED,
+            STREAM_TEST_CHUNK_DOCS,
+        );
+        let mut stream = StreamingTextCorpus::new_with_chunk_docs(
+            STREAM_TEST_MULTI_DOCS,
+            STREAM_TEST_SEED,
+            STREAM_TEST_CHUNK_DOCS,
+        );
+        let mut titles = Vec::new();
+        for len in [10, 64, 1, 200, 25] {
+            titles.extend(stream.next_titles(len));
+        }
+        assert_eq!(titles.len(), STREAM_TEST_MULTI_DOCS);
+        for (i, title) in titles.iter().enumerate() {
+            assert_eq!(title, disk.doc(i), "doc {i} differs across a chunk boundary");
+        }
+    }
+
+    /// `gen_next_chunk` across multiple chunks (vector): same cross-boundary
+    /// check as the text variant.
+    #[test]
+    fn streaming_vector_matches_disk_across_chunks() {
+        let disk = MmapVectorCorpus::generate_with_chunk(
+            STREAM_TEST_MULTI_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+            STREAM_TEST_CHUNK_DOCS,
+        );
+        let mut stream = StreamingVectorCorpus::new_with_chunk_docs(
+            STREAM_TEST_MULTI_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+            STREAM_TEST_CHUNK_DOCS,
+        );
+        let mut flat = Vec::new();
+        for len in [10, 64, 1, 200, 25] {
+            flat.extend(stream.next_flat(len));
+        }
+        assert_eq!(
+            flat.as_slice(),
+            disk.as_slice(),
+            "vectors differ across a chunk boundary"
+        );
     }
 
     /// `text_corpus_bytes` (the analytic size streaming reports) must equal the
