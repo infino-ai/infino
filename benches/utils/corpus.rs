@@ -600,11 +600,6 @@ fn page_floor(off: usize) -> usize {
     off & !(PAGE_BYTES - 1)
 }
 
-pub mod combined;
-pub mod grading;
-
-pub use combined::SequentialSyntheticCorpus;
-
 // ─── Vector corpus ────────────────────────────────────────────────────
 
 /// Generate `n_docs` planted-cluster vectors of [`DIM`] dimensions,
