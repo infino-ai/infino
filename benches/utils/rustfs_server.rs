@@ -76,9 +76,25 @@ impl Drop for RustFsHandle {
     }
 }
 
-/// Send SIGTERM to a spawned RustFS child, then SIGKILL if needed.
+/// Force-stop a spawned RustFS child, then wait briefly before a final kill attempt.
 pub fn terminate_child(child: &mut Child) {
     terminate_child_impl(child);
+}
+...
+fn terminate_child_impl(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_millis(TEARDOWN_GRACE_MS);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(TEARDOWN_POLL_MS));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Locate or download the `rustfs` binary.
