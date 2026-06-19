@@ -105,8 +105,16 @@ const DOC_ID_PREFIX_BYTES: usize = 3;
 /// bytes; fewer digits still occupy this width.
 const DOC_ID_PAD_WIDTH: usize = 7;
 /// Bytes in one body token `" term{:05}"` — 5 for `" term"` plus 5 digits.
-/// Fixed because `VOCAB_SIZE = 10_000 ≤ 100_000` keeps the index ≤ 5 digits.
+/// Fixed-width: a term index of ≤ 5 digits keeps every token 10 bytes, which
+/// the static assert below pins to `VOCAB_SIZE`.
 const TERM_BYTES: usize = 10;
+
+// The deterministic byte layout holds only while every term index fits in 5
+// digits — `zipf.sample(..)` draws in `1..=VOCAB_SIZE`, so guard the ceiling.
+const _: () = assert!(
+    VOCAB_SIZE <= 99_999,
+    "VOCAB_SIZE past 5 digits widens term tokens and breaks the fixed byte layout"
+);
 /// Docs assigned to one text corpus scheduling chunk. Each worker streams its
 /// chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than buffering
 /// the whole chunk in memory.
@@ -301,8 +309,24 @@ pub fn generate_text_corpus(n_docs: usize, seed: u64) -> Vec<String> {
     out
 }
 
+/// On-disk byte length of doc `doc_id`: the `"doc{doc_id:07}"` token plus
+/// `TOKENS_PER_DOC` fixed-width body tokens. RNG-independent — token *content*
+/// varies but every length is fixed — so this is the single source of truth
+/// for the layout: the offset table, the corpus-size accounting, and the bytes
+/// [`write_text_doc`] actually emits all derive from it.
+fn doc_len(doc_id: usize) -> u64 {
+    let digits = if doc_id == 0 {
+        1
+    } else {
+        doc_id.ilog10() as usize + 1
+    };
+    let doc_token = DOC_ID_PREFIX_BYTES + digits.max(DOC_ID_PAD_WIDTH);
+    (doc_token + TOKENS_PER_DOC * TERM_BYTES) as u64
+}
+
 /// Write one doc's bytes — `"doc{id:07}"` then `TOKENS_PER_DOC` body tokens.
-/// Shared by the disk and streaming corpora so both emit identical bytes.
+/// Shared by the disk and streaming corpora so both emit identical bytes;
+/// writes exactly [`doc_len`] bytes.
 fn write_text_doc(buf: &mut Vec<u8>, doc_id: usize, rng: &mut StdRng, zipf: &ZipfDistribution) {
     write!(buf, "doc{doc_id:07}").expect("fmt doc token");
     for _ in 0..TOKENS_PER_DOC {
@@ -327,24 +351,10 @@ impl MmapTextCorpus {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
 
-        // Each doc's on-disk byte length is RNG-independent: the body is
-        // exactly `TOKENS_PER_DOC` tokens of " term{:05}" (10 bytes each,
-        // since VOCAB_SIZE = 10_000 keeps the index ≤ 5 digits), and the
-        // leading "doc{doc_id:07}" is 3 + max(7, digits(doc_id)) bytes.
-        // So the offset table is deterministic and every chunk can write
-        // to its own disjoint byte range — letting all cores generate the
-        // (RNG-driven) token *content* in parallel via positioned writes.
-        #[inline]
-        fn doc_len(doc_id: usize) -> u64 {
-            let digits = if doc_id == 0 {
-                1
-            } else {
-                doc_id.ilog10() as usize + 1
-            };
-            let doc_token = DOC_ID_PREFIX_BYTES + digits.max(DOC_ID_PAD_WIDTH);
-            (doc_token + TOKENS_PER_DOC * TERM_BYTES) as u64
-        }
-
+        // Doc byte lengths are RNG-independent (see `doc_len`), so the offset
+        // table is fully determined up front and every chunk can write to its
+        // own disjoint byte range — all cores generate the (RNG-driven) token
+        // *content* in parallel via positioned writes.
         let mut offsets = Vec::with_capacity(n_docs + 1);
         let mut pos = 0u64;
         offsets.push(pos);
@@ -571,20 +581,12 @@ impl StreamingTextCorpus {
     }
 }
 
-/// Logical byte size of an `n_docs` text corpus — pure function of the
-/// deterministic per-doc layout (no generation).
+/// Logical byte size of an `n_docs` text corpus — sums [`doc_len`] over every
+/// doc. A pure function of the deterministic layout (no generation), sharing
+/// `doc_len` with [`MmapTextCorpus`] so it can never drift from the bytes the
+/// disk corpus actually writes.
 pub fn text_corpus_bytes(n_docs: usize) -> u64 {
-    let body = (TOKENS_PER_DOC * TERM_BYTES) as u64;
-    (0..n_docs)
-        .map(|doc_id| {
-            let digits = if doc_id == 0 {
-                1
-            } else {
-                doc_id.ilog10() as usize + 1
-            };
-            (DOC_ID_PREFIX_BYTES + digits.max(DOC_ID_PAD_WIDTH)) as u64 + body
-        })
-        .sum()
+    (0..n_docs).map(doc_len).sum()
 }
 
 /// Page size assumed for `madvise` range alignment. 4 KiB on every
@@ -1498,6 +1500,22 @@ mod tests {
         );
         let flat = stream.next_flat(STREAM_TEST_DOCS);
         assert_eq!(flat.as_slice(), disk.as_slice(), "streamed vectors differ");
+    }
+
+    /// `text_corpus_bytes` (the analytic size streaming reports) must equal the
+    /// bytes the disk corpus actually writes — both go through `doc_len`, so a
+    /// divergence means the shared layout was forked. Spans the doc-id digit
+    /// widths that change `doc_len` (1-digit through 5+) to catch a bad bound.
+    #[test]
+    fn text_corpus_bytes_matches_disk() {
+        for n_docs in [1, 9, 10, 100, STREAM_TEST_DOCS] {
+            let disk = MmapTextCorpus::generate(n_docs, STREAM_TEST_SEED);
+            assert_eq!(
+                text_corpus_bytes(n_docs),
+                disk.total_bytes(),
+                "analytic byte size diverged from disk at {n_docs} docs"
+            );
+        }
     }
 
     #[test]

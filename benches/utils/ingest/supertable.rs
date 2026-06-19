@@ -317,8 +317,9 @@ trait ChunkSource {
     ) -> RecordBatch;
     /// Drop the just-committed chunk's pages from RSS (resident only).
     fn advise_consumed(&self, _start: usize, _len: usize) {}
-    /// The SQL sample title at `doc_id` (SQL modality only).
-    fn sample_title(&mut self, doc_id: usize) -> String;
+    /// The SQL sample title at `doc_id` (SQL modality only). Read-only — it
+    /// neither consumes nor advances the chunk stream.
+    fn sample_title(&self, doc_id: usize) -> String;
 }
 
 /// Reads chunks off a fully-materialized mmap corpus — the bench path,
@@ -364,7 +365,7 @@ impl ChunkSource for ResidentSource<'_> {
             vectors.advise_consumed(start, len);
         }
     }
-    fn sample_title(&mut self, doc_id: usize) -> String {
+    fn sample_title(&self, doc_id: usize) -> String {
         self.corpus
             .text
             .as_ref()
@@ -379,6 +380,10 @@ impl ChunkSource for ResidentSource<'_> {
 struct StreamingSource {
     text: Option<corpus::StreamingTextCorpus>,
     vectors: Option<corpus::StreamingVectorCorpus>,
+    /// Docs served so far. The streams serve sequentially with no notion of
+    /// `start`, so this pins the loop's contiguous-from-zero invariant: it
+    /// must equal the requested `start` of every chunk (see `batch`).
+    served: usize,
 }
 
 impl StreamingSource {
@@ -395,7 +400,11 @@ impl StreamingSource {
                 true,
             )
         });
-        Self { text, vectors }
+        Self {
+            text,
+            vectors,
+            served: 0,
+        }
     }
 }
 
@@ -408,16 +417,21 @@ impl ChunkSource for StreamingSource {
         end: usize,
         len: usize,
     ) -> RecordBatch {
+        // The streams have no random access — they hand back the next `len`
+        // docs in order. Correct only if the loop consumes chunks contiguously
+        // from zero; assert that rather than silently desync from `doc_id`.
+        debug_assert_eq!(self.served, start, "streaming chunk requested out of order");
         let title = modality.has_text().then(|| {
             let titles = self.text.as_mut().expect("text corpus").next_titles(len);
-            LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>())
+            LargeStringArray::from_iter_values(titles)
         });
         let vectors = modality
             .has_vector()
             .then(|| self.vectors.as_mut().expect("vector corpus").next_flat(len));
+        self.served += len;
         assemble_batch(modality, schema, title, vectors, start, end, len)
     }
-    fn sample_title(&mut self, doc_id: usize) -> String {
+    fn sample_title(&self, doc_id: usize) -> String {
         self.text
             .as_ref()
             .expect("sql modality has text")
