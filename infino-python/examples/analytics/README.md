@@ -1,8 +1,8 @@
 # Analytics
 
 Aggregate **and** search the same data over a **single**
-[Infino](https://pypi.org/project/infino/) table — no vector index, no separate
-analytics database or search cluster:
+[Infino](https://pypi.org/project/infino/) table — one engine instead of a
+separate analytics database and search cluster:
 
 - **`query_sql`** — `GROUP BY` time-series, top-N, and leaderboards with
   `COUNT` / `AVG` / `MAX`.
@@ -10,9 +10,9 @@ analytics database or search cluster:
 - **Both at once** — `bm25_search` is a SQL table function, so search results
   feed straight into `JOIN` + `GROUP BY`.
 
-The dataset is real Hacker News stories (title, author, points, comments,
-timestamp) from the HuggingFace Hub, indexed on local disk. No embeddings — this
-example is about the SQL + full-text path.
+The dataset is Hacker News stories (title, author, points, comments, timestamp)
+from the HuggingFace Hub, indexed on local disk. This example uses no embeddings
+— it's the SQL and full-text path.
 
 > Setup and the shared helpers are covered in the
 > [examples README](../README.md). Run that setup once, then open the notebook.
