@@ -9,6 +9,7 @@
 //! re-compacted.
 
 use crate::{
+    superfile::vector::{cell_posting::merge_encoded_blobs, layout::VectorLayout},
     Supertable,
     config::CompactionSettings,
     superfile::builder::SuperfileBuilder,
@@ -336,6 +337,89 @@ Ok(())
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
+    pub(crate) async fn merge_cell_posting_superfiles(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+    ) -> Result<PreparedSuperfile, BuildError> {
+        let manifest = { self.inner().manifest.load().clone() };
+        let store = manifest.options.store.clone();
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let tombstone_cache = self.inner().tombstone_cache.clone();
+
+        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
+        for entry in superfiles {
+            let open_fut = async {
+                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
+                (entry.superfile_id, r)
+            };
+            superfile_readers_fut.push(open_fut);
+        }
+        let readers = futures::future::join_all(superfile_readers_fut).await;
+
+        let now = std::time::Instant::now();
+        if let Some(tombstone_cache) = &tombstone_cache {
+            let superfile_ids = superfiles
+                .iter()
+                .map(|entry| entry.superfile_id)
+                .collect::<Vec<_>>();
+            tombstone_cache.prefetch(&superfile_ids, now).await;
+        }
+
+        let mut readers_with_tombstones = Vec::with_capacity(readers.len());
+        let mut blobs = Vec::with_capacity(readers.len());
+        let storage_ref = storage.as_ref();
+        for (entry, (superfile_id, reader)) in superfiles.iter().zip(readers) {
+            let bitmap = tombstone_cache
+                .as_ref()
+                .map(|t| t.bitmap_for(superfile_id, now))
+                .transpose()
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+
+            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            let blob = crate::supertable::query::vector::fetch_cell_posting_blob(
+                storage_ref.ok_or_else(|| BuildError::Store("cell posting compaction requires storage".into()))?,
+                disk_cache.as_ref(),
+                entry,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            readers_with_tombstones.push((reader.clone(), bitmap.clone()));
+            blobs.push((blob, bitmap));
+        }
+
+        let blob_refs = blobs
+            .iter()
+            .map(|(blob, bitmap)| (blob.as_ref(), bitmap.as_deref()))
+            .collect::<Vec<_>>();
+        let (merged_vec_blob, n_docs) = merge_encoded_blobs(&blob_refs)
+            .map_err(BuildError::Store)?;
+        if n_docs == 0 {
+            return Err(BuildError::NoDocsToBuild);
+        }
+
+        let mut opts = self.inner().options.builder_options();
+        opts.vector_layout = VectorLayout::CellPosting;
+        let (merged_bytes, superfile_stats) = SuperfileBuilder::build_from_readers_with_prebuilt_vector_blob(
+            opts,
+            &readers_with_tombstones,
+            merged_vec_blob,
+        )?;
+        debug_assert_eq!(superfile_stats.n_docs, n_docs);
+        let merged_bytes = Bytes::from(merged_bytes);
+
+        let shard = ShardOutput::new_with_params(
+            merged_bytes,
+            superfile_stats.n_docs,
+            superfile_stats.id_min,
+            superfile_stats.id_max,
+            superfile_stats.scalar_stats,
+        );
+
+        let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
+        prepared_superfile.ok_or(BuildError::NoDocsToBuild)
+    }
+
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
@@ -404,10 +488,16 @@ Ok(())
             }
         }
 
-        let merged_segment = self
-            .merge_superfiles(&inputs)
-            .await
-            .map_err(|e| CompactionError::Build(e.to_string()))?;
+        let is_cell_posting = inputs
+            .first()
+            .map(|e| e.vector_layout == VectorLayout::CellPosting)
+            .unwrap_or(false);
+        let merged_segment = if is_cell_posting {
+            self.merge_cell_posting_superfiles(&inputs).await
+        } else {
+            self.merge_superfiles(&inputs).await
+        }
+        .map_err(|e| CompactionError::Build(e.to_string()))?;
 
         let partition_key = job.partition_key.clone();
         let partition_hint = inputs.first().and_then(|e| e.partition_hint);

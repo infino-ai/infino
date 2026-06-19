@@ -684,6 +684,86 @@ impl SuperfileBuilder {
         Ok(superfile_stats)
     }
 
+    /// Build a CellPosting-layout superfile by merging scalar/FTS rows from
+    /// existing readers while splicing in a prebuilt Sq8+epsilon vector blob.
+    ///
+    /// This is used by hidden vector-index maintenance: CellPosting vectors are
+    /// already encoded as Sq8+epsilon, so compaction must not route them through
+    /// `get_vectors_fp32` / `CellPostingBuilder::add`. The caller is responsible
+    /// for constructing `vec_blob` with local doc ids matching the scalar row
+    /// order produced by `readers` after tombstone filtering.
+    pub(crate) fn build_from_readers_with_prebuilt_vector_blob(
+        opts: BuilderOptions,
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        vec_blob: Vec<u8>,
+    ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        if opts.vector_layout != VectorLayout::CellPosting {
+            return Err(BuildError::VectorSchemaMismatch(
+                "prebuilt vector blob is only supported for CellPosting layout".into(),
+            ));
+        }
+        if readers.is_empty() {
+            return Err(BuildError::BatchReadError);
+        }
+
+        let mut batches = Vec::with_capacity(readers.len());
+        let mut stats = Vec::with_capacity(readers.len());
+        for (reader, deleted) in readers {
+            opts.check_mergeability(
+                reader.id_column(),
+                reader.schema(),
+                reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+                None,
+            )?;
+            let batch = reader
+                .get_record_batch(deleted.clone())
+                .map_err(|_| BuildError::BatchReadError)?;
+            stats.push(SuperfileStats::try_compute_from_record_batch(&batch)?);
+            batches.push(batch);
+        }
+        let merged_stats = SuperfileStats::from_children(&stats);
+        if merged_stats.n_docs == 0 {
+            return Err(BuildError::BatchReadError);
+        }
+
+        let mut kvs: Vec<(String, String)> = vec![
+            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
+            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
+            (kv::ID_COLUMN.into(), opts.id_column.clone()),
+            (kv::N_DOCS.into(), merged_stats.n_docs.to_string()),
+            (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
+        ];
+        if !opts.fts_columns.is_empty() {
+            kvs.push((
+                kv::FTS_COLUMNS.into(),
+                fts_columns_json(&opts.fts_columns),
+            ));
+        }
+        if !opts.vector_columns.is_empty() {
+            kvs.push((
+                kv::VEC_COLUMNS.into(),
+                vec_columns_json(&opts.vector_columns),
+            ));
+            if opts.vector_layout != VectorLayout::Ivf {
+                kvs.push((
+                    kv::VEC_LAYOUT.into(),
+                    opts.vector_layout.as_kv_value().into(),
+                ));
+            }
+        }
+
+        let id_page_limit = [(opts.id_column.as_str(), opts.id_page_size_limit)];
+        let body = encode_parquet_body(
+            &opts.schema,
+            &batches,
+            opts.compression,
+            opts.row_group_size,
+            &id_page_limit,
+        )?;
+        let parts = splice_index_blobs(body, &Vec::new(), &vec_blob, &kvs)?;
+        Ok((parts.bytes, merged_stats))
+    }
+
     /// Builds a superfile from the given readers, merging them into one.
     pub fn build_from_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],

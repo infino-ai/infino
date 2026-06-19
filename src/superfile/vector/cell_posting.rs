@@ -9,6 +9,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use roaring::RoaringBitmap;
 
 use crate::superfile::BuildError;
 use crate::superfile::builder::VectorConfig;
@@ -17,6 +18,7 @@ use crate::superfile::vector::distance::{
 };
 
 const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
+const SEGMENTED_MAGIC: &[u8] = b"infino.cell_posting.segments.v1\n";
 const SQ8_CODE_MAX: f32 = 255.0;
 const EPSILON_I8_CLAMP: f32 = 127.0;
 const ROW_BYTES_PER_DIM: usize = 2;
@@ -138,10 +140,63 @@ pub fn encode_blob(
     Ok(out)
 }
 
-fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
+fn open_segments(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
+    if bytes.starts_with(SEGMENTED_MAGIC) {
+        open_segmented_blob(bytes)
+    } else {
+        Ok(vec![open_legacy_blob(bytes)?])
+    }
+}
+
+fn open_legacy_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
     let body = bytes
         .strip_prefix(MAGIC)
         .ok_or_else(|| "bad cell posting magic".to_string())?;
+    let (posting, _) = parse_segment_body(body, true)?;
+    Ok(posting)
+}
+
+fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
+    let body = bytes
+        .strip_prefix(SEGMENTED_MAGIC)
+        .ok_or_else(|| "bad segmented cell posting magic".to_string())?;
+    if body.len() < 4 + 1 + 4 {
+        return Err("segmented cell posting header truncated".into());
+    }
+    let dim = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let metric = metric_from_id(body[4])?;
+    let n_segments = u32::from_le_bytes(body[5..9].try_into().unwrap()) as usize;
+    let mut off = 9;
+    let mut segments = Vec::with_capacity(n_segments);
+    for _ in 0..n_segments {
+        if body.len() < off + 4 {
+            return Err("segmented cell posting segment header truncated".into());
+        }
+        let n_docs = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let segment_len = dim * 8 + n_docs * dim * ROW_BYTES_PER_DIM + n_docs * 4 + n_docs * 4;
+        if body.len() < off + segment_len {
+            return Err("segmented cell posting segment body truncated".into());
+        }
+        let seg_body = [
+            &(dim as u32).to_le_bytes()[..],
+            &[metric_id(metric)][..],
+            &(n_docs as u32).to_le_bytes()[..],
+            &body[off..off + segment_len],
+        ]
+        .concat();
+        let (segment, consumed) = parse_segment_body(&seg_body, false)?;
+        debug_assert_eq!(consumed, seg_body.len());
+        segments.push(segment);
+        off += segment_len;
+    }
+    if off != body.len() {
+        return Err("segmented cell posting trailing bytes".into());
+    }
+    Ok(segments)
+}
+
+fn parse_segment_body(body: &[u8], allow_legacy_missing_norms: bool) -> Result<(DecodedPosting, usize), String> {
     if body.len() < 4 + 1 + 4 {
         return Err("cell posting header truncated".into());
     }
@@ -158,6 +213,7 @@ fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
     let offset_start = scale_start + dim * 4;
     let rows_start = header;
     let ids_start = rows_start + rows_len;
+    let norms_start = ids_start + ids_len;
     let mut scale = vec![0f32; dim];
     let mut offset = vec![0f32; dim];
     for d in 0..dim {
@@ -174,74 +230,207 @@ fn open_blob(bytes: &[u8]) -> Result<DecodedPosting, String> {
     }
     let ids = decode_ids(&body[ids_start..ids_start + ids_len]);
     let rows = body[rows_start..rows_start + rows_len].to_vec();
-    let norms_start = ids_start + ids_len;
-    let per_doc_norms = if body.len() >= norms_start + n_docs * 4 {
-        let mut norms = Vec::with_capacity(n_docs);
-        for i in 0..n_docs {
-            let off = norms_start + i * 4;
-            norms.push(f32::from_le_bytes(body[off..off + 4].try_into().unwrap()));
-        }
-        Some(norms)
-    } else {
-        None
-    };
-    Ok(DecodedPosting {
+    let mut posting = DecodedPosting {
         dim,
         metric,
         ids,
         scale,
         offset,
         rows,
-        per_doc_norms,
-    })
+        per_doc_norms: None,
+    };
+    let consumed = if body.len() >= norms_start + n_docs * 4 {
+        let mut norms = Vec::with_capacity(n_docs);
+        for i in 0..n_docs {
+            let off = norms_start + i * 4;
+            norms.push(f32::from_le_bytes(body[off..off + 4].try_into().unwrap()));
+        }
+        posting.per_doc_norms = Some(norms);
+        norms_start + n_docs * 4
+    } else if allow_legacy_missing_norms && matches!(metric, Metric::L2Sq | Metric::Cosine) {
+        posting.per_doc_norms = Some(compute_encoded_norms(&posting));
+        norms_start
+    } else {
+        norms_start
+    };
+    Ok((posting, consumed))
 }
 
 pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f32)>, String> {
-    let posting = open_blob(bytes)?;
-    if query.len() != posting.dim {
+    let postings = open_segments(bytes)?;
+    let Some(first) = postings.first() else {
+        return Ok(Vec::new());
+    };
+    if query.len() != first.dim {
         return Err("cell posting query dim mismatch".into());
     }
-    if k == 0 || posting.ids.is_empty() {
+    if k == 0 {
         return Ok(Vec::new());
     }
-    let norms_for_kernel = match posting.metric {
-        Metric::NegDot => None,
-        Metric::L2Sq | Metric::Cosine => Some(
-            posting
-                .per_doc_norms
-                .as_deref()
-                .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
-        ),
-    };
-    let kernel = Sq8ResidualEpsilonKernel::new(
-        posting.metric,
-        query,
-        &posting.scale,
-        &posting.offset,
-        SQ8_RESIDUAL_DIVISOR,
-        norms_for_kernel,
-    );
-    let dim = posting.dim;
     let mut heap = BinaryHeap::<WorstHit>::new();
-    for row in 0..posting.ids.len() {
-        let base = row * dim * ROW_BYTES_PER_DIM;
-        let codes = &posting.rows[base..base + dim];
-        let residuals = &posting.rows[base + dim..base + dim + dim];
-        let norm = norms_for_kernel.map(|norms| norms[row]);
-        let d = kernel.distance_with_norm(codes, residuals, norm);
-        let hit = WorstHit((posting.ids[row], d));
-        if heap.len() < k {
-            heap.push(hit);
-        } else if let Some(worst) = heap.peek() {
-            if cmp_f32(hit.0.1, worst.0.1).is_lt() {
-                heap.pop();
+    for posting in &postings {
+        if posting.dim != first.dim || posting.metric != first.metric {
+            return Err("cell posting segment metric/dim mismatch".into());
+        }
+        let norms_for_kernel = match posting.metric {
+            Metric::NegDot => None,
+            Metric::L2Sq | Metric::Cosine => Some(
+                posting
+                    .per_doc_norms
+                    .as_deref()
+                    .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
+            ),
+        };
+        let kernel = Sq8ResidualEpsilonKernel::new(
+            posting.metric,
+            query,
+            &posting.scale,
+            &posting.offset,
+            SQ8_RESIDUAL_DIVISOR,
+            norms_for_kernel,
+        );
+        let dim = posting.dim;
+        for row in 0..posting.ids.len() {
+            let base = row * dim * ROW_BYTES_PER_DIM;
+            let codes = &posting.rows[base..base + dim];
+            let residuals = &posting.rows[base + dim..base + dim + dim];
+            let norm = norms_for_kernel.map(|norms| norms[row]);
+            let d = kernel.distance_with_norm(codes, residuals, norm);
+            let hit = WorstHit((posting.ids[row], d));
+            if heap.len() < k {
                 heap.push(hit);
+            } else if let Some(worst) = heap.peek() {
+                if cmp_f32(hit.0.1, worst.0.1).is_lt() {
+                    heap.pop();
+                    heap.push(hit);
+                }
             }
         }
     }
     let mut out: Vec<(u32, f32)> = heap.into_iter().map(|h| h.0).collect();
     out.sort_by(|a, b| cmp_f32(a.1, b.1));
     Ok(out)
+}
+
+pub fn merge_encoded_blobs(
+    inputs: &[(&[u8], Option<&RoaringBitmap>)],
+) -> Result<(Vec<u8>, u64), String> {
+    if inputs.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut merged_segments = Vec::new();
+    let mut next_id = 0u32;
+    let mut dim = None;
+    let mut metric = None;
+    for (blob, deleted) in inputs {
+        for segment in open_segments(blob)? {
+            if let Some(d) = dim {
+                if d != segment.dim {
+                    return Err("cell posting merge dim mismatch".into());
+                }
+            } else {
+                dim = Some(segment.dim);
+            }
+            if let Some(m) = metric {
+                if m != segment.metric {
+                    return Err("cell posting merge metric mismatch".into());
+                }
+            } else {
+                metric = Some(segment.metric);
+            }
+            let mut ids = Vec::with_capacity(segment.ids.len());
+            let mut rows = Vec::with_capacity(segment.rows.len());
+            let mut norms = segment.per_doc_norms.as_ref().map(|_| Vec::with_capacity(segment.ids.len()));
+            for (row, &old_id) in segment.ids.iter().enumerate() {
+                if deleted.is_some_and(|bm| bm.contains(old_id)) {
+                    continue;
+                }
+                ids.push(next_id);
+                next_id = next_id.saturating_add(1);
+                let base = row * segment.dim * ROW_BYTES_PER_DIM;
+                rows.extend_from_slice(&segment.rows[base..base + segment.dim * ROW_BYTES_PER_DIM]);
+                if let (Some(src), Some(dst)) = (segment.per_doc_norms.as_ref(), norms.as_mut()) {
+                    dst.push(src[row]);
+                }
+            }
+            if !ids.is_empty() {
+                let mut segment = DecodedPosting {
+                    dim: segment.dim,
+                    metric: segment.metric,
+                    ids,
+                    scale: segment.scale,
+                    offset: segment.offset,
+                    rows,
+                    per_doc_norms: norms,
+                };
+                if segment.per_doc_norms.is_none() && matches!(segment.metric, Metric::L2Sq | Metric::Cosine) {
+                    segment.per_doc_norms = Some(compute_encoded_norms(&segment));
+                }
+                merged_segments.push(segment);
+            }
+        }
+    }
+    let n_docs = u64::from(next_id);
+    if n_docs == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    Ok((encode_segmented_blob(dim.unwrap(), metric.unwrap(), &merged_segments)?, n_docs))
+}
+
+fn encode_segmented_blob(
+    dim: usize,
+    metric: Metric,
+    segments: &[DecodedPosting],
+) -> Result<Vec<u8>, String> {
+    let mut out = SEGMENTED_MAGIC.to_vec();
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
+    out.push(metric_id(metric));
+    out.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+    for segment in segments {
+        if segment.dim != dim || segment.metric != metric {
+            return Err("cell posting segment metric/dim mismatch".into());
+        }
+        out.extend_from_slice(&(segment.ids.len() as u32).to_le_bytes());
+        for v in &segment.scale {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &segment.offset {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&segment.rows);
+        for id in &segment.ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        let norms = match (&segment.per_doc_norms, metric) {
+            (Some(norms), _) => norms.clone(),
+            (None, Metric::NegDot) => Vec::new(),
+            (None, Metric::L2Sq | Metric::Cosine) => compute_encoded_norms(segment),
+        };
+        if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+            for n in norms {
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
+    let dim = p.dim;
+    let mut norms = Vec::with_capacity(p.ids.len());
+    for row in 0..p.ids.len() {
+        let base = row * dim * ROW_BYTES_PER_DIM;
+        let mut acc = 0.0f64;
+        for d in 0..dim {
+            let code = p.rows[base + d] as f32;
+            let eps = i8::from_le_bytes([p.rows[base + dim + d]]) as f32;
+            let step = p.scale[d] / SQ8_RESIDUAL_DIVISOR;
+            let x = p.offset[d] + code * p.scale[d] + eps * step;
+            acc += (x as f64) * (x as f64);
+        }
+        norms.push(acc as f32);
+    }
+    norms
 }
 
 fn decode_ids(bytes: &[u8]) -> Vec<u32> {
@@ -392,12 +581,45 @@ mod tests {
                 vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
             }
         }
-        let blob = encode_blob(Metric::Cosine, dim, &ids, &vecs).expect("encode");
+        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
         let mut q = vec![0f32; dim];
         q[0] = 0.31;
         let hits = search_blob(&blob, &q, 5).expect("search");
         assert_eq!(hits.len(), 5);
         assert_eq!(hits[0].0, 31);
+    }
+
+
+    #[test]
+    fn merge_encoded_blobs_remaps_ids_and_searches_segments() {
+        let dim = 4usize;
+        let ids_a = vec![0u32, 1, 2];
+        let ids_b = vec![0u32, 1];
+        let vecs_a = vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let vecs_b = vec![
+            0.0, 0.0, 0.0, 1.0,
+            2.0, 0.0, 0.0, 0.0,
+        ];
+        let blob_a = encode_blob(Metric::L2Sq, dim, &ids_a, &vecs_a).expect("encode a");
+        let blob_b = encode_blob(Metric::L2Sq, dim, &ids_b, &vecs_b).expect("encode b");
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert(1);
+
+        let (merged, n_docs) = merge_encoded_blobs(&[
+            (blob_a.as_slice(), Some(&deleted)),
+            (blob_b.as_slice(), None),
+        ])
+        .expect("merge");
+        assert_eq!(n_docs, 4);
+
+        let hits = search_blob(&merged, &[2.0, 0.0, 0.0, 0.0], 4).expect("search merged");
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].0, 3, "second blob row id must be remapped after surviving rows");
+        assert!(hits.iter().all(|(id, _)| *id < 4));
     }
 
     #[test]

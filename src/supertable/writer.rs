@@ -57,6 +57,7 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use object_store::PutPayload;
 use rayon::prelude::*;
 
@@ -1515,13 +1516,21 @@ impl SupertableWriter {
                         })?;
                     let (user_res, hidden_res) = tokio::join!(
                         persist_superfile_publish_batch_async(&user_inner, user_batch),
-                        publish_hidden_cell_posting_async(hidden_inner, hidden_storage, prep),
+                        publish_hidden_cell_posting_async(Arc::clone(&hidden_inner), hidden_storage, prep),
                     );
                     user_res?;
-                    if let Err(e) = hidden_res {
-                        tracing::warn!(
-                            "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                        );
+                    match hidden_res {
+                        Ok(()) => {
+                            #[cfg(not(test))]
+                            if std::env::var_os("INFINO_HIDDEN_SPFRESH_MAINTENANCE").is_some() {
+                                spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
+                            );
+                        }
                     }
                     Ok::<(), BuildError>(())
                 }
@@ -2234,6 +2243,23 @@ where
     }
 }
 
+#[cfg(not(test))]
+fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
+    let rt = inner.query_runtime();
+    rt.spawn_blocking(move || {
+        let hidden = Supertable::from_inner(inner);
+        let cfg = super::handle::hidden_vector_index_spfresh_compaction_settings();
+        if let Err(e) = hidden.compact(&cfg) {
+            match e {
+                crate::supertable::error::CompactionError::AlreadyCompacting => {}
+                other => tracing::warn!(
+                    "supertable: hidden SPFresh maintenance failed: {other}"
+                ),
+            }
+        }
+    });
+}
+
 async fn publish_hidden_cell_posting_async(
     inner: Arc<SupertableInner>,
     storage: Arc<dyn crate::storage::StorageProvider>,
@@ -2471,14 +2497,20 @@ pub async fn write_superfile_list(
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
+    // Bound object-store fanout to the writer-pool width. A vector commit can
+    // stage one hidden delta per touched cell plus user shards; driving all PUTs
+    // at once opens dozens of Azure sockets and can stall the commit path.
+    let write_concurrency = opts.writer_pool.current_num_threads().max(1);
+
     let replace_futs = pending_storage_replaces
         .iter()
         .enumerate()
         .map(|(i, (uri, bytes))| {
             let storage = Arc::clone(storage);
+            let uri = *uri;
             let bytes = bytes.clone();
             async move {
-                let path = superfile_storage_path(uri);
+                let path = superfile_storage_path(&uri);
                 put_superfile_replace(&storage, &path, bytes)
                     .await
                     .map(|()| i)
@@ -2487,12 +2519,17 @@ pub async fn write_superfile_list(
         });
     let mut err = None;
     let mut successful_replace_idx = Vec::with_capacity(pending_storage_replaces.len());
-    for r in futures::future::join_all(replace_futs).await.into_iter().rev() {
+    for r in stream::iter(replace_futs)
+        .buffer_unordered(write_concurrency)
+        .collect::<Vec<_>>()
+        .await
+    {
         match r {
             Ok(i) => successful_replace_idx.push(i),
             Err(e) => err = Some(e),
         }
     }
+    successful_replace_idx.sort_unstable_by(|a, b| b.cmp(a));
     for idx in successful_replace_idx {
         pending_storage_replaces.remove(idx);
     }
@@ -2502,17 +2539,17 @@ pub async fn write_superfile_list(
 
     let multipart_threshold = opts.put_multipart_threshold_bytes;
     let put_futs = pending_storage_writes
-        .iter_mut()
+        .iter()
         .enumerate()
         .map(|(i, (uri, bytes))| {
             let storage = Arc::clone(storage);
+            let uri = *uri;
+            let bytes = bytes.clone();
             async move {
-                let path = superfile_storage_path(uri);
+                let path = superfile_storage_path(&uri);
                 let result = if (bytes.len() as u64) >= multipart_threshold {
                     put_superfile_multipart(storage.as_ref(), &path, bytes.clone()).await
                 } else {
-                    // Superfile writes don't chain CAS, so the
-                    // returned etag isn't needed here.
                     storage.put_atomic(&path, bytes.clone()).await.map(|_| ())
                 };
                 match result {
@@ -2524,15 +2561,20 @@ pub async fn write_superfile_list(
         });
 
     let mut err = None;
-    let mut successful_writes_idx = Vec::with_capacity(put_futs.len());
+    let mut successful_writes_idx = Vec::with_capacity(pending_storage_writes.len());
 
-    for r in futures::future::join_all(put_futs).await.into_iter().rev() {
+    for r in stream::iter(put_futs)
+        .buffer_unordered(write_concurrency)
+        .collect::<Vec<_>>()
+        .await
+    {
         match r {
             Ok(i) => successful_writes_idx.push(i),
             Err(e) => err = Some(e),
         }
     }
 
+    successful_writes_idx.sort_unstable_by(|a, b| b.cmp(a));
     for idx in successful_writes_idx {
         pending_storage_writes.remove(idx);
     }

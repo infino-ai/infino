@@ -759,6 +759,20 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
     }
 }
 
+/// Fast post-commit hidden-vector maintenance profile.
+///
+/// This is the Level-1 SPFresh-style collapse: after append-only hidden ingest,
+/// quickly merge tiny per-cell deltas so queries don't fan out across many
+/// files while the heavier periodic compaction remains on the normal profile.
+#[cfg(not(test))]
+pub(crate) fn hidden_vector_index_spfresh_compaction_settings() -> crate::config::CompactionSettings {
+    crate::config::CompactionSettings {
+        target_superfile_size_mb: 8,
+        min_fill_percent: 1,
+        max_memory_mb: 512,
+    }
+}
+
 pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
     let strategy = inner
         .pending_partition_strategy
@@ -1860,7 +1874,7 @@ mod tests {
         use crate::superfile::vector::distance::Metric;
         use crate::superfile::vector::rerank_codec::RerankCodec;
 
-        let dim = 16usize;
+        let dim = 128usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let schema = Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
@@ -1899,9 +1913,14 @@ mod tests {
         .with_writer_pool(pool);
         let st = Supertable::create(options).expect("create");
 
+        let rows_per_commit = 8usize;
         for commit in 0..10 {
-            let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
-            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let titles = LargeStringArray::from(
+                (0..rows_per_commit)
+                    .map(|row| format!("doc-{commit}-{row}"))
+                    .collect::<Vec<_>>(),
+            );
+            let flat = Float32Array::from(vec![1.0f32; rows_per_commit * dim]);
             let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
             let batch = arrow_array::RecordBatch::try_new(
                 schema.clone(),

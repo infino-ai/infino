@@ -355,8 +355,13 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             );
         }
         let batch = chunk_batch(modality, corpus, &schema, start, end, len);
+        let commit_t0 = std::time::Instant::now();
         w.append(&batch).expect("append");
         w.commit().expect("commit");
+        eprintln!(
+            "[supertable_ingest] commit {commit_idx}/{commits} took {} ms ({len} docs)",
+            commit_t0.elapsed().as_millis(),
+        );
         // The chunk is committed; drop its corpus pages from RSS so the
         // build sampler measures the engine, not the streamed harness
         // pages (clean file-backed pages — they'd re-fault if touched).
