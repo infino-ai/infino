@@ -236,29 +236,26 @@ def test_mutations_reject_memory():
         t.update("title = 'alpha'", [{"title": "beta"}])
 
 
-def test_compact_preserves_data(tmp_path):
+def test_optimize_preserves_data(tmp_path):
     db = infino.connect(str(tmp_path / "catalog"))
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
         t.append([{"title": title}])
 
-    t.compact(infino.CompactOptions(target_superfile_size_mb=256, min_fill_percent=50))
+    t.optimize(infino.OptimizeOptions(target_superfile_size_mb=256, min_fill_percent=50))
     assert _count(db, "docs") == 3
     assert t.token_match("title", "beta").num_rows == 1
 
-    t.compact()  # defaults run cleanly too
+    t.optimize()  # defaults run cleanly too
 
 
-def test_compact_on_memory_is_noop():
-    # Compaction needs a store to write merged files, but "memory://" is a
-    # store — so this is a no-op, not the durable-storage rejection that
-    # delete / update raise. Pin that contract.
+def test_optimize_on_memory_is_noop():
     db = infino.connect("memory://")
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     for title in ("alpha", "beta", "gamma"):
         t.append([{"title": title}])
 
-    assert t.compact() is None
+    assert t.optimize() is None
     assert _count(db, "docs") == 3
 
 
@@ -279,3 +276,66 @@ def test_vector_search_end_to_end():
     hits = t.vector_search("emb", onehot(0), 10)
     assert hits.num_rows >= 1
     assert "_id" in hits.column_names and "score" in hits.column_names
+
+
+def test_filtered_vector_search():
+    db = infino.connect("memory://")
+    dim = 16
+
+    def onehot(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    # A table with both an FTS column (title) and a vector column (emb).
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
+    ])
+    t = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+    )
+    t.append(
+        pa.record_batch(
+            [
+                pa.array(
+                    ["billing and refunds", "refund policy", "dark mode appearance"],
+                    type=pa.large_utf8(),
+                ),
+                pa.array([onehot(0), onehot(0), onehot(1)], type=pa.list_(pa.float32(), dim)),
+            ],
+            schema=schema,
+        )
+    )
+
+    # Unfiltered kNN over the topic-0 embedding sees both topic-0 rows.
+    assert t.vector_search("emb", onehot(0), 10).num_rows >= 2
+
+    # Same kNN, restricted to rows whose `title` matches "billing" — a pushdown
+    # pre-filter, so only the matching row comes back (not a post-filter over
+    # the global top-k).
+    filtered = t.vector_search(
+        "emb",
+        onehot(0),
+        10,
+        filter_column="title",
+        filter_query="billing",
+        filter_mode="or",
+        projection=["_id", "title", "score"],
+    )
+    assert filtered.num_rows == 1
+    assert filtered.column("title").to_pylist() == ["billing and refunds"]
+
+    # filter_column and filter_query must be supplied together.
+    with pytest.raises(ValueError):
+        t.vector_search("emb", onehot(0), 10, filter_column="title")
+
+    # filter_mode alone (no column/query) is rejected, not silently ignored.
+    with pytest.raises(ValueError):
+        t.vector_search("emb", onehot(0), 10, filter_mode="or")
+
+    # an invalid filter_mode is rejected when a filter is present.
+    with pytest.raises(ValueError):
+        t.vector_search(
+            "emb", onehot(0), 10, filter_column="title", filter_query="billing", filter_mode="xor"
+        )

@@ -3,16 +3,18 @@
 
 //! Single combined supertable ingest + search consumer for `supertable_all`.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::DiskCacheStore;
-use infino::supertable::storage::StorageProvider;
+use infino::supertable::{Supertable, reader_cache::DiskCacheStore, storage::StorageProvider};
 use tempfile::TempDir;
 
-use crate::ingest::supertable::{self, IngestResult, Modality};
-use crate::tiers;
+use crate::{
+    ingest::supertable::{self, IngestResult, Modality},
+    tiers,
+};
 
 /// Seconds-to-nanoseconds factor for recording build time for the
 /// Criterion replay path.

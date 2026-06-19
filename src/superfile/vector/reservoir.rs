@@ -47,9 +47,7 @@
 //! patch versions, and `StdRng` is already a transitive dep
 //! via `rand 0.10` so we avoid pulling in `rand_chacha`.
 
-use rand::RngExt;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 /// Multiplier on a column's IVF centroid count to size its k-means
 /// training sample. Slightly above the FAISS-empirical 30–60× sweet

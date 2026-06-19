@@ -51,21 +51,26 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::env;
-use std::ops::Range;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    env,
+    ops::Range,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
+use infino::{
+    supertable::{
+        OpenError, Supertable,
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::supertable::{OpenError, Supertable};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
 const ENV_KILL_POINT: &str = "INFINO_M12_CRASH_KILL_POINT";

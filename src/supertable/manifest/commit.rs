@@ -41,15 +41,25 @@
 //! URI predictable before any PUT); a serial implementation
 //! is correctness-equivalent but pessimistic on object stores.
 
-use std::sync::Arc;
+use std::{str::from_utf8, sync::Arc};
 
-use crate::storage::{ObjectMeta, StorageError, StorageProvider};
-use crate::supertable::error::CommitError;
-use crate::supertable::manifest::list::{self as list_mod, ManifestList};
-use crate::supertable::manifest::part::{
-    self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart, PartId,
+use bytes::Bytes;
+use zstd::zstd_safe::get_frame_content_size;
+
+use crate::{
+    storage::{ObjectMeta, StorageError, StorageProvider},
+    supertable::{
+        Manifest, ManifestLoadError,
+        error::CommitError,
+        manifest::{
+            list::{self as list_mod, ManifestList},
+            part::{
+                self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart,
+                PartId,
+            },
+        },
+    },
 };
-use crate::supertable::{Manifest, ManifestLoadError};
 
 /// Pointer-file location under the supertable root. The only
 /// path that ever gets atomically renamed; everything else is
@@ -61,7 +71,7 @@ pub const POINTER_PATH: &str = "_supertable/current";
 pub const MANIFEST_LISTS_DIR: &str = "manifest-lists";
 
 /// Subdirectory for manifest part files.
-pub const MANIFEST_PARTS_DIR: &str = "manifests";
+pub const MANIFEST_PARTS_DIR: &str = "manifest-parts";
 
 /// Build the URI for a manifest list at a given manifest_id.
 /// 6-digit zero-pad gives stable lexicographic ordering for
@@ -110,7 +120,7 @@ impl PointerFile {
 
     /// Parse the on-disk text format.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestLoadError> {
-        let s = std::str::from_utf8(bytes)
+        let s = from_utf8(bytes)
             .map_err(|e| ManifestLoadError::PointerParse(format!("not utf-8: {e}")))?;
 
         let mut manifest_id: Option<u64> = None;
@@ -233,10 +243,7 @@ pub async fn write_manifest_part(
     let size_compressed = compressed.len() as u64;
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
 
-    match storage
-        .put_atomic(&uri, bytes::Bytes::from(compressed))
-        .await
-    {
+    match storage.put_atomic(&uri, Bytes::from(compressed)).await {
         Ok(_) => {}
         // Content-addressed: same hash → same bytes. Already
         // there is benign — another writer wrote the same
@@ -257,7 +264,7 @@ pub async fn write_manifest_part(
 /// Read the decompressed size from the zstd frame header in O(1), no
 /// actual decompression.
 pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
-    zstd::zstd_safe::get_frame_content_size(compressed)
+    get_frame_content_size(compressed)
         .ok()
         .flatten()
         .unwrap_or(fallback)
@@ -270,7 +277,7 @@ pub(crate) async fn write_part_bytes(
 ) -> Result<(), CommitError> {
     let uri = part_uri(&ContentHash::of(encoded));
     match storage
-        .put_atomic(&uri, bytes::Bytes::copy_from_slice(encoded))
+        .put_atomic(&uri, Bytes::copy_from_slice(encoded))
         .await
     {
         Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
@@ -291,7 +298,7 @@ pub async fn write_manifest_list(
     let content_hash = ContentHash::of(&json);
     let uri = list_uri(list.manifest_id);
     let size = json.len() as u64;
-    storage.put_atomic(&uri, bytes::Bytes::from(json)).await?;
+    storage.put_atomic(&uri, Bytes::from(json)).await?;
     Ok(ListWriteResult {
         uri,
         content_hash,
@@ -315,7 +322,7 @@ pub async fn write_pointer(
     pointer: &PointerFile,
     expected_prev_etag: Option<&str>,
 ) -> Result<(), CommitError> {
-    let bytes = bytes::Bytes::from(pointer.to_bytes());
+    let bytes = Bytes::from(pointer.to_bytes());
     let result = match expected_prev_etag {
         None => storage.put_atomic(POINTER_PATH, bytes).await,
         Some(_) => {
@@ -379,11 +386,12 @@ pub async fn get_current_manifest_etag(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::storage::LocalFsStorageProvider;
     use std::sync::Arc;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::storage::LocalFsStorageProvider;
 
     // ---- URI helpers ---------------------------------------------------
 
@@ -413,9 +421,12 @@ mod tests {
         let uri_a = part_uri(&h);
         let uri_b = part_uri(&ContentHash::of(b"hello manifest part"));
         assert_eq!(uri_a, uri_b);
-        assert!(uri_a.starts_with("manifests/part-"));
+        assert!(uri_a.starts_with("manifest-parts/part-"));
         assert!(uri_a.ends_with(".avro.zst"));
-        assert_eq!(uri_a, format!("manifests/part-{}.avro.zst", h.to_hex()));
+        assert_eq!(
+            uri_a,
+            format!("manifest-parts/part-{}.avro.zst", h.to_hex())
+        );
     }
 
     // ---- PointerFile round-trip ----------------------------------------
@@ -439,7 +450,7 @@ mod tests {
         // changes line-ordering rules surfaces here.
         let p = sample_pointer();
         let bytes = p.to_bytes();
-        let s = std::str::from_utf8(&bytes).expect("utf-8");
+        let s = from_utf8(&bytes).expect("utf-8");
         assert!(s.contains("manifest_id=7"));
         assert!(s.contains("manifest_list_uri=manifest-lists/list-000007.json"));
         assert!(s.contains("content_hash=blake3:"));
@@ -688,6 +699,6 @@ mod tests {
         // upgrade — surfaces it as a test failure first.
         assert_eq!(POINTER_PATH, "_supertable/current");
         assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
-        assert_eq!(MANIFEST_PARTS_DIR, "manifests");
+        assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     }
 }

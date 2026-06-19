@@ -12,18 +12,20 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
-
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 /// Commits in the fold fixture — multiple segments so the statistics
 /// fold exercises the cross-segment merge, not a single-segment

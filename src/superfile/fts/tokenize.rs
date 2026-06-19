@@ -19,7 +19,11 @@
 //!     into the trait without changing the FTS pipeline.
 //!   - Empty tokens are never emitted.
 
-use std::borrow::Cow;
+use std::{
+    any::Any,
+    borrow::Cow,
+    str::{from_utf8, from_utf8_unchecked},
+};
 
 use wide::u8x16;
 
@@ -82,7 +86,7 @@ pub trait Tokenizer: Send + Sync + 'static {
     /// Downcast hatch for the FTS build hot path. Default impl
     /// returns `self` cast to `&dyn Any`; concrete impls should
     /// not override unless they wrap another tokenizer.
-    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any(&self) -> &dyn Any;
 
     /// Used to tokenize a query. The tokens handed to `f` stay alive
     /// as long as `text` (the query) is alive.
@@ -179,7 +183,7 @@ impl AsciiLowerTokenizer {
                 // is a single-byte ASCII codepoint. The slice is
                 // therefore valid UTF-8 and the original `text`
                 // outlives the callback call.
-                let s = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
+                let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
                 f(s);
             } else {
                 // Slow path: copy + lowercase into the reusable buf.
@@ -191,7 +195,7 @@ impl AsciiLowerTokenizer {
                 // SAFETY: same reasoning — every byte pushed is an
                 // ASCII alphanumeric (or its lowercased form, which
                 // is also ASCII).
-                let s = unsafe { std::str::from_utf8_unchecked(&buf) };
+                let s = unsafe { from_utf8_unchecked(&buf) };
                 f(s);
             }
         }
@@ -331,7 +335,7 @@ impl Tokenizer for AsciiLowerTokenizer {
         self.tokenize_each_inline(text, |s| f(s));
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -351,7 +355,7 @@ impl Tokenizer for AsciiLowerTokenizer {
             if had_non_ascii || start == pos {
                 continue;
             }
-            let s = std::str::from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
+            let s = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
             if had_upper {
                 f(Cow::Owned(s.to_ascii_lowercase()));
             } else {
@@ -419,7 +423,7 @@ impl Iterator for AsciiLowerIter<'_> {
             // SAFETY: we only push ASCII letters and digits via
             // is_token_byte + to_ascii_lowercase, so the buffer is
             // guaranteed valid UTF-8.
-            let s = std::str::from_utf8(&self.buf)
+            let s = from_utf8(&self.buf)
                 .expect("ASCII-only by construction")
                 .to_owned();
             return Some(s);
@@ -573,7 +577,7 @@ mod tests {
             fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
                 AsciiLowerTokenizer.tokenize(text)
             }
-            fn as_any(&self) -> &dyn std::any::Any {
+            fn as_any(&self) -> &dyn Any {
                 self
             }
         }

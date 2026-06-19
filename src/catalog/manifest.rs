@@ -14,15 +14,17 @@
 //! indirection (which exists to cache large immutable manifest lists)
 //! buys nothing here.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, io::Cursor, sync::Arc};
 
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::InfinoError;
-use crate::storage::{StorageError, StorageProvider};
+use crate::{
+    InfinoError,
+    storage::{StorageError, StorageProvider},
+};
 
 /// Object key (relative to the catalog root storage) holding the catalog.
 pub(crate) const CATALOG_PATH: &str = "_catalog/current";
@@ -121,7 +123,7 @@ where
 pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, InfinoError> {
     let mut out = Vec::new();
     {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, schema)
+        let mut writer = StreamWriter::try_new(&mut out, schema)
             .map_err(|e| InfinoError::Backend(format!("schema ipc write: {e}")))?;
         writer
             .finish()
@@ -132,21 +134,21 @@ pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, InfinoError> {
 
 /// Reconstruct a schema from Arrow-IPC bytes written by [`schema_to_ipc`].
 pub(crate) fn schema_from_ipc(bytes: &[u8]) -> Result<Arc<Schema>, InfinoError> {
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|e| InfinoError::Backend(format!("schema ipc read: {e}")))?;
     Ok(reader.schema())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::sync::Mutex;
+    use std::{error::Error, ops::Range, sync::Mutex, time::SystemTime};
 
     use arrow_schema::{DataType, Field};
     use async_trait::async_trait;
+    use object_store::MultipartUpload;
     use tempfile::TempDir;
 
+    use super::*;
     use crate::storage::{LocalFsStorageProvider, ObjectMeta};
 
     fn local(dir: &TempDir) -> Arc<dyn StorageProvider> {
@@ -340,7 +342,7 @@ mod tests {
     }
 
     fn mock_unimplemented(uri: &str) -> StorageError {
-        let boxed: Box<dyn std::error::Error + Send + Sync> = "unimplemented for mock".into();
+        let boxed: Box<dyn Error + Send + Sync> = "unimplemented for mock".into();
         StorageError::Permanent {
             uri: uri.into(),
             source: boxed,
@@ -355,7 +357,7 @@ mod tests {
                 Some((b, etag)) => Ok(ObjectMeta {
                     size: b.len() as u64,
                     etag: Some(etag.clone()),
-                    last_modified: std::time::SystemTime::UNIX_EPOCH,
+                    last_modified: SystemTime::UNIX_EPOCH,
                 }),
                 None => Err(StorageError::NotFound { uri: uri.into() }),
             }
@@ -370,18 +372,14 @@ mod tests {
                     ObjectMeta {
                         size: b.len() as u64,
                         etag: Some(etag.clone()),
-                        last_modified: std::time::SystemTime::UNIX_EPOCH,
+                        last_modified: SystemTime::UNIX_EPOCH,
                     },
                 )),
                 None => Err(StorageError::NotFound { uri: uri.into() }),
             }
         }
 
-        async fn get_range(
-            &self,
-            uri: &str,
-            _range: std::ops::Range<u64>,
-        ) -> Result<Bytes, StorageError> {
+        async fn get_range(&self, uri: &str, _range: Range<u64>) -> Result<Bytes, StorageError> {
             Err(mock_unimplemented(uri))
         }
 
@@ -402,10 +400,7 @@ mod tests {
             self.try_put(bytes)
         }
 
-        async fn put_multipart(
-            &self,
-            uri: &str,
-        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
             Err(mock_unimplemented(uri))
         }
 

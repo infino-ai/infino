@@ -36,15 +36,20 @@
 //! query sees the new bitmap immediately. Other processes pick
 //! up the change on their next refresh.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
+use futures::future::join_all;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::runtime_bridge::bridge_sync_to_async;
-use crate::supertable::wal::{SealRecord, WalStore};
+use crate::{
+    runtime_bridge::bridge_sync_to_async,
+    supertable::wal::{SealRecord, WalStore},
+};
 
 /// Default refresh interval — 1 second. Bounds how stale the
 /// cache's view can be on a query path that didn't write its
@@ -184,7 +189,7 @@ impl SidecarCache {
             let wal_store = self.wal_store.clone();
             async move { (id, wal_store.get_tombstones(id).await) }
         });
-        let results = futures::future::join_all(fetches).await;
+        let results = join_all(fetches).await;
         for (id, result) in results {
             let (bitmap, seal, etag) = match result {
                 Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
@@ -332,10 +337,15 @@ impl SidecarCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+    use std::iter::once;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::wal::tombstones_codec::TombstonesSidecar,
+    };
 
     fn fixture() -> (TempDir, WalStore, SidecarCache) {
         let dir = TempDir::new().expect("tempdir");
@@ -424,7 +434,7 @@ mod tests {
         ws.put_tombstones(present, None, &TombstonesSidecar { seal: None, bitmap })
             .await
             .expect("put");
-        let ids: Vec<Uuid> = std::iter::once(present)
+        let ids: Vec<Uuid> = once(present)
             .chain((2..32u128).map(Uuid::from_u128))
             .collect();
 

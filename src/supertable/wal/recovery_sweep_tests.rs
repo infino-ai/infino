@@ -8,26 +8,29 @@
 //! lease ownership directly — internal state that is not part of the
 //! public API — so they live in-crate rather than under `tests/`.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use chrono::Utc;
 use tempfile::TempDir;
 
-use crate::storage::{LocalFsStorageProvider, StorageProvider};
-use crate::supertable::Supertable;
-use crate::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use crate::supertable::wal::WalStore;
-use crate::supertable::wal::state_doc::{
-    OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome, WalId,
-    WalState, WalStateDoc,
+use crate::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        wal::{
+            WalStore,
+            state_doc::{
+                Lease, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+                TombstoneOutcome, WalId, WalState, WalStateDoc,
+            },
+        },
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use crate::test_helpers::{build_title_batch, default_supertable_options};
 
-fn make_disk_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
+fn make_disk_cache(storage: Arc<dyn StorageProvider>, cache_root: &Path) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
         disk_budget_bytes: 1 << 30,
@@ -126,12 +129,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     // against the same handle excludes the row.
     let hits = st
         .reader()
-        .bm25_hits(
-            "title",
-            "alpha",
-            10,
-            crate::superfile::fts::reader::BoolMode::Or,
-        )
+        .bm25_hits("title", "alpha", 10, BoolMode::Or)
         .expect("fts");
     // The "alpha" row is local doc_id 0 — verify it's filtered.
     for hit in &hits {
@@ -235,7 +233,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     }
     let now = Utc::now();
     let mut wal = seed_intent_delete_wal(target_id, 0xCAFE_BABE);
-    wal.lease = Some(crate::supertable::wal::state_doc::Lease {
+    wal.lease = Some(Lease {
         // "Process A": some random owner id that's no longer
         // alive.
         owner: SupertableHandleId(0xDEAD_BEEF),
@@ -273,12 +271,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     // FTS query no longer returns the tombstoned row.
     let hits = st
         .reader()
-        .bm25_hits(
-            "title",
-            "foo",
-            10,
-            crate::superfile::fts::reader::BoolMode::Or,
-        )
+        .bm25_hits("title", "foo", 10, BoolMode::Or)
         .expect("fts");
     for hit in &hits {
         assert_ne!(hit.local_doc_id, 0);

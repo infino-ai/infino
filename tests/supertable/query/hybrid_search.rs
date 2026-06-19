@@ -21,17 +21,17 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{
     ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-
-use infino::superfile::builder::FtsConfig;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{default_tokenizer, default_vector_config};
+use infino::{
+    superfile::builder::FtsConfig,
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::{default_tokenizer, default_vector_config},
+};
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
 const DIM: usize = 16;

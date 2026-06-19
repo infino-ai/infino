@@ -6,10 +6,11 @@
 //! drift between backends; each backend keeps its own error
 //! translation and feeds already-translated results in.
 
-use std::ops::Range;
-use std::time::Duration;
+use std::{error::Error, future::Future, ops::Range, time::Duration};
 
 use bytes::{Bytes, BytesMut};
+use object_store::RetryConfig;
+use tokio::time;
 
 use super::StorageError;
 
@@ -31,8 +32,8 @@ const BACKOFF_CAP_MS: u64 = 2000;
 const MAX_TRANSIENT_RETRIES: u32 = 8;
 
 /// Retry budget applied to a store builder via `.with_retry(...)`.
-pub(crate) fn config() -> object_store::RetryConfig {
-    object_store::RetryConfig {
+pub(crate) fn config() -> RetryConfig {
+    RetryConfig {
         max_retries: MAX_RETRIES,
         retry_timeout: RETRY_TIMEOUT,
         ..Default::default()
@@ -55,7 +56,7 @@ fn backoff(attempt: u32) -> Duration {
 /// Permanent error: the object returned fewer bytes than requested and
 /// made no progress. Stable, so callers don't retry.
 fn short_read(uri: &str, start: u64, requested: u64, got: u64) -> StorageError {
-    let source: Box<dyn std::error::Error + Send + Sync> = format!(
+    let source: Box<dyn Error + Send + Sync> = format!(
         "get_range short read: object returned {got} of {requested} bytes from offset {start}"
     )
     .into();
@@ -70,14 +71,14 @@ fn short_read(uri: &str, start: u64, requested: u64, got: u64) -> StorageError {
 pub(crate) async fn with_reissue<T, F, Fut>(mut op: F) -> Result<T, StorageError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, StorageError>>,
+    Fut: Future<Output = Result<T, StorageError>>,
 {
     let mut attempt = 0u32;
     loop {
         match op().await {
             Ok(v) => return Ok(v),
             Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
-                tokio::time::sleep(backoff(attempt)).await;
+                time::sleep(backoff(attempt)).await;
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -99,7 +100,7 @@ pub(crate) async fn complete_range<F, Fut>(
 ) -> Result<Bytes, StorageError>
 where
     F: FnMut(Range<u64>) -> Fut,
-    Fut: std::future::Future<Output = Result<Bytes, StorageError>>,
+    Fut: Future<Output = Result<Bytes, StorageError>>,
 {
     let want = range.end.saturating_sub(range.start);
     if want == 0 {
@@ -113,7 +114,7 @@ where
         let chunk = match fetch(cursor..range.end).await {
             Ok(c) => c,
             Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
-                tokio::time::sleep(backoff(attempt)).await;
+                time::sleep(backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
@@ -123,7 +124,7 @@ where
             // Empty body for an in-bounds range is a transport glitch,
             // not end-of-object (that surfaces as a typed error).
             if attempt < MAX_TRANSIENT_RETRIES {
-                tokio::time::sleep(backoff(attempt)).await;
+                time::sleep(backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }

@@ -21,8 +21,10 @@
 
 use std::sync::OnceLock;
 
-use crate::report::{Better, Block, Report, Section, metric, text};
-use crate::storage_meter::ObjectStoreMeter;
+use crate::{
+    report::{Better, Block, Report, Section, metric, text},
+    storage_meter::ObjectStoreMeter,
+};
 
 /// S3 Standard capacity, USD per GB-month (decimal GB).
 const USD_PER_GB_MONTH: f64 = 0.023;

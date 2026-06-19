@@ -29,16 +29,16 @@
 
 use std::collections::HashSet;
 
-use infino::superfile::VectorSearchOptions;
-use infino::superfile::reader::SuperfileReader;
-use infino::superfile::vector::distance::Metric;
+use infino::superfile::{VectorSearchOptions, reader::SuperfileReader, vector::distance::Metric};
 
-use crate::corpus::{
-    brute_force_topk, build_superfile_with_metric, generate_realistic_queries,
-    generate_vector_corpus, open_superfile,
+use crate::{
+    corpus::{
+        brute_force_topk, build_superfile_with_metric, generate_realistic_queries,
+        generate_vector_corpus, open_superfile,
+    },
+    report::{Better, Block, Cell, Report, Section, metric, text},
+    rss::{self, PeakSampler, RssStats},
 };
-use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-use crate::rss::{self, PeakSampler, RssStats};
 
 const N_DOCS: usize = 10_000;
 const N_CENT: usize = 64;

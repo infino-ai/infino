@@ -11,20 +11,27 @@
 //! superfile set reuse it across manifest versions without a
 //! re-PUT.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    fmt,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
-use apache_avro::Schema as AvroSchema;
-use apache_avro::types::Value as AvroValue;
-use apache_avro::{from_avro_datum, to_avro_datum};
+use apache_avro::{
+    Schema as AvroSchema, from_avro_datum, to_avro_datum, types::Value as AvroValue,
+};
 use thiserror::Error;
 use uuid::Uuid;
+use zstd::stream;
 
-use crate::supertable::manifest::encoding::{
-    DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
-    encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+use crate::supertable::manifest::{
+    SubsectionOffsets, SuperfileEntry, SuperfileUri,
+    encoding::{
+        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
+        encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+    },
 };
-use crate::supertable::manifest::{SubsectionOffsets, SuperfileEntry};
 
 /// The format version stamped into every emitted part.
 ///
@@ -107,8 +114,8 @@ impl ContentHash {
     }
 }
 
-impl std::fmt::Debug for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show only the first 8 hex chars in Debug to keep
         // logs readable. Use `to_hex()` for the full form.
         write!(
@@ -119,8 +126,8 @@ impl std::fmt::Debug for ContentHash {
     }
 }
 
-impl std::fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "blake3:{}", self.to_hex())
     }
 }
@@ -138,8 +145,8 @@ impl PartId {
     }
 }
 
-impl std::fmt::Display for PartId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PartId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -321,7 +328,7 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
     ]);
 
     let avro_bytes = to_avro_datum(schema(), record).expect("avro datum encode");
-    zstd::stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
+    stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
 }
 
 /// Decode a manifest-part byte buffer (zstd-wrapped Avro)
@@ -331,12 +338,11 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    let avro_bytes =
-        zstd::stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+    let avro_bytes = stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
     // reader doesn't need a wire-side schema.
-    let mut cursor = std::io::Cursor::new(avro_bytes.as_slice());
+    let mut cursor = Cursor::new(avro_bytes.as_slice());
     let value = from_avro_datum(schema(), &mut cursor, None)
         .map_err(|e| PartParseError::Avro(e.to_string()))?;
 
@@ -414,7 +420,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
 
     Ok(SuperfileEntry {
         superfile_id,
-        uri: crate::supertable::manifest::SuperfileUri(uri),
+        uri: SuperfileUri(uri),
         n_docs,
         id_min,
         id_max,
@@ -731,15 +737,19 @@ mod tests {
     //! property cross-version part-reuse rides on);
     //! format_version major/minor compat; corrupt zstd
     //! surfaces a typed error.
-    use super::*;
-    use crate::supertable::manifest::bloom::BloomBuilder;
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, VectorSummary};
-    use crate::supertable::{SuperfileEntry, SuperfileUri};
+    use std::{collections::HashMap, sync::Arc};
+
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use bytes::Bytes;
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::supertable::{
+        SuperfileEntry, SuperfileUri,
+        manifest::{
+            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder,
+        },
+    };
 
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
@@ -749,7 +759,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -767,17 +777,13 @@ mod tests {
         }
     }
 
-    fn make_fts_summary(seed: u8, n_terms: u32, range: (Vec<u8>, Vec<u8>)) -> FtsSummary {
+    fn make_fts_summary(seed: u8, n_terms: u32, range: (Vec<u8>, Vec<u8>)) -> FtsSummaryAgg {
         let mut builder = BloomBuilder::with_n_blocks(16);
         for i in 0..n_terms {
             let key = format!("term_{}_{i}", seed);
             builder.insert(key.as_bytes());
         }
-        FtsSummary {
-            term_bloom: builder.finish(),
-            n_terms_distinct: n_terms,
-            term_range: range,
-        }
+        FtsSummaryAgg::new_with_params(builder.finish(), n_terms, range)
     }
 
     fn make_vector_summary(dim: usize, seed: f32) -> VectorSummary {
@@ -785,46 +791,43 @@ mod tests {
         VectorSummary {
             centroid,
             radius: seed * 1.7,
-            clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+            clusters: ClusterCentroids::empty(),
         }
     }
 
-    fn make_scalar_stats() -> ScalarStatsTable {
+    fn make_scalar_stats() -> HashMap<String, ScalarStatsAgg> {
         // Cover Int64, Float64, Boolean, Utf8 — the four
         // shapes the existing skip path supports.
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "ts".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![1_715_000_000_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1_715_086_400_i64])) as ArrayRef,
             ),
         );
         cols.insert(
             "score".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Float64Array::from(vec![0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![0.999_999])) as ArrayRef,
             ),
         );
         cols.insert(
             "active".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
             ),
         );
         cols.insert(
             "category".into(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(StringArray::from(vec!["alpha"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["zulu"])) as ArrayRef,
             ),
         );
-        ScalarStatsTable {
-            cols,
-            ..Default::default()
-        }
+        cols
     }
 
     fn make_rich_superfile() -> Arc<SuperfileEntry> {
@@ -876,16 +879,17 @@ mod tests {
         assert_eq!(a.partition_hint, b.partition_hint, "partition_hint");
 
         assert_eq!(
-            a.scalar_stats.cols.len(),
-            b.scalar_stats.cols.len(),
+            a.scalar_stats.len(),
+            b.scalar_stats.len(),
             "scalar_stats column count"
         );
-        for (k, (a_min, a_max)) in &a.scalar_stats.cols {
-            let (b_min, b_max) = b
+        for (k, a_agg) in &a.scalar_stats {
+            let (a_min, a_max) = (&a_agg.min, &a_agg.max);
+            let b_agg = b
                 .scalar_stats
-                .cols
                 .get(k)
                 .unwrap_or_else(|| panic!("missing scalar col {k}"));
+            let (b_min, b_max) = (&b_agg.min, &b_agg.max);
             assert_eq!(a_min.data_type(), b_min.data_type(), "scalar {k} min type");
             assert_eq!(a_max.data_type(), b_max.data_type(), "scalar {k} max type");
             assert_eq!(a_min.to_data(), b_min.to_data(), "scalar {k} min data");
@@ -904,8 +908,8 @@ mod tests {
             );
             assert_eq!(av.term_range, bv.term_range, "fts {k} term_range");
             assert_eq!(
-                av.term_bloom.to_bytes(),
-                bv.term_bloom.to_bytes(),
+                av.term_bloom.as_ref().map(|b| b.to_bytes()),
+                bv.term_bloom.as_ref().map(|b| b.to_bytes()),
                 "fts {k} bloom bytes"
             );
         }
@@ -1017,7 +1021,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
@@ -1032,7 +1036,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1156,7 +1160,7 @@ mod tests {
             n_docs: 3,
             id_min: -5,
             id_max: 7,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1220,7 +1224,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1584,7 +1588,7 @@ mod tests {
             ("superfiles".into(), AvroValue::Array(vec![])),
         ]);
         let avro_bytes = to_avro_datum(schema(), record).expect("avro encode");
-        let bytes = zstd::stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
+        let bytes = stream::encode_all(avro_bytes.as_slice(), 3).expect("zstd");
         let err = decode(&bytes).expect_err("bad part_id");
         assert!(
             matches!(err, PartParseError::BadSuperfileId(_)),

@@ -7,10 +7,12 @@
 //! Mirrors the planted-ground-truth correctness pattern.
 
 use bytes::Bytes;
-use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, normalize};
-use infino::superfile::vector::reader::VectorReader;
-use infino::superfile::vector::rerank_codec::RerankCodec;
+use infino::superfile::vector::{
+    builder::{VectorBuilder, VectorConfig},
+    distance::{Metric, normalize},
+    reader::VectorReader,
+    rerank_codec::RerankCodec,
+};
 
 /// `text_emb` column shape (cosine, unit-norm).
 const TEXT_EMB_DIM: usize = 16;

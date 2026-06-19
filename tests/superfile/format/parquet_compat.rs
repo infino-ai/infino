@@ -30,14 +30,19 @@
 //! truth. If we ever break the Parquet body (e.g. by an off-by-one
 //! in the splice's truncation), this test catches it.
 
+use std::sync::Arc;
+
 use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use datafusion::prelude::*;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::vector::distance::normalize;
-use infino::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-use std::sync::Arc;
+use infino::{
+    superfile::{
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        vector::distance::normalize,
+    },
+    test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+};
 use tempfile::NamedTempFile;
 
 /// Decimal128 precision / scale for the `doc_id` column.

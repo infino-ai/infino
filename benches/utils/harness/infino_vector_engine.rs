@@ -13,13 +13,13 @@ use std::sync::Arc;
 use arrow_array::{Decimal128Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use infino::superfile::{
+    SuperfileReader,
+    builder::{BuilderOptions, SuperfileBuilder, VectorConfig},
+    reader::VectorSearchOptions,
+    vector::{distance::Metric as InfinoMetric, rerank_codec::RerankCodec},
+};
 use rayon::prelude::*;
-
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
-use infino::superfile::reader::VectorSearchOptions;
-use infino::superfile::vector::distance::Metric as InfinoMetric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
 
 use super::{Capabilities, VectorEngine, VectorHit, VectorMetric, VectorSearch};
 use crate::corpus::{self, block_on_inmem};

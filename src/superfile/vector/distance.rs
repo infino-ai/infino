@@ -12,6 +12,8 @@
 //! IVF cluster scan (probing centroids) and the full-precision rerank
 //! (after the 1-bit shortlist).
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 use std::sync::Arc;
 
 use wide::f32x8;
@@ -19,8 +21,6 @@ use wide::f32x8;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 
 /// Residual quantization step divisor for [`RerankCodec::Sq8ResidualEpsilon`].
 /// The signed 8-bit residual code at dim `d` carries
@@ -1604,8 +1604,7 @@ mod tests {
     /// hoist a pure function call on loop-invariant references out of the
     /// timing loop and collapse it to ~1 cycle (single-cycle add latency).
     fn time_ns<R, F: FnMut() -> R>(iters: u32, mut f: F) -> f64 {
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
         // Warmup — populate caches, JIT-equivalent steady state.
         for _ in 0..(iters / 10).max(64) {
             black_box(f());

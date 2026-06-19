@@ -29,16 +29,21 @@
 //! prefix accumulate. See [`DEFAULT_WAL_GRACE`] +
 //! [`DEFAULT_SIDECAR_GRACE`] for the defaults.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::storage::StorageProvider;
-use crate::supertable::handle::Supertable;
-use crate::supertable::wal::persistence::{WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::{WalId, WalState};
+use crate::{
+    storage::{StorageError, StorageProvider},
+    supertable::{
+        handle::Supertable,
+        wal::{
+            persistence::{WalStore, WalStoreError},
+            state_doc::{WalId, WalState},
+        },
+    },
+};
 
 /// Default grace period before reaping a `Complete` WAL's
 /// state-doc. Sized so a writer's inline-delete failure has
@@ -162,7 +167,7 @@ pub async fn run_sweep(
     // the `.json` shape; an arrow file with no matching json
     // means the producer crashed between sidecar PUT and
     // state-doc create.
-    let known_ids: std::collections::HashSet<WalId> = wal_ids.into_iter().collect();
+    let known_ids: HashSet<WalId> = wal_ids.into_iter().collect();
     let sidecar_grace_chrono =
         chrono::Duration::from_std(sidecar_grace).unwrap_or_else(|_| chrono::Duration::seconds(0));
     match list_arrow_orphans(&storage, &known_ids).await {
@@ -208,8 +213,8 @@ pub async fn run_sweep(
 /// mtime.
 async fn list_arrow_orphans(
     storage: &Arc<dyn StorageProvider>,
-    known_ids: &std::collections::HashSet<WalId>,
-) -> Result<Vec<(WalId, Option<DateTime<Utc>>)>, crate::storage::StorageError> {
+    known_ids: &HashSet<WalId>,
+) -> Result<Vec<(WalId, Option<DateTime<Utc>>)>, StorageError> {
     let uris = storage.list_with_prefix("wal/mutations").await?;
     let mut out: Vec<(WalId, Option<DateTime<Utc>>)> = Vec::new();
     for uri in uris {
@@ -239,15 +244,20 @@ async fn list_arrow_orphans(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::Supertable;
-    use crate::supertable::wal::state_doc::{
-        OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalStateDoc,
-    };
-    use crate::test_helpers::default_supertable_options;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            Supertable,
+            wal::state_doc::{
+                OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalStateDoc,
+            },
+        },
+        test_helpers::default_supertable_options,
+    };
 
     fn complete_wal(wal_id_v: i128, created_at: DateTime<Utc>) -> WalStateDoc {
         WalStateDoc {

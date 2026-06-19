@@ -40,30 +40,22 @@ impl core::marker::Unpin for infino::ColdFetchMode
 impl core::marker::UnsafeUnpin for infino::ColdFetchMode
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ColdFetchMode
 impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
-pub enum infino::CompactionError
-pub infino::CompactionError::AlreadyCompacting
-pub infino::CompactionError::Build(alloc::string::String)
-pub infino::CompactionError::Commit(alloc::string::String)
-pub infino::CompactionError::EmptyMergedSuperfile
-pub infino::CompactionError::NoStorage
-pub infino::CompactionError::Refresh(alloc::string::String)
-pub infino::CompactionError::Seal(alloc::string::String)
-pub infino::CompactionError::SidecarConflict
-pub infino::CompactionError::SidecarConflict::existing_compaction_id: uuid::Uuid
-pub infino::CompactionError::SidecarConflict::superfile_id: uuid::Uuid
-pub infino::CompactionError::SuperfileNotFound(uuid::Uuid)
-impl core::error::Error for infino::CompactionError
-impl core::fmt::Debug for infino::CompactionError
-pub fn infino::CompactionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for infino::CompactionError
-pub fn infino::CompactionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for infino::CompactionError
-impl core::marker::Send for infino::CompactionError
-impl core::marker::Sync for infino::CompactionError
-impl core::marker::Unpin for infino::CompactionError
-impl core::marker::UnsafeUnpin for infino::CompactionError
-impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionError
-impl core::panic::unwind_safe::UnwindSafe for infino::CompactionError
+pub enum infino::GcError
+pub infino::GcError::NoStorage
+pub infino::GcError::Storage(infino::storage::StorageError)
+impl core::error::Error for infino::GcError
+pub fn infino::GcError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for infino::GcError
+pub fn infino::GcError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::GcError
+pub fn infino::GcError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::GcError
+impl core::marker::Send for infino::GcError
+impl core::marker::Sync for infino::GcError
+impl core::marker::Unpin for infino::GcError
+impl core::marker::UnsafeUnpin for infino::GcError
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::GcError
+impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
@@ -104,6 +96,30 @@ impl core::marker::Unpin for infino::Metric
 impl core::marker::UnsafeUnpin for infino::Metric
 impl core::panic::unwind_safe::RefUnwindSafe for infino::Metric
 impl core::panic::unwind_safe::UnwindSafe for infino::Metric
+pub enum infino::OptimizeError
+pub infino::OptimizeError::AlreadyRunning
+pub infino::OptimizeError::Build(alloc::string::String)
+pub infino::OptimizeError::Commit(alloc::string::String)
+pub infino::OptimizeError::EmptyMergedSuperfile
+pub infino::OptimizeError::NoStorage
+pub infino::OptimizeError::Refresh(alloc::string::String)
+pub infino::OptimizeError::Seal(alloc::string::String)
+pub infino::OptimizeError::SidecarConflict
+pub infino::OptimizeError::SidecarConflict::existing_compaction_id: uuid::Uuid
+pub infino::OptimizeError::SidecarConflict::superfile_id: uuid::Uuid
+pub infino::OptimizeError::SuperfileNotFound(uuid::Uuid)
+impl core::error::Error for infino::OptimizeError
+impl core::fmt::Debug for infino::OptimizeError
+pub fn infino::OptimizeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for infino::OptimizeError
+pub fn infino::OptimizeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::OptimizeError
+impl core::marker::Send for infino::OptimizeError
+impl core::marker::Sync for infino::OptimizeError
+impl core::marker::Unpin for infino::OptimizeError
+impl core::marker::UnsafeUnpin for infino::OptimizeError
+impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
+impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
 pub struct infino::CompactionSettings
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
@@ -165,6 +181,25 @@ impl core::marker::Unpin for infino::Connection
 impl core::marker::UnsafeUnpin for infino::Connection
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Connection
 impl !core::panic::unwind_safe::UnwindSafe for infino::Connection
+pub struct infino::GcReport
+pub infino::GcReport::bytes_freed: u64
+pub infino::GcReport::delete_errors: u64
+pub infino::GcReport::objects_deleted: u64
+pub infino::GcReport::objects_skipped_live: u64
+pub infino::GcReport::objects_skipped_too_new: u64
+impl core::clone::Clone for infino::GcReport
+pub fn infino::GcReport::clone(&self) -> infino::GcReport
+impl core::default::Default for infino::GcReport
+pub fn infino::GcReport::default() -> infino::GcReport
+impl core::fmt::Debug for infino::GcReport
+pub fn infino::GcReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::GcReport
+impl core::marker::Send for infino::GcReport
+impl core::marker::Sync for infino::GcReport
+impl core::marker::Unpin for infino::GcReport
+impl core::marker::UnsafeUnpin for infino::GcReport
+impl core::panic::unwind_safe::RefUnwindSafe for infino::GcReport
+impl core::panic::unwind_safe::UnwindSafe for infino::GcReport
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -203,6 +238,22 @@ impl core::marker::Unpin for infino::MutationStats
 impl core::marker::UnsafeUnpin for infino::MutationStats
 impl core::panic::unwind_safe::RefUnwindSafe for infino::MutationStats
 impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
+pub struct infino::OptimizeOptions
+impl infino::OptimizeOptions
+pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
+impl core::clone::Clone for infino::OptimizeOptions
+pub fn infino::OptimizeOptions::clone(&self) -> infino::OptimizeOptions
+impl core::default::Default for infino::OptimizeOptions
+pub fn infino::OptimizeOptions::default() -> infino::OptimizeOptions
+impl core::fmt::Debug for infino::OptimizeOptions
+pub fn infino::OptimizeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::OptimizeOptions
+impl core::marker::Send for infino::OptimizeOptions
+impl core::marker::Sync for infino::OptimizeOptions
+impl core::marker::Unpin for infino::OptimizeOptions
+impl core::marker::UnsafeUnpin for infino::OptimizeOptions
+impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
+impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
@@ -214,11 +265,13 @@ pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::r
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl infino::Supertable
-pub fn infino::Supertable::compact(&self, &infino::CompactionSettings) -> core::result::Result<(), infino::CompactionError>
+pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
+impl infino::Supertable
+pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
 impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
 impl infino::Supertable
-pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
 impl core::fmt::Debug for infino::Supertable
@@ -230,19 +283,30 @@ impl core::marker::Unpin for infino::Supertable
 impl core::marker::UnsafeUnpin for infino::Supertable
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::Supertable
 impl !core::panic::unwind_safe::UnwindSafe for infino::Supertable
+pub struct infino::VectorFilter<'a>
+pub infino::VectorFilter::column: &'a str
+pub infino::VectorFilter::mode: infino::BoolMode
+pub infino::VectorFilter::query: &'a str
+impl<'a> core::marker::Freeze for infino::VectorFilter<'a>
+impl<'a> core::marker::Send for infino::VectorFilter<'a>
+impl<'a> core::marker::Sync for infino::VectorFilter<'a>
+impl<'a> core::marker::Unpin for infino::VectorFilter<'a>
+impl<'a> core::marker::UnsafeUnpin for infino::VectorFilter<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for infino::VectorFilter<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for infino::VectorFilter<'a>
 pub struct infino::VectorSearchOptions
-pub infino::VectorSearchOptions::nprobe: usize
+pub infino::VectorSearchOptions::nprobe: core::option::Option<usize>
 impl infino::VectorSearchOptions
 pub const infino::VectorSearchOptions::DEFAULT_NPROBE: usize
 pub const infino::VectorSearchOptions::RERANK_MULT: usize
 pub fn infino::VectorSearchOptions::new() -> Self
-pub fn infino::VectorSearchOptions::rerank_mult(&self) -> usize
+pub fn infino::VectorSearchOptions::rerank_mult(&self) -> core::option::Option<usize>
 pub fn infino::VectorSearchOptions::with_nprobe(self, usize) -> Self
 pub fn infino::VectorSearchOptions::with_rerank_mult(self, usize) -> Self
 impl core::clone::Clone for infino::VectorSearchOptions
 pub fn infino::VectorSearchOptions::clone(&self) -> infino::VectorSearchOptions
 impl core::default::Default for infino::VectorSearchOptions
-pub fn infino::VectorSearchOptions::default() -> Self
+pub fn infino::VectorSearchOptions::default() -> infino::VectorSearchOptions
 impl core::fmt::Debug for infino::VectorSearchOptions
 pub fn infino::VectorSearchOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::VectorSearchOptions

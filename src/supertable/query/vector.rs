@@ -60,30 +60,50 @@
 //! object-store-native engine never issues. For cold queries
 //! this is the difference between seconds and milliseconds.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Instant,
+};
 
-use crate::superfile::SuperfileReader;
-pub use crate::superfile::reader::VectorSearchOptions;
-use crate::superfile::vector::cell_posting;
-use crate::superfile::vector::distance::Metric;
-use crate::superfile::vector::layout::VectorLayout;
-use crate::storage::StorageProvider;
-use bytes::Bytes;
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::{Manifest, SuperfileEntry, SuperfileUri};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use roaring::RoaringBitmap;
 
-use super::SuperfileHit;
-use super::dispatch;
-use super::exec::common::resolve_hits_named;
+use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::resolve_hits_named};
+pub use crate::superfile::reader::VectorSearchOptions;
+use crate::{
+    superfile::{
+        SuperfileReader,
+        fts::reader::BoolMode,
+        vector::cell_posting,
+        vector::distance::Metric,
+        vector::layout::VectorLayout,
+    },
+    storage::StorageProvider,
+    supertable::{
+        error::QueryError,
+        handle::{Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri},
+        tombstones::SidecarCache,
+    },
+};
 
-/// How to probe one superfile in the vector fan-out: the globally-selected
-/// cluster ids for that superfile, or — for a superfile whose manifest
-/// summary carries no per-cluster centroids — a normal per-superfile
-/// `nprobe` probe (fallback, never silently dropped).
+/// An optional text-predicate filter for vector kNN search. When
+/// supplied, kNN is ranked only among rows matching the predicate
+/// (pushdown, not post-filter). Built from an FTS-indexed column, a
+/// query string, and a [`BoolMode`].
+pub struct VectorFilter<'a> {
+    /// FTS-indexed column the predicate applies to.
+    pub column: &'a str,
+    /// Query string — tokenized with the index tokenizer.
+    pub query: &'a str,
+    /// Token matching mode (AND / OR).
+    pub mode: BoolMode,
+}
+
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
@@ -485,18 +505,70 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
-        metric: Metric,
+        _metric: Metric,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
+        self.vector_fanout_over_superfiles(
+            superfiles.to_vec(),
+            column,
+            query,
+            k,
+            options,
+            None,
+        )
+        .await
+    }
+
+    async fn vector_fanout_over_superfiles(
+        &self,
+        superfiles: Vec<Arc<SuperfileEntry>>,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let filtered = allow.is_some();
+        let (nprobe, _) = options.resolve(filtered);
+        let manifest = self.manifest();
+
+        // ---- Global cross-superfile cluster selection.
+        //
+        // Each kept superfile's manifest summary carries its per-cluster
+        // (Sq8) centroids. Rank every (superfile, cluster) by centroid
+        // distance to the query and probe only the globally-closest
+        // clusters — so a query touches just the superfiles that own a
+        // near cluster, instead of running `nprobe` in every superfile.
+        // (A single per-superfile centroid can't do this: a time-ordered
+        // superfile is a broad mix, so its mean sits near the global
+        // centroid. Per-cluster centroids are fine-grained enough to
+        // rank.) A superfile whose summary has no cluster centroids falls
+        // back to a normal per-superfile `nprobe` probe — never dropped.
+        let metric = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
+        // Folded Sq8-domain scoring (`ClusterCentroids::score_clusters_into`):
+        // Σq / ‖q‖² once per query, then one SIMD Sq8 dot per cluster over
+        // the contiguous code rows — no per-cluster dequantize, no scratch.
         let sum_q: f32 = query.iter().sum();
         let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         for (si, entry) in superfiles.iter().enumerate() {
+            // Filtered search: a superfile whose predicate matched no row
+            // (absent from `allow`) is dropped here — it never scores a
+            // cluster, never enters the fan-out, and issues zero GETs.
+            if allow.as_ref().is_some_and(|m| !m.contains_key(&entry.uri)) {
+                continue;
+            }
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
                     vs.clusters
@@ -508,11 +580,21 @@ impl SupertableReader {
             }
         }
 
-        let n_eligible = superfiles.len().saturating_sub(fallback.len());
-        let budget = options
-            .nprobe
-            .saturating_mul(n_eligible.max(1))
-            .max(options.nprobe);
+        // Global probe budget: the closest `nprobe × (eligible superfiles)`
+        // clusters — the same total probe count as the old per-superfile
+        // `nprobe`, but selected globally, so near superfiles get more
+        // probes and far superfiles are skipped entirely. (Stage-4 recall
+        // tuning may lower this.) Eligible = superfiles that actually
+        // scored a cluster (filtered-out superfiles produce neither a
+        // scored cluster nor a fallback, so they don't inflate the
+        // budget).
+        let n_eligible = {
+            let mut segs: Vec<usize> = scored.iter().map(|&(si, _, _)| si).collect();
+            segs.sort_unstable();
+            segs.dedup();
+            segs.len()
+        };
+        let budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         if scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
@@ -524,58 +606,365 @@ impl SupertableReader {
             per_seg.entry(si).or_default().push(c);
         }
 
-        let fallback: std::collections::HashSet<usize> = fallback.into_iter().collect();
-        let mut units: Vec<(Arc<SuperfileEntry>, Probe)> = Vec::new();
+        // Build fan-out units: selected superfiles probe their chosen
+        // clusters; fallback superfiles probe `nprobe` normally; superfiles
+        // with centroids but no globally-selected cluster are skipped
+        // (the cross-superfile win). For filtered search each unit also
+        // carries its per-superfile allow-set (a superfile reaching here
+        // is guaranteed present in `allow` — empties were dropped above).
+        let fallback: HashSet<usize> = fallback.into_iter().collect();
+        // Look the allow-set up only for a superfile that is actually
+        // selected (scored a kept cluster, or is a fallback) — a superfile
+        // that survived vector pruning but whose predicate matched no row
+        // is absent from `allow`, and must never be probed. Resolving the
+        // bitmap eagerly for every entry would `expect`-panic on exactly
+        // those filtered-out superfiles; gating it behind the selection
+        // guards keeps the lookup on the path where presence is invariant.
+        let mut units: Vec<(Arc<SuperfileEntry>, (Probe, Option<Arc<RoaringBitmap>>))> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
-            if let Some(ids) = per_seg.remove(&si) {
-                units.push((Arc::clone(entry), Probe::Clusters(ids)));
+            let probe = if let Some(ids) = per_seg.remove(&si) {
+                Probe::Clusters(ids)
             } else if fallback.contains(&si) {
-                units.push((Arc::clone(entry), Probe::Nprobe));
-            }
+                Probe::Nprobe
+            } else {
+                continue;
+            };
+            let bitmap = match allow.as_ref() {
+                Some(m) => match m.get(&entry.uri) {
+                    Some(bm) => Some(Arc::clone(bm)),
+                    None => continue,
+                },
+                None => None,
+            };
+            units.push((Arc::clone(entry), (probe, bitmap)));
         }
         if units.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Fan out through the shared [`query::dispatch::fanout`] (also
+        // used by FTS), but in waves capped by the configured reader
+        // pool width. A cold vector kernel can hold large selected-cluster
+        // `[codes][doc_ids]` prefix blocks while it builds its shortlist;
+        // capping the number of concurrent superfiles keeps that transient
+        // memory bounded by instance configuration instead of table size.
+        // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
-        let kernel = move |reader: Arc<SuperfileReader>, probe: Probe| {
-            let column = Arc::clone(&column_arc);
-            let query = Arc::clone(&query_arc);
-            async move {
-                let res = match probe {
-                    Probe::Clusters(ids) => {
-                        reader
-                            .vector_search_clusters(&column, &query, k, &ids, options)
-                            .await
-                    }
-                    Probe::Nprobe => reader.vector_hits_async(&column, &query, k, options).await,
-                };
-                res.map_err(|e| QueryError::Parquet(e.to_string()))
+        let kernel =
+            move |reader: Arc<SuperfileReader>,
+                  (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
+                let column = Arc::clone(&column_arc);
+                let query = Arc::clone(&query_arc);
+                async move {
+                    let res = match probe {
+                        Probe::Clusters(ids) => {
+                            reader
+                                .vector_search_clusters_filtered(
+                                    &column, &query, k, &ids, options, bitmap,
+                                )
+                                .await
+                        }
+                        Probe::Nprobe => {
+                            reader
+                                .vector_hits_filtered_async(&column, &query, k, options, bitmap)
+                                .await
+                        }
+                    };
+                    res.map_err(|e| QueryError::Parquet(e.to_string()))
+                }
+            };
+        // Filtered search holds a per-superfile RoaringBitmap while the
+        // kernel builds its shortlist; wave-cap the fan-out by reader-pool
+        // width so transient memory stays bounded. The unfiltered path
+        // carries no bitmaps and fans out all units at once (matching
+        // main's concurrency — every superfile GET overlaps on tokio).
+        let per_superfile = if allow.is_some() {
+            let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+            let mut collected = Vec::new();
+            while !units.is_empty() {
+                let n = fanout_width.min(units.len());
+                let wave: Vec<_> = units.drain(..n).collect();
+                collected.extend(dispatch::fanout(self, wave, kernel.clone()).await?);
             }
+            collected
+        } else {
+            dispatch::fanout(self, units, kernel).await?
         };
-        let fanout_width = self
-            .manifest()
-            .options
-            .reader_pool
-            .current_num_threads()
-            .max(1);
-        let mut per_superfile = Vec::new();
-        let mut units = units;
-        while !units.is_empty() {
-            let n = fanout_width.min(units.len());
-            let wave: Vec<_> = units.drain(..n).collect();
-            per_superfile.extend(
-                crate::supertable::query::dispatch::fanout(self, wave, kernel.clone()).await?,
-            );
-        }
 
         Ok(top_k_ascending(per_superfile, k))
     }
 
-    /// User-table vector kNN: manifest prune on the user snapshot, then
-    /// fan-out at the user storage prefix. Used by hybrid search and any
-    /// filtered vector path.
+    /// Filtered single-column vector kNN: the k-nearest rows **among
+    /// those matching a text predicate**, by pushdown.
+    ///
+    /// The predicate is `filter_col` contains `filter_query`'s tokens
+    /// under `mode` (the same unranked token match as
+    /// [`Self::token_match_async`]). It is resolved per superfile into an
+    /// allow-set of `local_doc_id`s, and each superfile's vector kernel
+    /// ranks distance **only among its allowed doc-ids** — so the result
+    /// is the true k-nearest among matching rows, with no over-fetch and
+    /// no post-filter underflow. Superfiles whose predicate matches
+    /// nothing are skipped (zero vector GETs).
+    ///
+    /// An empty `filter_query` (tokenizes to nothing) or a predicate
+    /// that matches no row anywhere returns an empty `Vec`.
+    ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    pub(crate) async fn vector_hits_filtered_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        filter: VectorFilter<'_>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Tokenize the predicate once with the index tokenizer (the same
+        // tokenizer used at build time, so the terms match the postings).
+        // No tokens (e.g. empty / punctuation-only) ⇒ nothing matches.
+        let Some(tokenizer) = manifest.options.tokenizer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the per-superfile allow-set: one `token_match` per
+        // candidate superfile (postings only — the same retrieval
+        // `CandidatePlan::TermsAll` uses), grouped to a
+        // `superfile → RoaringBitmap` map. Empty bitmaps are dropped so
+        // their superfile never fans out. Reuses the shared `fanout`
+        // orchestrator (concurrent reader opens) but keeps each unit's
+        // result keyed to its superfile URI.
+        let allow = self
+            .candidate_bitmaps(&superfiles, filter.column, &tokens, filter.mode)
+            .await?;
+        if allow.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+            .await
+    }
+
+    /// Resolve the text predicate (`filter_col` contains `tokens` under
+    /// `mode`) to a per-superfile allow-set of matching `local_doc_id`s,
+    /// over exactly the given vector-pruned `superfiles`.
+    ///
+    /// One `SuperfileReader::token_match` per superfile (postings-only,
+    /// the leaf [`crate::supertable::query::candidate::CandidatePlan`]
+    /// also uses), fanned out concurrently. Superfiles whose predicate
+    /// matches no row are omitted from the returned map, so the caller
+    /// skips them entirely.
+    async fn candidate_bitmaps(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        filter_col: &str,
+        tokens: &[String],
+        mode: BoolMode,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
+        let filter_col_arc = Arc::new(filter_col.to_owned());
+        let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
+        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+            let filter_col_arc = Arc::clone(&filter_col_arc);
+            let tokens_arc = Arc::clone(&tokens_arc);
+            async move {
+                let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
+                r.token_match(&filter_col_arc, &refs, mode)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))
+                    .map(|docs| docs.into_iter().collect::<RoaringBitmap>())
+            }
+        })
+        .await
+    }
+
+    /// Filtered vector kNN driven by a SQL `WHERE` [`CandidatePlan`] — the
+    /// pushdown path for the `vector_search` table-valued function — rather
+    /// than the single text-predicate shape of
+    /// [`Self::vector_hits_filtered_async`].
+    ///
+    /// `plan` must be a **bounded** plan (not [`CandidatePlan::Unbounded`]):
+    /// the caller routes `Unbounded` to the unfiltered
+    /// [`Self::vector_search_async`], where DataFusion's `FilterExec`
+    /// re-applies the predicate. For a bounded plan, each superfile's vector
+    /// kernel ranks distance only among the `local_doc_id`s the plan admits,
+    /// so the result is the true k-nearest among matching rows.
+    ///
+    /// There is deliberately **no selectivity gate** here (unlike the scan
+    /// provider, which skips the index path above ~1% match density because
+    /// a Parquet `RowSelection` can't skip saturated pages). The vector
+    /// kernel reads the same IVF clusters either way; the allow-set only
+    /// filters which candidates enter the shortlist heap, and even a
+    /// non-selective predicate must still yield exactly-k matching hits — so
+    /// a bounded plan is always pushed down.
+    pub(crate) async fn vector_hits_filtered_by_plan(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        plan: &CandidatePlan,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow = self.candidate_bitmaps_from_plan(&superfiles, plan).await?;
+        if allow.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+            .await
+    }
+
+    /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
+    /// same global row numbering as the bench corpus and is translated to
+    /// per-superfile `local_doc_id` bitmaps before entering the normal filtered
+    /// fan-out. This lets the supertable bench mirror the superfile filtered
+    /// recall probe without requiring an FTS predicate on the vector-only
+    /// fixture.
+    #[cfg(feature = "test-helpers")]
+    pub async fn vector_hits_global_allow_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        allow_global: Arc<RoaringBitmap>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 || allow_global.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut allow_by_uri: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
+        let mut allowed = allow_global.iter().peekable();
+        let mut base = 0u64;
+        for entry in manifest.superfiles.iter() {
+            let end = base.saturating_add(entry.n_docs);
+            while allowed.peek().is_some_and(|&id| (id as u64) < base) {
+                allowed.next();
+            }
+            let mut local = RoaringBitmap::new();
+            while let Some(id) = allowed.peek().copied() {
+                let id = id as u64;
+                if id >= end {
+                    break;
+                }
+                local.insert((id - base) as u32);
+                allowed.next();
+            }
+            if !local.is_empty() {
+                allow_by_uri.insert(entry.uri, local);
+            }
+            base = end;
+        }
+
+        if allow_by_uri.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow = allow_by_uri
+            .into_iter()
+            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .collect();
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+            .await
+    }
+
+    /// Resolve a [`CandidatePlan`] to a per-superfile allow-set of matching
+    /// `local_doc_id`s over the given vector-pruned `superfiles` — the
+    /// boolean-plan analog of [`Self::candidate_bitmaps`] (which evaluates a
+    /// single term match). `token_match` leaves are combined by `AND`/`OR`;
+    /// superfiles whose plan matches no row are omitted so the caller skips
+    /// them. Tombstoned rows are dropped by the shared `fanout` (a deleted
+    /// row must never be a kNN candidate).
+    ///
+    /// The caller passes only a bounded plan, so `evaluate` returns
+    /// `Some(bitmap)` per superfile; a defensive `None` (unbounded) is
+    /// treated as the empty set, skipping that superfile.
+    async fn candidate_bitmaps_from_plan(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        plan: &CandidatePlan,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
+        let plan_arc = Arc::new(plan.clone());
+        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+            let plan = Arc::clone(&plan_arc);
+            async move {
+                plan.evaluate(r.as_ref())
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    .ok_or_else(|| {
+                        QueryError::Execute(
+                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                        )
+                    })
+            }
+        })
+        .await
+    }
+
+    /// Fan out over `superfiles`, resolve matching `local_doc_id`s per
+    /// superfile via `doc_ids`, subtract tombstones, and drop empties.
+    async fn fanout_candidate_bitmaps<F, Fut>(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        doc_ids: F,
+    ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError>
+    where
+        F: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Result<RoaringBitmap, QueryError>> + Send,
+    {
+        let units: Vec<(Arc<SuperfileEntry>, ())> =
+            superfiles.iter().map(|e| (Arc::clone(e), ())).collect();
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         _: ()| {
+            let doc_ids = doc_ids.clone();
+            async move {
+                let mut bm = doc_ids(r, Arc::clone(&entry)).await?;
+                subtract_tombstones(&mut bm, &entry, tombstone_cache.as_deref(), now)?;
+                Ok((entry.uri, bm))
+            }
+        };
+        let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
+            dispatch::fanout_with(self, units, body).await?;
+        Ok(pairs
+            .into_iter()
+            .filter(|(_, bm)| !bm.is_empty())
+            .map(|(uri, bm)| (uri, Arc::new(bm)))
+            .collect())
+    }
     pub(crate) async fn vector_search_user_table_async(
         &self,
         column: &str,
@@ -640,7 +1029,7 @@ impl SupertableReader {
                             &clusters,
                             vit_metric,
                             query,
-                            options.nprobe,
+                            options.resolve(false).0,
                         );
                         // Always scan the "incoming" append region in addition
                         // to the nprobe-routed cells: those rows have not been
@@ -722,44 +1111,38 @@ impl SupertableReader {
 }
 
 impl SupertableReader {
-    /// Single-column vector kNN search over this reader's pinned
-    /// snapshot, materialized as Arrow rows.
-    ///
-    /// This is the user-facing row-returning path. It runs the same
-    /// vector hit kernel the SQL TVF uses, then resolves those top-k hits
-    /// through the shared row materializer. Returned batches include
-    /// `_id`, every visible scalar column, and a trailing `score` column
-    /// containing the distance (smaller is better).
     pub fn vector_search(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         self.block_on(async {
-            let hits = self
-                .vector_search_global_index_async(column, query, k, options)
-                .await?;
-            let on_user_table = hits.is_empty() || hits_reference_user_superfiles(self, &hits);
-            // `_id`-only hidden-index fast path: when the hits come from the
-            // hidden index and the caller wants only `_id`+score, the remap's
-            // step-1 id-resolution already produces the answer — skip steps 2/3
-            // and the user-superfile resolve (no data-page read).
-            if projection.is_none() && !on_user_table {
-                let batch = hidden_hits_id_score_batch(self, &hits).await?;
-                return Ok(vec![batch]);
-            }
-            let hits = if on_user_table {
-                hits
-            } else {
-                remap_hidden_hits_to_user_hits(self, &hits).await?
+            let hits = match filter {
+                None => {
+                    let hits = self
+                        .vector_search_global_index_async(column, query, k, options)
+                        .await?;
+                    let on_user_table =
+                        hits.is_empty() || hits_reference_user_superfiles(self, &hits);
+                    if projection.is_none() && !on_user_table {
+                        let batch = hidden_hits_id_score_batch(self, &hits).await?;
+                        return Ok(vec![batch]);
+                    }
+                    if on_user_table {
+                        hits
+                    } else {
+                        remap_hidden_hits_to_user_hits(self, &hits).await?
+                    }
+                }
+                Some(f) => {
+                    self.vector_hits_filtered_async(column, query, k, options, f)
+                        .await?
+                }
             };
-            // `projection` selects output columns by name (`_id`, the
-            // visible scalar columns, or the trailing `score`); `None`
-            // returns `_id` + `score` only. The shared resolver decodes
-            // only the projected columns.
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -767,29 +1150,45 @@ impl SupertableReader {
         })
     }
 
-    /// Low-level vector kNN search over this reader's pinned snapshot.
-    ///
-    /// Drives the internal async kernel to completion via the
-    /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
-    /// to `k` hits sorted by distance *ascending*.
     pub fn vector_hits(
         &self,
         column: &str,
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.block_on(async {
-            let hits = self
-                .vector_search_global_index_async(column, query, k, options)
-                .await?;
-            if hits_reference_user_superfiles(self, &hits) {
-                Ok(hits)
-            } else {
-                remap_hidden_hits_to_user_hits(self, &hits).await
-            }
-        })
+        match filter {
+            None => self.block_on(async {
+                let hits = self
+                    .vector_search_global_index_async(column, query, k, options)
+                    .await?;
+                if hits_reference_user_superfiles(self, &hits) {
+                    Ok(hits)
+                } else {
+                    remap_hidden_hits_to_user_hits(self, &hits).await
+                }
+            }),
+            Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
+        }
     }
+}
+
+fn subtract_tombstones(
+    bm: &mut RoaringBitmap,
+    entry: &SuperfileEntry,
+    tombstone_cache: Option<&SidecarCache>,
+    now: Instant,
+) -> Result<(), QueryError> {
+    if let Some(cache) = tombstone_cache {
+        let deleted = cache
+            .bitmap_for(entry.superfile_id, now)
+            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+        if !deleted.is_empty() {
+            *bm -= &*deleted;
+        }
+    }
+    Ok(())
 }
 
 /// Merge per-superfile hits and return the top-k by *ascending*
@@ -878,10 +1277,11 @@ impl Supertable {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
         self.reader()
-            .vector_search(column, query, k, options, projection)
+            .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
     }
 }

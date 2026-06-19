@@ -14,14 +14,18 @@
 //!   stateless callers that don't want to materialize the
 //!   superfile in the disk cache.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 
-use crate::storage::{StorageError, StorageProvider};
-use crate::superfile::{LazyByteSource, LazyByteSourceError};
+use crate::{
+    storage::{StorageError, StorageProvider},
+    superfile::{LazyByteSource, LazyByteSourceError},
+};
 
 /// Bounded re-issue budget for a `get_range` that comes back
 /// short of the requested length. Each re-issue fetches only the
@@ -241,10 +245,12 @@ impl LazyByteSource for StorageRangeSource {
 
 #[cfg(test)]
 mod tests {
+    use std::{error::Error, ops::Range, sync::atomic::AtomicUsize, time::SystemTime};
+
+    use object_store::MultipartUpload;
+
     use super::*;
     use crate::storage::ObjectMeta;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::SystemTime;
 
     /// Storage fake that serves `get_range` in capped chunks and
     /// against a (possibly smaller-than-advertised) backing object.
@@ -279,7 +285,7 @@ mod tests {
     }
 
     fn permanent(uri: &str, msg: &'static str) -> StorageError {
-        let boxed: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        let boxed: Box<dyn Error + Send + Sync> = msg.into();
         StorageError::Permanent {
             uri: uri.into(),
             source: boxed,
@@ -300,11 +306,7 @@ mod tests {
             Err(permanent(uri, "get unimplemented"))
         }
 
-        async fn get_range(
-            &self,
-            _uri: &str,
-            range: std::ops::Range<u64>,
-        ) -> Result<Bytes, StorageError> {
+        async fn get_range(&self, _uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             let start = range.start as usize;
             let req = (range.end - range.start) as usize;
@@ -330,10 +332,7 @@ mod tests {
             Err(permanent(uri, "put_if_match unimplemented"))
         }
 
-        async fn put_multipart(
-            &self,
-            uri: &str,
-        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
             Err(permanent(uri, "put_multipart unimplemented"))
         }
 

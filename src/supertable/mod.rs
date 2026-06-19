@@ -17,8 +17,8 @@
 //!   handed to the underlying [`SuperfileBuilder`].
 //! - [`utils::idgen`] — 128-bit Snowflake-style generator for the
 //!   auto-injected `_id` column.
-//! - [`manifest`] — `Manifest`, `SuperfileEntry`, `ScalarStatsTable`,
-//!   `FtsSummary`, `VectorSummary`, plus the `Bloom` skip-summary
+//! - [`manifest`] — `Manifest`, `SuperfileEntry`, `ScalarStatsAgg`,
+//!   `FtsSummaryAgg`, `VectorSummary`, plus the `Bloom` skip-summary
 //!   container.
 //! - [`handle`] — `Supertable` (clone-shared handle) and
 //!   `SupertableReader` (snapshot-pinned reader).
@@ -26,11 +26,13 @@
 pub(crate) mod build;
 pub(crate) mod compaction;
 pub mod error;
+pub(crate) mod gc;
 pub mod handle;
 pub mod lazy_source;
 pub(crate) mod spfresh;
 pub mod manifest;
 pub mod mutations;
+pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
@@ -39,6 +41,20 @@ pub mod tombstones;
 pub mod utils;
 pub mod wal;
 pub mod writer;
+
+pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
+pub use gc::GcReport;
+pub use handle::{Supertable, SupertableReader};
+pub use lazy_source::StorageRangeSource;
+pub use manifest::{
+    FtsSummaryAgg, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
+    SuperfileList, SuperfileUri, VectorSummary,
+};
+pub use mutations::MutationStats;
+pub use options::SupertableOptions;
+pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
+pub use stats::SupertableStats;
+pub use writer::SupertableWriter;
 
 /// Re-export of [`crate::storage`] under the
 /// `supertable::storage::*` path. Storage moved out from
@@ -54,20 +70,7 @@ pub mod writer;
 pub use crate::storage;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) use crate::storage;
-
 pub use crate::storage::{
     AzureStorageProvider, LocalFsStorageProvider, ObjectMeta, S3StorageProvider, StorageError,
     StorageProvider,
 };
-pub use error::{BuildError, CommitError, CompactionError, OpenError, QueryError};
-pub use handle::{Supertable, SupertableReader};
-pub use lazy_source::StorageRangeSource;
-pub use manifest::{
-    FtsSummary, Manifest, ManifestLoadError, ManifestPartLoader, ScalarStatsTable, SuperfileEntry,
-    SuperfileList, SuperfileUri, VectorSummary,
-};
-pub use mutations::MutationStats;
-pub use options::SupertableOptions;
-pub use reader_cache::{InMemoryReaderCache, ReaderCacheError, SuperfileReaderCache};
-pub use stats::SupertableStats;
-pub use writer::SupertableWriter;

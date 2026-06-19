@@ -278,7 +278,7 @@ jobs:
           REMOTE
 
       - name: Summarize results
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set +e -u -o pipefail
           SUMMARY="$GITHUB_STEP_SUMMARY"
@@ -330,7 +330,7 @@ jobs:
           fi
 
       - name: Upload full log
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: dataset-bench-log-${{ inputs.modality }}

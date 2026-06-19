@@ -31,15 +31,17 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use std::collections::HashSet;
-
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 
 /// Disk-cache byte budget (1 GiB) for the hierarchical-manifest tests.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;

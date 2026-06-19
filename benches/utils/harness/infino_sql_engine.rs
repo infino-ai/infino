@@ -18,11 +18,14 @@ use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::default_tokenizer;
+use infino::{
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::default_tokenizer,
+};
 use rayon::prelude::*;
 
 use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};

@@ -52,7 +52,7 @@
 //! (each block is 8 × `u64` = 64 B). Storing as `u64` rather than
 //! `u8` lets the inner loop test bits with one shift-and-mask per
 //! probe, no byte-aligned addressing math. The Arc wrapper is so a
-//! `FtsSummary` clone (and through it, a manifest clone) doesn't
+//! `FtsSummaryAgg` clone (and through it, a manifest clone) doesn't
 //! duplicate the bloom payload.
 
 use std::sync::Arc;
@@ -86,7 +86,7 @@ const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 /// superfile.
 ///
 /// Cheap to clone (`Arc::clone` on the underlying word buffer); a
-/// `FtsSummary` clone shares this Arc with all manifest copies in
+/// `FtsSummaryAgg` clone shares this Arc with all manifest copies in
 /// the supertable's snapshot history.
 #[derive(Clone, Debug)]
 pub struct Bloom {
@@ -311,6 +311,8 @@ fn block_and_mask(h: u64, n_blocks_mask: u32) -> (usize, [u64; BLOCK_WORDS]) {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, str::from_utf8};
+
     use super::*;
 
     /// Build a bloom from a small, deterministic set of keys.
@@ -342,7 +344,7 @@ mod tests {
             assert!(
                 b.contains(k),
                 "inserted key {:?} must be reported present",
-                std::str::from_utf8(k).unwrap_or("<non-utf8>"),
+                from_utf8(k).unwrap_or("<non-utf8>"),
             );
         }
     }
@@ -500,8 +502,7 @@ mod tests {
     /// be a tiny fraction.
     #[test]
     fn different_keys_rarely_collide_on_same_signature() {
-        let mut sigs: std::collections::HashMap<(usize, [u64; BLOCK_WORDS]), Vec<String>> =
-            std::collections::HashMap::new();
+        let mut sigs: HashMap<(usize, [u64; BLOCK_WORDS]), Vec<String>> = HashMap::new();
         for i in 0..1000usize {
             let key = format!("a-{i}");
             let h = xxh3_64(key.as_bytes());

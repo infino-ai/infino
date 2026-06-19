@@ -3,8 +3,7 @@
 
 //! Stream synthetic text + vector rows for supertable ingest (no full-dataset file).
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::corpus::{DIM, TOKENS_PER_DOC, VOCAB_SIZE, ZipfDistribution, normalize};

@@ -11,29 +11,42 @@
 //! Self-contained: owns its `Bytes`. Per-column metadata is parsed
 //! eagerly at `open()`; per-query work happens on demand.
 
-use crate::superfile::format::checksum::crc32c;
-use crate::superfile::format::{self};
-pub(crate) use crate::superfile::lazy_source::Source;
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
-use crate::superfile::vector::distance::{
-    Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
-    distance_bytes_codec,
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    ops::Range,
+    sync::{Arc, OnceLock},
+    thread,
 };
-use crate::superfile::vector::quant::BitQuantizer;
-use crate::superfile::vector::rerank_codec::RerankCodec;
-use crate::superfile::vector::rotation::RandomRotation;
-use crate::superfile::{ReadError, error::VectorError};
+
 use bytes::Bytes;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 use serde::Deserialize;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use tokio::sync::oneshot;
 
-use crate::superfile::format::vec::{
-    CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-    dir_entry, outer_hdr, sub_hdr,
+pub(crate) use crate::superfile::lazy_source::Source;
+use crate::superfile::{
+    ReadError,
+    error::VectorError,
+    format::{
+        checksum::crc32c,
+        vec::{
+            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+            dir_entry, outer_hdr, sub_hdr,
+        },
+        {self},
+    },
+    lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
+    vector::{
+        distance::{
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
+            distance_bytes_codec,
+        },
+        quant::BitQuantizer,
+        rerank_codec::RerankCodec,
+        rotation::RandomRotation,
+    },
 };
 
 const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
@@ -141,6 +154,14 @@ pub struct ColumnReader {
     /// ~7.9 ms, dominant over every other per-query stage if rebuilt
     /// per `search()`. Build once, reuse forever.
     rot: RandomRotation,
+}
+
+/// Shared context threaded through the probe → shortlist → score pipeline.
+struct ProbeCtx<'a> {
+    q_rot: &'a [f32],
+    k: usize,
+    rerank_mult: usize,
+    allow: Option<Arc<RoaringBitmap>>,
 }
 
 impl ColumnReader {
@@ -1407,15 +1428,19 @@ impl VectorReader {
         // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
         // survivor `full[]` rows are fetched below — the only step
         // that differs from the async path.
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult,
+            allow: None,
+        };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            &q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
+            &ctx,
         )
         .await
         {
@@ -1477,6 +1502,10 @@ impl VectorReader {
         k: usize,
         nprobe: usize,
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1499,7 +1528,19 @@ impl VectorReader {
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
+        // Filtered search: boost nprobe and rerank_mult inversely with
+        // selectivity so probed clusters and the rerank shortlist cover
+        // enough eligible rows. Capped at [`MAX_FILTER_SELECTIVITY_MULT`]
+        // on the selectivity side and [`MAX_EFFECTIVE_FILTERED_RERANK_MULT`]
+        // on the effective rerank width.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let nprobe_eff = nprobe
+            .saturating_mul(filter_mult)
+            .min(col.n_cent as usize)
+            .max(1);
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
@@ -1512,7 +1553,14 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        let rerank_mult_eff = effective_filtered_rerank_mult(rerank_mult, filter_mult);
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: rerank_mult_eff,
+            allow,
+        };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }
 
@@ -1530,6 +1578,10 @@ impl VectorReader {
         k: usize,
         clusters: &[u32],
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1546,7 +1598,21 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        // Same inverse-selectivity boost as [`Self::search_async`]: the
+        // supertable fan-out probes externally chosen clusters (no local
+        // nprobe scoring), so rerank breadth must scale here — not only
+        // on the per-superfile nprobe fallback path.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            allow,
+        };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }
 
@@ -1560,11 +1626,9 @@ impl VectorReader {
         &self,
         col: &ColumnReader,
         query: &[f32],
-        q_rot: &[f32],
+        ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
-        k: usize,
-        rerank_mult: usize,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
@@ -1621,13 +1685,11 @@ impl VectorReader {
         // diverges from the sync path.
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
+            ctx,
         )
         .await
         {
@@ -1656,7 +1718,7 @@ impl VectorReader {
             &candidates,
             col,
             query,
-            k,
+            ctx.k,
         )
         .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
@@ -1839,16 +1901,13 @@ enum ShortlistOutcome {
 /// then runs [`rerank_candidates_from_blocks`]. Factoring this out
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
-#[allow(clippy::too_many_arguments)]
 async fn build_shortlist(
     col: &ColumnReader,
-    q_rot: &[f32],
     cb: usize,
     cluster_meta: &[(usize, u32, u32)],
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
-    k: usize,
-    rerank_mult: usize,
+    ctx: &ProbeCtx<'_>,
 ) -> ShortlistOutcome {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
@@ -1860,9 +1919,9 @@ async fn build_shortlist(
     // shortlists rank identically.
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
     let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        k
+        ctx.k
     } else {
-        k.saturating_mul(rerank_mult)
+        ctx.k.saturating_mul(ctx.rerank_mult)
     };
     if coarse_limit == 0 {
         return ShortlistOutcome::Done(Vec::new());
@@ -1882,7 +1941,15 @@ async fn build_shortlist(
             let codes = block.slice(0..codes_len);
             let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
             score_cluster_codes_into_heap(
-                &codes, &doc_ids, cnt, off, c as u32, &col.quant, q_rot, heap,
+                &codes,
+                &doc_ids,
+                cnt,
+                off,
+                c as u32,
+                &col.quant,
+                ctx.q_rot,
+                ctx.allow.as_deref(),
+                heap,
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
@@ -1894,10 +1961,13 @@ async fn build_shortlist(
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
-        let q_rot_v: Vec<f32> = q_rot.to_vec();
+        let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Move an `Arc` clone of the allow-set into the rayon task; each
+        // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
+        let allow_owned = ctx.allow.clone();
+        let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
                 .par_chunks(chunk)
@@ -1910,7 +1980,15 @@ async fn build_shortlist(
                         let codes = block.slice(0..codes_len);
                         let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
                         score_cluster_codes_into_heap(
-                            &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot_v, &mut heap,
+                            &codes,
+                            &doc_ids,
+                            cnt,
+                            off,
+                            c as u32,
+                            &quant,
+                            &q_rot_v,
+                            allow_owned.as_deref(),
+                            &mut heap,
                         );
                     }
                     heap
@@ -1948,7 +2026,7 @@ async fn build_shortlist(
     // the contract, not numerical agreement with fp32. `rerank_mult`
     // is intentionally ignored — there's nothing to refine.
     if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        let _ = rerank_mult;
+        let _ = ctx.rerank_mult;
         shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         return ShortlistOutcome::Done(
             shortlist
@@ -2001,6 +2079,53 @@ async fn build_shortlist(
     }
 }
 
+/// Maximum multiplier applied to filtered-search probe breadth and
+/// rerank width. Caps the inverse-selectivity boost so very sparse
+/// predicates don't turn every query into a full cluster scan.
+const MAX_FILTER_SELECTIVITY_MULT: usize = 64;
+/// Maximum effective rerank multiplier after filtered-search selectivity scaling.
+const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
+/// Multiplier for the unfiltered path, and for degenerate empty-column
+/// metadata where there is no population to estimate selectivity from.
+const UNFILTERED_SELECTIVITY_MULT: usize = 1;
+/// Multiplier for a present-but-empty allow-set: no row can match, so
+/// callers should return an empty result without probing.
+const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+/// Population count for an empty allow-set or empty column.
+const EMPTY_FILTER_POPULATION: u64 = 0;
+/// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).
+const FULL_SELECTIVITY: f64 = 1.0;
+
+/// Compute the inverse-selectivity multiplier for filtered search.
+/// Returns [`UNFILTERED_SELECTIVITY_MULT`] when `allow` is `None`
+/// (unfiltered). Returns [`EMPTY_FILTER_SELECTIVITY_MULT`] when `allow`
+/// is present but empty (no row can match — callers must short-circuit).
+/// Capped at [`MAX_FILTER_SELECTIVITY_MULT`].
+fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
+    let Some(bm) = allow.as_ref() else {
+        return UNFILTERED_SELECTIVITY_MULT;
+    };
+    let allowed = bm.len();
+    if allowed == EMPTY_FILTER_POPULATION {
+        return EMPTY_FILTER_SELECTIVITY_MULT;
+    }
+    let n = n_docs as u64;
+    if n == EMPTY_FILTER_POPULATION {
+        return UNFILTERED_SELECTIVITY_MULT;
+    }
+    let selectivity = allowed as f64 / n as f64;
+    (FULL_SELECTIVITY / selectivity)
+        .ceil()
+        .min(MAX_FILTER_SELECTIVITY_MULT as f64) as usize
+}
+
+/// Scale rerank breadth for filtered search and cap before shortlist sizing.
+fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usize {
+    rerank_mult
+        .saturating_mul(filter_mult)
+        .min(MAX_EFFECTIVE_FILTERED_RERANK_MULT)
+}
+
 /// Score `query` against every centroid in `centroids_bytes` and
 /// return the top `nprobe` `(cluster_id, distance)` pairs sorted by
 /// ascending distance (closest first).
@@ -2048,7 +2173,7 @@ const PARALLEL_SCAN_MIN: usize = 2048;
 /// logical parallelism, capped by the item count so we never make more
 /// chunks than there is work.
 fn parallel_chunks(n_items: usize) -> usize {
-    std::thread::available_parallelism()
+    thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1)
         .min(n_items)
@@ -2069,7 +2194,7 @@ where
     if parallel_chunks(items.len()) <= 1 {
         return items.iter().map(&f).collect();
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = oneshot::channel();
     rayon::spawn(move || {
         let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
@@ -2086,19 +2211,30 @@ fn score_cluster_codes_into_heap(
     cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
+    allow: Option<&roaring::RoaringBitmap>,
     out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
     let q_total: f32 = q_rot.iter().sum();
     for i in 0..cnt as usize {
-        let code = &cluster_codes[i * cb..(i + 1) * cb];
-        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         let did = u32::from_le_bytes([
             cluster_doc_ids[i * 4],
             cluster_doc_ids[i * 4 + 1],
             cluster_doc_ids[i * 4 + 2],
             cluster_doc_ids[i * 4 + 3],
         ]);
+        // Filtered search: the predicate's per-superfile allow-set is a
+        // hard constraint applied *before* the candidate enters the
+        // coarse heap. The heap therefore ranks distance only among
+        // matching doc-ids, so the top-k is the true k-nearest among
+        // matching rows with no underflow — no over-fetch, no
+        // post-filter. Decode the code (the hot work) only for an
+        // allowed candidate.
+        if allow.is_some_and(|bm| !bm.contains(did)) {
+            continue;
+        }
+        let code = &cluster_codes[i * cb..(i + 1) * cb];
+        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         out.push(CoarseCandidate {
             did,
             estimate: est,
@@ -2272,7 +2408,7 @@ async fn rerank_candidates_from_blocks(
     col: &ColumnReader,
     query: &[f32],
     k: usize,
-) -> Result<Vec<(u32, f32)>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<(u32, f32)>, LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
@@ -2794,7 +2930,7 @@ fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
     extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
     let Some(extra) = extra else {
         return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
     };
@@ -2813,7 +2949,7 @@ async fn get_cluster_ranges_coalesced_with_extra_async(
     source: &Source,
     ranges: &[Range<usize>],
     extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
     let Some(extra) = extra else {
         return Ok((
             get_cluster_ranges_coalesced_async(source, ranges).await?,
@@ -2831,7 +2967,7 @@ async fn get_cluster_ranges_coalesced_with_extra_async(
 fn get_cluster_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -2847,7 +2983,7 @@ fn get_cluster_ranges_coalesced(
 async fn get_cluster_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -2881,6 +3017,19 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        fs::File,
+        hint::black_box,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    use memmap2::Mmap;
+    use memory_stats::memory_stats;
+    use tempfile::NamedTempFile;
+    use tokio::time::sleep;
+
     use super::*;
     use crate::superfile::vector::builder::{VectorBuilder, VectorConfig};
 
@@ -3122,11 +3271,11 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank)
+            .search_async("v", q, k, n_cent as usize, rerank, None)
             .await
             .expect("search_async");
         let probed = r
-            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank)
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None)
             .await
             .expect("search_clusters_async");
 
@@ -3141,7 +3290,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank)
+            .search_clusters_async("v", q, k, &[], rerank, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -4094,8 +4243,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "recall diagnostic; ~10s; --ignored --nocapture"]
     async fn sq8_recall_diagnostic_planted_cluster_cosine() {
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
+        use rand::{SeedableRng, rngs::StdRng};
         use rand_distr::{Distribution, StandardNormal};
 
         let n_docs = 16_000u32;
@@ -4225,7 +4373,7 @@ mod tests {
         let k = 10usize;
         let nprobe = n_cent_ivf / 4;
         let rerank_mult = 50usize; // Sq8 rerank floor at dim ≤ 384
-        let ground_truth: Vec<std::collections::HashSet<u32>> = (0..n_queries)
+        let ground_truth: Vec<HashSet<u32>> = (0..n_queries)
             .map(|qi| {
                 let q = &all[qi];
                 let mut sims: Vec<(u32, f32)> = (0..all.len())
@@ -4234,9 +4382,7 @@ mod tests {
                         (j as u32, d)
                     })
                     .collect();
-                sims.sort_unstable_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sims.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
                 sims.into_iter().take(k).map(|(id, _)| id).collect()
             })
             .collect();
@@ -4252,8 +4398,7 @@ mod tests {
                     .search("v", &all[qi], k, nprobe, rerank_mult)
                     .await
                     .expect("search");
-                let hit_ids: std::collections::HashSet<u32> =
-                    hits.into_iter().map(|(id, _)| id).collect();
+                let hit_ids: HashSet<u32> = hits.into_iter().map(|(id, _)| id).collect();
                 let gt = &ground_truth[qi];
                 total_match += gt.iter().filter(|id| hit_ids.contains(id)).count();
             }
@@ -4277,8 +4422,7 @@ mod tests {
                     .search("v", &all[qi], k, nprobe, rm)
                     .await
                     .expect("search");
-                let hit_ids: std::collections::HashSet<u32> =
-                    hits.into_iter().map(|(id, _)| id).collect();
+                let hit_ids: HashSet<u32> = hits.into_iter().map(|(id, _)| id).collect();
                 tm += ground_truth[qi]
                     .iter()
                     .filter(|id| hit_ids.contains(id))
@@ -4298,13 +4442,13 @@ mod tests {
             let mut sims: Vec<f32> = (0..all.len())
                 .map(|j| (0..dim).map(|i| q[i] * all[j][i]).sum::<f32>())
                 .collect();
-            sims.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            sims.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
             let top11: Vec<f32> = sims.iter().take(11).cloned().collect();
             // Spread between top-1 (self, sim=1) and top-10
             let span = top11[0] - top11[10];
             // Median consecutive gap among top-10
             let mut gaps: Vec<f32> = (1..11).map(|i| top11[i - 1] - top11[i]).collect();
-            gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let med_gap = gaps[gaps.len() / 2];
             spreads.push((span, med_gap));
         }
@@ -4389,9 +4533,12 @@ mod tests {
     // disabled) — exposes any silent fallthrough that would
     // bypass the block_on bridge.
 
+    use std::sync::{
+        Arc as StdArc,
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    };
+
     use crate::superfile::lazy_source::{BytesLazyByteSource, LazyByteSource, LazyByteSourceError};
-    use std::sync::Arc as StdArc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
     /// Test-only [`LazyByteSource`] that wraps a `Bytes` payload and
     /// records every async / sync range request as a counter. The
@@ -4462,7 +4609,7 @@ mod tests {
         /// `bytes.slice(...)` body of `range()` resolves
         /// instantaneously and in-flight peaks at 1 even when
         /// many futures were spawned together).
-        fn set_async_latency(&self, latency: std::time::Duration) {
+        fn set_async_latency(&self, latency: Duration) {
             self.async_latency_us
                 .store(latency.as_micros() as u64, AtomicOrdering::Relaxed);
         }
@@ -4514,7 +4661,7 @@ mod tests {
             );
             let latency_us = self.async_latency_us.load(AtomicOrdering::Relaxed);
             if latency_us > 0 {
-                tokio::time::sleep(std::time::Duration::from_micros(latency_us)).await;
+                sleep(Duration::from_micros(latency_us)).await;
             }
             let total = self.bytes.len() as u64;
             if start.saturating_add(len) > total {
@@ -4765,7 +4912,7 @@ mod tests {
     /// (which is private to that module). Sharing the mapping
     /// via `Arc<Mmap>` keeps it alive for the reader's lifetime
     /// while also letting the test anchor the mmap explicitly.
-    struct MmapOwner(StdArc<memmap2::Mmap>);
+    struct MmapOwner(StdArc<Mmap>);
 
     impl AsRef<[u8]> for MmapOwner {
         fn as_ref(&self) -> &[u8] {
@@ -4785,12 +4932,7 @@ mod tests {
     /// folded through a linear congruential step per dim slot.
     /// Same shape the bench corpus generators use, inlined so
     /// the unit test doesn't reach into the bench harness.
-    fn build_corpus_to_file(
-        path: &std::path::Path,
-        n_docs: u32,
-        dim: usize,
-        n_cent: usize,
-    ) -> String {
+    fn build_corpus_to_file(path: &Path, n_docs: u32, dim: usize, n_cent: usize) -> String {
         use std::io::BufWriter;
 
         let mut b = VectorBuilder::new();
@@ -4812,7 +4954,7 @@ mod tests {
             }
             b.add(0, &v).expect("add to vector builder");
         }
-        let file = std::fs::File::create(path).expect("create tempfile");
+        let file = File::create(path).expect("create tempfile");
         let writer = BufWriter::new(file);
         b.finish_to(writer).expect("finish_to BufWriter<File>");
 
@@ -4835,16 +4977,14 @@ mod tests {
     /// open path only touches a handful of pages (outer
     /// header, directory, per-subsection header) and leaves
     /// the rest of the file unmapped.
-    fn measure_lazy_open_rss_delta(corpus_path: &std::path::Path, json: &str) -> (usize, usize) {
-        let file = std::fs::File::open(corpus_path).expect("reopen corpus readonly");
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+    fn measure_lazy_open_rss_delta(corpus_path: &Path, json: &str) -> (usize, usize) {
+        let file = File::open(corpus_path).expect("reopen corpus readonly");
+        let mmap = unsafe { Mmap::map(&file) }.expect("mmap corpus");
         let mmap_arc = StdArc::new(mmap);
         let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
         let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
 
-        let before = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let before = memory_stats().expect("memory_stats supported").physical_mem;
 
         let reader = VectorReader::open_with_source(
             Source::Lazy(lazy),
@@ -4853,9 +4993,7 @@ mod tests {
         )
         .expect("lazy open");
 
-        let after = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let after = memory_stats().expect("memory_stats supported").physical_mem;
 
         let n_cols = reader.columns.len();
         let delta = after.saturating_sub(before);
@@ -4863,7 +5001,7 @@ mod tests {
         // Keep both alive past the RSS reads — dropping
         // `reader` before reading `after` would silently
         // make the delta look smaller than reality.
-        std::hint::black_box((&reader, &mmap_arc));
+        black_box((&reader, &mmap_arc));
         drop(reader);
         drop(mmap_arc);
 
@@ -4893,7 +5031,7 @@ mod tests {
         const DIM: usize = 384;
         const N_CENT: usize = 1024;
 
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = NamedTempFile::new().expect("tempfile");
         let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
 
         let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
@@ -4936,7 +5074,7 @@ mod tests {
         const DIM: usize = 64;
         const N_CENT: usize = 64;
 
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = NamedTempFile::new().expect("tempfile");
         let json = build_corpus_to_file(tmp.path(), N_DOCS, DIM, N_CENT);
 
         let (delta_bytes, n_cols) = measure_lazy_open_rss_delta(tmp.path(), &json);
@@ -5006,7 +5144,7 @@ mod tests {
     /// the total RSS delta attributable to those opens. Anchors
     /// `(readers, mmaps)` past the after-RSS read.
     fn measure_lazy_multi_superfile_open_rss_delta(
-        corpus_paths: &[std::path::PathBuf],
+        corpus_paths: &[PathBuf],
         jsons: &[String],
     ) -> (usize, usize, usize) {
         assert_eq!(corpus_paths.len(), jsons.len(), "paths/jsons must align");
@@ -5015,20 +5153,18 @@ mod tests {
         // Pre-build (mmap, lazy source) pairs *before* the `before`
         // snapshot so the syscalls don't contaminate the delta — we
         // only want the open path's allocations in the measurement.
-        let mut lazies: Vec<(StdArc<memmap2::Mmap>, StdArc<dyn LazyByteSource>)> =
+        let mut lazies: Vec<(StdArc<Mmap>, StdArc<dyn LazyByteSource>)> =
             Vec::with_capacity(n_superfiles);
         for path in corpus_paths {
-            let file = std::fs::File::open(path).expect("reopen corpus readonly");
-            let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("mmap corpus");
+            let file = File::open(path).expect("reopen corpus readonly");
+            let mmap = unsafe { Mmap::map(&file) }.expect("mmap corpus");
             let mmap_arc = StdArc::new(mmap);
             let bytes = Bytes::from_owner(MmapOwner(StdArc::clone(&mmap_arc)));
             let lazy: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(bytes));
             lazies.push((mmap_arc, lazy));
         }
 
-        let before = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let before = memory_stats().expect("memory_stats supported").physical_mem;
 
         let mut readers: Vec<VectorReader> = Vec::with_capacity(n_superfiles);
         let mut n_cols_total = 0usize;
@@ -5043,16 +5179,14 @@ mod tests {
             readers.push(reader);
         }
 
-        let after = memory_stats::memory_stats()
-            .expect("memory_stats supported")
-            .physical_mem;
+        let after = memory_stats().expect("memory_stats supported").physical_mem;
 
         let delta = after.saturating_sub(before);
 
         // Keep both alive past the RSS reads — dropping any reader
         // (or mmap) before reading `after` would silently shrink the
         // measured delta.
-        std::hint::black_box((&readers, &lazies));
+        black_box((&readers, &lazies));
         drop(readers);
         drop(lazies);
 
@@ -5081,11 +5215,11 @@ mod tests {
         const DIM: usize = 64;
         const N_CENT: usize = 64;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for _ in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             let json = build_corpus_to_file(tmp.path(), N_DOCS_PER_SEG, DIM, N_CENT);
             paths.push(tmp.path().to_path_buf());
             jsons.push(json);
@@ -5152,11 +5286,11 @@ mod tests {
         const DIM: usize = 384;
         const N_CENT_PER_SEG: usize = 256;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for i in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             eprintln!(
                 "  building superfile {i:2}/{N_SUPERFILES} \
                  ({N_DOCS_PER_SEG} × {DIM}, n_cent={N_CENT_PER_SEG})…"
@@ -5237,11 +5371,11 @@ mod tests {
         const DIM: usize = 128;
         const N_CENT_PER_SEG: usize = 128;
 
-        let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
-        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(N_SUPERFILES);
+        let mut tmps: Vec<NamedTempFile> = Vec::with_capacity(N_SUPERFILES);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(N_SUPERFILES);
         let mut jsons: Vec<String> = Vec::with_capacity(N_SUPERFILES);
         for i in 0..N_SUPERFILES {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let tmp = NamedTempFile::new().expect("tempfile");
             if i % 10 == 0 {
                 eprintln!(
                     "  building superfile {i:3}/{N_SUPERFILES} \
@@ -5504,7 +5638,7 @@ mod tests {
         let async_counter = counting.async_counter();
         let max_in_flight = counting.max_in_flight_counter();
         counting.disable_sync();
-        counting.set_async_latency(std::time::Duration::from_millis(5));
+        counting.set_async_latency(Duration::from_millis(5));
 
         let r_lazy = VectorReader::open_lazy(
             StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
@@ -6204,10 +6338,8 @@ mod tests {
                 !hits_lazy.is_empty(),
                 "lazy cold Sq8 arm returns hits (query {q})"
             );
-            let eager_ids: std::collections::HashSet<u32> =
-                hits_eager.iter().map(|(id, _)| *id).collect();
-            let lazy_ids: std::collections::HashSet<u32> =
-                hits_lazy.iter().map(|(id, _)| *id).collect();
+            let eager_ids: HashSet<u32> = hits_eager.iter().map(|(id, _)| *id).collect();
+            let lazy_ids: HashSet<u32> = hits_lazy.iter().map(|(id, _)| *id).collect();
             assert!(
                 eager_ids.intersection(&lazy_ids).count() >= 1,
                 "lazy cold Sq8 result set must overlap the eager top-5 (query {q})"
@@ -6266,21 +6398,19 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
         // ordering: the deferred-meta arm returns its refined candidate set
         // through a distinct code path.
         assert!(!hits_lazy.is_empty(), "lazy async arm returns hits");
-        let eager_ids: std::collections::HashSet<u32> =
-            hits_eager.iter().map(|(id, _)| *id).collect();
-        let lazy_ids: std::collections::HashSet<u32> =
-            hits_lazy.iter().map(|(id, _)| *id).collect();
+        let eager_ids: HashSet<u32> = hits_eager.iter().map(|(id, _)| *id).collect();
+        let lazy_ids: HashSet<u32> = hits_lazy.iter().map(|(id, _)| *id).collect();
         assert!(
             eager_ids.intersection(&lazy_ids).count() >= 1,
             "lazy cold Sq8 search_async result set must overlap the eager top-5"
@@ -6305,11 +6435,11 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6319,7 +6449,7 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5)
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None)
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6330,13 +6460,13 @@ mod tests {
         // resolve_column error arms reached through the async entry point.
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5).await;
+        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None).await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
-        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5).await;
+        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None).await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());
@@ -6564,7 +6694,7 @@ mod tests {
     /// never exceeds the item count.
     #[test]
     fn parallel_chunks_clamped_to_item_count_and_parallelism() {
-        let par = std::thread::available_parallelism()
+        let par = thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1);
         assert_eq!(parallel_chunks(0), 1, "never returns zero chunks");
@@ -6930,7 +7060,7 @@ mod tests {
         .expect("open_lazy for search_async");
         flaky_a.fail_from_now();
         let err = ra
-            .search_async("embedding", &all[0], 5, 4, 5)
+            .search_async("embedding", &all[0], 5, 4, 5, None)
             .await
             .expect_err("search_async must surface failure");
         assert!(
@@ -6948,7 +7078,7 @@ mod tests {
         .expect("open_lazy for search_clusters_async");
         flaky_c.fail_from_now();
         let err = rc
-            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
             .await
             .expect_err("search_clusters_async must surface failure");
         assert!(
@@ -7172,7 +7302,7 @@ mod tests {
             .await
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
-            match ra.search_async("embedding", &all[0], 5, 4, 5).await {
+            match ra.search_async("embedding", &all[0], 5, 4, 5, None).await {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
                 Ok(_) => {}
                 other => panic!("search_async unexpected outcome: {other:?}"),
@@ -7188,7 +7318,7 @@ mod tests {
             .expect("open_lazy search_clusters_async");
             flaky_c.fail_after_call(fail_at);
             match rc
-                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5)
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => clusters_errors += 1,

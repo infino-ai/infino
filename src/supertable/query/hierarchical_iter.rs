@@ -26,9 +26,13 @@
 
 use std::sync::Arc;
 
-use crate::supertable::ManifestLoadError;
-use crate::supertable::manifest::part::{ManifestPart, PartId};
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
+use crate::supertable::{
+    ManifestLoadError,
+    manifest::{
+        Manifest, SuperfileEntry,
+        part::{ManifestPart, PartId},
+    },
+};
 
 /// Lazy-load each part in `kept_part_ids` via
 /// `Manifest::part(id).await`, in parallel.

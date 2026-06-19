@@ -31,14 +31,18 @@
 //! bridge, no throwaway `current_thread` runtime, and
 //! object-store retries fire correctly.
 
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use crate::storage::StorageProvider;
-use crate::superfile::SuperfileReader;
-use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
-use crate::supertable::reader_cache::DiskCacheStore;
-use crate::supertable::reader_cache::disk::DiskCacheError;
-use crate::supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache};
+use crate::{
+    storage::StorageProvider,
+    superfile::{ReadError, SuperfileReader},
+    supertable::{
+        manifest::{SubsectionOffsets, SuperfileUri},
+        reader_cache::{
+            DiskCacheStore, ReaderCacheError, SuperfileReaderCache, disk::DiskCacheError,
+        },
+    },
+};
 
 /// Look up `uri`'s `SuperfileReader`, preferring the in-
 /// memory tier and falling back to the disk cache when
@@ -95,9 +99,7 @@ pub async fn superfile_reader(
             .get(&path)
             .await
             .map_err(|e| ReaderCacheError::OpenFailed {
-                source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-                    "storage fetch {path}: {e}"
-                ))),
+                source: ReadError::Io(io::Error::other(format!("storage fetch {path}: {e}"))),
             })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
@@ -109,27 +111,27 @@ pub async fn superfile_reader(
 
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
     ReaderCacheError::OpenFailed {
-        source: crate::superfile::ReadError::Io(std::io::Error::other(format!(
-            "disk cache fetch: {e}"
-        ))),
+        source: ReadError::Io(io::Error::other(format!("disk cache fetch: {e}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    use crate::storage::LocalFsStorageProvider;
-    use crate::superfile::ReadError;
-    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder};
-    use crate::supertable::reader_cache::InMemoryReaderCache;
-    use crate::supertable::reader_cache::config::DiskCacheConfig;
-    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+    use super::*;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        superfile::{
+            ReadError,
+            builder::{BuilderOptions, SuperfileBuilder},
+        },
+        supertable::reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        test_helpers::{decimal128_id_field, decimal128_ids},
+    };
 
     /// `n_docs()` of the superfile every helper below builds — three
     /// scalar rows, no FTS / vector indexes.
@@ -221,7 +223,7 @@ mod tests {
     impl SuperfileReaderCache for AlwaysOpenFailedCache {
         fn reader(&self, _uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
             Err(ReaderCacheError::OpenFailed {
-                source: ReadError::Io(std::io::Error::other("in-memory tier boom")),
+                source: ReadError::Io(io::Error::other("in-memory tier boom")),
             })
         }
         fn insert(&self, _uri: SuperfileUri, _bytes: Bytes) -> Result<(), ReaderCacheError> {

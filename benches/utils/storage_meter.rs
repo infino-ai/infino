@@ -4,9 +4,13 @@
 //! Counts object-store `head`, `tail`, and `get_range` calls during a bench window.
 //! Used by the cost model to price cold-query S3 requests.
 
-use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;

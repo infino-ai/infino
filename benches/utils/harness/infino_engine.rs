@@ -14,12 +14,15 @@ use std::sync::Arc;
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use infino::{
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        fts::reader::BoolMode as InfinoBoolMode,
+    },
+    test_helpers::default_tokenizer,
+};
 use rayon::prelude::*;
-
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
-use infino::test_helpers::default_tokenizer;
 
 use super::{BoolMode, Capabilities, FtsEngine, Hit};
 use crate::corpus::block_on_inmem;

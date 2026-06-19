@@ -43,19 +43,26 @@
 //! sweep is itself a sequence of independent per-WAL state
 //! machines so partial progress is always safe.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use thiserror::Error;
 
-use crate::supertable::handle::Supertable;
-use crate::supertable::wal::lease::{self, LeaseError};
-use crate::supertable::wal::persistence::{WalStore, WalStoreError};
-use crate::supertable::wal::pipeline::{
-    self, AppendPhaseError, AppendPhaseOutcome, TombstonePhaseError, TombstonePhaseOutcome,
+use crate::{
+    storage::StorageError,
+    supertable::{
+        handle::Supertable,
+        wal::{
+            lease::{self, LeaseError},
+            persistence::{Etag, WalStore, WalStoreError},
+            pipeline::{
+                self, AppendPhaseError, AppendPhaseOutcome, TombstonePhaseError,
+                TombstonePhaseOutcome,
+            },
+            state_doc::{OpKind, SupertableHandleId, WalId, WalState, WalStateDoc},
+        },
+    },
 };
-use crate::supertable::wal::state_doc::{OpKind, SupertableHandleId, WalId, WalState, WalStateDoc};
 
 /// Aggregate counts from one recovery sweep. Stable shape so
 /// integration tests + operator scripts can pin assertions
@@ -222,7 +229,7 @@ async fn recover_one(
     let doc = match wal_store.read(wal_id).await {
         Ok((d, _etag)) => d,
         Err(WalStoreError::Storage {
-            source: crate::storage::StorageError::NotFound { .. },
+            source: StorageError::NotFound { .. },
             ..
         }) => return Err(SweepStep::Vanished),
         Err(_) => return Err(SweepStep::Vanished),
@@ -264,7 +271,7 @@ async fn drive_to_complete(
     supertable: &Supertable,
     wal_store: &WalStore,
     doc: WalStateDoc,
-    etag: crate::supertable::wal::persistence::Etag,
+    etag: Etag,
 ) -> Result<OneWalOutcome, SweepStep> {
     let (post_doc, post_etag, append_ran) = match (doc.op_kind, doc.state) {
         (OpKind::Update, WalState::Intent) => {
@@ -328,16 +335,22 @@ async fn drive_to_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::Supertable;
-    use crate::supertable::wal::state_doc::{
-        OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome,
-    };
-    use crate::test_helpers::default_supertable_options;
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            Supertable,
+            wal::state_doc::{
+                Lease, OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry,
+                TombstoneOutcome,
+            },
+        },
+        test_helpers::default_supertable_options,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scan_empty_supertable_reports_zero_work() {
@@ -460,7 +473,7 @@ mod tests {
             op_kind: OpKind::Delete,
             state: WalState::Intent,
             created_at: now,
-            lease: Some(crate::supertable::wal::state_doc::Lease {
+            lease: Some(Lease {
                 owner: SupertableHandleId(0xDEAD_DEAD),
                 acquired_at: now,
                 expires_at: now + chrono::Duration::seconds(120),

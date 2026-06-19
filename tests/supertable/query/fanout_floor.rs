@@ -37,21 +37,28 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use infino::{
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        fts::reader::BoolMode,
+    },
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::LocalFsStorageProvider,
+    },
+    test_helpers::{decimal128_id_field, decimal128_ids, default_tokenizer},
+};
 use tempfile::TempDir;
-
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::LocalFsStorageProvider;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{decimal128_id_field, decimal128_ids, default_tokenizer};
 
 /// Commits — enough for the fan-out cost to dominate any single
 /// kernel, while keeping the fixture build in the low seconds.

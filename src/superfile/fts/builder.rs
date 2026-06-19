@@ -70,27 +70,40 @@
 //! 4. `finish()` (returns `Vec<u8>`) or `finish_to(impl Write)`
 //!    (streams the blob progressively to any sink).
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::fs::File;
-use std::hash::{BuildHasher, Hash};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    env, fs,
+    fs::File,
+    hash::{BuildHasher, Hash},
+    io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    mem,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+    vec::IntoIter,
+};
 
+use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use crate::superfile::BuildError;
-use crate::superfile::format::checksum::{crc32c, crc32c_append};
-use crate::superfile::format::fts::HEADER_SIZE as FTS_HEADER_SIZE;
-use crate::superfile::format::{self, FST_SEPARATOR};
-use crate::superfile::fts::dict::{DictBuilder, StreamingDictBuilder};
-use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, Block, EncodedBlock, encode_block};
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
+use crate::superfile::{
+    BuildError,
+    format::{
+        self, FST_SEPARATOR,
+        checksum::{crc32c, crc32c_append},
+        fts::HEADER_SIZE as FTS_HEADER_SIZE,
+    },
+    fts::{
+        bm25,
+        dict::{DictBuilder, StreamingDictBuilder},
+        fst_value::FstValue,
+        posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
+        tokenize::{AsciiLowerTokenizer, Tokenizer},
+    },
+};
 
 /// Per-column term interner table.
 ///
@@ -160,7 +173,7 @@ struct FinishProfile {
 impl FinishProfile {
     fn from_env() -> Self {
         Self {
-            enabled: std::env::var_os("INFINO_FTS_PROFILE").is_some(),
+            enabled: env::var_os("INFINO_FTS_PROFILE").is_some(),
             ..Self::default()
         }
     }
@@ -334,7 +347,7 @@ enum ColumnPostings {
         ///   `&str` keys / entries bitwise-deallocated without
         ///   dereferencing, and only then does the arena's
         ///   `Drop` free the term bytes.
-        term_arena: bumpalo::Bump,
+        term_arena: Bump,
     },
 }
 
@@ -390,7 +403,7 @@ struct SpillPartition {
 /// and reinterprets as `&[[u32; 3]]` via `bytemuck` — zero per-
 /// record allocation, no UTF-8 validation, no `Box<str>` round-
 /// trips.
-const TRIPLE_BYTES: usize = std::mem::size_of::<Triple>();
+const TRIPLE_BYTES: usize = mem::size_of::<Triple>();
 
 /// Sortable + heap-mergeable posting triple. Matches the on-disk
 /// layout (`[term_id_le, doc_id_le, tf_le]`) exactly so a partition
@@ -509,7 +522,7 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
         return Ok(Vec::new());
     }
     if bytes.len() % TRIPLE_BYTES != 0 {
-        return Err(BuildError::Io(std::io::Error::new(
+        return Err(BuildError::Io(Error::new(
             ErrorKind::InvalidData,
             format!(
                 "spill partition {path:?} length {} not a multiple of {}",
@@ -526,7 +539,7 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
         // `align_of::<usize>()` (8 bytes on x86_64), so the cast
         // to `[u32; 3]` (alignment 4) is sound.
         let triples: &[Triple] = bytemuck::try_cast_slice(&bytes).map_err(|_| {
-            BuildError::Io(std::io::Error::new(
+            BuildError::Io(Error::new(
                 ErrorKind::InvalidData,
                 "bytemuck: spill bytes failed alignment for &[Triple]",
             ))
@@ -641,7 +654,7 @@ fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> 
 fn intern_term_id(
     term_to_id: &mut TermIdMap,
     id_to_term: &mut Vec<&'static str>,
-    arena: &bumpalo::Bump,
+    arena: &Bump,
     term: &str,
 ) -> (u32, bool) {
     let hash = compute_hash(term_to_id.hasher(), term);
@@ -726,7 +739,7 @@ fn pack_sort_key(lex_rank: u32, doc_id: u32) -> u64 {
 /// finish-time sort never holds more than one chunk plus one
 /// record per chunk file at a time.
 enum PartitionIter {
-    InMemory(std::vec::IntoIter<Triple>),
+    InMemory(IntoIter<Triple>),
     Merge {
         readers: Vec<BufReader<File>>,
         heap: BinaryHeap<MergeEntry>,
@@ -837,8 +850,10 @@ fn spill_sorted_chunk(
 /// `#[cfg(test)]` so production binaries pay zero runtime cost.
 #[cfg(test)]
 mod finish_debug {
-    use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
+    use std::{
+        cell::RefCell,
+        path::{Path, PathBuf},
+    };
 
     thread_local! {
         // Thread-local so concurrent `cargo test` workers do not
@@ -975,7 +990,7 @@ fn open_partition_sorted(
     partition_label: &str,
     lex_rank: &[u32],
 ) -> Result<PartitionIter, BuildError> {
-    let len = std::fs::metadata(partition_path)?.len();
+    let len = fs::metadata(partition_path)?.len();
     if len <= max_partition_bytes {
         let mut triples = read_partition_triples(partition_path)?;
         radix_sort_triples_by_lex_rank(&mut triples, lex_rank);
@@ -1081,7 +1096,7 @@ pub struct FtsBuilder {
     /// arm interns tokens straight into the column's `term_to_id`
     /// and dedupes via a dense `Vec<u32>` (kept inside `ColumnPostings
     /// ::Spilled`) keyed by `term_id` instead.
-    bump: bumpalo::Bump,
+    bump: Bump,
 }
 
 impl FtsBuilder {
@@ -1129,7 +1144,7 @@ impl FtsBuilder {
             spill_partitions: DEFAULT_SPILL_PARTITIONS,
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
-            bump: bumpalo::Bump::new(),
+            bump: Bump::new(),
         }
     }
 
@@ -1159,14 +1174,14 @@ impl FtsBuilder {
     /// modes.
     pub fn set_spill_partitions(&mut self, n: usize) -> Result<(), BuildError> {
         if !self.columns.is_empty() {
-            return Err(BuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidInput,
                 "FtsBuilder::set_spill_partitions must be called before any register_column",
             )));
         }
         if n == 0 {
-            return Err(BuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidInput,
                 "FtsBuilder: spill_partitions must be ≥ 1",
             )));
         }
@@ -1176,8 +1191,8 @@ impl FtsBuilder {
         // hot path stays branch-free instead of falling back to
         // modulo.
         if !n.is_power_of_two() {
-            return Err(BuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidInput,
                 format!("FtsBuilder: spill_partitions must be a power of two; got {n}"),
             )));
         }
@@ -1252,7 +1267,7 @@ impl FtsBuilder {
         partitions: &mut [SpillPartition],
         term_to_id: &mut TermIdMap,
         id_to_term: &mut Vec<&'static str>,
-        arena: &bumpalo::Bump,
+        arena: &Bump,
     ) -> Result<(), BuildError> {
         let n_part = partitions.len();
         debug_assert!(
@@ -1552,13 +1567,13 @@ impl FtsBuilder {
             // interner from the drained vocab, transition to
             // `Spilled` so subsequent `add_doc` calls route to
             // `add_doc_spilled`.
-            let drained = std::mem::take(terms);
+            let drained = mem::take(terms);
             let mut partitions = Self::open_partitions_for_column(
                 self.scratch_dir.path(),
                 column_id,
                 self.spill_partitions,
             )?;
-            let term_arena = bumpalo::Bump::new();
+            let term_arena = Bump::new();
             let mut term_to_id: TermIdMap = TermIdMap::default();
             // Pre-size to the exact post-flush vocab.
             let mut id_to_term: Vec<&'static str> = Vec::with_capacity(drained.len());
@@ -2139,7 +2154,7 @@ impl FtsBuilder {
                     drop(sorted_slices);
                     drop(mmaps);
                     for p in &sorted_files {
-                        let _ = std::fs::remove_file(p);
+                        let _ = fs::remove_file(p);
                     }
                     // The raw spill partition files are also no
                     // longer needed once the merge finishes — the
@@ -2426,13 +2441,13 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => w.write_all(&bytes)?,
         FstSource::Streamed { path, crc, .. } => {
             let mut reader = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&path)?);
-            std::io::copy(&mut reader, w)?;
+            io::copy(&mut reader, w)?;
             w.write_all(&crc.to_le_bytes())?;
         }
     }
     let mut postings_reader =
         BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
-    std::io::copy(&mut postings_reader, w)?;
+    io::copy(&mut postings_reader, w)?;
     drop(postings_reader);
 
     // Drop the scratch tempdir as soon as the streamed source
@@ -2469,7 +2484,7 @@ fn assemble_and_write_blob<W: Write>(
 
 #[inline]
 fn map_fst_err(e: fst::Error) -> BuildError {
-    BuildError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    BuildError::Io(Error::new(ErrorKind::InvalidData, e))
 }
 
 /// Reusable per-term scratch buffers threaded through
@@ -2547,7 +2562,7 @@ fn encode_and_emit_term<W: Write>(
         FstValue::pack_inline(doc_id, tf)
     } else {
         profile.encode_pfor += 1;
-        let idf_t = crate::superfile::fts::bm25::idf(n_docs as u64, df);
+        let idf_t = bm25::idf(n_docs as u64, df);
         // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
@@ -2564,8 +2579,8 @@ fn encode_and_emit_term<W: Write>(
         // hence the take/put dance. The take/put preserves capacity at
         // `BLOCK_LEN`, so the steady-state per-chunk cost is
         // `clear` + `extend_from_slice` of ≤128 u32s with no realloc.
-        let mut block_doc_ids = std::mem::take(&mut scratch.doc_ids);
-        let mut block_tfs = std::mem::take(&mut scratch.tfs);
+        let mut block_doc_ids = mem::take(&mut scratch.doc_ids);
+        let mut block_tfs = mem::take(&mut scratch.tfs);
         if block_doc_ids.capacity() < BLOCK_LEN {
             block_doc_ids.reserve(BLOCK_LEN - block_doc_ids.capacity());
         }
@@ -2584,8 +2599,8 @@ fn encode_and_emit_term<W: Write>(
                 .unwrap_or(0);
             min_dl_per_block.push(min_dl);
             let block = Block {
-                doc_ids: std::mem::take(&mut block_doc_ids),
-                tfs: std::mem::take(&mut block_tfs),
+                doc_ids: mem::take(&mut block_doc_ids),
+                tfs: mem::take(&mut block_tfs),
             };
             encoded_blocks.push(encode_block(&block));
             // Reclaim the underlying allocations for the next chunk.
@@ -2630,12 +2645,7 @@ fn encode_and_emit_term<W: Write>(
         let mut block_offset: u32 = (TERM_META_SIZE + skip_table_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
-            let max_bm25 = crate::superfile::fts::bm25::block_upper_bound(
-                idf_t,
-                blk.max_tf,
-                min_dl_per_block[i],
-                avgdl,
-            );
+            let max_bm25 = bm25::block_upper_bound(idf_t, blk.max_tf, min_dl_per_block[i], avgdl);
             // ceil(): the stored fixed-point value must stay a true
             // UPPER bound after quantization — truncation would round
             // it below the real block max and let BMW / floor skips
@@ -2811,8 +2821,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_doc_accumulates_tf_within_doc() {
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
+
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         let mut b = FtsBuilder::new(tokenizer());
         b.register_column("title".into()).expect("register column");
@@ -2842,8 +2853,9 @@ mod tests {
         // posting region. This also exercises the spill-backed
         // accumulator: column id is implicit in the selected partition
         // set, while the final FST key remains `<col>\x1F<term>`.
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
+
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         let mut b = FtsBuilder::new(tokenizer());
         let title_id = b.register_column("title".into()).expect("register title");
@@ -2993,9 +3005,11 @@ mod tests {
 
     #[tokio::test]
     async fn finish_to_temp_file_round_trips_through_reader() {
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
-        use bytes::Bytes;
         use std::io::BufWriter;
+
+        use bytes::Bytes;
+
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         let mut b = FtsBuilder::new(tokenizer());
         b.register_column("title".into()).expect("register title");
@@ -3011,7 +3025,7 @@ mod tests {
             let writer = BufWriter::new(file);
             b.finish_to(writer).expect("finish_to file");
         }
-        let blob = std::fs::read(&path).expect("read blob");
+        let blob = fs::read(&path).expect("read blob");
         let r = FtsReader::open(
             Bytes::from(blob),
             r#"[{"name":"title","tokenizer":"ascii_lower"}]"#,
@@ -3150,11 +3164,11 @@ mod tests {
     /// Walk a directory recursively yielding only files.
     /// Local helper used by `small_build_stays_in_ram_no_spill_files_created`;
     /// avoids pulling in a dev-dep on `walkdir` for one test.
-    fn walkdir_files(root: &std::path::Path) -> Vec<std::fs::DirEntry> {
+    fn walkdir_files(root: &Path) -> Vec<fs::DirEntry> {
         let mut out = Vec::new();
-        let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let rd = match std::fs::read_dir(&dir) {
+            let rd = match fs::read_dir(&dir) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -3244,9 +3258,7 @@ mod tests {
         // disk. This test asserts the directory the builder created
         // under the override path is gone after the build.
         let parent = tempfile::tempdir().expect("parent tempdir");
-        let dir_count_before = std::fs::read_dir(parent.path())
-            .expect("read parent")
-            .count();
+        let dir_count_before = fs::read_dir(parent.path()).expect("read parent").count();
 
         let mut b = FtsBuilder::with_scratch(tokenizer(), parent.path().to_path_buf())
             .expect("with_scratch");
@@ -3254,9 +3266,7 @@ mod tests {
         b.add_doc(0, 0, "alpha beta gamma").expect("add doc");
         let _blob = b.finish().expect("finish");
 
-        let dir_count_after = std::fs::read_dir(parent.path())
-            .expect("read parent")
-            .count();
+        let dir_count_after = fs::read_dir(parent.path()).expect("read parent").count();
         assert_eq!(
             dir_count_after, dir_count_before,
             "FtsBuilder scratch tempdir leaked under override path"
@@ -3265,8 +3275,9 @@ mod tests {
 
     #[tokio::test]
     async fn configurable_spill_partitions_round_trips_through_reader() {
-        use crate::superfile::fts::reader::{BoolMode, FtsReader};
         use bytes::Bytes;
+
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
 
         // Higher partition count: more files, smaller per-partition
         // working set. Must still produce a queryable blob.
@@ -3358,7 +3369,7 @@ mod tests {
         // An empty spill partition file decodes to zero triples.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("empty.part");
-        std::fs::write(&path, []).expect("write empty file");
+        fs::write(&path, []).expect("write empty file");
         let triples = read_partition_triples(&path).expect("read empty");
         assert!(triples.is_empty());
     }
@@ -3373,7 +3384,7 @@ mod tests {
         for field in [3u32, 4, 5, 6, 7, 8] {
             bytes.extend_from_slice(&field.to_le_bytes());
         }
-        std::fs::write(&path, &bytes).expect("write triples");
+        fs::write(&path, &bytes).expect("write triples");
         let triples = read_partition_triples(&path).expect("read triples");
         assert_eq!(triples, vec![[3u32, 4, 5], [6u32, 7, 8]]);
     }
@@ -3385,7 +3396,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ragged.part");
         // One full triple plus a stray byte.
-        std::fs::write(&path, vec![0u8; TRIPLE_BYTES + 1]).expect("write ragged file");
+        fs::write(&path, vec![0u8; TRIPLE_BYTES + 1]).expect("write ragged file");
         let err = read_partition_triples(&path).expect_err("expected error");
         match err {
             BuildError::Io(e) => {

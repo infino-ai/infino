@@ -57,31 +57,33 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
     RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use infino::VectorSearchOptions;
-use infino::config::{
-    CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-    SupertableSettings, ThreadCount,
+use infino::{
+    VectorSearchOptions,
+    config::{
+        CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings, ThreadCount,
+    },
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        fts::reader::BoolMode,
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{AzureStorageProvider, StorageProvider},
+    },
+    test_helpers::default_tokenizer,
 };
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::supertable::Supertable;
-use infino::supertable::SupertableOptions;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{AzureStorageProvider, StorageProvider};
-use infino::test_helpers::default_tokenizer;
 use infino_bench_utils::corpus::generate_text_corpus;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use tempfile::TempDir;
 
@@ -333,6 +335,7 @@ fn run_vector_queries(st: &Supertable) -> Vec<Vec<i128>> {
                     VECTOR_K,
                     VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
                     None,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("vector_search(doc {idx}) failed: {e}"));
             extract_sorted_ids(&batches)
@@ -510,12 +513,12 @@ async fn compact_azure_two_jobs_results_preserved() {
     //   job 0 — merges files 0..FILES_PER_JOB into one compacted superfile
     //   job 1 — merges files FILES_PER_JOB..N_COMMITS into one compacted superfile
     // Both jobs operate on the single default partition (n_buckets=1).
-    let cfg = CompactionSettings {
+    let cfg = OptimizeOptions::compact(CompactionSettings {
         target_superfile_size_mb: target_mib,
         min_fill_percent: 1,
         ..CompactionSettings::default()
-    };
-    st.compact(&cfg).expect("compact");
+    });
+    st.optimize(&cfg).expect("optimize");
     eprintln!("[compact_azure] compact() done");
 
     let reader_post = st.reader();
@@ -695,13 +698,13 @@ async fn compact_real_azure_two_jobs_results_preserved() {
              (first_{FILES_PER_JOB}_sum={first_n_sum} B, next_file={next_file_size} B)"
         );
 
-        let compact_cfg = CompactionSettings {
+        let compact_cfg = OptimizeOptions::compact(CompactionSettings {
             target_superfile_size_mb: target_mib,
             min_fill_percent: 1,
             ..CompactionSettings::default()
-        };
-        st.compact(&compact_cfg)
-            .map_err(|e| format!("compact: {e}"))?;
+        });
+        st.optimize(&compact_cfg)
+            .map_err(|e| format!("optimize: {e}"))?;
         eprintln!("[real-azure-compact] compact() done");
 
         let reader_post = st.reader();

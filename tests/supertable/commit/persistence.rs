@@ -25,16 +25,17 @@
 
 use std::sync::Arc;
 
-use infino::supertable::Supertable;
-use infino::supertable::manifest::commit::read_pointer;
+use infino::supertable::{Supertable, manifest::commit::read_pointer};
 
 /// 1-byte multipart threshold forcing every upload through the
 /// multipart path.
 const PUT_MULTIPART_THRESHOLD_BYTES: u64 = 1;
 /// BM25 top-k for the post-commit query.
 const BM25_TOP_K: usize = 5;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::storage::{LocalFsStorageProvider, StorageProvider},
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 
 #[test]
@@ -67,8 +68,8 @@ fn commit_persists_pointer_list_part_and_superfile() {
     assert!(!list_bytes.is_empty());
 
     // At least one manifest part exists in manifests/.
-    let manifests_dir = dir.path().join("manifests");
-    let parts: Vec<_> = std::fs::read_dir(&manifests_dir)
+    let manifest_parts_dir = dir.path().join("manifest-parts");
+    let parts: Vec<_> = std::fs::read_dir(&manifest_parts_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .collect();
@@ -135,8 +136,8 @@ fn two_successive_commits_both_publish() {
     // Manifest part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
     // means a fresh part per commit, no reuse).
-    let manifests_dir = dir.path().join("manifests");
-    let n_parts = std::fs::read_dir(&manifests_dir)
+    let manifest_parts_dir = dir.path().join("manifest-parts");
+    let n_parts = std::fs::read_dir(&manifest_parts_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .count();

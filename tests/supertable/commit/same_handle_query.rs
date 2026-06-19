@@ -28,19 +28,25 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::options::Consistency;
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
+use infino::{
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        options::Consistency,
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
 /// BM25 top-k for the regression queries.

@@ -38,23 +38,28 @@
 //!
 //! [`utils::vector_split::split_vectors`]: super::utils::vector_split::split_vectors
 
-use std::sync::Arc;
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
-use arrow_schema::{DataType, Schema};
-use rayon::ThreadPool;
+use arrow_schema::{DataType, Field, Schema};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
-use crate::config::{Config, StorageBackend, StorageColdFetchMode};
-use crate::storage::{
-    AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider,
+use super::{
+    error::BuildError,
+    reader_cache::{
+        ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
+        SuperfileReaderCache,
+    },
 };
-use crate::superfile::builder::{BuilderOptions, FtsConfig, VectorConfig};
-use crate::superfile::vector::layout::VectorLayout;
-use crate::superfile::fts::tokenize::Tokenizer;
-
-use super::error::BuildError;
-use super::reader_cache::{
-    ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
-    SuperfileReaderCache,
+use crate::{
+    config::{Config, StorageBackend, StorageColdFetchMode},
+    storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
+    superfile::{
+        OpenOptions,
+        builder::{BuilderOptions, FtsConfig, VectorConfig},
+        fts::tokenize::Tokenizer,
+        vector::layout::VectorLayout,
+    },
+    supertable::manifest::list::PartitionStrategy,
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -148,7 +153,7 @@ pub enum Consistency {
     /// pinned snapshot in between. Trades a bounded staleness window
     /// for not paying the pointer read on every (sub-millisecond) hot
     /// query — the speed-per-dollar default.
-    BoundedStaleness(std::time::Duration),
+    BoundedStaleness(Duration),
     /// Snapshot fixed at open. Only same-process commits advance it;
     /// other processes' new data requires a fresh `open`. For pure
     /// read replicas / time-bounded scans that never want surprise
@@ -163,7 +168,7 @@ impl Default for Consistency {
         // dominates a hot one, so amortize it rather than pay it per
         // hot query. Strong/Snapshot are opt-in via
         // `with_read_consistency`.
-        Consistency::BoundedStaleness(std::time::Duration::from_secs(DEFAULT_READ_STALENESS_SECS))
+        Consistency::BoundedStaleness(Duration::from_secs(DEFAULT_READ_STALENESS_SECS))
     }
 }
 
@@ -214,7 +219,7 @@ pub struct SupertableOptions {
     /// Reads go through `store` (the in-memory
     /// `SuperfileReaderCache`) unless a `disk_cache` is attached,
     /// in which case the reader path routes through the cache.
-    pub storage: Option<Arc<dyn crate::storage::StorageProvider>>,
+    pub storage: Option<Arc<dyn StorageProvider>>,
     /// Disk cache for storage-backed superfile reads.
     /// When attached together with `storage`, the supertable's
     /// reader path routes superfile-bytes lookups through this
@@ -237,7 +242,7 @@ pub struct SupertableOptions {
     /// Independent of `storage`: attaching a cache without
     /// storage is a configuration error caught at
     /// [`Supertable::create`] / [`Supertable::open`] time.
-    pub disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    pub disk_cache: Option<Arc<DiskCacheStore>>,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -284,7 +289,7 @@ pub struct SupertableOptions {
     /// At [`Supertable::open`] time, this field is read from
     /// the persisted manifest list — config changes after
     /// creation have no effect.
-    pub partition_strategy: Option<crate::supertable::manifest::list::PartitionStrategy>,
+    pub partition_strategy: Option<PartitionStrategy>,
     pub vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
@@ -463,7 +468,7 @@ impl SupertableOptions {
         // 4. Logical names unique across fts_columns + vector_columns.
         //    (Each was checked for presence in `schema` above; here
         //    we ensure no duplicates between the two role lists.)
-        let mut seen_logical: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_logical: HashSet<&str> = HashSet::new();
         for fc in &fts_columns {
             if !seen_logical.insert(fc.column.as_str()) {
                 return Err(BuildError::DuplicateLogicalName(fc.column.clone()));
@@ -482,7 +487,7 @@ impl SupertableOptions {
 
         // 6. Build default thread pools + store.
         let reader_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(default_reader_thread_count())
                 .thread_name(|i| format!("supertable-reader-{i}"))
                 .build()
@@ -490,7 +495,7 @@ impl SupertableOptions {
         );
         let writer_threads = default_writer_thread_count();
         let writer_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(writer_threads)
                 .thread_name(|i| format!("supertable-writer-{i}"))
                 .build()
@@ -537,7 +542,7 @@ impl SupertableOptions {
     /// commit path hands to `SuperfileBuilder` and what Parquet
     /// stores.
     pub fn effective_schema(&self) -> Arc<Schema> {
-        let mut fields = vec![Arc::new(arrow_schema::Field::new(
+        let mut fields = vec![Arc::new(Field::new(
             &self.id_column,
             DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
             false,
@@ -554,10 +559,7 @@ impl SupertableOptions {
     /// callers wanting real partitioning set
     /// [`Self::partition_strategy`] via
     /// [`Self::with_partition_strategy`].
-    pub fn effective_partition_strategy(
-        &self,
-    ) -> crate::supertable::manifest::list::PartitionStrategy {
-        use crate::supertable::manifest::list::PartitionStrategy;
+    pub fn effective_partition_strategy(&self) -> PartitionStrategy {
         self.partition_strategy
             .clone()
             .unwrap_or_else(|| PartitionStrategy::Hash {
@@ -624,7 +626,7 @@ impl SupertableOptions {
     ///
     /// Reads still go through `store` unless a `disk_cache`
     /// is also attached.
-    pub fn with_storage(mut self, storage: Arc<dyn crate::storage::StorageProvider>) -> Self {
+    pub fn with_storage(mut self, storage: Arc<dyn StorageProvider>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -650,10 +652,7 @@ impl SupertableOptions {
     /// [`DiskCacheStore`] yourself with whatever `pinned_fn` /
     /// budget / eviction policy fits the deployment; pass the
     /// resulting `Arc<DiskCacheStore>` here.
-    pub fn with_disk_cache(
-        mut self,
-        cache: Arc<crate::supertable::reader_cache::DiskCacheStore>,
-    ) -> Self {
+    pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
         self.disk_cache = Some(cache);
         self
     }
@@ -682,10 +681,7 @@ impl SupertableOptions {
     /// require external compaction). Without this call,
     /// [`Self::effective_partition_strategy`] returns the
     /// single-bucket Hash default.
-    pub fn with_partition_strategy(
-        mut self,
-        strategy: crate::supertable::manifest::list::PartitionStrategy,
-    ) -> Self {
+    pub fn with_partition_strategy(mut self, strategy: PartitionStrategy) -> Self {
         self.partition_strategy = Some(strategy);
         self
     }
@@ -751,8 +747,8 @@ impl SupertableOptions {
     /// match the current `verify_crc_on_open` setting. Used
     /// by every supertable-internal callsite that opens a
     /// superfile so the global config knob applies uniformly.
-    pub(crate) fn superfile_open_options(&self) -> crate::superfile::OpenOptions {
-        crate::superfile::OpenOptions {
+    pub(crate) fn superfile_open_options(&self) -> OpenOptions {
+        OpenOptions {
             verify_crc: self.verify_crc_on_open,
         }
     }
@@ -787,14 +783,14 @@ impl SupertableOptions {
             .resolve_or_default(default_writer_thread_count());
 
         self.reader_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(reader_n)
                 .thread_name(|i| format!("supertable-reader-{i}"))
                 .build()
                 .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
         );
         self.writer_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(writer_n)
                 .thread_name(|i| format!("supertable-writer-{i}"))
                 .build()
@@ -922,14 +918,13 @@ impl SupertableOptions {
     /// future optimization if benches show this on the hot
     /// path.
     pub fn scalar_schema(&self) -> Arc<Schema> {
-        let vector_names: std::collections::HashSet<&str> = self
+        let vector_names: HashSet<&str> = self
             .vector_columns
             .iter()
             .map(|vc| vc.column.as_str())
             .collect();
-        let mut kept: Vec<Arc<arrow_schema::Field>> =
-            Vec::with_capacity(self.schema.fields().len() + 1);
-        kept.push(Arc::new(arrow_schema::Field::new(
+        let mut kept: Vec<Arc<Field>> = Vec::with_capacity(self.schema.fields().len() + 1);
+        kept.push(Arc::new(Field::new(
             &self.id_column,
             DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
             false,
@@ -945,8 +940,8 @@ impl SupertableOptions {
     }
 }
 
-impl std::fmt::Debug for SupertableOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SupertableOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupertableOptions")
             .field("schema_fields", &self.schema.fields().len())
             .field("id_column", &self.id_column)
@@ -975,12 +970,13 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
+    use std::{env, fs, sync::Arc};
 
     use arrow_schema::{DataType, Field};
+    use uuid::Uuid;
 
-    use crate::superfile::vector::distance::Metric;
+    use super::*;
+    use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -1006,7 +1002,7 @@ mod tests {
             n_cent: 4,
             rot_seed: 0,
             metric: Metric::Cosine,
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Fp32,
         }
     }
 
@@ -1297,8 +1293,10 @@ mod tests {
 
     #[test]
     fn apply_config_sets_writer_pool_size_to_fixed_value() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         let yaml = r#"
 supertable:
@@ -1306,8 +1304,8 @@ supertable:
   writer_threads: 5
   commit_threshold_size_mb: 7
 "#;
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
 
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
@@ -1324,7 +1322,7 @@ supertable:
     fn apply_config_auto_resolves_to_num_cpus_defaults() {
         // `auto` is the embedded default; verify resolution clamps
         // ≥ 1 and uses num_cpus-derived defaults.
-        let cfg = crate::config::Config::defaults().expect("embedded default");
+        let cfg = Config::defaults().expect("embedded default");
 
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)], Some(tok()))
@@ -1365,9 +1363,7 @@ supertable:
     fn consistency_default_is_bounded_staleness_one_sec() {
         assert_eq!(
             Consistency::default(),
-            Consistency::BoundedStaleness(std::time::Duration::from_secs(
-                DEFAULT_READ_STALENESS_SECS
-            ))
+            Consistency::BoundedStaleness(Duration::from_secs(DEFAULT_READ_STALENESS_SECS))
         );
     }
 
@@ -1406,7 +1402,6 @@ supertable:
 
     #[test]
     fn effective_partition_strategy_defaults_to_single_bucket_hash() {
-        use crate::supertable::manifest::list::PartitionStrategy;
         let opts = plain_opts();
         match opts.effective_partition_strategy() {
             PartitionStrategy::Hash { column, n_buckets } => {
@@ -1419,7 +1414,6 @@ supertable:
 
     #[test]
     fn effective_partition_strategy_returns_configured_strategy() {
-        use crate::supertable::manifest::list::PartitionStrategy;
         let strat = PartitionStrategy::Hash {
             column: "category".into(),
             n_buckets: 64,
@@ -1462,13 +1456,13 @@ supertable:
     #[test]
     fn with_reader_and_writer_pool_override_pools() {
         let reader = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(2)
                 .build()
                 .expect("reader pool"),
         );
         let writer = Arc::new(
-            rayon::ThreadPoolBuilder::new()
+            ThreadPoolBuilder::new()
                 .num_threads(3)
                 .build()
                 .expect("writer pool"),
@@ -1493,13 +1487,13 @@ supertable:
 
     #[test]
     fn with_storage_attaches_provider() {
-        let dir = std::env::temp_dir().join(format!("infino-opts-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = env::temp_dir().join(format!("infino-opts-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
         let opts = plain_opts().with_storage(storage);
         assert!(opts.storage.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1532,23 +1526,27 @@ supertable:
 
     #[test]
     fn apply_config_overrides_id_column_when_no_collision() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         let yaml = r#"
 supertable:
   id_column: row_pk
 "#;
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert_eq!(opts.id_column, "row_pk");
     }
 
     #[test]
     fn apply_config_rejects_id_column_that_collides_with_schema() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // Config id column collides with the user-schema field
         // `category`.
@@ -1556,8 +1554,8 @@ supertable:
 supertable:
   id_column: category
 "#;
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let err = plain_opts().apply_config(&cfg).expect_err("collision");
         assert!(matches!(err, BuildError::IdColumnReserved(c) if c == "category"));
     }
@@ -1567,7 +1565,7 @@ supertable:
         // Default config has storage.backend = none → no storage /
         // disk cache attached, exercising the early-return arm of
         // apply_storage_config.
-        let cfg = crate::config::Config::defaults().expect("defaults");
+        let cfg = Config::defaults().expect("defaults");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert!(opts.storage.is_none());
         assert!(opts.disk_cache.is_none());
@@ -1577,8 +1575,8 @@ supertable:
     fn with_disk_cache_attaches_cache() {
         use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
 
-        let dir = std::env::temp_dir().join(format!("infino-opts-dc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = env::temp_dir().join(format!("infino-opts-dc-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
         let cache = DiskCacheStore::new_unpinned(
@@ -1595,72 +1593,77 @@ supertable:
         let opts = plain_opts().with_storage(storage).with_disk_cache(cache);
         assert!(opts.disk_cache.is_some());
         assert!(opts.storage.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_config_attaches_local_fs_storage() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // `storage.backend = local_fs` with a local_root exercises
         // the LocalFs arm of apply_storage_config; no disk_cache_root
         // means the cache stays unattached.
-        let dir =
-            std::env::temp_dir().join(format!("infino-opts-localfs-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = env::temp_dir().join(format!("infino-opts-localfs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
         let yaml = format!(
             "storage:\n  backend: local_fs\n  local_root: {}\n",
             dir.display()
         );
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(&yaml))).expect("parse config");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert!(opts.storage.is_some(), "local_fs backend attaches storage");
         assert!(
             opts.disk_cache.is_none(),
             "no disk_cache_root ⇒ no cache attached"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_config_local_fs_with_disk_cache_root_attaches_both() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // local_fs backend + a disk_cache_root drives the disk-cache
         // construction branch of apply_storage_config (cold-fetch
         // mode mapping, DiskCacheConfig build, new_unpinned).
-        let dir = std::env::temp_dir().join(format!("infino-opts-dcroot-{}", uuid::Uuid::new_v4()));
+        let dir = env::temp_dir().join(format!("infino-opts-dcroot-{}", Uuid::new_v4()));
         let cache_root = dir.join("cache");
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        fs::create_dir_all(&dir).expect("mkdir");
         let yaml = format!(
             "storage:\n  backend: local_fs\n  local_root: {}\n  disk_cache_root: {}\n",
             dir.display(),
             cache_root.display()
         );
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(&yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(&yaml))).expect("parse config");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert!(opts.storage.is_some());
         assert!(
             opts.disk_cache.is_some(),
             "disk_cache_root ⇒ cache attached"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_config_local_fs_without_root_is_rejected() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // local_fs backend but no local_root → the typed Store error
         // arm of apply_storage_config.
         let yaml = "storage:\n  backend: local_fs\n";
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let err = plain_opts()
             .apply_config(&cfg)
             .expect_err("missing local_root");
@@ -1669,16 +1672,18 @@ supertable:
 
     #[test]
     fn apply_config_attaches_s3_storage_from_bucket() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // `storage.backend = s3` with a bucket drives the S3 arm of
         // apply_storage_config. `S3StorageProvider::new` only builds a
         // client object from the AWS credential chain — it makes no
         // network call — so the arm is exercised offline.
         let yaml = "storage:\n  backend: s3\n  bucket: example-bucket\n  prefix: tbl/example\n";
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let opts = plain_opts().apply_config(&cfg).expect("apply_config");
         assert!(opts.storage.is_some(), "s3 backend attaches storage");
         assert!(
@@ -1689,28 +1694,32 @@ supertable:
 
     #[test]
     fn apply_config_s3_without_bucket_is_rejected() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // s3 backend but no bucket → the typed Store error arm of
         // apply_storage_config.
         let yaml = "storage:\n  backend: s3\n";
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let err = plain_opts().apply_config(&cfg).expect_err("missing bucket");
         assert!(matches!(err, BuildError::Store(_)), "{err:?}");
     }
 
     #[test]
     fn apply_config_azure_without_bucket_is_rejected() {
-        use figment::Figment;
-        use figment::providers::{Format, Yaml};
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
 
         // azure backend but no container → the typed Store error arm
         // of apply_storage_config.
         let yaml = "storage:\n  backend: azure\n";
-        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
-            .expect("parse config");
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         let err = plain_opts()
             .apply_config(&cfg)
             .expect_err("missing container");

@@ -38,10 +38,13 @@
 //!
 //! [`SuperfileReader::open_lazy`]: crate::superfile::reader::SuperfileReader::open_lazy
 
+use std::{fmt, ops::Range, sync::Arc};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::ops::Range;
-use std::sync::Arc;
+use futures::future::try_join_all;
+
+use crate::runtime_bridge::bridge_sync_to_async_send;
 
 /// Source of byte ranges from an arbitrary backing.
 ///
@@ -167,8 +170,8 @@ pub(crate) enum Source {
     Lazy(Arc<dyn LazyByteSource>),
 }
 
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
             Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
@@ -224,7 +227,7 @@ impl Source {
         // bridge in `runtime_bridge`. Clone the `Arc` into the future
         // so it is `Send + 'static`.
         let src = Arc::clone(s);
-        crate::runtime_bridge::bridge_sync_to_async_send(async move { src.range(start, len).await })
+        bridge_sync_to_async_send(async move { src.range(start, len).await })
     }
 
     /// Concurrent multi-range fetch. Sync-resident ranges are served
@@ -270,11 +273,11 @@ impl Source {
                         async move { s.range(start, len).await }
                     })
                     .collect::<Vec<_>>();
-                futures::future::try_join_all(futs).await
+                try_join_all(futs).await
             };
             // Shared bridge handles every runtime context; the future
             // owns its `Arc` clones so it is `Send + 'static`.
-            let bytes: Vec<Bytes> = crate::runtime_bridge::bridge_sync_to_async_send(fut)?;
+            let bytes: Vec<Bytes> = bridge_sync_to_async_send(fut)?;
             for (slot, b) in order.into_iter().zip(bytes) {
                 out[slot] = Some(b);
             }
@@ -349,7 +352,7 @@ impl Source {
                     async move { s.range(start, len).await }
                 })
                 .collect::<Vec<_>>();
-            let bytes = futures::future::try_join_all(futs).await?;
+            let bytes = try_join_all(futs).await?;
             for (slot, b) in order.into_iter().zip(bytes) {
                 out[slot] = Some(b);
             }
@@ -444,8 +447,8 @@ impl LazySubSource {
     }
 }
 
-impl std::fmt::Debug for LazySubSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LazySubSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LazySubSource")
             .field("offset", &self.offset)
             .field("len", &self.len)
@@ -539,8 +542,8 @@ impl PrefetchedSource {
     }
 }
 
-impl std::fmt::Debug for PrefetchedSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PrefetchedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefetchedSource")
             .field("size", &self.inner.size())
             .field("prefetched_count", &self.prefetched.len())

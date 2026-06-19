@@ -41,15 +41,13 @@ pub mod in_memory;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use thiserror::Error;
-
-use crate::superfile::{ReadError, SuperfileReader};
-
-use super::manifest::SuperfileUri;
-
 pub use config::{CacheEvictionPolicy, ColdFetchMode, DiskCacheConfig, LruPolicy};
 pub use disk::{CacheStats, DiskCacheStore};
 pub use in_memory::InMemoryReaderCache;
+use thiserror::Error;
+
+use super::manifest::SuperfileUri;
+use crate::superfile::{ReadError, SuperfileReader};
 
 /// Maps a `SuperfileUri` to a `SuperfileReader`. Owned by the
 /// supertable's inner state; shared across all readers via

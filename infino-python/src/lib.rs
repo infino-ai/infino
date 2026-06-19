@@ -28,8 +28,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, ConnectOptions, InfinoError,
-    Metric, VectorSearchOptions,
+    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
+    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
 /// Map a core [`InfinoError`] to the closest Python exception.
@@ -47,10 +47,7 @@ fn py_err(e: InfinoError) -> PyErr {
     }
 }
 
-/// Compaction has its own error type, so it doesn't go through `py_err`.
-/// These are storage / build failures — surfaced as runtime errors, like
-/// the mutation paths.
-fn compact_err(e: CompactionError) -> PyErr {
+fn optimize_err(e: OptimizeError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -282,8 +279,8 @@ impl MutationStats {
     }
 }
 
-/// Tuning for `compact`; omitted fields fall back to engine defaults.
-#[pyclass(name = "CompactOptions", skip_from_py_object)]
+/// Tuning for `optimize`; omitted fields fall back to engine defaults.
+#[pyclass(name = "OptimizeOptions", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct CompactOptions {
     max_memory_mb: Option<u64>,
@@ -366,7 +363,14 @@ impl Table {
     /// smaller is nearer); omitting it returns the engine-native
     /// `_id` + `score` pair with no scalar decode. Materializing row
     /// data is an explicit opt-in by naming columns.
-    #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
+    ///
+    /// Pass `filter_column` and `filter_query` together to restrict the
+    /// search to rows whose (FTS-indexed) `filter_column` matches the
+    /// query terms — a pushdown pre-filter, so kNN ranks only among the
+    /// matching rows rather than post-filtering the global top-`k`.
+    /// `filter_mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -374,16 +378,42 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        filter_column: Option<String>,
+        filter_query: Option<String>,
+        filter_mode: Option<&str>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
+        // Optional text-predicate filter (pushdown). `filter_column` and
+        // `filter_query` must be supplied together; `filter_mode` is only
+        // meaningful alongside them (a lone `filter_mode` is rejected rather
+        // than silently ignored, so an invalid value never passes unnoticed).
+        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+            (Some(col), Some(q), mode) => Some(VectorFilter {
+                column: col,
+                query: q,
+                mode: parse_mode(mode)?,
+            }),
+            (None, None, None) => None,
+            (None, None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "filter_mode requires filter_column and filter_query",
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "filter_column and filter_query must be provided together",
+                ));
+            }
+        };
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.vector_search(column, &query, k, opts, names.as_deref())
+                self.inner
+                    .vector_search(column, &query, k, opts, filter, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -472,7 +502,7 @@ impl Table {
     /// Merge small / underfilled superfiles into larger ones. Omit
     /// `settings` for engine defaults.
     #[pyo3(signature = (settings=None))]
-    fn compact(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
+    fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
@@ -485,7 +515,8 @@ impl Table {
                 s.target_superfile_size_mb = v;
             }
         }
-        py.detach(|| self.inner.compact(&s)).map_err(compact_err)
+        let opts = OptimizeOptions::compact(s);
+        py.detach(|| self.inner.optimize(&opts)).map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.

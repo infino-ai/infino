@@ -32,8 +32,7 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 
-use crate::supertable::error::BuildError;
-use crate::supertable::options::SupertableOptions;
+use crate::supertable::{error::BuildError, options::SupertableOptions};
 
 /// Maximum number of null row offsets collected into a
 /// `VectorColumnHasNulls` error. Bounds the error payload so a batch
@@ -191,15 +190,16 @@ fn collect_first_nulls_primitive(arr: &Float32Array, max: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use arrow_array::{Array, Float32Array, LargeStringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
+    use super::*;
+    use crate::superfile::{
+        builder::{FtsConfig, VectorConfig},
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    };
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -222,7 +222,7 @@ mod tests {
             n_cent: 4,
             rot_seed: 0,
             metric: Metric::Cosine,
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Fp32,
         }
     }
 

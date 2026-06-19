@@ -27,9 +27,13 @@
 
 use std::sync::Arc;
 
-use infino::supertable::Supertable;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::{
+        Supertable,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 
 /// Disk-cache byte budget (1 GiB) for the stats integration cache.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
@@ -224,11 +228,12 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     // before any activity, so downstream consumers can
     // sample them on a timer without worrying about
     // initialization order.
-    use infino::supertable::SuperfileUri;
-    use infino::supertable::reader_cache::{
-        ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-    };
     use std::collections::HashSet;
+
+    use infino::supertable::{
+        SuperfileUri,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    };
 
     let storage_dir = TempDir::new().expect("storage dir");
     let cache_dir = TempDir::new().expect("cache dir");

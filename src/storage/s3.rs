@@ -33,17 +33,16 @@
 //!     `new_with_endpoint` shape with the relevant endpoint +
 //!     credentials.
 
-use std::ops::Range;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::{AmazonS3, AmazonS3Builder};
-use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    PutPayload, UpdateVersion,
+    ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectStore,
+    ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut},
+    path::Path as ObjPath,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, retry};
@@ -66,7 +65,7 @@ impl S3StorageProvider {
         let bucket = bucket.into();
         let store = AmazonS3Builder::from_env()
             .with_bucket_name(&bucket)
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
             .with_client_options(tuned_client_options())
             .with_retry(retry::config())
             .build()
@@ -127,7 +126,7 @@ impl S3StorageProvider {
             // any non-AWS S3-compatible service that
             // doesn't terminate `<bucket>.<endpoint>` DNS).
             .with_virtual_hosted_style_request(false)
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
             // NB: do NOT apply `tuned_client_options()` here. The
             // deep idle-connection pool / long keep-alive is tuned
             // for real-S3 fan-out latency and destabilizes local
@@ -218,11 +217,11 @@ const S3_POOL_MAX_IDLE_PER_HOST: usize = 1024;
 /// Client idle-connection timeout. Held below S3's ~20s server-side
 /// idle-close window so reqwest never reuses a socket S3 has already
 /// dropped (which surfaces as a transient send failure).
-const S3_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const S3_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect-phase timeout. Bounds a single slow SYN/TLS so it can't
 /// dominate the fan-out's p99; the retry layer covers genuine drops.
-const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
@@ -234,8 +233,8 @@ const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// inflating the p99 tail under load. Keeping a large warm idle
 /// pool lets the fan-out reuse connections so the per-GET cost is
 /// one RTT, not handshake + RTT.
-fn tuned_client_options() -> object_store::ClientOptions {
-    object_store::ClientOptions::new()
+fn tuned_client_options() -> ClientOptions {
+    ClientOptions::new()
         // Keep many connections warm per host so concurrent
         // fan-out GETs reuse established TLS sessions instead of
         // handshaking. AWS S3 in-region serves many parallel
@@ -410,10 +409,7 @@ impl StorageProvider for S3StorageProvider {
             .map_err(|e| translate(uri, e))
     }
 
-    async fn put_multipart(
-        &self,
-        uri: &str,
-    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+    async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
         self.store
             .put_multipart(&path)
@@ -433,14 +429,14 @@ impl StorageProvider for S3StorageProvider {
     async fn list_with_prefix_metadata(
         &self,
         prefix: &str,
-    ) -> Result<Vec<(String, super::ObjectMeta)>, StorageError> {
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             out.push((
                 meta.location.to_string(),
-                super::ObjectMeta {
+                ObjectMeta {
                     size: meta.size,
                     etag: meta.e_tag,
                     last_modified: meta.last_modified.into(),
@@ -474,10 +470,9 @@ mod tests {
     //! `put_if_match`, and `tail` — are exercised here over the
     //! real S3 HTTP wire protocol without any cloud credentials
     //! or network access.
-    use std::net::SocketAddr;
+    use std::{fs::create_dir_all, net::SocketAddr};
 
-    use s3s::auth::SimpleAuth;
-    use s3s::service::S3ServiceBuilder;
+    use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
     use s3s_fs::FileSystem;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -502,7 +497,7 @@ mod tests {
         // s3s-fs treats top-level dirs as buckets; pre-create the
         // bucket dir so a put on a key inside it doesn't 404 the
         // bucket.
-        std::fs::create_dir_all(fs_root.path().join(HARNESS_BUCKET)).expect("create bucket dir");
+        create_dir_all(fs_root.path().join(HARNESS_BUCKET)).expect("create bucket dir");
 
         let fs_backend = FileSystem::new(fs_root.path()).expect("s3s-fs FileSystem");
         let service = {
@@ -520,8 +515,10 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
 
         tokio::spawn(async move {
-            use hyper_util::rt::{TokioExecutor, TokioIo};
-            use hyper_util::server::conn::auto::Builder as ConnBuilder;
+            use hyper_util::{
+                rt::{TokioExecutor, TokioIo},
+                server::conn::auto::Builder as ConnBuilder,
+            };
             let http = ConnBuilder::new(TokioExecutor::new());
             loop {
                 let (stream, _peer) = match listener.accept().await {

@@ -28,20 +28,22 @@
 
 use std::sync::Arc;
 
-use arrow::ipc::reader::StreamReader;
 use datafusion::scalar::ScalarValue;
-
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::error::QueryError;
-use crate::supertable::manifest::list::ManifestList;
-use crate::supertable::manifest::list_prune::{
-    prune_parts_for_fts_prefix, prune_parts_for_fts_terms,
-};
-use crate::supertable::manifest::part::PartId;
-use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
 use super::skip::{
     ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
+};
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        error::QueryError,
+        manifest::{
+            Manifest, SuperfileEntry,
+            list::ManifestList,
+            list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
+            part::PartId,
+        },
+    },
 };
 
 /// One conjunct of a prune predicate: a per-column test backed by a
@@ -89,8 +91,10 @@ impl PruneLeaf {
 /// the predicate's column could satisfy it. A missing aggregate or
 /// undecodable bounds → keep (conservative — never a false prune).
 ///
-/// The aggregate min/max live as length-1 Arrow IPC batches
-/// (`ScalarStatsAgg.{min,max}`); we decode them and reuse the same
+/// The aggregate min/max are held as length-1 [`ArrayRef`]s
+/// (`ScalarStatsAgg.{min,max}`), already decoded when the manifest list
+/// was loaded — so this hot path reads the [`ScalarValue`] straight from
+/// the array with no per-query Arrow-IPC decode, then reuses the same
 /// comparison core the superfile tier uses ([`scalar_value_may_match`]).
 fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId> {
     list.parts
@@ -100,8 +104,8 @@ fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId>
                 None => true,
                 Some(agg) => {
                     match (
-                        decode_length1_scalar(&agg.min),
-                        decode_length1_scalar(&agg.max),
+                        ScalarValue::try_from_array(agg.min.as_ref(), 0).ok(),
+                        ScalarValue::try_from_array(agg.max.as_ref(), 0).ok(),
                     ) {
                         (Some(min), Some(max)) => {
                             scalar_value_may_match(&min, &max, pred.op, &pred.value)
@@ -113,21 +117,6 @@ fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId>
             keep.then_some(entry.part_id)
         })
         .collect()
-}
-
-/// Decode a length-1 Arrow IPC stream (the `ScalarStatsAgg.{min,max}`
-/// wire shape — one batch, one column, one row) into its single
-/// `ScalarValue`. `None` on any decode failure, which callers treat as
-/// "keep".
-fn decode_length1_scalar(bytes: &[u8]) -> Option<ScalarValue> {
-    let reader = StreamReader::try_new(bytes, None).ok()?;
-    for batch in reader {
-        let batch = batch.ok()?;
-        if batch.num_columns() >= 1 && batch.num_rows() >= 1 {
-            return ScalarValue::try_from_array(batch.column(0).as_ref(), 0).ok();
-        }
-    }
-    None
 }
 
 /// Select the superfiles a predicate could match, newest-first in
@@ -207,29 +196,34 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::superfile::builder::FtsConfig;
-    use crate::supertable::SupertableOptions;
-    use crate::supertable::manifest::aggregates;
-    use crate::supertable::manifest::list::{
-        FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-    };
-    use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsTable, SuperfileEntry, SuperfileUri, bloom::BloomBuilder,
-    };
-    use crate::supertable::query::skip::ScalarOp;
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray};
+    use std::{collections::HashMap, slice::from_ref};
+
+    use arrow_array::{Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use std::collections::HashMap;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        superfile::builder::FtsConfig,
+        supertable::{
+            SupertableOptions,
+            manifest::{
+                FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, aggregates,
+                bloom::BloomBuilder,
+                list::{FORMAT_VERSION, ManifestList, ManifestPartEntry, PartitionStrategy},
+                part::{ContentHash, PartId},
+            },
+            query::skip::ScalarOp,
+        },
+        test_helpers::default_tokenizer,
+    };
 
     fn seg_int(col: &str, min: i64, max: i64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             col.to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(Int64Array::from(vec![min])),
                 Arc::new(Int64Array::from(vec![max])),
             ),
@@ -240,10 +234,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -253,9 +244,9 @@ mod tests {
         })
     }
 
-    fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
-        let aggs = aggregates::compute(segs);
-        ManifestListEntry {
+    fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestPartEntry {
+        let aggs = aggregates::compute(segs, None);
+        ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: segs.len() as u64,
@@ -270,7 +261,7 @@ mod tests {
         }
     }
 
-    fn list_with(parts: Vec<ManifestListEntry>) -> ManifestList {
+    fn list_with(parts: Vec<ManifestPartEntry>) -> ManifestList {
         ManifestList {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -338,7 +329,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let tk = crate::test_helpers::default_tokenizer();
+        let tk = default_tokenizer();
         Arc::new(
             SupertableOptions::new(
                 schema,
@@ -361,10 +352,10 @@ mod tests {
         sorted.sort();
         let (mn, mx) = (sorted[0], sorted[sorted.len() - 1]);
 
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "title".to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![mn])),
                 Arc::new(LargeStringArray::from(vec![mx])),
             ),
@@ -377,11 +368,11 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummary {
-                term_bloom: bb.finish(),
-                n_terms_distinct: titles.len() as u32,
-                term_range: (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
-            },
+            FtsSummaryAgg::new_with_params(
+                bb.finish(),
+                titles.len() as u32,
+                (mn.as_bytes().to_vec(), mx.as_bytes().to_vec()),
+            ),
         );
 
         let id = Uuid::new_v4();
@@ -391,10 +382,7 @@ mod tests {
             n_docs: titles.len() as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -432,7 +420,7 @@ mod tests {
 
         // DataFusion-equivalent: scalar min/max only. "mango" is within
         // both superfiles' lexicographic ranges, so neither is pruned.
-        let scalar_only = select_superfiles(&manifest, std::slice::from_ref(&scalar_leaf))
+        let scalar_only = select_superfiles(&manifest, from_ref(&scalar_leaf))
             .await
             .expect("select");
         assert_eq!(
@@ -466,10 +454,10 @@ mod tests {
     /// for the `title` column. `bloom_tokens` are inserted as exact
     /// terms; the term range is their lex span.
     fn seg(scalar_min: &str, scalar_max: &str, bloom_tokens: &[&str]) -> Arc<SuperfileEntry> {
-        let mut cols: HashMap<String, (ArrayRef, ArrayRef)> = HashMap::new();
+        let mut cols: HashMap<String, ScalarStatsAgg> = HashMap::new();
         cols.insert(
             "title".to_string(),
-            (
+            ScalarStatsAgg::from_min_max(
                 Arc::new(LargeStringArray::from(vec![scalar_min])),
                 Arc::new(LargeStringArray::from(vec![scalar_max])),
             ),
@@ -491,11 +479,7 @@ mod tests {
         let mut fts = HashMap::new();
         fts.insert(
             "title".to_string(),
-            FtsSummary {
-                term_bloom: bb.finish(),
-                n_terms_distinct: bloom_tokens.len() as u32,
-                term_range,
-            },
+            FtsSummaryAgg::new_with_params(bb.finish(), bloom_tokens.len() as u32, term_range),
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
@@ -504,10 +488,7 @@ mod tests {
             n_docs: bloom_tokens.len().max(1) as u64,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable {
-                cols,
-                ..Default::default()
-            },
+            scalar_stats: cols,
             fts_summary: fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

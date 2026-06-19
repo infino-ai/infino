@@ -23,10 +23,11 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-
-use infino::superfile::builder::FtsConfig;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{default_tokenizer, default_vector_config};
+use infino::{
+    superfile::builder::FtsConfig,
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::{default_tokenizer, default_vector_config},
+};
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
 const DIM: usize = 16;

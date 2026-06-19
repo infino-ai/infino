@@ -30,13 +30,16 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
 
 /// Disk-cache budget (1 GiB) for the end-to-end integration cache.

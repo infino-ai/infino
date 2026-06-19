@@ -36,18 +36,20 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
-use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema};
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
-use crate::supertable::manifest::bloom::Bloom;
-use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, VectorSummary};
+use crate::supertable::manifest::{
+    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+};
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -74,6 +76,13 @@ pub enum DecodeError {
     #[error("invalid vector summary: {0}")]
     InvalidVectorSummary(String),
 
+    /// Term range was inverted (`min_term > max_term`). Both-empty is the
+    /// legal "no range" sentinel and an empty min is fine (the empty string
+    /// is lex-smallest), but an out-of-order pair is corrupt input that
+    /// would break prefix-overlap pruning.
+    #[error("invalid term range: min_term > max_term (inverted range)")]
+    InvalidTermRange,
+
     /// Arrow IPC parse failed.
     #[error("arrow ipc parse failed: {0}")]
     ArrowIpc(String),
@@ -84,8 +93,26 @@ pub enum DecodeError {
     UnexpectedBatchCount(usize),
 }
 
+/// Errors from the per-summary binary encoders.
+///
+/// Surfaced by [`encode_length1_array`] when the Arrow IPC writer rejects
+/// an array; the manifest-list encoder wraps it into its own encode error
+/// so a commit fails cleanly rather than panicking.
+#[derive(Debug, Error)]
+pub enum EncodeError {
+    /// Arrow IPC serialization failed.
+    #[error("arrow ipc encode failed: {0}")]
+    ArrowIpc(String),
+
+    /// A length-1 array was expected (an aggregate is a single value) but
+    /// the array had a different row count — caught before persisting so a
+    /// malformed manifest is never written.
+    #[error("expected a length-1 array, got {0} rows")]
+    WrongRowCount(usize),
+}
+
 // ---------------------------------------------------------
-// ScalarStatsTable: arrow-ipc encoding.
+// Scalar stats (`HashMap<String, ScalarStatsAgg>`): arrow-ipc encoding.
 // ---------------------------------------------------------
 //
 // One RecordBatch carries every column's stats as length-1
@@ -104,43 +131,43 @@ const NULLS_SUFFIX: &str = "__nulls";
 const SUM_SUFFIX: &str = "__sum";
 const HLL_SUFFIX: &str = "__hll";
 
-pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
-    if stats.cols.is_empty() {
+pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
+    if stats.is_empty() {
         // Empty table → emit a sentinel zero-length blob.
-        // Decode treats that as `ScalarStatsTable::new()`.
+        // Decode treats that as an empty map.
         return Vec::new();
     }
     // Sort columns for deterministic output. The order
     // doesn't matter for correctness but makes diffs +
     // content-addressing stable.
-    let mut keys: Vec<&String> = stats.cols.keys().collect();
+    let mut keys: Vec<&String> = stats.keys().collect();
     keys.sort();
 
     let mut fields: Vec<Field> = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
     for key in keys {
-        let (mn, mx) = &stats.cols[key];
+        let agg = &stats[key];
         fields.push(Field::new(
             format!("{key}{MIN_SUFFIX}"),
-            mn.data_type().clone(),
+            agg.min.data_type().clone(),
             true,
         ));
         fields.push(Field::new(
             format!("{key}{MAX_SUFFIX}"),
-            mx.data_type().clone(),
+            agg.max.data_type().clone(),
             true,
         ));
-        arrays.push(mn.clone());
-        arrays.push(mx.clone());
-        if let Some(&nulls) = stats.null_counts.get(key) {
+        arrays.push(agg.min.clone());
+        arrays.push(agg.max.clone());
+        if let Some(nulls) = agg.null_count {
             fields.push(Field::new(
                 format!("{key}{NULLS_SUFFIX}"),
-                arrow_schema::DataType::UInt64,
+                DataType::UInt64,
                 true,
             ));
-            arrays.push(Arc::new(arrow_array::UInt64Array::from(vec![nulls])) as ArrayRef);
+            arrays.push(Arc::new(UInt64Array::from(vec![nulls])) as ArrayRef);
         }
-        if let Some(sum) = stats.sums.get(key) {
+        if let Some(sum) = &agg.sum {
             fields.push(Field::new(
                 format!("{key}{SUM_SUFFIX}"),
                 sum.data_type().clone(),
@@ -148,15 +175,13 @@ pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
             ));
             arrays.push(sum.clone());
         }
-        if let Some(sketch) = stats.hll.get(key) {
+        if let Some(sketch) = &agg.hll {
             fields.push(Field::new(
                 format!("{key}{HLL_SUFFIX}"),
-                arrow_schema::DataType::Binary,
+                DataType::Binary,
                 true,
             ));
-            arrays.push(
-                Arc::new(arrow_array::BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef,
-            );
+            arrays.push(Arc::new(BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef);
         }
     }
     let schema = Arc::new(Schema::new(fields));
@@ -172,9 +197,9 @@ pub fn encode_scalar_stats(stats: &ScalarStatsTable) -> Vec<u8> {
     out
 }
 
-pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError> {
+pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAgg>, DecodeError> {
     if bytes.is_empty() {
-        return Ok(ScalarStatsTable::new());
+        return Ok(HashMap::new());
     }
     let reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
@@ -188,10 +213,13 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
     let schema = batch.schema();
 
     // Bucket fields by stripped base name; min/max must pair up,
-    // everything else is optional.
+    // everything else is optional. Assembled into per-column
+    // `ScalarStatsAgg` once every field is seen.
     let mut mins: HashMap<String, ArrayRef> = HashMap::new();
     let mut maxes: HashMap<String, ArrayRef> = HashMap::new();
-    let mut stats = ScalarStatsTable::new();
+    let mut null_counts: HashMap<String, u64> = HashMap::new();
+    let mut sums: HashMap<String, ArrayRef> = HashMap::new();
+    let mut hlls: HashMap<String, Vec<u8>> = HashMap::new();
     for (i, field) in schema.fields().iter().enumerate() {
         let name = field.name();
         let column = batch.column(i);
@@ -202,24 +230,24 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
         } else if let Some(base) = name.strip_suffix(NULLS_SUFFIX) {
             let arr = column
                 .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
+                .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| {
                     DecodeError::ArrowIpc(format!("{name}: __nulls column is not UInt64"))
                 })?;
             if !arr.is_empty() && !arr.is_null(0) {
-                stats.null_counts.insert(base.to_string(), arr.value(0));
+                null_counts.insert(base.to_string(), arr.value(0));
             }
         } else if let Some(base) = name.strip_suffix(SUM_SUFFIX) {
-            stats.sums.insert(base.to_string(), column.clone());
+            sums.insert(base.to_string(), column.clone());
         } else if let Some(base) = name.strip_suffix(HLL_SUFFIX) {
             let arr = column
                 .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
+                .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
                     DecodeError::ArrowIpc(format!("{name}: __hll column is not Binary"))
                 })?;
             if !arr.is_empty() && !arr.is_null(0) {
-                stats.hll.insert(base.to_string(), arr.value(0).to_vec());
+                hlls.insert(base.to_string(), arr.value(0).to_vec());
             }
         } else {
             return Err(DecodeError::ArrowIpc(format!(
@@ -234,57 +262,191 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<ScalarStatsTable, DecodeError
             maxes.len()
         )));
     }
-    for (base, mn) in mins {
-        let mx = maxes.remove(&base).ok_or_else(|| {
+    let mut stats: HashMap<String, ScalarStatsAgg> = HashMap::new();
+    for (base, min) in mins {
+        let max = maxes.remove(&base).ok_or_else(|| {
             DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
         })?;
-        stats.cols.insert(base, (mn, mx));
+        let null_count = null_counts.remove(&base);
+        let sum = sums.remove(&base);
+        let hll = hlls.remove(&base);
+        stats.insert(
+            base,
+            ScalarStatsAgg {
+                min,
+                max,
+                null_count,
+                sum,
+                hll,
+            },
+        );
+    }
+    // Each matched base was `remove`d from the optional maps above, so a
+    // leftover entry is a `__nulls` / `__sum` / `__hll` field whose base
+    // column carries no `__min`/`__max` pair. Valid data always pairs
+    // optionals with min/max, so an orphan signals corruption — reject it
+    // rather than silently dropping it (which would hide bad manifest data
+    // and yield incomplete statistics).
+    if let Some(base) = null_counts
+        .keys()
+        .chain(sums.keys())
+        .chain(hlls.keys())
+        .next()
+    {
+        return Err(DecodeError::ArrowIpc(format!(
+            "orphan optional stat for column {base} with no __min/__max pair"
+        )));
     }
     Ok(stats)
 }
 
+/// Encode a single length-1 [`ArrayRef`] as Arrow-IPC stream bytes —
+/// the `ScalarStatsAgg.{min,max,sum}` wire shape (one batch, one
+/// column, one row). `field_name` is recorded in the IPC schema only;
+/// decoders read column 0 by position and ignore the name. Output is
+/// deterministic for identical inputs, which the manifest list's
+/// content-addressing relies on.
+///
+/// Returns [`EncodeError::WrongRowCount`] if `arr` is not exactly one row
+/// (an aggregate is a single value), or [`EncodeError::ArrowIpc`] if the
+/// Arrow IPC writer rejects the array (e.g. an unsupported data type). In
+/// practice the schema is built from the array's own `data_type`, so the
+/// batch always matches — but failures are surfaced rather than panicked so
+/// a bad array can't abort a commit.
+pub(crate) fn encode_length1_array(
+    field_name: &str,
+    arr: &ArrayRef,
+) -> Result<Vec<u8>, EncodeError> {
+    // Enforce the single-value contract before writing — fail fast here
+    // rather than persisting a manifest that `decode_length1_array` would
+    // later reject.
+    if arr.len() != 1 {
+        return Err(EncodeError::WrongRowCount(arr.len()));
+    }
+    let field = Field::new(field_name, arr.data_type().clone(), true);
+    let schema = Arc::new(Schema::new(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![arr.clone()])
+        .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+    let mut out = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut out, &schema)
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+        writer
+            .finish()
+            .map_err(|e| EncodeError::ArrowIpc(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+/// Decode the bytes produced by [`encode_length1_array`] back into the
+/// single length-1 [`ArrayRef`] (column 0 of the one-batch stream).
+pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    if batch.num_columns() != 1 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "expected exactly one column, got {}",
+            batch.num_columns()
+        )));
+    }
+    // The aggregate is a single value; callers read index 0 as the only
+    // element. Reject any other row count so malformed manifest data fails
+    // loudly here rather than silently yielding a wrong min/max (which would
+    // corrupt list-level prune decisions).
+    if batch.num_rows() != 1 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "expected exactly one row, got {}",
+            batch.num_rows()
+        )));
+    }
+    Ok(batch.column(0).clone())
+}
+
 // ---------------------------------------------------------
-// FtsSummary: custom packed.
+// FtsSummaryAgg: custom packed.
 //
 // Layout (all LE):
-//   u32 bloom_len                  (== n_blocks × BLOCK_BYTES)
+//   u32 bloom_len                  (== n_blocks × BLOCK_BYTES; 0 ⇒ no bloom)
 //   [bloom_len bytes]              (Bloom::to_bytes output)
-//   u32 n_terms_distinct
+//   u32 n_terms_distinct           (per-superfile count fits u32; widened to
+//                                   u64 in memory)
 //   u32 min_term_len
 //   [min_term bytes]
 //   u32 max_term_len
-//   [max_term bytes]
+//   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
+//
 // ---------------------------------------------------------
 
-pub fn encode_fts_summary(s: &FtsSummary) -> Vec<u8> {
-    let bloom_bytes = s.term_bloom.to_bytes();
-    let cap = 4 + bloom_bytes.len() + 4 + 4 + s.term_range.0.len() + 4 + s.term_range.1.len();
+pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
+    let bloom_bytes = s
+        .term_bloom
+        .as_ref()
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    // `None` range encodes as empty min+max (the 0-term / no-range sentinel).
+    let (min_term, max_term): (&[u8], &[u8]) = match &s.term_range {
+        Some((mn, mx)) => (mn, mx),
+        None => (&[], &[]),
+    };
+    let cap = 4 + bloom_bytes.len() + 4 + 4 + min_term.len() + 4 + max_term.len();
     let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&bloom_bytes);
-    out.extend_from_slice(&s.n_terms_distinct.to_le_bytes());
-    out.extend_from_slice(&(s.term_range.0.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.term_range.0);
-    out.extend_from_slice(&(s.term_range.1.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.term_range.1);
+    // Keep the wire field u32 (a single superfile's distinct count fits) so
+    // the part format is unchanged; saturate the u64 in-memory value.
+    out.extend_from_slice(
+        &u32::try_from(s.n_terms_distinct)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&(min_term.len() as u32).to_le_bytes());
+    out.extend_from_slice(min_term);
+    out.extend_from_slice(&(max_term.len() as u32).to_le_bytes());
+    out.extend_from_slice(max_term);
     out
 }
 
-pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummary, DecodeError> {
+pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
     let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
-    let term_bloom =
-        Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?;
-    let n_terms_distinct = read_u32(&mut c, "n_terms_distinct")?;
+    // Empty bloom run ⇒ "no bloom info" (None); a non-empty run must be a
+    // valid bloom layout.
+    let term_bloom = if bloom_bytes.is_empty() {
+        None
+    } else {
+        Some(Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
+    };
+    let n_terms_distinct = u64::from(read_u32(&mut c, "n_terms_distinct")?);
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
     let min_term = read_n(&mut c, min_len, "min_term")?;
     let max_len = read_u32(&mut c, "max_term_len")? as usize;
     let max_term = read_n(&mut c, max_len, "max_term")?;
-    Ok(FtsSummary {
+    // Both-empty is the "no range" sentinel (None). Otherwise it's a real
+    // `[min, max]` — which must be ordered. An empty min is legal (the empty
+    // string is lex-smallest), but `min > max` is an inverted, corrupt range
+    // that would break prefix-overlap pruning, so reject it.
+    let term_range = if min_term.is_empty() && max_term.is_empty() {
+        None
+    } else if min_term <= max_term {
+        Some((min_term, max_term))
+    } else {
+        return Err(DecodeError::InvalidTermRange);
+    };
+    Ok(FtsSummaryAgg {
         term_bloom,
         n_terms_distinct,
-        term_range: (min_term, max_term),
+        term_range,
     })
 }
 
@@ -421,7 +583,7 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
 //     [value_len bytes]  (encode_<inner>)
 // ---------------------------------------------------------
 
-pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummary>) -> Vec<u8> {
+pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummaryAgg>) -> Vec<u8> {
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     let mut out = Vec::new();
@@ -437,7 +599,7 @@ pub fn encode_fts_summary_map(map: &HashMap<String, FtsSummary>) -> Vec<u8> {
     out
 }
 
-pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary>, DecodeError> {
+pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummaryAgg>, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n = read_u32(&mut c, "fts_map_n")? as usize;
     let mut out = HashMap::with_capacity(n);
@@ -517,17 +679,31 @@ mod decode_error_tests {
     //! shape-mismatch paths (truncation, bad arrow columns, unpaired
     //! min/max, non-UTF-8 map keys) are covered, not just the happy
     //! round-trips.
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::{collections::HashMap, io::Cursor, sync::Arc};
 
+    use arrow::ipc::writer::StreamWriter;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary,
-        decode_vector_summary_map, encode_scalar_stats, read_n, read_u32,
+        DecodeError, ScalarStatsAgg, decode_fts_summary, decode_fts_summary_map,
+        decode_length1_array, decode_scalar_stats, decode_vector_summary,
+        decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
     };
-    use crate::supertable::manifest::ScalarStatsTable;
+
+    /// Hand-build a `decode_fts_summary` payload: no bloom, a given
+    /// distinct count, then the `(min_term, max_term)` pair verbatim.
+    /// Lets a test plant a half-empty range the encoder would never emit.
+    fn fts_summary_bytes(n_terms_distinct: u32, min_term: &[u8], max_term: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // bloom_len = 0 ⇒ no bloom
+        out.extend_from_slice(&n_terms_distinct.to_le_bytes());
+        out.extend_from_slice(&(min_term.len() as u32).to_le_bytes());
+        out.extend_from_slice(min_term);
+        out.extend_from_slice(&(max_term.len() as u32).to_le_bytes());
+        out.extend_from_slice(max_term);
+        out
+    }
 
     /// One length-1 arrow-IPC RecordBatch with the given fields/columns,
     /// matching the on-wire shape `encode_scalar_stats` emits.
@@ -536,8 +712,7 @@ mod decode_error_tests {
         let batch = RecordBatch::try_new(schema.clone(), arrays).expect("batch");
         let mut out = Vec::new();
         {
-            let mut w =
-                arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
             w.write(&batch).expect("ipc write");
             w.finish().expect("ipc finish");
         }
@@ -549,9 +724,52 @@ mod decode_error_tests {
     #[test]
     fn decode_scalar_stats_empty_is_empty_table() {
         let table = decode_scalar_stats(&[]).expect("empty");
-        assert!(table.cols.is_empty());
+        assert!(table.is_empty());
         // The empty table round-trips back to a zero-length blob.
-        assert!(encode_scalar_stats(&ScalarStatsTable::new()).is_empty());
+        assert!(encode_scalar_stats(&HashMap::new()).is_empty());
+    }
+
+    /// Full encode → decode round-trip of a populated table, with columns
+    /// exercising every optional-field combination (min/max only; +nulls;
+    /// +sum; all of them). Confirms the suffixed-column wire format and the
+    /// decode assembly reconstruct each per-column `ScalarStatsAgg` exactly,
+    /// including which optional stats are present vs absent.
+    #[test]
+    fn encode_decode_scalar_stats_round_trips_all_optional_field_combos() {
+        let i64_arr = |v: i64| Arc::new(Int64Array::from(vec![v])) as ArrayRef;
+        let str_arr = |v: &str| Arc::new(StringArray::from(vec![v])) as ArrayRef;
+
+        let mut table: HashMap<String, ScalarStatsAgg> = HashMap::new();
+        // Every stat present.
+        table.insert(
+            "full".into(),
+            ScalarStatsAgg {
+                min: i64_arr(1),
+                max: i64_arr(100),
+                null_count: Some(7),
+                sum: Some(i64_arr(5050)),
+                hll: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            },
+        );
+        // Min/max only (the `from_min_max` shape).
+        table.insert(
+            "bounds_only".into(),
+            ScalarStatsAgg::from_min_max(str_arr("alpha"), str_arr("omega")),
+        );
+        // Nulls but no sum/hll (e.g. a non-summable type that still counts nulls).
+        table.insert(
+            "nulls_no_sum".into(),
+            ScalarStatsAgg {
+                min: i64_arr(-3),
+                max: i64_arr(9),
+                null_count: Some(2),
+                sum: None,
+                hll: None,
+            },
+        );
+
+        let decoded = decode_scalar_stats(&encode_scalar_stats(&table)).expect("round-trip");
+        assert_eq!(decoded, table);
     }
 
     /// Garbage (non-arrow-IPC) bytes surface an `ArrowIpc` decode error.
@@ -580,6 +798,103 @@ mod decode_error_tests {
             vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
         );
         let err = decode_scalar_stats(&bytes).expect_err("bad suffix");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A single length-1 array round-trips through encode/decode.
+    #[test]
+    fn decode_length1_array_round_trips_single_row() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![42]));
+        let bytes = encode_length1_array("v", &arr).expect("encode");
+        let decoded = decode_length1_array(&bytes).expect("decode");
+        assert_eq!(decoded.to_data(), arr.to_data());
+    }
+
+    /// Encoding a non-length-1 array fails fast, before any bytes are
+    /// written, so an invalid aggregate never reaches a persisted manifest.
+    #[test]
+    fn encode_length1_array_rejects_non_single_row() {
+        use super::EncodeError;
+        let multi: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let err = encode_length1_array("v", &multi).expect_err("multi-row");
+        assert!(matches!(err, EncodeError::WrongRowCount(2)), "got {err:?}");
+
+        let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
+        let err = encode_length1_array("v", &empty).expect_err("zero-row");
+        assert!(matches!(err, EncodeError::WrongRowCount(0)), "got {err:?}");
+    }
+
+    /// A multi-row batch is rejected — callers read index 0 as the only
+    /// element, so accepting >1 rows would silently produce a wrong
+    /// aggregate min/max and corrupt list-level prune decisions.
+    #[test]
+    fn decode_length1_array_rejects_multi_row() {
+        let bytes = ipc_batch(
+            vec![Field::new("v", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        );
+        let err = decode_length1_array(&bytes).expect_err("multi-row");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A zero-row batch is rejected for the same single-value contract.
+    #[test]
+    fn decode_length1_array_rejects_zero_row() {
+        let bytes = ipc_batch(
+            vec![Field::new("v", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+        );
+        let err = decode_length1_array(&bytes).expect_err("zero-row");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A batch with more than one column is rejected — the aggregate is a
+    /// single value, read from column 0.
+    #[test]
+    fn decode_length1_array_rejects_multi_column() {
+        let bytes = ipc_batch(
+            vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+        );
+        let err = decode_length1_array(&bytes).expect_err("multi-column");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// A stream carrying more than one batch is rejected with the
+    /// dedicated `UnexpectedBatchCount` error.
+    #[test]
+    fn decode_length1_array_rejects_multi_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("batch");
+        let mut out = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            w.write(&batch).expect("write 1");
+            w.write(&batch).expect("write 2");
+            w.finish().expect("finish");
+        }
+        let err = decode_length1_array(&out).expect_err("two batches");
+        assert!(
+            matches!(err, DecodeError::UnexpectedBatchCount(2)),
+            "got {err:?}"
+        );
+    }
+
+    /// Garbage (non-arrow-IPC) bytes surface an `ArrowIpc` error from the
+    /// length-1 decoder's reader-init path.
+    #[test]
+    fn decode_length1_array_garbage_is_arrow_ipc_error() {
+        let err = decode_length1_array(b"definitely not arrow ipc").expect_err("garbage");
         assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 
@@ -625,6 +940,36 @@ mod decode_error_tests {
         );
     }
 
+    /// An inverted term range (`min_term > max_term`) is corrupt input and
+    /// must surface `InvalidTermRange`, not deserialize into a `Some` that
+    /// would break prefix-overlap pruning. `min_term = "abc", max_term = ""`
+    /// is such a pair (`"" < "abc"`).
+    #[test]
+    fn decode_fts_summary_inverted_term_range_errors() {
+        let inverted = fts_summary_bytes(0, b"abc", b"");
+        let err = decode_fts_summary(&inverted).expect_err("min > max");
+        assert!(matches!(err, DecodeError::InvalidTermRange), "got {err:?}");
+    }
+
+    /// The legal term-range encodings decode as expected: both bounds empty
+    /// ⇒ `None`; both present ⇒ `Some`; and an **empty min** with a present
+    /// max is valid (the empty string is lex-smallest, so `min ≤ max`).
+    #[test]
+    fn decode_fts_summary_legal_term_ranges() {
+        let none = decode_fts_summary(&fts_summary_bytes(0, b"", b"")).expect("both empty");
+        assert_eq!(none.term_range, None);
+
+        let some = decode_fts_summary(&fts_summary_bytes(3, b"alpha", b"omega")).expect("both set");
+        assert_eq!(
+            some.term_range,
+            Some((b"alpha".to_vec(), b"omega".to_vec()))
+        );
+
+        // Empty min, present max: a valid ordered range, not an error.
+        let empty_min = decode_fts_summary(&fts_summary_bytes(1, b"", b"xyz")).expect("empty min");
+        assert_eq!(empty_min.term_range, Some((b"".to_vec(), b"xyz".to_vec())));
+    }
+
     /// An empty map round-trips: both decoders read `n_entries = 0` and
     /// return an empty `HashMap`.
     #[test]
@@ -640,13 +985,13 @@ mod decode_error_tests {
     /// the buffer is shorter than the requested read.
     #[test]
     fn cursor_helpers_truncate() {
-        let mut c = std::io::Cursor::new(&[0u8, 1][..]);
+        let mut c = Cursor::new(&[0u8, 1][..]);
         let err = read_u32(&mut c, "header").expect_err("only 2 bytes");
         assert!(
             matches!(err, DecodeError::Truncated { what: "header", .. }),
             "got {err:?}"
         );
-        let mut c = std::io::Cursor::new(&[0u8, 1, 2][..]);
+        let mut c = Cursor::new(&[0u8, 1, 2][..]);
         let err = read_n(&mut c, 8, "body").expect_err("only 3 bytes");
         assert!(
             matches!(
@@ -659,6 +1004,88 @@ mod decode_error_tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// A scalar-stats stream carrying more than one batch is rejected with
+    /// the dedicated `UnexpectedBatchCount` error (the decode_scalar_stats
+    /// multi-batch guard).
+    #[test]
+    fn decode_scalar_stats_rejects_multi_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c__min",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("batch");
+        let mut out = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut out, &schema).expect("ipc init");
+            w.write(&batch).expect("write 1");
+            w.write(&batch).expect("write 2");
+            w.finish().expect("finish");
+        }
+        let err = decode_scalar_stats(&out).expect_err("two batches");
+        assert!(
+            matches!(err, DecodeError::UnexpectedBatchCount(2)),
+            "got {err:?}"
+        );
+    }
+
+    /// A `__hll` column typed as something other than Binary is rejected
+    /// (the hll-column type check), mirroring the `__nulls` type guard.
+    #[test]
+    fn decode_scalar_stats_wrong_hll_type_errors() {
+        let bytes = ipc_batch(
+            vec![Field::new("c__hll", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("bad hll type");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// An optional stat field (`__sum`/`__nulls`/`__hll`) whose base column
+    /// has no `__min`/`__max` pair is rejected, not silently dropped — a
+    /// stray optional signals corrupted manifest data.
+    #[test]
+    fn decode_scalar_stats_rejects_orphan_optional_stat() {
+        let bytes = ipc_batch(
+            vec![
+                Field::new("a__min", DataType::Int64, true),
+                Field::new("a__max", DataType::Int64, true),
+                // `b__sum` has no b__min / b__max — orphaned.
+                Field::new("b__sum", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3])) as ArrayRef,
+            ],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("orphan __sum");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
+    }
+
+    /// Equal min/max field counts but mismatched base names: a `__min` for
+    /// one column and a `__max` for another. The count check passes, so the
+    /// per-column assembly surfaces the "has __min but no __max" error.
+    #[test]
+    fn decode_scalar_stats_mismatched_min_max_bases_errors() {
+        let bytes = ipc_batch(
+            vec![
+                Field::new("a__min", DataType::Int64, true),
+                Field::new("b__max", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("mismatched bases");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)), "got {err:?}");
     }
 }
 

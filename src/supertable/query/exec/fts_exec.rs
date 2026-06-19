@@ -26,28 +26,29 @@
 //! descending). The optional `mode` is `'or'` (default) or `'and'`;
 //! prefix search always runs OR over the expanded term set.
 
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+use datafusion::{
+    catalog::{Session, TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{Expr, TableType},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
 };
 
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::handle::{SupertableReader, WeakReader};
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::handle::{SupertableReader, WeakReader},
+};
 
 /// SQL name for the term-based BM25 TVF.
 pub(crate) const BM25_SEARCH_UDTF: &str = "bm25_search";
@@ -412,15 +413,16 @@ pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::lit;
 
-    use crate::superfile::builder::FtsConfig;
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
+    use super::*;
+    use crate::{
+        superfile::builder::FtsConfig,
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
 
     fn title_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(

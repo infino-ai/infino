@@ -47,25 +47,30 @@
 //! INFINO_SQL_DIAG=tvf cargo bench -- sql-diag
 //! ```
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use datafusion::datasource::MemTable;
-use datafusion::prelude::{ParquetReadOptions, SessionContext};
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::{
+    datasource::MemTable,
+    prelude::{ParquetReadOptions, SessionContext},
+};
+use infino::{
+    superfile::builder::FtsConfig,
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::default_tokenizer,
+};
+use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio::runtime::Runtime;
 
-use infino::superfile::builder::FtsConfig;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::default_tokenizer;
-
-use crate::corpus::{self, MmapTextCorpus};
-use crate::markdown::fmt_count;
+use crate::{
+    corpus::{self, MmapTextCorpus},
+    markdown::fmt_count,
+};
 
 /// Rows per commit — mirrors `InfinoSqlEngine`'s `WRITE_CHUNK`, so the
 /// superfile count matches the headline SQL bench.

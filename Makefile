@@ -1,13 +1,21 @@
-.PHONY: check test doctest \
+.PHONY: check fmt test doctest \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
-        python-test python-wheel \
-        node-test node-build node-verify
+        python-test python-wheel python-examples-test \
+        node-test node-build node-verify node-example
+
+# Import layout: group into std / external / crate blocks and merge each
+# crate into one `use` tree.
+RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 
 check:
-	cargo fmt --check
+	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+
+# Apply formatting, including the import-layout rules above.
+fmt:
+	cargo fmt --all -- --config $(RUSTFMT_OPTS)
 
 # Public-API surface guard. Regenerates the curated public surface and
 # fails if it drifts from the committed `public-api.txt` snapshot. The
@@ -116,6 +124,26 @@ python-wheel:
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
+# Build the bindings from source, install the examples' deps, and run every
+# notebook with nbconvert (a failing cell fails the target). Scratch tables are
+# cleaned afterwards; the venv is a reused throwaway (gitignored).
+python-examples-test:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip maturin
+	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
+	# Drop infino from the requirements; the from-source build above is what runs.
+	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q nbconvert ipykernel
+	@status=0; \
+	for nb in infino-python/examples/[0-9]*.ipynb; do \
+		echo "executing $$nb"; \
+		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
+	done; \
+	rm -rf infino-python/examples/*_data infino-python/examples/_shared/__pycache__; \
+	exit $$status
+
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
 # from the cargo workspace, so the core crate never needs a Node
 # toolchain. These targets require npm + a Rust toolchain on PATH.
@@ -127,6 +155,14 @@ node-test:
 # Build a release addon for the current platform.
 node-build:
 	cd infino-node && npm install && npm run build
+
+# Run the Node examples as end-to-end smoke tests. Assumes the addon is already
+# built (run `make node-test` or `make node-build` first); each example's
+# `file:../..` dependency links that build. The hybrid-search-api example runs
+# with SMOKE=1 so it self-checks and exits instead of serving forever.
+node-example:
+	cd infino-node/examples/agent-memory && npm install && node index.mjs
+	cd infino-node/examples/hybrid-search-api && npm install && SMOKE=1 node index.mjs
 
 # Verify the published package shape: pack the thin main package + the
 # host platform package, install them into a throwaway project, and run a

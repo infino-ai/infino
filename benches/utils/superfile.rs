@@ -3,9 +3,11 @@
 
 //! Superfile-layer benchmark runners grouped by modality.
 
-use crate::cost;
-use crate::report::{Better, Cell, Report, metric, text};
-use crate::rss;
+use crate::{
+    cost,
+    report::{Better, Cell, Report, metric, text},
+    rss,
+};
 
 /// Shared headers for the single-superfile ingest tables (fts / vector /
 /// sql), so the three modalities can't drift. `Corpus` is the raw input
@@ -122,26 +124,33 @@ pub mod fts {
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
     //! ```
 
-    use std::collections::HashMap;
-    use std::hint::black_box;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        hint::black_box,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use bytes::Bytes;
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::fts::reader::{BoolMode as InfinoBoolMode, OrAlgo};
+    use infino::superfile::{
+        SuperfileReader,
+        fts::reader::{BoolMode as InfinoBoolMode, OrAlgo},
+    };
 
-    use crate::corpus::{self, MmapTextCorpus, block_on_inmem};
-    use crate::cost;
-    use crate::executors::ColdTiming;
-    use crate::executors::fts as exec_fts;
-    use crate::executors::fts::{FTS_BATTERY, FtsRead};
-    use crate::harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index};
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, RssStats};
-    use crate::supertable::Phases;
-    use crate::tiers;
+    use crate::{
+        corpus::{self, MmapTextCorpus, block_on_inmem},
+        cost,
+        executors::{
+            ColdTiming, fts as exec_fts,
+            fts::{FTS_BATTERY, FtsRead},
+        },
+        harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index},
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, RssStats},
+        supertable::Phases,
+        tiers,
+    };
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -824,23 +833,29 @@ pub mod vector {
     //! cargo bench -- superfile vector search             # search only
     //! ```
 
-    use std::sync::{Arc, OnceLock};
-    use std::time::Duration;
-
-    use crate::corpus::{self, DIM};
-    use crate::cost;
-    use crate::executors::vector as exec_vec;
-    use crate::executors::vector::VectorRead;
-    use crate::harness::{
-        EngineVectorResult, InfinoVectorEngine, InfinoVectorIndex, VectorMetric, VectorRunConfig,
-        run_vector_with_index,
+    use std::{
+        io::Write,
+        sync::{Arc, OnceLock},
+        time::{Duration, Instant},
     };
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss;
-    use crate::supertable::Phases;
-    use crate::tiers;
+
     use bytes::Bytes;
+    use infino::roaring::RoaringBitmap;
+
+    use crate::{
+        corpus::{self, DIM},
+        cost,
+        executors::{vector as exec_vec, vector::VectorRead},
+        harness::{
+            EngineVectorResult, InfinoVectorEngine, InfinoVectorIndex, VectorMetric,
+            VectorRunConfig, run_vector_with_index,
+        },
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss,
+        supertable::Phases,
+        tiers,
+    };
 
     // ─── Constants ────────────────────────────────────────────────────────
 
@@ -851,8 +866,16 @@ pub mod vector {
 
     /// Default options for the user-facing "what does it cost in
     /// production?" baseline reported in the search markdown.
-    use infino::superfile::reader::VectorSearchOptions;
+    const UNFILTERED_DEFAULT_NPROBE: usize = 6;
+    const UNFILTERED_DEFAULT_RERANK_MULT: usize = 256;
+    /// Filtered kNN defaults (nominal config before selectivity boost).
+    const FILTERED_DEFAULT_NPROBE: usize = 8;
+    const FILTERED_DEFAULT_RERANK_MULT: usize = 256;
 
+    /// The filtered-search row keeps every Nth row in its allow-set — a
+    /// ~10% selective predicate. Latency depends on the allow-set's density,
+    /// not which rows it holds, so a simple stride suffices.
+    const FILTER_KEEP_EVERY: usize = 10;
     /// Nanoseconds per second, for latency markdown.
     const NS_PER_SEC: f64 = 1e9;
     /// Deterministic rotation seed for the vector corpus fixture.
@@ -972,6 +995,285 @@ pub mod vector {
         ]
     }
 
+    fn vector_sweep_enabled() -> bool {
+        std::env::var_os("INFINO_BENCH_VECTOR_SWEEP").is_some()
+    }
+
+    const SWEEP_START_PROBE: usize = 5;
+    const SWEEP_START_RERANK: usize = 256;
+
+    fn sweep_start_probe() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SWEEP_START_PROBE)
+    }
+
+    fn sweep_start_rerank() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_RERANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SWEEP_START_RERANK)
+    }
+
+    fn sweep_probe_min() -> usize {
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(sweep_start_probe)
+    }
+
+    fn sweep_probe_max() -> Option<usize> {
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }
+
+    fn sweep_rerank_ladder(start: usize) -> Vec<usize> {
+        let mut rs = Vec::new();
+        let mut r = start.max(1);
+        loop {
+            rs.push(r);
+            if r == 1 {
+                break;
+            }
+            let next = (r / 2).max(1);
+            if next == r {
+                break;
+            }
+            r = next;
+        }
+        rs
+    }
+
+    fn sweep_probe_ladder(start: usize) -> Vec<usize> {
+        (1..=start.max(1)).rev().collect()
+    }
+
+    fn filtered_ground_truth(allow: &RoaringBitmap) -> Vec<Vec<u32>> {
+        let q_corr = queries_correctness();
+        let vecs = vectors();
+        q_corr
+            .iter()
+            .map(|q| {
+                let mut dists: Vec<(f32, u32)> = allow
+                    .iter()
+                    .map(|id| {
+                        let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
+                        let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                        (-dot, id)
+                    })
+                    .collect();
+                dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                dists.truncate(TOP_K);
+                dists.into_iter().map(|(_, id)| id).collect()
+            })
+            .collect()
+    }
+
+    fn mean_filtered_recall(
+        reader: &infino::superfile::SuperfileReader,
+        allow: &Arc<RoaringBitmap>,
+        filtered_gt: &[Vec<u32>],
+        nprobe: usize,
+        rerank: usize,
+    ) -> f32 {
+        let q_corr = queries_correctness();
+        let opts = exec_vec::search_opts(nprobe, rerank);
+        let mut sum = 0f32;
+        for (q, gt) in q_corr.iter().zip(filtered_gt) {
+            let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                VEC_COLUMN,
+                q,
+                TOP_K,
+                opts,
+                Some(Arc::clone(allow)),
+            ))
+            .expect("filtered sweep query");
+            sum += corpus::recall_at_k(&hits, gt);
+        }
+        sum / q_corr.len() as f32
+    }
+
+    /// One build; walk `(p, r)` downward from the 0.99-calibrated start point.
+    fn run_vector_param_sweep(
+        report: &mut Report,
+        n_docs: usize,
+        reader: &infino::superfile::SuperfileReader,
+    ) {
+        let start_p = sweep_start_probe();
+        let start_r = sweep_start_rerank();
+        let n_cent = corpus::n_cent(n_docs);
+        let floor = exec_vec::CORRECTNESS_RECALL_FLOOR;
+
+        let (probes, reranks, sweep_label) = if let Some(max_p) = sweep_probe_max() {
+            let min_p = sweep_probe_min();
+            (
+                (min_p..=max_p).collect::<Vec<_>>(),
+                vec![start_r],
+                format!("p={min_p}..={max_p} at r={start_r}"),
+            )
+        } else {
+            (
+                sweep_probe_ladder(start_p),
+                sweep_rerank_ladder(start_r),
+                format!("p={start_p}..1, r={start_r} halving to 1",),
+            )
+        };
+
+        let mut allow = RoaringBitmap::new();
+        for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+            allow.insert(i);
+        }
+        let allow = Arc::new(allow);
+        let filtered_gt = filtered_ground_truth(&allow);
+        let q_corr = queries_correctness();
+        let gt = ground_truth_correctness();
+
+        eprintln!(
+            "[superfile_vec] param sweep ({sweep_label}) — floor recall@{TOP_K} ≥ {floor:.2}",
+        );
+        eprintln!("|   p |    r | unfiltered | filtered (~10%) |");
+        eprintln!("| --- | ---- | ---------- | ----------------- |");
+
+        let mut table_rows = Vec::new();
+        let mut best_dual: Option<(usize, usize, f32, f32)> = None;
+
+        for &p in &probes {
+            let p_eff = p.min(n_cent).max(1);
+            for &r in &reranks {
+                let unfiltered =
+                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, gt, TOP_K, p_eff, r);
+                let filtered = mean_filtered_recall(reader, &allow, &filtered_gt, p_eff, r);
+                let pass = unfiltered >= floor && filtered >= floor;
+                eprintln!(
+                    "| {p_eff:3} | {r:4} | {unfiltered:10.3} | {filtered:17.3} |{}",
+                    if pass { " PASS" } else { "" },
+                );
+                let _ = std::io::stderr().flush();
+                table_rows.push(vec![
+                    text(format!("{p_eff}")),
+                    text(format!("{r}")),
+                    text(format!("{unfiltered:.3}")),
+                    text(format!("{filtered:.3}")),
+                    text(if pass {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    }),
+                ]);
+                if pass {
+                    let cost = p_eff * r;
+                    if best_dual
+                        .as_ref()
+                        .is_none_or(|(bp, br, _, _)| cost < bp * br)
+                    {
+                        best_dual = Some((p_eff, r, unfiltered, filtered));
+                    }
+                }
+            }
+        }
+
+        if let Some((p, r, u, f)) = best_dual {
+            eprintln!(
+                "[superfile_vec] sweep: cheapest dual-pass (both ≥ {floor:.2}): p={p}, r={r} \
+                 (unfiltered={u:.3}, filtered={f:.3}, p×r={})",
+                p * r,
+            );
+        } else {
+            eprintln!("[superfile_vec] sweep: no (p, r) cleared the floor on both paths");
+        }
+
+        report.emit(&Section {
+            anchor: "bench/vector/superfile/sweep".into(),
+            title: format!(
+                "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={DIM})",
+                fmt_count(n_docs),
+            ),
+            note: format!("One build; {sweep_label}. Floor recall@{TOP_K} ≥ {floor:.2}."),
+            blocks: vec![Block {
+                subtitle: String::new(),
+                headers: vec![
+                    "p".into(),
+                    "r".into(),
+                    "unfiltered recall@10".into(),
+                    "filtered recall@10".into(),
+                    "floor".into(),
+                ],
+                rows: table_rows,
+            }],
+        });
+    }
+
+    fn vector_latency_compare_enabled() -> bool {
+        std::env::var_os("INFINO_BENCH_VECTOR_LATENCY").is_some()
+    }
+
+    fn measure_vector_p50(
+        reader: &infino::superfile::SuperfileReader,
+        query: &[f32],
+        nprobe: usize,
+        rerank: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+    ) -> Duration {
+        let opts = exec_vec::search_opts(nprobe, rerank);
+        let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
+        for _ in 0..CALIBRATION_P50_ITERS {
+            let t0 = Instant::now();
+            if let Some(allow) = allow.as_ref() {
+                let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                    VEC_COLUMN,
+                    query,
+                    TOP_K,
+                    opts,
+                    Some(Arc::clone(allow)),
+                ))
+                .expect("filtered latency query");
+                std::hint::black_box(hits);
+            } else {
+                let hits =
+                    tiers::block_on(reader.vector_hits_async(VEC_COLUMN, query, TOP_K, opts))
+                        .expect("vector latency query");
+                std::hint::black_box(hits);
+            }
+            samples.push(t0.elapsed());
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// One build; warm p50 (calibration q0, [`CALIBRATION_P50_ITERS`] reps) for
+    /// `(1, 64)` vs `(5, 128)`, unfiltered and filtered (~10%).
+    fn run_vector_latency_compare(n_docs: usize, reader: &infino::superfile::SuperfileReader) {
+        let mut allow = RoaringBitmap::new();
+        for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+            allow.insert(i);
+        }
+        let allow = Arc::new(allow);
+        let q0 = &queries_calibration()[0];
+
+        eprintln!(
+            "[superfile_vec] latency compare ({}×{DIM}, q=calibration[0], {} iters/query):",
+            fmt_count(n_docs),
+            CALIBRATION_P50_ITERS,
+        );
+        eprintln!("| (p, r)  | path       | p50    |");
+        eprintln!("| ------- | ---------- | ------ |");
+
+        for (p, r) in [(1usize, 64usize), (5, 128)] {
+            let unfiltered = measure_vector_p50(reader, q0, p, r, None);
+            let filtered = measure_vector_p50(reader, q0, p, r, Some(Arc::clone(&allow)));
+            eprintln!(
+                "| p={p}, r={r:<3} | unfiltered | {} |",
+                fmt_time(unfiltered.as_secs_f64() * NS_PER_SEC),
+            );
+            eprintln!(
+                "| p={p}, r={r:<3} | filtered   | {} |",
+                fmt_time(filtered.as_secs_f64() * NS_PER_SEC),
+            );
+        }
+    }
+
     pub fn run(phases: Phases) {
         let n_docs = n_docs();
         eprintln!(
@@ -982,6 +1284,18 @@ pub mod vector {
             phases.cold,
         );
         let (build_result, index) = build_warm_artifact(n_docs);
+
+        if vector_sweep_enabled() {
+            let mut report = Report::load("superfile_vector");
+            run_vector_param_sweep(&mut report, n_docs, index.reader());
+            report.save();
+            return;
+        }
+
+        if vector_latency_compare_enabled() {
+            run_vector_latency_compare(n_docs, index.reader());
+            return;
+        }
 
         let build_rows = build_rows(n_docs, &build_result, index.bytes().len() as u64);
         let mut report = Report::load("superfile_vector");
@@ -999,7 +1313,13 @@ pub mod vector {
                     committed.object_size,
                 )
             };
-            let default_opts = VectorSearchOptions::default();
+            let (default_nprobe, default_rerank) = {
+                let o = VectorSearchOptions::default();
+                (
+                    o.nprobe.unwrap_or(VectorSearchOptions::DEFAULT_NPROBE),
+                    o.rerank_mult().unwrap_or(VectorSearchOptions::RERANK_MULT),
+                )
+            };
             let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
@@ -1007,8 +1327,8 @@ pub mod vector {
                 VEC_COLUMN,
                 n_docs,
                 TOP_K,
-                default_opts.nprobe,
-                default_opts.rerank_mult(),
+                default_nprobe,
+                default_rerank,
                 queries_correctness(),
                 ground_truth_correctness(),
                 queries_calibration(),
@@ -1046,6 +1366,181 @@ pub mod vector {
                     n_docs,
                     &cost::warm_from_vector(&recall_rows),
                 );
+            }
+
+            if phases.warm {
+                // Filtered kNN: rank distance only among an allow-set of
+                // matching `local_doc_id`s (predicate pushdown). Measure its
+                // p50 beside the unfiltered baseline at the same config. The
+                // allow-set keeps every Nth row — for latency only its
+                // density matters, not which rows.
+                let reader = index.reader();
+                let mut allow = RoaringBitmap::new();
+                for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                    allow.insert(i);
+                }
+                let allow = Arc::new(allow);
+
+                // Filtered recall gate: brute-force nearest among the
+                // allowed rows, then measure recall of the filtered kNN
+                // against that filtered ground truth.
+                {
+                    let q_corr = queries_correctness();
+                    let vecs = vectors();
+                    let filtered_gt: Vec<Vec<u32>> = q_corr
+                        .iter()
+                        .map(|q| {
+                            let mut dists: Vec<(f32, u32)> = allow
+                                .iter()
+                                .map(|id| {
+                                    let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
+                                    let dot: f32 =
+                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                    (-dot, id)
+                                })
+                                .collect();
+                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                            dists.truncate(TOP_K);
+                            dists.into_iter().map(|(_, id)| id).collect()
+                        })
+                        .collect();
+                    let mut recalls = Vec::new();
+                    for (q, gt) in q_corr.iter().zip(&filtered_gt) {
+                        let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                            VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::search_opts(
+                                FILTERED_DEFAULT_NPROBE,
+                                FILTERED_DEFAULT_RERANK_MULT,
+                            ),
+                            Some(Arc::clone(&allow)),
+                        ))
+                        .expect("filtered recall query");
+                        recalls.push(corpus::recall_at_k(&hits, gt));
+                    }
+                    let mean: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+                    eprintln!(
+                        "[superfile_vec] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean:.3}",
+                        q_corr.len()
+                    );
+                    assert!(
+                        mean >= 0.80,
+                        "filtered recall@{TOP_K} floor: {mean:.3} < 0.80"
+                    );
+                }
+
+                let vecs = vectors();
+                let q_corr = queries_correctness();
+                let unfiltered_gt = ground_truth_correctness();
+                let filtered_gt: Vec<Vec<u32>> = q_corr
+                    .iter()
+                    .map(|q| {
+                        let mut dists: Vec<(f32, u32)> = allow
+                            .iter()
+                            .map(|id| {
+                                let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
+                                let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                                (-dot, id)
+                            })
+                            .collect();
+                        dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                        dists.truncate(TOP_K);
+                        dists.into_iter().map(|(_, id)| id).collect()
+                    })
+                    .collect();
+
+                /// Maximum multiplier applied by filtered search's
+                /// selectivity boost in the vector reader.
+                const FILTER_MAX_MULT: usize = 64;
+                let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
+                let filtered_nprobe = FILTERED_DEFAULT_NPROBE
+                    .saturating_mul(filter_mult)
+                    .min(corpus::n_cent(n_docs));
+                let filtered_rerank = FILTERED_DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
+                let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
+                let mut rows = Vec::new();
+                for (
+                    label,
+                    set,
+                    gt,
+                    nominal_nprobe,
+                    nominal_rerank,
+                    effective_nprobe,
+                    effective_rerank,
+                    selectivity_label,
+                ) in [
+                    (
+                        "unfiltered",
+                        None,
+                        unfiltered_gt,
+                        UNFILTERED_DEFAULT_NPROBE,
+                        UNFILTERED_DEFAULT_RERANK_MULT,
+                        UNFILTERED_DEFAULT_NPROBE,
+                        UNFILTERED_DEFAULT_RERANK_MULT,
+                        "100.0%".to_string(),
+                    ),
+                    (
+                        "filtered (~10%)",
+                        Some(Arc::clone(&allow)),
+                        &filtered_gt,
+                        FILTERED_DEFAULT_NPROBE,
+                        FILTERED_DEFAULT_RERANK_MULT,
+                        filtered_nprobe,
+                        filtered_rerank,
+                        format!("{:.1}%", selectivity * 100.0),
+                    ),
+                ] {
+                    let mut samples = Vec::new();
+                    let mut recall_samples = Vec::new();
+                    for (qi, q) in q_corr.iter().enumerate() {
+                        for _ in 0..CALIBRATION_P50_ITERS {
+                            let t0 = Instant::now();
+                            let hits = tiers::block_on(reader.vector_hits_filtered_async(
+                                VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                exec_vec::search_opts(nominal_nprobe, nominal_rerank),
+                                set.clone(),
+                            ))
+                            .expect("filtered vector search");
+                            samples.push(t0.elapsed());
+                            recall_samples.push(corpus::recall_at_k(&hits, &gt[qi]));
+                        }
+                    }
+                    samples.sort_unstable();
+                    let ns = samples[samples.len() / 2].as_secs_f64() * NS_PER_SEC;
+                    let mean_recall: f32 =
+                        recall_samples.iter().sum::<f32>() / recall_samples.len() as f32;
+                    rows.push(vec![
+                        text(label),
+                        text(format!("p={nominal_nprobe}, r={nominal_rerank}")),
+                        text(format!("p={effective_nprobe}, r={effective_rerank}")),
+                        text(selectivity_label),
+                        text(format!("{mean_recall:.3}")),
+                        metric(ns, fmt_time(ns), Better::Lower),
+                    ]);
+                }
+                report.emit(&Section {
+                    anchor: "bench/vector/superfile/filtered".into(),
+                    title: format!(
+                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
+                        fmt_count(n_docs)
+                    ),
+                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` includes the reader's selectivity boost. Δ is vs the previous run.".into(),
+                    blocks: vec![Block {
+                        subtitle: String::new(),
+                        headers: vec![
+                            "Filter".into(),
+                            "(p, r)".into(),
+                            "effective (p, r)".into(),
+                            "selectivity".into(),
+                            "recall@10".into(),
+                            "p50".into(),
+                        ],
+                        rows,
+                    }],
+                });
             }
 
             struct SuperfileVecColdGuard {
@@ -1202,20 +1697,21 @@ pub mod sql {
 
     use infino::supertable::Supertable;
 
-    use crate::corpus::{self, MmapTextCorpus};
-    use crate::cost;
-    use crate::executors::sql as exec_sql;
-    use crate::executors::sql::SqlRead;
-    use crate::harness::{
-        EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
-        build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
-        sql_options,
+    use crate::{
+        corpus::{self, MmapTextCorpus},
+        cost,
+        executors::{sql as exec_sql, sql::SqlRead},
+        harness::{
+            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
+            build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
+            sql_options,
+        },
+        markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, RssStats},
+        supertable::Phases,
+        tiers,
     };
-    use crate::markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, RssStats};
-    use crate::supertable::Phases;
-    use crate::tiers;
 
     /// Deterministic category labels assigned round-robin by doc id, so the
     /// planted distribution is exactly known for the correctness gate.

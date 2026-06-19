@@ -46,17 +46,20 @@ pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
 }
 
 pub mod fts {
-    use super::*;
     use std::collections::HashMap;
 
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
-    use infino::supertable::SupertableReader;
+    use infino::{
+        superfile::{SuperfileReader, fts::reader::BoolMode as InfinoBoolMode},
+        supertable::SupertableReader,
+    };
 
-    use crate::harness::{BoolMode, FtsQuery};
-    use crate::markdown::{fmt_count, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{BoolMode, FtsQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Nanoseconds per second, for time-cell formatting.
     const NS_PER_SEC: f64 = 1e9;
@@ -662,18 +665,20 @@ pub mod fts {
 }
 
 pub mod vector {
+    use std::{collections::HashMap, hint::black_box};
+
+    use infino::{
+        superfile::{SuperfileReader, reader::VectorSearchOptions},
+        supertable::Supertable,
+    };
+
     use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
-
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::reader::VectorSearchOptions;
-    use infino::supertable::Supertable;
-
-    use crate::corpus::{self, Calibrated};
-    use crate::markdown::fmt_time;
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use crate::{
+        corpus::{self, Calibrated},
+        markdown::fmt_time,
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Recall correctness gate (shared by both tiers).
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
@@ -750,7 +755,7 @@ pub mod vector {
         ) -> Vec<(u32, f32)> {
             let reader = self.reader();
             let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank))
+                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
             // Per-superfile doc offsets in manifest order. Unfiltered
@@ -1208,15 +1213,28 @@ pub mod vector {
     ) -> Vec<RecallRow> {
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
+        let default_recall: Option<f32>;
         if skip_calibration {
             // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
-            // correctness gate, no recall-target grid — just the fixed
-            // `(default_nprobe, default_rerank)` row below. Needs no ground
-            // truth and no warmed reader, so a cold-only run is fast and
-            // prod-shaped.
+            // high-recall correctness gate, no recall-target grid — only
+            // the fixed `(default_nprobe, default_rerank)` recall sample.
             eprintln!(
-                "[{log_prefix}] skip-calibration: measuring only fixed (p={default_nprobe}, r={default_rerank})",
+                "[{log_prefix}] skip-calibration: VectorSearchOptions::default() → unfiltered p={default_nprobe}, r={default_rerank} ({} queries)...",
+                q_correct.len(),
             );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            eprintln!(
+                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
+            );
+            default_recall = Some(default);
         } else {
             eprintln!(
                 "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
@@ -1237,14 +1255,25 @@ pub mod vector {
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
 
-            if let Some(st) = promote_before_calibration {
-                eprintln!(
-                    "[{log_prefix}] promoting disk cache after correctness before calibration..."
-                );
-                st.wait_until_warm(std::time::Duration::from_secs(600))
-                    .expect("supertable warm promotion after correctness");
-            }
-
+            eprintln!(
+                "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
+                q_correct.len(),
+            );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            assert!(
+                default >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
+            default_recall = Some(default);
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)
             // evaluations (see `calibrate_staircase`).
@@ -1293,7 +1322,9 @@ pub mod vector {
         rows.push(RecallRow {
             target: "default".into(),
             params: format!("p={default_nprobe}, r={default_rerank}"),
-            recall: "—".into(),
+            recall: default_recall
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "—".into()),
             warm: include_warm
                 .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
             cold: include_cold.then(|| {
@@ -1323,16 +1354,17 @@ pub mod vector {
 }
 
 pub mod sql {
-    use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
+    use std::{collections::HashMap, hint::black_box};
 
     use infino::supertable::Supertable;
 
-    use crate::harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery};
-    use crate::markdown::{fmt_count, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Timed query repetitions per query (after one warmup).
     pub const ITERS: usize = 10;
