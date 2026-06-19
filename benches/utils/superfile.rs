@@ -841,6 +841,7 @@ pub mod vector {
 
     use bytes::Bytes;
     use infino::roaring::RoaringBitmap;
+    use infino::superfile::reader::VectorSearchOptions;
 
     use crate::{
         corpus::{self, DIM},

@@ -1055,6 +1055,7 @@ pub mod vector {
                         &q_cal[0],
                         TOP_K,
                         bench_default_opts(),
+                        None,
                     )
                     .expect("warm prewarm vector_hits");
                 consumer
