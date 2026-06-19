@@ -1,0 +1,13 @@
+{
+  "name": "infino-example-agent-memory",
+  "private": true,
+  "type": "module",
+  "description": "Agent long-term memory with infino: hybrid recall + SQL over memory, using a local embedder.",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "infino": "file:../..",
+    "@huggingface/transformers": "^4.2.0"
+  }
+}

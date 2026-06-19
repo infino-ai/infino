@@ -506,7 +506,7 @@ jobs:
           fi
 
       - name: Summarize results
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           # Best-effort parser: never abort early; exit codes are set
           # explicitly below.
@@ -597,7 +597,7 @@ jobs:
       # Pull this run's metric JSONs off the VM so the AI-summary step can diff
       # them against the staged main baseline. Best-effort per report.
       - name: Collect current metrics
-        if: ${{ always() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
@@ -615,7 +615,7 @@ jobs:
       # a flagged metric is a one-off or part of a sustained drift on main.
       # Best-effort: a missing series just drops the trend annotation.
       - name: Collect main history
-        if: ${{ always() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' }}
         env:
           ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
           KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
@@ -649,7 +649,7 @@ jobs:
       # narrate them. Falls back to the deterministic delta table on any model
       # failure or missing creds — the comment is always correct.
       - name: AI summary
-        if: ${{ always() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
           BASELINE_DIR: baseline
@@ -670,7 +670,7 @@ jobs:
       # Sticky PR comment, one per matrix leg. The hidden marker lets a new
       # push edit in place instead of stacking comments.
       - name: Post results to PR
-        if: ${{ always() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' }}
         uses: actions/github-script@v7
         env:
           MARKER: <!-- infino-bench:${{ inputs.bench }}${{ inputs.name_suffix }} -->
@@ -708,7 +708,7 @@ jobs:
             }
 
       - name: Upload full log
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: supertable-bench-log

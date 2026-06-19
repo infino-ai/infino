@@ -1,0 +1,13 @@
+{
+  "name": "infino-example-hybrid-search-api",
+  "private": true,
+  "type": "module",
+  "description": "Embedded hybrid (BM25 + vector) search API over a product catalog — infino in-process, no separate search server.",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "infino": "file:../..",
+    "@huggingface/transformers": "^4.2.0"
+  }
+}

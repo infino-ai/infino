@@ -9,6 +9,11 @@ and vector indexes embedded directly inside it; a table composes many such files
 with snapshot-isolated reads, append-only writes, and atomic commits. It runs in
 your process — there is no daemon, no cluster, and no managed service to operate.
 
+Use it for **RAG**, **agent memory**, **hybrid search**, and **semantic search**:
+it's an embedded **vector database**, **full-text (BM25)** search engine, and
+**SQL** query engine in one library — no separate vector database or search
+server to run.
+
 Synchronous, Arrow at the boundary: pass arrays of objects (or apache-arrow
 `Table`s) in, get plain records out; pass `{ arrow: true }` to a search or query
 for an apache-arrow `Table` instead.
@@ -65,6 +70,18 @@ const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'
 ```
 
 CommonJS works too — `const { connect, IndexSpec } = require("infino");`.
+
+## Examples
+
+Runnable, end-to-end examples in [`examples/`](examples) (each its own folder
+with a README; build the addon first, then `npm install && node index.mjs`):
+
+- [`agent-memory/`](examples/agent-memory) — infino as an AI agent's long-term
+  memory: load a real multi-session conversation, then recall it with hybrid
+  search, query it with SQL (`GROUP BY`, filters), and forget parts of it.
+- [`hybrid-search-api/`](examples/hybrid-search-api) — an embedded HTTP search
+  service over a real product catalog, ranked by native `hybrid_search` — with
+  no separate search server to run.
 
 ## Core concepts
 
@@ -124,6 +141,29 @@ vecs.vectorSearch("emb", queryVector, 10, {
 });
 ```
 
+## Hybrid search
+
+Combine BM25 and vector search in **one query** with the `hybrid_search` table
+function — a single pass over both indexes, fused inside the engine (no separate
+reranker service, no two round-trips). Keyword-only search misses paraphrases;
+vector-only search misses exact terms — hybrid gets both. Results come back
+best-first with a fused `score`.
+
+```javascript
+const spec = new IndexSpec().fts("body").vector("emb", 384, 256, "cosine");
+const docs = db.createTable("docs", { body: "large_utf8", emb: { vector: 384 } }, spec);
+docs.append([{ body: "To cancel a subscription, open Settings then Billing.", emb: embed(/* … */) }]);
+
+// hybrid_search(table, text_col, query_text, vec_col, query_vec, k)
+const qvec = embed("how do I stop my plan?").join(",");
+db.querySql(
+  `SELECT _id, score FROM hybrid_search('docs', 'body', 'cancel subscription', 'emb', '${qvec}', 10)`,
+);
+```
+
+For a complete, runnable hybrid search service see the
+[`hybrid-search-api` example](examples/hybrid-search-api).
+
 ## SQL
 
 Run SQL across the catalog's tables for analytics and filtering; the search
@@ -134,8 +174,10 @@ records (or an apache-arrow `Table` with `{ arrow: true }`).
 db.querySql("SELECT COUNT(*) AS n FROM docs");
 db.querySql("SELECT title FROM docs WHERE title = 'a lazy dog'");
 
-// Search table functions compose in SQL — e.g. hybrid (BM25 + vector) fusion:
-db.querySql("SELECT _id, score FROM hybrid_search('docs', 'title', 'fox', 'emb', '0.1,0.2,…', 10)");
+// The search methods are also SQL table functions — bm25_search, vector_search,
+// and hybrid_search (see "Hybrid search" above) — so you can filter, join, and
+// aggregate over search results.
+db.querySql("SELECT _id, score FROM bm25_search('docs', 'title', 'fox', 10)");
 ```
 
 ## Projections
@@ -270,6 +312,35 @@ npm install && npm run build && npm test
 
 - The API is **synchronous**. In a long-running server, run calls in a
   `worker_thread` so a query doesn't block the event loop.
+
+## FAQ
+
+**Is infino a vector database?** It does vector search, but it's more than that —
+an embedded engine that runs vector search *and* full-text (BM25) *and* SQL over
+one copy of your data. Reach for it wherever you'd use a vector database, plus the
+cases a vector store alone can't cover: keyword search, filtering, joins, and
+aggregates.
+
+**Does it need a server?** No. It runs in your Node.js process — no daemon, no
+cluster, no managed service. Your data is Parquet on local disk or S3.
+
+**Can it do hybrid (keyword + vector) search?** Yes, natively — BM25 and vector
+fused in a single pass via `hybrid_search` (see [Hybrid search](#hybrid-search)),
+not a client-side rerank.
+
+**Where is my data stored?** As Apache Parquet files on local disk or any
+S3-compatible object store; each file embeds its own BM25 and vector indexes.
+
+**Does it work with TypeScript?** Yes — the package ships type definitions and the
+API is identical from JavaScript and TypeScript. Both ESM `import` and CommonJS
+`require` work.
+
+**Do I need a Rust toolchain to install it?** No — a prebuilt native binary is
+selected automatically at install (macOS and Linux, x64 and arm64).
+
+**Is it a good fit for RAG or agent memory?** Yes, that's a primary use case:
+store documents or conversation history once, retrieve with hybrid search, and
+filter/aggregate with SQL. See the runnable [examples](examples).
 
 ## License
 
