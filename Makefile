@@ -136,12 +136,12 @@ python-examples-test:
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
 	@status=0; \
-	for nb in infino-python/examples/[0-9]*.ipynb; do \
+	for nb in infino-python/examples/*/[0-9]*.ipynb; do \
 		echo "executing $$nb"; \
 		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
 			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
 	done; \
-	rm -rf infino-python/examples/*_data infino-python/examples/_shared/__pycache__; \
+	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
 	exit $$status
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
