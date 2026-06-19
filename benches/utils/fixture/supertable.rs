@@ -73,8 +73,8 @@ pub fn ingest_recorded() -> bool {
     INGEST.get().is_some()
 }
 
-/// FTS-only supertable ingest (apples-to-apples vs Tantivy). Separate storage
-/// prefix + fixture from the combined build.
+/// FTS-only supertable ingest. Separate storage prefix + fixture from the
+/// combined build.
 pub fn ensure_fts_ingest(reason: &str) -> &'static IngestResult {
     if FTS_INGEST.get().is_none() {
         eprintln!(
@@ -105,7 +105,7 @@ pub fn fts_ingest_recorded() -> bool {
     FTS_INGEST.get().is_some()
 }
 
-/// Vector-only supertable ingest (apples-to-apples vs Lance vector-only).
+/// Vector-only supertable ingest.
 pub fn ensure_vector_ingest(reason: &str) -> &'static IngestResult {
     if VEC_INGEST.get().is_none() {
         eprintln!(

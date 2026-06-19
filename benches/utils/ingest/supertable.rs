@@ -94,9 +94,9 @@ pub struct IngestResult {
     pub sql_sample_key: Option<String>,
 }
 
-/// Which index shapes a supertable build includes. Drives apples-to-apples
-/// ingest comparisons: `Fts` vs Tantivy (FTS-only), `Vector` vs Lance
-/// (vector-only), `Combined` vs a combined Lance table.
+/// Which index shapes a supertable build includes: `Fts` builds only the
+/// FTS index, `Vector` only the vector index, `Combined` both — so each
+/// shape's ingest cost is measured in isolation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Modality {
     Fts,
@@ -498,8 +498,8 @@ impl PhaseTimings {
 /// Ingest the corpus chunk by chunk → append → commit → object storage,
 /// building only the index shapes named by `modality`. `src` supplies each
 /// chunk (resident mmap or streamed); the loop is the same either way. The
-/// corpus is identical across modalities (same seeds), so each shape is
-/// directly comparable to its single-modality competitor.
+/// corpus is identical across modalities (same seeds), so each shape's cost
+/// is directly comparable across runs.
 fn build_on_storage_inner(modality: Modality, src: &mut dyn ChunkSource) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();

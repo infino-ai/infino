@@ -3,12 +3,10 @@
 
 //! Engine-generic benchmark harness.
 //!
-//! Defines the [`FtsEngine`] trait so one driver ([`run_fts`]) can
-//! measure infino and other retrieval engines through identical code.
-//! infino ships the reference implementation ([`InfinoFtsEngine`]); the
-//! external comparison crate implements the trait for
-//! other engines (Tantivy, DuckDB, LanceDB, CoreDB) and drives them all
-//! the same way, against a byte-identical [`crate::corpus::MmapTextCorpus`].
+//! Defines the [`FtsEngine`] trait so one driver ([`run_fts`]) measures a
+//! retrieval engine through a fixed open/write/read contract. infino ships
+//! the implementation ([`InfinoFtsEngine`]); the driver runs it against a
+//! byte-identical [`crate::corpus::MmapTextCorpus`].
 //!
 //! The three verbs the driver measures are:
 //!
@@ -17,9 +15,8 @@
 //!     ready to query (the build phase).
 //!   - [`FtsEngine::read`]  — run a BM25 query (the search phase).
 //!
-//! Memory (RSS) and timing reuse the same [`crate::rss`] sampler the
-//! in-tree infino benches use, so internal and comparison numbers are
-//! produced by one measurement path.
+//! Memory (RSS) and timing reuse the same [`crate::rss`] sampler the other
+//! infino benches use, so every number comes from one measurement path.
 
 pub mod driver;
 mod infino_engine;
@@ -114,9 +111,8 @@ pub trait FtsEngine {
     /// Build the corpus from scratch with `writers` concurrent writers,
     /// for the build-throughput row only — nothing queryable is kept.
     /// `writers == 1` is the single-writer build; `> 1` is the engine's
-    /// parallel build (infino shards across builders; Tantivy uses that
-    /// many indexing threads). Lets the driver compare ingest at 1 vs N
-    /// writers apples-to-apples without favoring any engine.
+    /// parallel build (infino shards across that many builders). Lets the
+    /// driver compare ingest at 1 vs N writers.
     fn parallel_write(column: &str, docs: &[(u64, &str)], writers: usize);
 
     /// BM25 top-`k` over already-tokenized `terms`, returning hits
