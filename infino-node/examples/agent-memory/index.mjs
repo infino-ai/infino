@@ -51,7 +51,11 @@ async function fetchJson(url, attempt = 0) {
 }
 
 process.stderr.write("loading a conversation …\n");
-const conv = (await fetchJson(SOURCE))[0].conversation; // one multi-session conversation
+const payload = await fetchJson(SOURCE);
+if (!Array.isArray(payload) || !payload[0]?.conversation) {
+  throw new Error("unexpected dataset shape — expected a non-empty array of conversations");
+}
+const conv = payload[0].conversation; // one multi-session conversation
 
 // Each message becomes one memory, prefixed with its session timestamp (so
 // "when did X happen?" is answerable) and tagged with the session + speaker.

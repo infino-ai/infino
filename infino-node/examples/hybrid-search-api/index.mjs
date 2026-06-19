@@ -139,25 +139,33 @@ const server = createServer(async (req, res) => {
 // ephemeral port (0) so CI never collides with whatever's already on 3000.
 const PORT = Number(process.env.PORT ?? (process.env.SMOKE ? 0 : 3000));
 server.listen(PORT, async () => {
-  const port = server.address().port;
-  // Self-check on startup, so `node index.mjs` doubles as an end-to-end smoke
-  // test. Results depend on a live dataset sample, so we assert SHAPE (the
-  // endpoint works and hybrid ranking returns well-formed rows), not an exact hit.
-  const res = await fetch(`http://localhost:${port}/search?q=${encodeURIComponent("a thoughtful birthday gift")}&k=5`);
-  const body = await res.json();
-  assert.equal(res.status, 200, "search endpoint should return 200");
-  assert.ok(body.results.length > 0, "search should return results");
-  assert.equal(typeof body.results[0].title, "string");
-  assert.ok(body.results[0].title.length > 0, "result should have a title");
-  assert.ok(Number.isFinite(body.results[0].price), "result should have a numeric price");
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+    const port = address.port;
+    // Self-check on startup, so `node index.mjs` doubles as an end-to-end smoke
+    // test. Results depend on a live dataset sample, so we assert SHAPE (the
+    // endpoint works and hybrid ranking returns well-formed rows), not an exact hit.
+    const res = await fetch(`http://localhost:${port}/search?q=${encodeURIComponent("a thoughtful birthday gift")}&k=5`);
+    const body = await res.json();
+    assert.equal(res.status, 200, "search endpoint should return 200");
+    assert.ok(body.results.length > 0, "search should return results");
+    assert.equal(typeof body.results[0].title, "string");
+    assert.ok(body.results[0].title.length > 0, "result should have a title");
+    assert.ok(Number.isFinite(body.results[0].price), "result should have a numeric price");
 
-  console.log(`✓ hybrid search API listening on http://localhost:${port} (${rows.length} products)`);
-  console.log(`  try: curl 'http://localhost:${port}/search?q=gift+for+someone+who+loves+cooking'`);
-  console.log(`       curl 'http://localhost:${port}/search?q=something+to+keep+skin+moisturized'`);
+    console.log(`✓ hybrid search API listening on http://localhost:${port} (${rows.length} products)`);
+    console.log(`  try: curl 'http://localhost:${port}/search?q=gift+for+someone+who+loves+cooking'`);
+    console.log(`       curl 'http://localhost:${port}/search?q=something+to+keep+skin+moisturized'`);
 
-  // CI runs with SMOKE=1: the self-check passed, so exit cleanly.
-  if (process.env.SMOKE) {
-    console.log("✓ self-check passed");
+    // CI runs with SMOKE=1: the self-check passed, so exit cleanly.
+    if (process.env.SMOKE) {
+      console.log("✓ self-check passed");
+      server.close();
+    }
+  } catch (e) {
+    // Close the listener so a failed self-check terminates instead of hanging.
     server.close();
+    throw e;
   }
 });
