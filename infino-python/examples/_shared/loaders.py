@@ -4,6 +4,7 @@ Each loader takes the first `n` rows; raise `n` to index more. The first call
 downloads from the Hub; later calls are cached.
 """
 
+import datetime as dt
 import os
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -164,3 +165,43 @@ def load_code_search(n: int = 800) -> list[dict]:
         if len(funcs) >= n:
             break
     return funcs
+
+
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_hackernews(n: int = 4000) -> list[dict]:
+    """Hacker News stories from `julien040/hacker-news-posts` (posts only).
+
+    The `time` field is a Unix epoch; we derive a `"YYYY-MM-DD HH:MM:SS"`
+    string plus `year` / `month` for SQL bucketing. `points` is the upvote count
+    (named to avoid clashing with the BM25 relevance `score`). Returns
+    `[{"title", "by", "url", "points", "num_comments", "time", "month", "year"}]`.
+    """
+    stream = load_dataset("julien040/hacker-news-posts", split="train", streaming=True)
+    stories: list[dict] = []
+    for row in stream:
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+        try:
+            when = dt.datetime.fromtimestamp(int(row["time"]), dt.timezone.utc)
+        except (TypeError, ValueError, KeyError):
+            continue
+        stories.append({
+            "title": title,
+            "by": str(row.get("author") or "unknown"),
+            "url": str(row.get("url") or ""),
+            "points": _to_int(row.get("score")),
+            "num_comments": _to_int(row.get("comments")),
+            "time": when.strftime("%Y-%m-%d %H:%M:%S"),
+            "month": when.strftime("%Y-%m"),
+            "year": when.year,
+        })
+        if len(stories) >= n:
+            break
+    return stories

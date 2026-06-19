@@ -14,6 +14,7 @@ and runs **locally and key-free**.
 | ------ | -------------- |
 | [`rag/`](rag/) | Retrieval-Augmented Generation — chunk, embed, retrieve (vector / hybrid / filtered / conversational) and ground an answer |
 | [`code_search/`](code_search/) | Code search — exact symbol lookup, natural-language (vector), keyword (BM25), and hybrid search over one table |
+| [`analytics/`](analytics/) | SQL analytics + full-text — `GROUP BY` time-series, top-N, and leaderboards alongside BM25 search, no vector index |
 
 More categories are on the way.
 
