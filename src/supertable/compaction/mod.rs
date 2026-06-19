@@ -488,10 +488,12 @@ Ok(())
             }
         }
 
-        let is_cell_posting = inputs
-            .first()
-            .map(|e| e.vector_layout == VectorLayout::CellPosting)
-            .unwrap_or(false);
+        // Authoritative for the hidden table: its own options layout decides the
+        // merge path. Keying off an input entry's `vector_layout` is unsafe
+        // because the generic `build_from_readers` path drops the cell-posting
+        // vec blob (the CellPosting reader exposes no fp32 vectors), publishing
+        // a vec-less superfile the query layer then can't read.
+        let is_cell_posting = self.inner().options.vector_layout == VectorLayout::CellPosting;
         let merged_segment = if is_cell_posting {
             self.merge_cell_posting_superfiles(&inputs).await
         } else {
@@ -514,10 +516,14 @@ Ok(())
             partition_key,
             partition_hint,
             subsection_offsets: merged_old.subsection_offsets.clone(),
-            vector_layout: inputs
-                .first()
-                .map(|e| e.vector_layout)
-                .unwrap_or(crate::superfile::vector::layout::VectorLayout::Ivf),
+            vector_layout: if is_cell_posting {
+                VectorLayout::CellPosting
+            } else {
+                inputs
+                    .first()
+                    .map(|e| e.vector_layout)
+                    .unwrap_or(VectorLayout::Ivf)
+            },
         });
         let new_entries = vec![merged_entry];
         let mut pending_storage_writes = vec![

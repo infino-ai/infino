@@ -2043,6 +2043,17 @@ pub(super) fn prepare_superfile_with_uri(
     // fire the parquet-footer, vector, and FTS subsection GETs in
     // parallel on cold open (1 RTT instead of 2 sequential).
     let subsection_offsets = build_subsection_offsets(&shard.bytes);
+    let vector_layout = read_vector_layout_from_bytes(&shard.bytes);
+    if vector_layout == VectorLayout::CellPosting
+        && subsection_offsets.as_ref().and_then(|o| o.vec).is_none()
+    {
+        let kvs = crate::superfile::format::footer::read_kv_metadata(shard.bytes.as_ref())
+            .map(|kvs| kvs.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        return Err(BuildError::Store(format!(
+            "cell-posting superfile missing inf.vec offset/length; kv_keys={kvs:?}"
+        )));
+    }
 
     let entry = Arc::new(SuperfileEntry {
         superfile_id: uuid::Uuid::new_v4(),
@@ -2059,7 +2070,7 @@ pub(super) fn prepare_superfile_with_uri(
         partition_key: Vec::new(),
         partition_hint: None,
         subsection_offsets,
-        vector_layout: read_vector_layout_from_bytes(&shard.bytes),
+        vector_layout,
     });
 
     Ok(Some(PreparedSuperfile {
@@ -2496,7 +2507,7 @@ pub async fn write_superfile_list(
     // Bound object-store fanout to the writer-pool width. A vector commit can
     // stage one hidden delta per touched cell plus user shards; driving all PUTs
     // at once opens dozens of Azure sockets and can stall the commit path.
-    let write_concurrency = opts.writer_pool.current_num_threads().max(1);
+    let write_concurrency = opts.writer_pool.current_num_threads().div_ceil(2).max(1);
 
     let replace_futs = pending_storage_replaces
         .iter()
