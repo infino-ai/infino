@@ -124,9 +124,14 @@ python-wheel:
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
+# How many example notebooks to execute concurrently. Override on the command
+# line (e.g. `make python-examples-test CONCURRENT_EXAMPLE_TESTS=2`) on smaller runners.
+CONCURRENT_EXAMPLE_TESTS ?= 4
+
 # Build the bindings from source, install the examples' deps, and run every
-# notebook with nbconvert (a failing cell fails the target). Scratch tables are
-# cleaned afterwards; the venv is a reused throwaway (gitignored).
+# notebook with nbconvert (a failing cell fails the target). Notebooks run in
+# parallel; each uses a distinct scratch dir, so they don't collide. Scratch
+# tables are cleaned afterwards; the venv is a reused throwaway (gitignored).
 python-examples-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
@@ -135,12 +140,15 @@ python-examples-test:
 	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
-	@status=0; \
-	for nb in infino-python/examples/*/[0-9]*.ipynb; do \
-		echo "executing $$nb"; \
-		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
-			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
-	done; \
+	# Warm the shared embedding model once so parallel workers hit a populated
+	# cache instead of racing to download it.
+	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
+		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
+	@ls infino-python/examples/*/[0-9]*.ipynb | \
+	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
+		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \
+	status=$$?; \
 	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
 	exit $$status
 
