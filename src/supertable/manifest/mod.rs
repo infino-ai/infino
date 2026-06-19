@@ -630,7 +630,7 @@ impl Manifest {
     /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
     /// operation may create new ManifestParts. The function also returns the new ManifestParts that
     /// the caller can decide to write to storage.
-    pub async fn rebalance(
+    pub async fn update(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
@@ -2523,7 +2523,7 @@ mod tests {
         assert!(r.is_none(), "type mismatch drops the stat");
     }
 
-    // ---- Manifest::rebalance -------------------------------------------
+    // ---- Manifest::update-------------------------------------------
     fn make_superfile_entry(docs: u64, pk: Vec<u8>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
             superfile_id: uuid::Uuid::new_v4(),
@@ -2582,7 +2582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_fresh_start_cold_partition_should_create_entry() {
+    async fn update_fresh_start_cold_partition_should_create_entry() {
         let opts = make_opts();
         let old_manifest = empty_manifest(&opts);
         let pk = hash_bucket_0_pk();
@@ -2591,9 +2591,9 @@ mod tests {
         let new_entries = vec![new_entry];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 1);
@@ -2605,7 +2605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_fresh_start_multiple_cold_partitions_should_create_entries() {
+    async fn update_fresh_start_multiple_cold_partitions_should_create_entries() {
         // With Hash strategy (n_buckets=1), all entries map to the same partition.
         let opts = make_opts();
         let old_manifest = empty_manifest(&opts);
@@ -2616,9 +2616,9 @@ mod tests {
         let new_entries = vec![entry1, entry2];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 1);
@@ -2638,7 +2638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_add_to_existing_partition_rewrites_part() {
+    async fn update_add_to_existing_partition_rewrites_part() {
         // Adding a new entry to an existing single-part partition rewrites that part.
         let opts = make_opts();
         let pk_untouched = hash_bucket_0_pk();
@@ -2704,9 +2704,9 @@ mod tests {
         let new_entries = vec![new_entry];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Should have 1 list entry (rewritten old one)
@@ -2725,14 +2725,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_leaves_unchanged_parts_untouched() {
+    async fn update_leaves_unchanged_parts_untouched() {
         // Start with three parts, two superfiles each:
         //   - part_a_old, part_a_latest  → partition A (pk_a)
         //   - part_b                     → partition B (pk_b)
         // The latest part for A has room for one more superfile
         // (target = 3, so 2 + 1 = 3 stays within target → rewrite, no
         // split). We then commit a single new superfile into partition
-        // A. After rebalance ONLY the latest A part should change; the
+        // A. After update ONLY the latest A part should change; the
         // frozen older A part and the entire B partition must carry
         // over byte-for-byte — same part_id, uri, and content_hash —
         // and must NOT be re-emitted into `parts_to_write` (no
@@ -2744,7 +2744,7 @@ mod tests {
         let pk_b = hash2_pk(1);
         let (_dir, storage) = local_storage();
 
-        // Attach storage so the manifests `rebalance` derives also carry
+        // Attach storage so the manifests `update` derives also carry
         // a loader — the second (removal) phase loads carried-over parts
         // (A_old, B) back from storage.
         let mut base_opts =
@@ -2846,9 +2846,9 @@ mod tests {
         // around — the second phase below removes it again.
         let new_entry = make_superfile_entry_hinted(140, pk_a.clone(), 0);
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(from_ref(&new_entry), &[])
+            .update(from_ref(&new_entry), &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Three list entries remain (A_old carried over, A_latest
@@ -2868,7 +2868,7 @@ mod tests {
             list_entries
                 .iter()
                 .find(|e| e.part_id == part_id)
-                .unwrap_or_else(|| panic!("entry for part {part_id:?} missing after rebalance"))
+                .unwrap_or_else(|| panic!("entry for part {part_id:?} missing after update"))
         };
 
         let a_old_after = find(pw_a_old.part_id);
@@ -2919,9 +2919,9 @@ mod tests {
             .part_id;
 
         let (after_removal, removal_parts) = new_manifest
-            .rebalance(&[], from_ref(&new_entry))
+            .update(&[], from_ref(&new_entry))
             .await
-            .expect("rebalance removal");
+            .expect("update removal");
         let entries_after = after_removal.get_all_list_entries();
 
         assert_eq!(entries_after.len(), 3, "list entry count after removal");
@@ -2984,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_rewrite_partition_within_target() {
+    async fn update_rewrite_partition_within_target() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
@@ -3054,9 +3054,9 @@ mod tests {
         let new_entries = vec![new_entry];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Rewrite case: 1 list entry (old entry replaced), 1 new part
@@ -3076,7 +3076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_split_partition_exceeds_target() {
+    async fn update_split_partition_exceeds_target() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
@@ -3147,9 +3147,9 @@ mod tests {
         let new_entries = vec![new_entry1, new_entry2];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Split case: 2 list entries (old + fresh for split), 1 new part (fresh)
@@ -3194,7 +3194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_older_entry_preserved_when_latest_rewritten() {
+    async fn update_older_entry_preserved_when_latest_rewritten() {
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
@@ -3289,9 +3289,9 @@ mod tests {
         let new_entries = vec![make_superfile_entry(75, pk.clone())];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Expect: old entry (preserved) + latest entry (rewritten) = 2 list entries
@@ -3320,7 +3320,7 @@ mod tests {
     // ---- cross-partition tests --------------------------------------------
 
     #[tokio::test]
-    async fn rebalance_two_partitions_both_touched() {
+    async fn update_two_partitions_both_touched() {
         // Two distinct partitions each have one existing superfile; a new
         // entry is added to both. Both should be rewritten independently.
         let mut base_opts =
@@ -3420,9 +3420,9 @@ mod tests {
         ];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Both partitions are rewritten: 2 list entries, 2 new parts
@@ -3447,7 +3447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_two_partitions_one_touched_exact_carry_over() {
+    async fn update_two_partitions_one_touched_exact_carry_over() {
         // Partition A is touched (gets a new entry); partition B is not.
         // Verifies that B's list entry carries over with the exact URI and
         // content_hash that were written — no re-encode, no PUT.
@@ -3546,9 +3546,9 @@ mod tests {
         let new_entries = vec![make_superfile_entry_hinted(50, pk_a.clone(), 0)];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // 2 list entries (A rewritten, B carried over), 1 new part (A only)
@@ -3570,7 +3570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_two_partitions_each_with_prior_split() {
+    async fn update_two_partitions_each_with_prior_split() {
         // Each partition already has two parts from a prior split: an older
         // frozen part and a latest mutable part. Adding one new entry to each
         // partition should rewrite only the latest part for each, carrying
@@ -3723,9 +3723,9 @@ mod tests {
         ];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, &[])
+            .update(&new_entries, &[])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // 4 list entries: [a_old, a_rewritten, b_old, b_rewritten]
@@ -3763,7 +3763,7 @@ mod tests {
     // ---- removal tests ---------------------------------------------------
 
     #[tokio::test]
-    async fn rebalance_remove_one_superfile_from_partition() {
+    async fn update_remove_one_superfile_from_partition() {
         // Partition has 2 superfiles; remove one. Verifies the part is
         // rewritten containing only the superfile that was not removed.
         let opts = make_opts();
@@ -3826,9 +3826,9 @@ mod tests {
         });
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&[], from_ref(&sf_remove))
+            .update(&[], from_ref(&sf_remove))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Part rewritten with 1 superfile; no cold entries
@@ -3846,7 +3846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_add_and_remove_in_same_partition() {
+    async fn update_add_and_remove_in_same_partition() {
         // One new superfile is added while one existing superfile is removed
         // in the same partition. The resulting part should contain the
         // surviving existing superfile plus the new one — not the removed one.
@@ -3917,9 +3917,9 @@ mod tests {
         let new_entries = vec![sf_new.clone()];
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&new_entries, from_ref(&sf_remove))
+            .update(&new_entries, from_ref(&sf_remove))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Net result: 1 list entry, 1 part — sf_keep + sf_new, sf_remove absent
@@ -3944,7 +3944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_remove_from_one_partition_other_carried_over_exactly() {
+    async fn update_remove_from_one_partition_other_carried_over_exactly() {
         // Two partitions: remove a superfile from partition A, leave partition B alone.
         // Verifies partition B's list entry is carried over with the exact URI and
         // content_hash — no re-encode, no PUT — while partition A is rewritten.
@@ -4037,9 +4037,9 @@ mod tests {
         });
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&[], from_ref(&sf_a_remove))
+            .update(&[], from_ref(&sf_a_remove))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // 2 list entries, 1 new part (only partition A was rewritten)
@@ -4065,7 +4065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_remove_from_latest_part_in_split_partition() {
+    async fn update_remove_from_latest_part_in_split_partition() {
         // Partition A has two parts from a prior split: part_a_old (frozen, 1 sf)
         // and part_a_latest (mutable, 2 sfs). We remove sf_a_latest_remove,
         // which lives in the SECOND (latest) part.
@@ -4176,9 +4176,9 @@ mod tests {
         });
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], from_ref(&sf_a_latest_remove))
+            .update(&[], from_ref(&sf_a_latest_remove))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 2);
@@ -4214,7 +4214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_remove_all_superfiles_empties_partition() {
+    async fn update_remove_all_superfiles_empties_partition() {
         // All superfiles in a partition are removed. Documents the current
         // behavior: the list entry survives with n_superfiles=0 and the
         // part has no superfiles (empty partition).
@@ -4278,9 +4278,9 @@ mod tests {
         });
 
         let (new_manifest, parts) = old_manifest
-            .rebalance(&[], &[sf1.clone(), sf2.clone()])
+            .update(&[], &[sf1.clone(), sf2.clone()])
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         // Both superfiles removed: list entry remains with n_superfiles=0
@@ -4292,7 +4292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_remove_nonexistent_superfile_id_is_noop() {
+    async fn update_remove_nonexistent_superfile_id_is_noop() {
         // entries_to_remove contains a superfile_id that is not present in any
         // part. The filter matches nothing and both original superfiles survive.
         // The part is still rewritten (the removal loop doesn't skip parts where
@@ -4360,9 +4360,9 @@ mod tests {
         let sf_ghost = make_superfile_entry(50, pk.clone());
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], from_ref(&sf_ghost))
+            .update(&[], from_ref(&sf_ghost))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 1);
@@ -4372,7 +4372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_remove_from_older_frozen_part_in_split_partition() {
+    async fn update_remove_from_older_frozen_part_in_split_partition() {
         // Partition A has two parts from a prior split: part_a_old (frozen, 2
         // sfs: sf_a_old_keep + sf_a_old_remove) and part_a_latest (mutable, 1
         // sf). We remove sf_a_old_remove, which lives in the FIRST (older,
@@ -4480,9 +4480,9 @@ mod tests {
         });
 
         let (new_manifest, parts_to_write) = old_manifest
-            .rebalance(&[], from_ref(&sf_a_old_remove))
+            .update(&[], from_ref(&sf_a_old_remove))
             .await
-            .expect("rebalance");
+            .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 2);

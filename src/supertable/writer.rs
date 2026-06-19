@@ -1819,9 +1819,9 @@ pub(crate) async fn try_commit_attempt(
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
-    // 2. Rebalance the manifest for the commit.
+    // 2. update the manifest for the commit.
     let (new_manifest, parts_to_write) = current_manifest
-        .rebalance(new_entries, entries_to_remove)
+        .update(new_entries, entries_to_remove)
         .await?;
 
     // 3. Read the prior pointer's etag for the CAS. Fresh
