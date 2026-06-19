@@ -722,7 +722,13 @@ pub struct MmapVectorCorpus {
 
 impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
-        Self::generate_with_chunk(n_docs, n_cent, seed, normalize_each, VECTOR_CORPUS_CHUNK_DOCS)
+        Self::generate_with_chunk(
+            n_docs,
+            n_cent,
+            seed,
+            normalize_each,
+            VECTOR_CORPUS_CHUNK_DOCS,
+        )
     }
 
     /// `chunk_docs` is a parameter only so tests can exercise the multi-chunk
@@ -869,7 +875,13 @@ pub struct StreamingVectorCorpus {
 
 impl StreamingVectorCorpus {
     pub fn new(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
-        Self::new_with_chunk_docs(n_docs, n_cent, seed, normalize_each, VECTOR_CORPUS_CHUNK_DOCS)
+        Self::new_with_chunk_docs(
+            n_docs,
+            n_cent,
+            seed,
+            normalize_each,
+            VECTOR_CORPUS_CHUNK_DOCS,
+        )
     }
 
     fn new_with_chunk_docs(
@@ -1546,11 +1558,19 @@ mod tests {
     /// boundaries (mirrors the text uneven-split test).
     #[test]
     fn streaming_vector_uneven_splits_are_stable() {
-        let mut whole =
-            StreamingVectorCorpus::new(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
+        let mut whole = StreamingVectorCorpus::new(
+            STREAM_TEST_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+        );
         let whole = whole.next_flat(STREAM_TEST_DOCS);
-        let mut split =
-            StreamingVectorCorpus::new(STREAM_TEST_DOCS, STREAM_TEST_N_CENT, STREAM_TEST_SEED, true);
+        let mut split = StreamingVectorCorpus::new(
+            STREAM_TEST_DOCS,
+            STREAM_TEST_N_CENT,
+            STREAM_TEST_SEED,
+            true,
+        );
         let mut pieced = Vec::new();
         for len in [333, 1000, 1, 2762] {
             pieced.extend(split.next_flat(len));
@@ -1588,7 +1608,11 @@ mod tests {
         }
         assert_eq!(titles.len(), STREAM_TEST_MULTI_DOCS);
         for (i, title) in titles.iter().enumerate() {
-            assert_eq!(title, disk.doc(i), "doc {i} differs across a chunk boundary");
+            assert_eq!(
+                title,
+                disk.doc(i),
+                "doc {i} differs across a chunk boundary"
+            );
         }
     }
 

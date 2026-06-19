@@ -425,7 +425,11 @@ impl ChunkSource for StreamingSource {
         assert_eq!(self.served, start, "streaming chunk requested out of order");
         let title = modality.has_text().then(|| {
             let titles = self.text.as_mut().expect("text corpus").next_titles(len);
-            assert_eq!(titles.len(), len, "streaming text source returned a short chunk");
+            assert_eq!(
+                titles.len(),
+                len,
+                "streaming text source returned a short chunk"
+            );
             LargeStringArray::from_iter_values(titles)
         });
         let vectors = modality.has_vector().then(|| {
@@ -488,7 +492,13 @@ struct PhaseTimings {
 impl PhaseTimings {
     fn log(&self, modality: Modality) {
         let total = (self.generate + self.append + self.commit).as_secs_f64();
-        let pct = |d: Duration| if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 };
+        let pct = |d: Duration| {
+            if total > 0.0 {
+                d.as_secs_f64() / total * 100.0
+            } else {
+                0.0
+            }
+        };
         eprintln!(
             "[supertable_ingest] {} phase split: generate {:.1}s ({:.0}%), \
              append {:.1}s ({:.0}%), commit {:.1}s ({:.0}%)",
