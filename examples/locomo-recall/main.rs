@@ -76,6 +76,8 @@ struct Case {
     question: String,
     #[serde(default)]
     category: String,
+    #[serde(default)]
+    gold: String,
     #[serde(rename = "queryVector")]
     query_vector: Vec<f32>,
     expected: Vec<String>,
@@ -387,6 +389,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut focus_missing = false;
     for (i, s) in &selected {
         println!("\n[#{i}] ({}) {}", s.case.category, s.case.question);
+        if !s.case.gold.is_empty() {
+            println!("  gold answer: {}", s.case.gold);
+        }
         if s.expected_present.is_empty() {
             println!("  no evidence in the corpus — not scored (adversarial / open inference)");
             continue;

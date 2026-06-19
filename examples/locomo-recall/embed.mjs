@@ -115,6 +115,8 @@ function qaOf(item) {
     .map((q) => ({
       question: q.question,
       category: CAT[q.category] ?? `cat-${q.category ?? "?"}`,
+      // the gold answer — carried so the repro can show query → answer → evidence
+      gold: String(q.answer ?? q.adversarial_answer ?? ""),
       // LOCOMO sometimes packs several dia_ids in one evidence string ("D8:6; D9:17").
       evidence: (Array.isArray(q.evidence) ? q.evidence : []).flatMap((e) => String(e).match(/D\d+:\d+/g) || []),
     }));
@@ -166,6 +168,7 @@ async function fetchJson(url, attempt = 0) {
     cases: qas.map((q, i) => ({
       question: q.question,
       category: q.category,
+      gold: q.gold,
       queryVector: qVecs[i],
       // keep only evidence ids that point at a real memory (some point at skipped/empty turns)
       expected: q.evidence.filter((d) => memIds.has(d)),
