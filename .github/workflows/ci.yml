@@ -222,6 +222,42 @@ jobs:
       # Builds the addon (debug) + runs the node:test smoke suite.
       - run: make node-test
 
+  # End-to-end: run the Node examples against a freshly built addon (mirrors the
+  # python-examples job). They fetch real public datasets and download a model,
+  # so this is its own parallel job — it never slows the `node` smoke job — and is
+  # meant to stay NON-required: a Hub outage shouldn't block a merge. The
+  # deterministic gate is the `node` job's `make node-test`.
+  node-examples:
+    name: Node examples (end to end)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Build infino as a normal dep — don't fail on a transitive deprecation warning.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infino-node
+      # Build the addon (debug); the examples' `file:../..` dependency links it.
+      - run: cd infino-node && npm install && npm run build:debug
+      # Run each example end to end (self-asserting; non-zero exit fails the job).
+      - run: make node-example
+
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
