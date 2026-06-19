@@ -69,10 +69,9 @@ use crate::superfile::format::vec::{
     dir_entry, outer_hdr, sub_hdr,
 };
 use crate::superfile::format::{footer::read_kv_metadata, kv};
+use crate::supertable::error::ManifestError;
 use crate::supertable::manifest::Manifest;
 use crate::supertable::manifest::commit::get_current_manifest_etag;
-use crate::supertable::manifest::commit::{self as commit_mod};
-use crate::supertable::manifest::list::{FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList};
 use crate::supertable::manifest::part::{self as part_mod, PartId};
 use crate::supertable::{CommitError as SupertableCommitError, ManifestLoadError};
 
@@ -81,7 +80,7 @@ use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
 use super::manifest::{
-    FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use super::mutations::{
     CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -987,7 +986,7 @@ pub struct ShardOutput {
     /// aggregate kernels; types whose ordering isn't well-defined
     /// (FixedSizeList, struct, etc.) are absent and treated as
     /// "can't prune" by the skip planner.
-    scalar_stats: ScalarStatsTable,
+    scalar_stats: HashMap<String, ScalarStatsAgg>,
 }
 
 impl ShardOutput {
@@ -996,7 +995,7 @@ impl ShardOutput {
         n_docs: u64,
         id_min: i128,
         id_max: i128,
-        scalar_stats: ScalarStatsTable,
+        scalar_stats: HashMap<String, ScalarStatsAgg>,
     ) -> Self {
         Self {
             bytes,
@@ -1060,7 +1059,7 @@ fn build_one_shard(
     // batches into the builder via `finish`. We pass references —
     // `from_batches` doesn't take ownership.
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
-    let scalar_stats = ScalarStatsTable::from_batches(&scalar_schema, &scalar_batches);
+    let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
     let bytes = Bytes::from(builder.finish()?);
 
@@ -1370,7 +1369,7 @@ pub(super) fn prepare_superfile(
     )
     .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
 
-    let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
+    let mut fts_summary: HashMap<String, FtsSummaryAgg> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
             let terms = fts_reader
@@ -1387,11 +1386,11 @@ pub(super) fn prepare_superfile(
             }
             fts_summary.insert(
                 fc.column.clone(),
-                FtsSummary {
-                    term_bloom: bloom_builder.finish(),
+                FtsSummaryAgg::new_with_params(
+                    bloom_builder.finish(),
                     n_terms_distinct,
-                    term_range: (min_term, max_term),
-                },
+                    (min_term, max_term),
+                ),
             );
         }
     }
@@ -1515,9 +1514,8 @@ fn publish_superfiles(
         // inner.manifest each iteration to incorporate any
         // commits from other writers that won the race.
         drop(old);
-        let new_manifest = persist_commit(inner, storage, new_entries, pending_storage_writes)
+        persist_commit(inner, storage, new_entries, &[], pending_storage_writes)
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        inner.manifest.store(Arc::new(new_manifest));
 
         // Warm the cache with the superfiles we just persisted.
         // Skips the cold-fetch round-trip on the producer's
@@ -1630,8 +1628,9 @@ pub(in crate::supertable) fn persist_commit(
     inner: &SupertableInner,
     storage: Arc<dyn crate::storage::StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
+    entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
-) -> Result<crate::supertable::Manifest, crate::supertable::CommitError> {
+) -> Result<(), crate::supertable::CommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
 
@@ -1658,33 +1657,20 @@ pub(in crate::supertable) fn persist_commit(
             // iteration) feeds into our successor's
             // `new_superfile_list`.
             let old = inner.manifest.load_full();
-            let new_superfile_list = old
-                .get_all_superfiles()
-                .iter()
-                .chain(new_entries.iter())
-                .map(Arc::clone)
-                .collect::<Vec<_>>();
-
             let pending_writes = &mut pending_storage_writes;
-            let new_manifest_id = old.manifest_id + 1;
 
             match try_commit_attempt(
                 Arc::clone(&storage_async),
                 Arc::clone(&opts),
                 Arc::clone(&old),
                 &new_entries,
-                &[],
-                new_manifest_id,
+                entries_to_remove,
                 pending_writes,
             )
             .await
             {
-                Ok(new_list) => {
-                    return Ok::<_, crate::supertable::CommitError>((
-                        new_manifest_id,
-                        new_list,
-                        new_superfile_list,
-                    ));
+                Ok(new_manifest) => {
+                    return Ok::<_, crate::supertable::CommitError>(new_manifest);
                 }
                 Err(crate::supertable::CommitError::WriteContentionExhausted)
                     if attempt + 1 < max_retries =>
@@ -1704,34 +1690,23 @@ pub(in crate::supertable) fn persist_commit(
         Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
     };
 
-    let (new_manifest_id, new_list, new_superfile_list) =
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                // Ambient tokio runtime present — use it. Don't
-                // touch `inner.query_runtime()` so we don't risk
-                // dropping our owned runtime from within
-                // another's worker context.
-                tokio::task::block_in_place(|| handle.block_on(drive))?
-            }
-            Err(_) => {
-                // Sync caller; lazy-init the supertable's
-                // owned runtime.
-                inner.query_runtime().block_on(drive)?
-            }
-        };
+    let new_manifest = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // Ambient tokio runtime present — use it. Don't
+            // touch `inner.query_runtime()` so we don't risk
+            // dropping our owned runtime from within
+            // another's worker context.
+            tokio::task::block_in_place(|| handle.block_on(drive))?
+        }
+        Err(_) => {
+            // Sync caller; lazy-init the supertable's
+            // owned runtime.
+            inner.query_runtime().block_on(drive)?
+        }
+    };
 
-    // Build the new in-memory Manifest with the persisted
-    // list + a fresh ManifestPartLoader installed.
-    let opts = Arc::clone(&inner.options);
-    let manifest = Manifest::new(
-        new_manifest_id,
-        opts,
-        new_superfile_list,
-        Some(storage),
-        Some(new_list),
-    );
-
-    Ok(manifest)
+    inner.manifest.store(Arc::new(new_manifest));
+    Ok(())
 }
 
 // Writes the superfile list to storage. Performs the side-effect of modifying pending_storage_writes
@@ -1824,63 +1799,25 @@ pub async fn write_superfile_list(
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn crate::storage::StorageProvider>,
     opts: Arc<SupertableOptions>,
-    old: Arc<crate::supertable::Manifest>,
+    current_manifest: Arc<crate::supertable::Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
-    new_manifest_id: u64,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
-) -> Result<ManifestList, SupertableCommitError> {
+) -> Result<Manifest, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
     // 2. Rebalance the manifest for the commit.
-    let (out_list_entries, parts_to_write) =
-        commit_mod::rebalance_for_commit(&opts, &old, new_entries, entries_to_remove).await?;
+    let (new_manifest, parts_to_write) = current_manifest
+        .rebalance(new_entries, entries_to_remove)
+        .await?;
 
-    // 3. Build the new manifest list. The options_hash
-    //    digest covers (schema, id_column, fts/vector
-    //    column declarations, partition strategy);
-    //    Supertable::open validates the caller's options
-    //    against this so a schema mismatch surfaces as a
-    //    typed error rather than a downstream decode
-    //    failure.
-    let strategy = old.get_partition_strategy();
-    let opts_hash =
-        crate::supertable::manifest::options_hash::compute_options_hash(opts.as_ref(), &strategy);
-    let new_list = ManifestList {
-        format_version: LIST_FORMAT_VERSION.into(),
-        manifest_id: new_manifest_id,
-        options_hash: opts_hash,
-        schema: Vec::new(),
-        id_column: opts.id_column.clone(),
-        fts_columns: opts
-            .fts_columns
-            .iter()
-            .map(|f| crate::supertable::manifest::list::FtsColumnInfo {
-                column: f.column.clone(),
-            })
-            .collect(),
-        vector_columns: opts
-            .vector_columns
-            .iter()
-            .map(|v| crate::supertable::manifest::list::VectorColumnInfo {
-                column: v.column.clone(),
-                dim: v.dim,
-                n_cent: v.n_cent,
-                rot_seed: v.rot_seed,
-                metric: format!("{:?}", v.metric).to_lowercase(),
-            })
-            .collect(),
-        partition_strategy: strategy,
-        parts: out_list_entries,
-    };
-
-    // 4. Read the prior pointer's etag for the CAS. Fresh
+    // 3. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial
     //    commit).
-    let prev_etag = get_current_manifest_etag(&storage, old).await?;
+    let prev_etag = get_current_manifest_etag(&storage, current_manifest).await?;
 
-    // 5. Parallel-issue (touched parts) + list PUTs, then
+    // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
     //    content-hashes) are unchanged in the new list.
@@ -1888,19 +1825,15 @@ pub(crate) async fn try_commit_attempt(
         .iter()
         .map(|ep| ep.encoded.as_slice())
         .collect();
-    commit_mod::commit_manifest(
-        storage.as_ref(),
-        prev_etag.as_deref(),
-        &new_list,
-        &encoded_refs,
-    )
-    .await?;
+    new_manifest
+        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
+        .await?;
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
     // from inside `build_part_and_entry`).
     let _ = std::marker::PhantomData::<(PartId, part_mod::ContentHash)>;
 
-    Ok(new_list)
+    Ok(new_manifest)
 }
 
 /// Re-read the manifest pointer from storage, load any newer
@@ -1926,7 +1859,11 @@ async fn refresh_inner_state_async(
         Ok(manifest) => manifest,
         Err(ManifestLoadError::PointerNotFound) => return Ok(()),
         Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),
-        Err(err) => return Err(crate::supertable::CommitError::ManifestLoadError(err)),
+        Err(err) => {
+            return Err(crate::supertable::CommitError::ManifestError(
+                ManifestError::ManifestLoadError(err),
+            ));
+        }
     };
     inner.manifest.store(manifest);
     Ok(())
@@ -2259,15 +2196,13 @@ mod tests {
             fts.n_terms_distinct,
         );
         // Bloom should report present for inserted terms.
-        assert!(fts.term_bloom.contains(b"alpha"));
-        assert!(fts.term_bloom.contains(b"doc"));
-        // Lex range should be non-empty and consistent.
-        assert!(!fts.term_range.0.is_empty());
-        assert!(!fts.term_range.1.is_empty());
-        assert!(
-            fts.term_range.0 <= fts.term_range.1,
-            "min_term <= max_term invariant",
-        );
+        assert!(fts.may_contain(b"alpha"));
+        assert!(fts.may_contain(b"doc"));
+        // Lex range should be present and consistent.
+        let (min_term, max_term) = fts.term_range.as_ref().expect("non-empty FST has a range");
+        assert!(!min_term.is_empty());
+        assert!(!max_term.is_empty());
+        assert!(min_term <= max_term, "min_term <= max_term invariant");
     }
 
     // ---- vector summary ----------------------------------------------

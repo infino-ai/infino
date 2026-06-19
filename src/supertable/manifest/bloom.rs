@@ -52,7 +52,7 @@
 //! (each block is 8 × `u64` = 64 B). Storing as `u64` rather than
 //! `u8` lets the inner loop test bits with one shift-and-mask per
 //! probe, no byte-aligned addressing math. The Arc wrapper is so a
-//! `FtsSummary` clone (and through it, a manifest clone) doesn't
+//! `FtsSummaryAgg` clone (and through it, a manifest clone) doesn't
 //! duplicate the bloom payload.
 
 use std::sync::Arc;
@@ -86,7 +86,7 @@ const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 /// superfile.
 ///
 /// Cheap to clone (`Arc::clone` on the underlying word buffer); a
-/// `FtsSummary` clone shares this Arc with all manifest copies in
+/// `FtsSummaryAgg` clone shares this Arc with all manifest copies in
 /// the supertable's snapshot history.
 #[derive(Clone, Debug)]
 pub struct Bloom {
@@ -532,5 +532,30 @@ mod tests {
         let b = build_with(&[b"x"]);
         let s = format!("{:?}", b);
         assert!(s.contains("Bloom"));
+    }
+
+    /// Builder geometry (`n_blocks` on the *builder*, plus `Default`)
+    /// and the finished bloom's `len` / `is_empty` agree across the
+    /// build → finish boundary.
+    #[test]
+    fn builder_and_bloom_geometry_is_consistent() {
+        const CUSTOM_BLOCKS: usize = 4;
+        let mut b = BloomBuilder::with_n_blocks(CUSTOM_BLOCKS);
+        assert_eq!(
+            b.n_blocks(),
+            CUSTOM_BLOCKS,
+            "builder reports its block count"
+        );
+        b.insert(b"alpha");
+        let bloom = b.finish();
+        assert_eq!(bloom.n_blocks(), CUSTOM_BLOCKS);
+        assert_eq!(bloom.len(), CUSTOM_BLOCKS * BLOCK_BYTES);
+        assert!(!bloom.is_empty(), "a sized bloom's word array is non-empty");
+
+        // `Default` builds the standard geometry, same as `new()`.
+        assert_eq!(
+            BloomBuilder::default().n_blocks(),
+            BloomBuilder::new().n_blocks()
+        );
     }
 }

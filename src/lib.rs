@@ -113,6 +113,13 @@ pub mod supertable;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod supertable;
 
+// `roaring` is already an internal dependency. Re-export it under
+// `test-helpers` only, so a bench can build an allow-set for the filtered
+// vector kernel without its own `roaring` dependency. Off the public
+// contract (the `cargo-public-api` snapshot is taken without the feature).
+#[cfg(feature = "test-helpers")]
+pub use roaring;
+
 // The catalog layer (`Connection` + `connect`). Internal module; its
 // public items are re-exported at the crate root below.
 mod catalog;
@@ -124,7 +131,7 @@ mod runtime_bridge;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
-pub use config::CompactionSettings;
+pub use config::{CompactionSettings, OptimizeOptions};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
@@ -134,7 +141,8 @@ pub use superfile::vector::distance::Metric;
 /// Single-table handle: `append` / `update` / `delete` / `bm25_search`
 /// / `vector_search` / `schema`.
 pub use supertable::Supertable;
-pub use supertable::{CompactionError, MutationStats};
+pub use supertable::query::vector::VectorFilter;
+pub use supertable::{GcError, GcReport, MutationStats, OptimizeError};
 
 /// Convenience builders for test fixtures. Visible to:
 ///   - Unit tests (via `cfg(test)` — always on for `cargo test`)

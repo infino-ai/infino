@@ -244,6 +244,7 @@ mod tests {
     use super::*;
     use crate::storage::ObjectMeta;
     use std::sync::atomic::AtomicUsize;
+    use std::time::SystemTime;
 
     /// Storage fake that serves `get_range` in capped chunks and
     /// against a (possibly smaller-than-advertised) backing object.
@@ -291,6 +292,7 @@ mod tests {
             Ok(ObjectMeta {
                 size: self.obj_size as u64,
                 etag: None,
+                last_modified: SystemTime::UNIX_EPOCH,
             })
         }
 

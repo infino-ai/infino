@@ -209,7 +209,7 @@ fn run_vector(st: &Supertable) -> Vec<(String, u32)> {
     q[0] = 1.0;
     hit_key(
         &st.reader()
-            .vector_hits("emb", &q, K, VectorSearchOptions::new())
+            .vector_hits("emb", &q, K, VectorSearchOptions::new(), None)
             .expect("vector"),
     )
 }

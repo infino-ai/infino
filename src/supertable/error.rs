@@ -20,6 +20,7 @@ use thiserror::Error;
 use crate::storage::StorageError;
 use crate::superfile::error::BuildError as SuperfileBuildError;
 use crate::supertable::ManifestLoadError;
+use crate::supertable::manifest::part;
 
 /// Errors raised when constructing or operating against a
 /// `SupertableOptions` / `SupertableWriter`.
@@ -152,8 +153,8 @@ pub enum CommitError {
     Build(#[from] BuildError),
 
     /// Manifest error
-    #[error("manifest load error: {0}")]
-    ManifestLoadError(#[from] ManifestLoadError),
+    #[error("manifest error: {0}")]
+    ManifestError(#[from] ManifestError),
 
     /// Failed to encode a manifest part or list to its wire
     /// format. Indicates a programmer error (e.g., a
@@ -173,7 +174,10 @@ pub enum CommitError {
     /// loop later is non-breaking.
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
+}
 
+#[derive(Debug, Error)]
+pub enum ManifestError {
     /// A superfile's column range spans multiple
     /// partitions under the configured `PartitionStrategy`.
     /// For `TimeRange` / `ColumnRange`, the superfile's
@@ -186,6 +190,12 @@ pub enum CommitError {
     /// possible value hashes to bucket 0.
     #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
+    /// Manifest load error
+    #[error("manifest load error: {0}")]
+    ManifestLoadError(#[from] ManifestLoadError),
+    /// Unknown part id
+    #[error("unknown part id: {0}")]
+    UnknownPartId(part::PartId),
 }
 
 /// Errors raised by [`crate::supertable::Supertable::open`] and
@@ -247,9 +257,58 @@ pub enum OpenError {
     Commit(#[from] CommitError),
 }
 
-/// Errors raised by [`crate::supertable::Supertable::compact`].
+/// Errors raised by [`crate::supertable::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
-pub enum CompactionError {
+pub enum OptimizeError {
+    #[error("optimize requires a storage backend")]
+    NoStorage,
+    #[error("superfile {0} not found in manifest snapshot")]
+    SuperfileNotFound(uuid::Uuid),
+    #[error("empty merged superfile")]
+    EmptyMergedSuperfile,
+    #[error(
+        "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
+    )]
+    SidecarConflict {
+        superfile_id: uuid::Uuid,
+        existing_compaction_id: uuid::Uuid,
+    },
+    #[error("seal failed: {0}")]
+    Seal(String),
+    #[error("failed to build superfile: {0}")]
+    Build(String),
+    #[error("failed to commit: {0}")]
+    Commit(String),
+    #[error("post-commit manifest refresh failed: {0}")]
+    Refresh(String),
+    #[error("optimize already in progress on this handle")]
+    AlreadyRunning,
+}
+
+impl From<CompactionError> for OptimizeError {
+    fn from(e: CompactionError) -> Self {
+        match e {
+            CompactionError::NoStorage => OptimizeError::NoStorage,
+            CompactionError::SuperfileNotFound(id) => OptimizeError::SuperfileNotFound(id),
+            CompactionError::EmptyMergedSuperfile => OptimizeError::EmptyMergedSuperfile,
+            CompactionError::SidecarConflict {
+                superfile_id,
+                existing_compaction_id,
+            } => OptimizeError::SidecarConflict {
+                superfile_id,
+                existing_compaction_id,
+            },
+            CompactionError::Seal(s) => OptimizeError::Seal(s),
+            CompactionError::Build(s) => OptimizeError::Build(s),
+            CompactionError::Commit(s) => OptimizeError::Commit(s),
+            CompactionError::Refresh(s) => OptimizeError::Refresh(s),
+            CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompactionError {
     /// Compaction requires durable storage
     /// (needs to seal sidecars and publish the merged superfile).
     #[error("compaction requires a storage backend")]
@@ -296,6 +355,16 @@ pub enum CompactionError {
     /// Another compaction is already running on this supertable handle.
     #[error("compaction already in progress on this supertable handle")]
     AlreadyCompacting,
+}
+
+/// Errors raised by [`crate::supertable::Supertable::gc`].
+#[derive(Debug, thiserror::Error)]
+pub enum GcError {
+    #[error("gc requires a storage backend")]
+    NoStorage,
+
+    #[error("storage error during gc: {0}")]
+    Storage(#[from] crate::storage::StorageError),
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]

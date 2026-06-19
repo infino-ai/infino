@@ -164,7 +164,7 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
-    pub fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+    pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
         crate::runtime_bridge::bridge_on_runtime(
             self.compact_async(cfg),
             &self.inner().query_runtime(),
@@ -430,7 +430,6 @@ impl Supertable {
                 current,
                 &new_entries,
                 &entries_to_remove,
-                inner.manifest.load().manifest_id + 1,
                 &mut pending_storage_writes,
             )
             .await
@@ -814,18 +813,17 @@ mod tests {
         let title_stats = merged_superfile
             .entry
             .scalar_stats
-            .cols
             .get("title")
             .expect("merged entry should have title column stats");
 
         // Extract min and max string values from the arrays
         let title_min_arr = title_stats
-            .0
+            .min
             .as_any()
             .downcast_ref::<arrow_array::LargeStringArray>()
             .expect("title column should be LargeStringArray");
         let title_max_arr = title_stats
-            .1
+            .max
             .as_any()
             .downcast_ref::<arrow_array::LargeStringArray>()
             .expect("title column should be LargeStringArray");
@@ -993,6 +991,32 @@ mod tests {
             second_hits.len(),
             1,
             "should find exactly 1 doc matching 'second'"
+        );
+    }
+
+    /// An in-memory supertable (no storage, no tombstone cache) takes
+    /// the empty-sidecar-map fallback arm in `compact_async`: it still
+    /// builds per-superfile stats and runs `select`, and with a single
+    /// committed superfile `select` finds nothing to do, so the call
+    /// returns `Ok(())` without touching storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_in_memory_table_takes_empty_sidecar_fallback() {
+        let st =
+            Supertable::create(default_supertable_options()).expect("create in-memory supertable");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&["alpha first", "alpha second"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("in-memory compact is a no-op, not an error");
+        assert_eq!(
+            st.manifest_id(),
+            before,
+            "single superfile yields no compaction job"
         );
     }
 
@@ -1218,7 +1242,7 @@ mod tests {
             b"sierra",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
                 std::str::from_utf8(term).expect("term literal is valid utf-8")
             );
@@ -1415,7 +1439,7 @@ mod tests {
             b"juliet",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
                 std::str::from_utf8(term).expect("term literal is valid utf-8")
             );

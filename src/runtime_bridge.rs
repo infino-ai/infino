@@ -102,6 +102,31 @@ where
     }
 }
 
+/// Shared multi-thread runtime for driving the sync query API's async I/O.
+///
+/// Multi-thread is required, not just preferred: the bridges above take the
+/// `block_in_place` branch once this is the ambient runtime, and
+/// `block_in_place` panics on a `current_thread` runtime. Workers scale to
+/// the CPU count so a cold query's per-superfile fan-out overlaps instead
+/// of serializing.
+pub(crate) fn build_query_runtime(thread_name: &str) -> std::sync::Arc<tokio::runtime::Runtime> {
+    const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
+    std::sync::Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .thread_name(thread_name)
+            .build()
+            .expect(
+                "invariant: tokio Runtime build only fails on \
+                 catastrophic OS resource exhaustion",
+            ),
+    )
+}
+
 fn build_current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

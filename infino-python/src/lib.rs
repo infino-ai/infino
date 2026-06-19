@@ -28,8 +28,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, CompactionError, CompactionSettings, ConnectOptions, InfinoError, Metric,
-    VectorSearchOptions,
+    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
+    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
 /// Map a core [`InfinoError`] to the closest Python exception.
@@ -47,10 +47,7 @@ fn py_err(e: InfinoError) -> PyErr {
     }
 }
 
-/// Compaction has its own error type, so it doesn't go through `py_err`.
-/// These are storage / build failures — surfaced as runtime errors, like
-/// the mutation paths.
-fn compact_err(e: CompactionError) -> PyErr {
+fn optimize_err(e: OptimizeError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -66,13 +63,29 @@ fn metric_from_str(s: &str) -> PyResult<Metric> {
     }
 }
 
+/// Parse a cold-fetch-mode name into its [`ColdFetchMode`].
+fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
+        "range_only" => Ok(ColdFetchMode::RangeOnly),
+        "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),
+        other => Err(PyValueError::new_err(format!(
+            "unknown cold_fetch_mode {other:?}; use 'hybrid_with_prefetch', \
+             'range_only', or 'lazy_foreground_with_background_fill'"
+        ))),
+    }
+}
+
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments (no separate
-/// `connect_with` in Python). Today that is the explicit S3-compatible
-/// endpoint + static credentials; omit them for local / `memory://` /
-/// ambient-credential S3.
+/// can't carry is passed as keyword arguments: explicit S3 endpoint +
+/// static credentials, and the optional local disk cache (`cache_dir`,
+/// `cache_budget_bytes`, `cold_fetch_mode`). Omit all for local /
+/// `memory://` / ambient-credential S3.
+// Flat kwargs are the intended Python API; a config struct would change it.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None))]
+#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None,
+                    cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -80,24 +93,49 @@ fn connect(
     region: Option<String>,
     access_key: Option<String>,
     secret_key: Option<String>,
+    cache_dir: Option<String>,
+    cache_budget_bytes: Option<u64>,
+    cold_fetch_mode: Option<String>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
-    let inner = py
-        .detach(|| match endpoint {
-            Some(endpoint) => {
-                let region = region
-                    .ok_or_else(|| PyValueError::new_err("region is required with endpoint"))?;
-                let access_key = access_key
-                    .ok_or_else(|| PyValueError::new_err("access_key is required with endpoint"))?;
-                let secret_key = secret_key
-                    .ok_or_else(|| PyValueError::new_err("secret_key is required with endpoint"))?;
-                let opts = ConnectOptions::new()
-                    .with_s3_endpoint(endpoint, region, access_key, secret_key);
-                infino::connect_with(uri, opts).map_err(py_err)
-            }
-            None => infino::connect(uri).map_err(py_err),
-        })?;
+    let inner = py.detach(|| {
+        let mut opts = ConnectOptions::new();
+        let mut has_options = false;
+        // The S3 endpoint + credentials are all-or-nothing: any one of them
+        // means the caller wants an explicit endpoint, so require the rest
+        // rather than silently dropping a partial config back to ambient.
+        if endpoint.is_some() || region.is_some() || access_key.is_some() || secret_key.is_some() {
+            let endpoint = endpoint
+                .ok_or_else(|| PyValueError::new_err("endpoint is required with S3 credentials"))?;
+            let region = region
+                .ok_or_else(|| PyValueError::new_err("region is required for an S3 endpoint"))?;
+            let access_key = access_key
+                .ok_or_else(|| PyValueError::new_err("access_key is required for an S3 endpoint"))?;
+            let secret_key = secret_key
+                .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
+            opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            has_options = true;
+        }
+        if let Some(dir) = cache_dir {
+            opts = opts.with_cache_dir(dir);
+            has_options = true;
+        }
+        if let Some(bytes) = cache_budget_bytes {
+            opts = opts.with_cache_budget_bytes(bytes);
+            has_options = true;
+        }
+        if let Some(mode) = cold_fetch_mode {
+            opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            has_options = true;
+        }
+        // Preserve the plain `connect(uri)` path when no options are set.
+        if has_options {
+            infino::connect_with(uri, opts).map_err(py_err)
+        } else {
+            infino::connect(uri).map_err(py_err)
+        }
+    })?;
     Ok(Connection { inner })
 }
 
@@ -241,8 +279,8 @@ impl MutationStats {
     }
 }
 
-/// Tuning for `compact`; omitted fields fall back to engine defaults.
-#[pyclass(name = "CompactOptions", skip_from_py_object)]
+/// Tuning for `optimize`; omitted fields fall back to engine defaults.
+#[pyclass(name = "OptimizeOptions", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct CompactOptions {
     max_memory_mb: Option<u64>,
@@ -325,7 +363,14 @@ impl Table {
     /// smaller is nearer); omitting it returns the engine-native
     /// `_id` + `score` pair with no scalar decode. Materializing row
     /// data is an explicit opt-in by naming columns.
-    #[pyo3(signature = (column, query, k, nprobe=None, projection=None))]
+    ///
+    /// Pass `filter_column` and `filter_query` together to restrict the
+    /// search to rows whose (FTS-indexed) `filter_column` matches the
+    /// query terms — a pushdown pre-filter, so kNN ranks only among the
+    /// matching rows rather than post-filtering the global top-`k`.
+    /// `filter_mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
         py: Python<'py>,
@@ -333,16 +378,42 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        filter_column: Option<String>,
+        filter_query: Option<String>,
+        filter_mode: Option<&str>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
         }
+        // Optional text-predicate filter (pushdown). `filter_column` and
+        // `filter_query` must be supplied together; `filter_mode` is only
+        // meaningful alongside them (a lone `filter_mode` is rejected rather
+        // than silently ignored, so an invalid value never passes unnoticed).
+        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+            (Some(col), Some(q), mode) => Some(VectorFilter {
+                column: col,
+                query: q,
+                mode: parse_mode(mode)?,
+            }),
+            (None, None, None) => None,
+            (None, None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "filter_mode requires filter_column and filter_query",
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "filter_column and filter_query must be provided together",
+                ));
+            }
+        };
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.vector_search(column, &query, k, opts, names.as_deref())
+                self.inner
+                    .vector_search(column, &query, k, opts, filter, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -431,7 +502,7 @@ impl Table {
     /// Merge small / underfilled superfiles into larger ones. Omit
     /// `settings` for engine defaults.
     #[pyo3(signature = (settings=None))]
-    fn compact(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
+    fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
@@ -444,7 +515,8 @@ impl Table {
                 s.target_superfile_size_mb = v;
             }
         }
-        py.detach(|| self.inner.compact(&s)).map_err(compact_err)
+        let opts = OptimizeOptions::compact(s);
+        py.detach(|| self.inner.optimize(&opts)).map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.

@@ -37,6 +37,7 @@ must not name them.
 """
 
 [pr_code_suggestions]
+commitable_code_suggestions = true
 extra_instructions = """\
 Favor correctness and clarity over micro-optimizations. Enforce infino's code
 standards on the changed lines:

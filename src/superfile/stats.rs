@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
+use std::collections::HashMap;
+
 use arrow_array::{Decimal128Array, RecordBatch};
 
-use crate::{superfile::BuildError, supertable::ScalarStatsTable};
+use crate::{superfile::BuildError, supertable::ScalarStatsAgg};
 
 /// Statistics for a superfile, including the number of documents,
 /// id range, and scalar statistics. Usually used during build time.
@@ -13,7 +15,7 @@ pub struct SuperfileStats {
     pub n_docs: u64,
     pub id_min: i128,
     pub id_max: i128,
-    pub scalar_stats: ScalarStatsTable,
+    pub scalar_stats: HashMap<String, ScalarStatsAgg>,
     // TODO: Vector & FTS related stats could also be added here
 }
 
@@ -43,7 +45,7 @@ impl SuperfileStats {
         }
         n_docs += id_col.len() as u64;
 
-        let scalar_stats = ScalarStatsTable::from_batch(&schema, batch);
+        let scalar_stats = ScalarStatsAgg::from_batch(&schema, batch);
         Ok(Self {
             n_docs,
             id_min,
@@ -56,12 +58,12 @@ impl SuperfileStats {
         let mut n_docs: u64 = 0;
         let mut id_min = i128::MAX;
         let mut id_max = i128::MIN;
-        let mut scalar_stats = ScalarStatsTable::default();
+        let mut scalar_stats: HashMap<String, ScalarStatsAgg> = HashMap::new();
         for stat in stats {
             n_docs += stat.n_docs;
             id_min = id_min.min(stat.id_min);
             id_max = id_max.max(stat.id_max);
-            scalar_stats.merge(&stat.scalar_stats);
+            ScalarStatsAgg::merge_tables(&mut scalar_stats, &stat.scalar_stats);
         }
         Self {
             n_docs,
@@ -95,9 +97,9 @@ mod tests {
         assert_eq!(stats.n_docs, 1);
         assert_eq!(stats.id_min, 42);
         assert_eq!(stats.id_max, 42);
-        assert_eq!(stats.scalar_stats.cols.len(), 2);
-        assert!(stats.scalar_stats.cols.contains_key("doc_id"));
-        assert!(stats.scalar_stats.cols.contains_key("title"));
+        assert_eq!(stats.scalar_stats.len(), 2);
+        assert!(stats.scalar_stats.contains_key("doc_id"));
+        assert!(stats.scalar_stats.contains_key("title"));
     }
 
     #[test]
@@ -150,10 +152,10 @@ mod tests {
         .expect("build RecordBatch");
 
         let stats = SuperfileStats::try_compute_from_record_batch(&batch).expect("compute stats");
-        assert_eq!(stats.scalar_stats.cols.len(), 3);
-        assert!(stats.scalar_stats.cols.contains_key("doc_id"));
-        assert!(stats.scalar_stats.cols.contains_key("title"));
-        assert!(stats.scalar_stats.cols.contains_key("count"));
+        assert_eq!(stats.scalar_stats.len(), 3);
+        assert!(stats.scalar_stats.contains_key("doc_id"));
+        assert!(stats.scalar_stats.contains_key("title"));
+        assert!(stats.scalar_stats.contains_key("count"));
     }
 
     #[test]
@@ -162,7 +164,7 @@ mod tests {
         assert_eq!(result.n_docs, 0);
         assert_eq!(result.id_min, i128::MAX);
         assert_eq!(result.id_max, i128::MIN);
-        assert_eq!(result.scalar_stats.cols.len(), 0);
+        assert_eq!(result.scalar_stats.len(), 0);
     }
 
     #[test]
@@ -182,7 +184,7 @@ mod tests {
         assert_eq!(merged.n_docs, 2);
         assert_eq!(merged.id_min, 100);
         assert_eq!(merged.id_max, 200);
-        assert_eq!(merged.scalar_stats.cols.len(), 2);
+        assert_eq!(merged.scalar_stats.len(), 2);
     }
 
     #[test]
@@ -264,9 +266,9 @@ mod tests {
         };
 
         let merged = SuperfileStats::from_children(&[stats1, stats2]);
-        assert_eq!(merged.scalar_stats.cols.len(), 2);
-        assert!(merged.scalar_stats.cols.contains_key("doc_id"));
-        assert!(merged.scalar_stats.cols.contains_key("value"));
+        assert_eq!(merged.scalar_stats.len(), 2);
+        assert!(merged.scalar_stats.contains_key("doc_id"));
+        assert!(merged.scalar_stats.contains_key("value"));
     }
 
     #[test]

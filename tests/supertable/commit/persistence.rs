@@ -54,7 +54,7 @@ fn commit_persists_pointer_list_part_and_superfile() {
     let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
         .expect("read")
         .expect("pointer present");
-    assert_eq!(pointer.manifest_id, 1);
+    assert_eq!(pointer.get_manifest_id(), 1);
     assert!(
         pointer
             .manifest_list_uri
@@ -119,7 +119,8 @@ fn two_successive_commits_both_publish() {
         .expect("read")
         .expect("pointer");
     assert_eq!(
-        pointer.manifest_id, 2,
+        pointer.get_manifest_id(),
+        2,
         "two commits ⇒ pointer at manifest_id=2"
     );
 
@@ -295,5 +296,5 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
         .expect("read")
         .expect("pointer");
-    assert_eq!(pointer.manifest_id, 1);
+    assert_eq!(pointer.get_manifest_id(), 1);
 }

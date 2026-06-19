@@ -130,6 +130,60 @@ where
     K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
 {
+    fanout_with(
+        reader,
+        units,
+        move |r, entry, tombstone_cache, now, params| {
+            let kernel = kernel.clone();
+            async move {
+                let hits = kernel(r, params).await?;
+                let mut tagged = tag_hits(&entry, hits);
+                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        },
+    )
+    .await
+}
+
+/// Lower-level fan-out primitive: the shared orchestration behind
+/// [`fanout`] and the count path, generic over the per-superfile result
+/// `R`.
+///
+/// It warms the tombstone sidecar cache for every distinct superfile in
+/// one batch, `tokio::spawn`s one task per unit on the shared query
+/// runtime (each opening its reader concurrently), then collects every
+/// task with [`futures::future::try_join_all`] — so the **first**
+/// per-superfile error (in time, not spawn order) short-circuits the
+/// whole fan-out and returns early.
+///
+/// `body` runs inside each task with the opened reader, the superfile
+/// entry, the (warmed) tombstone cache + the batch `now` instant, and
+/// the unit's params. Resolving the per-superfile tombstone bitmap and
+/// applying it is the body's job, since callers differ: [`fanout`]
+/// tags + retains hits, while the count path either takes the O(1)
+/// `term_df` fast path (no tombstones) or counts the matching ids minus
+/// tombstones.
+pub(crate) async fn fanout_with<P, R, B, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    body: B,
+) -> Result<Vec<R>, QueryError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    B: Fn(
+            Arc<SuperfileReader>,
+            Arc<SuperfileEntry>,
+            Option<Arc<SidecarCache>>,
+            std::time::Instant,
+            P,
+        ) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+{
     if units.is_empty() {
         return Ok(Vec::new());
     }
@@ -149,30 +203,23 @@ where
         cache.prefetch(&ids, now).await;
     }
 
-    let handles: Vec<_> = units
-        .into_iter()
-        .map(|(entry, params)| {
-            let store = Arc::clone(&store);
-            let disk_cache = disk_cache.clone();
-            let storage = storage.clone();
-            let tombstone_cache = tombstone_cache.clone();
-            let kernel = kernel.clone();
-            tokio::spawn(async move {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            })
-        })
-        .collect();
-
-    let mut out: Vec<Vec<SuperfileHit>> = Vec::with_capacity(handles.len());
-    for h in handles {
-        let tagged = h
-            .await
-            .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))??;
-        out.push(tagged);
-    }
-    Ok(out)
+    let handles = units.into_iter().map(|(entry, params)| {
+        let store = Arc::clone(&store);
+        let disk_cache = disk_cache.clone();
+        let storage = storage.clone();
+        let tombstone_cache = tombstone_cache.clone();
+        let body = body.clone();
+        let handle = tokio::spawn(async move {
+            let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            body(r, entry, tombstone_cache, now, params).await
+        });
+        // Flatten the join error into a QueryError so `try_join_all`
+        // short-circuits on the first failing superfile.
+        async move {
+            handle
+                .await
+                .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
+        }
+    });
+    futures::future::try_join_all(handles).await
 }

@@ -16,7 +16,8 @@ pub fn vector_topk_global(
     options: VectorSearchOptions,
 ) -> Vec<u32> {
     let hits: Vec<SuperfileHit> = st
-        .vector_search(VEC_COLUMN, query, k, options)
+        .reader()
+        .vector_hits(VEC_COLUMN, query, k, options, None)
         .expect("vector_search");
     let r = st.reader();
     let manifest = r.manifest();

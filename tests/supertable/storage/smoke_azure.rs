@@ -440,6 +440,7 @@ async fn supertable_real_azure_round_trip() {
                 VECTOR_SEARCH_K,
                 VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
                 None,
+                None,
             )
             .map_err(|e| format!("cold vector search over real Azure: {e}"))?;
         if vector_hits.is_empty() {

@@ -31,6 +31,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use roaring::RoaringBitmap;
+
 use crate::superfile::format::vec::{
     CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
     dir_entry, outer_hdr, sub_hdr,
@@ -141,6 +143,14 @@ pub struct ColumnReader {
     /// ~7.9 ms, dominant over every other per-query stage if rebuilt
     /// per `search()`. Build once, reuse forever.
     rot: RandomRotation,
+}
+
+/// Shared context threaded through the probe → shortlist → score pipeline.
+struct ProbeCtx<'a> {
+    q_rot: &'a [f32],
+    k: usize,
+    rerank_mult: usize,
+    allow: Option<Arc<RoaringBitmap>>,
 }
 
 impl ColumnReader {
@@ -1323,15 +1333,19 @@ impl VectorReader {
         // `[codes][doc_ids][full?]`; scoring reads the prefix, and the
         // survivor `full[]` rows are fetched below — the only step
         // that differs from the async path.
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult,
+            allow: None,
+        };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            &q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
+            &ctx,
         )
         .await
         {
@@ -1393,6 +1407,10 @@ impl VectorReader {
         k: usize,
         nprobe: usize,
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1415,7 +1433,19 @@ impl VectorReader {
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
+        // Filtered search: boost nprobe and rerank_mult inversely with
+        // selectivity so probed clusters and the rerank shortlist cover
+        // enough eligible rows. Capped at [`MAX_FILTER_SELECTIVITY_MULT`]
+        // on the selectivity side and [`MAX_EFFECTIVE_FILTERED_RERANK_MULT`]
+        // on the effective rerank width.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let nprobe_eff = nprobe
+            .saturating_mul(filter_mult)
+            .min(col.n_cent as usize)
+            .max(1);
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
@@ -1428,7 +1458,14 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        let rerank_mult_eff = effective_filtered_rerank_mult(rerank_mult, filter_mult);
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: rerank_mult_eff,
+            allow,
+        };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }
 
@@ -1446,6 +1483,10 @@ impl VectorReader {
         k: usize,
         clusters: &[u32],
         rerank_mult: usize,
+        // Filtered search allow-set (per-superfile matching doc-ids).
+        // `None` = unfiltered; threaded to the coarse shortlist so the
+        // top-k is the true k-nearest among matching rows.
+        allow: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1462,7 +1503,21 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        self.probe_clusters_async(col, query, &q_rot, &cluster_idx, &chosen, k, rerank_mult)
+        // Same inverse-selectivity boost as [`Self::search_async`]: the
+        // supertable fan-out probes externally chosen clusters (no local
+        // nprobe scoring), so rerank breadth must scale here — not only
+        // on the per-superfile nprobe fallback path.
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            allow,
+        };
+        self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
     }
 
@@ -1476,11 +1531,9 @@ impl VectorReader {
         &self,
         col: &ColumnReader,
         query: &[f32],
-        q_rot: &[f32],
+        ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
-        k: usize,
-        rerank_mult: usize,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
@@ -1537,13 +1590,11 @@ impl VectorReader {
         // diverges from the sync path.
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
-            q_rot,
             cb,
             &cluster_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            k,
-            rerank_mult,
+            ctx,
         )
         .await
         {
@@ -1572,7 +1623,7 @@ impl VectorReader {
             &candidates,
             col,
             query,
-            k,
+            ctx.k,
         )
         .await
         .map_err(|e| VectorError::LazySource(e.to_string()))
@@ -1755,16 +1806,13 @@ enum ShortlistOutcome {
 /// then runs [`rerank_candidates_from_blocks`]. Factoring this out
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
-#[allow(clippy::too_many_arguments)]
 async fn build_shortlist(
     col: &ColumnReader,
-    q_rot: &[f32],
     cb: usize,
     cluster_meta: &[(usize, u32, u32)],
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
-    k: usize,
-    rerank_mult: usize,
+    ctx: &ProbeCtx<'_>,
 ) -> ShortlistOutcome {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
@@ -1776,9 +1824,9 @@ async fn build_shortlist(
     // shortlists rank identically.
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
     let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        k
+        ctx.k
     } else {
-        k.saturating_mul(rerank_mult)
+        ctx.k.saturating_mul(ctx.rerank_mult)
     };
     if coarse_limit == 0 {
         return ShortlistOutcome::Done(Vec::new());
@@ -1798,7 +1846,15 @@ async fn build_shortlist(
             let codes = block.slice(0..codes_len);
             let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
             score_cluster_codes_into_heap(
-                &codes, &doc_ids, cnt, off, c as u32, &col.quant, q_rot, heap,
+                &codes,
+                &doc_ids,
+                cnt,
+                off,
+                c as u32,
+                &col.quant,
+                ctx.q_rot,
+                ctx.allow.as_deref(),
+                heap,
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
@@ -1810,9 +1866,12 @@ async fn build_shortlist(
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
-        let q_rot_v: Vec<f32> = q_rot.to_vec();
+        let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
+        // Move an `Arc` clone of the allow-set into the rayon task; each
+        // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
+        let allow_owned = ctx.allow.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
@@ -1826,7 +1885,15 @@ async fn build_shortlist(
                         let codes = block.slice(0..codes_len);
                         let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
                         score_cluster_codes_into_heap(
-                            &codes, &doc_ids, cnt, off, c as u32, &quant, &q_rot_v, &mut heap,
+                            &codes,
+                            &doc_ids,
+                            cnt,
+                            off,
+                            c as u32,
+                            &quant,
+                            &q_rot_v,
+                            allow_owned.as_deref(),
+                            &mut heap,
                         );
                     }
                     heap
@@ -1864,7 +1931,7 @@ async fn build_shortlist(
     // the contract, not numerical agreement with fp32. `rerank_mult`
     // is intentionally ignored — there's nothing to refine.
     if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        let _ = rerank_mult;
+        let _ = ctx.rerank_mult;
         shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         return ShortlistOutcome::Done(
             shortlist
@@ -1915,6 +1982,53 @@ async fn build_shortlist(
         candidates,
         survivor_full_ranges,
     }
+}
+
+/// Maximum multiplier applied to filtered-search probe breadth and
+/// rerank width. Caps the inverse-selectivity boost so very sparse
+/// predicates don't turn every query into a full cluster scan.
+const MAX_FILTER_SELECTIVITY_MULT: usize = 64;
+/// Maximum effective rerank multiplier after filtered-search selectivity scaling.
+const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
+/// Multiplier for the unfiltered path, and for degenerate empty-column
+/// metadata where there is no population to estimate selectivity from.
+const UNFILTERED_SELECTIVITY_MULT: usize = 1;
+/// Multiplier for a present-but-empty allow-set: no row can match, so
+/// callers should return an empty result without probing.
+const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+/// Population count for an empty allow-set or empty column.
+const EMPTY_FILTER_POPULATION: u64 = 0;
+/// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).
+const FULL_SELECTIVITY: f64 = 1.0;
+
+/// Compute the inverse-selectivity multiplier for filtered search.
+/// Returns [`UNFILTERED_SELECTIVITY_MULT`] when `allow` is `None`
+/// (unfiltered). Returns [`EMPTY_FILTER_SELECTIVITY_MULT`] when `allow`
+/// is present but empty (no row can match — callers must short-circuit).
+/// Capped at [`MAX_FILTER_SELECTIVITY_MULT`].
+fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> usize {
+    let Some(bm) = allow.as_ref() else {
+        return UNFILTERED_SELECTIVITY_MULT;
+    };
+    let allowed = bm.len();
+    if allowed == EMPTY_FILTER_POPULATION {
+        return EMPTY_FILTER_SELECTIVITY_MULT;
+    }
+    let n = n_docs as u64;
+    if n == EMPTY_FILTER_POPULATION {
+        return UNFILTERED_SELECTIVITY_MULT;
+    }
+    let selectivity = allowed as f64 / n as f64;
+    (FULL_SELECTIVITY / selectivity)
+        .ceil()
+        .min(MAX_FILTER_SELECTIVITY_MULT as f64) as usize
+}
+
+/// Scale rerank breadth for filtered search and cap before shortlist sizing.
+fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usize {
+    rerank_mult
+        .saturating_mul(filter_mult)
+        .min(MAX_EFFECTIVE_FILTERED_RERANK_MULT)
 }
 
 /// Score `query` against every centroid in `centroids_bytes` and
@@ -2002,19 +2116,30 @@ fn score_cluster_codes_into_heap(
     cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
+    allow: Option<&roaring::RoaringBitmap>,
     out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
     let q_total: f32 = q_rot.iter().sum();
     for i in 0..cnt as usize {
-        let code = &cluster_codes[i * cb..(i + 1) * cb];
-        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         let did = u32::from_le_bytes([
             cluster_doc_ids[i * 4],
             cluster_doc_ids[i * 4 + 1],
             cluster_doc_ids[i * 4 + 2],
             cluster_doc_ids[i * 4 + 3],
         ]);
+        // Filtered search: the predicate's per-superfile allow-set is a
+        // hard constraint applied *before* the candidate enters the
+        // coarse heap. The heap therefore ranks distance only among
+        // matching doc-ids, so the top-k is the true k-nearest among
+        // matching rows with no underflow — no over-fetch, no
+        // post-filter. Decode the code (the hot work) only for an
+        // allowed candidate.
+        if allow.is_some_and(|bm| !bm.contains(did)) {
+            continue;
+        }
+        let code = &cluster_codes[i * cb..(i + 1) * cb];
+        let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
         out.push(CoarseCandidate {
             did,
             estimate: est,
@@ -3038,11 +3163,11 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank)
+            .search_async("v", q, k, n_cent as usize, rerank, None)
             .await
             .expect("search_async");
         let probed = r
-            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank)
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None)
             .await
             .expect("search_clusters_async");
 
@@ -3057,7 +3182,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank)
+            .search_clusters_async("v", q, k, &[], rerank, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -6182,11 +6307,11 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20)
+            .search_async("v", &all[17], 5, 4, 20, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
@@ -6221,11 +6346,11 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6235,7 +6360,7 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5)
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None)
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6246,13 +6371,13 @@ mod tests {
         // resolve_column error arms reached through the async entry point.
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5).await;
+        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None).await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
-        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5).await;
+        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None).await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());
@@ -6714,5 +6839,454 @@ mod tests {
         assert_eq!(out[0].as_ref(), &bytes[100..120]);
         assert_eq!(out[1].as_ref(), &bytes[80..100]);
         assert_eq!(out[2].as_ref(), &bytes[130..150]);
+    }
+
+    // -----------------------------------------------------------------
+    // Lazy-source failure propagation
+    // -----------------------------------------------------------------
+    //
+    // The reader maps every `LazyByteSource` failure to
+    // `VectorError::LazySource`. These tests drive a source that can be
+    // switched into a failing mode so the search / get_vectors / open
+    // error-mapping arms run rather than only the happy paths.
+
+    /// `range()`-call index at which [`FlakyLazyByteSource`] starts
+    /// erroring. The open path issues a fixed, small number of fetches
+    /// (outer header, directory, then one per subsection); a value past
+    /// those lets open succeed before the failing mode trips.
+    const FAIL_NEVER: u64 = u64::MAX;
+
+    /// Test-only [`LazyByteSource`] over a real blob that serves bytes
+    /// until the test flips it into a failing mode. `try_get_range_sync`
+    /// always returns `None`, so every reader fetch routes through the
+    /// async `range()` (or its sync bridge) and observes the flag. Used
+    /// to pin that a backing-store failure surfaces as
+    /// `VectorError::LazySource` instead of a panic or silent miss.
+    #[derive(Debug)]
+    struct FlakyLazyByteSource {
+        bytes: Bytes,
+        /// Number of `range()` calls observed so far.
+        calls: AtomicU64,
+        /// Once `calls >= fail_after`, every `range()` returns an error.
+        fail_after: AtomicU64,
+    }
+
+    impl FlakyLazyByteSource {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                calls: AtomicU64::new(0),
+                fail_after: AtomicU64::new(FAIL_NEVER),
+            }
+        }
+
+        /// Begin failing on the next `range()` call. Called after a
+        /// successful open so search-time fetches hit the failing arm.
+        fn fail_from_now(&self) {
+            let seen = self.calls.load(AtomicOrdering::Relaxed);
+            self.fail_after.store(seen, AtomicOrdering::Relaxed);
+        }
+
+        /// Fail starting from the `nth` (0-based) `range()` call — used
+        /// to fail a specific open-time fetch wave.
+        fn fail_after_call(&self, nth: u64) {
+            self.fail_after.store(nth, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LazyByteSource for FlakyLazyByteSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let n = self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if n >= self.fail_after.load(AtomicOrdering::Relaxed) {
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: 0,
+                });
+            }
+            let total = self.bytes.len() as u64;
+            if start.saturating_add(len) > total {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: total,
+                });
+            }
+            let s = start as usize;
+            Ok(self.bytes.slice(s..s + len as usize))
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            // Always miss so reader fetches take the async `range()`
+            // path and observe the failing flag.
+            None
+        }
+    }
+
+    /// A backing-store failure during sync `search()` surfaces as
+    /// `VectorError::LazySource` rather than a panic. Exercises the
+    /// `map_err(LazySource)` arms on the cold fetch path.
+    #[tokio::test]
+    async fn search_propagates_lazy_source_error() {
+        let (blob, json, all) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_from_now();
+        let err = r
+            .search("embedding", &all[0], 5, 4, 5)
+            .await
+            .expect_err("search must surface the backing-store failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "expected LazySource, got {err:?}"
+        );
+    }
+
+    /// The async `search_async` and externally-selected
+    /// `search_clusters_async` paths also map a backing-store failure to
+    /// `VectorError::LazySource`. Exercises the async error arms in
+    /// `search_async` / `search_clusters_async` / `probe_clusters_async`.
+    #[tokio::test]
+    async fn async_search_paths_propagate_lazy_source_error() {
+        let (blob, json, all) = build_search_corpus();
+
+        let flaky_a = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        let ra = VectorReader::open_lazy(
+            StdArc::clone(&flaky_a) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy for search_async");
+        flaky_a.fail_from_now();
+        let err = ra
+            .search_async("embedding", &all[0], 5, 4, 5, None)
+            .await
+            .expect_err("search_async must surface failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "search_async expected LazySource, got {err:?}"
+        );
+
+        let flaky_c = StdArc::new(FlakyLazyByteSource::new(blob));
+        let rc = VectorReader::open_lazy(
+            StdArc::clone(&flaky_c) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy for search_clusters_async");
+        flaky_c.fail_from_now();
+        let err = rc
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
+            .await
+            .expect_err("search_clusters_async must surface failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "search_clusters_async expected LazySource, got {err:?}"
+        );
+    }
+
+    /// `get_vectors_fp32` maps a backing-store failure on the
+    /// cluster-index / block fetch to `VectorError::LazySource`.
+    #[tokio::test]
+    async fn get_vectors_fp32_propagates_lazy_source_error() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_from_now();
+        let err = r
+            .get_vectors_fp32("embedding")
+            .expect_err("get_vectors_fp32 must surface the backing-store failure");
+        assert!(
+            matches!(err, VectorError::LazySource(_)),
+            "expected LazySource, got {err:?}"
+        );
+    }
+
+    /// A failure on the outer-header fetch during `open_lazy` maps to a
+    /// `MalformedVersion` read error (the open path stringifies the
+    /// lazy error into its own structural-decode error).
+    #[tokio::test]
+    async fn open_lazy_header_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(0); // fail the very first (header) fetch
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("header fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// A failure on the directory fetch (the second `range()` wave)
+    /// during `open_lazy` also aborts open with a `MalformedVersion`
+    /// read error, exercising the directory-fetch error arm.
+    #[tokio::test]
+    async fn open_lazy_directory_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(1); // header succeeds, directory fetch fails
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("directory fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// A failure on the subsection-header fetch wave (third `range()`
+    /// onward) during `open_lazy` aborts open with a `MalformedVersion`
+    /// read error, exercising the subheader-fetch error arm.
+    #[tokio::test]
+    async fn open_lazy_subheader_fetch_failure_errors() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob));
+        flaky.fail_after_call(2); // header + directory succeed, subheaders fail
+        let err = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect_err("subheader fetch failure must abort open_lazy");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    /// Malformed `inf.vec.columns` JSON is rejected at open with a
+    /// `MalformedVersion` read error — exercises the JSON-parse error
+    /// arm in `open_with_source`.
+    #[test]
+    fn open_rejects_malformed_columns_json() {
+        let (blob, _json) = build_blob(32, 16, 4, Metric::L2Sq);
+        let err = VectorReader::open(blob, "{ this is not valid json")
+            .expect_err("malformed JSON must be rejected");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Per-wave cold-fetch failure sweeps
+    // -----------------------------------------------------------------
+    //
+    // The single-wave `*_propagates_lazy_source_error` tests above fail
+    // the *first* search-time fetch, so only the earliest `map_err`
+    // closure on each path runs. These sweeps fail every successive
+    // fetch wave in turn — opening a fresh source each time and tripping
+    // the failing mode at one later `range()` call — so each path's
+    // *downstream* cold-fetch error closures (Sq8-meta batch, the
+    // coalesced survivor-rerank wave, and the final rerank fetch) all
+    // execute, not just the leading one. Every wave must surface a
+    // `VectorError::LazySource`.
+
+    /// Number of open-time `range()` calls a `FlakyLazyByteSource` sees
+    /// before any search fetch — read back from the source's own counter
+    /// after a successful `open_lazy`, so the sweep starts failing at the
+    /// first *search* wave rather than re-failing an open wave.
+    fn open_call_count(flaky: &FlakyLazyByteSource) -> u64 {
+        flaky.calls.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Drive `search` on a fresh cold lazy source that errors starting at
+    /// the `nth` `range()` call. Returns the search result so the caller
+    /// can assert per-wave behavior.
+    async fn search_failing_at_call(
+        blob: &Bytes,
+        json: &str,
+        query: &[f32],
+        fail_at: u64,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        let r = VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy before failing mode");
+        flaky.fail_after_call(fail_at);
+        r.search("embedding", query, 5, 4, 5).await
+    }
+
+    /// Failing each successive cold-fetch wave of the sync `search` path
+    /// in turn surfaces a `LazySource` error on at least one wave beyond
+    /// the leading centroid fetch — exercising the coalesced-prefix,
+    /// survivor-rerank, and final-rerank `map_err` closures.
+    #[tokio::test]
+    async fn search_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, all) = build_search_corpus();
+        // Learn open's call count from a clean open.
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        // Sweep a generous window of search-time waves; each fresh source
+        // re-runs the identical open, so `open_calls` is the stable base.
+        /// Number of successive search-time `range()` waves to fail.
+        const SEARCH_WAVE_SWEEP: u64 = 12;
+        let mut lazy_errors = 0usize;
+        for offset in 0..SEARCH_WAVE_SWEEP {
+            match search_failing_at_call(&blob, &json, &all[0], open_calls + offset).await {
+                Err(VectorError::LazySource(_)) => lazy_errors += 1,
+                // Some waves may already have all bytes in hand (e.g. a
+                // coalesced fetch served everything), so a clean result
+                // is allowed — we only require that failures map cleanly.
+                Ok(_) => {}
+                other => panic!("unexpected non-LazySource outcome: {other:?}"),
+            }
+        }
+        assert!(
+            lazy_errors >= 2,
+            "at least the centroid and one downstream cold wave must surface LazySource"
+        );
+    }
+
+    /// The async `search_async` and `search_clusters_async` paths surface
+    /// `LazySource` on each successive cold wave too — covering their
+    /// downstream coalesced-fetch / rerank error closures, not just the
+    /// leading centroid+index fetch.
+    #[tokio::test]
+    async fn async_search_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, all) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        /// Successive search-time waves to fail on the async paths.
+        const ASYNC_WAVE_SWEEP: u64 = 12;
+        let mut async_errors = 0usize;
+        let mut clusters_errors = 0usize;
+        for offset in 0..ASYNC_WAVE_SWEEP {
+            let fail_at = open_calls + offset;
+
+            let flaky_a = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let ra = VectorReader::open_lazy(
+                StdArc::clone(&flaky_a) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy search_async");
+            flaky_a.fail_after_call(fail_at);
+            match ra.search_async("embedding", &all[0], 5, 4, 5, None).await {
+                Err(VectorError::LazySource(_)) => async_errors += 1,
+                Ok(_) => {}
+                other => panic!("search_async unexpected outcome: {other:?}"),
+            }
+
+            let flaky_c = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let rc = VectorReader::open_lazy(
+                StdArc::clone(&flaky_c) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy search_clusters_async");
+            flaky_c.fail_after_call(fail_at);
+            match rc
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
+                .await
+            {
+                Err(VectorError::LazySource(_)) => clusters_errors += 1,
+                Ok(_) => {}
+                other => panic!("search_clusters_async unexpected outcome: {other:?}"),
+            }
+        }
+        assert!(
+            async_errors >= 2,
+            "search_async must surface LazySource on the centroid and a downstream wave"
+        );
+        assert!(
+            clusters_errors >= 2,
+            "search_clusters_async must surface LazySource on the index and a downstream wave"
+        );
+    }
+
+    /// `get_vectors_fp32` surfaces `LazySource` on both its fetch waves:
+    /// the cluster-index `get_range` and the per-cluster block
+    /// `get_ranges_parallel`. The single-wave test above only trips the
+    /// first; sweeping both indices exercises the second `map_err` arm.
+    #[tokio::test]
+    async fn get_vectors_fp32_every_cold_wave_failure_surfaces_lazy_source() {
+        let (blob, json, _) = build_search_corpus();
+        let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+        VectorReader::open_lazy(
+            StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy to count open calls");
+        let open_calls = open_call_count(&flaky);
+
+        /// `get_vectors_fp32` issues an index fetch then a block fetch;
+        /// fail each in turn (plus a small margin).
+        const GET_VECTORS_WAVE_SWEEP: u64 = 4;
+        let mut lazy_errors = 0usize;
+        for offset in 0..GET_VECTORS_WAVE_SWEEP {
+            let flaky = StdArc::new(FlakyLazyByteSource::new(blob.clone()));
+            let r = VectorReader::open_lazy(
+                StdArc::clone(&flaky) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .expect("open_lazy before failing mode");
+            flaky.fail_after_call(open_calls + offset);
+            match r.get_vectors_fp32("embedding") {
+                Err(VectorError::LazySource(_)) => lazy_errors += 1,
+                Ok(_) => {}
+                other => panic!("get_vectors_fp32 unexpected outcome: {other:?}"),
+            }
+        }
+        assert!(
+            lazy_errors >= 2,
+            "both the cluster-index and block fetch waves must surface LazySource"
+        );
     }
 }

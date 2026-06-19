@@ -315,7 +315,13 @@ async fn vector_query_excludes_tombstoned_row() {
     let q = [0.0f32; DIM];
     let hits = st
         .reader()
-        .vector_hits("embedding", &q, VECTOR_SEARCH_K, VectorSearchOptions::new())
+        .vector_hits(
+            "embedding",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new(),
+            None,
+        )
         .expect("vector");
     assert!(!hits.is_empty(), "expected at least one un-tombstoned hit");
     for hit in &hits {

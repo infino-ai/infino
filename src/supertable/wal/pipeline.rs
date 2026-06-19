@@ -69,7 +69,7 @@ use crate::superfile::builder::SuperfileBuilder;
 use crate::supertable::handle::Supertable;
 use crate::supertable::manifest::bloom::BloomBuilder;
 use crate::supertable::manifest::{
-    FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
@@ -391,7 +391,7 @@ async fn do_apply(
     let fts_summary = build_fts_summary(&reader, &inner.options);
     let vector_summary = build_vector_summary(&reader, &inner.options);
     let scalar_stats =
-        ScalarStatsTable::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+        ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)
@@ -434,16 +434,16 @@ async fn do_apply(
     // `Writer::commit` path arms it. We swap here so subsequent
     // reads + the idempotency probe on a retry both see the
     // new superfile.
-    let new_manifest = crate::supertable::writer::persist_commit(
+    crate::supertable::writer::persist_commit(
         inner,
         storage,
         vec![entry],
+        &[],
         vec![(uri, bytes.clone())],
     )
     .map_err(|e| AppendPhaseError::ManifestCommit {
         message: format!("{e}"),
     })?;
-    inner.manifest.store(Arc::new(new_manifest));
 
     // Warm the in-memory reader cache with the freshly-published
     // bytes so this process's later reads (queries, tombstone
@@ -546,8 +546,8 @@ fn prepend_id_column(
 fn build_fts_summary(
     reader: &SuperfileReader,
     options: &crate::supertable::SupertableOptions,
-) -> HashMap<String, FtsSummary> {
-    let mut out: HashMap<String, FtsSummary> = HashMap::new();
+) -> HashMap<String, FtsSummaryAgg> {
+    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
         return out;
     };
@@ -566,11 +566,11 @@ fn build_fts_summary(
         }
         out.insert(
             fc.column.clone(),
-            FtsSummary {
-                term_bloom: bloom_builder.finish(),
+            FtsSummaryAgg::new_with_params(
+                bloom_builder.finish(),
                 n_terms_distinct,
-                term_range: (min_term, max_term),
-            },
+                (min_term, max_term),
+            ),
         );
     }
     out

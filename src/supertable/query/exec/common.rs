@@ -560,13 +560,22 @@ mod tests {
 
     use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
     use arrow_schema::Field;
+    use bytes::Bytes;
+    use object_store::path::Path as ObjPath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
+    use crate::storage::{LocalFsStorageProvider, StorageProvider};
+    use crate::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
     use crate::superfile::fts::reader::BoolMode;
     use crate::superfile::vector::distance::Metric;
     use crate::superfile::vector::rerank_codec::RerankCodec;
+    use crate::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore};
     use crate::supertable::{Supertable, SupertableOptions};
     use crate::test_helpers::default_tokenizer as tok;
+    use crate::test_helpers::{
+        build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
+    };
+    use tempfile::TempDir;
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
@@ -759,5 +768,474 @@ mod tests {
             .expect("bm25_search empty");
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 0);
+    }
+
+    // ---- resolve_hits direct: projection branches that the named
+    //      wrapper never reaches (score-only, empty projection) ----
+
+    /// Two hits against the demo superfile, with deliberately distinct
+    /// scores so the synthesized `score` column can be checked.
+    fn two_hits(reader: &SupertableReader) -> Vec<SuperfileHit> {
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        vec![
+            SuperfileHit {
+                superfile: entry.uri,
+                local_doc_id: 0,
+                score: 1.5,
+            },
+            SuperfileHit {
+                superfile: entry.uri,
+                local_doc_id: (entry.n_docs - 1) as u32,
+                score: 0.5,
+            },
+        ]
+    }
+
+    #[test]
+    fn resolve_hits_score_only_synthesizes_score_without_decoding_scalars() {
+        // Projecting just the trailing `score` index decodes no scalar
+        // columns (the cost-first "open no readers" branch): `needed`
+        // is empty, `score` is synthesized straight from the hits.
+        let st = demo(16);
+        let reader = st.reader();
+        let hits = two_hits(&reader);
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        let score_idx = scalar_schema.fields().len();
+
+        let batch = reader
+            .block_on(resolve_hits(
+                &reader,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                Some(&[score_idx]),
+            ))
+            .expect("score-only resolve");
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), SCORE_COLUMN);
+        assert_eq!(batch.num_rows(), hits.len());
+        let scores = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("score col");
+        assert_eq!(scores.value(0), 1.5);
+        assert_eq!(scores.value(1), 0.5);
+    }
+
+    #[test]
+    fn resolve_hits_none_projection_returns_all_scalar_columns_and_score() {
+        // `projection: None` (distinct from `resolve_hits_named`'s
+        // `_id`+`score` default) materializes every scalar column plus
+        // the trailing synthesized `score`, in schema order.
+        let st = demo(16);
+        let reader = st.reader();
+        let hits = two_hits(&reader);
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+
+        let batch = reader
+            .block_on(resolve_hits(
+                &reader,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                None,
+            ))
+            .expect("none-projection resolve");
+
+        assert_eq!(batch.num_columns(), output_schema.fields().len());
+        assert_eq!(batch.num_rows(), hits.len());
+        let last = batch.num_columns() - 1;
+        assert_eq!(batch.schema().field(last).name(), SCORE_COLUMN);
+        assert_eq!(batch.schema().field(0).name(), "_id");
+    }
+
+    #[test]
+    fn resolve_hits_empty_projection_preserves_hit_row_count() {
+        // A zero-column projection (the `COUNT(*)` shape) emits no
+        // columns but must still report `hits.len()` rows — the
+        // `with_row_count` path.
+        let st = demo(16);
+        let reader = st.reader();
+        let hits = two_hits(&reader);
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+
+        let batch = reader
+            .block_on(resolve_hits(
+                &reader,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                Some(&[]),
+            ))
+            .expect("empty-projection resolve");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), hits.len());
+    }
+
+    // ---- resolve_ids_arithmetic direct: the no-I/O span arithmetic
+    //      and its fallback when the span check can't apply ----
+
+    #[test]
+    fn resolve_ids_arithmetic_maps_local_ids_via_manifest_span() {
+        // Single contiguous commit => `id_max - id_min + 1 == n_docs`,
+        // so row `local` resolves to `id_min + local` with no file read.
+        let st = demo(16);
+        let reader = st.reader();
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        let last = (entry.n_docs - 1) as u32;
+        let hits = vec![
+            SuperfileHit {
+                superfile: entry.uri,
+                local_doc_id: 0,
+                score: 0.0,
+            },
+            SuperfileHit {
+                superfile: entry.uri,
+                local_doc_id: last,
+                score: 0.0,
+            },
+        ];
+
+        let batch = resolve_ids_arithmetic(&reader, &hits)
+            .expect("contiguous span => Some")
+            .expect("ok batch");
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "_id");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal id col");
+        assert_eq!(ids.value(0), entry.id_min);
+        assert_eq!(ids.value(1), entry.id_min + i128::from(last));
+    }
+
+    #[test]
+    fn resolve_ids_arithmetic_returns_none_when_superfile_absent() {
+        // A hit naming a superfile not in the manifest fails the
+        // lookup, so arithmetic bails to `None` and the caller falls
+        // back to the id-page read.
+        let st = demo(16);
+        let reader = st.reader();
+        let hits = vec![SuperfileHit {
+            superfile: SuperfileUri::new_v4(),
+            local_doc_id: 0,
+            score: 0.0,
+        }];
+        assert!(
+            resolve_ids_arithmetic(&reader, &hits).is_none(),
+            "unknown superfile must abandon the arithmetic fast path",
+        );
+    }
+
+    // ---- take_rows_object_store: the cold/object-store row-resolution
+    //      path, exercised directly against an in-memory object store ----
+
+    /// Titles for the standalone superfile the cold-path tests stream
+    /// rows out of. Five rows so a sub-selection genuinely skips some.
+    const TITLES: [&str; 5] = ["alpha", "bravo", "charlie", "delta", "echo"];
+
+    /// Build a standalone superfile (id + `title` scalar columns, no
+    /// indexes) whose `title` rows are [`TITLES`], in row order.
+    fn titled_superfile_bytes() -> Bytes {
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids(0..TITLES.len() as u64);
+        let title = LargeStringArray::from(TITLES.to_vec());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(title)])
+            .expect("build batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish builder"))
+    }
+
+    /// Open `bytes` eagerly just to read the parquet schema + row count
+    /// that the cold path passes to [`take_rows_object_store`].
+    fn schema_and_n_docs(bytes: &Bytes) -> (SchemaRef, u64) {
+        let reader = SuperfileReader::open(bytes.clone()).expect("open");
+        (Arc::clone(reader.schema()), reader.n_docs())
+    }
+
+    /// Put `bytes` into a fresh in-memory object store and return the
+    /// handle + path the cold reader will range-GET against.
+    async fn object_store_with(bytes: &Bytes) -> (Arc<dyn ObjectStore>, ObjPath) {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("data/seg.sf.parquet");
+        store
+            .put(&path, PutPayload::from_bytes(bytes.clone()))
+            .await
+            .expect("put superfile into object store");
+        (store, path)
+    }
+
+    /// Downcast the single returned `title` column to a string array.
+    fn titles_of(batch: &RecordBatch) -> Vec<String> {
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title col");
+        (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_streams_rows_in_caller_rank_order() {
+        // Out-of-order ids: rows are decoded sorted but ranked back into
+        // the caller's order, so output row i is the i-th requested id.
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let batch = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &[2, 0, 3],
+            &["title"],
+        )
+        .await
+        .expect("take rows");
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "title");
+        assert_eq!(titles_of(&batch), vec!["charlie", "alpha", "delta"]);
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_ranks_back_duplicate_ids() {
+        // The same id requested twice must appear twice in the output —
+        // rows are decoded once (distinct) and gathered back per request.
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let batch = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &[1, 1, 0],
+            &["title"],
+        )
+        .await
+        .expect("take rows");
+
+        assert_eq!(titles_of(&batch), vec!["bravo", "bravo", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_discovers_size_when_file_size_none() {
+        // `None` file_size omits the `with_file_size` shortcut, so the
+        // parquet reader discovers the size itself — same rows out.
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let batch = take_rows_object_store(store, path, None, &schema, n_docs, &[4], &["title"])
+            .await
+            .expect("take rows");
+
+        assert_eq!(titles_of(&batch), vec!["echo"]);
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_empty_ids_returns_empty_batch() {
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let batch = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &[],
+            &["title"],
+        )
+        .await
+        .expect("empty ids");
+
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().field(0).name(), "title");
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_out_of_range_id_errors() {
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let err = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &[n_docs as u32],
+            &["title"],
+        )
+        .await
+        .expect_err("doc id past n_docs must error");
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected an out-of-range error, got {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn take_rows_object_store_unknown_column_errors() {
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+
+        let err = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &[0],
+            &["nope"],
+        )
+        .await
+        .expect_err("unknown column must error");
+        assert!(
+            err.to_string().contains("unknown column"),
+            "expected an unknown-column error, got {err}",
+        );
+    }
+
+    // ---- resolve_columns cold path: lazy (object-store) readers ----
+    //
+    // `demo()` keeps superfile bytes resident, so its readers are warm
+    // and `resolve_columns` only ever takes the rayon decode branch. To
+    // drive the cold branch (lazy readers → `take_rows_object_store`),
+    // commit to durable storage, then *reopen* with a lazy disk cache:
+    // the reopened handle's in-memory tier is empty, so every read cold-
+    // fetches a lazy reader from object storage.
+
+    /// Commit four titled docs to `storage` via a throwaway producer.
+    fn commit_titles_to(storage: &Arc<dyn StorageProvider>) {
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(storage)))
+                .expect("create producer");
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&[
+            "rust async",
+            "python data",
+            "rust systems",
+            "go routines",
+        ]))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// Reopen the supertable at `consumer_storage` with a lazy
+    /// (`LazyForegroundWithBackgroundFill`) disk cache so reads resolve to
+    /// lazy range-GET readers. The reopened handle's in-memory tier is
+    /// empty, so every read cold-fetches.
+    fn open_cold(
+        consumer_storage: Arc<dyn StorageProvider>,
+        cache_dir: &TempDir,
+    ) -> (Arc<DiskCacheStore>, Supertable) {
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            ..Default::default()
+        };
+        let cache =
+            DiskCacheStore::new_unpinned(Arc::clone(&consumer_storage), cfg).expect("cache");
+        let consumer = Supertable::open(
+            default_supertable_options()
+                .with_storage(consumer_storage)
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open consumer");
+        (cache, consumer)
+    }
+
+    /// Producer commits to local-FS storage; consumer reopens cold over
+    /// the same storage. Returns the temp dirs (kept alive as RAII
+    /// guards), the cache (for stats), and the cold consumer handle.
+    fn cold_consumer() -> (TempDir, TempDir, Arc<DiskCacheStore>, Supertable) {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        commit_titles_to(&storage);
+        let (cache, consumer) = open_cold(Arc::clone(&storage), &cache_dir);
+        (storage_dir, cache_dir, cache, consumer)
+    }
+
+    #[test]
+    fn resolve_columns_cold_path_streams_scalar_via_object_store() {
+        // Naming a non-id scalar column forces resolve_columns; the lazy
+        // readers route it through take_rows_object_store (range GETs),
+        // and `score` is synthesized alongside in rank order.
+        let (_sd, _cd, cache, consumer) = cold_consumer();
+
+        let batches = consumer
+            .reader()
+            .bm25_search("title", "rust", 10, BoolMode::Or, Some(&["title", "score"]))
+            .expect("cold bm25 with scalar projection");
+
+        let b = &batches[0];
+        assert_eq!(b.num_columns(), 2);
+        assert_eq!(b.schema().field(0).name(), "title");
+        assert_eq!(b.schema().field(1).name(), "score");
+        let titles = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title col");
+        assert_eq!(titles.len(), 2, "two docs contain 'rust'");
+        for i in 0..titles.len() {
+            assert!(titles.value(i).contains("rust"));
+        }
+        // The reopened consumer's in-memory tier is empty, so resolving
+        // the rows genuinely cold-fetched through the disk cache — this
+        // is what put us on the cold branch.
+        assert!(
+            cache.stats().n_cold_fetches >= 1,
+            "scalar resolution must cold-fetch lazy readers; got {}",
+            cache.stats().n_cold_fetches,
+        );
+    }
+
+    #[test]
+    fn resolve_columns_cold_path_empty_hits_opens_no_readers() {
+        // A query that matches nothing produces no hits, so resolve_hits
+        // short-circuits before resolve_columns ever opens a reader — no
+        // cold-fetch is issued for the (absent) scalar resolution.
+        let (_sd, _cd, _cache, consumer) = cold_consumer();
+
+        let batches = consumer
+            .reader()
+            .bm25_search(
+                "title",
+                "nonexistentterm",
+                10,
+                BoolMode::Or,
+                Some(&["title", "score"]),
+            )
+            .expect("cold bm25 with no matches");
+
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 0);
     }
 }

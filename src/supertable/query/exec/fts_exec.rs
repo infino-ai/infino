@@ -672,6 +672,42 @@ mod tests {
         out
     }
 
+    /// Construct `Bm25Table` directly through the TVF `call` path and
+    /// exercise its `TableProvider` metadata methods (`Debug`,
+    /// `as_any`, `table_type`) plus the lowered `Bm25Exec`'s `name` /
+    /// `Debug` — none of which normal query execution touches.
+    #[tokio::test]
+    async fn bm25_table_and_exec_trait_methods() {
+        let st = demo_corpus();
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let func = Bm25SearchFunc::new(reader, scalar_schema);
+        let table = func
+            .call(&[lit("title"), lit("rust"), lit(10_i64)])
+            .expect("bm25 table");
+
+        // TableProvider metadata.
+        let dbg = format!("{table:?}");
+        assert!(dbg.contains("Bm25Table"), "Debug missing: {dbg}");
+        assert!(
+            table.as_any().downcast_ref::<Bm25Table>().is_some(),
+            "as_any downcasts to Bm25Table"
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+
+        // Lower to the ExecutionPlan and hit its name / Debug.
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(plan.name(), "Bm25Exec");
+        assert!(
+            format!("{plan:?}").contains("Bm25Exec"),
+            "Exec Debug missing"
+        );
+    }
+
     #[test]
     fn bm25_exec_display_describes_search_and_prefix_branches() {
         let st = demo_corpus();

@@ -111,7 +111,7 @@ pub(crate) const DECIMAL128_SCALE: i8 = 0;
 const DEFAULT_READ_STALENESS_SECS: u64 = 1;
 /// Default soft cap on superfiles per manifest part; exceeding it
 /// triggers a part split on commit.
-const DEFAULT_TARGET_SUPERFILES_PER_PARTITION: u64 = 10_000;
+const DEFAULT_TARGET_SUPERFILES_PER_PART: u64 = 10_000;
 /// Default soft cap on a manifest part's compressed size (10 MiB).
 const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// Default: eager-load manifest parts at open when there are at most
@@ -289,7 +289,7 @@ pub struct SupertableOptions {
     /// the next commit's superfiles for that partition go into
     /// a fresh part instead of rewriting the existing one.
     /// Default `10_000`.
-    pub target_superfiles_per_partition: u64,
+    pub target_superfiles_per_part: u64,
     /// Soft cap on a `ManifestPart`'s compressed Avro+zstd
     /// size in bytes. Triggers part-split alongside
     /// `target_superfiles_per_partition`. Default `10 * (1 << 20)`
@@ -510,7 +510,7 @@ impl SupertableOptions {
             memory_budget_bytes: None,
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
-            target_superfiles_per_partition: DEFAULT_TARGET_SUPERFILES_PER_PARTITION,
+            target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
@@ -689,8 +689,8 @@ impl SupertableOptions {
 
     /// Override the soft cap on superfiles per manifest part.
     /// Default `10_000`.
-    pub fn with_target_superfiles_per_partition(mut self, n: u64) -> Self {
-        self.target_superfiles_per_partition = n;
+    pub fn with_target_superfiles_per_part(mut self, n: u64) -> Self {
+        self.target_superfiles_per_part = n;
         self
     }
 
@@ -1372,8 +1372,8 @@ supertable:
         assert!(opts.memory_budget_bytes.is_none());
         assert!(opts.partition_strategy.is_none());
         assert_eq!(
-            opts.target_superfiles_per_partition,
-            DEFAULT_TARGET_SUPERFILES_PER_PARTITION
+            opts.target_superfiles_per_part,
+            DEFAULT_TARGET_SUPERFILES_PER_PART
         );
         assert_eq!(
             opts.part_size_threshold_bytes,
@@ -1422,7 +1422,7 @@ supertable:
     #[test]
     fn scalar_threshold_builders_set_their_fields() {
         let opts = plain_opts()
-            .with_target_superfiles_per_partition(42)
+            .with_target_superfiles_per_part(42)
             .with_part_size_threshold_bytes(4096)
             .with_eager_load_threshold(0)
             .with_max_commit_retries(99)
@@ -1431,7 +1431,7 @@ supertable:
             .with_memory_budget(1 << 30)
             .with_cache_prepopulation(false)
             .with_verify_crc_on_open(false);
-        assert_eq!(opts.target_superfiles_per_partition, 42);
+        assert_eq!(opts.target_superfiles_per_part, 42);
         assert_eq!(opts.part_size_threshold_bytes, 4096);
         assert_eq!(opts.eager_load_threshold_parts, 0);
         assert_eq!(opts.max_commit_retries, 99);
@@ -1655,6 +1655,56 @@ supertable:
         let err = plain_opts()
             .apply_config(&cfg)
             .expect_err("missing local_root");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
+
+    #[test]
+    fn apply_config_attaches_s3_storage_from_bucket() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // `storage.backend = s3` with a bucket drives the S3 arm of
+        // apply_storage_config. `S3StorageProvider::new` only builds a
+        // client object from the AWS credential chain — it makes no
+        // network call — so the arm is exercised offline.
+        let yaml = "storage:\n  backend: s3\n  bucket: example-bucket\n  prefix: tbl/example\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert!(opts.storage.is_some(), "s3 backend attaches storage");
+        assert!(
+            opts.disk_cache.is_none(),
+            "no disk_cache_root ⇒ no cache attached"
+        );
+    }
+
+    #[test]
+    fn apply_config_s3_without_bucket_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // s3 backend but no bucket → the typed Store error arm of
+        // apply_storage_config.
+        let yaml = "storage:\n  backend: s3\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts().apply_config(&cfg).expect_err("missing bucket");
+        assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
+
+    #[test]
+    fn apply_config_azure_without_bucket_is_rejected() {
+        use figment::Figment;
+        use figment::providers::{Format, Yaml};
+
+        // azure backend but no container → the typed Store error arm
+        // of apply_storage_config.
+        let yaml = "storage:\n  backend: azure\n";
+        let cfg = crate::config::Config::from_figment(Figment::new().merge(Yaml::string(yaml)))
+            .expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("missing container");
         assert!(matches!(err, BuildError::Store(_)), "{err:?}");
     }
 }

@@ -837,6 +837,22 @@ impl SuperfileReader {
         Ok(fts.token_match(column, tokens, mode).await?)
     }
 
+    /// Unranked token-match **count**: the number of `local_doc_id`s
+    /// [`token_match`](Self::token_match) would return under `mode`,
+    /// without materializing the id `Vec`. Delegates to
+    /// [`FtsReader::token_match_count`].
+    pub async fn token_match_count(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<u64, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.token_match_count(column, tokens, mode).await?)
+    }
+
     /// Document frequency of `token` in `column` (0 if absent) — a cheap
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to
@@ -1103,14 +1119,32 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.vector_hits_filtered_async(column, query, k, options, None)
+            .await
+    }
+
+    /// As [`Self::vector_hits_async`], but restricts the kNN ranking to
+    /// the `local_doc_id`s in `allow` (a per-superfile predicate
+    /// allow-set). The allow-set is applied *inside* the coarse 1-bit
+    /// shortlist, so the returned top-k is the true k-nearest among
+    /// matching rows — pushdown, not post-filter, with no underflow.
+    /// `allow == None` is identical to [`Self::vector_hits_async`].
+    pub async fn vector_hits_filtered_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        allow: Option<Arc<RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let filtered = allow.is_some();
+        let (nprobe, rerank_mult) = options.resolve(filtered);
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
-        Ok(
-            v.search_async(column, query, k, options.nprobe, rerank_mult)
-                .await?,
-        )
+        let rerank_mult = v.public_rerank_mult(column, rerank_mult);
+        Ok(v.search_async(column, query, k, nprobe, rerank_mult, allow)
+            .await?)
     }
 
     /// As [`Self::vector_search`], but probes an **externally chosen**
@@ -1126,72 +1160,89 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
+        self.vector_search_clusters_filtered(column, query, k, clusters, options, None)
+            .await
+    }
+
+    /// As [`Self::vector_search_clusters`], but restricts the kNN
+    /// ranking to the `local_doc_id`s in `allow` (a per-superfile
+    /// predicate allow-set), applied inside the coarse shortlist.
+    /// `allow == None` is identical to [`Self::vector_search_clusters`].
+    pub async fn vector_search_clusters_filtered(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        options: VectorSearchOptions,
+        allow: Option<Arc<RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let filtered = allow.is_some();
+        let (_, rerank_mult) = options.resolve(filtered);
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
+        let rerank_mult = v.public_rerank_mult(column, rerank_mult);
         Ok(
-            v.search_clusters_async(column, query, k, clusters, rerank_mult)
+            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow)
                 .await?,
         )
     }
 }
 
 /// Tuning knobs for vector search (`Supertable::vector_search`).
-/// Defaults are picked so a caller who hasn't profiled the
-/// recall-vs-latency tradeoff still gets recall in the 0.9+ range on
-/// typical IVF setups.
 ///
-/// - `nprobe`: number of IVF clusters to scan. Higher = better recall,
-///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a
-///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
-///   index per query.
+/// Each field is an optional override. `None` means “use the engine default”,
+/// which depends on whether the query is filtered:
 ///
-/// - `rerank_mult`: number of coarse candidates per requested hit to
-///   feed into exact/Sq8 rerank. Higher = better recall, slower.
-#[derive(Debug, Clone, Copy)]
+/// - unfiltered: `nprobe=6`, `rerank_mult=256`
+/// - filtered (`filter: Some(...)` or an internal allow-set): `nprobe=8`, `rerank_mult=256`
+///
+/// Set a field with [`Self::with_nprobe`] / [`Self::with_rerank_mult`].
+#[derive(Debug, Clone, Copy, Default)]
 pub struct VectorSearchOptions {
-    pub nprobe: usize,
-    rerank_mult: usize,
+    /// IVF probe override. `None` → engine default for the query path.
+    pub nprobe: Option<usize>,
+    rerank_mult: Option<usize>,
 }
 
 impl VectorSearchOptions {
-    pub const DEFAULT_NPROBE: usize = 8;
+    /// Unfiltered default `nprobe` (used when [`Self::nprobe`] is `None`).
+    pub const DEFAULT_NPROBE: usize = 6;
 
-    /// Internal rerank multiplier. `k * RERANK_MULT` candidates
-    /// from the 1-bit RaBitQ shortlist enter Sq8/residual rerank.
-    /// Bench-validated: recall saturates at 4 on 10M×384 cosine.
-    pub const RERANK_MULT: usize = 4;
+    /// Default `rerank_mult` for both paths (used when unset).
+    pub const RERANK_MULT: usize = 256;
 
-    /// Construct with defaults applied.
+    /// Filtered default `nprobe` (internal; applied when the query carries a filter).
+    pub(crate) const FILTERED_DEFAULT_NPROBE: usize = 8;
+
     pub fn new() -> Self {
-        Self {
-            nprobe: Self::DEFAULT_NPROBE,
-            rerank_mult: Self::RERANK_MULT,
-        }
+        Self::default()
     }
 
-    /// Override the IVF probe count.
     pub fn with_nprobe(mut self, n: usize) -> Self {
-        self.nprobe = n;
+        self.nprobe = Some(n);
         self
     }
 
-    /// Override the rerank multiplier. Values below 1 are clamped
-    /// to 1 so `k > 0` always admits at least `k` coarse candidates.
     pub fn with_rerank_mult(mut self, n: usize) -> Self {
-        self.rerank_mult = n.max(1);
+        self.rerank_mult = Some(n.max(1));
         self
     }
 
-    pub fn rerank_mult(&self) -> usize {
+    pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
     }
-}
 
-impl Default for VectorSearchOptions {
-    fn default() -> Self {
-        Self::new()
+    /// Resolve `(nprobe, rerank_mult)` for this query path.
+    pub(crate) fn resolve(&self, filtered: bool) -> (usize, usize) {
+        let nprobe = self.nprobe.unwrap_or(if filtered {
+            Self::FILTERED_DEFAULT_NPROBE
+        } else {
+            Self::DEFAULT_NPROBE
+        });
+        let rerank_mult = self.rerank_mult.unwrap_or(Self::RERANK_MULT);
+        (nprobe, rerank_mult)
     }
 }
 
@@ -1569,10 +1620,10 @@ mod tests {
     #[test]
     fn vector_search_options_default_values() {
         let opts = VectorSearchOptions::default();
-        assert_eq!(opts.nprobe, 8);
-        assert_eq!(opts.rerank_mult(), 4);
-        let opts2 = VectorSearchOptions::new();
-        assert_eq!(opts.nprobe, opts2.nprobe);
+        assert_eq!(opts.nprobe, None);
+        assert_eq!(opts.rerank_mult(), None);
+        assert_eq!(opts.resolve(false), (6, 256));
+        assert_eq!(opts.resolve(true), (8, 256));
     }
 
     #[test]
@@ -1580,8 +1631,10 @@ mod tests {
         let opts = VectorSearchOptions::new()
             .with_nprobe(2)
             .with_rerank_mult(32);
-        assert_eq!(opts.nprobe, 2);
-        assert_eq!(opts.rerank_mult(), 32);
+        assert_eq!(opts.nprobe, Some(2));
+        assert_eq!(opts.rerank_mult(), Some(32));
+        assert_eq!(opts.resolve(false), (2, 32));
+        assert_eq!(opts.resolve(true), (2, 32));
     }
 
     #[tokio::test]
@@ -2017,5 +2070,192 @@ mod tests {
         // The crate re-exports BoolMode as FtsBoolMode for convenience.
         let m: FtsBoolMode = FtsBoolMode::And;
         assert_eq!(m, BoolMode::And);
+    }
+
+    // ── KV-validation error branches (eager + lazy open paths) ─────────
+
+    /// A complete superfile's worth of bytes whose footer carries only
+    /// the caller-supplied `extra_kv`. Reuses the production parquet
+    /// encode + splice path so the bytes are a real parquet file; the
+    /// missing/garbled `inf.*` keys then drive the open-time validation
+    /// branches. No FTS/vector blobs are spliced — every key under test
+    /// is hand-supplied through `extra_kv`.
+    fn superfile_with_kv(extra_kv: &[(String, String)]) -> Bytes {
+        use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
+        use parquet::basic::Compression;
+        /// One row group; the body is tiny, so a single group is enough.
+        const ROW_GROUP_SIZE: usize = 1024;
+        let schema = schema_with_text();
+        let ids = decimal128_ids(vec![1u64]);
+        let title = LargeStringArray::from(vec!["x"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(title)])
+            .expect("build RecordBatch");
+        let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
+            .expect("encode parquet body");
+        let parts = splice_index_blobs(body, &[], &[], extra_kv).expect("splice index blobs");
+        Bytes::from(parts.bytes)
+    }
+
+    /// The five always-required KV entries, with a correct format value
+    /// and a current-major version, so a superfile carrying exactly
+    /// these passes required-key + version validation and exposes the
+    /// remaining (FTS/vector) branches under test.
+    fn required_kv() -> Vec<(String, String)> {
+        vec![
+            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
+            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
+            (kv::ID_COLUMN.into(), "doc_id".into()),
+            (kv::N_DOCS.into(), "1".into()),
+            (kv::BUILDER.into(), "test".into()),
+        ]
+    }
+
+    #[test]
+    fn open_with_rejects_format_value_mismatch() {
+        // Required keys present, but inf.format carries the wrong sentinel.
+        let mut kvs = required_kv();
+        kvs[0] = (kv::FORMAT.into(), "not-a-superfile".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_incompatible_version() {
+        // A valid semver that parses but whose major differs from ours.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "9999.0.0".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_partial_fts_keys() {
+        // Only one of the three all-or-none inf.fts.* keys present.
+        let mut kvs = required_kv();
+        kvs.push((kv::FTS_OFFSET.into(), "0".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_partial_vec_keys() {
+        // Only one of the three all-or-none inf.vec.* keys present.
+        let mut kvs = required_kv();
+        kvs.push((kv::VEC_OFFSET.into(), "0".into()));
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[tokio::test]
+    async fn open_lazy_rejects_malformed_kvs() {
+        // Same crafted-KV bytes, wrapped in a lazy source, must exercise
+        // the lazy open path's mirror validation branches.
+        let lazy = |bytes: Bytes| -> Arc<dyn crate::superfile::LazyByteSource> {
+            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes))
+        };
+
+        // Missing a required key (drop inf.n_docs) → MissingKv.
+        let mut kvs = required_kv();
+        kvs.retain(|(k, _)| k != kv::N_DOCS);
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("missing required");
+        assert!(matches!(err, ReadError::MissingKv(_)));
+
+        // Wrong format sentinel → MalformedKv.
+        let mut kvs = required_kv();
+        kvs[0] = (kv::FORMAT.into(), "not-a-superfile".into());
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("bad format");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+
+        // Incompatible version → UnsupportedVersion.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "9999.0.0".into());
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("bad version");
+        assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+
+        // Partial vec keys → MalformedKv (the lazy partial-vec branch).
+        let mut kvs = required_kv();
+        kvs.push((kv::VEC_OFFSET.into(), "0".into()));
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("partial vec");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+
+        // Partial fts keys → MalformedKv (the lazy partial-fts branch).
+        let mut kvs = required_kv();
+        kvs.push((kv::FTS_OFFSET.into(), "0".into()));
+        let err = SuperfileReader::open_lazy(lazy(superfile_with_kv(&kvs)))
+            .await
+            .expect_err("partial fts");
+        assert!(matches!(err, ReadError::MalformedKv(_)));
+    }
+
+    #[tokio::test]
+    async fn id_lookup_on_lazy_reader_is_unsupported() {
+        // id_lookup needs resident bytes; a lazy-opened reader must
+        // surface an Io error rather than silently scanning nothing.
+        let bytes = build_simple_fts_only_superfile();
+        let src: Arc<dyn crate::superfile::LazyByteSource> =
+            Arc::new(crate::superfile::BytesLazyByteSource::new(bytes));
+        let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        let err = r.id_lookup(10).expect_err("lazy id_lookup rejected");
+        assert!(matches!(err, ReadError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn exact_match_with_no_token_candidates_returns_empty() {
+        // A value whose tokens are present in the dictionary but never
+        // co-occur in one row drives the empty-candidates short-circuit:
+        // "rust" (docs 0,2) AND "javascript" (doc 3) ⇒ no candidate row.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .exact_match("title", "rust javascript")
+            .await
+            .expect("exact_match");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bm25_search_prefix_range_unmatched_prefix_is_empty() {
+        // A valid (non-degenerate) range with a prefix no term begins
+        // with drives the empty-term-expansion short-circuit.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let hits = r
+            .bm25_search_prefix_range("title", "zz", 10, 0, 4)
+            .await
+            .expect("prefix range");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_match_on_non_text_column_errors() {
+        // `exact_match` only supports LargeUtf8 columns. Querying the
+        // Decimal128 `doc_id` column drives the non-LargeUtf8 downcast
+        // failure. The value tokenizes to nothing (punctuation only),
+        // so every row becomes a candidate and the verify pass reaches
+        // the downcast on the decimal column.
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+        let err = r
+            .exact_match("doc_id", "!!!")
+            .await
+            .expect_err("expected error");
+        match err {
+            ReadError::Io(e) => {
+                assert!(e.to_string().contains("not LargeUtf8"));
+            }
+            other => panic!("expected ReadError::Io, got {:?}", other),
+        }
     }
 }

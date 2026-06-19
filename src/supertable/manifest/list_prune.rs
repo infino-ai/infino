@@ -37,7 +37,7 @@ use crate::supertable::manifest::list::{ManifestList, ManifestListEntry};
 use crate::supertable::manifest::part::PartId;
 
 /// Filter the list's parts to those whose
-/// `term_range_union[column]` overlaps the prefix
+/// `fts_summary_agg[column].term_range` overlaps the prefix
 /// `[prefix, prefix_upper_bound)`.
 ///
 /// Parts without an `fts_summary_agg` entry for this column
@@ -67,7 +67,7 @@ fn part_overlaps_prefix(
         // No info → always-keep.
         return true;
     };
-    let Some((min_term, max_term)) = agg.term_range_union.as_ref() else {
+    let Some((min_term, max_term)) = agg.term_range.as_ref() else {
         // Every superfile had an empty FST for this column;
         // nothing to match. Skip.
         return false;
@@ -102,7 +102,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Filter the list's parts to those whose
-/// `term_bloom_union[column]` allows at least one query
+/// `fts_summary_agg[column].term_bloom` allows at least one query
 /// term (mode = Or) or all of them (mode = And) — i.e. the
 /// list-level analogue of superfile-level `fts_bloom_skip`.
 ///
@@ -148,13 +148,8 @@ fn part_matches_terms(
     let Some(agg) = entry.fts_summary_agg.get(column) else {
         return true; // no info → always-keep
     };
-    if agg.term_bloom_union.is_empty() || agg.term_bloom_n_blocks == 0 {
-        return true; // empty union → always-keep
-    }
-    let Some(bloom) = crate::supertable::manifest::bloom::Bloom::from_bytes(&agg.term_bloom_union)
-    else {
-        // Corrupt / unexpected shape → fall back to
-        // always-keep (correctness over selectivity).
+    let Some(bloom) = agg.term_bloom.as_ref() else {
+        // No bloom info → always-keep (correctness over selectivity).
         return true;
     };
     match mode {
@@ -265,7 +260,7 @@ mod tests {
         FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsTable, VectorSummary};
+    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::Int64Array;
     use std::collections::HashMap;
@@ -310,11 +305,11 @@ mod tests {
             };
             fts.insert(
                 "title".into(),
-                FtsSummary {
-                    term_bloom: bloom.finish(),
-                    n_terms_distinct: title_terms.len() as u32,
+                FtsSummaryAgg::new_with_params(
+                    bloom.finish(),
+                    title_terms.len() as u32,
                     term_range,
-                },
+                ),
             );
         }
         let mut vec_summary = HashMap::new();
@@ -334,7 +329,7 @@ mod tests {
             n_docs: ((id_max - id_min) + 1) as u64,
             id_min,
             id_max,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: Vec::new(),
@@ -407,11 +402,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s_c = Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -419,7 +414,7 @@ mod tests {
             n_docs: 5,
             id_min: 21,
             id_max: 25,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -429,7 +424,7 @@ mod tests {
 
         let aggs = aggregates::compute(&[s_a, s_b, s_c]);
         let fts_agg = aggs.fts_summary_agg.get("title").expect("title agg");
-        let (mn, mx) = fts_agg.term_range_union.as_ref().expect("range");
+        let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
         assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
         assert_eq!(mx, b"delta", "max of maxes across non-empty FSTs");
     }
@@ -440,11 +435,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s = Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -452,7 +447,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -469,7 +464,7 @@ mod tests {
                     .fts_summary_agg
                     .get("title")
                     .expect("agg")
-                    .term_range_union
+                    .term_range
                     .is_none()
         );
     }
@@ -510,20 +505,17 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_min: i128, ts_lo: i64, ts_hi: i64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, (arrow_array::ArrayRef, arrow_array::ArrayRef)> = Map::new();
+            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
             let mn: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_lo]));
             let mx: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
-            cols.insert("ts".into(), (mn, mx));
+            cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
                 id_min,
                 id_max: id_min,
-                scalar_stats: ScalarStatsTable {
-                    cols,
-                    ..Default::default()
-                },
+                scalar_stats: cols,
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -537,10 +529,9 @@ mod tests {
             .scalar_stats_agg
             .get("ts")
             .expect("ts scalar agg present");
-        // IPC byte introspection is a separate concern; here we just
-        // confirm presence + non-empty encoding.
-        assert!(!s.min.is_empty(), "ts min IPC bytes must be non-empty");
-        assert!(!s.max.is_empty(), "ts max IPC bytes must be non-empty");
+        // The aggregate min/max are length-1 arrays of the column type.
+        assert_eq!(s.min.len(), 1, "ts min must be a length-1 array");
+        assert_eq!(s.max.len(), 1, "ts max must be a length-1 array");
     }
 
     #[test]
@@ -551,7 +542,7 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_lo: i128, id_hi: i128) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, (arrow_array::ArrayRef, arrow_array::ArrayRef)> = Map::new();
+            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
             let mn: arrow_array::ArrayRef = Arc::new(
                 arrow_array::Decimal128Array::from(vec![id_lo])
                     .with_precision_and_scale(38, 0)
@@ -562,17 +553,14 @@ mod tests {
                     .with_precision_and_scale(38, 0)
                     .expect("decimal128"),
             );
-            cols.insert("_id".into(), (mn, mx));
+            cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
                 id_min: id_lo,
                 id_max: id_hi,
-                scalar_stats: ScalarStatsTable {
-                    cols,
-                    ..Default::default()
-                },
+                scalar_stats: cols,
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),

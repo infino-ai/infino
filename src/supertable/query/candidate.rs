@@ -83,7 +83,7 @@ impl CandidatePlan {
     /// (absent ⇒ no FTS columns ⇒ always [`Unbounded`]).
     pub(crate) fn from_filters(
         filters: &[Expr],
-        fts_cols: &HashSet<String>,
+        fts_cols: &HashSet<&str>,
         tokenizer: Option<&Arc<dyn Tokenizer>>,
     ) -> CandidatePlan {
         let Some(tok) = tokenizer else {
@@ -198,7 +198,7 @@ impl CandidatePlan {
 }
 
 /// Lower one `Expr` node.
-fn lower(expr: &Expr, fts_cols: &HashSet<String>, tok: &dyn Tokenizer) -> CandidatePlan {
+fn lower(expr: &Expr, fts_cols: &HashSet<&str>, tok: &dyn Tokenizer) -> CandidatePlan {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
             Operator::And => and_combine(vec![
@@ -224,7 +224,7 @@ fn lower(expr: &Expr, fts_cols: &HashSet<String>, tok: &dyn Tokenizer) -> Candid
 fn eq_leaf(
     left: &Expr,
     right: &Expr,
-    fts_cols: &HashSet<String>,
+    fts_cols: &HashSet<&str>,
     tok: &dyn Tokenizer,
 ) -> CandidatePlan {
     let (column, value) = match (left, right) {
@@ -238,7 +238,7 @@ fn eq_leaf(
 /// Lower `col IN ('a', 'b', …)` on an FTS column to an OR of term-ANDs.
 fn in_list_leaf(
     il: &datafusion::logical_expr::expr::InList,
-    fts_cols: &HashSet<String>,
+    fts_cols: &HashSet<&str>,
     tok: &dyn Tokenizer,
 ) -> CandidatePlan {
     let Expr::Column(c) = il.expr.as_ref() else {
@@ -260,7 +260,7 @@ fn in_list_leaf(
 fn terms_all(
     column: &str,
     value: &ScalarValue,
-    fts_cols: &HashSet<String>,
+    fts_cols: &HashSet<&str>,
     tok: &dyn Tokenizer,
 ) -> CandidatePlan {
     if !fts_cols.contains(column) {
@@ -336,9 +336,9 @@ mod tests {
 
     use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
 
-    fn fts_cols() -> HashSet<String> {
+    fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
-        s.insert("title".to_string());
+        s.insert("title");
         s
     }
 

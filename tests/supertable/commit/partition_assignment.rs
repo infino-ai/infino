@@ -144,7 +144,7 @@ fn target_superfiles_per_partition_triggers_part_split() {
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(2);
+        .with_target_superfiles_per_part(2);
     let st = Supertable::create(opts).expect("create");
 
     for _i in 0..COMMITS_PER_TEST {

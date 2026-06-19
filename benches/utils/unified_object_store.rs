@@ -1756,6 +1756,7 @@ pub(crate) mod diag {
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
                     None,
+                    None,
                 )
                 .expect("cold vector search over real S3 supertable");
             let cold_vec = vec_t0.elapsed();
@@ -1787,6 +1788,7 @@ pub(crate) mod diag {
                     &query,
                     TOP_K,
                     VectorSearchOptions::new().with_nprobe(nprobe),
+                    None,
                     None,
                 )
                 .expect("warm vector search over real S3 supertable");
@@ -2204,6 +2206,7 @@ pub(crate) mod diag {
                 TOP_K,
                 VectorSearchOptions::new().with_nprobe(BENCH_NPROBE),
                 None,
+                None,
             )
             .expect("warm-up vector");
         rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
@@ -2262,7 +2265,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
-                .vector_search(VEC_COLUMN, &q, TOP_K, opts, None)
+                .vector_search(VEC_COLUMN, &q, TOP_K, opts, None, None)
                 .expect("kernel vector");
             kernel_vec.push(t.elapsed());
         }

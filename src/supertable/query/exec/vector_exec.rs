@@ -35,6 +35,7 @@
 //! [`SuperfileHit::score`].
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -46,7 +47,7 @@ use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -59,6 +60,7 @@ use datafusion::scalar::ScalarValue;
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
 use crate::superfile::reader::VectorSearchOptions;
 use crate::supertable::handle::{SupertableReader, WeakReader};
+use crate::supertable::query::candidate::CandidatePlan;
 
 /// SQL name the TVF is registered under.
 pub(crate) const VECTOR_SEARCH_UDTF: &str = "vector_search";
@@ -171,7 +173,7 @@ impl TableProvider for VectorSearchTable {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let exec = VectorSearchExec::try_new(
@@ -183,8 +185,32 @@ impl TableProvider for VectorSearchTable {
             Arc::clone(&self.scalar_schema),
             Arc::clone(&self.output_schema),
             projection.cloned(),
+            filters.to_vec(),
         )?;
         Ok(Arc::new(exec))
+    }
+
+    /// Report every `WHERE` filter as `Inexact`. DataFusion then both hands
+    /// the predicates to [`scan`](Self::scan) — so a bounded FTS predicate
+    /// is pushed into the kNN (each superfile's kernel ranks distance only
+    /// among matching rows, yielding the true k-nearest among matches
+    /// instead of a post-filtered global top-k that underflows for selective
+    /// filters) — **and** keeps a `FilterExec` above the scan that re-applies
+    /// the exact predicate. Correctness never depends on the pushdown.
+    ///
+    /// The FTS candidate plan is a token-match *superset* of exact SQL
+    /// equality. For columns whose tokenization is 1:1 with the literal
+    /// (keyword / categorical values) the pushdown is exact and the
+    /// `FilterExec` drops nothing. For free-text columns where the literal
+    /// is a sub-token of larger text, the `FilterExec` may trim below `k`
+    /// (mild underflow) — still far better than the pre-pushdown behavior,
+    /// which filtered the *global* top-k. The exact, no-`FilterExec` path is
+    /// the Rust `Supertable::vector_search_filtered` API.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -197,6 +223,9 @@ struct VectorSearchExec {
     query: Vec<f32>,
     k: usize,
     options: VectorSearchOptions,
+    /// `WHERE` predicates DataFusion pushed into this scan (reported
+    /// `Inexact`); lowered to a [`CandidatePlan`] in `execute`.
+    filters: Vec<Expr>,
     /// Scalar schema, used as the resolve projection.
     scalar_schema: SchemaRef,
     /// Full (pre-projection) output schema: scalar columns + score.
@@ -219,6 +248,7 @@ impl VectorSearchExec {
         scalar_schema: SchemaRef,
         output_schema: SchemaRef,
         projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
     ) -> DfResult<Self> {
         let projected_schema = match &projection {
             Some(indices) => Arc::new(
@@ -240,6 +270,7 @@ impl VectorSearchExec {
             query,
             k,
             options,
+            filters,
             scalar_schema,
             output_schema,
             projection,
@@ -312,16 +343,43 @@ impl ExecutionPlan for VectorSearchExec {
         let query = self.query.clone();
         let k = self.k;
         let options = self.options;
+        let filters = self.filters.clone();
         let scalar_schema = Arc::clone(&self.scalar_schema);
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
 
         let fut = async move {
-            let hits = reader
-                .vector_search_async(&column, &query, k, options)
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            // Lower the pushed-down `WHERE` filters to an FTS candidate
+            // plan. A bounded plan is pushed into the kNN (the kernel ranks
+            // distance only among matching rows); `Unbounded` (no
+            // FTS-resolvable predicate, or none pushed) runs the plain kNN
+            // and lets the `FilterExec` above apply the predicate.
+            let manifest = reader.manifest();
+            let fts_cols: HashSet<&str> = manifest
+                .options
+                .fts_columns
+                .iter()
+                .map(|c| c.column.as_str())
+                .collect();
+            let plan = CandidatePlan::from_filters(
+                &filters,
+                &fts_cols,
+                manifest.options.tokenizer.as_ref(),
+            );
+            let hits = match plan {
+                CandidatePlan::Unbounded => {
+                    reader
+                        .vector_search_async(&column, &query, k, options)
+                        .await
+                }
+                bounded => {
+                    reader
+                        .vector_hits_filtered_by_plan(&column, &query, k, options, &bounded)
+                        .await
+                }
+            }
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &hits,
@@ -525,6 +583,58 @@ mod tests {
         st
     }
 
+    /// Single-superfile table for filter-pushdown tests. Doc `i` has vector
+    /// `[1, i, 0, …]`, whose cosine distance to the query `[1, 0, …]` is
+    /// `1 - 1/√(1+i²)` — strictly increasing in `i`, so doc 0 is nearest and
+    /// distance ranks by index. The nearest `n_common` docs get title
+    /// `"common"`, the farther ones `"rare"`. So the unfiltered top-k is
+    /// all-`common` while `rare` docs sit farther out: a post-filter on
+    /// `title = 'rare'` over the global top-k would underflow, which is
+    /// exactly what the pushdown must avoid. Requires `dim >= 2`.
+    fn supertable_for_pushdown(dim: usize, n: usize, n_common: usize) -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        let titles = LargeStringArray::from(
+            (0..n)
+                .map(|i| if i < n_common { "common" } else { "rare" })
+                .collect::<Vec<_>>(),
+        );
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            for d in 0..dim {
+                flat.push(match d {
+                    0 => 1.0,
+                    1 => i as f32,
+                    _ => 0.0,
+                });
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as ArrayRef,
+            None,
+        )
+        .expect("FSL");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    /// Count rows across `batches` whose `title` equals `want`.
+    fn count_title(batches: &[RecordBatch], want: &str) -> usize {
+        batches
+            .iter()
+            .map(|b| {
+                let t = col_str(b, "title");
+                (0..t.len()).filter(|&i| t.value(i) == want).count()
+            })
+            .sum()
+    }
+
     /// `"1,0,0,..."` one-hot query targeting `active`.
     fn csv_one_hot(dim: usize, active: usize) -> String {
         (0..dim)
@@ -609,6 +719,76 @@ mod tests {
                 score.value(i)
             );
         }
+    }
+
+    #[test]
+    fn vector_search_tvf_where_pushdown_returns_knn_among_matching() {
+        let dim = 16;
+        let k = 3;
+        // Docs 0..=2 are "common" (nearest), docs 3..=7 are "rare" (farther).
+        let st = supertable_for_pushdown(dim, 8, 3);
+        let q = csv_one_hot(dim, 0);
+
+        // Guard: the unfiltered top-k is entirely "common", so post-filtering
+        // it on `title = 'rare'` would underflow (fewer than k rows). This is
+        // the condition the pushdown exists to fix.
+        let unfiltered = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k})"
+            ))
+            .expect("query_sql");
+        let rare_in_topk = count_title(&unfiltered, "rare");
+        assert!(
+            rare_in_topk < k,
+            "guard: unfiltered top-{k} holds {rare_in_topk} rare rows (< {k}); \
+             a post-filter would underflow"
+        );
+
+        // Pushdown: rank distance only among matching ("rare") rows, so we get
+        // exactly the k nearest rare docs — no underflow, every row matches.
+        let filtered = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title = 'rare'"
+            ))
+            .expect("query_sql");
+        let total: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, k,
+            "filtered search returns exactly k rows (the k nearest rare docs)"
+        );
+        assert_eq!(
+            count_title(&filtered, "rare"),
+            k,
+            "every returned row satisfies the filter"
+        );
+        for b in &filtered {
+            let s = col_f32(b, "score");
+            for i in 1..s.len() {
+                assert!(s.value(i - 1) <= s.value(i), "scores must be ascending");
+            }
+        }
+    }
+
+    #[test]
+    fn vector_search_tvf_where_non_fts_predicate_falls_back() {
+        let dim = 16;
+        let k = 3;
+        let st = supertable_for_pushdown(dim, 8, 3);
+        let q = csv_one_hot(dim, 0);
+        // `score` is not an FTS column, so the candidate plan is Unbounded:
+        // the plain kNN runs and the FilterExec applies the predicate. Every
+        // cosine distance here is >= 0, so all k rows survive — proving the
+        // unbounded path still returns correct results end-to-end.
+        let rows = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE score >= 0.0"
+            ))
+            .expect("query_sql");
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, k, "unbounded predicate falls back to plain kNN");
     }
 
     #[test]
@@ -811,6 +991,41 @@ mod tests {
                     csv_one_hot(dim, 0)
                 ))
                 .is_err()
+        );
+    }
+
+    /// Construct `VectorSearchTable` directly through the TVF `call`
+    /// path and exercise its `TableProvider` metadata methods (`Debug`,
+    /// `as_any`, `table_type`) plus the lowered `VectorSearchExec`'s
+    /// `name` / `Debug` — none of which normal query execution touches.
+    #[tokio::test]
+    async fn vector_table_and_exec_trait_methods() {
+        let dim = 16;
+        let st = supertable_one_superfile(dim, 8);
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let func = VectorSearchFunc::new(reader, scalar_schema);
+        let table = func
+            .call(&[lit("emb"), lit(csv_one_hot(dim, 0)), lit(5_i64)])
+            .expect("vector table");
+
+        let dbg = format!("{table:?}");
+        assert!(dbg.contains("VectorSearchTable"), "Debug missing: {dbg}");
+        assert!(
+            table.as_any().downcast_ref::<VectorSearchTable>().is_some(),
+            "as_any downcasts to VectorSearchTable"
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(plan.name(), "VectorSearchExec");
+        assert!(
+            format!("{plan:?}").contains("VectorSearchExec"),
+            "Exec Debug missing"
         );
     }
 
