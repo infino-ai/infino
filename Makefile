@@ -1,13 +1,21 @@
-.PHONY: check test doctest \
+.PHONY: check fmt test doctest \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
         python-test python-wheel python-examples-test \
         node-test node-build node-verify
 
+# Import layout: group into std / external / crate blocks and merge each
+# crate into one `use` tree.
+RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
+
 check:
-	cargo fmt --check
+	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+
+# Apply formatting, including the import-layout rules above.
+fmt:
+	cargo fmt --all -- --config $(RUSTFMT_OPTS)
 
 # Public-API surface guard. Regenerates the curated public surface and
 # fails if it drifts from the committed `public-api.txt` snapshot. The

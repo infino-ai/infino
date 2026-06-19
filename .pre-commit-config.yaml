@@ -19,8 +19,8 @@ repos:
     hooks:
       - id: rustfmt
         name: rustfmt
-        description: Check if all files follow the rustfmt style
-        entry: cargo fmt --all -- --check --color always
+        description: Check formatting, including import layout (std/external/crate grouping + per-crate merge).
+        entry: cargo fmt --all -- --check --config imports_granularity=Crate,group_imports=StdExternalCrate --color always
         language: system
         pass_filenames: false
       - id: cargo-check
