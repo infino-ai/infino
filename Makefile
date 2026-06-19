@@ -3,7 +3,7 @@
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
         python-test python-wheel \
-        node-test node-build node-verify
+        node-test node-build node-verify node-example
 
 check:
 	cargo fmt --check
@@ -127,6 +127,14 @@ node-test:
 # Build a release addon for the current platform.
 node-build:
 	cd infino-node && npm install && npm run build
+
+# Run the Node examples as end-to-end smoke tests. Assumes the addon is already
+# built (run `make node-test` or `make node-build` first); each example's
+# `file:../..` dependency links that build. The hybrid-search-api example runs
+# with SMOKE=1 so it self-checks and exits instead of serving forever.
+node-example:
+	cd infino-node/examples/agent-memory && npm install && node index.mjs
+	cd infino-node/examples/hybrid-search-api && npm install && SMOKE=1 node index.mjs
 
 # Verify the published package shape: pack the thin main package + the
 # host platform package, install them into a throwaway project, and run a
