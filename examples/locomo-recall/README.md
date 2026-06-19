@@ -79,7 +79,7 @@ Current baseline on the committed fixture (conv-26, all 197 scored questions,
 keyword **0.51**.
 
 Because hybrid jitters ~0.4pt run-to-run (see the determinism caveat), the CI
-tripwire (`.github/workflows/locomo-recall.yml`) sizes its floor as a **tolerance
+tripwire (the `LOCOMO recall test` job in `.github/workflows/ci.yml`) sizes its floor as a **tolerance
 band below baseline**, not an exact value — currently `--fail-under=0.68`, a few
 points under 0.72 and well above the jitter. That catches a real ranking/fusion
 regression while absorbing the tie-break noise. Tighten it once hybrid

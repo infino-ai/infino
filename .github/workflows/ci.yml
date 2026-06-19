@@ -258,6 +258,35 @@ jobs:
       # Run each example end to end (self-asserting; non-zero exit fails the job).
       - run: make node-example
 
+  # LOCOMO recall tripwire — runs the locomo-recall example against the committed
+  # fixture (frozen vectors → only the engine varies) and reports recall@k on real
+  # long-term-memory queries. Complements the brute-force recall gate in `check`
+  # (which proves the ANN index returns the true neighbours); this proves
+  # ranking/fusion quality holds up on real questions. Cheap — no embedder or
+  # network. Keep it out of branch protection's required set so a recall wobble
+  # never blocks a merge; tighten --fail-under as the baseline firms up.
+  locomo-recall:
+    name: LOCOMO recall test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Frozen fixture → no embedder, key, or network. Reports recall@k + every
+      # hybrid miss in the log, and fails only below the tolerance floor.
+      - run: cargo run --example locomo-recall -- --fail-under=0.68
+
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
