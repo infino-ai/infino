@@ -487,7 +487,11 @@ async fn s3s_fs_fixture(s3s_bucket: &str) -> StorageFixture {
     }
 }
 
-async fn rustfs_fixture(bucket: &str, prefix_default: &str, supertable_shaped: bool) -> StorageFixture {
+async fn rustfs_fixture(
+    bucket: &str,
+    prefix_default: &str,
+    supertable_shaped: bool,
+) -> StorageFixture {
     let handle = tokio::task::spawn_blocking({
         let bucket = bucket.to_string();
         move || rustfs_server::spawn_rustfs(&bucket)
@@ -560,12 +564,11 @@ pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
         let base = crate::dataset::dataset_prefix()
             .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
         let prefix = format!("{}/{subdir}", base.trim_matches('/'));
-        let handle = tokio::task::spawn_blocking(|| {
-            rustfs_server::spawn_rustfs(RUSTFS_BENCH_BUCKET)
-        })
-        .await
-        .expect("rustfs spawn_blocking join")
-        .unwrap_or_else(|e| panic!("{e}"));
+        let handle =
+            tokio::task::spawn_blocking(|| rustfs_server::spawn_rustfs(RUSTFS_BENCH_BUCKET))
+                .await
+                .expect("rustfs spawn_blocking join")
+                .unwrap_or_else(|e| panic!("{e}"));
         let storage = rustfs_server::rustfs_s3_provider(&handle, &prefix)
             .unwrap_or_else(|e| panic!("rustfs dataset provider: {e}"));
         eprintln!("[tiers] dataset rustfs prefix={prefix}");

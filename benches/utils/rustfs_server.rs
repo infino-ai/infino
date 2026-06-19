@@ -7,20 +7,21 @@
 //! waits for `/health`, creates the target bucket, and builds an HTTPS
 //! `S3StorageProvider` that trusts the bench-local CA.
 
-use std::io::Cursor;
-use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    io::Cursor,
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use object_store::Certificate;
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-use object_store::ClientOptions;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SerialNumber,
+use object_store::{
+    Certificate, ClientOptions,
+    aws::{AmazonS3Builder, S3ConditionalPut},
 };
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SerialNumber};
 use tempfile::TempDir;
 
 /// Default pinned RustFS release for auto-download.
@@ -33,8 +34,10 @@ pub const RUSTFS_BENCH_BUCKET: &str = "infino-bench";
 const HEALTH_POLL_INTERVAL_MS: u64 = 200;
 /// Maximum time to wait for RustFS `/health` after spawn.
 const HEALTH_TIMEOUT_SECS: u64 = 60;
-/// Grace period after SIGTERM before SIGKILL on teardown.
+/// Grace period after SIGKILL before a second kill attempt during teardown.
 const TEARDOWN_GRACE_MS: u64 = 2_000;
+/// Poll interval while waiting for a killed RustFS child to exit.
+const TEARDOWN_POLL_MS: u64 = 50;
 /// Spawn attempts when the reserved loopback port is taken before RustFS binds.
 const RUSTFS_SPAWN_MAX_ATTEMPTS: u32 = 5;
 /// Filename of the upstream checksum manifest on RustFS GitHub releases.
@@ -85,7 +88,10 @@ pub fn ensure_rustfs_binary() -> Result<PathBuf, String> {
         if path.is_file() {
             return Ok(path);
         }
-        return Err(format!("INFINO_RUSTFS_BIN={} is not a file", path.display()));
+        return Err(format!(
+            "INFINO_RUSTFS_BIN={} is not a file",
+            path.display()
+        ));
     }
 
     let cached = rustfs_cache_binary_path();
@@ -131,9 +137,7 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
 
         if child_exited(&mut child) {
             last_err = format!("rustfs exited immediately on port {port}");
-            eprintln!(
-                "[rustfs] spawn attempt {attempt}/{RUSTFS_SPAWN_MAX_ATTEMPTS}: {last_err}"
-            );
+            eprintln!("[rustfs] spawn attempt {attempt}/{RUSTFS_SPAWN_MAX_ATTEMPTS}: {last_err}");
             continue;
         }
 
@@ -147,9 +151,7 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
                     RUSTFS_REGION,
                     &ca_pem,
                 )?;
-                eprintln!(
-                    "[rustfs] endpoint={endpoint} bucket={bucket} storage_label=rustfs"
-                );
+                eprintln!("[rustfs] endpoint={endpoint} bucket={bucket} storage_label=rustfs");
                 return Ok(RustFsHandle {
                     endpoint,
                     bucket: bucket.to_string(),
@@ -219,7 +221,8 @@ fn build_rustfs_provider(
 }
 
 fn rustfs_credentials() -> (String, String) {
-    let access_key = std::env::var("RUSTFS_ACCESS_KEY").unwrap_or_else(|_| generate_key(GENERATED_KEY_LEN));
+    let access_key =
+        std::env::var("RUSTFS_ACCESS_KEY").unwrap_or_else(|_| generate_key(GENERATED_KEY_LEN));
     let secret_key =
         std::env::var("RUSTFS_SECRET_KEY").unwrap_or_else(|_| generate_key(GENERATED_SECRET_LEN));
     (access_key, secret_key)
@@ -265,9 +268,7 @@ fn which_rustfs_on_path() -> Option<PathBuf> {
 fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     let version = rustfs_version();
     let asset = release_asset_name()?;
-    let release_base = format!(
-        "https://github.com/rustfs/rustfs/releases/download/{version}"
-    );
+    let release_base = format!("https://github.com/rustfs/rustfs/releases/download/{version}");
     let url = format!("{release_base}/{asset}");
     eprintln!("[rustfs] downloading {url} ...");
 
@@ -308,24 +309,22 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
 }
 
 /// Fetch a public GitHub release asset over HTTPS (system trust roots).
+///
+/// Follows redirects (3xx). Only 2xx responses return a body; 4xx/5xx fail fast.
 fn github_bytes(url: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .build()
         .map_err(|e| e.to_string())?;
-    Ok(client
+    let response = client
         .get(url)
         .send()
         .map_err(|e| format!("GET {url} failed: {e}"))?
-        .bytes()
-        .map_err(|e| e.to_string())?
-        .to_vec())
+        .error_for_status()
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    Ok(response.bytes().map_err(|e| e.to_string())?.to_vec())
 }
 
-fn verify_release_sha256(
-    zip_bytes: &[u8],
-    release_base: &str,
-    asset: &str,
-) -> Result<(), String> {
+fn verify_release_sha256(zip_bytes: &[u8], release_base: &str, asset: &str) -> Result<(), String> {
     let sums_url = format!("{release_base}/{RUSTFS_SHA256SUMS_ASSET}");
     eprintln!("[rustfs] verifying {asset} against {RUSTFS_SHA256SUMS_ASSET} ...");
     let sums_text = String::from_utf8(github_bytes(&sums_url)?)
@@ -358,7 +357,9 @@ fn parse_sha256_sums_entry(sums: &str, asset: &str) -> Result<String, String> {
             return Ok(hash.to_ascii_lowercase());
         }
     }
-    Err(format!("{RUSTFS_SHA256SUMS_ASSET} has no entry for {asset}"))
+    Err(format!(
+        "{RUSTFS_SHA256SUMS_ASSET} has no entry for {asset}"
+    ))
 }
 
 fn child_exited(child: &mut Child) -> bool {
@@ -399,9 +400,7 @@ fn generate_tls_material() -> Result<(TempDir, Vec<u8>), String> {
     ca_params
         .distinguished_name
         .push(DnType::CommonName, "Infino Test CA");
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| e.to_string())?;
+    let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| e.to_string())?;
     let ca_pem = ca_cert.pem().into_bytes();
 
     let server_key = KeyPair::generate().map_err(|e| e.to_string())?;
@@ -522,10 +521,7 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
     );
     let canonical_request = format!(
         "{}\n{}\n\n{}\n{signed_headers}\n{}",
-        params.method,
-        params.canonical_uri,
-        canonical_headers,
-        params.payload_hash
+        params.method, params.canonical_uri, canonical_headers, params.payload_hash
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{credential_scope}\n{}",
@@ -568,10 +564,17 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
 }
 
 fn terminate_child_impl(child: &mut Child) {
-    if let Ok(()) = child.kill() {
-        let _ = child.wait();
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
     }
-    std::thread::sleep(Duration::from_millis(TEARDOWN_GRACE_MS));
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_millis(TEARDOWN_GRACE_MS);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(TEARDOWN_POLL_MS));
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
