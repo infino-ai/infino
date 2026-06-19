@@ -224,6 +224,16 @@ const S3_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// dominate the fan-out's p99; the retry layer covers genuine drops.
 const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Whole-request timeout (incl. body upload/download). `object_store`
+/// defaults this to 30s, which is too tight for large multipart PUTs and
+/// for any request that has to wait on a starved connection pool when a
+/// wide commit fan-out overlaps background hidden-index maintenance — the
+/// request gets guillotined at 30s and surfaces as "error sending request"
+/// even though the retry budget (300s / 20 attempts) is far from spent.
+/// Matches `azure.rs`'s 300s for the same reason; the connect timeout above
+/// still bounds a genuinely dead dial.
+const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
 /// The supertable vector/FTS query path fans out one cold-open +
@@ -257,6 +267,9 @@ fn tuned_client_options() -> object_store::ClientOptions {
         // Bound the connect phase so a single slow SYN/TLS doesn't
         // dominate the fan-out's p99; the retry layer covers drops.
         .with_connect_timeout(S3_CONNECT_TIMEOUT)
+        // Give each request body enough wall-clock to complete under a
+        // contended pool instead of being cut at the 30s default.
+        .with_timeout(S3_REQUEST_TIMEOUT)
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.

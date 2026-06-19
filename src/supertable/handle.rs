@@ -764,7 +764,6 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
 /// This is the Level-1 SPFresh-style collapse: after append-only hidden ingest,
 /// quickly merge tiny per-cell deltas so queries don't fan out across many
 /// files while the heavier periodic compaction remains on the normal profile.
-#[cfg(not(test))]
 pub(crate) fn hidden_vector_index_spfresh_compaction_settings() -> crate::config::CompactionSettings {
     crate::config::CompactionSettings {
         target_superfile_size_mb: 8,

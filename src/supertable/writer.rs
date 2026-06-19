@@ -1514,6 +1514,15 @@ impl SupertableWriter {
                         .ok_or_else(|| {
                             BuildError::Store("hidden cell posting commit requires storage".into())
                         })?;
+                    // Capture the cells this commit appended deltas to before
+                    // `prep` is consumed, so light maintenance can target only
+                    // those partitions.
+                    let touched_partitions: std::collections::HashSet<Vec<u8>> = prep
+                        .batch
+                        .new_entries
+                        .iter()
+                        .map(|e| e.partition_key.clone())
+                        .collect();
                     let (user_res, hidden_res) = tokio::join!(
                         persist_superfile_publish_batch_async(&user_inner, user_batch),
                         publish_hidden_cell_posting_async(Arc::clone(&hidden_inner), hidden_storage, prep),
@@ -1521,8 +1530,10 @@ impl SupertableWriter {
                     user_res?;
                     match hidden_res {
                         Ok(()) => {
-                            #[cfg(not(test))]
-                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
+                            spawn_hidden_spfresh_maintenance(
+                                Arc::clone(&hidden_inner),
+                                touched_partitions,
+                            );
                         },
                         Err(e) => {
                             tracing::warn!(
@@ -2241,13 +2252,24 @@ where
     }
 }
 
-#[cfg(not(test))]
-fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
+/// Light post-commit SPFresh maintenance: collapse only the delta superfiles
+/// of the cells this commit just appended to (`touched_partitions`), and only
+/// once a cell has built up a small run of deltas. This is the design's step 3
+/// done lightly — bounded per-commit work over the just-appended blobs, not a
+/// whole-index scan. The heavier cross-run packing toward one base per cell
+/// stays on the explicit `compact()`.
+fn spawn_hidden_spfresh_maintenance(
+    inner: Arc<SupertableInner>,
+    touched_partitions: std::collections::HashSet<Vec<u8>>,
+) {
+    if touched_partitions.is_empty() {
+        return;
+    }
     let rt = inner.query_runtime();
     rt.spawn_blocking(move || {
         let hidden = Supertable::from_inner(inner);
         let cfg = super::handle::hidden_vector_index_spfresh_compaction_settings();
-        if let Err(e) = hidden.compact(&cfg) {
+        if let Err(e) = hidden.compact_cells(&cfg, &touched_partitions) {
             match e {
                 crate::supertable::error::CompactionError::AlreadyCompacting => {}
                 other => tracing::warn!(
@@ -2489,16 +2511,33 @@ async fn put_superfile_replace(
     }
 }
 
+/// Commit-time object-store write fanout width: half the machine's CPU
+/// parallelism, floored at 1. A single commit and a concurrent background
+/// maintenance compaction each fan out their PUTs at this width, so keeping
+/// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
+/// core count rather than a multiple of it.
+fn commit_write_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
+
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
-    // Bound object-store fanout to the writer-pool width. A vector commit can
-    // stage one hidden delta per touched cell plus user shards; driving all PUTs
-    // at once opens dozens of Azure sockets and can stall the commit path.
-    let write_concurrency = opts.writer_pool.current_num_threads().max(1);
+    // Bound object-store fanout to half the machine's CPU parallelism. A vector
+    // commit can stage one hidden delta per touched cell plus user shards;
+    // driving all PUTs at once opens dozens of sockets and can stall the commit
+    // path. Crucially, bulk ingest commits overlap background hidden-index
+    // SPFresh maintenance (its own compaction PUT/GET waves), so a full-width
+    // fanout from each stacks and starves the connection pool until requests
+    // hit the per-request timeout. Capping each operation at ~50% of cores
+    // leaves headroom for a concurrent maintenance pass without saturation.
+    let write_concurrency = commit_write_concurrency();
 
     let replace_futs = pending_storage_replaces
         .iter()

@@ -27,7 +27,11 @@ use crate::{
     },
 };
 use bytes::Bytes;
-use std::{collections::BTreeMap, sync::Arc, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+    sync::atomic::Ordering,
+};
 use uuid::Uuid;
 
 struct CompactionSlot<'a>(&'a std::sync::atomic::AtomicBool);
@@ -39,6 +43,26 @@ impl Drop for CompactionSlot<'_> {
 }
 
 const MIB: u64 = 1024 * 1024;
+
+/// Light SPFresh maintenance only collapses a cell once it has accumulated at
+/// least this many small delta superfiles. Each append-only commit adds one
+/// delta per touched cell; without a floor, collapsing every commit would
+/// rewrite a cell's whole delta run on every commit (quadratic in commits).
+/// Waiting for a small run bounds query-time per-cell fan-out to roughly this
+/// many deltas while keeping amortized merge work linear: a given delta is
+/// rewritten about once per this many commits, not every commit. The heavier
+/// cross-run packing toward one base per cell stays on the full `compact()`.
+const SPFRESH_MIN_CELL_DELTAS: usize = 8;
+
+/// Scope for a light, partition-targeted compaction pass (SPFresh maintenance).
+struct CompactionScope<'a> {
+    /// Only consider superfiles in these partitions (cells) — the cells the
+    /// triggering commit just appended deltas to.
+    only_partitions: &'a HashSet<Vec<u8>>,
+    /// Skip a partition until it has accumulated at least this many small
+    /// delta superfiles, so a cell isn't re-merged on every commit.
+    min_partition_deltas: usize,
+}
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +119,31 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
         pack_partition(key, segs, target_bytes, min_output_bytes, &mut jobs);
     }
     jobs
+}
+
+/// Drop superfiles whose cell hasn't yet accumulated `min_deltas` small,
+/// mergeable delta superfiles. "Small" mirrors [`pack_partition`]'s candidate
+/// filter (below target size, not sealed by another compaction) so the floor
+/// counts exactly the superfiles [`select`] would actually merge.
+fn retain_partitions_meeting_delta_floor(
+    stats: &mut Vec<SuperfileStats>,
+    cfg: &CompactionSettings,
+    min_deltas: usize,
+) {
+    let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+    let mut delta_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    for s in stats.iter() {
+        if !s.sealed_by_other && s.size_bytes < target_bytes {
+            *delta_counts.entry(s.partition_key.clone()).or_default() += 1;
+        }
+    }
+    stats.retain(|s| {
+        delta_counts
+            .get(&s.partition_key)
+            .copied()
+            .unwrap_or(0)
+            >= min_deltas
+    });
 }
 
 fn pack_partition(
@@ -187,9 +236,53 @@ impl Supertable {
         Ok(())
     }
 
+    /// Light SPFresh maintenance: collapse the small delta superfiles of only
+    /// the cells this commit just appended to, leaving the rest of the index
+    /// untouched. A cell is collapsed only once it has accumulated
+    /// [`SPFRESH_MIN_CELL_DELTAS`] small deltas, so this is bounded per-commit
+    /// work, not a whole-index scan. The heavier cross-run packing stays on the
+    /// full [`Supertable::compact`].
+    pub(crate) fn compact_cells(
+        &self,
+        cfg: &CompactionSettings,
+        touched_partitions: &HashSet<Vec<u8>>,
+    ) -> Result<(), CompactionError> {
+        crate::runtime_bridge::bridge_on_runtime(
+            self.compact_cells_async(cfg, touched_partitions),
+            &self.inner().query_runtime(),
+        )
+    }
+
+    pub(crate) async fn compact_cells_async(
+        &self,
+        cfg: &CompactionSettings,
+        touched_partitions: &HashSet<Vec<u8>>,
+    ) -> Result<(), CompactionError> {
+        if touched_partitions.is_empty() {
+            return Ok(());
+        }
+        Self::compact_one_table_scoped(
+            self,
+            cfg,
+            Some(CompactionScope {
+                only_partitions: touched_partitions,
+                min_partition_deltas: SPFRESH_MIN_CELL_DELTAS,
+            }),
+        )
+        .await
+    }
+
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
+    ) -> Result<(), CompactionError> {
+        Self::compact_one_table_scoped(table, cfg, None).await
+    }
+
+    async fn compact_one_table_scoped(
+        table: &Supertable,
+        cfg: &CompactionSettings,
+        scope: Option<CompactionScope<'_>>,
     ) -> Result<(), CompactionError> {
         let inner = table.inner();
 
@@ -206,14 +299,58 @@ impl Supertable {
 
         let manifest = inner.manifest.load_full();
 
+        // The working set: every superfile for a full compaction, or only the
+        // touched cells' superfiles for light SPFresh maintenance. Scoping
+        // here keeps the light path's sidecar prefetch and stats build
+        // proportional to the cells this commit touched, not the whole index.
+        let all_superfiles = manifest.get_all_superfiles();
+        let mut working: Vec<&Arc<SuperfileEntry>> = match &scope {
+            Some(scope) => all_superfiles
+                .iter()
+                .filter(|e| scope.only_partitions.contains(&e.partition_key))
+                .collect(),
+            None => all_superfiles.iter().collect(),
+        };
+
+        // Light path: decide whether there is anything to collapse using only
+        // the in-memory manifest (superfile sizes are known there) BEFORE any
+        // object-store I/O. A cell qualifies only once it has accumulated
+        // `min_partition_deltas` small superfiles. If none qualify — the common
+        // case, since each commit adds just one delta per cell — return now
+        // without prefetching a single sidecar. This keeps the per-commit
+        // maintenance free until a collapse is actually due, instead of issuing
+        // hundreds of GETs every commit that contend with ingest for the S3
+        // connection pool.
+        if let Some(scope) = &scope {
+            let qualifying: HashSet<Vec<u8>> = {
+                let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+                let mut delta_counts: HashMap<&[u8], usize> = HashMap::new();
+                for e in &working {
+                    let size = e
+                        .subsection_offsets
+                        .as_ref()
+                        .map(|o| o.total_size)
+                        .unwrap_or(0);
+                    if size < target_bytes {
+                        *delta_counts.entry(e.partition_key.as_slice()).or_default() += 1;
+                    }
+                }
+                delta_counts
+                    .iter()
+                    .filter(|&(_, &n)| n >= scope.min_partition_deltas)
+                    .map(|(k, _)| k.to_vec())
+                    .collect()
+            };
+            if qualifying.is_empty() {
+                return Ok(());
+            }
+            working.retain(|e| qualifying.contains(e.partition_key.as_slice()));
+        }
+
         // Prefetch sidecars using the cache to batch storage GETs.
         // This populates both bitmap and seal information for all superfiles.
         // The cache returns empty bitmaps for superfiles without tombstones.
-        let superfile_ids: Vec<Uuid> = manifest
-            .get_all_superfiles()
-            .iter()
-            .map(|e| e.superfile_id)
-            .collect();
+        let superfile_ids: Vec<Uuid> = working.iter().map(|e| e.superfile_id).collect();
 
         let sidecar_map: std::collections::HashMap<
             Uuid,
@@ -239,9 +376,8 @@ impl Supertable {
             std::collections::HashMap::new()
         };
 
-        // Build SuperfileStats for every superfile in the snapshot.
-        let stats: Vec<SuperfileStats> = manifest
-            .get_all_superfiles()
+        // Build SuperfileStats for every superfile in the working set.
+        let mut stats: Vec<SuperfileStats> = working
             .iter()
             .map(|entry| {
                 let (bitmap, seal) = sidecar_map
@@ -264,6 +400,17 @@ impl Supertable {
                 }
             })
             .collect();
+
+        // Light path: only collapse a cell once it has built up a small run of
+        // deltas. Cells below the floor are left for a later commit (or the
+        // heavy `compact()`), keeping per-commit work bounded.
+        if let Some(scope) = &scope {
+            retain_partitions_meeting_delta_floor(
+                &mut stats,
+                cfg,
+                scope.min_partition_deltas,
+            );
+        }
 
         let jobs = select(&stats, cfg);
 
