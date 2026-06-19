@@ -2239,20 +2239,61 @@ where
 /// incoming superfiles are simply scanned by queries (recall is unaffected).
 const INCOMING_DRAIN_THRESHOLD: usize = 4;
 
+/// Dedicated single-worker runtime for background hidden-index maintenance.
+/// Maintenance MUST NOT run on the shared query runtime: its drain does
+/// CPU-heavy per-cell encode and S3 I/O that, on the shared runtime + global
+/// rayon pool, saturates every core and starves the foreground ingest commit's
+/// own S3 futures — which then time out at 30s. One worker keeps maintenance
+/// strictly in the background, costing ingest at most one core.
+static MAINT_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Single-thread rayon pool for the drain's CPU work (cell assignment + per-cell
+/// superfile encode). Installing the build under this pool pins all its nested
+/// `par_iter`/`join` to one thread instead of fanning out across every core.
+static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+fn maint_runtime() -> &'static tokio::runtime::Runtime {
+    MAINT_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("hidden-maint-rt")
+            .build()
+            .expect("hidden maintenance runtime")
+    })
+}
+
+fn maint_pool() -> &'static rayon::ThreadPool {
+    MAINT_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "hidden-maint-cpu".into())
+            .build()
+            .expect("hidden maintenance rayon pool")
+    })
+}
+
 /// Background SPFresh maintenance: drain the hidden index's "incoming" IVF
 /// superfiles into per-cell CellPosting "cell superfiles" and delete the
-/// incoming ones. Runs off the commit path (`spawn_blocking`), and only once
+/// incoming ones. Runs on the dedicated single-worker maintenance runtime so it
+/// never competes with foreground ingest for runtime workers, and only once
 /// enough incoming superfiles have accumulated so the per-cell build amortizes.
 fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
-    let rt = inner.query_runtime();
-    rt.spawn_blocking(move || {
-        let runtime = inner.query_runtime();
-        if let Err(e) = runtime.block_on(drain_incoming_into_cells(Arc::clone(&inner))) {
-            tracing::warn!(
-                "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
-            );
-        }
-    });
+    // A short-lived thread drives the drain on the dedicated maintenance
+    // runtime via `block_on` (the drain future borrows through
+    // `write_superfile_list`, so it isn't `'static` enough for `spawn`). The
+    // `compaction_outstanding` single-flight guard inside the drain makes
+    // concurrent invocations cheap no-ops, so threads don't pile up.
+    std::thread::Builder::new()
+        .name("hidden-maint".into())
+        .spawn(move || {
+            if let Err(e) = maint_runtime().block_on(drain_incoming_into_cells(inner)) {
+                tracing::warn!(
+                    "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
+                );
+            }
+        })
+        .ok();
 }
 
 /// Read each accumulated incoming IVF superfile back to `(_id, vector)` rows,
@@ -2344,27 +2385,35 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         });
     }
 
-    // Assign rows to cells; build one CellPosting superfile per touched cell.
-    let cell_shards = split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
-    let mut prepared: Vec<PreparedSuperfile> = Vec::new();
-    let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-    for (cell_id, batches) in &cell_shards {
-        let mut rows = Vec::new();
-        append_batch_rows(&mut rows, batches, vec_dim);
-        rows.sort_by_key(|(id, _)| *id);
-        if rows.is_empty() {
-            continue;
-        }
-        let added = rows.len() as u32;
-        let task = CellBuildTask {
-            cell_id: *cell_id,
-            rows,
-        };
-        let p = build_cell_posting_task(&inner, &inner.options, vec_dim, task)?;
-        let base = clusters.counts.get(*cell_id as usize).copied().unwrap_or(0);
-        cell_updates.insert(*cell_id, base.saturating_add(added));
-        prepared.push(p);
-    }
+    // Assign rows to cells and build one CellPosting superfile per touched
+    // cell. All of this is CPU-heavy (nearest-centroid assignment + Sq8 encode),
+    // so run it inside the single-thread maintenance pool: that pins every
+    // nested rayon `par_iter`/`join` to one core and keeps the drain from
+    // starving foreground ingest.
+    let (prepared, cell_updates): (Vec<PreparedSuperfile>, HashMap<u32, u32>) = maint_pool()
+        .install(|| -> Result<_, BuildError> {
+            let cell_shards = split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
+            let mut prepared: Vec<PreparedSuperfile> = Vec::new();
+            let mut cell_updates: HashMap<u32, u32> = HashMap::new();
+            for (cell_id, batches) in &cell_shards {
+                let mut rows = Vec::new();
+                append_batch_rows(&mut rows, batches, vec_dim);
+                rows.sort_by_key(|(id, _)| *id);
+                if rows.is_empty() {
+                    continue;
+                }
+                let added = rows.len() as u32;
+                let task = CellBuildTask {
+                    cell_id: *cell_id,
+                    rows,
+                };
+                let p = build_cell_posting_task(&inner, &inner.options, vec_dim, task)?;
+                let base = clusters.counts.get(*cell_id as usize).copied().unwrap_or(0);
+                cell_updates.insert(*cell_id, base.saturating_add(added));
+                prepared.push(p);
+            }
+            Ok((prepared, cell_updates))
+        })?;
     if prepared.is_empty() {
         return Ok(());
     }
@@ -2427,6 +2476,12 @@ async fn publish_hidden_cell_posting_async(
         .iter()
         .map(|e| e.uri.clone())
         .collect();
+    // We already hold the incoming superfile's bytes here. Warm them onto local
+    // disk so the background SPFresh drain reads them via mmap instead of
+    // cold-fetching ~one superfile per accumulated commit back from object
+    // storage — those GETs otherwise contend with foreground ingest PUTs and
+    // stall the commit. Cheap clone (Bytes is Arc-backed).
+    let incoming_writes: Vec<(SuperfileUri, Bytes)> = prep.batch.pending_storage_writes.clone();
     persist_commit_async(
         &inner,
         Arc::clone(&storage),
@@ -2437,6 +2492,9 @@ async fn publish_hidden_cell_posting_async(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
+    if let Some(cache) = inner.options.disk_cache.as_ref().cloned() {
+        warm_cache_after_commit(&inner, &cache, incoming_writes);
+    }
     for entry in &prep.batch.to_remove {
         if !new_uris.contains(&entry.uri) {
             let path = superfile_storage_path(&entry.uri);
