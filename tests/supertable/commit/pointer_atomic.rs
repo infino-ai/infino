@@ -38,6 +38,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
+    storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     supertable::{
         CommitError, Manifest, ManifestLoadError,
         manifest::{
@@ -46,12 +47,11 @@ use infino::{
                 part_uri, read_pointer, write_pointer,
             },
             list::{
-                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
+                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
                 PartitionStrategy,
             },
             part::{self as part_mod, ContentHash, ManifestPart, PartId},
         },
-        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
     test_helpers::default_supertable_options,
 };
@@ -163,7 +163,7 @@ fn fresh_part(seed: u8) -> ManifestPart {
     }
 }
 
-fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
+fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
     ManifestList {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
@@ -182,7 +182,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
 
 /// Build a manifest list entry referencing an already-encoded
 /// part. Skip-summary aggregates left empty here.
-fn entry_for(part: &ManifestPart) -> ManifestListEntry {
+fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
     let encoded = part_mod::encode(part, 3);
     let hash = ContentHash::of(&encoded);
     let uri = part_uri(&hash);
@@ -190,7 +190,7 @@ fn entry_for(part: &ManifestPart) -> ManifestListEntry {
     let size_uncompressed = zstd::stream::decode_all(encoded.as_slice())
         .expect("self-decode")
         .len() as u64;
-    ManifestListEntry {
+    ManifestPartEntry {
         part_id: part.part_id,
         uri,
         n_superfiles: part.superfiles.len() as u64,
@@ -639,7 +639,7 @@ async fn write_pointer_initial_rejects_existing() {
 fn directory_layout_constants_match_plan() {
     assert_eq!(POINTER_PATH, "_supertable/current");
     assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
-    assert_eq!(MANIFEST_PARTS_DIR, "manifests");
+    assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     assert_eq!(
         list_uri(POINTER_ROUNDTRIP_MANIFEST_ID),
         "manifest-lists/list-000042.json"
@@ -648,6 +648,6 @@ fn directory_layout_constants_match_plan() {
     // suffix.
     let h = ContentHash([0u8; 32]);
     let u = part_uri(&h);
-    assert!(u.starts_with("manifests/part-"));
+    assert!(u.starts_with("manifest-parts/part-"));
     assert!(u.ends_with(".avro.zst"));
 }

@@ -68,8 +68,8 @@ fn commit_persists_pointer_list_part_and_superfile() {
     assert!(!list_bytes.is_empty());
 
     // At least one manifest part exists in manifests/.
-    let manifests_dir = dir.path().join("manifests");
-    let parts: Vec<_> = std::fs::read_dir(&manifests_dir)
+    let manifest_parts_dir = dir.path().join("manifest-parts");
+    let parts: Vec<_> = std::fs::read_dir(&manifest_parts_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .collect();
@@ -136,8 +136,8 @@ fn two_successive_commits_both_publish() {
     // Manifest part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
     // means a fresh part per commit, no reuse).
-    let manifests_dir = dir.path().join("manifests");
-    let n_parts = std::fs::read_dir(&manifests_dir)
+    let manifest_parts_dir = dir.path().join("manifest-parts");
+    let n_parts = std::fs::read_dir(&manifest_parts_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .count();
