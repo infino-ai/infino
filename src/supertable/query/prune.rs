@@ -210,7 +210,7 @@ mod tests {
             manifest::{
                 FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, aggregates,
                 bloom::BloomBuilder,
-                list::{FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy},
+                list::{FORMAT_VERSION, ManifestList, ManifestPartEntry, PartitionStrategy},
                 part::{ContentHash, PartId},
             },
             query::skip::ScalarOp,
@@ -243,9 +243,9 @@ mod tests {
         })
     }
 
-    fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
+    fn part_from(segs: &[Arc<SuperfileEntry>], seed: u8) -> ManifestPartEntry {
         let aggs = aggregates::compute(segs, None);
-        ManifestListEntry {
+        ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: segs.len() as u64,
@@ -260,7 +260,7 @@ mod tests {
         }
     }
 
-    fn list_with(parts: Vec<ManifestListEntry>) -> ManifestList {
+    fn list_with(parts: Vec<ManifestPartEntry>) -> ManifestList {
         ManifestList {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,

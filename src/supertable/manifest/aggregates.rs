@@ -35,7 +35,7 @@ use std::{
 
 use crate::supertable::manifest::{
     SuperfileEntry,
-    list::{FtsSummaryAgg, ManifestListEntry, ScalarStatsAgg, VectorSummaryAgg},
+    list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
 };
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
@@ -57,7 +57,7 @@ pub struct AggregateSet {
 /// "always-keep" — correctness is preserved.
 pub fn compute(
     superfiles: &[Arc<SuperfileEntry>],
-    base_part: Option<&ManifestListEntry>,
+    base_part: Option<&ManifestPartEntry>,
 ) -> AggregateSet {
     if superfiles.is_empty() {
         return base_part
@@ -218,8 +218,8 @@ mod tests {
     fn base_entry(
         id_range: (i128, i128),
         scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
-    ) -> ManifestListEntry {
-        ManifestListEntry {
+    ) -> ManifestPartEntry {
+        ManifestPartEntry {
             part_id: PartId(uuid::Uuid::from_bytes([0xb; 16])),
             uri: "manifests/part-base.avro.zst".into(),
             n_superfiles: 1,

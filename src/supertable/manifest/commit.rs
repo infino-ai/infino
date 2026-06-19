@@ -71,7 +71,7 @@ pub const POINTER_PATH: &str = "_supertable/current";
 pub const MANIFEST_LISTS_DIR: &str = "manifest-lists";
 
 /// Subdirectory for manifest part files.
-pub const MANIFEST_PARTS_DIR: &str = "manifests";
+pub const MANIFEST_PARTS_DIR: &str = "manifest-parts";
 
 /// Build the URI for a manifest list at a given manifest_id.
 /// 6-digit zero-pad gives stable lexicographic ordering for
@@ -421,9 +421,12 @@ mod tests {
         let uri_a = part_uri(&h);
         let uri_b = part_uri(&ContentHash::of(b"hello manifest part"));
         assert_eq!(uri_a, uri_b);
-        assert!(uri_a.starts_with("manifests/part-"));
+        assert!(uri_a.starts_with("manifest-parts/part-"));
         assert!(uri_a.ends_with(".avro.zst"));
-        assert_eq!(uri_a, format!("manifests/part-{}.avro.zst", h.to_hex()));
+        assert_eq!(
+            uri_a,
+            format!("manifest-parts/part-{}.avro.zst", h.to_hex())
+        );
     }
 
     // ---- PointerFile round-trip ----------------------------------------
@@ -695,6 +698,6 @@ mod tests {
         // upgrade — surfaces it as a test failure first.
         assert_eq!(POINTER_PATH, "_supertable/current");
         assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
-        assert_eq!(MANIFEST_PARTS_DIR, "manifests");
+        assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     }
 }

@@ -69,7 +69,7 @@ use crate::{
                 translate_contention, write_manifest_list, write_part_bytes, write_pointer,
             },
             list::{
-                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
+                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
@@ -574,7 +574,7 @@ impl Manifest {
         }
     }
 
-    pub fn get_all_list_entries(&self) -> &[ManifestListEntry] {
+    pub fn get_all_list_entries(&self) -> &[ManifestPartEntry] {
         match &self.list {
             Some(list) => &list.parts,
             None => &[],
@@ -678,7 +678,7 @@ impl Manifest {
         // partitions. Order: existing entries (touched ones
         // replaced in place; untouched preserved) followed by
         // entries for cold partitions.
-        let mut out_list_entries: Vec<ManifestListEntry> = Vec::new();
+        let mut out_list_entries: Vec<ManifestPartEntry> = Vec::new();
         let mut parts_to_write: Vec<EncodedPart> = Vec::new();
         let mut handled_partitions: HashSet<Vec<u8>> = HashSet::new();
 
@@ -911,9 +911,9 @@ fn rebuild_part_and_entry(
     old_superfiles: Vec<Arc<SuperfileEntry>>,
     new_superfiles: Vec<Arc<SuperfileEntry>>,
     partition_key: Vec<u8>,
-    base_part: Option<&ManifestListEntry>,
+    base_part: Option<&ManifestPartEntry>,
 ) -> (
-    ManifestListEntry,
+    ManifestPartEntry,
     ManifestPart,
     Vec<u8>, // pre-encoded compressed bytes — reused by write path, no second encode
 ) {
@@ -933,8 +933,7 @@ fn rebuild_part_and_entry(
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
-
-    let entry = ManifestListEntry {
+    let entry = ManifestPartEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),
         n_superfiles: part.superfiles.len() as u64,
@@ -2052,8 +2051,7 @@ mod tests {
                 SupertableOptions,
                 manifest::{
                     list::{
-                        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry,
-                        PartitionStrategy,
+                        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
                     },
                     part::{self as part_mod, ContentHash, ManifestPart, PartId},
                 },
@@ -2162,7 +2160,7 @@ mod tests {
 
         fn encode_and_index(
             parts: &[ManifestPart],
-        ) -> (HashMap<String, Bytes>, Vec<ManifestListEntry>) {
+        ) -> (HashMap<String, Bytes>, Vec<ManifestPartEntry>) {
             let mut objects = HashMap::new();
             let mut entries = Vec::new();
             for p in parts {
@@ -2171,7 +2169,7 @@ mod tests {
                 let uri = format!("manifests/part-{}.avro.zst", hash.to_hex());
                 let size_compressed = bytes.len() as u64;
                 objects.insert(uri.clone(), Bytes::from(bytes));
-                entries.push(ManifestListEntry {
+                entries.push(ManifestPartEntry {
                     part_id: p.part_id,
                     uri,
                     n_superfiles: p.superfiles.len() as u64,
@@ -2188,7 +2186,7 @@ mod tests {
             (objects, entries)
         }
 
-        fn fresh_list(entries: Vec<ManifestListEntry>) -> ManifestList {
+        fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
             ManifestList {
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
@@ -2428,7 +2426,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![list::ManifestListEntry {
+            parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
                 n_superfiles: 0,
@@ -2667,7 +2665,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -2780,8 +2778,8 @@ mod tests {
         let (part_b, pw_b) = two_superfile_part(storage.as_ref(), &pk_b, 1, [200, 210]).await;
 
         // Build a list entry mirroring a persisted part.
-        let entry_for = |pw: &PartWriteResult, pk: &[u8]| -> ManifestListEntry {
-            ManifestListEntry {
+        let entry_for = |pw: &PartWriteResult, pk: &[u8]| -> ManifestPartEntry {
+            ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
@@ -3017,7 +3015,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -3109,7 +3107,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -3239,7 +3237,7 @@ mod tests {
                 n_buckets: 1,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_old.part_id,
                     uri: pw_old.uri.clone(),
                     content_hash: pw_old.content_hash,
@@ -3252,7 +3250,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_latest.part_id,
                     uri: pw_latest.uri,
                     content_hash: pw_latest.content_hash,
@@ -3365,7 +3363,7 @@ mod tests {
                 n_buckets: 2,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
@@ -3378,7 +3376,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
@@ -3493,7 +3491,7 @@ mod tests {
                 n_buckets: 2,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
@@ -3506,7 +3504,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri.clone(),
                     content_hash: pw_b.content_hash,
@@ -3642,7 +3640,7 @@ mod tests {
                 n_buckets: 2,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
@@ -3655,7 +3653,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri,
                     content_hash: pw_a_latest.content_hash,
@@ -3668,7 +3666,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_b_old.part_id,
                     uri: pw_b_old.uri.clone(),
                     content_hash: pw_b_old.content_hash,
@@ -3681,7 +3679,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_b_latest.part_id,
                     uri: pw_b_latest.uri,
                     content_hash: pw_b_latest.content_hash,
@@ -3794,7 +3792,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -3882,7 +3880,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -3987,7 +3985,7 @@ mod tests {
                 n_buckets: 2,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
@@ -4000,7 +3998,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri.clone(),
                     content_hash: pw_b.content_hash,
@@ -4122,7 +4120,7 @@ mod tests {
                 n_buckets: 1,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
@@ -4135,7 +4133,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
@@ -4246,7 +4244,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -4325,7 +4323,7 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 1,
             },
-            parts: vec![ManifestListEntry {
+            parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
@@ -4426,7 +4424,7 @@ mod tests {
                 n_buckets: 1,
             },
             parts: vec![
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri,
                     content_hash: pw_a_old.content_hash,
@@ -4439,7 +4437,7 @@ mod tests {
                     fts_summary_agg: Default::default(),
                     vector_summary_agg: Default::default(),
                 },
-                ManifestListEntry {
+                ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri,
                     content_hash: pw_a_latest.content_hash,
@@ -4518,9 +4516,9 @@ mod tests {
     /// entries — enough to exercise the list-aware `Manifest` accessors
     /// without attaching storage.
     fn list_with_parts(n_parts: usize) -> list::ManifestList {
-        use list::{ManifestList, ManifestListEntry, PartitionStrategy};
+        use list::{ManifestList, ManifestPartEntry, PartitionStrategy};
         let parts = (0..n_parts)
-            .map(|i| ManifestListEntry {
+            .map(|i| ManifestPartEntry {
                 part_id: part::PartId(Uuid::from_u128(i as u128 + 1)),
                 uri: format!("manifests/part-{i}"),
                 n_superfiles: 0,

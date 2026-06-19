@@ -84,7 +84,7 @@ pub struct ManifestList {
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
-    pub parts: Vec<ManifestListEntry>,
+    pub parts: Vec<ManifestPartEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +126,10 @@ pub enum PartitionStrategy {
 }
 
 #[derive(Debug, Clone)]
-pub struct ManifestListEntry {
+pub struct ManifestPartEntry {
     pub part_id: PartId,
     /// Storage URI for the part. Typically
-    /// `manifests/part-<hash>.avro.zst`. Content-addressed so
+    /// `manifest-parts/part-<hash>.avro.zst`. Content-addressed so
     /// two identical lists share part files.
     pub uri: String,
     pub n_superfiles: u64,
@@ -730,7 +730,7 @@ struct ManifestListDto {
     fts_columns: Vec<FtsColumnInfo>,
     vector_columns: Vec<VectorColumnInfoDto>,
     partition_strategy: PartitionStrategyDto,
-    parts: Vec<ManifestListEntryDto>,
+    parts: Vec<ManifestPartEntryDto>,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -782,7 +782,7 @@ enum PartitionStrategyDto {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ManifestListEntryDto {
+struct ManifestPartEntryDto {
     part_id: String, // UUID
     uri: String,
     n_superfiles: u64,
@@ -889,7 +889,7 @@ fn encode_scalar_array(
     Ok(encode_b64(&bytes))
 }
 
-fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncodeError> {
+fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncodeError> {
     let mut scalar_stats_agg = BTreeMap::new();
     for (k, v) in &e.scalar_stats_agg {
         let sum = match &v.sum {
@@ -907,7 +907,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
             },
         );
     }
-    Ok(ManifestListEntryDto {
+    Ok(ManifestPartEntryDto {
         part_id: e.part_id.0.to_string(),
         uri: e.uri.clone(),
         n_superfiles: e.n_superfiles,
@@ -955,7 +955,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
     })
 }
 
-fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListParseError> {
+fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListParseError> {
     let part_id =
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
@@ -1042,7 +1042,7 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
             },
         );
     }
-    Ok(ManifestListEntry {
+    Ok(ManifestPartEntry {
         part_id,
         uri: d.uri,
         n_superfiles: d.n_superfiles,
@@ -1658,7 +1658,7 @@ mod tests {
         }
     }
 
-    fn rich_entry(seed: u8) -> ManifestListEntry {
+    fn rich_entry(seed: u8) -> ManifestPartEntry {
         // Several columns (inserted out of sorted order) so the JSON
         // round-trip and byte-equality tests actually exercise the
         // HashMap → BTreeMap re-sort that keeps the wire form
@@ -1708,7 +1708,7 @@ mod tests {
             },
         );
 
-        ManifestListEntry {
+        ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: 9_847,
@@ -1751,7 +1751,7 @@ mod tests {
         list
     }
 
-    fn assert_entries_equal(a: &ManifestListEntry, b: &ManifestListEntry) {
+    fn assert_entries_equal(a: &ManifestPartEntry, b: &ManifestPartEntry) {
         assert_eq!(a.part_id, b.part_id, "part_id");
         assert_eq!(a.uri, b.uri, "uri");
         assert_eq!(a.n_superfiles, b.n_superfiles, "n_superfiles");

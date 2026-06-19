@@ -35,7 +35,7 @@
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::manifest::{
-        list::{ManifestList, ManifestListEntry},
+        list::{ManifestList, ManifestPartEntry},
         part::PartId,
     },
 };
@@ -62,7 +62,7 @@ pub fn prune_parts_for_fts_prefix(list: &ManifestList, column: &str, prefix: &[u
 }
 
 fn part_overlaps_prefix(
-    entry: &ManifestListEntry,
+    entry: &ManifestPartEntry,
     column: &str,
     prefix: &[u8],
     upper: Option<&[u8]>,
@@ -144,7 +144,7 @@ pub fn prune_parts_for_fts_terms(
 }
 
 fn part_matches_terms(
-    entry: &ManifestListEntry,
+    entry: &ManifestPartEntry,
     column: &str,
     query_terms: &[&str],
     mode: BoolMode,
@@ -264,12 +264,12 @@ mod tests {
 
     use super::*;
     use crate::supertable::{
-        SuperfileEntry, SuperfileUri,
+        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         manifest::{
-            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, aggregates,
+            ClusterCentroids, aggregates,
             bloom::BloomBuilder,
-            list::{FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy},
-            part::{ContentHash, PartId},
+            list::{FORMAT_VERSION, PartitionStrategy},
+            part::ContentHash,
         },
     };
 
@@ -344,9 +344,9 @@ mod tests {
         })
     }
 
-    fn entry_from_superfiles(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestListEntry {
+    fn entry_from_superfiles(superfiles: &[Arc<SuperfileEntry>], seed: u8) -> ManifestPartEntry {
         let aggs = aggregates::compute(superfiles, None);
-        ManifestListEntry {
+        ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
             n_superfiles: superfiles.len() as u64,
@@ -361,7 +361,7 @@ mod tests {
         }
     }
 
-    fn list_with(entries: Vec<ManifestListEntry>) -> ManifestList {
+    fn list_with(entries: Vec<ManifestPartEntry>) -> ManifestList {
         ManifestList {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
