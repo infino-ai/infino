@@ -2055,6 +2055,17 @@ pub(super) fn prepare_superfile_with_uri(
     // fire the parquet-footer, vector, and FTS subsection GETs in
     // parallel on cold open (1 RTT instead of 2 sequential).
     let subsection_offsets = build_subsection_offsets(&shard.bytes);
+    let vector_layout = read_vector_layout_from_bytes(&shard.bytes);
+    if vector_layout == VectorLayout::CellPosting
+        && subsection_offsets.as_ref().and_then(|o| o.vec).is_none()
+    {
+        let kvs = crate::superfile::format::footer::read_kv_metadata(shard.bytes.as_ref())
+            .map(|kvs| kvs.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        return Err(BuildError::Store(format!(
+            "cell-posting superfile missing inf.vec offset/length; kv_keys={kvs:?}"
+        )));
+    }
 
     let entry = Arc::new(SuperfileEntry {
         superfile_id: uuid::Uuid::new_v4(),
@@ -2071,7 +2082,7 @@ pub(super) fn prepare_superfile_with_uri(
         partition_key: Vec::new(),
         partition_hint: None,
         subsection_offsets,
-        vector_layout: read_vector_layout_from_bytes(&shard.bytes),
+        vector_layout,
     });
 
     Ok(Some(PreparedSuperfile {

@@ -1960,11 +1960,26 @@ mod tests {
         };
         hidden.compact(&cfg).expect("hidden compact");
 
-        let after = count_by_cell(hidden.reader().manifest());
+        let after_reader = hidden.reader();
+        let after_manifest = after_reader.manifest();
+        let after = count_by_cell(after_manifest);
         assert!(
             after < before,
             "compaction should collapse per-cell superfiles: before={before} after={after}"
         );
+        for entry in &after_manifest.superfiles {
+            assert_eq!(entry.vector_layout, crate::superfile::vector::layout::VectorLayout::CellPosting);
+            assert!(
+                entry.subsection_offsets.as_ref().and_then(|o| o.vec).is_some(),
+                "compacted cell-posting entry {:?} missing vec subsection",
+                entry.uri
+            );
+        }
+        let hits = st
+            .reader()
+            .vector_hits("emb", &vec![1.0f32; dim], 3, crate::superfile::reader::VectorSearchOptions::new())
+            .expect("vector search after hidden compaction");
+        assert!(!hits.is_empty(), "vector search should still work after hidden compaction");
     }
 
     #[test]
