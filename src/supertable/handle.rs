@@ -683,13 +683,6 @@ impl Supertable {
         Some((total, max_per_cell))
     }
 
-    /// Superfile count of *this* table's current manifest snapshot. Used by
-    /// hidden maintenance to compact-to-stable (stop when a pass no longer
-    /// reduces the count).
-    pub(crate) fn hidden_self_superfile_count(&self) -> Option<usize> {
-        Some(self.reader().manifest().superfiles.len())
-    }
-
     /// Internal accessor used by the writer module. Not part of
     /// the public API.
     pub(super) fn inner(&self) -> &Arc<SupertableInner> {
