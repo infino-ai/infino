@@ -4,6 +4,7 @@
 //! Combined FTS + vector supertable ingest to object storage.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
@@ -466,6 +467,34 @@ pub fn build_on_storage_streaming(modality: Modality) -> IngestResult {
     build_on_storage_inner(modality, &mut StreamingSource::new(modality))
 }
 
+/// Wall-time split across the ingest loop's three serial phases. Lets prepare
+/// tuning target the real bottleneck — corpus generation, append, or the
+/// index-building commit — rather than guess from the total alone.
+#[derive(Default)]
+struct PhaseTimings {
+    generate: Duration,
+    append: Duration,
+    commit: Duration,
+}
+
+impl PhaseTimings {
+    fn log(&self, modality: Modality) {
+        let total = (self.generate + self.append + self.commit).as_secs_f64();
+        let pct = |d: Duration| if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 };
+        eprintln!(
+            "[supertable_ingest] {} phase split: generate {:.1}s ({:.0}%), \
+             append {:.1}s ({:.0}%), commit {:.1}s ({:.0}%)",
+            modality_label(modality),
+            self.generate.as_secs_f64(),
+            pct(self.generate),
+            self.append.as_secs_f64(),
+            pct(self.append),
+            self.commit.as_secs_f64(),
+            pct(self.commit),
+        );
+    }
+}
+
 /// Ingest the corpus chunk by chunk → append → commit → object storage,
 /// building only the index shapes named by `modality`. `src` supplies each
 /// chunk (resident mmap or streamed); the loop is the same either way. The
@@ -505,6 +534,7 @@ fn build_on_storage_inner(modality: Modality, src: &mut dyn ChunkSource) -> Inge
         schema_for(modality)
     };
     let mut commit_idx = 0usize;
+    let mut timings = PhaseTimings::default();
     for start in (0..n_docs).step_by(chunk_size) {
         commit_idx += 1;
         let end = (start + chunk_size).min(n_docs);
@@ -517,9 +547,17 @@ fn build_on_storage_inner(modality: Modality, src: &mut dyn ChunkSource) -> Inge
                 end.saturating_sub(1),
             );
         }
+        let t = Instant::now();
         let batch = src.batch(modality, &schema, start, end, len);
+        timings.generate += t.elapsed();
+
+        let t = Instant::now();
         w.append(&batch).expect("append");
+        timings.append += t.elapsed();
+
+        let t = Instant::now();
         w.commit().expect("commit");
+        timings.commit += t.elapsed();
         // The chunk is committed; drop its corpus pages from RSS so the
         // build sampler measures the engine, not the consumed corpus pages.
         src.advise_consumed(start, len);
@@ -531,6 +569,7 @@ fn build_on_storage_inner(modality: Modality, src: &mut dyn ChunkSource) -> Inge
         }
     }
     drop(w);
+    timings.log(modality);
     crate::rss::log_rss_breakdown("ingest writer dropped");
     let reader = st.reader();
     let n_superfiles = reader.n_superfiles();
