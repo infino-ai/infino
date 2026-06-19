@@ -231,28 +231,19 @@ async fn read_ids_for_locals(
             .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
             .await
             .map_err(|e| QueryError::Execute(e.to_string()))?;
-        sf.take_by_local_doc_ids(local_ids, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+        match sf.take_by_local_doc_ids(local_ids, &[id_column]) {
+            Ok(b) => b,
+            // The cached reader is still a lazy foreground reader (background
+            // mmap promotion hasn't finished) and can't do an eager row take.
+            // Fall back to the lazy-safe object-store range read.
+            Err(crate::superfile::ReadError::LazyReaderUnsupported) => {
+                read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage)
+                    .await?
+            }
+            Err(e) => return Err(QueryError::Execute(e.to_string())),
+        }
     } else {
-        let (obj_store, path) = storage
-            .object_store_handle(&entry.uri.storage_path())
-            .ok_or_else(|| {
-                QueryError::Execute("no object_store handle for superfile".into())
-            })?;
-        let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
-        let store = Arc::clone(&manifest.options.store);
-        let sf = super::dispatch::open_reader(&store, None, Some(storage), entry).await?;
-        super::exec::common::take_rows_object_store(
-            obj_store,
-            path,
-            file_size,
-            &sf.schema(),
-            sf.n_docs(),
-            local_ids,
-            &[id_column],
-        )
-        .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?
+        read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage).await?
     };
     let col = batch
         .column(0)
@@ -260,6 +251,36 @@ async fn read_ids_for_locals(
         .downcast_ref::<arrow_array::Decimal128Array>()
         .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
     Ok(col.values().to_vec())
+}
+
+/// Read the `_id` column at `local_ids` from a superfile via object-store range
+/// GETs. Works regardless of whether a reader is eager or lazy, so it serves
+/// both the no-disk-cache path and the fallback when a cached reader is still a
+/// lazy foreground reader (pre-mmap-promotion).
+async fn read_ids_batch_object_store(
+    manifest: &Manifest,
+    entry: &SuperfileEntry,
+    local_ids: &[u32],
+    id_column: &str,
+    storage: &Arc<dyn crate::storage::StorageProvider>,
+) -> Result<arrow_array::RecordBatch, QueryError> {
+    let (obj_store, path) = storage
+        .object_store_handle(&entry.uri.storage_path())
+        .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
+    let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
+    let store = Arc::clone(&manifest.options.store);
+    let sf = super::dispatch::open_reader(&store, None, Some(storage), entry).await?;
+    super::exec::common::take_rows_object_store(
+        obj_store,
+        path,
+        file_size,
+        &sf.schema(),
+        sf.n_docs(),
+        local_ids,
+        &[id_column],
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))
 }
 
 /// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
