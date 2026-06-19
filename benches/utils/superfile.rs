@@ -851,8 +851,10 @@ pub mod vector {
 
     /// Default options for the user-facing "what does it cost in
     /// production?" baseline reported in the search markdown.
-    const DEFAULT_NPROBE: usize = 8;
-    const DEFAULT_RERANK_MULT: usize = 20;
+    use infino::superfile::reader::VectorSearchOptions;
+
+    const DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
+    const DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
 
     /// Nanoseconds per second, for latency markdown.
     const NS_PER_SEC: f64 = 1e9;
@@ -1017,6 +1019,7 @@ pub mod vector {
                 phases.cold,
                 3,
                 false,
+                None,
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(

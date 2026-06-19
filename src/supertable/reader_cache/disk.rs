@@ -466,6 +466,18 @@ impl DiskCacheStore {
                 entry.last_access_us.store(self.now_us(), Ordering::Release);
                 return Ok(Arc::clone(&entry.reader));
             }
+            // Hybrid foreground already reserved budget for this URI; a duplicate
+            // cold_fetch double-reserves and fails at scale (calibration remap).
+            drop(entry);
+            self.wait_until_mmap_promoted(uri, Duration::from_secs(600))
+                .await?;
+            let entry = self.cached.get(uri).ok_or_else(|| {
+                DiskCacheError::SuperfileOpen(format!(
+                    "superfile {uri:?} missing after mmap promotion"
+                ))
+            })?;
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
+            return Ok(Arc::clone(&entry.reader));
         }
         let cell = self
             .coordinators

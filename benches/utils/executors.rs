@@ -1235,6 +1235,7 @@ pub mod vector {
         include_cold: bool,
         cold_iters: usize,
         skip_calibration: bool,
+        promote_before_calibration: Option<&Supertable>,
         log_prefix: &str,
         anchor: &str,
         title: String,
@@ -1270,6 +1271,14 @@ pub mod vector {
                 "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+
+            if let Some(st) = promote_before_calibration {
+                eprintln!(
+                    "[{log_prefix}] promoting disk cache after correctness before calibration..."
+                );
+                st.wait_until_warm(std::time::Duration::from_secs(600))
+                    .expect("supertable warm promotion after correctness");
+            }
 
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)

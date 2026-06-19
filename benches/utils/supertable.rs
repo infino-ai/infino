@@ -434,8 +434,6 @@ pub fn run() {
 const WARM_ITERS: usize = 20;
 const COLD_ITERS: usize = 5;
 const TOP_K: usize = 10;
-const VECTOR_NPROBE: usize = 8;
-const VECTOR_RERANK_MULT: usize = 20;
 
 /// Selected phases for a per-modality supertable runner.
 ///
@@ -818,8 +816,10 @@ pub mod vector {
     // live in `crate::executors::vector` (shared by both tiers).
     const N_CORRECTNESS_QUERIES: usize = 20;
     const N_CALIBRATION_QUERIES: usize = 100;
-    const DEFAULT_NPROBE: usize = VECTOR_NPROBE;
-    const DEFAULT_RERANK_MULT: usize = VECTOR_RERANK_MULT;
+    use infino::superfile::reader::VectorSearchOptions;
+
+    const DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
+    const DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
@@ -1033,6 +1033,11 @@ pub mod vector {
                 phases.cold,
                 COLD_ITERS,
                 skip_cal,
+                if phases.warm && !skip_cal {
+                    Some(&consumer)
+                } else {
+                    None
+                },
                 "supertable_vector",
                 "bench/vector/supertable/search",
                 title,
