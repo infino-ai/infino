@@ -155,6 +155,9 @@ fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Ve
             col,
             VectorSummaryAgg {
                 centroid_envelope,
+                // Per-column count of folded superfile centroids, so an
+                // incremental `merge` and this batch build agree on the mean.
+                n_vectors: entries.len() as u32,
                 envelope_radius,
             },
         );

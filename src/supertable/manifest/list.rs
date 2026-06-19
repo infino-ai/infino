@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::VectorSummary;
 use super::bloom::Bloom;
 use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
@@ -529,9 +530,248 @@ fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
 /// level pruner.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorSummaryAgg {
-    /// Packed LE f32 — same encoding as `VectorSummary.centroid`.
+    /// Packed LE f32 — the **mean** centroid (the envelope center),
+    /// same encoding as `VectorSummary.centroid`. Empty ⇒ "no info",
+    /// which the list-level pruner treats as always-keep.
     pub centroid_envelope: Vec<u8>,
+    /// Number of superfile centroids folded into this envelope. Lets
+    /// [`VectorSummaryAgg::merge`] update the mean exactly (Welford) when
+    /// folding in one more superfile without re-reading the others. `0`
+    /// is the empty/no-info default.
+    pub n_vectors: u32,
     pub envelope_radius: f32,
+}
+
+impl VectorSummaryAgg {
+    /// Fold one superfile's [`VectorSummary`] into this aggregate envelope,
+    /// incrementally and without re-reading the part's other superfiles.
+    ///
+    /// After the fold the envelope still **encloses** every input ball, so
+    /// the list-level vector skip stays correct by construction: it can
+    /// only over-keep parts (false positives), never drop one that holds a
+    /// possible hit (no false negatives) — the same guarantee a Bloom
+    /// filter gives.
+    ///
+    /// - **Center**: the running mean of the folded centroids, updated with
+    ///   the Welford recurrence so it equals the batch mean-of-centroids
+    ///   that `aggregates::vector_summary_agg` computes, independent of fold
+    ///   order.
+    /// - **Radius**: a conservative triangle bound — `max(dist(old_center,
+    ///   new_center) + old_radius, dist(new_centroid, new_center) +
+    ///   new_radius)`. Looser than the batch `maxᵢ(dist(centroidᵢ, mean) +
+    ///   radiusᵢ)` (it can't see the individual prior centroids), so it
+    ///   admits more false positives but never a false negative. The
+    ///   re-centering term `dist(old_center, new_center)` shrinks as
+    ///   `n_vectors` grows, so the looseness self-limits.
+    ///
+    /// An empty base (`n_vectors == 0`) adopts the incoming ball. A `new`
+    /// summary with no centroid (a superfile with no vector index for the
+    /// column) is a no-op. A dimension mismatch (which the schema's
+    /// fixed-per-column dim should make impossible) poisons the envelope to
+    /// a sticky always-keep rather than risk a false negative.
+    pub fn merge(&mut self, new: &VectorSummary) {
+        if new.centroid.is_empty() {
+            // Superfile has no vector index for this column — nothing to add.
+            return;
+        }
+        // A poisoned envelope (emptied on a prior dim mismatch, but with a
+        // non-zero count) stays always-keep forever — folding more balls in
+        // must not resurrect a bounded shape that could exclude something.
+        if self.centroid_envelope.is_empty() && self.n_vectors > 0 {
+            return;
+        }
+        if self.n_vectors == 0 {
+            self.centroid_envelope = encode_le_f32(&new.centroid);
+            self.n_vectors = 1;
+            self.envelope_radius = new.radius;
+            return;
+        }
+        let old_center = decode_le_f32(&self.centroid_envelope);
+        if old_center.len() != new.centroid.len() {
+            // Dim mismatch shouldn't happen (schema fixes dim per column).
+            // Poison to a sticky always-keep instead of corrupting the
+            // envelope or silently dropping the new ball (a false negative).
+            self.centroid_envelope.clear();
+            self.envelope_radius = 0.0;
+            return;
+        }
+        let old_radius = self.envelope_radius;
+        let n_new = self.n_vectors + 1;
+        // Welford online mean: center += (c - center) / n_new.
+        let mut new_center = old_center.clone();
+        for (m, &c) in new_center.iter_mut().zip(new.centroid.iter()) {
+            *m += (c - *m) / n_new as f32;
+        }
+        // Conservative enclosing radius: cover the re-centered old envelope
+        // and the new ball. Both terms use the updated center.
+        let old_ball = l2_distance(&old_center, &new_center) + old_radius;
+        let new_ball = l2_distance(&new.centroid, &new_center) + new.radius;
+        self.centroid_envelope = encode_le_f32(&new_center);
+        self.n_vectors = n_new;
+        self.envelope_radius = old_ball.max(new_ball);
+    }
+}
+
+/// Decode a packed LE-f32 centroid blob (as stored in
+/// [`VectorSummaryAgg::centroid_envelope`]) back to floats.
+fn decode_le_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Pack floats into the LE-f32 blob form used on the wire.
+fn encode_le_f32(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Euclidean (L2) distance — the metric the vector envelope uses for its
+/// bounding ball (cosine/negdot over normalized centroids reduce to L2).
+fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+#[cfg(test)]
+mod vector_agg_merge_tests {
+    //! `VectorSummaryAgg::merge` — incremental envelope folding.
+    //!
+    //! The load-bearing property is **no false negatives**: after any
+    //! sequence of merges the envelope must enclose every input ball, so
+    //! the list-level vector skip never drops a part that could hold a hit.
+    use super::super::{ClusterCentroids, VectorSummary};
+    use super::{VectorSummaryAgg, decode_le_f32, l2_distance};
+
+    /// Tolerance for f32 centroid/distance comparisons.
+    const EPS: f32 = 1e-4;
+
+    fn summary(centroid: &[f32], radius: f32) -> VectorSummary {
+        VectorSummary {
+            centroid: centroid.to_vec(),
+            radius,
+            clusters: ClusterCentroids::empty(),
+        }
+    }
+
+    /// Folding into the empty/default aggregate adopts the incoming ball
+    /// verbatim: the mean is the centroid, count is 1, radius carries over.
+    #[test]
+    fn merge_into_empty_adopts_ball() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5));
+        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
+        assert_eq!(agg.n_vectors, 1);
+        assert_eq!(agg.envelope_radius, 0.5);
+    }
+
+    /// The incrementally-folded center equals the batch mean-of-centroids,
+    /// independent of fold order (Welford). Checks both orders converge.
+    #[test]
+    fn merge_center_matches_batch_mean() {
+        let cs = [[0.0_f32, 0.0, 0.0], [3.0, 6.0, 9.0], [6.0, 0.0, 3.0]];
+        let expected_mean = [3.0_f32, 2.0, 4.0]; // column means of the three
+
+        let mut fwd = VectorSummaryAgg::default();
+        for c in &cs {
+            fwd.merge(&summary(c, 0.0));
+        }
+        let mut rev = VectorSummaryAgg::default();
+        for c in cs.iter().rev() {
+            rev.merge(&summary(c, 0.0));
+        }
+
+        for (got, want) in decode_le_f32(&fwd.centroid_envelope)
+            .iter()
+            .zip(expected_mean.iter())
+        {
+            assert!((got - want).abs() < EPS, "fwd center {got} vs {want}");
+        }
+        // Order-independent center.
+        for (f, r) in decode_le_f32(&fwd.centroid_envelope)
+            .iter()
+            .zip(decode_le_f32(&rev.centroid_envelope).iter())
+        {
+            assert!((f - r).abs() < EPS, "center depends on order: {f} vs {r}");
+        }
+        assert_eq!(fwd.n_vectors, 3);
+    }
+
+    /// After folding a set of balls, the envelope encloses every one of
+    /// them — `dist(centroidᵢ, center) + radiusᵢ ≤ envelope_radius`. This is
+    /// the no-false-negative guarantee the vector skip relies on.
+    #[test]
+    fn merge_encloses_all_input_balls() {
+        let balls = [
+            (vec![10.0_f32, 0.0], 1.0),
+            (vec![-8.0, 4.0], 0.5),
+            (vec![0.0, -12.0], 2.0),
+            (vec![5.0, 5.0], 0.25),
+        ];
+        let mut agg = VectorSummaryAgg::default();
+        for (c, r) in &balls {
+            agg.merge(&summary(c, *r));
+        }
+        let center = decode_le_f32(&agg.centroid_envelope);
+        for (c, r) in &balls {
+            let reach = l2_distance(c, &center) + r;
+            assert!(
+                reach <= agg.envelope_radius + EPS,
+                "ball {c:?} r={r} reaches {reach} > envelope {}",
+                agg.envelope_radius
+            );
+        }
+    }
+
+    /// A summary with no centroid (a superfile with no vector index for the
+    /// column) is a no-op — it neither changes the envelope nor the count.
+    #[test]
+    fn merge_skips_empty_centroid() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 1.0], 0.3));
+        let before = agg.clone();
+        agg.merge(&summary(&[], 9.9));
+        assert_eq!(agg, before, "empty-centroid summary must be a no-op");
+    }
+
+    /// A dimension mismatch (which the schema should preclude) poisons the
+    /// envelope to a sticky always-keep — emptied center — rather than
+    /// risk a false negative, and stays that way under further merges.
+    #[test]
+    fn merge_dim_mismatch_poisons_to_always_keep() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 2.0], 0.5));
+        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5)); // wrong dim
+        assert!(
+            agg.centroid_envelope.is_empty(),
+            "dim mismatch must poison to always-keep"
+        );
+        // Sticky: a later well-formed merge does not resurrect a bounded
+        // (and possibly under-covering) envelope.
+        agg.merge(&summary(&[4.0, 5.0], 0.1));
+        assert!(
+            agg.centroid_envelope.is_empty(),
+            "poisoned envelope must stay always-keep"
+        );
+    }
+
+    /// Manifests written before incremental merge omit `n_vectors`; serde
+    /// must default it to 0 rather than fail to decode the list.
+    #[test]
+    fn dto_defaults_n_vectors_when_absent() {
+        let json = r#"{"centroid_envelope":"","envelope_radius":1.5}"#;
+        let dto: super::VectorSummaryAggDto =
+            serde_json::from_str(json).expect("decode legacy dto");
+        assert_eq!(dto.n_vectors, 0);
+        assert_eq!(dto.envelope_radius, 1.5);
+    }
 }
 
 // ---------- Errors ----------
@@ -704,6 +944,10 @@ struct TermRangeUnionDto {
 #[derive(Serialize, Deserialize)]
 struct VectorSummaryAggDto {
     centroid_envelope: String, // base64
+    // Absent in pre-existing manifests (written before incremental merge);
+    // serde defaults it to 0, which reads as the empty/no-info count.
+    #[serde(default)]
+    n_vectors: u32,
     envelope_radius: f32,
 }
 
@@ -806,6 +1050,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
                     k.clone(),
                     VectorSummaryAggDto {
                         centroid_envelope: encode_b64(&v.centroid_envelope),
+                        n_vectors: v.n_vectors,
                         envelope_radius: v.envelope_radius,
                     },
                 )
@@ -897,6 +1142,7 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
             k,
             VectorSummaryAgg {
                 centroid_envelope: decode_b64(&v.centroid_envelope, "centroid_envelope")?,
+                n_vectors: v.n_vectors,
                 envelope_radius: v.envelope_radius,
             },
         );
@@ -1553,6 +1799,7 @@ mod tests {
             "emb".into(),
             VectorSummaryAgg {
                 centroid_envelope: 0.5_f32.to_le_bytes().repeat(8),
+                n_vectors: 3,
                 envelope_radius: 0.71_f32,
             },
         );
