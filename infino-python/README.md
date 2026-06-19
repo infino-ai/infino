@@ -23,6 +23,13 @@ as `pyarrow` objects, and every search returns a `pyarrow.Table`.
 pip install infino
 ```
 
+Or with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv add infino            # add to a uv-managed project
+uv pip install infino    # install into the active environment
+```
+
 Requires Python 3.9 or newer. `pyarrow` is installed as a dependency;
 `pandas` is optional and used only if you pass DataFrames.
 
@@ -290,6 +297,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install maturin pytest pyarrow
 maturin develop          # compile the extension and install it into the venv
 pytest tests/
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv venv && source .venv/bin/activate
+uv pip install maturin pytest pyarrow
+maturin develop          # compile the extension and install it into the venv
+uv run pytest tests/
 ```
 
 ## License
