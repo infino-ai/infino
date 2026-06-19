@@ -21,9 +21,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use infino::supertable::Supertable;
-use infino::supertable::storage::{StorageError, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::{
+        Supertable,
+        storage::{StorageError, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use infino_bench_utils::rustfs_server;
 
 const TEST_BUCKET: &str = "infino-rustfs-smoke";
@@ -46,8 +50,8 @@ async fn supertable_smoke_via_rustfs_https() {
         handle.endpoint
     );
 
-    let storage: Arc<dyn StorageProvider> = rustfs_server::rustfs_s3_provider(&handle, "")
-        .expect("rustfs provider");
+    let storage: Arc<dyn StorageProvider> =
+        rustfs_server::rustfs_s3_provider(&handle, "").expect("rustfs provider");
 
     // Probe round-trip before the writer path.
     let probe_bytes = Bytes::from_static(b"hello-rustfs-smoke");
@@ -66,20 +70,12 @@ async fn supertable_smoke_via_rustfs_https() {
     let (_, meta) = storage.get("probe/cas.txt").await.expect("read cas object");
     let etag = meta.etag.expect("etag after put_atomic");
     storage
-        .put_if_match(
-            "probe/cas.txt",
-            Bytes::from_static(b"v2"),
-            Some(&etag),
-        )
+        .put_if_match("probe/cas.txt", Bytes::from_static(b"v2"), Some(&etag))
         .await
         .expect("put_if_match with current etag");
     let stale = etag;
     let err = storage
-        .put_if_match(
-            "probe/cas.txt",
-            Bytes::from_static(b"v3"),
-            Some(&stale),
-        )
+        .put_if_match("probe/cas.txt", Bytes::from_static(b"v3"), Some(&stale))
         .await
         .expect_err("stale etag must fail");
     assert!(
@@ -147,8 +143,14 @@ async fn rustfs_keepalive_survives_fixture_drop() {
     };
 
     let storage = Arc::clone(&fixture.storage);
-    let (got, _) = storage.get(PROBE_KEY).await.expect("get with keepalive held");
-    assert_eq!(got, probe_bytes, "storage must stay reachable while handle lives");
+    let (got, _) = storage
+        .get(PROBE_KEY)
+        .await
+        .expect("get with keepalive held");
+    assert_eq!(
+        got, probe_bytes,
+        "storage must stay reachable while handle lives"
+    );
 
     drop(fixture);
     assert!(
