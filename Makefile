@@ -124,14 +124,12 @@ python-wheel:
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
-# How many example notebooks to execute concurrently. Override on the command
-# line (e.g. `make python-examples-test CONCURRENT_EXAMPLE_TESTS=2`) on smaller runners.
+# Concurrent example notebooks; lower it on smaller runners.
 CONCURRENT_EXAMPLE_TESTS ?= 4
 
-# Build the bindings from source, install the examples' deps, and run every
-# notebook with nbconvert (a failing cell fails the target). Notebooks run in
-# parallel; each uses a distinct scratch dir, so they don't collide. Scratch
-# tables are cleaned afterwards; the venv is a reused throwaway (gitignored).
+# Build the bindings from source and execute every example notebook (a failing
+# cell fails the target). Notebooks run in parallel — each uses a distinct
+# scratch dir. The venv is a reused throwaway (gitignored).
 python-examples-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
@@ -140,8 +138,7 @@ python-examples-test:
 	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
-	# Warm the shared embedding model once so parallel workers hit a populated
-	# cache instead of racing to download it.
+	# Warm the shared embedding model so parallel workers don't race the download.
 	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
 	@ls infino-python/examples/*/[0-9]*.ipynb | \
