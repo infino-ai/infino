@@ -38,8 +38,8 @@ use crate::{
     supertable::{
         error::QueryError,
         manifest::{
-            Manifest, SuperfileEntry,
-            list::ManifestList,
+            ManifestSnapshot, SuperfileEntry,
+            list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
         },
@@ -69,7 +69,7 @@ pub(crate) enum PruneLeaf {
 impl PruneLeaf {
     /// Part-tier keep set for this leaf, or `None` when the leaf has no
     /// part-level pruner (it imposes no part constraint → keep all).
-    pub(crate) fn keep_parts(&self, list: &ManifestList) -> Option<Vec<PartId>> {
+    pub(crate) fn keep_parts(&self, list: &Manifest) -> Option<Vec<PartId>> {
         match self {
             PruneLeaf::TermPresence {
                 column,
@@ -96,7 +96,7 @@ impl PruneLeaf {
 /// was loaded — so this hot path reads the [`ScalarValue`] straight from
 /// the array with no per-query Arrow-IPC decode, then reuses the same
 /// comparison core the superfile tier uses ([`scalar_value_may_match`]).
-fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId> {
+fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
@@ -127,7 +127,7 @@ fn scalar_keep_parts(list: &ManifestList, pred: &ScalarPredicate) -> Vec<PartId>
 ///
 /// An empty `leaves` slice keeps every superfile (the no-`WHERE` scan).
 pub(crate) async fn select_superfiles(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     leaves: &[PruneLeaf],
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     // ---- Tier A: part-level prune (only when a hierarchical list
@@ -208,9 +208,10 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, aggregates,
+                FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                aggregates,
                 bloom::BloomBuilder,
-                list::{FORMAT_VERSION, ManifestList, ManifestPartEntry, PartitionStrategy},
+                list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
                 part::{ContentHash, PartId},
             },
             query::skip::ScalarOp,
@@ -260,8 +261,8 @@ mod tests {
         }
     }
 
-    fn list_with(parts: Vec<ManifestPartEntry>) -> ManifestList {
-        ManifestList {
+    fn list_with(parts: Vec<ManifestPartEntry>) -> Manifest {
+        Manifest {
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -402,7 +403,8 @@ mod tests {
         // Superfile B: {kiwi, mango} → actually contains "mango".
         let a = seg_title(&["apple", "zebra"]);
         let b = seg_title(&["kiwi", "mango"]);
-        let manifest = Manifest::empty(opts_title_fts()).with_appended(vec![a.clone(), b.clone()]);
+        let manifest =
+            ManifestSnapshot::empty(opts_title_fts()).with_appended(vec![a.clone(), b.clone()]);
 
         let scalar_leaf = PruneLeaf::Scalar(ScalarPredicate {
             column: "title".into(),
@@ -494,11 +496,11 @@ mod tests {
         })
     }
 
-    fn manifest(segs: Vec<Arc<SuperfileEntry>>) -> Manifest {
-        Manifest::empty(opts_title_fts()).with_appended(segs)
+    fn manifest(segs: Vec<Arc<SuperfileEntry>>) -> ManifestSnapshot {
+        ManifestSnapshot::empty(opts_title_fts()).with_appended(segs)
     }
 
-    async fn ids(m: &Manifest, leaves: &[PruneLeaf]) -> Vec<Uuid> {
+    async fn ids(m: &ManifestSnapshot, leaves: &[PruneLeaf]) -> Vec<Uuid> {
         select_superfiles(m, leaves)
             .await
             .expect("select")

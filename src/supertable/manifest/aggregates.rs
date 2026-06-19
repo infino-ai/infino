@@ -11,7 +11,7 @@
 //! - `id_range`: `(min(seg.id_min), max(seg.id_max))`.
 //! - `scalar_stats_agg`: per scalar column, column-wise min /
 //!   max across all superfiles. Encoded as length-1 Arrow IPC
-//!   bytes (same encoding `ManifestListEntry` uses).
+//!   bytes (same encoding `ManifestPartEntry` uses).
 //! - `fts_summary_agg`: per FTS column, the union of the superfiles'
 //!   [`FtsSummaryAgg`]s — bloom bit-OR union + `(min(min_term),
 //!   max(max_term))` term-range union — folded via
@@ -38,7 +38,7 @@ use crate::supertable::manifest::{
     list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
 };
 
-/// All four aggregate buckets for one [`ManifestListEntry`].
+/// All four aggregate buckets for one [`ManifestPartEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
 #[derive(Debug, Default)]
 pub struct AggregateSet {
@@ -213,7 +213,7 @@ mod tests {
         part::{ContentHash, PartId},
     };
 
-    /// A `ManifestListEntry` standing in for an existing part, carrying the
+    /// A `ManifestPartEntry` standing in for an existing part, carrying the
     /// given id range + per-column scalar aggregates (empty fts/vector aggs).
     fn base_entry(
         id_range: (i128, i128),

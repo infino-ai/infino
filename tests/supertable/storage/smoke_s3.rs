@@ -29,7 +29,7 @@
 //! ## What's verified
 //!
 //! - `Supertable::create + writer.commit` against the S3
-//!   wire path (superfiles + manifest part + manifest list +
+//!   wire path (superfiles + manifest part + manifest +
 //!   pointer all PUT via HTTP).
 //! - `Supertable::open` from a fresh handle recovers the
 //!   pre-commit state (manifest_id, n_superfiles, n_docs_total).
@@ -507,7 +507,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let manifest = reader.manifest();
         let mut cleanup_keys = vec![
             "_supertable/current".to_string(),
-            infino::supertable::manifest::commit::list_uri(consumer.manifest_id()),
+            infino::supertable::manifest::commit::manifest_uri(consumer.manifest_id()),
         ];
         let list_entries = manifest.get_all_list_entries();
         cleanup_keys.extend(list_entries.iter().map(|p| p.uri.clone()));

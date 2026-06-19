@@ -9,10 +9,10 @@
 //!   - `_supertable/current` — the pointer file. The only
 //!     file ever atomically renamed; visibility barrier for a
 //!     commit.
-//!   - `manifest-lists/list-NNNNNN.json` — immutable per
+//!   - `manifest/manifest-NNNNNN.json` — immutable per
 //!     manifest version. Conditional-create on PUT (S3
 //!     `If-None-Match: *` / `O_EXCL` on LocalFS).
-//!   - `manifests/part-<content-hash>.avro.zst` — immutable,
+//!   - `manifest-parts/part-<content-hash>.avro.zst` — immutable,
 //!     content-addressed. Two writers that produce identical
 //!     bytes target the same URI; the second's `put_atomic`
 //!     surfaces `PreconditionFailed`, which is benign and
@@ -49,10 +49,10 @@ use zstd::zstd_safe::get_frame_content_size;
 use crate::{
     storage::{ObjectMeta, StorageError, StorageProvider},
     supertable::{
-        Manifest, ManifestLoadError,
+        ManifestLoadError, ManifestSnapshot,
         error::CommitError,
         manifest::{
-            list::{self as list_mod, ManifestList},
+            list::{self as list_mod, Manifest as PersistedManifest},
             part::{
                 self as part_mod, BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, ManifestPart,
                 PartId,
@@ -67,17 +67,17 @@ use crate::{
 /// paths is invisible (no committed pointer references it).
 pub const POINTER_PATH: &str = "_supertable/current";
 
-/// Subdirectory for manifest list files.
-pub const MANIFEST_LISTS_DIR: &str = "manifest-lists";
+/// Subdirectory for manifest files.
+pub const MANIFEST_DIR: &str = "manifest";
 
 /// Subdirectory for manifest part files.
 pub const MANIFEST_PARTS_DIR: &str = "manifest-parts";
 
-/// Build the URI for a manifest list at a given manifest_id.
+/// Build the URI for a manifest at a given manifest_id.
 /// 6-digit zero-pad gives stable lexicographic ordering for
 /// `aws s3 ls`-style listings up through 999,999 versions.
-pub fn list_uri(manifest_id: u64) -> String {
-    format!("{MANIFEST_LISTS_DIR}/list-{manifest_id:06}.json")
+pub fn manifest_uri(manifest_id: u64) -> String {
+    format!("{MANIFEST_DIR}/manifest-{manifest_id:06}.json")
 }
 
 /// Build the URI for a manifest part at a given content hash.
@@ -96,7 +96,7 @@ pub fn part_uri(content_hash: &ContentHash) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PointerFile {
     pub manifest_id: u64,
-    pub manifest_list_uri: String,
+    pub manifest_uri: String,
     pub content_hash: ContentHash,
 }
 
@@ -105,14 +105,14 @@ impl PointerFile {
     ///
     /// ```text
     /// manifest_id=42
-    /// manifest_list_uri=manifest-lists/list-000042.json
+    /// manifest_uri=manifest/manifest-000042.json
     /// content_hash=blake3:def...
     /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
         format!(
-            "manifest_id={}\nmanifest_list_uri={}\ncontent_hash=blake3:{}\n",
+            "manifest_id={}\nmanifest_uri={}\ncontent_hash=blake3:{}\n",
             self.manifest_id,
-            self.manifest_list_uri,
+            self.manifest_uri,
             self.content_hash.to_hex(),
         )
         .into_bytes()
@@ -124,7 +124,7 @@ impl PointerFile {
             .map_err(|e| ManifestLoadError::PointerParse(format!("not utf-8: {e}")))?;
 
         let mut manifest_id: Option<u64> = None;
-        let mut manifest_list_uri: Option<String> = None;
+        let mut manifest_uri: Option<String> = None;
         let mut content_hash: Option<ContentHash> = None;
 
         for line in s.lines() {
@@ -140,8 +140,8 @@ impl PointerFile {
                         ManifestLoadError::PointerParse(format!("manifest_id: {e}"))
                     })?);
                 }
-                "manifest_list_uri" => {
-                    manifest_list_uri = Some(value.to_string());
+                "manifest_uri" => {
+                    manifest_uri = Some(value.to_string());
                 }
                 "content_hash" => {
                     let hex = value.strip_prefix("blake3:").ok_or_else(|| {
@@ -174,9 +174,8 @@ impl PointerFile {
         Ok(Self {
             manifest_id: manifest_id
                 .ok_or_else(|| ManifestLoadError::PointerParse("missing manifest_id".into()))?,
-            manifest_list_uri: manifest_list_uri.ok_or_else(|| {
-                ManifestLoadError::PointerParse("missing manifest_list_uri".into())
-            })?,
+            manifest_uri: manifest_uri
+                .ok_or_else(|| ManifestLoadError::PointerParse("missing manifest_uri".into()))?,
             content_hash: content_hash
                 .ok_or_else(|| ManifestLoadError::PointerParse("missing content_hash".into()))?,
         })
@@ -218,9 +217,9 @@ pub struct PartWriteResult {
     pub size_bytes_uncompressed: u64,
 }
 
-/// Outcome of writing a manifest list.
+/// Outcome of writing a manifest.
 #[derive(Debug, Clone)]
-pub struct ListWriteResult {
+pub struct ManifestWriteResult {
     pub uri: String,
     pub content_hash: ContentHash,
     pub size_bytes: u64,
@@ -287,19 +286,19 @@ pub(crate) async fn write_part_bytes(
 
 /// Encode + write a manifest list. Conditional-create
 /// (`put_atomic`) — exactly one writer succeeds in publishing
-/// a given `manifest_id`'s list; concurrent attempts surface
+/// a given `manifest_id`'s manifest; concurrent attempts surface
 /// `PreconditionFailed` and the caller's commit fails (the
 /// writer's OCC retry loop catches this).
-pub async fn write_manifest_list(
+pub async fn write_manifest(
     storage: &dyn StorageProvider,
-    list: &ManifestList,
-) -> Result<ListWriteResult, CommitError> {
+    list: &PersistedManifest,
+) -> Result<ManifestWriteResult, CommitError> {
     let json = list_mod::encode(list).map_err(|e| CommitError::Encode(e.to_string()))?;
     let content_hash = ContentHash::of(&json);
-    let uri = list_uri(list.manifest_id);
+    let uri = manifest_uri(list.manifest_id);
     let size = json.len() as u64;
     storage.put_atomic(&uri, Bytes::from(json)).await?;
-    Ok(ListWriteResult {
+    Ok(ManifestWriteResult {
         uri,
         content_hash,
         size_bytes: size,
@@ -366,7 +365,7 @@ pub(crate) fn translate_contention(e: CommitError) -> CommitError {
 /// manifest is not yet committed.
 pub async fn get_current_manifest_etag(
     storage: &Arc<dyn StorageProvider>,
-    current: Arc<Manifest>,
+    current: Arc<ManifestSnapshot>,
 ) -> Result<Option<String>, CommitError> {
     let Some((pointer_file, meta)) = read_pointer(storage.as_ref())
         .await
@@ -391,25 +390,30 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::storage::LocalFsStorageProvider;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        supertable::manifest::list::{
+            FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest as PersistedManifest, PartitionStrategy,
+        },
+    };
 
     // ---- URI helpers ---------------------------------------------------
 
     #[test]
-    fn list_uri_zero_pads_to_six_digits() {
+    fn manifest_uri_zero_pads_to_six_digits() {
         // 6-digit zero-pad gives stable lexicographic ordering
         // for `aws s3 ls`-style listings up to 999,999 versions.
-        assert_eq!(list_uri(0), "manifest-lists/list-000000.json");
-        assert_eq!(list_uri(42), "manifest-lists/list-000042.json");
-        assert_eq!(list_uri(123_456), "manifest-lists/list-123456.json");
+        assert_eq!(manifest_uri(0), "manifest/manifest-000000.json");
+        assert_eq!(manifest_uri(42), "manifest/manifest-000042.json");
+        assert_eq!(manifest_uri(123_456), "manifest/manifest-123456.json");
     }
 
     #[test]
-    fn list_uri_overflows_padding_for_large_ids_intentionally() {
+    fn manifest_uri_overflows_padding_for_large_ids_intentionally() {
         // Past 6 digits the format widens — no truncation, just
         // breaks lex ordering. Spec'd behaviour; locked in to
         // catch accidental width changes.
-        assert_eq!(list_uri(1_000_000), "manifest-lists/list-1000000.json");
+        assert_eq!(manifest_uri(1_000_000), "manifest/manifest-1000000.json");
     }
 
     #[test]
@@ -438,7 +442,7 @@ mod tests {
         }
         PointerFile {
             manifest_id: 7,
-            manifest_list_uri: "manifest-lists/list-000007.json".into(),
+            manifest_uri: "manifest/manifest-000007.json".into(),
             content_hash: ContentHash(bytes),
         }
     }
@@ -452,7 +456,7 @@ mod tests {
         let bytes = p.to_bytes();
         let s = from_utf8(&bytes).expect("utf-8");
         assert!(s.contains("manifest_id=7"));
-        assert!(s.contains("manifest_list_uri=manifest-lists/list-000007.json"));
+        assert!(s.contains("manifest_uri=manifest/manifest-000007.json"));
         assert!(s.contains("content_hash=blake3:"));
         let parsed = PointerFile::from_bytes(&bytes).expect("parse");
         assert_eq!(parsed, p);
@@ -460,10 +464,10 @@ mod tests {
 
     #[test]
     fn pointer_file_from_bytes_skips_blank_lines() {
-        let bytes = b"\nmanifest_id=1\n\nmanifest_list_uri=foo.json\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n";
+        let bytes = b"\nmanifest_id=1\n\nmanifest_uri=foo.json\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n";
         let parsed = PointerFile::from_bytes(bytes).expect("parse");
         assert_eq!(parsed.manifest_id, 1);
-        assert_eq!(parsed.manifest_list_uri, "foo.json");
+        assert_eq!(parsed.manifest_uri, "foo.json");
         assert_eq!(parsed.content_hash.0, [0u8; 32]);
     }
 
@@ -472,7 +476,7 @@ mod tests {
         // Forward-compat: unknown keys must not error so that
         // an older reader can open a pointer that a future
         // writer extended.
-        let bytes = b"manifest_id=2\nmanifest_list_uri=x.json\ncontent_hash=blake3:1111111111111111111111111111111111111111111111111111111111111111\nfuture_field=ignored\n";
+        let bytes = b"manifest_id=2\nmanifest_uri=x.json\ncontent_hash=blake3:1111111111111111111111111111111111111111111111111111111111111111\nfuture_field=ignored\n";
         let parsed = PointerFile::from_bytes(bytes).expect("parse");
         assert_eq!(parsed.manifest_id, 2);
     }
@@ -512,7 +516,7 @@ mod tests {
         // with a clear parse error rather than silently rolling
         // forward.
         assert_parse_err(
-            b"manifest_id=abc\nmanifest_list_uri=x\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
+            b"manifest_id=abc\nmanifest_uri=x\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
             "manifest_id",
         );
     }
@@ -520,7 +524,7 @@ mod tests {
     #[test]
     fn pointer_file_from_bytes_rejects_content_hash_without_prefix() {
         assert_parse_err(
-            b"manifest_id=1\nmanifest_list_uri=x\ncontent_hash=cafebabe\n",
+            b"manifest_id=1\nmanifest_uri=x\ncontent_hash=cafebabe\n",
             "blake3:",
         );
     }
@@ -530,7 +534,7 @@ mod tests {
         // blake3 is always 32 bytes → 64 hex chars; anything
         // else is malformed.
         assert_parse_err(
-            b"manifest_id=1\nmanifest_list_uri=x\ncontent_hash=blake3:dead\n",
+            b"manifest_id=1\nmanifest_uri=x\ncontent_hash=blake3:dead\n",
             "64 chars",
         );
     }
@@ -541,32 +545,29 @@ mod tests {
         // from u8::from_str_radix.
         let mut hex = String::from("blake3:");
         hex.push_str(&"z".repeat(64));
-        let payload = format!("manifest_id=1\nmanifest_list_uri=x\ncontent_hash={hex}\n");
+        let payload = format!("manifest_id=1\nmanifest_uri=x\ncontent_hash={hex}\n");
         assert_parse_err(payload.as_bytes(), "content_hash hex");
     }
 
     #[test]
     fn pointer_file_from_bytes_rejects_missing_manifest_id() {
         assert_parse_err(
-            b"manifest_list_uri=x\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
+            b"manifest_uri=x\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
             "missing manifest_id",
         );
     }
 
     #[test]
-    fn pointer_file_from_bytes_rejects_missing_list_uri() {
+    fn pointer_file_from_bytes_rejects_missing_manifest_uri() {
         assert_parse_err(
             b"manifest_id=1\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
-            "missing manifest_list_uri",
+            "missing manifest_uri",
         );
     }
 
     #[test]
     fn pointer_file_from_bytes_rejects_missing_content_hash() {
-        assert_parse_err(
-            b"manifest_id=1\nmanifest_list_uri=x\n",
-            "missing content_hash",
-        );
+        assert_parse_err(b"manifest_id=1\nmanifest_uri=x\n", "missing content_hash");
     }
 
     // ---- translate_contention ------------------------------------------
@@ -656,17 +657,14 @@ mod tests {
     #[tokio::test]
     async fn write_manifest_list_succeeds_and_addresses_uri() {
         // write_manifest_list encodes JSON, computes a hash,
-        // and PUTs at list_uri(manifest_id). Verify the
+        // and PUTs at manifest_uri(manifest_id). Verify the
         // returned URI matches the deterministic naming rule
         // and the bytes are reachable through `get`.
-        use crate::supertable::manifest::list::{
-            FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
-        };
         let (_dir, storage) = local_storage();
-        // Smallest valid ManifestList shape — no parts, no
+        // Smallest valid Manifest shape — no parts, no
         // columns, an empty schema. Encoding only requires the
         // format header + the empty collections.
-        let list = ManifestList {
+        let list = PersistedManifest {
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -680,10 +678,10 @@ mod tests {
             },
             parts: Vec::new(),
         };
-        let res = write_manifest_list(storage.as_ref(), &list)
+        let res = write_manifest(storage.as_ref(), &list)
             .await
             .expect("write");
-        assert_eq!(res.uri, list_uri(1));
+        assert_eq!(res.uri, manifest_uri(1));
         assert!(res.size_bytes > 0);
         // Read back to confirm bytes land at the URI.
         let _ = storage.get(&res.uri).await.expect("get list back");
@@ -697,7 +695,7 @@ mod tests {
         // would silently invalidate existing supertables on
         // upgrade — surfaces it as a test failure first.
         assert_eq!(POINTER_PATH, "_supertable/current");
-        assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
+        assert_eq!(MANIFEST_DIR, "manifest");
         assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     }
 }

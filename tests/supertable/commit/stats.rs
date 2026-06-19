@@ -51,7 +51,7 @@ fn fresh_supertable_returns_empty_stats() {
     assert_eq!(s.n_superfiles, 0);
     assert_eq!(
         s.n_manifest_parts, 0,
-        "fresh in-process supertable has no ManifestList"
+        "fresh in-process supertable has no persisted Manifest"
     );
     assert_eq!(s.n_manifest_parts_loaded, 0);
     assert!(s.process_rss_bytes > 0, "RSS must be non-zero");
@@ -85,7 +85,7 @@ fn stats_track_commits_on_in_process_supertable() {
     );
     assert_eq!(
         s2.n_manifest_parts, 0,
-        "in-process supertable never has a ManifestList"
+        "in-process supertable never has a persisted Manifest"
     );
 }
 
@@ -111,7 +111,7 @@ fn stats_show_manifest_parts_when_storage_attached() {
     assert_eq!(producer_stats.manifest_id, 1);
     assert_eq!(
         producer_stats.n_manifest_parts, 1,
-        "post-commit ManifestList exists with one part"
+        "post-commit persisted Manifest exists with one part"
     );
     assert_eq!(
         producer_stats.n_manifest_parts_loaded, 1,

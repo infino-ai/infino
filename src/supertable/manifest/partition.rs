@@ -17,7 +17,7 @@ use crate::supertable::{
 };
 
 /// Opaque partition identifier. Encoded into
-/// `SuperfileEntry.partition_key` + `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` + `ManifestPartEntry.partition_key`
 /// for the manifest layer; the writer uses this typed shape
 /// in-memory to group superfiles before encoding.
 ///
@@ -37,7 +37,7 @@ pub enum PartitionKey {
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
-/// `SuperfileEntry.partition_key` and `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` and `ManifestPartEntry.partition_key`
 /// carry: 8-byte LE u64 for TimeRange, 4-byte LE u32 for
 /// Hash, 2-byte LE u16 for ColumnRange.
 pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {

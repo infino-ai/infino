@@ -7,7 +7,7 @@
 //! `ContentHash` over the load-bearing options fields — the
 //! Arrow schema, id column, FTS / vector column declarations,
 //! and the resolved partition strategy. Stamped onto
-//! [`ManifestList::options_hash`] at commit time; verified
+//! `Manifest::options_hash` at commit time; verified
 //! at [`Supertable::open`] against the caller's options so a
 //! schema mismatch surfaces as a clean
 //! [`OpenError::OptionsHashMismatch`] instead of a parquet /
@@ -43,7 +43,7 @@
 //! [`verify_options_hash`] — older manifests + test fixtures that
 //! construct lists manually keep opening cleanly.
 //!
-//! [`ManifestList::options_hash`]: super::list::ManifestList
+//! `Manifest::options_hash`: see super::list::Manifest
 //! [`Supertable::open`]: crate::supertable::Supertable::open
 //! [`OpenError::OptionsHashMismatch`]: crate::supertable::OpenError::OptionsHashMismatch
 

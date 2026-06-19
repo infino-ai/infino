@@ -4,9 +4,9 @@
 //! `Supertable` + `SupertableReader` — the in-memory handle.
 //!
 //! `Supertable::create(opts).expect("create")` returns a clone-shared handle holding
-//! an empty initial manifest behind `ArcSwap<Manifest>`.
+//! an empty initial manifest behind `ArcSwap<ManifestSnapshot>`.
 //! `Supertable::reader()` does `ArcSwap::load_full` once and pins
-//! the resulting `Arc<Manifest>` for the reader's lifetime, so a
+//! the resulting `Arc<ManifestSnapshot>` for the reader's lifetime, so a
 //! reader captured before a commit keeps seeing pre-commit state
 //! even after the writer has swapped in a new manifest.
 //!
@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 
 use super::{
     error::{BuildError, OpenError},
-    manifest::Manifest,
+    manifest::ManifestSnapshot,
     options::SupertableOptions,
 };
 use crate::{
@@ -75,10 +75,10 @@ pub(super) struct SupertableInner {
     /// instances without copying.
     pub(super) options: Arc<SupertableOptions>,
     /// The current point-in-time view of which superfiles exist.
-    /// Each commit publishes a new Manifest via ArcSwap::store;
+    /// Each commit publishes a new ManifestSnapshot via ArcSwap::store;
     /// readers do ArcSwap::load_full at construction to pin a
     /// snapshot for the duration of their queries.
-    pub(super) manifest: ArcSwap<Manifest>,
+    pub(super) manifest: ArcSwap<ManifestSnapshot>,
     /// Single-writer slot: the writer flips this true on
     /// acquisition (via compare-exchange) and (via Drop) flips
     /// it false on release. Atomic flag, not a lock — never
@@ -119,10 +119,10 @@ pub(super) struct SupertableInner {
     /// SQL where the kernel itself runs in microseconds.
     ///
     /// Invalidation is automatic: every commit publishes a new
-    /// `Arc<Manifest>` via `manifest.store(...)`, so on the next
+    /// `Arc<ManifestSnapshot>` via `manifest.store(...)`, so on the next
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
-    pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
+    pub(super) sql_session_cache: Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -244,7 +244,7 @@ impl Supertable {
         }
 
         let options = Arc::new(options);
-        let initial = Manifest::empty(options.clone());
+        let initial = ManifestSnapshot::empty(options.clone());
         let tombstone_cache = build_tombstone_cache(&options);
         let id_generator = IdGenerator::new();
         let handle_id = SupertableHandleId(id_generator.next_id());
@@ -325,7 +325,7 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
 
-        let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
+        let manifest = ManifestSnapshot::load(None, storage, Some(options_arc.clone())).await?;
         let tombstone_cache = build_tombstone_cache(&options_arc);
         // Fresh generator per open. The 64-bit ms timestamp
         // prefix advances naturally across process restarts, so
@@ -396,7 +396,7 @@ impl Supertable {
             .clone();
 
         let current = self.inner.manifest.load_full();
-        let manifest = match Manifest::load(Some(current), storage, None).await {
+        let manifest = match ManifestSnapshot::load(Some(current), storage, None).await {
             Ok(manifest) => manifest,
             Err(ManifestLoadError::PointerNotFound) => return Ok(false),
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
@@ -676,7 +676,9 @@ impl Supertable {
     /// keyed on the manifest `Arc`. Used by `query_sql` to
     /// reuse the registered provider + TVFs across queries on
     /// the same snapshot.
-    pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
+    pub(crate) fn sql_session_cache(
+        &self,
+    ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
     }
 
@@ -759,7 +761,7 @@ impl fmt::Debug for Supertable {
     }
 }
 
-/// Snapshot-pinned reader. Captures `Arc<Manifest>` at construction
+/// Snapshot-pinned reader. Captures `Arc<ManifestSnapshot>` at construction
 /// and holds it through query lifetime — new commits to the parent
 /// `Supertable` don't affect this reader's view. The public read
 /// methods (`bm25_search`, `bm25_search_prefix`, `vector_search`,
@@ -769,7 +771,7 @@ impl fmt::Debug for Supertable {
 /// drives `commit`.
 #[derive(Clone)]
 pub struct SupertableReader {
-    manifest: Arc<Manifest>,
+    manifest: Arc<ManifestSnapshot>,
     /// Per-process tombstone-bitmap cache shared with the parent
     /// `Supertable`. Query paths read through this before
     /// returning per-superfile hits so tombstoned rows never
@@ -792,14 +794,14 @@ pub struct SupertableReader {
 /// (`SupertableInner` → cached `SessionContext` → TVF →
 /// `Arc<SupertableReader>` → `SupertableInner`), which leaked the
 /// entire consumer on every reopen. `WeakReader` breaks it: it holds a
-/// `Weak<SupertableInner>` plus the pinned `Arc<Manifest>` (a manifest
+/// `Weak<SupertableInner>` plus the pinned `Arc<ManifestSnapshot>` (a manifest
 /// never points back at the inner, so it adds no cycle) and rebuilds
 /// the strong reader on demand. The upgrade always succeeds while a
 /// query is executing, because the live consumer keeps the inner alive.
 #[derive(Clone)]
 pub(crate) struct WeakReader {
     inner: Weak<SupertableInner>,
-    manifest: Arc<Manifest>,
+    manifest: Arc<ManifestSnapshot>,
     tombstone_cache: Option<Arc<SidecarCache>>,
 }
 
@@ -859,7 +861,7 @@ impl SupertableReader {
     /// Pinned manifest. Exposed for query-side machinery
     /// (skip helpers, fan-out, etc.) to read the superfile list
     /// + summaries directly.
-    pub fn manifest(&self) -> &Arc<Manifest> {
+    pub fn manifest(&self) -> &Arc<ManifestSnapshot> {
         &self.manifest
     }
 
@@ -880,7 +882,7 @@ impl SupertableReader {
     /// only caller is [`WeakReader::upgrade`] in this file.
     fn from_inner_pinned(
         inner: Arc<SupertableInner>,
-        manifest: Arc<Manifest>,
+        manifest: Arc<ManifestSnapshot>,
         tombstone_cache: Option<Arc<SidecarCache>>,
     ) -> Self {
         Self {
@@ -897,7 +899,9 @@ impl SupertableReader {
 
     /// Cached `SessionContext` keyed on the manifest `Arc`, reused by
     /// [`SupertableReader::query_sql`] across queries on this snapshot.
-    pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
+    pub(crate) fn sql_session_cache(
+        &self,
+    ) -> &Mutex<Option<(Arc<ManifestSnapshot>, SessionContext)>> {
         &self.inner.sql_session_cache
     }
 }
@@ -1073,7 +1077,7 @@ mod tests {
 
     #[test]
     fn reader_manifest_arc_outlives_supertable_drop() {
-        // The reader's pinned Arc<Manifest> must keep the manifest
+        // The reader's pinned Arc<ManifestSnapshot> must keep the manifest
         // alive even after the parent Supertable is dropped. This
         // is the "snapshot pinned past the supertable's lifetime"
         // guarantee — the underlying superfiles stay reachable.
@@ -1091,7 +1095,7 @@ mod tests {
     #[test]
     fn many_concurrent_readers_share_one_manifest() {
         // Two readers issued at the same point should pin the SAME
-        // Arc<Manifest>. The Arc-share is what makes "thousands of
+        // Arc<ManifestSnapshot>. The Arc-share is what makes "thousands of
         // concurrent readers" cheap: one allocation, N+1 ref count.
         let st = Supertable::create(opts()).expect("create");
         publish_appended(&st, vec![entry(7)]);

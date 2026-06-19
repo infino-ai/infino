@@ -470,7 +470,7 @@ async fn supertable_real_azure_round_trip() {
         let manifest = reader.manifest();
         let mut cleanup_keys = vec![
             "_supertable/current".to_string(),
-            infino::supertable::manifest::commit::list_uri(consumer.manifest_id()),
+            infino::supertable::manifest::commit::manifest_uri(consumer.manifest_id()),
         ];
         let list_entries = manifest.get_all_list_entries();
         cleanup_keys.extend(list_entries.iter().map(|p| p.uri.clone()));

@@ -1748,7 +1748,7 @@ pub(crate) mod diag {
                 let manifest = reader.manifest();
                 let mut keys = cleanup_keys_for_run.lock().unwrap();
                 keys.push("_supertable/current".to_string());
-                keys.push(infino::supertable::manifest::commit::list_uri(
+                keys.push(infino::supertable::manifest::commit::manifest_uri(
                     consumer.manifest_id(),
                 ));
                 let list_entries = manifest.get_all_list_entries();

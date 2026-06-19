@@ -68,7 +68,7 @@ use crate::{
     storage::StorageError,
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
-        Manifest, SupertableOptions,
+        ManifestSnapshot, SupertableOptions,
         handle::{Supertable, SupertableInner},
         manifest::{
             ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
@@ -263,7 +263,7 @@ pub async fn run_append_phase(
 /// matching `superfile_id`. O(N) in the number of live
 /// superfiles; called once per append-phase invocation, so the
 /// linear scan is fine at the supertable sizes we target.
-fn manifest_contains(manifest: &Manifest, superfile_id: Uuid) -> bool {
+fn manifest_contains(manifest: &ManifestSnapshot, superfile_id: Uuid) -> bool {
     manifest
         .get_all_superfiles()
         .iter()
@@ -1041,7 +1041,7 @@ async fn cas_tombstone_bit(
 /// of candidates per target.
 fn resolve_target_id_in_manifest(
     inner: &Arc<SupertableInner>,
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     target_id: RowId,
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
@@ -1184,6 +1184,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             Supertable,
+            manifest::ManifestSnapshot,
             wal::{
                 state_doc::{
                     OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome,
@@ -1267,7 +1268,7 @@ mod tests {
     async fn manifest_contains_returns_true_for_matching_uuid() {
         let (_dir, _st, _ws, _wal, _etag) = fixture().await;
         let opts = Arc::new(default_supertable_options());
-        let empty = Manifest::empty(Arc::clone(&opts));
+        let empty = ManifestSnapshot::empty(Arc::clone(&opts));
         assert!(!manifest_contains(&empty, Uuid::nil()));
     }
 

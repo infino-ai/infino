@@ -3,7 +3,7 @@
 
 //! Manifest-level skip pruning helpers.
 //!
-//! Each helper takes a pinned [`Manifest`] snapshot plus a query
+//! Each helper takes a pinned [`ManifestSnapshot`] snapshot plus a query
 //! shape and returns a `Vec<bool>` mask — one slot per superfile, in
 //! manifest order — where `true` means "keep" and `false` means
 //! "prune".  The masks are pure functions of manifest metadata
@@ -53,7 +53,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::distance::{Metric, distance},
     },
-    supertable::manifest::{Manifest, SuperfileEntry},
+    supertable::manifest::{ManifestSnapshot, SuperfileEntry},
 };
 
 /// Bloom-skip mask for an exact-term BM25 search.
@@ -147,7 +147,11 @@ pub fn fts_prefix_skip(
 /// [`superfiles_sorted_by_centroid_distance`] to bias fan-out
 /// order toward likely-close superfiles — that alone gives a
 /// near-cutoff result fast for cache-aware top-k merging.
-pub fn vector_centroid_skip(manifest: &Manifest, _column: &str, _query: &[f32]) -> Vec<bool> {
+pub fn vector_centroid_skip(
+    manifest: &ManifestSnapshot,
+    _column: &str,
+    _query: &[f32],
+) -> Vec<bool> {
     vec![true; manifest.superfiles.len()]
 }
 
@@ -164,7 +168,7 @@ pub fn vector_centroid_skip(manifest: &Manifest, _column: &str, _query: &[f32]) 
 /// of how to materialize the ordered fan-out (rayon `par_iter`
 /// over indices is the typical shape).
 pub fn superfiles_sorted_by_centroid_distance(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     column: &str,
     query: &[f32],
     metric: Metric,
@@ -336,7 +340,7 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                ClusterCentroids, FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry,
+                ClusterCentroids, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
                 SuperfileUri, VectorSummary, bloom::BloomBuilder,
             },
         },
@@ -453,7 +457,7 @@ mod tests {
     fn bloom_skip_keeps_superfiles_with_any_query_term_in_or_mode() {
         let s_a = superfile_with_terms("title", &["alpha", "beta"]);
         let s_b = superfile_with_terms("title", &["gamma", "delta"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "missing"], BoolMode::Or);
         // Superfile A has alpha → keep. Superfile B has neither → prune.
         assert_eq!(mask, vec![true, false]);
@@ -463,7 +467,7 @@ mod tests {
     fn bloom_skip_requires_all_terms_present_in_and_mode() {
         let s_a = superfile_with_terms("title", &["alpha", "beta"]);
         let s_b = superfile_with_terms("title", &["alpha", "gamma"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "beta"], BoolMode::And);
         // Superfile A has both. Superfile B is missing 'beta' → prune.
         assert_eq!(mask, vec![true, false]);
@@ -472,7 +476,7 @@ mod tests {
     #[test]
     fn bloom_skip_unknown_column_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "no_such_column", &["alpha"], BoolMode::Or);
         assert_eq!(mask, vec![true]);
     }
@@ -480,14 +484,14 @@ mod tests {
     #[test]
     fn bloom_skip_empty_terms_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &[], BoolMode::Or);
         assert_eq!(mask, vec![true]);
     }
 
     #[test]
     fn bloom_skip_with_no_superfiles_returns_empty_vec() {
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha"], BoolMode::Or);
         assert!(mask.is_empty());
     }
@@ -502,7 +506,7 @@ mod tests {
         //            overlaps the upper end.
         let s_a = superfile_with_terms("title", &["apple", "banana"]);
         let s_b = superfile_with_terms("title", &["python", "rust"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![false, true]);
     }
@@ -511,7 +515,7 @@ mod tests {
     fn prefix_skip_keeps_superfiles_with_matching_prefix_inside_range() {
         // Terms ['rusting', 'rusty'] → prefix "rust" overlaps.
         let s = superfile_with_terms("title", &["rusting", "rusty"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![true]);
     }
@@ -519,7 +523,7 @@ mod tests {
     #[test]
     fn prefix_skip_empty_prefix_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"");
         assert_eq!(mask, vec![true]);
     }
@@ -527,7 +531,7 @@ mod tests {
     #[test]
     fn prefix_skip_unknown_column_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "no_such_column", b"alp");
         assert_eq!(mask, vec![true]);
     }
@@ -536,7 +540,7 @@ mod tests {
     fn prefix_skip_zero_term_superfile_pruned() {
         // Empty term_range = no terms indexed. Prefix can't match.
         let s = Arc::new(empty_superfile());
-        let m = Manifest::new_from_superfiles(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         // No FTS summary on the superfile → keep (column-missing
         // path). Sanity: this is the "unknown column" path, not
@@ -550,7 +554,7 @@ mod tests {
     fn vector_centroid_skip_v1_keeps_all_superfiles() {
         let s_a = superfile_with_centroid("emb", vec![0.0; 16], 0.5);
         let s_b = superfile_with_centroid("emb", vec![10.0; 16], 0.5);
-        let m = Manifest::new_from_superfiles(opts_with_vector(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![s_a, s_b]);
         let q = vec![0.0f32; 16];
         let mask = vector_centroid_skip(&m, "emb", &q);
         assert_eq!(mask, vec![true, true]);
@@ -578,7 +582,7 @@ mod tests {
             },
             0.0,
         );
-        let m = Manifest::new_from_superfiles(opts, vec![far.clone(), near.clone()]);
+        let m = ManifestSnapshot::new_from_superfiles(opts, vec![far.clone(), near.clone()]);
         let q = {
             let mut v = vec![0.0f32; 16];
             v[0] = 1.0;
@@ -593,7 +597,7 @@ mod tests {
     fn superfiles_sorted_by_centroid_distance_pushes_missing_summary_to_end() {
         let with_v = superfile_with_centroid("emb", vec![1.0f32; 16], 0.0);
         let without_v = Arc::new(empty_superfile());
-        let m = Manifest::new_from_superfiles(opts_with_vector(), vec![without_v, with_v]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![without_v, with_v]);
         let q = vec![1.0f32; 16];
         let order = superfiles_sorted_by_centroid_distance(&m, "emb", &q, Metric::L2Sq);
         // Index 1 (has summary) sorted before index 0 (missing).

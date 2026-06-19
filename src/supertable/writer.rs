@@ -73,8 +73,8 @@ use super::{
     error::BuildError,
     handle::{Supertable, SupertableInner},
     manifest::{
-        FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri,
-        VectorSummary, bloom::BloomBuilder,
+        FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
+        SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -114,7 +114,7 @@ use crate::{
         CommitError as SupertableCommitError, ManifestLoadError,
         error::ManifestError,
         manifest::{
-            ClusterCentroids, Manifest,
+            ClusterCentroids,
             commit::get_current_manifest_etag,
             part::{self as part_mod, PartId},
         },
@@ -1606,8 +1606,8 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 
 /// Storage write-through with OCC retry. Persist the new
 /// superfiles + manifest to storage, returning the new
-/// in-memory `Manifest` with the fresh `ManifestList` +
-/// `ManifestPartLoader` installed.
+/// in-memory `ManifestSnapshot` with the fresh persisted Manifest +
+/// loader installed.
 ///
 /// **OCC retry semantics.** On each iteration:
 ///  1. Reload `inner.manifest` to incorporate any commit a
@@ -1799,7 +1799,7 @@ pub async fn write_superfile_list(
 /// For each touched partition, the writer finds the latest
 /// existing part (if any), rebuilds it with the union of its
 /// existing superfiles + the new ones, and emits a new
-/// `ManifestListEntry` that replaces the prior one (same
+/// `ManifestPartEntry` that replaces the prior one (same
 /// `partition_key`, new `part_id` + content hash). Untouched
 /// partitions' list entries carry over verbatim — no
 /// re-encode, no PUT. A cold partition (no prior entry) gets
@@ -1811,11 +1811,11 @@ pub async fn write_superfile_list(
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
     opts: Arc<SupertableOptions>,
-    current_manifest: Arc<Manifest>,
+    current_manifest: Arc<ManifestSnapshot>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
-) -> Result<Manifest, SupertableCommitError> {
+) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(&storage, &opts, pending_storage_writes).await?;
 
@@ -1850,9 +1850,9 @@ pub(crate) async fn try_commit_attempt(
 
 /// Re-read the manifest pointer from storage, load any newer
 /// manifest list, inherit unchanged parts from the current
-/// in-memory `Manifest` via content-addressed `Arc::clone`,
+/// in-memory `ManifestSnapshot` via content-addressed `Arc::clone`,
 /// eager-fetch newly-referenced parts, and `ArcSwap` the
-/// refreshed `Manifest` into `inner.manifest`.
+/// refreshed `ManifestSnapshot` into `inner.manifest`.
 ///
 /// Called from the OCC retry loop between attempts so the next
 /// iteration's `inner.manifest.load_full()` sees the winning
@@ -1867,7 +1867,7 @@ async fn refresh_inner_state_async(
     storage: &Arc<dyn StorageProvider>,
 ) -> Result<(), SupertableCommitError> {
     let current = inner.manifest.load_full();
-    let manifest = match Manifest::load(Some(current), storage.clone(), None).await {
+    let manifest = match ManifestSnapshot::load(Some(current), storage.clone(), None).await {
         Ok(manifest) => manifest,
         Err(ManifestLoadError::PointerNotFound) => return Ok(()),
         Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),

@@ -29,16 +29,16 @@ use std::sync::Arc;
 use crate::supertable::{
     ManifestLoadError,
     manifest::{
-        Manifest, SuperfileEntry,
+        ManifestSnapshot, SuperfileEntry,
         part::{ManifestPart, PartId},
     },
 };
 
 /// Lazy-load each part in `kept_part_ids` via
-/// `Manifest::part(id).await`, in parallel.
+/// `ManifestSnapshot::part(id).await`, in parallel.
 ///
 /// Cheap when parts are already loaded (eager mode, or a
-/// prior query warmed them) — each `Manifest::part` call
+/// prior query warmed them) — each `ManifestSnapshot::part` call
 /// hits the part's `OnceCell` and returns an `Arc::clone`
 /// without I/O. Lazy mode triggers one storage GET per
 /// not-yet-loaded part; the `join_all` issues them in
@@ -48,7 +48,7 @@ use crate::supertable::{
 /// `await`s each part load on the caller's runtime; cold lazy
 /// parts' GETs run on that runtime's reactor.
 pub async fn load_kept_parts(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<ManifestPart>>, ManifestLoadError> {
     if kept_part_ids.is_empty() {
@@ -86,7 +86,7 @@ pub fn flatten_superfiles(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry
 /// Combined helper: lazy-load + flatten in one call. The
 /// common shape across query paths.
 pub async fn load_and_flatten(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
     let parts = load_kept_parts(manifest, kept_part_ids).await?;
@@ -97,8 +97,8 @@ pub async fn load_and_flatten(
 /// in-process manifests with no `list` (in-memory-only
 /// supertables, or supertables that haven't persisted yet): just return
 /// the flat `manifest.superfiles`. The eager-mode + lazy-mode hierarchical
-/// path through `load_and_flatten` requires a `ManifestList`; this branch
+/// path through `load_and_flatten` requires a persisted Manifest; this branch
 /// covers the no-list case so the query paths remain uniformly callable.
-pub fn fallback_to_flat_superfiles(manifest: &Manifest) -> Vec<Arc<SuperfileEntry>> {
+pub fn fallback_to_flat_superfiles(manifest: &ManifestSnapshot) -> Vec<Arc<SuperfileEntry>> {
     manifest.superfiles.to_vec()
 }

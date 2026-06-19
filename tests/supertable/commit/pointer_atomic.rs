@@ -40,14 +40,14 @@ use bytes::Bytes;
 use infino::{
     storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     supertable::{
-        CommitError, Manifest, ManifestLoadError,
+        CommitError, ManifestLoadError, ManifestSnapshot,
         manifest::{
             commit::{
-                self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri,
+                self, MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, manifest_uri,
                 part_uri, read_pointer, write_pointer,
             },
             list::{
-                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
+                FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
             },
             part::{self as part_mod, ContentHash, ManifestPart, PartId},
@@ -55,6 +55,7 @@ use infino::{
     },
     test_helpers::default_supertable_options,
 };
+// Note: Manifest is the persisted data struct; ManifestSnapshot is the wrapper with lazy-loading.
 use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
@@ -80,7 +81,7 @@ const PARALLEL_PUT_POLL_INTERVAL_MS: u64 = 10;
 async fn commit_manifest(
     storage: &Arc<dyn StorageProvider>,
     expected_prev_etag: Option<&str>,
-    new_list: &ManifestList,
+    new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
     let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
@@ -88,11 +89,11 @@ async fn commit_manifest(
 
     // Start from an empty manifest (no superfiles) carrying the
     // new list, then commit it via the production persistence
-    // path. `Manifest::write` issues the part + list PUTs in
+    // path. `ManifestSnapshot::write` issues the part + list PUTs in
     // parallel and finishes with the conditional pointer PUT (the
     // visibility barrier). It only serializes the attached list,
     // so the default options suffice for the persistence side.
-    let manifest = Manifest::new(
+    let manifest = ManifestSnapshot::new(
         new_list.manifest_id,
         Arc::new(default_supertable_options()),
         Vec::new(),
@@ -119,7 +120,7 @@ async fn commit_manifest(
 fn pointer_file_text_format_roundtrip() {
     let p = PointerFile {
         manifest_id: POINTER_ROUNDTRIP_MANIFEST_ID,
-        manifest_list_uri: "manifest-lists/list-000042.json".into(),
+        manifest_uri: "manifest/manifest-000042.json".into(),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
     };
     let bytes = p.to_bytes();
@@ -128,7 +129,7 @@ fn pointer_file_text_format_roundtrip() {
         s.contains("manifest_id=42"),
         "must spell out manifest_id; got {s:?}"
     );
-    assert!(s.contains("manifest_list_uri=manifest-lists/list-000042.json"));
+    assert!(s.contains("manifest_uri=manifest/manifest-000042.json"));
     assert!(s.contains("content_hash=blake3:"));
     let parsed = PointerFile::from_bytes(&bytes).expect("parse");
     assert_eq!(parsed, p);
@@ -136,7 +137,7 @@ fn pointer_file_text_format_roundtrip() {
 
 #[test]
 fn pointer_file_rejects_truncated() {
-    let bad = b"manifest_id=1\nmanifest_list_uri=foo\n"; // missing content_hash
+    let bad = b"manifest_id=1\nmanifest_uri=foo\n"; // missing content_hash
     let err = PointerFile::from_bytes(bad).expect_err("must reject");
     assert!(matches!(err, ManifestLoadError::PointerParse(_)), "{err:?}");
 }
@@ -144,7 +145,7 @@ fn pointer_file_rejects_truncated() {
 #[test]
 fn pointer_file_tolerates_unknown_keys_for_forward_compat() {
     let s = b"manifest_id=7\n\
-              manifest_list_uri=manifest-lists/list-000007.json\n\
+              manifest_uri=manifest/manifest-000007.json\n\
               content_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n\
               future_field=whatever\n";
     let p = PointerFile::from_bytes(s).expect("parse");
@@ -163,8 +164,8 @@ fn fresh_part(seed: u8) -> ManifestPart {
     }
 }
 
-fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
-    ManifestList {
+fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
+    Manifest {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
@@ -219,7 +220,7 @@ async fn initial_commit_writes_list_part_pointer() {
         .expect("initial commit");
 
     assert_eq!(pointer.get_manifest_id(), 0);
-    assert_eq!(pointer.manifest_list_uri, list_uri(0));
+    assert_eq!(pointer.manifest_uri, manifest_uri(0));
 
     // Pointer is readable.
     let (read, _) = read_pointer(storage.as_ref())
@@ -228,7 +229,7 @@ async fn initial_commit_writes_list_part_pointer() {
         .expect("some");
     assert_eq!(read, pointer);
     // List + part are at their expected URIs.
-    let (list_bytes, _) = storage.get(&list_uri(0)).await.expect("list bytes");
+    let (list_bytes, _) = storage.get(&manifest_uri(0)).await.expect("list bytes");
     assert!(!list_bytes.is_empty());
     let (part_bytes, _) = storage
         .get(&entry_for(&part).uri)
@@ -591,7 +592,7 @@ async fn write_pointer_initial_then_update() {
 
     let p0 = PointerFile {
         manifest_id: 0,
-        manifest_list_uri: list_uri(0),
+        manifest_uri: manifest_uri(0),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
     };
     write_pointer(&storage, &p0, None).await.expect("initial");
@@ -605,7 +606,7 @@ async fn write_pointer_initial_then_update() {
 
     let p1 = PointerFile {
         manifest_id: 1,
-        manifest_list_uri: list_uri(1),
+        manifest_uri: manifest_uri(1),
         content_hash: ContentHash([0xcd; 32]),
     };
     write_pointer(&storage, &p1, Some(&etag))
@@ -622,7 +623,7 @@ async fn write_pointer_initial_rejects_existing() {
     let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
     let p0 = PointerFile {
         manifest_id: 0,
-        manifest_list_uri: list_uri(0),
+        manifest_uri: manifest_uri(0),
         content_hash: ContentHash([0u8; 32]),
     };
     write_pointer(&storage, &p0, None).await.expect("first");
@@ -638,11 +639,11 @@ async fn write_pointer_initial_rejects_existing() {
 #[test]
 fn directory_layout_constants_match_plan() {
     assert_eq!(POINTER_PATH, "_supertable/current");
-    assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
+    assert_eq!(MANIFEST_DIR, "manifest");
     assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     assert_eq!(
-        list_uri(POINTER_ROUNDTRIP_MANIFEST_ID),
-        "manifest-lists/list-000042.json"
+        manifest_uri(POINTER_ROUNDTRIP_MANIFEST_ID),
+        "manifest/manifest-000042.json"
     );
     // part_uri is hash-shaped — just sanity-check the prefix +
     // suffix.

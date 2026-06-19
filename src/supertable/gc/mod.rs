@@ -10,9 +10,9 @@ use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
     supertable::{
-        Manifest,
+        ManifestSnapshot,
         error::GcError,
-        manifest::commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+        manifest::commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
     },
 };
 
@@ -25,10 +25,10 @@ pub struct GcReport {
     pub delete_errors: u64,
 }
 
-fn build_live_set(manifest: &Manifest) -> HashSet<String> {
+fn build_live_set(manifest: &ManifestSnapshot) -> HashSet<String> {
     let mut live = HashSet::new();
     live.insert(POINTER_PATH.to_string());
-    live.insert(list_uri(manifest.manifest_id));
+    live.insert(manifest_uri(manifest.manifest_id));
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
     }
@@ -54,7 +54,7 @@ impl Supertable {
 
         let mut report = GcReport::default();
 
-        for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, "data"] {
+        for prefix in [MANIFEST_DIR, MANIFEST_PARTS_DIR, "data"] {
             let entries = storage.list_with_prefix_metadata(prefix).await?;
             for (key, meta) in entries {
                 if live.contains(&key) {
@@ -91,7 +91,7 @@ mod tests {
     use crate::{
         supertable::{
             SupertableOptions,
-            manifest::{Manifest, SuperfileEntry, SuperfileUri},
+            manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         },
         test_helpers::default_supertable_options,
     };
@@ -117,28 +117,28 @@ mod tests {
     }
 
     #[test]
-    fn build_live_set_contains_pointer_and_list_uri() {
-        let manifest = Manifest::empty(opts());
+    fn build_live_set_contains_pointer_and_manifest_uri() {
+        let manifest = ManifestSnapshot::empty(opts());
         let live = build_live_set(&manifest);
         assert!(live.contains(POINTER_PATH));
-        assert!(live.contains(&list_uri(manifest.manifest_id)));
+        assert!(live.contains(&manifest_uri(manifest.manifest_id)));
     }
 
     #[test]
     fn build_live_set_contains_superfile_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         let live = build_live_set(&manifest);
         assert!(live.contains(&uri.storage_path()));
     }
 
     #[test]
-    fn build_live_set_does_not_contain_older_list_uris() {
+    fn build_live_set_does_not_contain_older_manifest_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         assert_eq!(manifest.manifest_id, 1);
         let live = build_live_set(&manifest);
-        assert!(!live.contains(&list_uri(0)));
-        assert!(!live.contains(&list_uri(2)));
+        assert!(!live.contains(&manifest_uri(0)));
+        assert!(!live.contains(&manifest_uri(2)));
     }
 }

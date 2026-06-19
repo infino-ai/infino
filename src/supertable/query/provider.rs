@@ -95,7 +95,7 @@ use crate::{
     superfile::{LazyByteSource, fts::reader::BoolMode},
     supertable::{
         SuperfileEntry,
-        manifest::{Manifest, add_sum_arrays, hll::HllSketch},
+        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::CandidatePlan,
@@ -160,7 +160,7 @@ pub(crate) struct SupertableProvider {
     /// Matches the Parquet body each superfile was written with.
     schema: SchemaRef,
     /// Pinned manifest snapshot for this query.
-    manifest: Arc<Manifest>,
+    manifest: Arc<ManifestSnapshot>,
     /// In-memory superfile-bytes tier.
     store: Arc<dyn SuperfileReaderCache>,
     /// Optional disk cache (storage-backed supertables).
@@ -206,7 +206,7 @@ impl SupertableProvider {
     /// mirror what `Supertable::query_sql` already pins.
     pub(crate) fn new(
         schema: SchemaRef,
-        manifest: Arc<Manifest>,
+        manifest: Arc<ManifestSnapshot>,
         store: Arc<dyn SuperfileReaderCache>,
         disk_cache: Option<Arc<DiskCacheStore>>,
         tombstone_cache: Option<Arc<SidecarCache>>,
@@ -248,7 +248,7 @@ impl SupertableProvider {
     }
 
     /// The pinned manifest snapshot (covered/residual rewrite input).
-    pub(crate) fn manifest(&self) -> &Arc<Manifest> {
+    pub(crate) fn manifest(&self) -> &Arc<ManifestSnapshot> {
         &self.manifest
     }
 
