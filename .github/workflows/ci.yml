@@ -174,6 +174,15 @@ jobs:
         with:
           workspaces: infino-python
       - run: make python-wheel
+      # The README advertises `uv pip install infino`; verify that path
+      # against the freshly built wheel, not just pip.
+      - name: Smoke-test wheel with uv
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade uv
+          uv venv /tmp/uv-smoke
+          uv pip install --python /tmp/uv-smoke infino-python/dist/*.whl pytest pyarrow pandas
+          /tmp/uv-smoke/bin/python -m pytest infino-python/tests/ -v
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.os }}
