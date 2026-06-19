@@ -2239,29 +2239,11 @@ where
 /// incoming superfiles are simply scanned by queries (recall is unaffected).
 const INCOMING_DRAIN_THRESHOLD: usize = 4;
 
-/// Dedicated single-worker runtime for background hidden-index maintenance.
-/// Maintenance MUST NOT run on the shared query runtime: its drain does
-/// CPU-heavy per-cell encode and S3 I/O that, on the shared runtime + global
-/// rayon pool, saturates every core and starves the foreground ingest commit's
-/// own S3 futures — which then time out at 30s. One worker keeps maintenance
-/// strictly in the background, costing ingest at most one core.
-static MAINT_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
 /// Single-thread rayon pool for the drain's CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
-/// `par_iter`/`join` to one thread instead of fanning out across every core.
+/// `par_iter`/`join` to one thread instead of fanning out across every core, so
+/// the drain can't starve foreground ingest CPU.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-
-fn maint_runtime() -> &'static tokio::runtime::Runtime {
-    MAINT_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .thread_name("hidden-maint-rt")
-            .build()
-            .expect("hidden maintenance runtime")
-    })
-}
 
 fn maint_pool() -> &'static rayon::ThreadPool {
     MAINT_POOL.get_or_init(|| {
@@ -2275,19 +2257,24 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 
 /// Background SPFresh maintenance: drain the hidden index's "incoming" IVF
 /// superfiles into per-cell CellPosting "cell superfiles" and delete the
-/// incoming ones. Runs on the dedicated single-worker maintenance runtime so it
-/// never competes with foreground ingest for runtime workers, and only once
-/// enough incoming superfiles have accumulated so the per-cell build amortizes.
+/// incoming ones. Only collapses once enough incoming superfiles accumulate so
+/// the per-cell build amortizes.
+///
+/// The drain's async work (object-store + disk-cache I/O) MUST run on the same
+/// `query_runtime` as the foreground path: the disk cache's async coordination
+/// primitives (per-URI fetch coordinators, background-fill notifications) are
+/// bound to that runtime, and awaiting them from a *different* runtime loses
+/// wakeups and intermittently deadlocks the commit. A short-lived thread drives
+/// it via `block_on` (the drain future borrows through `write_superfile_list`,
+/// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
+/// not by a separate runtime. The `compaction_outstanding` single-flight guard
+/// makes concurrent invocations cheap no-ops, so threads don't pile up.
 fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
-    // A short-lived thread drives the drain on the dedicated maintenance
-    // runtime via `block_on` (the drain future borrows through
-    // `write_superfile_list`, so it isn't `'static` enough for `spawn`). The
-    // `compaction_outstanding` single-flight guard inside the drain makes
-    // concurrent invocations cheap no-ops, so threads don't pile up.
+    let runtime = inner.query_runtime();
     std::thread::Builder::new()
         .name("hidden-maint".into())
         .spawn(move || {
-            if let Err(e) = maint_runtime().block_on(drain_incoming_into_cells(inner)) {
+            if let Err(e) = runtime.block_on(drain_incoming_into_cells(inner)) {
                 tracing::warn!(
                     "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
                 );
@@ -2448,7 +2435,8 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         let path = superfile_storage_path(&entry.uri);
         let _ = storage.delete(&path).await;
     }
-    Ok(())}
+    Ok(())
+}
 
 async fn publish_hidden_cell_posting_async(
     inner: Arc<SupertableInner>,
@@ -2491,8 +2479,20 @@ async fn publish_hidden_cell_posting_async(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    if let Some(cache) = inner.options.disk_cache.as_ref().cloned() {
-        warm_cache_after_commit(&inner, &cache, incoming_writes);
+    // We're already in async context here — warm the disk cache by awaiting
+    // `insert_warm` directly. (Do NOT use `warm_cache_after_commit`, which does
+    // a nested `block_in_place` + `block_on`; calling that from inside this
+    // commit future deadlocks the runtime.)
+    if let Some(cache) = inner.options.disk_cache.as_ref() {
+        for (uri, bytes) in incoming_writes {
+            if let Err(e) = cache.insert_warm(&uri, bytes).await {
+                tracing::warn!(
+                    "supertable: warm incoming superfile {} failed: {e} \
+                     (drain will cold-fetch from storage)",
+                    uri.0
+                );
+            }
+        }
     }
     for entry in &prep.batch.to_remove {
         if !new_uris.contains(&entry.uri) {
@@ -2503,10 +2503,12 @@ async fn publish_hidden_cell_posting_async(
     if let Some(uri) = old_list_uri {
         let _ = storage.delete(&uri).await;
     }
-    if !prep.batch.pending_cache_inserts.is_empty()
-        && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
-    {
-        warm_cache_after_commit(&inner, &cache, prep.batch.pending_cache_inserts);
+    if let Some(cache) = inner.options.disk_cache.as_ref() {
+        for (uri, bytes) in prep.batch.pending_cache_inserts {
+            if let Err(e) = cache.insert_warm(&uri, bytes).await {
+                tracing::warn!("supertable: warm cache pre-population for {} failed: {e}", uri.0);
+            }
+        }
     }
     if let (Some(cache), Some(budget)) = (
         inner.options.disk_cache.as_ref(),
