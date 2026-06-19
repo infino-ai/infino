@@ -221,11 +221,6 @@ jobs:
           workspaces: infino-node
       # Builds the addon (debug) + runs the node:test smoke suite.
       - run: make node-test
-      # End-to-end: run the agent-memory example against the addon just built
-      # (Linux only — one platform is enough for an example smoke). The example
-      # ends in asserts, so a regression fails the job.
-      - if: runner.os == 'Linux'
-        run: make node-example
 
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.

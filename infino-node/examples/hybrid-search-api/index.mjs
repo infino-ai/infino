@@ -124,7 +124,9 @@ const server = createServer(async (req, res) => {
     return;
   }
   const q = url.searchParams.get("q") ?? "";
-  const k = Number(url.searchParams.get("k") ?? 5);
+  // Clamp the user-controlled k to a sane positive integer before it reaches SQL
+  // (rejects NaN / Infinity / negatives / absurd values).
+  const k = Math.min(50, Math.max(1, Math.trunc(Number(url.searchParams.get("k"))) || 5));
   try {
     const results = await search(q, k);
     res.writeHead(200, { "Content-Type": "application/json" });
