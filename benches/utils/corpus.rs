@@ -354,6 +354,7 @@ impl MmapTextCorpus {
     /// reseed path cheaply; production always uses [`TEXT_CORPUS_CHUNK_DOCS`]
     /// via [`MmapTextCorpus::generate`].
     fn generate_with_chunk(n_docs: usize, seed: u64, chunk_docs: usize) -> Self {
+        assert!(chunk_docs > 0, "chunk_docs must be greater than zero");
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
 
@@ -514,6 +515,7 @@ impl StreamingTextCorpus {
     }
 
     fn new_with_chunk_docs(n_docs: usize, seed: u64, chunk_docs: usize) -> Self {
+        assert!(chunk_docs > 0, "chunk_docs must be greater than zero");
         Self {
             seed,
             zipf: ZipfDistribution::new(VOCAB_SIZE),
@@ -733,6 +735,7 @@ impl MmapVectorCorpus {
         normalize_each: bool,
         chunk_docs: usize,
     ) -> Self {
+        assert!(chunk_docs > 0, "chunk_docs must be greater than zero");
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
 
@@ -876,6 +879,7 @@ impl StreamingVectorCorpus {
         normalize_each: bool,
         chunk_docs: usize,
     ) -> Self {
+        assert!(chunk_docs > 0, "chunk_docs must be greater than zero");
         Self {
             seed,
             n_cent,

@@ -419,16 +419,24 @@ impl ChunkSource for StreamingSource {
         len: usize,
     ) -> RecordBatch {
         // The streams have no random access — they hand back the next `len`
-        // docs in order. Correct only if the loop consumes chunks contiguously
-        // from zero; assert that rather than silently desync from `doc_id`.
-        debug_assert_eq!(self.served, start, "streaming chunk requested out of order");
+        // docs in order. Prepare runs in release and uploads a real dataset,
+        // so these stay unconditional asserts: a mis-ordered or short chunk
+        // would misalign doc_ids and silently ship a bad dataset.
+        assert_eq!(self.served, start, "streaming chunk requested out of order");
         let title = modality.has_text().then(|| {
             let titles = self.text.as_mut().expect("text corpus").next_titles(len);
+            assert_eq!(titles.len(), len, "streaming text source returned a short chunk");
             LargeStringArray::from_iter_values(titles)
         });
-        let vectors = modality
-            .has_vector()
-            .then(|| self.vectors.as_mut().expect("vector corpus").next_flat(len));
+        let vectors = modality.has_vector().then(|| {
+            let flat = self.vectors.as_mut().expect("vector corpus").next_flat(len);
+            assert_eq!(
+                flat.len(),
+                len * DIM,
+                "streaming vector source returned a short chunk"
+            );
+            flat
+        });
         self.served += len;
         assemble_batch(modality, schema, title, vectors, start, end, len)
     }
