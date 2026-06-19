@@ -236,29 +236,26 @@ def test_mutations_reject_memory():
         t.update("title = 'alpha'", [{"title": "beta"}])
 
 
-def test_compact_preserves_data(tmp_path):
+def test_optimize_preserves_data(tmp_path):
     db = infino.connect(str(tmp_path / "catalog"))
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
         t.append([{"title": title}])
 
-    t.compact(infino.CompactOptions(target_superfile_size_mb=256, min_fill_percent=50))
+    t.optimize(infino.OptimizeOptions(target_superfile_size_mb=256, min_fill_percent=50))
     assert _count(db, "docs") == 3
     assert t.token_match("title", "beta").num_rows == 1
 
-    t.compact()  # defaults run cleanly too
+    t.optimize()  # defaults run cleanly too
 
 
-def test_compact_on_memory_is_noop():
-    # Compaction needs a store to write merged files, but "memory://" is a
-    # store — so this is a no-op, not the durable-storage rejection that
-    # delete / update raise. Pin that contract.
+def test_optimize_on_memory_is_noop():
     db = infino.connect("memory://")
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     for title in ("alpha", "beta", "gamma"):
         t.append([{"title": title}])
 
-    assert t.compact() is None
+    assert t.optimize() is None
     assert _count(db, "docs") == 3
 
 

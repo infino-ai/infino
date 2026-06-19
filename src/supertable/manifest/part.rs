@@ -699,7 +699,7 @@ mod tests {
     //! surfaces a typed error.
     use super::*;
     use crate::supertable::manifest::bloom::BloomBuilder;
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, VectorSummary};
+    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use bytes::Bytes;
@@ -732,17 +732,13 @@ mod tests {
         }
     }
 
-    fn make_fts_summary(seed: u8, n_terms: u32, range: (Vec<u8>, Vec<u8>)) -> FtsSummary {
+    fn make_fts_summary(seed: u8, n_terms: u32, range: (Vec<u8>, Vec<u8>)) -> FtsSummaryAgg {
         let mut builder = BloomBuilder::with_n_blocks(16);
         for i in 0..n_terms {
             let key = format!("term_{}_{i}", seed);
             builder.insert(key.as_bytes());
         }
-        FtsSummary {
-            term_bloom: builder.finish(),
-            n_terms_distinct: n_terms,
-            term_range: range,
-        }
+        FtsSummaryAgg::new_with_params(builder.finish(), n_terms, range)
     }
 
     fn make_vector_summary(dim: usize, seed: f32) -> VectorSummary {
@@ -866,8 +862,8 @@ mod tests {
             );
             assert_eq!(av.term_range, bv.term_range, "fts {k} term_range");
             assert_eq!(
-                av.term_bloom.to_bytes(),
-                bv.term_bloom.to_bytes(),
+                av.term_bloom.as_ref().map(|b| b.to_bytes()),
+                bv.term_bloom.as_ref().map(|b| b.to_bytes()),
                 "fts {k} bloom bytes"
             );
         }

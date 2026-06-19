@@ -49,20 +49,12 @@ def _client_and_model():
     return None, None
 
 
-def have_llm() -> bool:
-    """True if an LLM backend is configured."""
-    client, _ = _client_and_model()
-    return client is not None
-
-
-def complete(prompt: str, system: str | None = None) -> str | None:
-    """Generate a completion, or return None if no LLM is configured."""
+def complete(prompt: str) -> str | None:
+    """Answer `prompt` with the configured LLM, or return None if none is set."""
     client, model = _client_and_model()
     if client is None:
         return None
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    reply = client.chat.completions.create(model=model, messages=messages)
+    reply = client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": prompt}]
+    )
     return reply.choices[0].message.content

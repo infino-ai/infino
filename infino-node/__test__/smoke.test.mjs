@@ -219,7 +219,7 @@ test("update and delete by SQL predicate (localfs)", () => {
   assert.equal(docs.tokenMatch("title", "alpha2").length, 1);
 });
 
-test("compact merges superfiles, data intact (localfs)", () => {
+test("optimize merges superfiles, data intact (localfs)", () => {
   const dir = mkdtempSync(join(tmpdir(), "infino-node-compact-"));
   const db = connect(dir);
   const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
@@ -228,13 +228,13 @@ test("compact merges superfiles, data intact (localfs)", () => {
   docs.append([{ title: "beta" }]);
   docs.append([{ title: "gamma" }]);
 
-  docs.compact({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
+  docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
   // data is intact after compaction
   assert.equal(docs.tokenMatch("title", "beta").length, 1);
   assert.equal(docs.tokenMatch("title", "alpha").length, 1);
   assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 3);
 
-  docs.compact(); // default settings also run cleanly
+  docs.optimize(); // default settings also run cleanly
 });
 
 test("update and delete require durable storage (reject memory://)", () => {

@@ -157,6 +157,23 @@ impl Default for CompactionSettings {
     }
 }
 
+/// Options for [`crate::Supertable::optimize`].
+///
+/// Additional operation kinds (e.g. vector-index maintenance) will be
+/// added here without breaking this type.
+#[derive(Debug, Clone, Default)]
+pub struct OptimizeOptions {
+    pub(crate) compaction: CompactionSettings,
+}
+
+impl OptimizeOptions {
+    pub fn compact(settings: CompactionSettings) -> Self {
+        Self {
+            compaction: settings,
+        }
+    }
+}
+
 /// Persistent storage backend selected by [`StorageSettings`].
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

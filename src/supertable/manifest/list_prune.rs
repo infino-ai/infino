@@ -37,7 +37,7 @@ use crate::supertable::manifest::list::{ManifestList, ManifestListEntry};
 use crate::supertable::manifest::part::PartId;
 
 /// Filter the list's parts to those whose
-/// `term_range_union[column]` overlaps the prefix
+/// `fts_summary_agg[column].term_range` overlaps the prefix
 /// `[prefix, prefix_upper_bound)`.
 ///
 /// Parts without an `fts_summary_agg` entry for this column
@@ -67,7 +67,7 @@ fn part_overlaps_prefix(
         // No info → always-keep.
         return true;
     };
-    let Some((min_term, max_term)) = agg.term_range_union.as_ref() else {
+    let Some((min_term, max_term)) = agg.term_range.as_ref() else {
         // Every superfile had an empty FST for this column;
         // nothing to match. Skip.
         return false;
@@ -102,7 +102,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Filter the list's parts to those whose
-/// `term_bloom_union[column]` allows at least one query
+/// `fts_summary_agg[column].term_bloom` allows at least one query
 /// term (mode = Or) or all of them (mode = And) — i.e. the
 /// list-level analogue of superfile-level `fts_bloom_skip`.
 ///
@@ -148,13 +148,8 @@ fn part_matches_terms(
     let Some(agg) = entry.fts_summary_agg.get(column) else {
         return true; // no info → always-keep
     };
-    if agg.term_bloom_union.is_empty() || agg.term_bloom_n_blocks == 0 {
-        return true; // empty union → always-keep
-    }
-    let Some(bloom) = crate::supertable::manifest::bloom::Bloom::from_bytes(&agg.term_bloom_union)
-    else {
-        // Corrupt / unexpected shape → fall back to
-        // always-keep (correctness over selectivity).
+    let Some(bloom) = agg.term_bloom.as_ref() else {
+        // No bloom info → always-keep (correctness over selectivity).
         return true;
     };
     match mode {
@@ -265,7 +260,7 @@ mod tests {
         FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
     };
     use crate::supertable::manifest::part::{ContentHash, PartId};
-    use crate::supertable::manifest::{FtsSummary, ScalarStatsAgg, VectorSummary};
+    use crate::supertable::manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary};
     use crate::supertable::{SuperfileEntry, SuperfileUri};
     use arrow_array::Int64Array;
     use std::collections::HashMap;
@@ -310,11 +305,11 @@ mod tests {
             };
             fts.insert(
                 "title".into(),
-                FtsSummary {
-                    term_bloom: bloom.finish(),
-                    n_terms_distinct: title_terms.len() as u32,
+                FtsSummaryAgg::new_with_params(
+                    bloom.finish(),
+                    title_terms.len() as u32,
                     term_range,
-                },
+                ),
             );
         }
         let mut vec_summary = HashMap::new();
@@ -407,11 +402,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s_c = Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -429,7 +424,7 @@ mod tests {
 
         let aggs = aggregates::compute(&[s_a, s_b, s_c]);
         let fts_agg = aggs.fts_summary_agg.get("title").expect("title agg");
-        let (mn, mx) = fts_agg.term_range_union.as_ref().expect("range");
+        let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
         assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
         assert_eq!(mx, b"delta", "max of maxes across non-empty FSTs");
     }
@@ -440,11 +435,11 @@ mod tests {
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
             "title".into(),
-            FtsSummary {
-                term_bloom: BloomBuilder::with_n_blocks(16).finish(),
-                n_terms_distinct: 0,
-                term_range: (Vec::new(), Vec::new()),
-            },
+            FtsSummaryAgg::new_with_params(
+                BloomBuilder::with_n_blocks(16).finish(),
+                0,
+                (Vec::new(), Vec::new()),
+            ),
         );
         let s = Arc::new(SuperfileEntry {
             superfile_id: id,
@@ -469,7 +464,7 @@ mod tests {
                     .fts_summary_agg
                     .get("title")
                     .expect("agg")
-                    .term_range_union
+                    .term_range
                     .is_none()
         );
     }

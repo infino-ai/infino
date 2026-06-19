@@ -257,9 +257,58 @@ pub enum OpenError {
     Commit(#[from] CommitError),
 }
 
-/// Errors raised by [`crate::supertable::Supertable::compact`].
+/// Errors raised by [`crate::supertable::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
-pub enum CompactionError {
+pub enum OptimizeError {
+    #[error("optimize requires a storage backend")]
+    NoStorage,
+    #[error("superfile {0} not found in manifest snapshot")]
+    SuperfileNotFound(uuid::Uuid),
+    #[error("empty merged superfile")]
+    EmptyMergedSuperfile,
+    #[error(
+        "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
+    )]
+    SidecarConflict {
+        superfile_id: uuid::Uuid,
+        existing_compaction_id: uuid::Uuid,
+    },
+    #[error("seal failed: {0}")]
+    Seal(String),
+    #[error("failed to build superfile: {0}")]
+    Build(String),
+    #[error("failed to commit: {0}")]
+    Commit(String),
+    #[error("post-commit manifest refresh failed: {0}")]
+    Refresh(String),
+    #[error("optimize already in progress on this handle")]
+    AlreadyRunning,
+}
+
+impl From<CompactionError> for OptimizeError {
+    fn from(e: CompactionError) -> Self {
+        match e {
+            CompactionError::NoStorage => OptimizeError::NoStorage,
+            CompactionError::SuperfileNotFound(id) => OptimizeError::SuperfileNotFound(id),
+            CompactionError::EmptyMergedSuperfile => OptimizeError::EmptyMergedSuperfile,
+            CompactionError::SidecarConflict {
+                superfile_id,
+                existing_compaction_id,
+            } => OptimizeError::SidecarConflict {
+                superfile_id,
+                existing_compaction_id,
+            },
+            CompactionError::Seal(s) => OptimizeError::Seal(s),
+            CompactionError::Build(s) => OptimizeError::Build(s),
+            CompactionError::Commit(s) => OptimizeError::Commit(s),
+            CompactionError::Refresh(s) => OptimizeError::Refresh(s),
+            CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompactionError {
     /// Compaction requires durable storage
     /// (needs to seal sidecars and publish the merged superfile).
     #[error("compaction requires a storage backend")]

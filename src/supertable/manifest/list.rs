@@ -25,8 +25,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::VectorSummary;
+use super::bloom::Bloom;
 use super::encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array};
 use super::part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId};
+use super::term_range::prefix_overlaps_range;
 
 /// Wire format version for the manifest list.
 ///
@@ -373,29 +376,151 @@ pub struct ScalarStatsMergeError {
     right: DataType,
 }
 
-/// Aggregate FTS summary across a part's superfiles.
+/// FTS skip summary for one column. Used both per-superfile
+/// (`SuperfileEntry.fts_summary`) and as the per-part aggregate
+/// (`ManifestListEntry.fts_summary_agg`) — the per-part value is the
+/// bloom-union + range-union across the part's superfiles.
 ///
-/// When populated, built via streaming HLL + a power-of-two-
-/// rounded blocked bloom sized to
-/// `manifest.list_bloom_target_fpr` (default 0.10) at the
-/// part's measured distinct-term cardinality. The `Default`
-/// shape — empty bloom, no range — is treated as "always-
-/// keep" by the list-level pruner (correctness preserved;
+/// The bloom is held as a decoded [`Bloom`] (cheap `Arc<[u64]>` clone) so
+/// the prune hot path can call `term_bloom.contains(..)` without a
+/// per-query `Bloom::from_bytes` copy; the JSON/byte wire form stores the
+/// bloom bytes (see [`FtsSummaryAggDto`] / [`super::encoding`]). The
+/// `Default` shape — `term_bloom: None`, no range — is treated as
+/// "always-keep" by the list-level pruner (correctness preserved;
 /// selectivity 0).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FtsSummaryAgg {
-    pub term_bloom_union: Vec<u8>,
-    /// Power-of-two block count for the union bloom. The
-    /// existing `BloomBuilder::with_n_blocks` asserts pow2;
-    /// emitting this here means decoders can reconstruct the
-    /// bloom shape without inferring from byte length.
-    pub term_bloom_n_blocks: u32,
-    /// HyperLogLog-estimated distinct term count across the
-    /// part's superfiles. `0` for the `Default` shape.
+    /// Term-presence bloom. `None` means "no bloom info" — the list-level
+    /// pruner treats it as always-keep. `Bloom` carries its own block
+    /// count, so no separate `n_blocks` field is needed.
+    pub term_bloom: Option<Bloom>,
+    /// HyperLogLog-estimated distinct term count. `0` for the `Default`
+    /// shape and currently for the part-level rollup (deferred).
     pub n_terms_distinct: u64,
-    /// `(min, max)` term range across the part. `None` if
-    /// every superfile's FST was empty for this column.
-    pub term_range_union: Option<(Vec<u8>, Vec<u8>)>,
+    /// `(min, max)` lex term range. `None` if the FST was empty for this
+    /// column (per-superfile) or every superfile's FST was empty (part).
+    pub term_range: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl PartialEq for FtsSummaryAgg {
+    /// `Bloom` is not `PartialEq`, so compare it by its serialized bytes
+    /// (the round-trip tests rely on value equality). Mirrors the manual
+    /// `PartialEq` on [`ScalarStatsAgg`].
+    fn eq(&self, other: &Self) -> bool {
+        let bloom_eq = match (&self.term_bloom, &other.term_bloom) {
+            (Some(a), Some(b)) => a.to_bytes() == b.to_bytes(),
+            (None, None) => true,
+            _ => false,
+        };
+        bloom_eq
+            && self.n_terms_distinct == other.n_terms_distinct
+            && self.term_range == other.term_range
+    }
+}
+
+impl FtsSummaryAgg {
+    /// Merge `other` into `self` — the union the part-level aggregate forms
+    /// across a part's superfiles:
+    ///
+    /// - **bloom**: bit-OR of the two filters (a term in either is in the
+    ///   union). Both must share a shape; a mismatch can't be unioned soundly,
+    ///   so the merged bloom drops to `None`.
+    /// - **term range**: widened to span both — `(min(mins), max(maxes))` lex.
+    /// - **distinct count**: a deferred planner hint; takes the larger side.
+    ///
+    /// **`None` is the identity here** (an empty contributor that leaves the
+    /// other side intact) — what a fold from [`Default::default`] over
+    /// per-superfile summaries needs, since every superfile carries a bloom
+    /// ([`new_with_params`] always yields `Some`). This is deliberately
+    /// *distinct* from the prune-time reading of `term_bloom: None` as "no
+    /// info / always-keep": a sound union of a known bloom with a genuinely
+    /// unknown one is unknown (`None`), so `merge` must only be folded over
+    /// summaries that carry real blooms — never over a true no-info summary.
+    ///
+    /// Folding `merge` over a part's superfiles yields the same bloom-union and
+    /// range-union as [`crate::supertable::manifest::aggregates`]'s rollup; the
+    /// `n_terms_distinct` hint differs (here the larger side, vs. the rollup's
+    /// current placeholder `0`).
+    pub fn merge(&mut self, other: &FtsSummaryAgg) {
+        self.term_bloom = match (self.term_bloom.take(), other.term_bloom.as_ref()) {
+            (Some(a), Some(b)) => union_blooms(&a, b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+        self.term_range = match (self.term_range.take(), other.term_range.as_ref()) {
+            (Some((amin, amax)), Some((bmin, bmax))) => {
+                let min = if &amin <= bmin { amin } else { bmin.clone() };
+                let max = if &amax >= bmax { amax } else { bmax.clone() };
+                Some((min, max))
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+        self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
+    }
+
+    /// Build the per-superfile summary for one column from its freshly-built
+    /// bloom, distinct-term count, and `(min, max)` lex term range.
+    ///
+    /// Adapts the per-superfile shape to this type: the bloom is always
+    /// present (`Some`); the count widens `u32` → `u64`; and an empty
+    /// `(min, max)` range (a 0-term column) becomes `None` — the same
+    /// "no range" signal the pruner already understands.
+    pub fn new_with_params(
+        term_bloom: Bloom,
+        n_terms_distinct: u32,
+        term_range: (Vec<u8>, Vec<u8>),
+    ) -> Self {
+        let term_range = if term_range.0.is_empty() && term_range.1.is_empty() {
+            None
+        } else {
+            Some(term_range)
+        };
+        Self {
+            term_bloom: Some(term_bloom),
+            n_terms_distinct: u64::from(n_terms_distinct),
+            term_range,
+        }
+    }
+
+    /// Whether this summary's bloom *may* contain `term` (a `false` is
+    /// definitive: the term is absent). A `None` bloom is "no info", so it
+    /// conservatively returns `true` (keep). This is the per-term primitive
+    /// both the superfile-level (`fts_bloom_skip`) and list-level
+    /// (`part_matches_terms`) bloom skips build on.
+    pub fn may_contain(&self, term: &[u8]) -> bool {
+        self.term_bloom.as_ref().is_none_or(|b| b.contains(term))
+    }
+
+    /// Whether this summary's lex term range *could* contain a term starting
+    /// with `prefix` (i.e. `[prefix, prefix_upper_bound)` overlaps the range).
+    /// A `None` range means the FST was empty for this column — nothing
+    /// matches, so this returns `false` (prune). The per-term-range primitive
+    /// both the superfile-level (`fts_prefix_skip`) and list-level
+    /// (`part_overlaps_prefix`) prefix skips build on.
+    pub fn may_match_prefix(&self, prefix: &[u8]) -> bool {
+        match self.term_range.as_ref() {
+            Some((min, max)) => prefix_overlaps_range(prefix, min, max),
+            None => false,
+        }
+    }
+}
+
+/// Bit-OR two same-shape blooms into their union. Different shapes can't be
+/// unioned (the block layout differs), so this returns `None` — "no bloom
+/// info", which the list-level pruner treats as always-keep.
+fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
+    let mut ab = a.to_bytes();
+    let bb = b.to_bytes();
+    if ab.len() != bb.len() {
+        return None;
+    }
+    for (x, y) in ab.iter_mut().zip(bb.iter()) {
+        *x |= *y;
+    }
+    Bloom::from_bytes(&ab)
 }
 
 /// Aggregate vector summary across a part's superfiles —
@@ -405,9 +530,248 @@ pub struct FtsSummaryAgg {
 /// level pruner.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorSummaryAgg {
-    /// Packed LE f32 — same encoding as `VectorSummary.centroid`.
+    /// Packed LE f32 — the **mean** centroid (the envelope center),
+    /// same encoding as `VectorSummary.centroid`. Empty ⇒ "no info",
+    /// which the list-level pruner treats as always-keep.
     pub centroid_envelope: Vec<u8>,
+    /// Number of superfile centroids folded into this envelope. Lets
+    /// [`VectorSummaryAgg::merge`] update the mean exactly (Welford) when
+    /// folding in one more superfile without re-reading the others. `0`
+    /// is the empty/no-info default.
+    pub n_vectors: u32,
     pub envelope_radius: f32,
+}
+
+impl VectorSummaryAgg {
+    /// Fold one superfile's [`VectorSummary`] into this aggregate envelope,
+    /// incrementally and without re-reading the part's other superfiles.
+    ///
+    /// After the fold the envelope still **encloses** every input ball, so
+    /// the list-level vector skip stays correct by construction: it can
+    /// only over-keep parts (false positives), never drop one that holds a
+    /// possible hit (no false negatives) — the same guarantee a Bloom
+    /// filter gives.
+    ///
+    /// - **Center**: the running mean of the folded centroids, updated with
+    ///   the Welford recurrence so it equals the batch mean-of-centroids
+    ///   that `aggregates::vector_summary_agg` computes, independent of fold
+    ///   order.
+    /// - **Radius**: a conservative triangle bound — `max(dist(old_center,
+    ///   new_center) + old_radius, dist(new_centroid, new_center) +
+    ///   new_radius)`. Looser than the batch `maxᵢ(dist(centroidᵢ, mean) +
+    ///   radiusᵢ)` (it can't see the individual prior centroids), so it
+    ///   admits more false positives but never a false negative. The
+    ///   re-centering term `dist(old_center, new_center)` shrinks as
+    ///   `n_vectors` grows, so the looseness self-limits.
+    ///
+    /// An empty base (`n_vectors == 0`) adopts the incoming ball. A `new`
+    /// summary with no centroid (a superfile with no vector index for the
+    /// column) is a no-op. A dimension mismatch (which the schema's
+    /// fixed-per-column dim should make impossible) poisons the envelope to
+    /// a sticky always-keep rather than risk a false negative.
+    pub fn merge(&mut self, new: &VectorSummary) {
+        if new.centroid.is_empty() {
+            // Superfile has no vector index for this column — nothing to add.
+            return;
+        }
+        // A poisoned envelope (emptied on a prior dim mismatch, but with a
+        // non-zero count) stays always-keep forever — folding more balls in
+        // must not resurrect a bounded shape that could exclude something.
+        if self.centroid_envelope.is_empty() && self.n_vectors > 0 {
+            return;
+        }
+        if self.n_vectors == 0 {
+            self.centroid_envelope = encode_le_f32(&new.centroid);
+            self.n_vectors = 1;
+            self.envelope_radius = new.radius;
+            return;
+        }
+        let old_center = decode_le_f32(&self.centroid_envelope);
+        if old_center.len() != new.centroid.len() {
+            // Dim mismatch shouldn't happen (schema fixes dim per column).
+            // Poison to a sticky always-keep instead of corrupting the
+            // envelope or silently dropping the new ball (a false negative).
+            self.centroid_envelope.clear();
+            self.envelope_radius = 0.0;
+            return;
+        }
+        let old_radius = self.envelope_radius;
+        let n_new = self.n_vectors + 1;
+        // Welford online mean: center += (c - center) / n_new.
+        let mut new_center = old_center.clone();
+        for (m, &c) in new_center.iter_mut().zip(new.centroid.iter()) {
+            *m += (c - *m) / n_new as f32;
+        }
+        // Conservative enclosing radius: cover the re-centered old envelope
+        // and the new ball. Both terms use the updated center.
+        let old_ball = l2_distance(&old_center, &new_center) + old_radius;
+        let new_ball = l2_distance(&new.centroid, &new_center) + new.radius;
+        self.centroid_envelope = encode_le_f32(&new_center);
+        self.n_vectors = n_new;
+        self.envelope_radius = old_ball.max(new_ball);
+    }
+}
+
+/// Decode a packed LE-f32 centroid blob (as stored in
+/// [`VectorSummaryAgg::centroid_envelope`]) back to floats.
+fn decode_le_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Pack floats into the LE-f32 blob form used on the wire.
+fn encode_le_f32(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Euclidean (L2) distance — the metric the vector envelope uses for its
+/// bounding ball (cosine/negdot over normalized centroids reduce to L2).
+fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+#[cfg(test)]
+mod vector_agg_merge_tests {
+    //! `VectorSummaryAgg::merge` — incremental envelope folding.
+    //!
+    //! The load-bearing property is **no false negatives**: after any
+    //! sequence of merges the envelope must enclose every input ball, so
+    //! the list-level vector skip never drops a part that could hold a hit.
+    use super::super::{ClusterCentroids, VectorSummary};
+    use super::{VectorSummaryAgg, decode_le_f32, l2_distance};
+
+    /// Tolerance for f32 centroid/distance comparisons.
+    const EPS: f32 = 1e-4;
+
+    fn summary(centroid: &[f32], radius: f32) -> VectorSummary {
+        VectorSummary {
+            centroid: centroid.to_vec(),
+            radius,
+            clusters: ClusterCentroids::empty(),
+        }
+    }
+
+    /// Folding into the empty/default aggregate adopts the incoming ball
+    /// verbatim: the mean is the centroid, count is 1, radius carries over.
+    #[test]
+    fn merge_into_empty_adopts_ball() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5));
+        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
+        assert_eq!(agg.n_vectors, 1);
+        assert_eq!(agg.envelope_radius, 0.5);
+    }
+
+    /// The incrementally-folded center equals the batch mean-of-centroids,
+    /// independent of fold order (Welford). Checks both orders converge.
+    #[test]
+    fn merge_center_matches_batch_mean() {
+        let cs = [[0.0_f32, 0.0, 0.0], [3.0, 6.0, 9.0], [6.0, 0.0, 3.0]];
+        let expected_mean = [3.0_f32, 2.0, 4.0]; // column means of the three
+
+        let mut fwd = VectorSummaryAgg::default();
+        for c in &cs {
+            fwd.merge(&summary(c, 0.0));
+        }
+        let mut rev = VectorSummaryAgg::default();
+        for c in cs.iter().rev() {
+            rev.merge(&summary(c, 0.0));
+        }
+
+        for (got, want) in decode_le_f32(&fwd.centroid_envelope)
+            .iter()
+            .zip(expected_mean.iter())
+        {
+            assert!((got - want).abs() < EPS, "fwd center {got} vs {want}");
+        }
+        // Order-independent center.
+        for (f, r) in decode_le_f32(&fwd.centroid_envelope)
+            .iter()
+            .zip(decode_le_f32(&rev.centroid_envelope).iter())
+        {
+            assert!((f - r).abs() < EPS, "center depends on order: {f} vs {r}");
+        }
+        assert_eq!(fwd.n_vectors, 3);
+    }
+
+    /// After folding a set of balls, the envelope encloses every one of
+    /// them — `dist(centroidᵢ, center) + radiusᵢ ≤ envelope_radius`. This is
+    /// the no-false-negative guarantee the vector skip relies on.
+    #[test]
+    fn merge_encloses_all_input_balls() {
+        let balls = [
+            (vec![10.0_f32, 0.0], 1.0),
+            (vec![-8.0, 4.0], 0.5),
+            (vec![0.0, -12.0], 2.0),
+            (vec![5.0, 5.0], 0.25),
+        ];
+        let mut agg = VectorSummaryAgg::default();
+        for (c, r) in &balls {
+            agg.merge(&summary(c, *r));
+        }
+        let center = decode_le_f32(&agg.centroid_envelope);
+        for (c, r) in &balls {
+            let reach = l2_distance(c, &center) + r;
+            assert!(
+                reach <= agg.envelope_radius + EPS,
+                "ball {c:?} r={r} reaches {reach} > envelope {}",
+                agg.envelope_radius
+            );
+        }
+    }
+
+    /// A summary with no centroid (a superfile with no vector index for the
+    /// column) is a no-op — it neither changes the envelope nor the count.
+    #[test]
+    fn merge_skips_empty_centroid() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 1.0], 0.3));
+        let before = agg.clone();
+        agg.merge(&summary(&[], 9.9));
+        assert_eq!(agg, before, "empty-centroid summary must be a no-op");
+    }
+
+    /// A dimension mismatch (which the schema should preclude) poisons the
+    /// envelope to a sticky always-keep — emptied center — rather than
+    /// risk a false negative, and stays that way under further merges.
+    #[test]
+    fn merge_dim_mismatch_poisons_to_always_keep() {
+        let mut agg = VectorSummaryAgg::default();
+        agg.merge(&summary(&[1.0, 2.0], 0.5));
+        agg.merge(&summary(&[1.0, 2.0, 3.0], 0.5)); // wrong dim
+        assert!(
+            agg.centroid_envelope.is_empty(),
+            "dim mismatch must poison to always-keep"
+        );
+        // Sticky: a later well-formed merge does not resurrect a bounded
+        // (and possibly under-covering) envelope.
+        agg.merge(&summary(&[4.0, 5.0], 0.1));
+        assert!(
+            agg.centroid_envelope.is_empty(),
+            "poisoned envelope must stay always-keep"
+        );
+    }
+
+    /// Manifests written before incremental merge omit `n_vectors`; serde
+    /// must default it to 0 rather than fail to decode the list.
+    #[test]
+    fn dto_defaults_n_vectors_when_absent() {
+        let json = r#"{"centroid_envelope":"","envelope_radius":1.5}"#;
+        let dto: super::VectorSummaryAggDto =
+            serde_json::from_str(json).expect("decode legacy dto");
+        assert_eq!(dto.n_vectors, 0);
+        assert_eq!(dto.envelope_radius, 1.5);
+    }
 }
 
 // ---------- Errors ----------
@@ -432,6 +796,12 @@ pub enum ListParseError {
         field: &'static str,
         source: DecodeError,
     },
+    /// A non-empty `term_bloom_union` payload didn't decode to a valid
+    /// `Bloom` layout (`n_blocks × BLOCK_BYTES`, power-of-two). Surfaced
+    /// rather than silently dropped to "no bloom", so on-disk corruption
+    /// isn't masked as a valid always-keep summary.
+    #[error("invalid term bloom layout: {0} bytes")]
+    InvalidBloom(usize),
     #[error("incompatible major version: got {got}, supported {supported}")]
     IncompatibleMajorVersion { got: String, supported: String },
 }
@@ -552,8 +922,11 @@ struct ScalarStatsAggDto {
 
 #[derive(Serialize, Deserialize)]
 struct FtsSummaryAggDto {
-    term_bloom_union: String, // base64
-    term_bloom_n_blocks: u32,
+    /// base64 of `Bloom::to_bytes()`; empty string ↔ no bloom (`None`).
+    /// The block count is inferred from the byte length at decode, so no
+    /// separate `n_blocks` field is carried. (Older manifests that still
+    /// carry `term_bloom_n_blocks` decode cleanly — serde ignores it.)
+    term_bloom_union: String,
     n_terms_distinct: u64,
     /// `None` ↔ field absent in JSON, not a `null`. Cleaner
     /// `jq` shape and avoids the
@@ -571,6 +944,10 @@ struct TermRangeUnionDto {
 #[derive(Serialize, Deserialize)]
 struct VectorSummaryAggDto {
     centroid_envelope: String, // base64
+    // Absent in pre-existing manifests (written before incremental merge);
+    // serde defaults it to 0, which reads as the empty/no-info count.
+    #[serde(default)]
+    n_vectors: u32,
     envelope_radius: f32,
 }
 
@@ -651,14 +1028,15 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
                 (
                     k.clone(),
                     FtsSummaryAggDto {
-                        term_bloom_union: encode_b64(&v.term_bloom_union),
-                        term_bloom_n_blocks: v.term_bloom_n_blocks,
+                        term_bloom_union: v
+                            .term_bloom
+                            .as_ref()
+                            .map(|b| encode_b64(&b.to_bytes()))
+                            .unwrap_or_default(),
                         n_terms_distinct: v.n_terms_distinct,
-                        term_range_union: v.term_range_union.as_ref().map(|(mn, mx)| {
-                            TermRangeUnionDto {
-                                min: encode_b64(mn),
-                                max: encode_b64(mx),
-                            }
+                        term_range_union: v.term_range.as_ref().map(|(mn, mx)| TermRangeUnionDto {
+                            min: encode_b64(mn),
+                            max: encode_b64(mx),
                         }),
                     },
                 )
@@ -672,6 +1050,7 @@ fn entry_to_dto(e: &ManifestListEntry) -> Result<ManifestListEntryDto, ListEncod
                     k.clone(),
                     VectorSummaryAggDto {
                         centroid_envelope: encode_b64(&v.centroid_envelope),
+                        n_vectors: v.n_vectors,
                         envelope_radius: v.envelope_radius,
                     },
                 )
@@ -731,10 +1110,23 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
         fts_summary_agg.insert(
             k,
             FtsSummaryAgg {
-                term_bloom_union: decode_b64(&v.term_bloom_union, "term_bloom_union")?,
-                term_bloom_n_blocks: v.term_bloom_n_blocks,
+                term_bloom: {
+                    let bytes = decode_b64(&v.term_bloom_union, "term_bloom_union")?;
+                    // Empty ⇒ no bloom (the pruner conservatively keeps the
+                    // part). Non-empty but malformed ⇒ on-disk corruption,
+                    // surfaced as a parse error rather than masked as a valid
+                    // "always-keep" summary.
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            Bloom::from_bytes(&bytes)
+                                .ok_or(ListParseError::InvalidBloom(bytes.len()))?,
+                        )
+                    }
+                },
                 n_terms_distinct: v.n_terms_distinct,
-                term_range_union: match v.term_range_union {
+                term_range: match v.term_range_union {
                     None => None,
                     Some(tr) => Some((
                         decode_b64(&tr.min, "term_range_union.min")?,
@@ -750,6 +1142,7 @@ fn entry_from_dto(d: ManifestListEntryDto) -> Result<ManifestListEntry, ListPars
             k,
             VectorSummaryAgg {
                 centroid_envelope: decode_b64(&v.centroid_envelope, "centroid_envelope")?,
+                n_vectors: v.n_vectors,
                 envelope_radius: v.envelope_radius,
             },
         );
@@ -933,6 +1326,7 @@ mod tests {
     //! major/minor compat; part reuse across versions
     //! decodes to bit-equal entries; top-level JSON keys are
     //! jq-friendly.
+    use super::super::bloom::BloomBuilder;
     use super::super::part::{ContentHash, PartId};
     use super::*;
     use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
@@ -1380,22 +1774,23 @@ mod tests {
         }
 
         let mut fts = BTreeMap::new();
+        let mut title_bloom = BloomBuilder::with_n_blocks(16);
+        title_bloom.insert(format!("title_{seed}").as_bytes());
         fts.insert(
             "title".into(),
             FtsSummaryAgg {
-                term_bloom_union: vec![seed; 64],
-                term_bloom_n_blocks: 16,
+                term_bloom: Some(title_bloom.finish()),
                 n_terms_distinct: 1_048_576,
-                term_range_union: Some((b"alpha".to_vec(), b"zulu".to_vec())),
+                term_range: Some((b"alpha".to_vec(), b"zulu".to_vec())),
             },
         );
+        // "body": no bloom info, no range (the all-None / always-keep shape).
         fts.insert(
             "body".into(),
             FtsSummaryAgg {
-                term_bloom_union: vec![0u8; 32],
-                term_bloom_n_blocks: 8,
+                term_bloom: None,
                 n_terms_distinct: 0,
-                term_range_union: None,
+                term_range: None,
             },
         );
 
@@ -1404,6 +1799,7 @@ mod tests {
             "emb".into(),
             VectorSummaryAgg {
                 centroid_envelope: 0.5_f32.to_le_bytes().repeat(8),
+                n_vectors: 3,
                 envelope_radius: 0.71_f32,
             },
         );
@@ -1579,6 +1975,121 @@ mod tests {
         let _ = decode(&bytes).expect("decode still works");
     }
 
+    fn fts_agg(terms: &[&[u8]], n_blocks: usize, range: Option<(&[u8], &[u8])>) -> FtsSummaryAgg {
+        let mut b = BloomBuilder::with_n_blocks(n_blocks);
+        for t in terms {
+            b.insert(t);
+        }
+        FtsSummaryAgg {
+            term_bloom: Some(b.finish()),
+            n_terms_distinct: terms.len() as u64,
+            term_range: range.map(|(mn, mx)| (mn.to_vec(), mx.to_vec())),
+        }
+    }
+
+    #[test]
+    fn fts_agg_merge_unions_blooms_widens_range_and_takes_max_distinct() {
+        let mut a = fts_agg(&[b"alpha"], 16, Some((b"alpha", b"mango")));
+        a.n_terms_distinct = 3;
+        let b = fts_agg(&[b"omega"], 16, Some((b"beta", b"zulu")));
+        // b.n_terms_distinct == 1 (one term)
+        a.merge(&b);
+
+        let bloom = a.term_bloom.as_ref().expect("union bloom");
+        assert!(
+            bloom.contains(b"alpha"),
+            "term from self survives the union"
+        );
+        assert!(bloom.contains(b"omega"), "term from other joins the union");
+        // Range widened to span both: (min(alpha,beta), max(mango,zulu)).
+        assert_eq!(a.term_range, Some((b"alpha".to_vec(), b"zulu".to_vec())));
+        assert_eq!(a.n_terms_distinct, 3, "distinct hint takes the larger side");
+    }
+
+    #[test]
+    fn fts_agg_merge_none_side_contributes_nothing() {
+        // Some.merge(None) keeps self untouched.
+        let mut a = fts_agg(&[b"x"], 16, Some((b"a", b"m")));
+        a.merge(&FtsSummaryAgg::default());
+        assert!(a.term_bloom.as_ref().expect("kept").contains(b"x"));
+        assert_eq!(a.term_range, Some((b"a".to_vec(), b"m".to_vec())));
+
+        // None.merge(Some) adopts the other side.
+        let mut none_side = FtsSummaryAgg::default();
+        none_side.merge(&fts_agg(&[b"y"], 16, Some((b"n", b"z"))));
+        assert!(none_side.term_bloom.as_ref().expect("taken").contains(b"y"));
+        assert_eq!(none_side.term_range, Some((b"n".to_vec(), b"z".to_vec())));
+    }
+
+    #[test]
+    fn fts_agg_merge_bloom_shape_mismatch_drops_to_none() {
+        // Different block counts can't be unioned → conservative "no info".
+        let mut a = fts_agg(&[b"a"], 16, None);
+        let b = fts_agg(&[b"b"], 8, None);
+        a.merge(&b);
+        assert!(
+            a.term_bloom.is_none(),
+            "shape mismatch → no bloom info (always-keep)"
+        );
+    }
+
+    #[test]
+    fn fts_agg_from_superfile_adapts_per_superfile_shape() {
+        let mut b = BloomBuilder::with_n_blocks(16);
+        b.insert(b"alpha");
+        let agg = FtsSummaryAgg::new_with_params(b.finish(), 7, (b"a".to_vec(), b"z".to_vec()));
+        assert!(
+            agg.term_bloom
+                .as_ref()
+                .expect("bloom present")
+                .contains(b"alpha")
+        );
+        assert_eq!(agg.n_terms_distinct, 7u64); // u32 → u64
+        assert_eq!(agg.term_range, Some((b"a".to_vec(), b"z".to_vec())));
+
+        // A 0-term column: empty (min, max) → `None` range, but a built bloom
+        // is still present.
+        let empty = FtsSummaryAgg::new_with_params(
+            BloomBuilder::with_n_blocks(16).finish(),
+            0,
+            (Vec::new(), Vec::new()),
+        );
+        assert_eq!(empty.term_range, None);
+        assert!(empty.term_bloom.is_some());
+    }
+
+    #[test]
+    fn fts_agg_may_contain() {
+        let mut b = BloomBuilder::with_n_blocks(16);
+        b.insert(b"present");
+        let agg = FtsSummaryAgg {
+            term_bloom: Some(b.finish()),
+            n_terms_distinct: 1,
+            term_range: None,
+        };
+        assert!(agg.may_contain(b"present"));
+        assert!(!agg.may_contain(b"definitely-absent-term"));
+        // No bloom info → conservatively keep.
+        assert!(FtsSummaryAgg::default().may_contain(b"anything"));
+    }
+
+    #[test]
+    fn fts_agg_may_match_prefix() {
+        let agg = FtsSummaryAgg {
+            term_bloom: None,
+            n_terms_distinct: 0,
+            term_range: Some((b"bravo".to_vec(), b"mango".to_vec())),
+        };
+        assert!(
+            agg.may_match_prefix(b"echo"),
+            "prefix inside [bravo, mango]"
+        );
+        assert!(!agg.may_match_prefix(b"zulu"), "above max → no overlap");
+        assert!(!agg.may_match_prefix(b"alpha"), "below min → no overlap");
+        // No range (empty FST) → nothing matches → prune.
+        assert!(!FtsSummaryAgg::default().may_match_prefix(b"echo"));
+    }
+
     #[test]
     fn same_logical_content_produces_byte_equal_json() {
         // Two lists built from identical inputs must produce
@@ -1692,6 +2203,35 @@ mod tests {
         assert!(
             matches!(err, ListParseError::Base64 { .. }),
             "expected Base64 error, got {err:?}"
+        );
+    }
+
+    /// A non-empty `term_bloom_union` that doesn't decode to a valid
+    /// `Bloom` layout is on-disk corruption: surface it as
+    /// `InvalidBloom`, not a silent `None` that the pruner would read as
+    /// a valid "always-keep" summary. (An empty string stays `None` —
+    /// that's the legitimate no-bloom encoding, covered by round-trip.)
+    #[test]
+    fn malformed_term_bloom_surfaces_typed_error() {
+        let list = rich_list(1);
+        let bytes = encode(&list).expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+        // rich_entry's "body" column has term_bloom = None ⇒ "". Swap it
+        // for base64 of 3 bytes ("abc") — non-empty, but not a valid
+        // `n_blocks × BLOCK_BYTES` bloom layout.
+        let tampered = s.replacen(
+            "\"term_bloom_union\": \"\"",
+            "\"term_bloom_union\": \"YWJj\"",
+            1,
+        );
+        assert_ne!(
+            tampered, s,
+            "test fixture must contain an empty bloom union"
+        );
+        let err = decode(tampered.as_bytes()).expect_err("malformed bloom");
+        assert!(
+            matches!(err, ListParseError::InvalidBloom(3)),
+            "expected InvalidBloom(3), got {err:?}"
         );
     }
 

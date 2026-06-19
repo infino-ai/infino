@@ -53,8 +53,8 @@ export interface MutationStats {
   nNotFound: number;
 }
 
-/** Tuning for `compact`; all fields optional (omitted ⇒ engine default). */
-export interface CompactOptions {
+/** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
+export interface OptimizeOptions {
   /** Build-time memory budget, in MB. */
   maxMemoryMb?: number;
   /** Only compact superfiles below this fill percent (0–100). */
@@ -319,8 +319,8 @@ export class Table {
 
   /** Merge small / underfilled superfiles into larger ones (omit `settings`
    * for engine defaults). */
-  compact(settings?: CompactOptions): void {
-    this.inner.compact(settings);
+  optimize(settings?: OptimizeOptions): void {
+    this.inner.optimize(settings);
   }
 }
 

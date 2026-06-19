@@ -28,8 +28,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, ConnectOptions, InfinoError,
-    Metric, VectorFilter, VectorSearchOptions,
+    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
+    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
 /// Map a core [`InfinoError`] to the closest Python exception.
@@ -47,10 +47,7 @@ fn py_err(e: InfinoError) -> PyErr {
     }
 }
 
-/// Compaction has its own error type, so it doesn't go through `py_err`.
-/// These are storage / build failures — surfaced as runtime errors, like
-/// the mutation paths.
-fn compact_err(e: CompactionError) -> PyErr {
+fn optimize_err(e: OptimizeError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -282,8 +279,8 @@ impl MutationStats {
     }
 }
 
-/// Tuning for `compact`; omitted fields fall back to engine defaults.
-#[pyclass(name = "CompactOptions", skip_from_py_object)]
+/// Tuning for `optimize`; omitted fields fall back to engine defaults.
+#[pyclass(name = "OptimizeOptions", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct CompactOptions {
     max_memory_mb: Option<u64>,
@@ -505,7 +502,7 @@ impl Table {
     /// Merge small / underfilled superfiles into larger ones. Omit
     /// `settings` for engine defaults.
     #[pyo3(signature = (settings=None))]
-    fn compact(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
+    fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
@@ -518,7 +515,8 @@ impl Table {
                 s.target_superfile_size_mb = v;
             }
         }
-        py.detach(|| self.inner.compact(&s)).map_err(compact_err)
+        let opts = OptimizeOptions::compact(s);
+        py.detach(|| self.inner.optimize(&opts)).map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.

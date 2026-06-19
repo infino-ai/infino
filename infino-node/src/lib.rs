@@ -44,8 +44,8 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, InfinoError, Metric,
-    VectorSearchOptions,
+    BoolMode, ColdFetchMode, CompactionSettings, InfinoError, Metric, OptimizeError,
+    OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,14 +78,11 @@ fn arrow_err(e: ArrowError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
 }
 
-/// Map a [`CompactionError`] (a distinct error type from `InfinoError`) to a
-/// JS error. `NoStorage` is a bad-argument case (compaction needs durable
-/// storage); everything else is a runtime failure carrying the message.
-fn compact_err(e: CompactionError) -> Error {
+fn optimize_err(e: OptimizeError) -> Error {
     match e {
-        CompactionError::NoStorage => Error::new(
+        OptimizeError::NoStorage => Error::new(
             Status::InvalidArg,
-            "compact requires durable storage (not memory://)",
+            "optimize requires durable storage (not memory://)",
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
@@ -205,9 +202,9 @@ pub struct ConnectOptions {
     pub cold_fetch_mode: Option<String>,
 }
 
-/// Tuning for `compact`; all fields optional (omitted ⇒ engine default).
+/// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
 #[napi(object)]
-pub struct CompactOptions {
+pub struct OptimizeOptions {
     /// Build-time memory budget, in MB.
     pub max_memory_mb: Option<u32>,
     /// Only compact superfiles below this fill percent (0–100).
@@ -563,7 +560,7 @@ impl Table {
     /// the memory budget, fill threshold, and target size (omit for engine
     /// defaults).
     #[napi]
-    pub fn compact(&self, settings: Option<CompactOptions>) -> Result<()> {
+    pub fn optimize(&self, settings: Option<OptimizeOptions>) -> Result<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
@@ -576,7 +573,8 @@ impl Table {
                 s.target_superfile_size_mb = v as u64;
             }
         }
-        self.inner.compact(&s).map_err(compact_err)
+        let opts = InfinoOptimizeOptions::compact(s);
+        self.inner.optimize(&opts).map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

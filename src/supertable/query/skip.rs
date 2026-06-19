@@ -52,7 +52,7 @@ use datafusion::scalar::ScalarValue;
 use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::vector::distance::{Metric, distance};
 
-use crate::supertable::manifest::{Manifest, SuperfileEntry, term_range::prefix_overlaps_range};
+use crate::supertable::manifest::{Manifest, SuperfileEntry};
 
 /// Bloom-skip mask for an exact-term BM25 search.
 ///
@@ -89,10 +89,10 @@ pub fn fts_bloom_skip(
             Some(summary) => match mode {
                 BoolMode::Or => query_terms
                     .iter()
-                    .any(|t| summary.term_bloom.contains(t.as_bytes())),
+                    .any(|t| summary.may_contain(t.as_bytes())),
                 BoolMode::And => query_terms
                     .iter()
-                    .all(|t| summary.term_bloom.contains(t.as_bytes())),
+                    .all(|t| summary.may_contain(t.as_bytes())),
             },
         })
         .collect()
@@ -101,17 +101,17 @@ pub fn fts_bloom_skip(
 /// Term-range skip mask for a prefix BM25 search.
 ///
 /// For each superfile, check whether `[prefix, prefix_upper_bound)`
-/// overlaps the superfile's lex term range
-/// `[fts_summary.term_range.0, fts_summary.term_range.1]`. A
-/// non-overlapping superfile cannot contain any term beginning with
-/// `prefix` and is pruned.
+/// overlaps the superfile's lex term range (via
+/// [`FtsSummaryAgg::may_match_prefix`]). A non-overlapping superfile
+/// cannot contain any term beginning with `prefix` and is pruned.
 ///
-/// `prefix` is the same lowercased byte sequence the prefix
-/// search uses against the FST — see [`prefix_overlaps_range`]
-/// for the exact comparison semantics.
+/// `prefix` is the same lowercased byte sequence the prefix search uses
+/// against the FST.
 ///
 /// An empty `prefix` (every term matches) short-circuits to
 /// all-keep.
+///
+/// [`FtsSummaryAgg::may_match_prefix`]: crate::supertable::manifest::FtsSummaryAgg::may_match_prefix
 pub fn fts_prefix_skip(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
@@ -124,15 +124,9 @@ pub fn fts_prefix_skip(
         .iter()
         .map(|entry| match entry.fts_summary.get(column) {
             None => true,
-            Some(summary) => {
-                let (min_term, max_term) = &summary.term_range;
-                if min_term.is_empty() && max_term.is_empty() {
-                    // 0-term superfile — bloom build also flags
-                    // this; nothing matches. Prune.
-                    return false;
-                }
-                prefix_overlaps_range(prefix, min_term, max_term)
-            }
+            // `may_match_prefix` returns false for a `None` range (0-term
+            // superfile — nothing matches, prune).
+            Some(summary) => summary.may_match_prefix(prefix),
         })
         .collect()
 }
@@ -334,7 +328,7 @@ mod tests {
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::SupertableOptions;
     use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+        FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         bloom::BloomBuilder,
     };
     use arrow_schema::{DataType, Field, Schema};
@@ -411,7 +405,7 @@ mod tests {
     }
 
     /// Build a one-column FTS summary with the given indexed terms.
-    fn fts_summary_with(column: &str, terms: &[&str]) -> (String, FtsSummary) {
+    fn fts_summary_with(column: &str, terms: &[&str]) -> (String, FtsSummaryAgg) {
         let mut bb = BloomBuilder::new();
         for t in terms {
             bb.insert(t.as_bytes());
@@ -420,11 +414,7 @@ mod tests {
             (Some(min), Some(max)) => (min.as_bytes().to_vec(), max.as_bytes().to_vec()),
             _ => (Vec::new(), Vec::new()),
         };
-        let summary = FtsSummary {
-            term_bloom: bb.finish(),
-            n_terms_distinct: terms.len() as u32,
-            term_range,
-        };
+        let summary = FtsSummaryAgg::new_with_params(bb.finish(), terms.len() as u32, term_range);
         (column.to_string(), summary)
     }
 

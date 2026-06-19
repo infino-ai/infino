@@ -69,7 +69,7 @@ use crate::superfile::builder::SuperfileBuilder;
 use crate::supertable::handle::Supertable;
 use crate::supertable::manifest::bloom::BloomBuilder;
 use crate::supertable::manifest::{
-    FtsSummary, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+    FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
 };
 use crate::supertable::options::{DECIMAL128_PRECISION, DECIMAL128_SCALE};
 use crate::supertable::utils::vector_split::split_vectors;
@@ -546,8 +546,8 @@ fn prepend_id_column(
 fn build_fts_summary(
     reader: &SuperfileReader,
     options: &crate::supertable::SupertableOptions,
-) -> HashMap<String, FtsSummary> {
-    let mut out: HashMap<String, FtsSummary> = HashMap::new();
+) -> HashMap<String, FtsSummaryAgg> {
+    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
     let Some(fts_reader) = reader.fts() else {
         return out;
     };
@@ -566,11 +566,11 @@ fn build_fts_summary(
         }
         out.insert(
             fc.column.clone(),
-            FtsSummary {
-                term_bloom: bloom_builder.finish(),
+            FtsSummaryAgg::new_with_params(
+                bloom_builder.finish(),
                 n_terms_distinct,
-                term_range: (min_term, max_term),
-            },
+                (min_term, max_term),
+            ),
         );
     }
     out

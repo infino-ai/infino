@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! In-memory manifest types: `Manifest`, `SuperfileEntry`,
-//! `FtsSummary`, `VectorSummary`. Per-scalar-column stats live in
-//! `SuperfileEntry.scalar_stats` as a `HashMap<String, ScalarStatsAgg>`.
+//! `VectorSummary`. Per-column skip stats live on `SuperfileEntry` as
+//! `HashMap<String, ScalarStatsAgg>` (scalar) and
+//! `HashMap<String, FtsSummaryAgg>` (FTS).
 //!
 //! `Manifest` is the single immutable point-in-time view of which
 //! superfiles exist. `Supertable` holds the current manifest behind
@@ -33,9 +34,10 @@ pub mod part;
 pub mod partition;
 pub mod term_range;
 
-/// Re-export the per-column scalar aggregate so callers can refer to it as
-/// `manifest::ScalarStatsAgg` (it is the value type of `SuperfileEntry.scalar_stats`).
-pub use list::ScalarStatsAgg;
+/// Re-export the per-column skip aggregates so callers can refer to them as
+/// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
+/// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
+pub use list::{FtsSummaryAgg, ScalarStatsAgg};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -67,7 +69,6 @@ use crate::{
     },
     supertable::{manifest::commit::read_pointer, query::hierarchical_iter},
 };
-use bloom::Bloom;
 
 use super::options::SupertableOptions;
 
@@ -1074,8 +1075,10 @@ pub struct SuperfileEntry {
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
-    /// FTS column name.
-    pub fts_summary: HashMap<String, FtsSummary>,
+    /// FTS column name. Same per-column [`FtsSummaryAgg`] shape the
+    /// list-level aggregate uses; built per superfile via
+    /// [`FtsSummaryAgg::from_superfile`].
+    pub fts_summary: HashMap<String, FtsSummaryAgg>,
     /// Per-vector-column centroid + radius. Drives vector skip via
     /// triangle-inequality against the bounding sphere. Keyed by
     /// vector column name.
@@ -1538,27 +1541,6 @@ pub(crate) fn column_min_max(col: &arrow_array::ArrayRef) -> Option<(ArrayRef, A
         }
         _ => None,
     }
-}
-
-/// Per-FTS-column summary: a term-presence bloom (drives
-/// exact-term skip pruning) plus a lex term range (drives
-/// prefix-query skip via `[prefix, prefix_upper_bound)` overlap).
-/// Both are derived for free at commit time from the FST's term
-/// iterator (the FST yields keys in lex order; the first and last
-/// keys are min and max).
-#[derive(Debug, Clone)]
-pub struct FtsSummary {
-    /// Term-presence bloom filter — sized to ~7% FPR at typical
-    /// per-column term cardinalities (64 KiB / column / superfile
-    /// is the default).
-    pub term_bloom: Bloom,
-    /// Number of distinct terms seen at build time. Useful for
-    /// validating the bloom's sizing in tests + for observability.
-    pub n_terms_distinct: u32,
-    /// Lex-smallest and lex-largest term in this superfile's FST for
-    /// this column. Prefix skip checks
-    /// `[prefix, prefix_upper_bound)` overlap with this range.
-    pub term_range: (Vec<u8>, Vec<u8>),
 }
 
 /// Per-vector-column summary: cluster centroid + bounding radius.
