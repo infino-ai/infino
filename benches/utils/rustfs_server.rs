@@ -382,22 +382,23 @@ fn child_exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
-fn release_asset_name() -> Result<String, String> {
+fn release_asset_name(version: &str) -> Result<String, String> {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     let stem = match (os, arch) {
-        ("linux", "x86_64") => "rustfs-linux-x86_64-gnu-latest.zip",
-        ("linux", "aarch64") => "rustfs-linux-aarch64-gnu-latest.zip",
-        ("macos", "x86_64") => "rustfs-macos-x86_64-latest.zip",
-        ("macos", "aarch64") => "rustfs-macos-aarch64-latest.zip",
-        ("windows", "x86_64") => "rustfs-windows-x86_64-latest.zip",
+        ("linux", "x86_64") => format!("rustfs-linux-x86_64-gnu-{version}.zip"),
+        ("linux", "aarch64") => format!("rustfs-linux-aarch64-gnu-{version}.zip"),
+        ("macos", "x86_64") => format!("rustfs-macos-x86_64-{version}.zip"),
+        ("macos", "aarch64") => format!("rustfs-macos-aarch64-{version}.zip"),
+        ("windows", "x86_64") => format!("rustfs-windows-x86_64-{version}.zip"),
         _ => {
             return Err(format!(
                 "unsupported platform for auto-download: {os}-{arch}"
             ));
         }
     };
-    Ok(stem.to_string())
+    Ok(stem)
+}
 }
 
 fn reserve_loopback_port() -> Result<SocketAddr, String> {
