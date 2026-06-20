@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -127,8 +127,8 @@ pub fn ensure_rustfs_binary() -> Result<PathBuf, String> {
     Ok(cached)
 }
 
-/// Spawn RustFS on a random loopback port with HTTPS enabled.
-pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
+/// Spawn RustFS on a random loopback port with HTTPS enabled (no bucket yet).
+fn spawn_rustfs_daemon() -> Result<RustFsHandle, String> {
     let binary = ensure_rustfs_binary()?;
     let (access_key, secret_key) = rustfs_credentials();
     let data_dir = TempDir::new().map_err(|e| e.to_string())?;
@@ -163,18 +163,10 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
 
         match wait_for_health(&endpoint, &ca_pem) {
             Ok(()) => {
-                create_bucket(
-                    &endpoint,
-                    bucket,
-                    &access_key,
-                    &secret_key,
-                    RUSTFS_REGION,
-                    &ca_pem,
-                )?;
-                eprintln!("[rustfs] endpoint={endpoint} bucket={bucket} storage_label=rustfs");
+                eprintln!("[rustfs] endpoint={endpoint} storage_label=rustfs");
                 return Ok(RustFsHandle {
                     endpoint,
-                    bucket: bucket.to_string(),
+                    bucket: String::new(),
                     access_key,
                     secret_key,
                     ca_pem,
@@ -197,6 +189,188 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
     Err(format!(
         "rustfs failed to start after {RUSTFS_SPAWN_MAX_ATTEMPTS} attempts: {last_err}"
     ))
+}
+
+/// Spawn a dedicated RustFS child and create `bucket` (standalone fixture for tests).
+pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
+    let mut handle = spawn_rustfs_daemon()?;
+    provision_bucket(
+        &handle.endpoint,
+        &handle.access_key,
+        &handle.secret_key,
+        &handle.ca_pem,
+        bucket,
+    )?;
+    handle.bucket = bucket.to_string();
+    eprintln!("[rustfs] bucket={bucket}");
+    Ok(handle)
+}
+
+/// Connection metadata for a long-lived RustFS daemon shared across a process.
+pub struct RustFsSession {
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    ca_pem: Vec<u8>,
+}
+
+static RUSTFS_SESSION: OnceLock<Arc<RustFsSession>> = OnceLock::new();
+
+/// One RustFS daemon per process; the child outlives individual bench fixtures.
+pub fn session() -> Arc<RustFsSession> {
+    Arc::clone(RUSTFS_SESSION.get_or_init(|| {
+        let handle = spawn_rustfs_daemon().expect("rustfs session daemon");
+        let session = Arc::new(RustFsSession {
+            endpoint: handle.endpoint.clone(),
+            access_key: handle.access_key.clone(),
+            secret_key: handle.secret_key.clone(),
+            ca_pem: handle.ca_pem.clone(),
+        });
+        Box::leak(Box::new(handle));
+        session
+    }))
+}
+
+/// Scoped bucket on the shared session. Empties and deletes the bucket on drop
+/// unless `INFINO_BENCH_KEEP_TABLE` is set or the lease was opened persistent.
+pub struct RustFsBucketLease {
+    pub bucket: String,
+    pub storage: Arc<dyn StorageProvider>,
+    session: Arc<RustFsSession>,
+    cleanup_on_drop: bool,
+}
+
+impl RustFsBucketLease {
+    /// Lease a bucket that survives drop (dataset / retained-prefix workflows).
+    pub fn persistent(
+        session: Arc<RustFsSession>,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        session.open_bucket(bucket, prefix, false)
+    }
+}
+
+impl Drop for RustFsBucketLease {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        if keep_rustfs_bucket() {
+            eprintln!(
+                "[rustfs] keeping bucket={} (INFINO_BENCH_KEEP_TABLE)",
+                self.bucket
+            );
+            return;
+        }
+        match empty_and_delete_bucket(&self.session, &self.bucket) {
+            Ok(()) => eprintln!("[rustfs] cleanup bucket={}: deleted", self.bucket),
+            Err(e) => eprintln!(
+                "[rustfs] cleanup bucket={}: FAILED ({e}) — objects may remain",
+                self.bucket
+            ),
+        }
+    }
+}
+
+impl RustFsSession {
+    /// Create `bucket` and return a provider scoped to `prefix`.
+    pub fn open_bucket(
+        self: &Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        cleanup_on_drop: bool,
+    ) -> Result<RustFsBucketLease, String> {
+        provision_bucket(
+            &self.endpoint,
+            &self.access_key,
+            &self.secret_key,
+            &self.ca_pem,
+            bucket,
+        )?;
+        let storage = build_rustfs_provider(
+            &self.endpoint,
+            bucket,
+            prefix,
+            &self.access_key,
+            &self.secret_key,
+            &self.ca_pem,
+        )?;
+        eprintln!("[rustfs] bucket={bucket} prefix={prefix}");
+        Ok(RustFsBucketLease {
+            bucket: bucket.to_string(),
+            storage,
+            session: Arc::clone(self),
+            cleanup_on_drop,
+        })
+    }
+
+    /// Fresh bucket name (`infino-{pid}-{nanos}`) for an isolated bench run.
+    pub fn open_unique_bucket(self: &Arc<Self>, prefix: &str) -> Result<RustFsBucketLease, String> {
+        self.open_bucket(&unique_rustfs_bucket_name(), prefix, true)
+    }
+}
+
+fn keep_rustfs_bucket() -> bool {
+    std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
+}
+
+fn unique_rustfs_bucket_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_nanos();
+    format!("infino-{}-{nanos}", std::process::id())
+}
+
+fn provision_bucket(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    ca_pem: &[u8],
+    bucket: &str,
+) -> Result<(), String> {
+    create_bucket(
+        endpoint,
+        bucket,
+        access_key,
+        secret_key,
+        RUSTFS_REGION,
+        ca_pem,
+    )
+}
+
+fn empty_and_delete_bucket(session: &RustFsSession, bucket: &str) -> Result<(), String> {
+    let storage = build_rustfs_provider(
+        &session.endpoint,
+        bucket,
+        "",
+        &session.access_key,
+        &session.secret_key,
+        &session.ca_pem,
+    )?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let keys = storage
+            .list_with_prefix("")
+            .await
+            .map_err(|e| e.to_string())?;
+        for key in keys {
+            storage.delete(&key).await.map_err(|e| e.to_string())?;
+        }
+        Ok::<(), String>(())
+    })?;
+    delete_bucket(
+        &session.endpoint,
+        bucket,
+        &session.access_key,
+        &session.secret_key,
+        RUSTFS_REGION,
+        &session.ca_pem,
+    )
 }
 
 /// Build an HTTPS S3 provider that trusts the bench-local CA.
@@ -514,6 +688,52 @@ fn create_bucket(
     }
     Err(format!(
         "CreateBucket failed for {bucket}: HTTP {} {:?}",
+        status,
+        response.text().ok()
+    ))
+}
+
+fn delete_bucket(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    ca_pem: &[u8],
+) -> Result<(), String> {
+    let cert = reqwest::Certificate::from_pem(ca_pem).map_err(|e| e.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let host = host_header(endpoint)?;
+    let url = format!("{endpoint}/{bucket}");
+    let amz_date = amz_timestamp();
+    let payload_hash = sha256_hex(b"");
+    let authorization = sign_s3_request(&S3SignParams {
+        method: "DELETE",
+        canonical_uri: &format!("/{bucket}"),
+        host: &host,
+        amz_date: &amz_date,
+        payload_hash: &payload_hash,
+        access_key,
+        secret_key,
+        region,
+    })?;
+    let response = client
+        .delete(&url)
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("authorization", authorization)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    if status.is_success() || status.as_u16() == 404 {
+        return Ok(());
+    }
+    Err(format!(
+        "DeleteBucket failed for {bucket}: HTTP {} {:?}",
         status,
         response.text().ok()
     ))

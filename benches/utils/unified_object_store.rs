@@ -86,7 +86,6 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::{
-    net::SocketAddr,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -114,17 +113,12 @@ use infino::{
     },
     test_helpers::default_tokenizer,
 };
-use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
-use s3s_fs::FileSystem;
 use tempfile::TempDir;
-use tokio::{net::TcpListener, runtime::Runtime};
+use tokio::runtime::Runtime;
+
+use crate::rustfs_server::{self, RustFsBucketLease};
 
 // ─── Constants ───────────────────────────────────────────────────────
-
-const TEST_BUCKET: &str = "infino-objstore-bench";
-const TEST_REGION: &str = "us-east-1";
-const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
 const QUICK_ITER_DEFAULT_DOCS: usize = 100_000;
 const REAL_S3_MAX_ITERS: u64 = 3;
@@ -397,75 +391,30 @@ impl S3CostModel {
     }
 }
 
-// ─── s3s-fs harness ──────────────────────────────────────────────────
+// ─── RustFS harness ──────────────────────────────────────────────────
 
-/// Spawn s3s-fs on a random loopback port. Returns the bound
-/// addr + the tempdir that owns the FS root (kept alive by
-/// the caller).
-async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
-    let fs_root = TempDir::new().expect("s3s-fs root tempdir");
-    std::fs::create_dir_all(fs_root.path().join(TEST_BUCKET)).expect("create bucket dir");
-
-    let fs_backend = FileSystem::new(fs_root.path()).expect("s3s-fs FileSystem");
-    let service = {
-        let mut b = S3ServiceBuilder::new(fs_backend);
-        b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-        b.build()
-    };
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-
-    tokio::spawn(async move {
-        use hyper_util::{
-            rt::{TokioExecutor, TokioIo},
-            server::conn::auto::Builder as ConnBuilder,
-        };
-        let http = ConnBuilder::new(TokioExecutor::new());
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(t) => t,
-                Err(_) => break,
-            };
-            let service = service.clone();
-            let http = http.clone();
-            tokio::spawn(async move {
-                let _ = http.serve_connection(TokioIo::new(stream), service).await;
-            });
-        }
-    });
-    (addr, fs_root)
-}
-
-/// One-time s3s-fs setup: spawn server, upload superfile,
-/// return the storage handle + URI to query. The tempdir
-/// stays alive in the returned tuple — drop it after the
-/// bench to GC the bucket data.
-async fn setup_s3_fixture(
+async fn setup_rustfs_fixture(
     superfile: &Bytes,
-) -> (SocketAddr, TempDir, Arc<dyn StorageProvider>, SuperfileUri) {
-    let (addr, fs_root) = spawn_s3s_fs().await;
-    let endpoint = format!("http://{addr}");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        S3StorageProvider::new_with_endpoint(
-            &endpoint,
-            TEST_BUCKET,
-            TEST_ACCESS_KEY,
-            TEST_SECRET_KEY,
-            TEST_REGION,
-        )
-        .expect("S3StorageProvider"),
-    );
+) -> (Arc<dyn StorageProvider>, SuperfileUri, RustFsBucketLease) {
+    let lease = tokio::task::spawn_blocking(|| {
+        rustfs_server::session()
+            .open_unique_bucket("")
+            .expect("rustfs object-store bench bucket")
+    })
+    .await
+    .expect("rustfs spawn_blocking join");
+    let storage = Arc::clone(&lease.storage);
     let uri = SuperfileUri::new_v4();
     let path = uri.storage_path();
-    // Upload against the raw provider — fixture-setup latency is
-    // not part of the measured cold path.
     storage
         .put_atomic(&path, superfile.clone())
         .await
-        .expect("upload superfile to s3s-fs");
-    eprintln!("[object_store_bench] s3s-fs spawned on {endpoint}, superfile uploaded to {path}");
-    (addr, fs_root, storage, uri)
+        .expect("upload superfile to rustfs");
+    eprintln!(
+        "[object_store_bench] rustfs bucket={} superfile uploaded to {path}",
+        lease.bucket
+    );
+    (storage, uri, lease)
 }
 
 struct BenchFixture {
@@ -474,7 +423,7 @@ struct BenchFixture {
     storage_label: &'static str,
     real_s3: bool,
     cleanup_path: Option<String>,
-    _fs_root: Option<TempDir>,
+    _rustfs_bucket: Option<RustFsBucketLease>,
 }
 
 impl BenchFixture {
@@ -528,17 +477,17 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
             storage_label: "real_s3",
             real_s3: true,
             cleanup_path: Some(path),
-            _fs_root: None,
+            _rustfs_bucket: None,
         }
     } else {
-        let (_addr, fs_root, storage, uri) = setup_s3_fixture(superfile).await;
+        let (storage, uri, lease) = setup_rustfs_fixture(superfile).await;
         BenchFixture {
             storage,
             uri,
-            storage_label: "s3s_fs",
+            storage_label: "rustfs",
             real_s3: false,
             cleanup_path: None,
-            _fs_root: Some(fs_root),
+            _rustfs_bucket: Some(lease),
         }
     }
 }
@@ -1266,14 +1215,17 @@ pub(crate) mod diag {
     /// unhinted-vs-hinted A/B + raw-RTT probes here go beyond the
     /// always-on summary `run()` emits; kept as an opt-in deep dive.
     #[allow(dead_code)]
-    pub fn diagnose_s3s_fs_cold_path() {
+    pub fn diagnose_rustfs_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();
         let n = quick_iter_n_docs();
         let nprobe = BENCH_NPROBE;
         let query = query_vector().to_vec();
 
-        let (_addr, _fs_root, raw_storage, uri) = rt.block_on(setup_s3_fixture(superfile));
+        let (raw_storage, uri, _lease) = rt.block_on(async {
+            let (storage, uri, lease) = setup_rustfs_fixture(superfile).await;
+            (storage, uri, lease)
+        });
         let storage = Arc::new(CountingStorage::new(raw_storage));
         let storage_dyn: Arc<dyn StorageProvider> =
             Arc::clone(&storage) as Arc<dyn StorageProvider>;
@@ -2151,19 +2103,11 @@ pub(crate) mod diag {
              (override via INFINO_DIAG_QUERY_SQL_ITERS, INFINO_BENCH_FULL=1 for 1M)"
         );
 
-        // 1. Spawn s3s-fs + storage provider.
-        let (addr, _fs_root) = rt.block_on(spawn_s3s_fs());
-        let endpoint = format!("http://{addr}");
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_endpoint(
-                &endpoint,
-                TEST_BUCKET,
-                TEST_ACCESS_KEY,
-                TEST_SECRET_KEY,
-                TEST_REGION,
-            )
-            .expect("s3 provider"),
-        );
+        // 1. RustFS session + storage provider.
+        let storage: Arc<dyn StorageProvider> = rt.block_on(async {
+            let (storage, _uri, _lease) = setup_rustfs_fixture(superfile_bytes()).await;
+            storage
+        });
 
         // 2. Disk cache (so warm == mmap, not re-fetch).
         let cache_dir = TempDir::new().expect("cache tempdir");
@@ -2183,7 +2127,7 @@ pub(crate) mod diag {
         let cache = DiskCacheStore::new(Arc::clone(&storage), cache_cfg, pinned).expect("cache");
 
         // 3. Producer: write n docs through Supertable's writer.
-        eprintln!("[diag-qsql-overhead] writing {n}-doc Supertable to s3s-fs ...");
+        eprintln!("[diag-qsql-overhead] writing {n}-doc Supertable to rustfs ...");
         let build_t0 = Instant::now();
         rt.block_on(async {
             let producer =
@@ -2191,7 +2135,7 @@ pub(crate) mod diag {
                     .expect("create producer Supertable");
             let mut writer = producer.writer().expect("producer writer");
             append_unified_supertable_batches(&mut writer, n);
-            writer.commit().expect("commit Supertable to s3s-fs");
+            writer.commit().expect("commit Supertable to rustfs");
         });
         eprintln!(
             "[diag-qsql-overhead] commit OK in {:.1} s",
@@ -2205,7 +2149,7 @@ pub(crate) mod diag {
                     .with_storage(Arc::clone(&storage))
                     .with_disk_cache(Arc::clone(&cache)),
             )
-            .expect("Supertable::open from s3s-fs")
+            .expect("Supertable::open from rustfs")
         });
         // 5. Warm the cache: cold pass + mmap-promotion sleep.
         eprintln!("[diag-qsql-overhead] warming cache (cold pass + 2s mmap promotion sleep)");
