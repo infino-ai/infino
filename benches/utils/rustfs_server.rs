@@ -283,7 +283,7 @@ fn which_rustfs_on_path() -> Option<PathBuf> {
 
 fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     let version = rustfs_version();
-    let asset = release_asset_name()?;
+    let asset = release_asset_name(&version)?;
     let release_base = format!("https://github.com/rustfs/rustfs/releases/download/{version}");
     let url = format!("{release_base}/{asset}");
     eprintln!("[rustfs] downloading {url} ...");
@@ -385,12 +385,16 @@ fn child_exited(child: &mut Child) -> bool {
 fn release_asset_name(version: &str) -> Result<String, String> {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
+    // Upstream release zips use a `v` prefix on the tag in the filename
+    // (e.g. `rustfs-linux-x86_64-gnu-v1.0.0-alpha.90.zip`) while the
+    // GitHub release tag path omits it (`.../download/1.0.0-alpha.90/`).
+    let versioned = format!("v{version}");
     let stem = match (os, arch) {
-        ("linux", "x86_64") => format!("rustfs-linux-x86_64-gnu-{version}.zip"),
-        ("linux", "aarch64") => format!("rustfs-linux-aarch64-gnu-{version}.zip"),
-        ("macos", "x86_64") => format!("rustfs-macos-x86_64-{version}.zip"),
-        ("macos", "aarch64") => format!("rustfs-macos-aarch64-{version}.zip"),
-        ("windows", "x86_64") => format!("rustfs-windows-x86_64-{version}.zip"),
+        ("linux", "x86_64") => format!("rustfs-linux-x86_64-gnu-{versioned}.zip"),
+        ("linux", "aarch64") => format!("rustfs-linux-aarch64-gnu-{versioned}.zip"),
+        ("macos", "x86_64") => format!("rustfs-macos-x86_64-{versioned}.zip"),
+        ("macos", "aarch64") => format!("rustfs-macos-aarch64-{versioned}.zip"),
+        ("windows", "x86_64") => format!("rustfs-windows-x86_64-{versioned}.zip"),
         _ => {
             return Err(format!(
                 "unsupported platform for auto-download: {os}-{arch}"
@@ -449,10 +453,10 @@ fn wait_for_health(endpoint: &str, ca_pem: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECS);
     while Instant::now() < deadline {
-        if let Ok(response) = client.get(&url).send() {
-            if response.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(response) = client.get(&url).send()
+            && response.status().is_success()
+        {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(HEALTH_POLL_INTERVAL_MS));
     }
@@ -609,5 +613,19 @@ def456  other.zip
     #[test]
     fn parse_sha256_sums_missing_asset_errors() {
         assert!(parse_sha256_sums_entry("abc123  other.zip\n", "missing.zip").is_err());
+    }
+
+    #[test]
+    fn release_asset_name_uses_v_prefix_in_zip_filename() {
+        let version = "1.0.0-alpha.90";
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "rustfs-linux-x86_64-gnu-v1.0.0-alpha.90.zip",
+            ("linux", "aarch64") => "rustfs-linux-aarch64-gnu-v1.0.0-alpha.90.zip",
+            ("macos", "x86_64") => "rustfs-macos-x86_64-v1.0.0-alpha.90.zip",
+            ("macos", "aarch64") => "rustfs-macos-aarch64-v1.0.0-alpha.90.zip",
+            ("windows", "x86_64") => "rustfs-windows-x86_64-v1.0.0-alpha.90.zip",
+            (os, arch) => panic!("unsupported platform for test: {os}-{arch}"),
+        };
+        assert_eq!(release_asset_name(version).expect("asset name"), expected);
     }
 }
