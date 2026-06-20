@@ -26,11 +26,10 @@ use tokio::time;
 use uuid::Uuid;
 
 use crate::{
-    superfile::vector::{cell_posting::merge_encoded_blobs, layout::VectorLayout},
     Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::builder::SuperfileBuilder,
+    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
@@ -41,7 +40,7 @@ use crate::{
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, try_commit_attempt,
+            prepare_superfile, split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -329,109 +328,20 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats) =
-            SuperfileBuilder::build_from_readers(&readers_with_tombstones)?;
-        let merged_bytes = Bytes::from(merged_bytes);
-
-        let shard = ShardOutput::new_with_params(
-            merged_bytes,
-            superfile_stats.n_docs,
-            superfile_stats.id_min,
-            superfile_stats.id_max,
-            superfile_stats.scalar_stats,
-        );
-
-        let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
-
-        prepared_superfile.ok_or(BuildError::NoDocsToBuild)
-    }
-
-    pub(crate) async fn merge_cell_posting_superfiles(
-        &self,
-        superfiles: &[Arc<SuperfileEntry>],
-    ) -> Result<PreparedSuperfile, BuildError> {
-        let manifest = { self.inner().manifest.load().clone() };
-        let store = manifest.options.store.clone();
-        let disk_cache = manifest.options.disk_cache.clone();
-        let storage = manifest
-            .options
-            .storage
-            .clone()
-            .ok_or_else(|| BuildError::Store("cell posting compaction requires storage".into()))?;
-        let tombstone_cache = self.inner().tombstone_cache.clone();
-
-        let now = std::time::Instant::now();
-        if let Some(tombstone_cache) = &tombstone_cache {
-            let superfile_ids = superfiles
-                .iter()
-                .map(|entry| entry.superfile_id)
-                .collect::<Vec<_>>();
-            tombstone_cache.prefetch(&superfile_ids, now).await;
-        }
-
-        let mut readers_with_tombstones = Vec::with_capacity(superfiles.len());
-        let mut blobs = Vec::with_capacity(superfiles.len());
-        for entry in superfiles {
-            let bitmap = tombstone_cache
-                .as_ref()
-                .map(|t| t.bitmap_for(entry.superfile_id, now))
-                .transpose()
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-
-            // Resident mmap-backed reader from the local disk cache (insert_warm
-            // at commit). The lazy query open path leaves `reader.bytes == None`,
-            // which breaks `get_record_batch` during merge.
-            let reader = if let Some(cache) = disk_cache.as_ref() {
-                cache
-                    .reader_synchronous_with_storage(&entry.uri, Arc::clone(&storage))
-                    .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?
+        let (merged_bytes, superfile_stats) = {
+            let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
+                reader.vec().and_then(|v| {
+                    v.vector_columns_config()
+                        .next()
+                        .map(|c| c.rerank_codec == crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon)
+                })
+            });
+            if sq8_merge == Some(true) {
+                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
             } else {
-                open_reader(&store, None, Some(&storage), entry)
-                    .await
-                    .map_err(|e| BuildError::Store(e.to_string()))?
-            };
-
-            let offsets = entry.subsection_offsets.as_ref().ok_or_else(|| {
-                BuildError::Store(format!(
-                    "cell posting superfile {:?} missing subsection_offsets",
-                    entry.uri
-                ))
-            })?;
-            let (off, len) = offsets.vec.ok_or_else(|| {
-                BuildError::Store(format!(
-                    "cell posting superfile {:?} missing vec subsection",
-                    entry.uri
-                ))
-            })?;
-            let blob = reader
-                .byte_source()
-                .range(off, len)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-
-            readers_with_tombstones.push((reader.clone(), bitmap.clone()));
-            blobs.push((blob, bitmap));
-        }
-
-        let blob_refs = blobs
-            .iter()
-            .map(|(blob, bitmap)| (blob.as_ref(), bitmap.as_deref()))
-            .collect::<Vec<_>>();
-        let (merged_vec_blob, n_docs) = merge_encoded_blobs(&blob_refs)
-            .map_err(BuildError::Store)?;
-        if n_docs == 0 {
-            return Err(BuildError::NoDocsToBuild);
-        }
-
-        let mut opts = self.inner().options.builder_options();
-        opts.vector_layout = VectorLayout::CellPosting;
-        let (merged_bytes, superfile_stats) = SuperfileBuilder::build_from_readers_with_prebuilt_vector_blob(
-            opts,
-            &readers_with_tombstones,
-            merged_vec_blob,
-        )?;
-        debug_assert_eq!(superfile_stats.n_docs, n_docs);
+                SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
+            }
+        };
         let merged_bytes = Bytes::from(merged_bytes);
 
         let shard = ShardOutput::new_with_params(
@@ -443,6 +353,7 @@ impl Supertable {
         );
 
         let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
+
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
     }
 
@@ -514,26 +425,13 @@ impl Supertable {
             }
         }
 
-        // Authoritative for the hidden table: its own options layout decides the
-        // merge path. Keying off an input entry's `vector_layout` is unsafe
-        // because the generic `build_from_readers` path drops the cell-posting
-        // vec blob (the CellPosting reader exposes no fp32 vectors), publishing
-        // a vec-less superfile the query layer then can't read.
-        let is_cell_posting = self.inner().options.vector_layout == VectorLayout::CellPosting;
-        let merged_segment = match if is_cell_posting {
-            self.merge_cell_posting_superfiles(&inputs).await
-        } else {
-            self.merge_superfiles(&inputs).await
-        } {
+        let merged_segment = match self.merge_superfiles(&inputs).await {
             Ok(segment) => segment,
             Err(e) => {
                 for entry in &inputs {
-                    if let Err(unseal_err) = tombstones_admin::unseal(
-                        &wal_store,
-                        entry.superfile_id,
-                        compaction_id,
-                    )
-                    .await
+                    if let Err(unseal_err) =
+                        tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
+                            .await
                     {
                         tracing::warn!(
                             superfile_id = %entry.superfile_id,
@@ -560,14 +458,10 @@ impl Supertable {
             partition_key,
             partition_hint,
             subsection_offsets: merged_old.subsection_offsets.clone(),
-            vector_layout: if is_cell_posting {
-                VectorLayout::CellPosting
-            } else {
-                inputs
-                    .first()
-                    .map(|e| e.vector_layout)
-                    .unwrap_or(VectorLayout::Ivf)
-            },
+            vector_layout: inputs
+                .first()
+                .map(|e| e.vector_layout)
+                .unwrap_or(VectorLayout::Ivf),
         });
         let new_entries = vec![merged_entry];
         let mut pending_storage_writes = vec![
@@ -619,13 +513,26 @@ impl Supertable {
                         .into_iter()
                         .collect::<Vec<_>>();
                     finalize_compaction_commit(
-                        inner,
+                        Arc::clone(inner),
                         &storage,
                         &new_entries,
                         &entries_to_remove,
                         pending_cache_inserts,
                     )
                     .await;
+                    if crate::supertable::handle::is_hidden_vector_index_table(&inner.options)
+                        && let Some(cell_id) = partition_hint
+                        && let Err(e) = split_overflow_cell_after_compaction(
+                            Arc::clone(inner),
+                            &new_entries[0],
+                            cell_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "supertable: hidden cell split after compaction failed: {e}"
+                        );
+                    }
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {

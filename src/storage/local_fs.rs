@@ -18,7 +18,6 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use fs4::tokio::AsyncFileExt;
 use futures::TryStreamExt;
 use object_store::{
     Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
@@ -515,14 +514,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_if_match_creates_supertable_lock_file() {
-        // `put_if_match`'s Some(etag) branch acquires an
-        // advisory flock on `<root>/_supertable/.lock` to
-        // close the read-then-overwrite TOCTOU window. The
-        // lock file persists (best-effort cleanup is not
-        // attempted), so its presence after a successful
-        // conditional update is a direct signal the lock
-        // path was exercised.
+    async fn put_if_match_creates_pointer_directory_lock_file() {
+        // `put_if_match`'s Some(etag) branch acquires an advisory flock on
+        // `<root>/<pointer-parent>/.lock` (not a single root-level lock) so
+        // distinct pointer paths — e.g. user table vs hidden index — do not
+        // serialize each other. The lock file persists after the update.
         let dir = TempDir::new().expect("tempdir");
         let p = LocalFsStorageProvider::new(dir.path()).expect("provider");
         p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
@@ -538,7 +534,7 @@ mod tests {
             .await
             .expect("conditional update");
 
-        let lock_path = dir.path().join("_supertable").join(".lock");
+        let lock_path = dir.path().join("ptr").join(".lock");
         assert!(
             lock_path.exists(),
             "expected advisory lock file at {lock_path:?}"

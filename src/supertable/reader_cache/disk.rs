@@ -356,7 +356,6 @@ impl DiskCacheStore {
             .unwrap_or_else(|| Arc::clone(&self.storage))
     }
 
-
     /// Hot path. Cached → cloned `Arc<SuperfileReader>`; cold
     /// → coalesced cold-fetch coordinator. Dispatches by
     /// `config.cold_fetch_mode`:
@@ -1850,9 +1849,7 @@ async fn lazy_background_fill(
         // 1. Parallel range-GETs into the temp file (existing
         //    cold_fetch_to_disk shape, but cancelable for
         //    short-lived caches).
-        if !cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size)
-            .await?
-        {
+        if !cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size).await? {
             return Ok(());
         }
         if background_store_abandoned(&store) {
@@ -2281,15 +2278,13 @@ mod tests {
         let _ = format!("{err}");
     }
 
-
     #[tokio::test]
     async fn cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
         use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
 
         let dir = TempDir::new().expect("tempdir");
-        let user_storage: Arc<dyn StorageProvider> = Arc::new(
-            LocalFsStorageProvider::new(dir.path()).expect("user root"),
-        );
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
         let hidden_root = dir.path().join("hidden_prefix");
         std::fs::create_dir_all(&hidden_root).expect("hidden root");
         let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
@@ -2341,7 +2336,10 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         // offsets = None → unknown-size StorageRangeSource.
-        let r = store.open_range_only(&uri, None, None).await.expect("range open");
+        let r = store
+            .open_range_only(&uri, None, None)
+            .await
+            .expect("range open");
         assert_eq!(r.n_docs(), 1);
         // Bypasses the cache entirely — nothing admitted.
         assert_eq!(store.stats().n_entries, 0);

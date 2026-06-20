@@ -85,8 +85,7 @@ use arrow_array::{Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
-use crate::superfile::vector::cell_posting::CellPostingBuilder;
-use crate::superfile::vector::layout::VectorLayout;
+
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::{
     BuildError, SuperfileReader,
@@ -100,7 +99,10 @@ use crate::superfile::{
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
     stats::SuperfileStats,
-    vector::{builder::VectorBuilder, distance::Metric, reader::ColumnReader},
+    vector::{
+        builder::VectorBuilder, cell_posting::CellPostingBuilder, distance::Metric,
+        layout::VectorLayout, reader::ColumnReader,
+    },
 };
 
 /// Per-column FTS configuration. The `column` must exist in
@@ -594,6 +596,99 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// Append a scalar-only batch (ids without vector payloads). Used when the
+    /// vector blob is supplied via [`Self::load_materialized_ivf_rows`].
+    pub(crate) fn add_batch_ids_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        if batch.schema().fields() != self.opts.schema.fields() {
+            return Err(BuildError::BatchSchemaMismatch);
+        }
+        self.next_local_doc_id += batch.num_rows() as u32;
+        self.batches.push(batch.clone());
+        Ok(())
+    }
+
+    /// Sq8-native maintenance: feed preserved IVF rows into the normal vector builder.
+    pub(crate) fn load_materialized_ivf_rows(
+        &mut self,
+        rows: Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>,
+    ) -> Result<(), BuildError> {
+        let vb = self
+            .vec_builder
+            .as_mut()
+            .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
+        vb.load_materialized_rows(0, rows)?;
+        Ok(())
+    }
+
+    /// Inject a byte-spliced IVF subsection for compaction merge.
+    pub(crate) fn set_prebuilt_ivf_subsection(
+        &mut self,
+        column_id: u32,
+        subsection: crate::superfile::vector::ivf_merge::MergedIvfSubsection,
+    ) -> Result<(), BuildError> {
+        let vb = self
+            .vec_builder
+            .as_mut()
+            .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
+        vb.set_prebuilt_subsection(column_id, subsection)?;
+        Ok(())
+    }
+
+    /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
+    /// per-cluster IVF blocks and remaps doc ids.
+    pub fn build_from_sq8_ivf_readers(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        use crate::superfile::vector::{
+            ivf_merge::merge_sq8_ivf_subsections, rerank_codec::RerankCodec,
+        };
+
+        let first = readers.first().ok_or(BuildError::BatchReadError)?;
+        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+
+        let vec_col = first
+            .0
+            .vec()
+            .and_then(|v| v.vector_columns_config().next())
+            .ok_or_else(|| BuildError::VectorReadError)?;
+        if vec_col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+            return Err(BuildError::VectorReadError);
+        }
+        let column = vec_col.name.clone();
+
+        let mut stats_collector = Vec::with_capacity(readers.len());
+        let mut merge_inputs: Vec<(&crate::superfile::vector::reader::VectorReader, String, u32)> =
+            Vec::with_capacity(readers.len());
+        let mut local_base = 0u32;
+
+        for (reader, deleted) in readers {
+            let record_batch = reader
+                .get_record_batch(deleted.clone())
+                .map_err(|_| BuildError::BatchReadError)?;
+            let stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
+            stats_collector.push(stats);
+
+            let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+            merge_inputs.push((v, column.clone(), local_base));
+
+            superfile_builder.add_batch_ids_only(&record_batch)?;
+            local_base += record_batch.num_rows() as u32;
+        }
+
+        let merge_refs: Vec<(&crate::superfile::vector::reader::VectorReader, &str, u32)> =
+            merge_inputs
+                .iter()
+                .map(|(v, col, off)| (*v, col.as_str(), *off))
+                .collect();
+        let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
+        superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
+
+        let bytes = superfile_builder.finish()?;
+        let stats = SuperfileStats::from_children(stats_collector.as_slice());
+        Ok((bytes, stats))
+    }
+
     /// Add all data (Parquet + fts + vectors) from another [`SuperfileReader`] to this builder.
     ///
     /// Extracts the record batch and vectors from the reader and adds them via
@@ -667,7 +762,7 @@ impl SuperfileBuilder {
 
                 let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
                 let result = v
-                    .get_vectors_fp32(&reader_col.name)
+                    .get_vectors_for_merge(&reader_col.name)
                     .map_err(|_| BuildError::VectorReadError)?;
                 for (row_idx, single_row) in result.iter().enumerate() {
                     // Skip deleted documents: only include rows not in the deleted_docs_bitmap
@@ -685,86 +780,6 @@ impl SuperfileBuilder {
         let slices: Vec<&[f32]> = vectors.iter().map(|row| row.as_slice()).collect();
         self.add_batch(&record_batch, &slices)?;
         Ok(superfile_stats)
-    }
-
-    /// Build a CellPosting-layout superfile by merging scalar/FTS rows from
-    /// existing readers while splicing in a prebuilt Sq8+epsilon vector blob.
-    ///
-    /// This is used by hidden vector-index maintenance: CellPosting vectors are
-    /// already encoded as Sq8+epsilon, so compaction must not route them through
-    /// `get_vectors_fp32` / `CellPostingBuilder::add`. The caller is responsible
-    /// for constructing `vec_blob` with local doc ids matching the scalar row
-    /// order produced by `readers` after tombstone filtering.
-    pub(crate) fn build_from_readers_with_prebuilt_vector_blob(
-        opts: BuilderOptions,
-        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
-        vec_blob: Vec<u8>,
-    ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
-        if opts.vector_layout != VectorLayout::CellPosting {
-            return Err(BuildError::VectorSchemaMismatch(
-                "prebuilt vector blob is only supported for CellPosting layout".into(),
-            ));
-        }
-        if readers.is_empty() {
-            return Err(BuildError::BatchReadError);
-        }
-
-        let mut batches = Vec::with_capacity(readers.len());
-        let mut stats = Vec::with_capacity(readers.len());
-        for (reader, deleted) in readers {
-            opts.check_mergeability(
-                reader.id_column(),
-                reader.schema(),
-                reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
-                None,
-            )?;
-            let batch = reader
-                .get_record_batch(deleted.clone())
-                .map_err(|_| BuildError::BatchReadError)?;
-            stats.push(SuperfileStats::try_compute_from_record_batch(&batch)?);
-            batches.push(batch);
-        }
-        let merged_stats = SuperfileStats::from_children(&stats);
-        if merged_stats.n_docs == 0 {
-            return Err(BuildError::BatchReadError);
-        }
-
-        let mut kvs: Vec<(String, String)> = vec![
-            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
-            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
-            (kv::ID_COLUMN.into(), opts.id_column.clone()),
-            (kv::N_DOCS.into(), merged_stats.n_docs.to_string()),
-            (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
-        ];
-        if !opts.fts_columns.is_empty() {
-            kvs.push((
-                kv::FTS_COLUMNS.into(),
-                fts_columns_json(&opts.fts_columns),
-            ));
-        }
-        if !opts.vector_columns.is_empty() {
-            kvs.push((
-                kv::VEC_COLUMNS.into(),
-                vec_columns_json(&opts.vector_columns),
-            ));
-            if opts.vector_layout != VectorLayout::Ivf {
-                kvs.push((
-                    kv::VEC_LAYOUT.into(),
-                    opts.vector_layout.as_kv_value().into(),
-                ));
-            }
-        }
-
-        let id_page_limit = [(opts.id_column.as_str(), opts.id_page_size_limit)];
-        let body = encode_parquet_body(
-            &opts.schema,
-            &batches,
-            opts.compression,
-            opts.row_group_size,
-            &id_page_limit,
-        )?;
-        let parts = splice_index_blobs(body, &Vec::new(), &vec_blob, &kvs)?;
-        Ok((parts.bytes, merged_stats))
     }
 
     /// Builds a superfile from the given readers, merging them into one.
@@ -858,12 +873,14 @@ impl SuperfileBuilder {
             )
         };
         let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
-            let (fts_blob, vec_blob) = finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
+            let (fts_blob, vec_blob) =
+                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
             let body = encode_body()?;
             (body, fts_blob, vec_blob)
         } else {
-            let (body_res, blobs_res) =
-                rayon::join(encode_body, || finish_index_blobs(fts_builder, vec_builder, cell_posting_builder));
+            let (body_res, blobs_res) = rayon::join(encode_body, || {
+                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)
+            });
             let body = body_res?;
             let (fts_blob, vec_blob) = blobs_res?;
             (body, fts_blob, vec_blob)

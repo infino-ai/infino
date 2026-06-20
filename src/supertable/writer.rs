@@ -63,12 +63,11 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use futures::stream::{self, StreamExt};
 use datafusion::prelude::Expr;
+use futures::stream::{self, StreamExt};
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::{runtime::Handle, task::block_in_place, time::sleep};
-
 
 use super::{
     build::{fanout_shards, fanout_shards_in_pool_scope},
@@ -93,8 +92,6 @@ use super::{
         },
     },
 };
-use crate::superfile::vector::layout::VectorLayout;
-use crate::supertable::manifest::partition::{assign_partition, encode_partition_key};
 #[cfg(test)]
 use crate::superfile::ReadError;
 use crate::{
@@ -113,14 +110,16 @@ use crate::{
                 U32_BYTES, dir_entry, outer_hdr, sub_hdr,
             },
         },
+        vector::{distance::Metric, layout::VectorLayout},
     },
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
         error::ManifestError,
         manifest::{
             ClusterCentroids, Manifest,
-            commit::{get_current_manifest_etag, list_uri},
+            commit::get_current_manifest_etag,
             part::{self as part_mod, PartId},
+            partition::{assign_partition, encode_partition_key},
         },
         reader_cache::DiskCacheStore,
     },
@@ -254,61 +253,71 @@ fn split_buffer_into_row_shards(
     shards
 }
 
+/// After a manifest swap that drops superfile references, schedule a deferred
+/// GC sweep instead of inline `storage.delete`. Inline delete races snapshot-
+/// pinned readers that may still cold-fetch superseded bytes.
+fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
+    if inner.options.storage.is_none() {
+        return;
+    }
+    // Integration tests that need reclaim call `Supertable::gc()` explicitly
+    // (see `tests/supertable/compact_gc.rs`). Spawning here from a
+    // `current_thread` tokio test runtime panics in `block_in_place`.
+    #[cfg(not(test))]
+    {
+        let rt = inner.query_runtime();
+        rt.spawn(async move {
+            sleep(super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE).await;
+            if let Err(e) = super::gc::gc_storage_sweep_for_inner(
+                &inner,
+                super::gc::DEFAULT_SUPERFILE_RECLAIM_GRACE,
+            )
+            .await
+            {
+                tracing::debug!("supertable: deferred storage reclaim: {e}");
+            }
+        });
+    }
+    #[cfg(test)]
+    {
+        let _ = inner;
+    }
+}
 
-/// Read Sq8+ε rerank rows from an incoming IVF superfile via
-/// [`VectorReader::decode_index_vectors`], scattered into local-doc-id order
-/// to align with the scalar `_id` batch.
-fn incoming_sq8_residual_rows_in_doc_order(
+/// Read Sq8+ε IVF rows plus 1-bit codes from an incoming superfile, aligned to
+/// scalar `_id` row order.
+fn incoming_materialized_rows_in_doc_order(
     vec_reader: &crate::superfile::vector::reader::VectorReader,
     column: &str,
-    n_rows: usize,
-    vec_dim: usize,
-) -> Result<Vec<f32>, BuildError> {
-    let (ids, flat) = vec_reader.decode_index_vectors(column).ok_or_else(|| {
+    id_arr: &Decimal128Array,
+) -> Result<Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>, BuildError> {
+    let mut rows = vec_reader.materialized_index_rows(column).ok_or_else(|| {
         BuildError::Store(format!(
-            "incoming drain: column '{column}' missing Sq8ResidualEpsilon index or codec meta"
+            "incoming routing: column '{column}' missing Sq8ResidualEpsilon IVF index"
         ))
     })?;
-    let mut out = vec![0.0f32; n_rows * vec_dim];
-    for (i, &doc_id) in ids.iter().enumerate() {
-        let row = doc_id as usize;
-        if row < n_rows {
-            let src = i * vec_dim;
-            out[row * vec_dim..(row + 1) * vec_dim].copy_from_slice(&flat[src..src + vec_dim]);
+    let n_rows = id_arr.len();
+    let mut by_local = vec![None; n_rows];
+    for row in &mut rows {
+        let slot = row.local_doc_id as usize;
+        if slot < n_rows {
+            row.stable_id = id_arr.value(slot);
+            by_local[slot] = Some(row.clone());
         }
     }
-    Ok(out)
-}
-
-fn append_batch_rows(rows: &mut Vec<(i128, Vec<f32>)>, batches: &[BufferedBatch], vec_dim: usize) {
-    let mut row_index: HashMap<i128, usize> = rows
-        .iter()
+    Ok(by_local
+        .into_iter()
         .enumerate()
-        .map(|(idx, (id, _))| (*id, idx))
-        .collect();
-    for batch in batches {
-        let n_rows = batch.scalar.num_rows();
-        let Some(id_arr) = batch.scalar.column(0).as_any().downcast_ref::<Decimal128Array>() else {
-            continue;
-        };
-        let vecs = batch.vectors[0].values();
-        for row in 0..n_rows {
-            let uid = id_arr.value(row);
-            let start = row * vec_dim;
-            let vector = vecs[start..start + vec_dim].to_vec();
-            if let Some(existing_idx) = row_index.get(&uid).copied() {
-                rows[existing_idx].1 = vector;
-            } else {
-                let idx = rows.len();
-                rows.push((uid, vector));
-                row_index.insert(uid, idx);
-            }
-        }
-    }
+        .filter_map(|(i, r)| {
+            r.map(|mut row| {
+                row.local_doc_id = i as u32;
+                row
+            })
+        })
+        .collect())
 }
 
-
-/// One commit's drained hidden-index batch, ready to build into a single
+/// One commit's hidden-index batch, ready to build into a single
 /// "incoming" IVF superfile. No per-cell split happens here — that is deferred
 /// to background SPFresh maintenance.
 struct HiddenIncomingPlan {
@@ -317,43 +326,15 @@ struct HiddenIncomingPlan {
     column: String,
 }
 
-/// One per-cell build task. Produced by SPFresh maintenance when it splits an
-/// incoming IVF superfile into per-cell CellPosting "cell superfiles".
-#[derive(Clone)]
-struct CellBuildTask {
-    cell_id: u32,
-    rows: Vec<(i128, Vec<f32>)>,
-}
-
-fn build_cell_posting_task(
-    inner: &SupertableInner,
-    options: &SupertableOptions,
-    vec_dim: usize,
-    task: CellBuildTask,
-) -> Result<PreparedSuperfile, BuildError> {
-    let merged = rows_to_buffered_batch(&task.rows, options, vec_dim)?;
-    let shard = build_one_shard(std::slice::from_ref(&merged), options)?;
-    let prepared = prepare_superfile_with_uri(inner, shard, None)?.ok_or_else(|| {
-        BuildError::Store("hidden cell shard unexpectedly empty".into())
-    })?;
-    let entry = finish_superfile_entry(inner, prepared.entry, Some(task.cell_id))?;
-    Ok(PreparedSuperfile {
-        entry,
-        bytes_for_store: prepared.bytes_for_store,
-        bytes_for_storage: prepared.bytes_for_storage,
-        bytes_for_cache: prepared.bytes_for_cache,
-    })
-}
-
-/// Build ONE "incoming" IVF superfile from a commit's drained hidden batch,
+/// Build ONE "incoming" IVF superfile from a commit's hidden batch,
 /// tagged with the reserved incoming partition. This reuses the standard IVF
 /// superfile writer (`build_one_shard`) verbatim — no per-cell work. Queries
-/// always scan incoming superfiles; background SPFresh maintenance later splits
-/// this into per-cell CellPosting superfiles and deletes it.
+/// always scan incoming superfiles; background SPFresh maintenance later routes
+/// them into per-cell IVF superfiles and deletes them.
 fn execute_hidden_incoming_plan_in_scope(
     inner: &SupertableInner,
     plan: HiddenIncomingPlan,
-) -> Result<HiddenCellPostingPrepare, BuildError> {
+) -> Result<HiddenIncomingPrepare, BuildError> {
     let HiddenIncomingPlan {
         buffer,
         clusters,
@@ -366,21 +347,23 @@ fn execute_hidden_incoming_plan_in_scope(
         pending_cache_inserts: Vec::new(),
     };
     if buffer.is_empty() {
-        return Ok(HiddenCellPostingPrepare {
+        return Ok(HiddenIncomingPrepare {
             batch: empty_batch,
             cell_updates: HashMap::new(),
+            radii_updates: HashMap::new(),
             clusters,
             column,
         });
     }
-    // Normal IVF layout, exactly like a user-table vector superfile. The hidden
-    // table's own default layout is CellPosting (the cell superfiles), so
-    // override to Ivf for this incoming append.
+    // Normal IVF layout for the incoming append region (same as user-table vectors).
     let shard = build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf)?;
     let prepared = prepare_superfile(inner, shard)?
         .ok_or_else(|| BuildError::Store("hidden incoming superfile unexpectedly empty".into()))?;
-    let entry =
-        finish_superfile_entry(inner, prepared.entry, Some(super::handle::INCOMING_VECTOR_CELL))?;
+    let entry = finish_superfile_entry(
+        inner,
+        prepared.entry,
+        Some(super::handle::INCOMING_VECTOR_CELL),
+    )?;
     let prepared = PreparedSuperfile {
         entry,
         bytes_for_store: prepared.bytes_for_store,
@@ -388,38 +371,13 @@ fn execute_hidden_incoming_plan_in_scope(
         bytes_for_cache: prepared.bytes_for_cache,
     };
     let batch = collect_prepared_superfiles(inner, vec![prepared])?;
-    Ok(HiddenCellPostingPrepare {
+    Ok(HiddenIncomingPrepare {
         batch,
         // Counts are bumped by maintenance when rows actually land in cells.
         cell_updates: HashMap::new(),
+        radii_updates: HashMap::new(),
         clusters,
         column,
-    })
-}
-
-fn rows_to_buffered_batch(
-    rows: &[(i128, Vec<f32>)],
-    options: &SupertableOptions,
-    vec_dim: usize,
-) -> Result<BufferedBatch, BuildError> {
-    let id_array = Decimal128Array::from_iter_values(rows.iter().map(|(id, _)| *id))
-        .with_precision_and_scale(
-            crate::supertable::options::DECIMAL128_PRECISION,
-            crate::supertable::options::DECIMAL128_SCALE,
-        )
-        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
-    let mut vec_data = Vec::with_capacity(rows.len() * vec_dim);
-    for (_, v) in rows {
-        vec_data.extend_from_slice(v);
-    }
-    let scalar = RecordBatch::try_new(
-        options.scalar_schema(),
-        vec![Arc::new(id_array) as ArrayRef],
-    )
-    .map_err(|_| BuildError::BatchSchemaMismatch)?;
-    Ok(BufferedBatch {
-        scalar,
-        vectors: vec![Arc::new(Float32Array::from(vec_data))],
     })
 }
 
@@ -615,9 +573,12 @@ fn bootstrap_centroids_from_batch(
     batches: &[BufferedBatch],
     vec_dim: usize,
     n_cells: usize,
+    metric: Metric,
 ) -> Option<crate::supertable::manifest::ClusterCentroids> {
-    use crate::superfile::vector::kmeans::kmeans_with_assignments;
-    use crate::supertable::handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED};
+    use crate::{
+        superfile::vector::kmeans::kmeans_with_assignments,
+        supertable::handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED},
+    };
 
     let mut vectors = Vec::new();
     for batch in batches {
@@ -646,12 +607,44 @@ fn bootstrap_centroids_from_batch(
     for &a in &assignments {
         counts[a as usize] += 1;
     }
-    Some(crate::supertable::manifest::ClusterCentroids::from_fp32(
+    let clusters = crate::supertable::manifest::ClusterCentroids::from_fp32(
         k as u32,
         vec_dim as u32,
         &centroids,
         counts,
-    ))
+    );
+    Some(clusters.clone().with_radii(per_cell_radii(
+        &clusters,
+        &vectors,
+        &assignments,
+        vec_dim,
+        metric,
+    )))
+}
+
+fn per_cell_radii(
+    clusters: &crate::supertable::manifest::ClusterCentroids,
+    vectors: &[f32],
+    assignments: &[u32],
+    vec_dim: usize,
+    metric: Metric,
+) -> Vec<f32> {
+    let n_cent = clusters.n_cent as usize;
+    let mut radii = vec![0.0f32; n_cent];
+    for (doc_idx, &cell) in assignments.iter().enumerate() {
+        let c = cell as usize;
+        if c >= n_cent {
+            continue;
+        }
+        let member = &vectors[doc_idx * vec_dim..(doc_idx + 1) * vec_dim];
+        let sum_m: f32 = member.iter().sum();
+        let norm_m_sq: f32 = member.iter().map(|v| v * v).sum();
+        let dist = clusters.score_one(metric, c, member, sum_m, norm_m_sq);
+        if dist > radii[c] {
+            radii[c] = dist;
+        }
+    }
+    radii
 }
 
 impl SupertableWriter {
@@ -804,7 +797,6 @@ impl SupertableWriter {
         self.buffer_bytes += bytes;
         Ok(())
     }
-
 
     /// Buffer a delete operation. Every row whose `_id`
     /// matches `predicate` at call time will be tombstoned by
@@ -1243,20 +1235,12 @@ impl SupertableWriter {
         })
     }
 
-    /// Drain the pending-appends buffer and publish all shard
-    /// outputs in one manifest swap. Internal-only; the public
-
-    /// Hidden-index commit: assign batch to nearest cells and append one
-    /// delta cell-posting superfile per touched cell. Per-cell collapse is
-    /// compaction's job (`compaction/mod.rs`), not inline merge here.
-
-    /// Drain the hidden writer's buffered vectors into a plan for ONE incoming
-    /// IVF superfile. Bootstraps the global cell centroids from the first batch
-    /// if they don't exist yet (routing and maintenance both need them), but
-    /// does NOT split by cell and does NOT touch per-cell counts — that is
-    /// deferred to background SPFresh maintenance, which is when the rows
-    /// actually land in cells.
-    fn plan_hidden_cell_posting(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
+    /// Plan one incoming IVF superfile from the hidden writer's buffered vectors.
+    /// Bootstraps the global cell centroids from the first batch if they don't
+    /// exist yet (routing and maintenance both need them), but does NOT split
+    /// by cell and does NOT touch per-cell counts — that is deferred to
+    /// background SPFresh routing, which is when the rows actually land in cells.
+    fn plan_hidden_incoming_shard(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
         let empty = HiddenIncomingPlan {
             buffer: Vec::new(),
             clusters: crate::supertable::manifest::ClusterCentroids::default(),
@@ -1284,6 +1268,14 @@ impl SupertableWriter {
             .map(|vc| vc.column.clone())
             .unwrap_or_default();
 
+        let metric = self
+            .inner
+            .options
+            .vector_columns
+            .first()
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
+
         // Ensure the global cell grid exists (bootstrap once from the first
         // batch). Counts are left untouched — maintenance bumps them when it
         // moves incoming rows into cells.
@@ -1297,6 +1289,7 @@ impl SupertableWriter {
                     &self.buffer,
                     vec_dim,
                     super::handle::GLOBAL_VECTOR_CELL_COUNT,
+                    metric,
                 )
                 .ok_or_else(|| {
                     BuildError::Store("hidden index: bootstrap centroids from batch failed".into())
@@ -1304,6 +1297,7 @@ impl SupertableWriter {
                 strategy = crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                     column: column.clone(),
                     clusters: boot.clone(),
+                    routing: Default::default(),
                 };
                 self.inner.manifest.store(Arc::new(
                     self.inner
@@ -1324,10 +1318,8 @@ impl SupertableWriter {
         })
     }
 
-    fn prepare_hidden_cell_posting_build(
-        &mut self,
-    ) -> Result<HiddenCellPostingPrepare, BuildError> {
-        let plan = self.plan_hidden_cell_posting()?;
+    fn prepare_hidden_incoming_build(&mut self) -> Result<HiddenIncomingPrepare, BuildError> {
+        let plan = self.plan_hidden_incoming_shard()?;
         let inner = Arc::clone(&self.inner);
         self.inner
             .options
@@ -1335,8 +1327,8 @@ impl SupertableWriter {
             .install(|| execute_hidden_incoming_plan_in_scope(&inner, plan))
     }
 
-    fn commit_cell_posting_internal(&mut self) -> Result<(), BuildError> {
-        let prep = self.prepare_hidden_cell_posting_build()?;
+    fn commit_hidden_incoming_internal(&mut self) -> Result<(), BuildError> {
+        let prep = self.prepare_hidden_incoming_build()?;
         if prep.batch.new_entries.is_empty() {
             return Ok(());
         }
@@ -1346,11 +1338,11 @@ impl SupertableWriter {
             .storage
             .as_ref()
             .cloned()
-            .ok_or_else(|| BuildError::Store("cell posting commit requires storage".into()))?;
+            .ok_or_else(|| BuildError::Store("hidden incoming commit requires storage".into()))?;
         let inner = Arc::clone(&self.inner);
         block_on_writer_future(
             &self.inner,
-            publish_hidden_cell_posting_async(inner, storage, prep),
+            publish_hidden_incoming_async(inner, storage, prep),
         )?;
         Ok(())
     }
@@ -1365,10 +1357,10 @@ impl SupertableWriter {
         if self.buffer.is_empty() {
             return Ok::<(), BuildError>(());
         }
-        if self.inner.options.vector_layout == VectorLayout::CellPosting
+        if crate::supertable::handle::is_hidden_vector_index_table(&self.inner.options)
             && self.inner.options.storage.is_some()
         {
-            return self.commit_cell_posting_internal();
+            return self.commit_hidden_incoming_internal();
         }
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
@@ -1462,25 +1454,24 @@ impl SupertableWriter {
                 (shards, hints)
             };
 
-        // Parallel create: user superfile build + hidden cell-posting build
+        // Parallel create: user superfile build + hidden incoming build
         // share one writer-pool install (rayon::join, no nested install).
         // Parallel publish: user + hidden manifest/storage commits overlap.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
         let hidden_plan = if let Some(vw) = hidden_writer.as_mut() {
-            Some(vw.plan_hidden_cell_posting()?)
+            Some(vw.plan_hidden_incoming_shard()?)
         } else {
             None
         };
         let hidden_inner = hidden_writer.as_ref().map(|vw| Arc::clone(&vw.inner));
-        let (user_batch, hidden_side) = if let (Some(plan), Some(hidden_inner)) =
-            (hidden_plan, hidden_inner)
-        {
-            writer_pool.install(
+        let (user_batch, hidden_side) =
+            if let (Some(plan), Some(hidden_inner)) = (hidden_plan, hidden_inner) {
+                writer_pool.install(
                 || -> Result<
                     (
                         SuperfilePublishBatch,
-                        Option<(Arc<SupertableInner>, HiddenCellPostingPrepare)>,
+                        Option<(Arc<SupertableInner>, HiddenIncomingPrepare)>,
                     ),
                     BuildError,
                 > {
@@ -1502,13 +1493,13 @@ impl SupertableWriter {
                     ))
                 },
             )?
-        } else {
-            let outputs = fanout_shards(&writer_pool, &shards, |slice| {
-                build_one_shard(slice.as_slice(), &self.inner.options)
-            })?;
-            let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-            (batch, None)
-        };
+            } else {
+                let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+                    build_one_shard(slice.as_slice(), &self.inner.options)
+                })?;
+                let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                (batch, None)
+            };
 
         let drive = async {
             match hidden_side {
@@ -1519,17 +1510,21 @@ impl SupertableWriter {
                         .as_ref()
                         .cloned()
                         .ok_or_else(|| {
-                            BuildError::Store("hidden cell posting commit requires storage".into())
+                            BuildError::Store("hidden incoming commit requires storage".into())
                         })?;
                     let (user_res, hidden_res) = tokio::join!(
                         persist_superfile_publish_batch_async(&user_inner, user_batch),
-                        publish_hidden_cell_posting_async(Arc::clone(&hidden_inner), hidden_storage, prep),
+                        publish_hidden_incoming_async(
+                            Arc::clone(&hidden_inner),
+                            hidden_storage,
+                            prep
+                        ),
                     );
                     user_res?;
                     match hidden_res {
                         Ok(()) => {
                             spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
-                        },
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
@@ -1542,6 +1537,9 @@ impl SupertableWriter {
             }
         };
         block_on_writer_future(&self.inner, drive)?;
+        if self.inner.options.storage.is_some() {
+            schedule_background_storage_reclaim(Arc::clone(&self.inner));
+        }
         Ok(())
     }
 }
@@ -1611,9 +1609,7 @@ fn build_one_shard(
 }
 
 /// Same as [`build_one_shard`] but with an explicit vector layout override.
-/// The hidden index's "incoming" append superfile is built in IVF layout even
-/// though the hidden table's default layout is CellPosting (its cell
-/// superfiles).
+/// The hidden index's "incoming" append superfile is always built in IVF layout.
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
@@ -2105,7 +2101,6 @@ pub(super) fn prepare_superfile_with_uri(
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
 /// docs × 4 superfiles is the dominant cost. Manifest swap +
 /// storage write-through stay serial after the join.
-
 fn finish_superfile_entry(
     inner: &SupertableInner,
     entry: Arc<SuperfileEntry>,
@@ -2133,7 +2128,6 @@ fn finish_superfile_entry(
     Ok(Arc::new(staged))
 }
 
-
 /// Collected superfile entries + pending storage/cache writes for one publish.
 struct SuperfilePublishBatch {
     new_entries: Vec<Arc<SuperfileEntry>>,
@@ -2142,10 +2136,11 @@ struct SuperfilePublishBatch {
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 }
 
-/// Hidden cell-posting build artifacts produced before manifest swap.
-struct HiddenCellPostingPrepare {
+/// Hidden incoming build artifacts produced before manifest swap.
+struct HiddenIncomingPrepare {
     batch: SuperfilePublishBatch,
     cell_updates: HashMap<u32, u32>,
+    radii_updates: HashMap<u32, f32>,
     clusters: crate::supertable::manifest::ClusterCentroids,
     column: String,
 }
@@ -2186,24 +2181,23 @@ fn prepare_user_superfile_batch_in_scope(
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
-    let prepared: Vec<PreparedSuperfile> = outputs
-        .into_par_iter()
-        .zip(hints.into_par_iter())
-        .filter_map(|(shard, hint)| {
-            match prepare_superfile(inner, shard) {
-                Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(
-                    |entry| PreparedSuperfile {
+    let prepared: Vec<PreparedSuperfile> =
+        outputs
+            .into_par_iter()
+            .zip(hints.into_par_iter())
+            .filter_map(|(shard, hint)| match prepare_superfile(inner, shard) {
+                Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(|entry| {
+                    PreparedSuperfile {
                         entry,
                         bytes_for_store: p.bytes_for_store,
                         bytes_for_storage: p.bytes_for_storage,
                         bytes_for_cache: p.bytes_for_cache,
-                    },
-                )),
+                    }
+                })),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
 
@@ -2226,7 +2220,7 @@ async fn persist_superfile_publish_batch_async(
         return Ok(());
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
-        persist_commit_async(
+        let new_manifest = persist_commit_async(
             inner,
             storage,
             batch.new_entries,
@@ -2236,6 +2230,7 @@ async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
+        inner.manifest.store(Arc::new(new_manifest));
         // Already async — await `insert_warm` directly. Do NOT call
         // `warm_cache_after_commit` here: its `block_in_place` + nested
         // `block_on` inside the `tokio::join!` commit future deadlocks the
@@ -2285,15 +2280,15 @@ where
 }
 
 /// Minimum number of accumulated "incoming" IVF superfiles before background
-/// maintenance drains them into per-cell CellPosting superfiles. Amortizes the
-/// per-cell build so it isn't paid on every commit; until a drain fires the
+/// maintenance routes them into per-cell IVF superfiles. Amortizes the
+/// per-cell build so it isn't paid on every commit; until routing fires the
 /// incoming superfiles are simply scanned by queries (recall is unaffected).
-const INCOMING_DRAIN_THRESHOLD: usize = 4;
+const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
 
-/// Single-thread rayon pool for the drain's CPU work (cell assignment + per-cell
+/// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
 /// `par_iter`/`join` to one thread instead of fanning out across every core, so
-/// the drain can't starve foreground ingest CPU.
+/// routing can't starve foreground ingest CPU.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn maint_pool() -> &'static rayon::ThreadPool {
@@ -2306,17 +2301,16 @@ fn maint_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Background SPFresh maintenance: drain the hidden index's "incoming" IVF
-/// superfiles into per-cell CellPosting "cell superfiles" and delete the
-/// incoming ones. Only collapses once enough incoming superfiles accumulate so
-/// the per-cell build amortizes.
+/// Background SPFresh maintenance: route the hidden index's "incoming" IVF
+/// superfiles into per-cell IVF superfiles and delete the incoming ones. Only
+/// runs once enough incoming superfiles accumulate so the per-cell build amortizes.
 ///
-/// The drain's async work (object-store + disk-cache I/O) MUST run on the same
+/// The routing future's async work (object-store + disk-cache I/O) MUST run on the same
 /// `query_runtime` as the foreground path: the disk cache's async coordination
 /// primitives (per-URI fetch coordinators, background-fill notifications) are
 /// bound to that runtime, and awaiting them from a *different* runtime loses
 /// wakeups and intermittently deadlocks the commit. A short-lived thread drives
-/// it via `block_on` (the drain future borrows through `write_superfile_list`,
+/// it via `block_on` (the routing future borrows through `write_superfile_list`,
 /// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
 /// not by a separate runtime. The `compaction_outstanding` single-flight guard
 /// makes concurrent invocations cheap no-ops, so threads don't pile up.
@@ -2325,7 +2319,7 @@ fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
     std::thread::Builder::new()
         .name("hidden-maint".into())
         .spawn(move || {
-            if let Err(e) = runtime.block_on(drain_incoming_into_cells(inner)) {
+            if let Err(e) = runtime.block_on(route_incoming_to_manifest_cells(inner)) {
                 tracing::warn!(
                     "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
                 );
@@ -2334,15 +2328,59 @@ fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
         .ok();
 }
 
-/// Read each accumulated incoming IVF superfile's Sq8+ε rerank rows back to
-/// `(_id, vector)` working values, assign every row to its nearest global cell, build one CellPosting superfile
-/// per touched cell, then publish those cell superfiles and remove the drained
-/// incoming superfiles in one OCC commit. This is the design's step 3: the
-/// incoming append region is "shifted" into the sorted per-cell base.
-async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
+/// Read each accumulated incoming IVF superfile's Sq8+ε rows, assign every row
+/// to its nearest global cell, build one Sq8 IVF superfile per touched cell,
+/// then publish those cell superfiles and remove the routed incoming
+/// superfiles in one OCC commit.
+async fn route_incoming_to_manifest_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
+    route_incoming_to_manifest_cells_if_ready(inner, INCOMING_ROUTE_MIN_SUPERFILES, None).await
+}
+
+/// Route every accumulated incoming IVF superfile (threshold = 1). Used by
+/// tests and by [`await_incoming_routed_to_cells`] so maintenance can be awaited
+/// before compaction runs on the per-cell IVF superfiles.
+#[cfg(any(test, feature = "test-helpers"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::supertable) async fn await_incoming_routed_to_cells(
+    inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
     use std::sync::atomic::Ordering;
 
-    // Single-flight: skip if another drain/compaction is already running.
+    const FLUSH_MAX_ROUNDS: usize = 64;
+    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
+        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
+            super::handle::INCOMING_VECTOR_CELL,
+        ),
+    );
+    for _ in 0..FLUSH_MAX_ROUNDS {
+        while inner.compaction_outstanding.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, None).await?;
+        let remaining = inner
+            .manifest
+            .load_full()
+            .get_all_superfiles()
+            .iter()
+            .filter(|e| e.partition_key == incoming_key)
+            .count();
+        if remaining == 0 {
+            return Ok(());
+        }
+    }
+    Err(BuildError::Store(
+        "hidden incoming routing flush exceeded round budget".into(),
+    ))
+}
+
+async fn route_incoming_to_manifest_cells_if_ready(
+    inner: Arc<SupertableInner>,
+    min_incoming: usize,
+    assign_among: Option<&[u32]>,
+) -> Result<(), BuildError> {
+    use std::sync::atomic::Ordering;
+
+    // Single-flight: skip if another routing/compaction pass is already running.
     if inner
         .compaction_outstanding
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2370,14 +2408,16 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         .filter(|e| e.partition_key == incoming_key)
         .cloned()
         .collect();
-    if incoming.len() < INCOMING_DRAIN_THRESHOLD {
+    if incoming.len() < min_incoming {
         return Ok(());
     }
 
-    let (clusters, column) = match manifest.get_partition_strategy() {
-        crate::supertable::manifest::list::PartitionStrategy::VectorCell { clusters, column } => {
-            (clusters, column)
-        }
+    let (clusters, column, routing) = match manifest.get_partition_strategy() {
+        crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => (clusters, column, routing),
         _ => return Ok(()),
     };
     if clusters.n_cent == 0 || clusters.dim == 0 {
@@ -2386,7 +2426,6 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
     let Some(vec_col) = inner.options.vector_columns.first().cloned() else {
         return Ok(());
     };
-    let vec_dim = vec_col.dim;
     let metric = vec_col.metric;
 
     let store = inner.options.store.clone();
@@ -2394,12 +2433,11 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
     let storage_opt = inner.options.storage.clone();
     let storage = storage_opt
         .clone()
-        .ok_or_else(|| BuildError::Store("incoming drain requires storage".into()))?;
+        .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
-    // Read (_id, Sq8+ε vector) rows from each incoming IVF superfile. Vectors are
-    // decoded with the Sq8Residual machinery (per-cluster scale/offset + code +
-    // residual sidecar), not the Fp32 rerank path.
-    let mut buffer: Vec<BufferedBatch> = Vec::with_capacity(incoming.len());
+    // Read (_id, Sq8+ε IVF rows) from each incoming superfile — no fp32 reconstruction.
+    let mut all_materialized: Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow> =
+        Vec::with_capacity(incoming.len());
     for entry in &incoming {
         let reader = crate::supertable::query::dispatch::open_reader(
             &store,
@@ -2412,63 +2450,80 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
         let scalar = reader
             .get_record_batch(None)
             .map_err(|e| BuildError::Store(e.to_string()))?;
+        let id_arr = scalar
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| BuildError::Store("incoming routing: missing _id column".into()))?;
         let vec_reader = reader
             .vec()
             .ok_or_else(|| BuildError::Store("incoming superfile missing vector index".into()))?;
-        let n_rows = scalar.num_rows();
-        let flat = incoming_sq8_residual_rows_in_doc_order(&vec_reader, &column, n_rows, vec_dim)?;
-        buffer.push(BufferedBatch {
-            scalar,
-            vectors: vec![Arc::new(Float32Array::from(flat))],
-        });
+        let mut rows = incoming_materialized_rows_in_doc_order(vec_reader, &column, id_arr)?;
+        all_materialized.append(&mut rows);
     }
 
-    // Assign rows to cells and build one CellPosting superfile per touched
-    // cell. All of this is CPU-heavy (nearest-centroid assignment + Sq8 encode),
-    // so run it inside the single-thread maintenance pool: that pins every
-    // nested rayon `par_iter`/`join` to one core and keeps the drain from
-    // starving foreground ingest.
-    let (prepared, cell_updates): (Vec<PreparedSuperfile>, HashMap<u32, u32>) = maint_pool()
-        .install(|| -> Result<_, BuildError> {
-            let cell_shards = split_buffer_by_vector_cell(buffer, &clusters, metric, 0);
-            let mut prepared: Vec<PreparedSuperfile> = Vec::new();
-            let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-            for (cell_id, batches) in &cell_shards {
-                let mut rows = Vec::new();
-                append_batch_rows(&mut rows, batches, vec_dim);
-                rows.sort_by_key(|(id, _)| *id);
-                if rows.is_empty() {
-                    continue;
-                }
-                let added = rows.len() as u32;
-                let task = CellBuildTask {
-                    cell_id: *cell_id,
-                    rows,
-                };
-                let p = build_cell_posting_task(&inner, &inner.options, vec_dim, task)?;
-                let base = clusters.counts.get(*cell_id as usize).copied().unwrap_or(0);
-                cell_updates.insert(*cell_id, base.saturating_add(added));
-                prepared.push(p);
+    // Assign rows to cells and build one IVF superfile per touched cell.
+    let (prepared, cell_updates, radii_updates): (
+        Vec<PreparedSuperfile>,
+        HashMap<u32, u32>,
+        HashMap<u32, f32>,
+    ) = maint_pool().install(|| -> Result<_, BuildError> {
+        let mut by_cell: HashMap<
+            u32,
+            Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>,
+        > = HashMap::new();
+        for row in all_materialized {
+            let cell = if let Some(cands) = assign_among {
+                super::spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
+            } else {
+                super::spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
+            };
+            by_cell.entry(cell).or_default().push(row);
+        }
+        let mut prepared: Vec<PreparedSuperfile> = Vec::new();
+        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
+        let mut radii_updates: HashMap<u32, f32> = HashMap::new();
+        for (cell_id, mut rows) in by_cell {
+            if rows.is_empty() {
+                continue;
             }
-            Ok((prepared, cell_updates))
-        })?;
+            rows.sort_by_key(|r| r.stable_id);
+            for (local, row) in rows.iter_mut().enumerate() {
+                row.local_doc_id = local as u32;
+            }
+            let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
+            let added = rows.len() as u32;
+            let shard_radius =
+                super::spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
+            if shard_radius > 0.0 {
+                radii_updates.insert(cell_id, shard_radius);
+            }
+            let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
+            let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
+            cell_updates.insert(cell_id, base.saturating_add(added));
+            prepared.push(p);
+        }
+        Ok((prepared, cell_updates, radii_updates))
+    })?;
     if prepared.is_empty() {
         return Ok(());
     }
     let batch = collect_prepared_superfiles(&inner, prepared)?;
 
     // Bump per-cell counts so routing sees the now-populated cells.
-    let updated_clusters = super::spfresh::apply_cell_count_updates(&clusters, &cell_updates);
-    inner.manifest.store(Arc::new(
-        inner.manifest.load().with_partition_strategy(
+    let updated_clusters =
+        super::spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
+    inner
+        .manifest
+        .store(Arc::new(inner.manifest.load().with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                 column,
                 clusters: updated_clusters,
+                routing,
             },
-        ),
-    ));
+        )));
 
-    // Publish: add the cell superfiles, remove the drained incoming superfiles.
+    // Publish: add the cell superfiles, remove the routed incoming superfiles.
     let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
@@ -2481,46 +2536,306 @@ async fn drain_incoming_into_cells(inner: Arc<SupertableInner>) -> Result<(), Bu
     .map_err(|e| BuildError::Store(e.to_string()))?;
     inner.manifest.store(Arc::new(new_manifest));
 
-    // Delete the drained incoming superfile bytes from object storage.
-    for entry in &incoming {
-        let path = superfile_storage_path(&entry.uri);
-        let _ = storage.delete(&path).await;
-    }
+    schedule_background_storage_reclaim(Arc::clone(&inner));
     Ok(())
 }
 
-async fn publish_hidden_cell_posting_async(
+/// Load Sq8+ε IVF rows from one cell superfile (no fp32 reconstruction).
+async fn load_materialized_rows_from_ivf_superfile(
+    inner: &SupertableInner,
+    entry: &Arc<SuperfileEntry>,
+    column: &str,
+    now: time::Instant,
+) -> Result<Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>, BuildError> {
+    use crate::supertable::query::dispatch::open_reader;
+
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| BuildError::Store("cell maintenance requires storage".into()))?;
+    let store = inner.options.store.clone();
+    let disk_cache = inner.options.disk_cache.as_ref();
+
+    let bitmap = inner
+        .tombstone_cache
+        .as_ref()
+        .map(|t| t.bitmap_for(entry.superfile_id, now))
+        .transpose()
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+
+    let reader = if let Some(cache) = disk_cache {
+        cache
+            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?
+    } else {
+        open_reader(&store, None, Some(storage), entry)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?
+    };
+
+    let scalar = reader
+        .get_record_batch(None)
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let id_arr = scalar
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| BuildError::Store("IVF cell superfile missing _id column".into()))?;
+    let vec_reader = reader
+        .vec()
+        .ok_or_else(|| BuildError::Store("IVF cell superfile missing vector index".into()))?;
+    let mut rows = vec_reader.materialized_index_rows(column).ok_or_else(|| {
+        BuildError::Store(format!(
+            "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
+        ))
+    })?;
+    let n_rows = id_arr.len();
+    let mut by_local = vec![None; n_rows];
+    for row in &mut rows {
+        if bitmap
+            .as_ref()
+            .is_some_and(|bm| bm.contains(row.local_doc_id))
+        {
+            continue;
+        }
+        let slot = row.local_doc_id as usize;
+        if slot < n_rows {
+            row.stable_id = id_arr.value(slot);
+            by_local[slot] = Some(row.clone());
+        }
+    }
+    Ok(by_local
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            r.map(|mut row| {
+                row.local_doc_id = i as u32;
+                row
+            })
+        })
+        .collect())
+}
+
+/// Build one Sq8 IVF superfile via the normal superfile/vector builder.
+fn build_prepared_ivf_from_materialized(
+    inner: &SupertableInner,
+    partition_hint: u32,
+    rows: Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>,
+) -> Result<PreparedSuperfile, BuildError> {
+    use crate::superfile::vector::layout::VectorLayout;
+
+    if rows.is_empty() {
+        return Err(BuildError::NoDocsToBuild);
+    }
+    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
+    let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+    let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
+    Ok(PreparedSuperfile {
+        entry,
+        bytes_for_store: prepared.bytes_for_store,
+        bytes_for_storage: prepared.bytes_for_storage,
+        bytes_for_cache: prepared.bytes_for_cache,
+    })
+}
+
+/// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
+/// into the normal vector builder — no fp32 corpus decode.
+fn build_one_shard_from_materialized(
+    rows: &[crate::superfile::vector::cell_posting::MaterializedIvfRow],
+    options: &SupertableOptions,
+    vector_layout: crate::superfile::vector::layout::VectorLayout,
+) -> Result<ShardOutput, BuildError> {
+    use arrow_array::Decimal128Array;
+
+    let id_array = Decimal128Array::from_iter_values(rows.iter().map(|r| r.stable_id))
+        .with_precision_and_scale(
+            crate::supertable::options::DECIMAL128_PRECISION,
+            crate::supertable::options::DECIMAL128_SCALE,
+        )
+        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+    let scalar = RecordBatch::try_new(
+        options.scalar_schema(),
+        vec![Arc::new(id_array) as ArrayRef],
+    )
+    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+    let mut builder =
+        SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
+    builder.add_batch_ids_only(&scalar)?;
+    builder.load_materialized_ivf_rows(rows.to_vec())?;
+
+    let id_min = rows.iter().map(|r| r.stable_id).min().unwrap_or(0);
+    let id_max = rows.iter().map(|r| r.stable_id).max().unwrap_or(0);
+    let n_docs = rows.len() as u64;
+    let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
+    let bytes = Bytes::from(builder.finish()?);
+
+    Ok(ShardOutput {
+        bytes,
+        n_docs,
+        id_min,
+        id_max,
+        scalar_stats,
+    })
+}
+
+/// SPFresh steps 7–9: Sq8-native split, centroid extension, neighborhood
+/// reassign, then redrive rows through incoming staging (not direct cell publish).
+pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
+    inner: Arc<SupertableInner>,
+    merged_entry: &Arc<SuperfileEntry>,
+    split_cell: u32,
+) -> Result<(), BuildError> {
+    use crate::{
+        superfile::vector::cell_posting::{EncodedCellRow, MaterializedIvfRow},
+        supertable::manifest::list::PartitionStrategy,
+    };
+
+    if !super::spfresh::split_overflow_needed(merged_entry.n_docs) {
+        return Ok(());
+    }
+
+    let manifest = inner.manifest.load_full();
+    let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            let Some(vec_col) = inner.options.vector_columns.first() else {
+                return Ok(());
+            };
+            (clusters, column, routing, vec_col.metric, vec_col.dim)
+        }
+        _ => return Ok(()),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(());
+    }
+
+    let storage = inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
+
+    let now = time::Instant::now();
+    let overflow_materialized =
+        load_materialized_rows_from_ivf_superfile(&inner, merged_entry, &column, now).await?;
+    if overflow_materialized.len() < 2 {
+        return Ok(());
+    }
+    let overflow_encoded: Vec<EncodedCellRow> = overflow_materialized
+        .iter()
+        .map(|r| r.encoded.clone())
+        .collect();
+
+    let (sub0, sub1) = maint_pool().install(|| {
+        super::spfresh::plan_sq8_split(&overflow_encoded, &clusters, split_cell, metric)
+    });
+    let mut sub_centroids = sub0;
+    sub_centroids.extend_from_slice(&sub1);
+
+    let old_n_cent = clusters.n_cent;
+    let (mut updated_clusters, new_cell_id) =
+        super::spfresh::insert_split_centroid(&clusters, split_cell, &sub_centroids);
+    let neighborhood = super::spfresh::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
+
+    let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
+    for entry in manifest.superfiles.iter() {
+        if entry
+            .partition_hint
+            .is_some_and(|hint| neighborhood.contains(&hint))
+        {
+            to_remove.push(Arc::clone(entry));
+        }
+    }
+
+    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
+    for entry in &to_remove {
+        let mut rows =
+            load_materialized_rows_from_ivf_superfile(&inner, entry, &column, now).await?;
+        all_materialized.append(&mut rows);
+    }
+    if all_materialized.is_empty() {
+        return Ok(());
+    }
+
+    // Rows leave the neighborhood cells; counts reset until routing lands them.
+    super::spfresh::zero_cell_counts(&mut updated_clusters, &neighborhood);
+
+    let incoming_prepared = maint_pool().install(|| -> Result<PreparedSuperfile, BuildError> {
+        let mut rows = all_materialized;
+        rows.sort_by_key(|r| r.stable_id);
+        for (local, row) in rows.iter_mut().enumerate() {
+            row.local_doc_id = local as u32;
+        }
+        build_prepared_ivf_from_materialized(&inner, super::handle::INCOMING_VECTOR_CELL, rows)
+    })?;
+
+    let batch = collect_prepared_superfiles(&inner, vec![incoming_prepared])?;
+
+    inner
+        .manifest
+        .store(Arc::new(manifest.with_partition_strategy(
+            PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: updated_clusters.clone(),
+                routing,
+            },
+        )));
+
+    let new_manifest = persist_commit_async(
+        &inner,
+        Arc::clone(&storage),
+        batch.new_entries,
+        &to_remove,
+        batch.pending_storage_writes,
+        Vec::new(),
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    inner.manifest.store(Arc::new(new_manifest));
+
+    schedule_background_storage_reclaim(Arc::clone(&inner));
+
+    // Step 9: redrive through incoming → route into per-cell IVF superfiles.
+    // Step 6 neighborhood reassignment: restrict assignment to P−1/P/P₂/P+1.
+    route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, Some(&neighborhood)).await
+}
+
+async fn publish_hidden_incoming_async(
     inner: Arc<SupertableInner>,
     storage: Arc<dyn crate::storage::StorageProvider>,
-    prep: HiddenCellPostingPrepare,
+    prep: HiddenIncomingPrepare,
 ) -> Result<(), BuildError> {
     if prep.batch.new_entries.is_empty() {
         return Ok(());
     }
     let manifest_before = inner.manifest.load();
-    let old_list_uri = Some(list_uri(manifest_before.get_manifest_id()));
+    let routing = match manifest_before.get_partition_strategy() {
+        crate::supertable::manifest::list::PartitionStrategy::VectorCell { routing, .. } => routing,
+        _ => Default::default(),
+    };
     let updated_clusters =
-        super::spfresh::apply_cell_count_updates(&prep.clusters, &prep.cell_updates);
+        super::spfresh::apply_cell_updates(&prep.clusters, &prep.cell_updates, &prep.radii_updates);
     let updated_strategy = crate::supertable::manifest::list::PartitionStrategy::VectorCell {
         column: prep.column,
         clusters: updated_clusters,
+        routing,
     };
     inner.manifest.store(Arc::new(
         manifest_before.with_partition_strategy(updated_strategy),
     ));
-    let new_uris: std::collections::HashSet<_> = prep
-        .batch
-        .new_entries
-        .iter()
-        .map(|e| e.uri.clone())
-        .collect();
     // We already hold the incoming superfile's bytes here. Warm them onto local
-    // disk so the background SPFresh drain reads them via mmap instead of
+    // disk so the background SPFresh routing pass reads them via mmap instead of
     // cold-fetching ~one superfile per accumulated commit back from object
     // storage — those GETs otherwise contend with foreground ingest PUTs and
     // stall the commit. Cheap clone (Bytes is Arc-backed).
     let incoming_writes: Vec<(SuperfileUri, Bytes)> = prep.batch.pending_storage_writes.clone();
-    persist_commit_async(
+    let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
         prep.batch.new_entries,
@@ -2530,6 +2845,7 @@ async fn publish_hidden_cell_posting_async(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
+    inner.manifest.store(Arc::new(new_manifest));
     // We're already in async context here — warm the disk cache by awaiting
     // `insert_warm` directly. (Do NOT use `warm_cache_after_commit`, which does
     // a nested `block_in_place` + `block_on`; calling that from inside this
@@ -2539,25 +2855,20 @@ async fn publish_hidden_cell_posting_async(
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
                 tracing::warn!(
                     "supertable: warm incoming superfile {} failed: {e} \
-                     (drain will cold-fetch from storage)",
+                     (routing will cold-fetch from storage)",
                     uri.0
                 );
             }
         }
     }
-    for entry in &prep.batch.to_remove {
-        if !new_uris.contains(&entry.uri) {
-            let path = superfile_storage_path(&entry.uri);
-            let _ = storage.delete(&path).await;
-        }
-    }
-    if let Some(uri) = old_list_uri {
-        let _ = storage.delete(&uri).await;
-    }
+    schedule_background_storage_reclaim(Arc::clone(&inner));
     if let Some(cache) = inner.options.disk_cache.as_ref() {
         for (uri, bytes) in prep.batch.pending_cache_inserts {
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
-                tracing::warn!("supertable: warm cache pre-population for {} failed: {e}", uri.0);
+                tracing::warn!(
+                    "supertable: warm cache pre-population for {} failed: {e}",
+                    uri.0
+                );
             }
         }
     }
@@ -2638,7 +2949,6 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// superfiles go into one `ManifestPart` with a fresh `PartId`.
 /// With a real `PartitionStrategy`, `try_commit_attempt` runs
 /// the per-partition part-reuse path described on that fn.
-
 pub(in crate::supertable) async fn persist_commit_async(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,
@@ -3045,30 +3355,22 @@ async fn put_superfile_multipart(
     Ok(())
 }
 
-/// After a successful compaction manifest commit: delete superseded
-/// superfile objects from object storage and warm-insert the merged
-/// output into the disk cache. Superseded cache entries are left to
-/// the LRU — they are no longer manifest-visible and will age out.
+/// After a successful compaction manifest commit: warm-insert the merged
+/// output into the disk cache and schedule deferred reclaim of superseded
+/// superfiles. Superseded cache entries are left to the LRU — they are no
+/// longer manifest-visible and will age out.
 pub(in crate::supertable) async fn finalize_compaction_commit(
-    inner: &SupertableInner,
-    storage: &Arc<dyn crate::storage::StorageProvider>,
-    new_entries: &[Arc<SuperfileEntry>],
-    entries_to_remove: &[Arc<SuperfileEntry>],
+    inner: Arc<SupertableInner>,
+    _storage: &Arc<dyn crate::storage::StorageProvider>,
+    _new_entries: &[Arc<SuperfileEntry>],
+    _entries_to_remove: &[Arc<SuperfileEntry>],
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 ) {
-    let new_uris: std::collections::HashSet<_> =
-        new_entries.iter().map(|e| e.uri.clone()).collect();
-    for entry in entries_to_remove {
-        if new_uris.contains(&entry.uri) {
-            continue;
-        }
-        let path = superfile_storage_path(&entry.uri);
-        let _ = storage.delete(&path).await;
-    }
+    schedule_background_storage_reclaim(Arc::clone(&inner));
     if !pending_cache_inserts.is_empty()
         && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
     {
-        warm_cache_after_commit(inner, &cache, pending_cache_inserts);
+        warm_cache_after_commit(&inner, &cache, pending_cache_inserts);
     }
     if let (Some(cache), Some(budget)) = (
         inner.options.disk_cache.as_ref(),
@@ -3115,10 +3417,10 @@ fn warm_cache_after_commit(
     }
 }
 
-
-pub(crate) fn read_vector_layout_from_bytes(bytes: &bytes::Bytes) -> crate::superfile::vector::layout::VectorLayout {
-    use crate::superfile::format::kv;
-    use crate::superfile::vector::layout::VectorLayout;
+pub(crate) fn read_vector_layout_from_bytes(
+    bytes: &bytes::Bytes,
+) -> crate::superfile::vector::layout::VectorLayout {
+    use crate::superfile::{format::kv, vector::layout::VectorLayout};
     let Ok(kvs) = crate::superfile::format::footer::read_kv_metadata(bytes.as_ref()) else {
         return VectorLayout::Ivf;
     };
@@ -3261,7 +3563,7 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn superfile_is_queryable_via_store() {
         // The published superfile's bytes are in the store; we
         // can fetch a SuperfileReader and run bm25_search on it.

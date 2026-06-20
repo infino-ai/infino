@@ -32,6 +32,10 @@ use crate::superfile::{
         },
     },
     vector::{
+        cell_posting::{
+            MaterializedIvfRow, cluster_quant_from_medoid, encoded_ivf_kmeans,
+            materialize_sq8_residual_row_into_cluster_quant,
+        },
         distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq},
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
@@ -212,6 +216,11 @@ struct ColumnState {
     /// every `add()` writes the new vector straight to disk.
     spill: Option<SpillWriter>,
     spill_threshold_bytes: usize,
+    /// Sq8-native maintenance rows: when set, finish uses the materialized IVF
+    /// rebuild path instead of the fp32 ingest pipeline.
+    materialized_rows: Option<Vec<MaterializedIvfRow>>,
+    /// Pre-built subsection bytes from byte-splice merge (compaction path).
+    prebuilt_subsection: Option<SubsectionBytes>,
 }
 
 /// Lazily-created scratch directory for vector spill and bucket files.
@@ -371,8 +380,63 @@ impl VectorBuilder {
             pre_spill_buffer: Vec::new(),
             spill: None,
             spill_threshold_bytes,
+            materialized_rows: None,
+            prebuilt_subsection: None,
         });
         Ok(column_id)
+    }
+
+    /// Load Sq8+ε maintenance rows for one column. Reuses the normal IVF
+    /// subsection writer on finish — no fp32 corpus decode.
+    pub(crate) fn load_materialized_rows(
+        &mut self,
+        column_id: u32,
+        rows: Vec<MaterializedIvfRow>,
+    ) -> Result<(), BuildError> {
+        let idx = column_id as usize;
+        let col = self
+            .columns
+            .get_mut(idx)
+            .ok_or_else(|| BuildError::FtsColumnTypeInvalid {
+                column: format!("(unregistered vector column_id {column_id})"),
+                actual: "n/a".to_string(),
+            })?;
+        if !matches!(col.config.rerank_codec, RerankCodec::Sq8ResidualEpsilon) {
+            return Err(BuildError::VectorRerankCodecUnimplemented {
+                column: col.config.column.clone(),
+                codec: col.config.rerank_codec.name(),
+            });
+        }
+        col.n_docs = rows.len() as u32;
+        col.materialized_rows = Some(rows);
+        Ok(())
+    }
+
+    /// Inject a pre-built IVF subsection (byte-splice merge). Skips the
+    /// materialized rebuild and fp32 ingest paths on finish.
+    pub(crate) fn set_prebuilt_subsection(
+        &mut self,
+        column_id: u32,
+        subsection: crate::superfile::vector::ivf_merge::MergedIvfSubsection,
+    ) -> Result<(), BuildError> {
+        let idx = column_id as usize;
+        let col = self
+            .columns
+            .get_mut(idx)
+            .ok_or_else(|| BuildError::FtsColumnTypeInvalid {
+                column: format!("(unregistered vector column_id {column_id})"),
+                actual: "n/a".to_string(),
+            })?;
+        col.n_docs = subsection.n_docs;
+        col.materialized_rows = None;
+        col.prebuilt_subsection = Some(SubsectionBytes {
+            bytes: subsection.bytes,
+            n_cent: subsection.n_cent,
+            summary_offset_in_sub: subsection.summary_offset_in_sub,
+            codec_meta_offset_in_sub: subsection.codec_meta_offset_in_sub,
+            codec_meta_size: subsection.codec_meta_size,
+        });
+        Ok(())
     }
 
     /// Override the k-means training sample size for a column. Must
@@ -543,6 +607,10 @@ impl VectorBuilder {
         if !columns.is_empty() {
             let scratch_path = scratch_dir.path()?.to_path_buf();
             for (col_idx, col) in columns.into_iter().enumerate() {
+                if let Some(prebuilt) = col.prebuilt_subsection {
+                    subsections.push(prebuilt);
+                    continue;
+                }
                 subsections.push(build_subsection_streaming(
                     col_idx as u32,
                     col,
@@ -726,6 +794,255 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///    centroid order, materialising the cluster-contiguous
 ///    `codes[]`, `full[]`, and `doc_ids[]` regions and the
 ///    cluster-index entries.
+/// Build one column's subsection from Sq8+ε maintenance rows. Reuses the same
+/// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
+fn build_subsection_from_materialized(
+    column_id: u32,
+    cfg: VectorConfig,
+    mut rows: Vec<MaterializedIvfRow>,
+) -> Result<SubsectionBytes, BuildError> {
+    use crate::superfile::vector::cell_posting::encoded_component_at;
+
+    rows.sort_by_key(|r| r.local_doc_id);
+    let n_docs = rows.len();
+    if n_docs == 0 {
+        return Err(BuildError::VectorSchemaMismatch(
+            "materialized IVF rebuild requires at least one row".into(),
+        ));
+    }
+    let dim = cfg.dim;
+    let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
+    let n_cent = cfg
+        .n_cent
+        .max(1)
+        .min(n_cent_row_count_cap(n_docs))
+        .min(n_docs.max(1));
+    let centroids = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
+
+    let mut summary_centroid = vec![0.0f32; dim];
+    if !centroids.is_empty() {
+        let mut acc = vec![0.0f64; dim];
+        for c in 0..n_cent {
+            let cv = &centroids[c * dim..(c + 1) * dim];
+            for (a, &x) in acc.iter_mut().zip(cv) {
+                *a += x as f64;
+            }
+        }
+        let inv = 1.0 / (n_cent as f64);
+        for (s, a) in summary_centroid.iter_mut().zip(&acc) {
+            *s = (*a * inv) as f32;
+        }
+    }
+
+    let quant = BitQuantizer::new(dim);
+    let code_bytes = quant.code_bytes();
+    let codec = cfg.rerank_codec;
+    debug_assert!(matches!(codec, RerankCodec::Sq8ResidualEpsilon));
+
+    let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
+    for row in &rows {
+        let mut best_c = 0usize;
+        let mut best_score = f32::INFINITY;
+        for c in 0..n_cent {
+            let cv = &centroids[c * dim..(c + 1) * dim];
+            let score = match cfg.metric {
+                Metric::L2Sq => {
+                    let mut s = 0.0f32;
+                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
+                        let diff = encoded_component_at(&row.encoded, d) - cv_d;
+                        s += diff * diff;
+                    }
+                    s
+                }
+                Metric::Cosine => {
+                    let mut dot = 0.0f32;
+                    let mut na = 0.0f32;
+                    let mut nb = 0.0f32;
+                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
+                        let va = encoded_component_at(&row.encoded, d);
+                        dot += va * cv_d;
+                        na += va * va;
+                        nb += cv_d * cv_d;
+                    }
+                    let denom = na.sqrt() * nb.sqrt();
+                    if denom > 0.0 {
+                        1.0 - dot / denom
+                    } else {
+                        1.0 - dot
+                    }
+                }
+                Metric::NegDot => {
+                    let mut dot = 0.0f32;
+                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
+                        dot += encoded_component_at(&row.encoded, d) * cv_d;
+                    }
+                    -dot
+                }
+            };
+            if score < best_score {
+                best_score = score;
+                best_c = c;
+            }
+        }
+        buckets[best_c].push(row);
+    }
+
+    let mut bucket_counts = vec![0u32; n_cent];
+    let mut summary_radius_sq_max = 0.0f32;
+    for (c, bucket) in buckets.iter().enumerate() {
+        bucket_counts[c] = bucket.len() as u32;
+        for row in bucket {
+            let r_sq = (0..dim)
+                .map(|d| {
+                    let v = encoded_component_at(&row.encoded, d);
+                    let diff = v - summary_centroid[d];
+                    diff * diff
+                })
+                .sum::<f32>();
+            if r_sq > summary_radius_sq_max {
+                summary_radius_sq_max = r_sq;
+            }
+        }
+    }
+
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = buckets
+        .iter()
+        .map(|bucket| {
+            if bucket.is_empty() {
+                (vec![1.0f32; dim], vec![0.0f32; dim])
+            } else {
+                cluster_quant_from_medoid(cfg.metric, dim, bucket)
+            }
+        })
+        .collect();
+
+    let summary_radius_x100 = (summary_radius_sq_max.sqrt() * SUMMARY_RADIUS_SCALE)
+        .max(0.0)
+        .min(u32::MAX as f32) as u32;
+
+    let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
+    let summary_size = dim * 4;
+    let centroids_size = n_cent * dim * 4;
+    let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
+    let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    let per_cluster_blocks_size = n_docs * (code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes);
+
+    let summary_off = SUB_HEADER_SIZE;
+    let centroids_off = summary_off + summary_size;
+    let cluster_idx_off = centroids_off + centroids_size;
+    let codec_meta_off = cluster_idx_off + cluster_idx_size;
+    let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+
+    let total_size_before_crc = SUB_HEADER_SIZE
+        + summary_size
+        + centroids_size
+        + cluster_idx_size
+        + codec_meta_size
+        + per_cluster_blocks_size;
+
+    let mut bytes = vec![0u8; total_size_before_crc];
+
+    bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
+    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
+        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
+    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
+        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(summary_off as u64).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
+        .copy_from_slice(&summary_radius_x100.to_le_bytes());
+    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(centroids_off as u64).to_le_bytes());
+    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
+    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
+
+    bytes[summary_off..summary_off + summary_size]
+        .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
+    bytes[centroids_off..centroids_off + centroids_size]
+        .copy_from_slice(bytemuck::cast_slice(&centroids));
+
+    let sq8_scale_block_off = codec_meta_off;
+    let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
+    let sq8_norms_block_off = match cfg.metric {
+        Metric::L2Sq | Metric::Cosine => Some(sq8_offset_block_off + n_cent * dim * 4),
+        Metric::NegDot => None,
+    };
+
+    for (cid, (scale_c, offset_c)) in sq8_quantizers.iter().enumerate().take(n_cent) {
+        let sc_off = sq8_scale_block_off + cid * dim * 4;
+        bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+        let oc_off = sq8_offset_block_off + cid * dim * 4;
+        bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
+    }
+
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let mut block_cursor = 0usize;
+    let mut acc_off = 0u32;
+    for &centroid_id in &cluster_order {
+        let cnt = bucket_counts[centroid_id];
+        let idx_base = cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
+        bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
+            .copy_from_slice(&acc_off.to_le_bytes());
+        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
+            .copy_from_slice(&cnt.to_le_bytes());
+
+        if cnt > 0 {
+            let cluster_count = cnt as usize;
+            let block_base = per_cluster_blocks_off + block_cursor;
+            let codes_len = cluster_count * code_bytes;
+            let ids_len = cluster_count * 4;
+            let full_chunk_base = block_base + codes_len + ids_len;
+            let bucket = &buckets[centroid_id];
+            let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
+            let store_norm = sq8_norms_block_off.is_some();
+            let mut row_buf = vec![0u8; dim * 2];
+            for (i, row) in bucket.iter().enumerate() {
+                let code_off = block_base + i * code_bytes;
+                bytes[code_off..code_off + code_bytes].copy_from_slice(&row.rabitq_code);
+                let id_off = block_base + codes_len + i * 4;
+                bytes[id_off..id_off + 4].copy_from_slice(&row.local_doc_id.to_le_bytes());
+
+                let norm_sq = materialize_sq8_residual_row_into_cluster_quant(
+                    &row.encoded,
+                    scale_c,
+                    offset_c,
+                    dim,
+                    &mut row_buf,
+                    store_norm,
+                );
+                let full_off = full_chunk_base + i * per_vec_bytes;
+                bytes[full_off..full_off + dim * 2].copy_from_slice(&row_buf);
+                if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm_sq) {
+                    let n_off = norms_off + (acc_off as usize + i) * 4;
+                    bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                }
+            }
+            block_cursor += cluster_count * cluster_stride;
+        }
+        acc_off += cnt;
+    }
+    let _ = column_id;
+
+    let crc = crc32c(&bytes);
+    let mut out = bytes;
+    out.extend_from_slice(&crc.to_le_bytes());
+
+    Ok(SubsectionBytes {
+        bytes: out,
+        n_cent,
+        summary_offset_in_sub: summary_off,
+        codec_meta_offset_in_sub: if codec_meta_size == 0 {
+            0
+        } else {
+            codec_meta_off
+        },
+        codec_meta_size,
+    })
+}
+
 fn build_subsection_streaming(
     column_id: u32,
     col: ColumnState,
@@ -738,7 +1055,14 @@ fn build_subsection_streaming(
         pre_spill_buffer,
         spill,
         spill_threshold_bytes: _,
+        materialized_rows,
+        prebuilt_subsection: _,
     } = col;
+
+    if let Some(rows) = materialized_rows {
+        drop(reservoir);
+        return build_subsection_from_materialized(column_id, cfg, rows);
+    }
 
     let dim = cfg.dim;
     let n_docs = n_docs_u32 as usize;

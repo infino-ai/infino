@@ -13,9 +13,10 @@
 
 pub mod builder;
 pub mod cell_posting;
-pub mod layout;
 pub mod distance;
+pub mod ivf_merge;
 pub mod kmeans;
+pub mod layout;
 pub mod quant;
 pub mod reader;
 pub mod rerank_codec;

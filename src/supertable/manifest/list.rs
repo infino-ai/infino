@@ -107,10 +107,32 @@ pub struct VectorColumnInfo {
     pub metric: String,
 }
 
+/// Adaptive cell-probe tuning for the hidden VectorCell index.
+/// Calibrated per table; persisted in the manifest list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRoutingParams {
+    /// Nearest cells always probed (recall floor).
+    pub nprobe_min: usize,
+    /// Hard cap on cells probed per query (GET budget).
+    pub nprobe_max: usize,
+    /// Margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
+    pub slack: f32,
+}
+
+impl Default for CellRoutingParams {
+    fn default() -> Self {
+        Self {
+            nprobe_min: 4,
+            nprobe_max: 64,
+            slack: 1.0,
+        }
+    }
+}
+
 /// How superfiles are routed into manifest parts. Stamped into
 /// the list on first commit; immutable thereafter (changes
 /// require external compaction).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
     TimeRange {
         column: String,
@@ -132,6 +154,7 @@ pub enum PartitionStrategy {
     VectorCell {
         column: String,
         clusters: super::ClusterCentroids,
+        routing: CellRoutingParams,
     },
 }
 
@@ -794,7 +817,46 @@ enum PartitionStrategyDto {
     VectorCell {
         column: String,
         clusters_b64: String,
+        #[serde(default)]
+        routing: Option<CellRoutingParamsDto>,
     },
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct CellRoutingParamsDto {
+    #[serde(default)]
+    nprobe_min: usize,
+    #[serde(default)]
+    nprobe_max: usize,
+    #[serde(default)]
+    slack: f32,
+}
+
+impl From<CellRoutingParams> for CellRoutingParamsDto {
+    fn from(r: CellRoutingParams) -> Self {
+        Self {
+            nprobe_min: r.nprobe_min,
+            nprobe_max: r.nprobe_max,
+            slack: r.slack,
+        }
+    }
+}
+
+impl From<CellRoutingParamsDto> for CellRoutingParams {
+    fn from(d: CellRoutingParamsDto) -> Self {
+        let mut r = CellRoutingParams::default();
+        if d.nprobe_min > 0 {
+            r.nprobe_min = d.nprobe_min;
+        }
+        if d.nprobe_max > 0 {
+            r.nprobe_max = d.nprobe_max;
+        }
+        if d.slack > 0.0 {
+            r.slack = d.slack;
+        }
+        r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
+        r
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -843,7 +905,7 @@ struct FtsSummaryAggDto {
     /// `None` ↔ field absent in JSON, not a `null`. Cleaner
     /// `jq` shape and avoids the
     /// `null`-vs-`{"min":"","max":""}` ambiguity.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     term_range_union: Option<TermRangeUnionDto>,
 }
 
@@ -1102,11 +1164,16 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
             }
         }
-        PartitionStrategy::VectorCell { column, clusters } => {
+        PartitionStrategy::VectorCell {
+            column,
+            clusters,
+            routing,
+        } => {
             let enc = super::encoding::encode_cluster_centroids(clusters);
             PartitionStrategyDto::VectorCell {
                 column: column.clone(),
                 clusters_b64: encode_b64(&enc),
+                routing: Some(CellRoutingParamsDto::from(*routing)),
             }
         }
     }
@@ -1137,12 +1204,17 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
         PartitionStrategyDto::VectorCell {
             column,
             clusters_b64,
+            routing,
         } => {
             let bytes = decode_b64(&clusters_b64, "partition_strategy.clusters")?;
             let clusters = super::encoding::decode_cluster_centroids(&bytes).map_err(|e| {
                 ListParseError::BadFieldValue("partition_strategy.clusters", e.to_string())
             })?;
-            PartitionStrategy::VectorCell { column, clusters }
+            PartitionStrategy::VectorCell {
+                column,
+                clusters,
+                routing: routing.map(CellRoutingParams::from).unwrap_or_default(),
+            }
         }
     })
 }
@@ -1907,6 +1979,7 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![1, 1],
             ),
+            routing: Default::default(),
         };
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
@@ -2142,14 +2215,15 @@ mod tests {
         );
     }
 
-
     #[test]
     fn vector_index_storage_prefix_roundtrip() {
         let mut list = empty_list();
-        list.vector_index_storage_prefix =
-            Some("_infino_deadbeef_vector_index".into());
+        list.vector_index_storage_prefix = Some("_infino_deadbeef_vector_index".into());
         let got = decode(&encode(&list).expect("encode")).expect("decode");
-        assert_eq!(got.vector_index_storage_prefix, list.vector_index_storage_prefix);
+        assert_eq!(
+            got.vector_index_storage_prefix,
+            list.vector_index_storage_prefix
+        );
     }
 
     #[test]

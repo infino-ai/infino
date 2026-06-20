@@ -306,9 +306,7 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                     "vector_layout".into(),
                     AvroValue::Union(
                         AVRO_UNION_VALUE_INDEX,
-                        Box::new(AvroValue::String(
-                            seg.vector_layout.as_kv_value().into(),
-                        )),
+                        Box::new(AvroValue::String(seg.vector_layout.as_kv_value().into())),
                     ),
                 ),
             ])

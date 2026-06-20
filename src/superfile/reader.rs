@@ -49,8 +49,10 @@ use crate::{
             reader::{self as fts_reader, BoolMode, FtsReader},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
-        vector::layout::VectorLayout,
-        vector::reader::{self as vector_reader, VectorReader},
+        vector::{
+            layout::VectorLayout,
+            reader::{self as vector_reader, VectorReader},
+        },
     },
     supertable::query::provider::tombstone_access_plan,
 };
@@ -408,7 +410,8 @@ impl SuperfileReader {
                         verify_crc: opts.verify_crc,
                     },
                 )?)
-            }        } else if any_present(&kv_map, kv::VEC_KEYS) {
+            }
+        } else if any_present(&kv_map, kv::VEC_KEYS) {
             return Err(ReadError::MalformedKv(
                 "partial inf.vec.* keys present".into(),
             ));

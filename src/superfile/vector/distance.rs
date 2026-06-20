@@ -665,6 +665,55 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
     }
 }
 
+/// Asymmetric distance from one stored Sq8+ε row to a manifest Sq8 centroid.
+/// Folds per-row scale/offset and per-centroid min/scale without materializing
+/// fp32 vector buffers — for SPFresh maintenance assignment only (not query).
+pub(crate) fn distance_encoded_to_centroid(
+    metric: Metric,
+    dim: usize,
+    row_scale: &[f32],
+    row_offset: &[f32],
+    row_codes: &[u8],
+    row_residuals: &[u8],
+    row_norm_sq: Option<f32>,
+    cent_min: f32,
+    cent_scale: f32,
+    cent_codes: &[u8],
+) -> f32 {
+    debug_assert_eq!(row_scale.len(), dim);
+    debug_assert_eq!(row_offset.len(), dim);
+    debug_assert_eq!(row_codes.len(), dim);
+    debug_assert_eq!(row_residuals.len(), dim);
+    debug_assert_eq!(cent_codes.len(), dim);
+    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    let mut dot = 0.0f32;
+    let mut row_norm_sq_acc = 0.0f32;
+    let mut cent_norm_sq = 0.0f32;
+    for d in 0..dim {
+        let doc_d = row_offset[d]
+            + row_scale[d]
+                * (row_codes[d] as f32 + (i8::from_le_bytes([row_residuals[d]]) as f32) * inv_div);
+        let cent_d = cent_min + cent_scale * cent_codes[d] as f32;
+        dot += doc_d * cent_d;
+        row_norm_sq_acc += doc_d * doc_d;
+        cent_norm_sq += cent_d * cent_d;
+    }
+    let row_norm_sq = row_norm_sq.unwrap_or(row_norm_sq_acc);
+    match metric {
+        Metric::NegDot => -dot,
+        Metric::Cosine => {
+            let row_norm = row_norm_sq.sqrt();
+            let cent_norm = cent_norm_sq.sqrt();
+            if row_norm > 0.0 && cent_norm > 0.0 {
+                COSINE_DISTANCE_BASE - dot / (row_norm * cent_norm)
+            } else {
+                COSINE_DISTANCE_BASE - dot
+            }
+        }
+        Metric::L2Sq => row_norm_sq - L2_CROSS_TERM_COEFF * dot + cent_norm_sq,
+    }
+}
+
 /// Dot-product reduction for `Sq8Kernel::distance_at`:
 /// `Σ_d q_prime[d] * (code_bytes[d] as f32)` over the first `dim`
 /// dimensions. This is the `q_prime · code` half of the Sq8 distance

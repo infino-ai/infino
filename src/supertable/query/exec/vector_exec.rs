@@ -1006,7 +1006,7 @@ mod tests {
     /// path and exercise its `TableProvider` metadata methods (`Debug`,
     /// `as_any`, `table_type`) plus the lowered `VectorSearchExec`'s
     /// `name` / `Debug` — none of which normal query execution touches.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vector_table_and_exec_trait_methods() {
         let dim = 16;
         let st = supertable_one_superfile(dim, 8);

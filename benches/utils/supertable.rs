@@ -438,9 +438,6 @@ pub fn run() {
 const WARM_ITERS: usize = 20;
 const COLD_ITERS: usize = 5;
 const TOP_K: usize = 10;
-const VECTOR_NPROBE: usize = 6;
-/// Bench default rerank at the 1M×1024 scale — see `superfile::vector` docs.
-const VECTOR_RERANK_MULT: usize = 256;
 
 /// Selected phases for a per-modality supertable runner.
 ///
@@ -828,8 +825,10 @@ pub mod vector {
     // live in `crate::executors::vector` (shared by both tiers).
     const N_CORRECTNESS_QUERIES: usize = 20;
     const N_CALIBRATION_QUERIES: usize = 100;
-    const DEFAULT_NPROBE: usize = VECTOR_NPROBE;
-    const DEFAULT_RERANK_MULT: usize = VECTOR_RERANK_MULT;
+    // Sourced from the engine's public defaults so the bench can't drift from
+    // what an unfiltered `VectorSearchOptions::default()` query resolves to.
+    const DEFAULT_NPROBE: usize = infino::superfile::reader::VectorSearchOptions::DEFAULT_NPROBE;
+    const DEFAULT_RERANK_MULT: usize = infino::superfile::reader::VectorSearchOptions::RERANK_MULT;
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
@@ -847,15 +846,15 @@ pub mod vector {
     /// [`VectorSearchOptions::default()`] with optional env overrides.
     fn bench_default_opts() -> infino::superfile::reader::VectorSearchOptions {
         let mut opts = infino::superfile::reader::VectorSearchOptions::default();
-        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_NPROBE") {
-            if let Ok(n) = v.parse() {
-                opts = opts.with_nprobe(n);
-            }
+        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_NPROBE")
+            && let Ok(n) = v.parse()
+        {
+            opts = opts.with_nprobe(n);
         }
-        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_RERANK") {
-            if let Ok(n) = v.parse() {
-                opts = opts.with_rerank_mult(n);
-            }
+        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_RERANK")
+            && let Ok(n) = v.parse()
+        {
+            opts = opts.with_rerank_mult(n);
         }
         opts
     }

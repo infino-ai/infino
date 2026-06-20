@@ -246,7 +246,7 @@ impl Manifest {
                 list: Some(list),
                 parts: DashMap::new(),
                 loader: Some(loader),
-            stamped_partition_strategy: None,
+                stamped_partition_strategy: None,
             }
         } else {
             Self {
@@ -335,9 +335,7 @@ impl Manifest {
         {
             return Some(prefix);
         }
-        self.superfile_list
-            .vector_index_storage_prefix
-            .as_deref()
+        self.superfile_list.vector_index_storage_prefix.as_deref()
     }
 
     fn stamp_vector_index_storage_prefix(
@@ -668,10 +666,7 @@ impl Manifest {
     /// Stamp (or replace) the partition strategy on this manifest snapshot.
     /// Updates both the persisted list metadata and the in-memory options
     /// fallback used before the first list write lands.
-    pub fn with_partition_strategy(
-        &self,
-        strategy: list::PartitionStrategy,
-    ) -> Self {
+    pub fn with_partition_strategy(&self, strategy: list::PartitionStrategy) -> Self {
         let new_list = match self.list.as_ref() {
             Some(list) => {
                 let mut list = list.clone();
@@ -693,7 +688,6 @@ impl Manifest {
             stamped_partition_strategy: Some(strategy),
         }
     }
-
 
     /// Lazy-load entry point for manifest parts.
     ///
@@ -763,7 +757,9 @@ impl Manifest {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for cell in routed_cells {
-            let pk = encode_partition_key(&crate::supertable::manifest::partition::PartitionKey::VectorCell(*cell));
+            let pk = encode_partition_key(
+                &crate::supertable::manifest::partition::PartitionKey::VectorCell(*cell),
+            );
             for sf in self.superfiles_for_partition_key(&pk).await? {
                 if seen.insert(sf.superfile_id) {
                     out.push(sf);
@@ -1002,8 +998,7 @@ impl Manifest {
                 })
                 .collect(),
             partition_strategy: strategy,
-            vector_index_storage_prefix: self
-                .stamp_vector_index_storage_prefix(&vector_columns),
+            vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
             parts: out_list_entries_after_removal,
         };
 
@@ -1749,6 +1744,10 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Per-cluster max member distance from the Sq8 centroid (same units
+    /// as [`Self::score_one`]). Empty on legacy manifests; adaptive
+    /// probing falls back to centroid distance when a cell has no radius.
+    pub radii: Vec<f32>,
     /// Lazily-computed per-cluster `(Σcode, Σcode²)` — the
     /// query-independent moments the folded L2 scoring needs to
     /// reconstruct `‖centroid‖²` without dequantizing. Populated on
@@ -1765,6 +1764,7 @@ impl PartialEq for ClusterCentroids {
             && self.mins == other.mins
             && self.scales == other.scales
             && self.counts == other.counts
+            && self.radii == other.radii
     }
 }
 
@@ -1828,8 +1828,111 @@ impl ClusterCentroids {
             mins,
             scales,
             counts,
+            radii: Vec::new(),
             code_moments: OnceLock::new(),
         }
+    }
+
+    /// Attach per-cell member radii (must match `n_cent` when non-empty).
+    pub fn with_radii(mut self, radii: Vec<f32>) -> Self {
+        if radii.len() == self.n_cent as usize {
+            self.radii = radii;
+        }
+        self
+    }
+
+    /// Score cluster `c` against `query` in the Sq8 domain (same kernel as
+    /// [`Self::score_clusters_into`]).
+    pub fn score_one(
+        &self,
+        metric: Metric,
+        c: usize,
+        query: &[f32],
+        sum_q: f32,
+        norm_q_sq: f32,
+    ) -> f32 {
+        let d = self.dim as usize;
+        debug_assert_eq!(query.len(), d);
+        let codes = &self.codes[c * d..(c + 1) * d];
+        let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
+        match metric {
+            Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
+            Metric::NegDot => -dot_qc,
+            Metric::L2Sq => {
+                let moments = self.code_moments.get_or_init(|| {
+                    (0..self.n_cent as usize)
+                        .map(|i| u8_sum_sumsq(&self.codes[i * d..(i + 1) * d]))
+                        .collect()
+                });
+                let (sum_c, sumsq_c) = moments[c];
+                let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
+                    + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
+                    + self.scales[c] * self.scales[c] * sumsq_c;
+                norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
+            }
+        }
+    }
+
+    /// Adaptive cell selection for hidden-index routing: score every populated
+    /// cell, apply the triangle-inequality lower bound (`d − r`), and return
+    /// the probe set (nearest-first by centroid distance).
+    pub fn select_cells_adaptive(
+        &self,
+        metric: Metric,
+        query: &[f32],
+        nprobe_floor: usize,
+        routing: crate::supertable::manifest::list::CellRoutingParams,
+    ) -> Vec<u32> {
+        use std::cmp::Ordering;
+
+        let dim = self.dim as usize;
+        if self.n_cent == 0 || dim == 0 || query.len() != dim {
+            return (0..self.n_cent).collect();
+        }
+        let sum_q: f32 = query.iter().sum();
+        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(self.n_cent as usize);
+        self.score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+            scored.push((c, score));
+        });
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        if scored.is_empty() {
+            return Vec::new();
+        }
+        let d_star = scored[0].1;
+        let r_star = self.radii.get(scored[0].0 as usize).copied().unwrap_or(0.0);
+        let tau = if r_star > 0.0 {
+            d_star + routing.slack * r_star
+        } else {
+            d_star * (1.0 + routing.slack)
+        };
+        let lb = |idx: usize| {
+            let (c, d) = scored[idx];
+            let r = self.radii.get(c as usize).copied().unwrap_or(0.0);
+            (d - r).max(0.0)
+        };
+        let nprobe_min = nprobe_floor.max(routing.nprobe_min).max(1);
+        let nprobe_max = routing.nprobe_max.max(nprobe_min);
+        let n = scored.len();
+        let floor = nprobe_min.min(n);
+        let mut chosen = vec![false; n];
+        let mut order: Vec<usize> = Vec::with_capacity(nprobe_max.min(n));
+        for (i, slot) in chosen.iter_mut().enumerate().take(floor) {
+            *slot = true;
+            order.push(i);
+        }
+        let mut by_lb: Vec<usize> = (0..n).filter(|&i| !chosen[i]).collect();
+        by_lb.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
+        for i in by_lb {
+            if order.len() >= nprobe_max {
+                break;
+            }
+            if lb(i) <= tau {
+                order.push(i);
+            }
+        }
+        order.sort_unstable();
+        order.into_iter().map(|i| scored[i].0).collect()
     }
 
     /// Score every populated cluster against `query` directly in the
@@ -1987,6 +2090,35 @@ mod tests {
     /// Folded Sq8-domain scoring must equal dequantize-then-distance
     /// (the prior selection path) up to f32 association order, for all
     /// three metrics, and must skip count-0 clusters.
+    #[test]
+    fn cluster_centroids_radii_roundtrip_and_adaptive_floor() {
+        use crate::supertable::manifest::{encoding, list::CellRoutingParams};
+
+        let clusters = ClusterCentroids::from_fp32(
+            4,
+            4,
+            &[
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0,
+            ],
+            vec![1, 1, 1, 1],
+        )
+        .with_radii(vec![0.5, 1.0, 2.0, 3.0]);
+        let bytes = encoding::encode_cluster_centroids(&clusters);
+        let decoded = encoding::decode_cluster_centroids(&bytes).expect("decode");
+        assert_eq!(decoded.radii, clusters.radii);
+
+        let query = [0.1, 0.0, 0.0, 0.0];
+        let routing = CellRoutingParams {
+            nprobe_min: 2,
+            nprobe_max: 4,
+            slack: 0.0,
+        };
+        let routed = decoded.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
+        assert!(routed.len() >= 2);
+        assert!(routed.len() <= 4);
+        assert_eq!(routed[0], decoded.nearest_cell(Metric::L2Sq, &query));
+    }
+
     #[test]
     fn score_clusters_into_matches_dequantized_distance() {
         let (n_cent, dim) = (17u32, 96u32);
@@ -2440,7 +2572,7 @@ mod tests {
                 list: Some(list),
                 parts: DashMap::new(),
                 loader: Some(loader),
-            stamped_partition_strategy: None,
+                stamped_partition_strategy: None,
             }
         }
 
@@ -2665,7 +2797,7 @@ mod tests {
             list: Some(list),
             parts: DashMap::new(),
             loader: None,
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -2921,7 +3053,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3277,7 +3409,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3372,7 +3504,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3520,7 +3652,7 @@ mod tests {
             list: Some(list),
             parts,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // Add one new entry for the partition
@@ -3652,7 +3784,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let new_entries = vec![
@@ -3783,7 +3915,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // Only touch partition A
@@ -3961,7 +4093,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let new_entries = vec![
@@ -4072,7 +4204,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4163,7 +4295,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4289,7 +4421,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4431,7 +4563,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4536,7 +4668,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4618,7 +4750,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -4744,7 +4876,7 @@ mod tests {
             list: Some(list),
             parts: parts_map,
             loader: Some(Arc::new(loader)),
-        stamped_partition_strategy: None,
+            stamped_partition_strategy: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest

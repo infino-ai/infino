@@ -18,7 +18,6 @@ use std::{
     collections::HashSet,
     fmt,
     future::Future,
-    io,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -36,11 +35,10 @@ use super::{
 };
 use crate::{
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
-    storage::{PrefixedStorageProvider, StorageError},
+    storage::PrefixedStorageProvider,
     superfile::vector::kmeans::kmeans,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
-        manifest::commit::read_pointer,
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -50,7 +48,6 @@ use crate::{
             WalStore, gc,
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
-            state_doc::SupertableHandleId,
         },
     },
 };
@@ -151,8 +148,7 @@ pub(super) struct SupertableInner {
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
     /// One-shot partition strategy for the next hidden-index commit
     /// (synced from the user table's trained global centroids).
-    pub(super) pending_partition_strategy:
-        Mutex<Option<super::manifest::list::PartitionStrategy>>,
+    pub(super) pending_partition_strategy: Mutex<Option<super::manifest::list::PartitionStrategy>>,
 }
 
 impl Drop for SupertableInner {
@@ -277,11 +273,9 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
-        let vector_index_table = if let Some(hidden_opts) = build_vector_index_options(
-            options_arc.as_ref(),
-            Some(manifest.as_ref()),
-            None,
-        ) {
+        let vector_index_table = if let Some(hidden_opts) =
+            build_vector_index_options(options_arc.as_ref(), Some(manifest.as_ref()), None)
+        {
             let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
                 OpenError::Build(BuildError::Store(
                     "VectorIndexSuperTable requires options.storage".into(),
@@ -514,6 +508,18 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
+    /// Block until every accumulated hidden incoming IVF superfile is
+    /// routed into per-cell IVF superfiles. Tests use this to
+    /// await background maintenance before compacting the hidden table.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn await_incoming_routed_to_cells_sync(&self) -> Result<(), BuildError> {
+        bridge_on_runtime(
+            super::writer::await_incoming_routed_to_cells(Arc::clone(&self.inner)),
+            &self.query_runtime(),
+        )
+    }
+
     /// Block until the on-disk cache has fully promoted every superfile
     /// in the current manifest to an mmap-backed reader, or `timeout`
     /// elapses for one of them. This is the public "warm-readiness"
@@ -576,7 +582,7 @@ impl Supertable {
     /// (different `ms` timestamp). Test-only accessor — production
     /// code reads `inner.handle_id` directly.
     #[cfg(test)]
-    pub(crate) fn handle_id(&self) -> SupertableHandleId {
+    pub(crate) fn handle_id(&self) -> crate::supertable::wal::state_doc::SupertableHandleId {
         self.inner.handle_id
     }
 
@@ -664,7 +670,7 @@ impl Supertable {
     /// Used by benches to observe how compacted the hidden cell index is.
     /// Force-open every user + hidden vector superfile reader on the
     /// pinned snapshot — the cold-open phase before a timed search.
-    /// Hidden cell-posting superfiles use their prefixed storage provider.
+    /// Hidden IVF superfiles use their prefixed storage provider.
     pub fn open_all_superfiles(&self) {
         let reader = self.reader();
         let manifest = reader.manifest();
@@ -682,7 +688,13 @@ impl Supertable {
         )> = manifest
             .superfiles
             .iter()
-            .map(|e| (e.uri, e.subsection_offsets.clone(), std::sync::Arc::clone(&user_storage)))
+            .map(|e| {
+                (
+                    e.uri,
+                    e.subsection_offsets.clone(),
+                    std::sync::Arc::clone(&user_storage),
+                )
+            })
             .collect();
         if let Some(hidden) = self.inner.vector_index_table.as_ref() {
             let hidden_manifest = hidden.inner.manifest.load_full();
@@ -727,7 +739,7 @@ impl Supertable {
         .expect("open_all_superfiles");
     }
 
-        pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
+    pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
@@ -819,8 +831,8 @@ pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 /// region. Each hidden commit writes one IVF superfile under this sentinel
 /// partition holding that whole batch (all cells mixed, unsorted). Queries
 /// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles; background SPFresh maintenance later drains incoming into the
-/// per-cell CellPosting superfiles and deletes it. `u32::MAX` is out of the
+/// superfiles; background SPFresh maintenance later routes incoming into the
+/// per-cell IVF superfiles and deletes it. `u32::MAX` is out of the
 /// valid cell range `0..n_cent`, so it never collides with a real cell.
 pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
 
@@ -835,6 +847,16 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// on the hidden index table for its next commit.
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact superfile per cell instead of many shard-sized files.
+/// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
+pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
+    !opts.vector_columns.is_empty()
+        && opts.fts_columns.is_empty()
+        && matches!(
+            opts.partition_strategy,
+            Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
+        )
+}
+
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     crate::config::CompactionSettings {
         target_superfile_size_mb: 8,
@@ -960,16 +982,27 @@ fn build_vector_index_options(
         )));
     }
     let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
+    // Hidden maintenance (incoming routing, cell split, compaction) reads Sq8+ε
+    // rerank rows without fp32 reconstruction. User-table rerank codec may be
+    // Fp32; the hidden index always stores Sq8+ε on disk.
+    let hidden_vector_columns: Vec<crate::superfile::builder::VectorConfig> = user_opts
+        .vector_columns
+        .iter()
+        .map(|vc| crate::superfile::builder::VectorConfig {
+            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            ..vc.clone()
+        })
+        .collect();
     let mut hidden_opts = SupertableOptions::new(
         hidden_schema,
         vec![],
-        user_opts.vector_columns.clone(),
+        hidden_vector_columns,
         user_opts.tokenizer.clone(),
     )
     .ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::CellPosting)
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
         .with_eager_load_threshold(128);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
@@ -982,6 +1015,7 @@ fn build_vector_index_options(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                 column: user_opts.vector_columns[0].column.clone(),
                 clusters,
+                routing: Default::default(),
             },
         );
     }
@@ -1557,10 +1591,11 @@ mod tests {
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
         use arrow_schema::{DataType, Field, Schema};
 
-        use crate::superfile::builder::{FtsConfig, VectorConfig};
-        use crate::superfile::reader::VectorSearchOptions;
-        use crate::superfile::vector::distance::Metric;
-        use crate::superfile::vector::rerank_codec::RerankCodec;
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            reader::VectorSearchOptions,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
 
         let dim = 16usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
@@ -1638,11 +1673,11 @@ mod tests {
         assert!(!hits.is_empty(), "search should find committed vectors");
     }
 
-    /// The hidden cell-posting superfiles must be made *resident* in the
+    /// The hidden IVF superfiles must be made *resident* in the
     /// disk cache by a vector query, and a warm re-query must serve from
     /// that resident mmap without re-fetching from storage.
     ///
-    /// Regression guard: the cell-posting read path used to `get_range`
+    /// Regression guard: the hidden-index read path used to `get_range`
     /// straight from object storage, bypassing the cache entirely — so the
     /// hidden superfiles were never resident and every (incl. warm) vector
     /// query paid an object-store round-trip. The fix routes the read
@@ -1650,23 +1685,23 @@ mod tests {
     /// hidden table's *prefixed* storage (the shared cache is keyed to the
     /// user storage and can't resolve the hidden prefix on its own).
     #[test]
-    fn hidden_cell_posting_superfiles_become_resident_in_cache() {
-        use std::collections::HashSet;
-        use std::sync::Arc;
+    fn hidden_ivf_superfiles_become_resident_in_cache() {
+        use std::{collections::HashSet, sync::Arc};
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
         use arrow_schema::{DataType, Field, Schema};
 
-        use crate::superfile::builder::{FtsConfig, VectorConfig};
-        use crate::superfile::reader::VectorSearchOptions;
-        use crate::superfile::vector::distance::Metric;
-        use crate::superfile::vector::rerank_codec::RerankCodec;
-        use crate::supertable::reader_cache::{
-            ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         };
 
         let dim = 16usize;
-        // A few hundred vectors across several cells. Cell-posting hidden
+        // A few hundred vectors across several cells. Hidden IVF
         // superfiles are never inlined into the manifest open_blob, so the
         // query reads each probed cell's vec blob from storage through the
         // disk cache regardless of size.
@@ -1716,12 +1751,12 @@ mod tests {
         // post-commit cache pre-population is irrelevant here — we test a
         // *fresh* consumer process (cold cache), as on a real deployment.
         {
-            let producer = Supertable::create(make_options().with_writer_pool(pool)).expect("create");
+            let producer =
+                Supertable::create(make_options().with_writer_pool(pool)).expect("create");
 
-            // Diverse vectors so the hidden cell-posting index has real content.
-            let titles = LargeStringArray::from(
-                (0..n_rows).map(|i| format!("doc {i}")).collect::<Vec<_>>(),
-            );
+            // Diverse vectors so the hidden IVF index has real content.
+            let titles =
+                LargeStringArray::from((0..n_rows).map(|i| format!("doc {i}")).collect::<Vec<_>>());
             let mut flat = Vec::<f32>::with_capacity(n_rows * dim);
             for i in 0..n_rows {
                 for d in 0..dim {
@@ -1745,6 +1780,11 @@ mod tests {
             let mut w = producer.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
+            if let Some(hidden) = producer.reader().vector_index_table() {
+                hidden
+                    .await_incoming_routed_to_cells_sync()
+                    .expect("route hidden incoming into manifest cells");
+            }
         }
 
         // ---- Consumer: open fresh with a brand-new empty disk cache,
@@ -1770,7 +1810,7 @@ mod tests {
         let st =
             Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
 
-        // Collect the hidden cell-posting superfile URIs.
+        // Collect the hidden IVF superfile URIs.
         let reader = st.reader();
         let hidden = reader.vector_index_table().expect("hidden index");
         let hidden_uris: Vec<SuperfileUri> = hidden
@@ -1782,7 +1822,7 @@ mod tests {
             .collect();
         assert!(
             !hidden_uris.is_empty(),
-            "hidden cell-posting index must have superfiles after commit"
+            "hidden IVF index must have superfiles after commit"
         );
 
         // Cold: none of the hidden superfiles are resident yet.
@@ -1793,7 +1833,7 @@ mod tests {
             );
         }
 
-        // First vector query routes through the cell-posting path.
+        // First vector query routes through the hidden IVF index.
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
         let hits = st
@@ -1802,20 +1842,20 @@ mod tests {
             .expect("vector search");
         assert!(!hits.is_empty(), "search should find committed vectors");
 
-        // Every probed hidden cell-posting superfile must now be resident
+        // Every probed hidden IVF superfile must now be resident
         // (mmap-backed), proving the read went through the disk cache via
         // the hidden prefixed storage — not a bare object-store get_range.
         let resident: Vec<&SuperfileUri> =
             hidden_uris.iter().filter(|u| cache.is_cached(u)).collect();
         assert!(
             !resident.is_empty(),
-            "vector query must make at least one hidden cell-posting superfile \
+            "vector query must make at least one hidden IVF superfile \
              resident in the cache; none of {hidden_uris:?} are cached"
         );
         for uri in &resident {
             assert!(
-                cache.is_mmap_promoted(uri),
-                "resident hidden superfile {uri:?} must be mmap-backed"
+                cache.is_cached(uri),
+                "resident hidden IVF superfile {uri:?} must be in disk cache"
             );
         }
 
@@ -1835,22 +1875,21 @@ mod tests {
         );
     }
 
-
     /// A storage-backed handle under `Consistency::Strong` drives
     /// `ensure_fresh`'s Strong arm, which calls `refresh`. With no
     /// commit yet there is no manifest pointer, so `refresh` reports
     /// "nothing newer" and the snapshot stays at the empty manifest.
     #[test]
-    fn hidden_cell_posting_append_only_emits_multiple_files_per_cell() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+    fn hidden_ivf_append_only_emits_multiple_files_per_cell() {
+        use std::{collections::HashMap, sync::Arc};
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
         use arrow_schema::{DataType, Field, Schema};
 
-        use crate::superfile::builder::{FtsConfig, VectorConfig};
-        use crate::superfile::vector::distance::Metric;
-        use crate::superfile::vector::rerank_codec::RerankCodec;
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
 
         let dim = 16usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
@@ -1928,17 +1967,19 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cell_posting_compaction_collapses_per_cell() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+    fn hidden_ivf_compaction_collapses_per_cell() {
+        use std::{collections::HashMap, sync::Arc};
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
         use arrow_schema::{DataType, Field, Schema};
 
-        use crate::config::CompactionSettings;
-        use crate::superfile::builder::{FtsConfig, VectorConfig};
-        use crate::superfile::vector::distance::Metric;
-        use crate::superfile::vector::rerank_codec::RerankCodec;
+        use crate::{
+            config::CompactionSettings,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+            },
+        };
 
         let dim = 128usize;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
@@ -2010,10 +2051,16 @@ mod tests {
         let count_by_cell = |manifest: &crate::supertable::manifest::Manifest| -> usize {
             let mut by_cell = HashMap::<Vec<u8>, usize>::new();
             for entry in manifest.superfiles.iter() {
+                if entry.vector_layout != VectorLayout::Ivf {
+                    continue;
+                }
                 *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
             }
             by_cell.values().copied().max().unwrap_or(0)
         };
+        hidden
+            .await_incoming_routed_to_cells_sync()
+            .expect("route hidden incoming into manifest cells");
         let before = count_by_cell(hidden.reader().manifest());
         assert!(
             before >= 2,
@@ -2035,18 +2082,34 @@ mod tests {
             "compaction should collapse per-cell superfiles: before={before} after={after}"
         );
         for entry in &after_manifest.superfiles {
-            assert_eq!(entry.vector_layout, crate::superfile::vector::layout::VectorLayout::CellPosting);
+            assert_eq!(
+                entry.vector_layout,
+                crate::superfile::vector::layout::VectorLayout::Ivf
+            );
             assert!(
-                entry.subsection_offsets.as_ref().and_then(|o| o.vec).is_some(),
-                "compacted cell-posting entry {:?} missing vec subsection",
+                entry
+                    .subsection_offsets
+                    .as_ref()
+                    .and_then(|o| o.vec)
+                    .is_some(),
+                "compacted hidden IVF entry {:?} missing vec subsection",
                 entry.uri
             );
         }
         let hits = st
             .reader()
-            .vector_hits("emb", &vec![1.0f32; dim], 3, crate::superfile::reader::VectorSearchOptions::new(), None)
+            .vector_hits(
+                "emb",
+                &vec![1.0f32; dim],
+                3,
+                crate::superfile::reader::VectorSearchOptions::new(),
+                None,
+            )
             .expect("vector search after hidden compaction");
-        assert!(!hits.is_empty(), "vector search should still work after hidden compaction");
+        assert!(
+            !hits.is_empty(),
+            "vector search should still work after hidden compaction"
+        );
     }
 
     #[test]

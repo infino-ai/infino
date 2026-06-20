@@ -904,7 +904,7 @@ mod tests {
     /// path and exercise its `TableProvider` metadata methods (`Debug`,
     /// `as_any`, `table_type`) plus the lowered `HybridSearchExec`'s
     /// `name` / `Debug` — none of which normal query execution touches.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hybrid_table_and_exec_trait_methods() {
         use datafusion::{execution::context::SessionContext, prelude::lit};
 

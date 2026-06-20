@@ -840,8 +840,7 @@ pub mod vector {
     };
 
     use bytes::Bytes;
-    use infino::roaring::RoaringBitmap;
-    use infino::superfile::reader::VectorSearchOptions;
+    use infino::{roaring::RoaringBitmap, superfile::reader::VectorSearchOptions};
 
     use crate::{
         corpus::{self, DIM},
@@ -867,8 +866,8 @@ pub mod vector {
 
     /// Default options for the user-facing "what does it cost in
     /// production?" baseline reported in the search markdown.
-    const UNFILTERED_DEFAULT_NPROBE: usize = 6;
-    const UNFILTERED_DEFAULT_RERANK_MULT: usize = 256;
+    const UNFILTERED_DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
+    const UNFILTERED_DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
     /// Filtered kNN defaults (nominal config before selectivity boost).
     const FILTERED_DEFAULT_NPROBE: usize = 8;
     const FILTERED_DEFAULT_RERANK_MULT: usize = 256;

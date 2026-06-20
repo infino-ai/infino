@@ -12,9 +12,16 @@ use crate::{
     supertable::{
         Manifest,
         error::GcError,
+        handle::SupertableInner,
         manifest::commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
     },
 };
+
+/// Minimum age of a storage object before [`gc_storage_sweep_for_inner`] may
+/// delete it. Sized so snapshot-pinned readers can finish cold fetches against
+/// superseded superfiles after a manifest swap.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
@@ -44,41 +51,50 @@ impl Supertable {
     }
 
     pub(crate) async fn gc_async(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
-        let inner = self.inner();
-        let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
-        let manifest = inner.manifest.load_full();
-        let live = build_live_set(&manifest);
-        let cutoff = SystemTime::now()
-            .checked_sub(safety_gap)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        gc_storage_sweep_for_inner(self.inner(), safety_gap).await
+    }
+}
 
-        let mut report = GcReport::default();
+/// Delete storage objects not referenced by the current manifest once they are
+/// older than `safety_gap`. Supersedes inline post-commit deletes so readers
+/// pinned to an older snapshot cannot lose bytes mid-fetch.
+pub(super) async fn gc_storage_sweep_for_inner(
+    inner: &SupertableInner,
+    safety_gap: Duration,
+) -> Result<GcReport, GcError> {
+    let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
+    let manifest = inner.manifest.load_full();
+    let live = build_live_set(&manifest);
+    let cutoff = SystemTime::now()
+        .checked_sub(safety_gap)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, "data"] {
-            let entries = storage.list_with_prefix_metadata(prefix).await?;
-            for (key, meta) in entries {
-                if live.contains(&key) {
-                    report.objects_skipped_live += 1;
-                    continue;
+    let mut report = GcReport::default();
+
+    for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, "data"] {
+        let entries = storage.list_with_prefix_metadata(prefix).await?;
+        for (key, meta) in entries {
+            if live.contains(&key) {
+                report.objects_skipped_live += 1;
+                continue;
+            }
+            if meta.last_modified >= cutoff {
+                report.objects_skipped_too_new += 1;
+                continue;
+            }
+            match storage.delete(&key).await {
+                Ok(()) => {
+                    report.objects_deleted += 1;
+                    report.bytes_freed += meta.size;
                 }
-                if meta.last_modified >= cutoff {
-                    report.objects_skipped_too_new += 1;
-                    continue;
-                }
-                match storage.delete(&key).await {
-                    Ok(()) => {
-                        report.objects_deleted += 1;
-                        report.bytes_freed += meta.size;
-                    }
-                    Err(_) => {
-                        report.delete_errors += 1;
-                    }
+                Err(_) => {
+                    report.delete_errors += 1;
                 }
             }
         }
-
-        Ok(report)
     }
+
+    Ok(report)
 }
 
 #[cfg(test)]

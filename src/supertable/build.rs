@@ -65,4 +65,3 @@ where
     }
     tasks.par_iter().map(&build_one).collect()
 }
-

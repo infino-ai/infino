@@ -1184,23 +1184,95 @@ impl VectorReader {
         Some((col.n_cent, dim as u32, centroids, counts))
     }
 
-    /// Decode all `(doc_id, vector)` pairs for a logical vector index by reading each
-    /// cluster's `[codes][doc_ids][full]` block and decoding the `full[]` rerank
-    /// rows. This is used to derive a rebuildable cross-superfile index from
-    /// authoritative superfile bytes at fold/compaction time.
-    ///
-    /// The decoded vectors are approximate: `offset + code * scale + epsilon *
-    /// scale / SQ8_RESIDUAL_DIVISOR`, matching the stored
-    /// [`RerankCodec::Sq8ResidualEpsilon`] rows. Returns `None` unless the
-    /// index uses `Sq8ResidualEpsilon` (codec metadata may be eager or lazily
-    /// fetched from the subsection's `codec_meta` region).
-    pub fn decode_index_vectors(&self, index_name: &str) -> Option<(Vec<u32>, Vec<f32>)> {
+    /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
+    pub(crate) fn sq8_ivf_merge_input(
+        &self,
+        column: &str,
+        doc_id_offset: u32,
+    ) -> Result<crate::superfile::vector::ivf_merge::Sq8IvfMergeInput, crate::superfile::BuildError>
+    {
+        use crate::superfile::format::vec::sub_hdr;
+
+        let cid = *self.column_id_by_name.get(column).ok_or_else(|| {
+            crate::superfile::BuildError::VectorSchemaMismatch(format!("unknown column {column}"))
+        })?;
+        let col = &self.columns[cid as usize];
+        if col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+            return Err(
+                crate::superfile::BuildError::VectorRerankCodecUnimplemented {
+                    column: column.to_string(),
+                    codec: col.rerank_codec.name(),
+                },
+            );
+        }
+        let dim = col.dim;
+        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+        let (scale, offset) = match &col.sq8_meta {
+            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
+            Some(Sq8ColumnMeta::Lazy {
+                scale_abs_off,
+                offset_abs_off,
+                ..
+            }) => {
+                let scale_bytes = self
+                    .source
+                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)
+                    .ok_or(crate::superfile::BuildError::VectorReadError)?;
+                let offset_bytes = self
+                    .source
+                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)
+                    .ok_or(crate::superfile::BuildError::VectorReadError)?;
+                (
+                    parse_f32_le_vec(scale_bytes.as_ref()),
+                    parse_f32_le_vec(offset_bytes.as_ref()),
+                )
+            }
+            _ => return Err(crate::superfile::BuildError::VectorReadError),
+        };
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())
+            .ok_or(crate::superfile::BuildError::VectorReadError)?;
+        let summary_radius_x100 = u32::from_le_bytes([
+            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF],
+            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 1],
+            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 2],
+            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 3],
+        ]);
+        Ok(crate::superfile::vector::ivf_merge::Sq8IvfMergeInput {
+            sub: sub.as_ref().to_vec(),
+            dim,
+            n_cent: col.n_cent as usize,
+            n_docs: col.n_docs,
+            metric: col.metric,
+            doc_id_offset,
+            cluster_idx_off: col.cluster_idx_off,
+            centroids_off: col.centroids_off,
+            per_cluster_blocks_off: col.per_cluster_blocks_off,
+            code_bytes: col.quant.code_bytes(),
+            per_vec_bytes: col.rerank_codec.per_vector_bytes(dim),
+            stride: col.per_cluster_doc_stride(),
+            scale,
+            offset,
+            summary_radius_x100,
+        })
+    }
+
+    /// Read Sq8+ε rerank rows plus preserved 1-bit RaBitQ codes for maintenance
+    /// rebuilds through the normal IVF writer (no fp32 reconstruction).
+    pub(crate) fn materialized_index_rows(
+        &self,
+        index_name: &str,
+    ) -> Option<Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>> {
+        use crate::superfile::vector::cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq};
+
         let cid = *self.column_id_by_name.get(index_name)?;
         let col = &self.columns[cid as usize];
         if col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
             return None;
         }
         let dim = col.dim;
+        let metric = col.metric;
         let so_block_bytes = (col.n_cent as usize) * dim * 4;
         let (scale_buf, offset_buf) = match &col.sq8_meta {
             Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
@@ -1232,9 +1304,9 @@ impl VectorReader {
         let id_bytes = format::vec::DOC_ID_BYTES;
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
         let n_cent = col.n_cent as usize;
+        let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
 
-        let mut ids: Vec<u32> = Vec::with_capacity(col.n_docs as usize);
-        let mut vecs: Vec<f32> = Vec::with_capacity(col.n_docs as usize * dim);
+        let mut out = Vec::with_capacity(col.n_docs as usize);
         for c in 0..n_cent {
             let e = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
             let doc_off = u32::from_le_bytes([sub[e], sub[e + 1], sub[e + 2], sub[e + 3]]) as usize;
@@ -1247,25 +1319,34 @@ impl VectorReader {
             let block = col.per_cluster_blocks_off + doc_off * stride;
             let doc_ids_at = block + count * code_bytes;
             let full_at = block + count * (code_bytes + id_bytes);
-            let sc = &scale[c * dim..c * dim + dim];
-            let of = &offset[c * dim..c * dim + dim];
+            let sc = scale[c * dim..c * dim + dim].to_vec();
+            let of = offset[c * dim..c * dim + dim].to_vec();
             for i in 0..count {
                 let idb = doc_ids_at + i * id_bytes;
-                ids.push(u32::from_le_bytes([
-                    sub[idb],
-                    sub[idb + 1],
-                    sub[idb + 2],
-                    sub[idb + 3],
-                ]));
+                let local_id =
+                    u32::from_le_bytes([sub[idb], sub[idb + 1], sub[idb + 2], sub[idb + 3]]);
+                let rabitq = sub[block + i * code_bytes..block + (i + 1) * code_bytes].to_vec();
                 let rowb = full_at + i * per_vec;
-                for d in 0..dim {
-                    let code = sub[rowb + d] as f32;
-                    let eps = sub[rowb + dim + d] as i8 as f32;
-                    vecs.push(of[d] + code * sc[d] + eps * sc[d] / SQ8_RESIDUAL_DIVISOR);
-                }
+                let codes = sub[rowb..rowb + dim].to_vec();
+                let residuals = sub[rowb + dim..rowb + dim + dim].to_vec();
+                let norm_sq =
+                    store_norm.then(|| sq8_residual_norm_sq(dim, &sc, &of, &codes, &residuals));
+                out.push(MaterializedIvfRow {
+                    local_doc_id: local_id,
+                    stable_id: 0,
+                    rabitq_code: rabitq,
+                    encoded: crate::superfile::vector::cell_posting::EncodedCellRow {
+                        stable_id: 0,
+                        scale: sc.clone(),
+                        offset: of.clone(),
+                        codes,
+                        residuals,
+                        norm_sq,
+                    },
+                });
             }
         }
-        Some((ids, vecs))
+        Some(out)
     }
 
     /// Single-column kNN search. Returns `(local_doc_id,
@@ -1848,6 +1929,33 @@ impl VectorReader {
                 })
             })
             .collect()
+    }
+
+    /// Decode vectors for superfile merge/rebuild. Fp32 columns use the stored
+    /// rerank payload; Sq8+ε columns decode at the merge boundary only.
+    pub(crate) fn get_vectors_for_merge(&self, column: &str) -> Result<Vec<Vec<f32>>, VectorError> {
+        let cid = *self
+            .column_id_by_name
+            .get(column)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let col = &self.columns[cid as usize];
+        if col.n_docs == 0 {
+            return Ok(Vec::new());
+        }
+        match col.rerank_codec {
+            RerankCodec::Fp32 => self.get_vectors_fp32(column),
+            RerankCodec::Sq8ResidualEpsilon => {
+                Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' uses Sq8ResidualEpsilon — merge via build_from_sq8_ivf_readers",
+                    col.name
+                ))))
+            }
+            other => Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "column '{}' uses rerank codec {} which cannot be merged",
+                col.name,
+                other.name()
+            )))),
+        }
     }
 
     fn resolve_column(

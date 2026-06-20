@@ -36,11 +36,7 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
@@ -48,7 +44,7 @@ use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
 use crate::supertable::manifest::{
-    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+    FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
 };
 
 /// Errors from the per-summary binary decoders.
@@ -477,6 +473,11 @@ pub fn encode_cluster_centroids(cl: &super::ClusterCentroids) -> Vec<u8> {
         out.extend_from_slice(&sc.to_le_bytes());
     }
     out.extend_from_slice(&cl.codes);
+    if cl.radii.len() == nc {
+        for &r in &cl.radii {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -516,6 +517,16 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids,
         ));
     }
 
+    let tail = c.position() as usize;
+    let radii = if tail + n_cent * 4 <= bytes.len() {
+        bytes[tail..tail + n_cent * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(super::ClusterCentroids {
         n_cent: n_cent as u32,
         dim: cdim as u32,
@@ -523,6 +534,7 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids,
         mins,
         scales,
         counts,
+        radii,
         code_moments: std::sync::OnceLock::new(),
     })
 }

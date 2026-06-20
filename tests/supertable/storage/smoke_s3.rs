@@ -459,7 +459,7 @@ async fn supertable_s3s_multi_commit_vector_no_hang() {
             q[0] = 1.0;
             let hits = st
                 .reader()
-                .vector_hits("emb", &q, 5, VectorSearchOptions::new())
+                .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
                 .map_err(|e| format!("vector query: {e}"))?;
             Ok(hits.len())
         })();
