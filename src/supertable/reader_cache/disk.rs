@@ -1164,7 +1164,7 @@ impl DiskCacheStore {
             // wrapped in a `PrefetchedSource` overlay carrying the
             // open-time byte ranges at their absolute offsets.
             let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
-                Arc::clone(&self.storage),
+                Arc::clone(&fetch_storage),
                 storage_uri.clone(),
                 total_size,
             ));
@@ -1238,7 +1238,7 @@ impl DiskCacheStore {
             // object size, then patches the source's size atomic.
             let range_src: Arc<dyn LazyByteSource> =
                 Arc::new(StorageRangeSource::with_unknown_size(
-                    Arc::clone(&self.storage),
+                    Arc::clone(&fetch_storage),
                     storage_uri.clone(),
                 ));
             let lazy_reader = SuperfileReader::open_lazy_with(
@@ -2313,6 +2313,49 @@ mod tests {
             .reader_with_hints(&uri, None, Some(&hidden_storage))
             .await
             .expect("cold fetch via caller storage");
+        assert_eq!(reader.n_docs(), 1);
+        assert_eq!(cache.stats().n_cold_fetches, 1);
+    }
+
+    /// Bench default (`LazyForegroundWithBackgroundFill`): the lazy inner
+    /// `StorageRangeSource` must honor the caller's prefixed storage, not
+    /// the cache's embedded user-root provider.
+    #[tokio::test]
+    async fn lazy_cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
+        use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
+        let hidden_root = dir.path().join("hidden_prefix");
+        std::fs::create_dir_all(&hidden_root).expect("hidden root");
+        let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&user_storage),
+            "hidden_prefix",
+        ));
+
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&user_storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        hidden_storage
+            .put_atomic(&uri.storage_path(), bytes.clone())
+            .await
+            .expect("put at hidden prefix");
+
+        let reader = cache
+            .reader_with_hints(&uri, None, Some(&hidden_storage))
+            .await
+            .expect("lazy cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
         assert_eq!(cache.stats().n_cold_fetches, 1);
     }

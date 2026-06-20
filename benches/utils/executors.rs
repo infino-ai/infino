@@ -1205,7 +1205,6 @@ pub mod vector {
         include_cold: bool,
         cold_iters: usize,
         skip_calibration: bool,
-        _promote_before_calibration: Option<&Supertable>,
         log_prefix: &str,
         anchor: &str,
         title: String,

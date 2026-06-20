@@ -298,7 +298,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query p50 over repeated bm25_search). Cold = fresh disk cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.
+Warm = shared consumer + disk cache; each query runs once untimed (cache fill for probed superfiles only), then p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.
 
 **OR queries**
 
@@ -373,7 +373,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.
+Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.
 
 | Recall target | (p, r) | recall | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -510,7 +510,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.
+Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls (only touched superfiles are cached). The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.
 
 **Aggregations & count-filters (read + compute, return few rows — not the index A/B)**
 

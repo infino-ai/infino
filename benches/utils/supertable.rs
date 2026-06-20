@@ -38,7 +38,7 @@
 //! ```
 
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{
     collections::HashMap,
     process::{Command, Stdio},
@@ -573,8 +573,8 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
-                 p50 over repeated bm25_search). Cold = fresh disk cache + consumer per iteration, so \
+                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), then \
+                 p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so \
                  each read pays the object-store cold open. Δ is vs the previous run.",
                 warm.as_deref(),
                 cold.as_ref(),
@@ -651,34 +651,12 @@ pub mod fts {
     fn measure_warm(
         built: &supertable::IngestResult,
     ) -> (Vec<exec_fts::FtsQueryStat>, Vec<exec_fts::CountStat>) {
-        eprintln!(
-            "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
-        );
-        // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
-        // the discriminator for "where do the warm-phase GiBs live" —
-        // ingest leftovers show up as anonymous bloat already present
-        // before the consumer opens; promotion double-residency shows
-        // up as anonymous ≈ file_backed after warm-up.
+        eprintln!("[supertable_fts] warm: opening shared consumer...");
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
-        let first = &FTS_BATTERY[0];
-        let first_query = first.terms.join(" ");
-        let _ = reader
-            .bm25_search(
-                supertable::TEXT_COLUMN,
-                &first_query,
-                TOP_K,
-                exec_fts::to_infino_mode(first.mode),
-                None,
-            )
-            .expect("warm prewarm bm25_search");
-        consumer
-            .wait_until_warm(Duration::from_secs(600))
-            .expect("supertable warm promotion");
-        crate::rss::log_rss_breakdown("supertable_fts after wait_until_warm");
         eprintln!(
-            "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
+            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
             FTS_BATTERY.len(),
         );
         let out = exec_fts::measure_warm(
@@ -841,22 +819,6 @@ pub mod vector {
     /// cold-only run without the 54-config calibration sweep.
     fn skip_calibration() -> bool {
         std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
-    }
-
-    /// [`VectorSearchOptions::default()`] with optional env overrides.
-    fn bench_default_opts() -> infino::superfile::reader::VectorSearchOptions {
-        let mut opts = infino::superfile::reader::VectorSearchOptions::default();
-        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_NPROBE")
-            && let Ok(n) = v.parse()
-        {
-            opts = opts.with_nprobe(n);
-        }
-        if let Ok(v) = std::env::var("INFINO_BENCH_VECTOR_RERANK")
-            && let Ok(n) = v.parse()
-        {
-            opts = opts.with_rerank_mult(n);
-        }
-        opts
     }
 
     /// Fixed probe count for the `default` row, overridable with
@@ -1037,29 +999,12 @@ pub mod vector {
             // only.
             drop(corpus);
 
-            // One consumer drives correctness + calibration. Full cache
-            // promotion (prewarm + wait_until_warm) only matters for the
-            // warm timing rows — a cold-only run skips it (fts/sql gate
-            // the same way) so it doesn't pull every superfile into the
-            // cache just to throw it away.
+            // One consumer drives correctness, calibration, and warm timing.
+            // Warm latency is query-driven: each config runs one untimed
+            // search (cache fill), then timed iterations — no global
+            // wait_until_warm that mmap-promotes every superfile.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
             if phases.warm {
-                eprintln!(
-                    "[supertable_vector] opening warm consumer, prewarm + wait_until_warm..."
-                );
-                let _ = consumer
-                    .reader()
-                    .vector_hits(
-                        supertable::VEC_COLUMN,
-                        &q_cal[0],
-                        TOP_K,
-                        bench_default_opts(),
-                        None,
-                    )
-                    .expect("warm prewarm vector_hits");
-                consumer
-                    .wait_until_warm(Duration::from_secs(600))
-                    .expect("supertable warm promotion");
                 if let Some((total, max_per_cell)) = consumer.hidden_vector_superfile_stats() {
                     eprintln!(
                         "[supertable_vector] hidden vector index at warm open: {total} superfiles, max {max_per_cell} per cell"
@@ -1089,15 +1034,10 @@ pub mod vector {
                 phases.cold,
                 COLD_ITERS,
                 skip_cal,
-                if phases.warm && !skip_cal {
-                    Some(&consumer)
-                } else {
-                    None
-                },
                 "supertable_vector",
                 "bench/vector/supertable/search",
                 title,
-                "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
+                "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
             );
             if phases.warm {
                 emit_cost_warm(
@@ -1309,15 +1249,8 @@ pub mod sql {
         }
 
         if phases.warm {
-            eprintln!("[supertable_sql] warm: opening consumer, prewarm + wait_until_warm...");
+            eprintln!("[supertable_sql] warm: opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-            let _ = consumer
-                .reader()
-                .query_sql("SELECT COUNT(*) AS n FROM supertable")
-                .expect("warm prewarm query_sql");
-            consumer
-                .wait_until_warm(Duration::from_secs(600))
-                .expect("supertable warm promotion");
             let sets =
                 exec_sql::measure_query_sets(&consumer, &inputs, exec_sql::ITERS, "supertable_sql");
             drop(consumer);
@@ -1329,7 +1262,7 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
             emit_cost_warm(
