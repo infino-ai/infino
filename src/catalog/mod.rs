@@ -42,7 +42,10 @@ use uri::{Backend, parse_uri};
 
 use crate::{
     InfinoError,
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    runtime_bridge::{
+        bridge_on_runtime, bridge_sync_to_async, get_or_init_query_runtime,
+        shutdown_query_runtime_on_drop,
+    },
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -130,11 +133,7 @@ impl Drop for ConnectionInner {
     /// within an async context" guard. `shutdown_background` consumes it
     /// without blocking; `try_unwrap` shuts down only on the last owner.
     fn drop(&mut self) {
-        if let Some(rt) = self.query_runtime.take()
-            && let Ok(rt) = Arc::try_unwrap(rt)
-        {
-            rt.shutdown_background();
-        }
+        shutdown_query_runtime_on_drop(&mut self.query_runtime);
     }
 }
 
@@ -485,11 +484,7 @@ impl Connection {
     /// Runtime for the table-free `query_sql` fallback (see
     /// [`ConnectionInner::query_runtime`]).
     fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(
-            self.inner
-                .query_runtime
-                .get_or_init(|| build_query_runtime("catalog-query")),
-        )
+        get_or_init_query_runtime(&self.inner.query_runtime, "catalog-query")
     }
 }
 

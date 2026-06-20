@@ -25,11 +25,14 @@ use thiserror::Error;
 use uuid::Uuid;
 use zstd::stream;
 
-use crate::supertable::manifest::{
-    SubsectionOffsets, SuperfileEntry, SuperfileUri,
-    encoding::{
-        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
-        encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+use crate::{
+    superfile::vector::layout::VectorLayout,
+    supertable::manifest::{
+        SubsectionOffsets, SuperfileEntry, SuperfileUri,
+        encoding::{
+            DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
+            encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+        },
     },
 };
 
@@ -413,8 +416,8 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         .map(|b| decode_subsection_offsets(&b))
         .transpose()?;
     let vector_layout = take_optional_string(&mut map, "vector_layout")?
-        .and_then(|s| crate::superfile::vector::layout::VectorLayout::from_kv_value(&s))
-        .unwrap_or(crate::superfile::vector::layout::VectorLayout::Ivf);
+        .and_then(|s| VectorLayout::from_kv_value(&s))
+        .unwrap_or(VectorLayout::Ivf);
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -762,7 +765,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -855,7 +858,7 @@ mod tests {
             vector_summary: vec_summary,
             partition_key: vec![0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             partition_hint: Some(13),
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(SubsectionOffsets {
                 total_size: 12_345_678,
                 vec: Some((123_456, 78_910)),
@@ -1024,7 +1027,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
             partition_hint: Some(0xdead_beef),
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         });
         let id2 = Uuid::new_v4();
@@ -1039,7 +1042,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg_with.clone(), seg_without.clone()]);
@@ -1163,7 +1166,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
@@ -1192,14 +1195,14 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::CellPosting,
+            vector_layout: VectorLayout::CellPosting,
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg]);
         let decoded = decode(&encode(&part, 3)).expect("decode");
         assert_eq!(
             decoded.superfiles[0].vector_layout,
-            crate::superfile::vector::layout::VectorLayout::CellPosting
+            VectorLayout::CellPosting
         );
     }
 
@@ -1227,7 +1230,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);

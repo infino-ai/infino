@@ -13,7 +13,11 @@ use roaring::RoaringBitmap;
 use crate::superfile::{
     BuildError,
     builder::VectorConfig,
-    vector::distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel},
+    format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
+    vector::{
+        builder::derive_sq8_quantizer_from_min_max,
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel, metric_distance_by},
+    },
 };
 
 const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
@@ -461,10 +465,13 @@ fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
 }
 
 fn decode_ids(bytes: &[u8]) -> Vec<u32> {
+    // `chunks_exact(4)` only yields 4-byte slices, so `u32_le` never errors here;
+    // collect through Result and fall back to empty rather than panicking.
     bytes
         .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+        .map(u32_le)
+        .collect::<Result<Vec<u32>, _>>()
+        .unwrap_or_default()
 }
 
 struct EncodedRows {
@@ -500,13 +507,7 @@ fn encode_rows(
             max[d] = max[d].max(src[d]);
         }
     }
-    let mut scale = vec![1.0; dim];
-    let mut offset = vec![0.0; dim];
-    for d in 0..dim {
-        let span = max[d] - min[d];
-        scale[d] = if span > 0.0 { span / SQ8_CODE_MAX } else { 1.0 };
-        offset[d] = min[d];
-    }
+    let (scale, offset) = derive_sq8_quantizer_from_min_max(&min, &max);
     let store_norms = matches!(metric, Metric::L2Sq | Metric::Cosine);
     let mut out_ids = Vec::with_capacity(rows.len());
     let mut encoded = Vec::with_capacity(rows.len() * dim * ROW_BYTES_PER_DIM);
@@ -575,18 +576,19 @@ fn cmp_f32(a: f32, b: f32) -> Ordering {
 }
 
 fn metric_id(m: Metric) -> u8 {
+    // Same metric↔id mapping as the IVF directory entry (format::vec).
     match m {
-        Metric::L2Sq => 0,
-        Metric::Cosine => 1,
-        Metric::NegDot => 2,
+        Metric::L2Sq => METRIC_ID_L2SQ as u8,
+        Metric::Cosine => METRIC_ID_COSINE as u8,
+        Metric::NegDot => METRIC_ID_NEGDOT as u8,
     }
 }
 
 fn metric_from_id(id: u8) -> Result<Metric, String> {
-    match id {
-        0 => Ok(Metric::L2Sq),
-        1 => Ok(Metric::Cosine),
-        2 => Ok(Metric::NegDot),
+    match id as u32 {
+        METRIC_ID_L2SQ => Ok(Metric::L2Sq),
+        METRIC_ID_COSINE => Ok(Metric::Cosine),
+        METRIC_ID_NEGDOT => Ok(Metric::NegDot),
         _ => Err(format!("unknown cell posting metric id {id}")),
     }
 }
@@ -729,51 +731,25 @@ fn distance_encoded_rows_symmetric(
     a: &EncodedCellRow,
     b: &EncodedCellRow,
 ) -> f32 {
-    match metric {
-        Metric::L2Sq => {
-            let mut sum = 0.0f32;
-            for d in 0..dim {
-                let diff = encoded_component_at(a, d) - encoded_component_at(b, d);
-                sum += diff * diff;
-            }
-            sum
-        }
-        Metric::Cosine => {
-            let mut dot = 0.0f32;
-            let mut na = 0.0f32;
-            let mut nb = 0.0f32;
-            for d in 0..dim {
-                let va = encoded_component_at(a, d);
-                let vb = encoded_component_at(b, d);
-                dot += va * vb;
-                na += va * va;
-                nb += vb * vb;
-            }
-            let denom = na.sqrt() * nb.sqrt();
-            if denom > 0.0 {
-                1.0 - dot / denom
-            } else {
-                1.0 - dot
-            }
-        }
-        Metric::NegDot => {
-            let mut dot = 0.0f32;
-            for d in 0..dim {
-                dot += encoded_component_at(a, d) * encoded_component_at(b, d);
-            }
-            -dot
-        }
-    }
+    metric_distance_by(
+        metric,
+        dim,
+        |d| encoded_component_at(a, d),
+        |d| encoded_component_at(b, d),
+    )
 }
 
-fn medoid_index_symmetric(metric: Metric, dim: usize, shard: &[EncodedCellRow]) -> usize {
+/// Index of the medoid row — the one minimizing the summed pairwise distance to
+/// all others — under an arbitrary row↔row distance `dist`. Shared by the
+/// symmetric kernel here and the asymmetric variant in `supertable::spfresh`.
+pub(crate) fn medoid_index_by<F>(shard: &[EncodedCellRow], dist: F) -> usize
+where
+    F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,
+{
     let mut best_idx = 0usize;
     let mut best_sum = f32::INFINITY;
     for (i, row_i) in shard.iter().enumerate() {
-        let sum: f32 = shard
-            .iter()
-            .map(|row_j| distance_encoded_rows_symmetric(metric, dim, row_i, row_j))
-            .sum();
+        let sum: f32 = shard.iter().map(|row_j| dist(row_i, row_j)).sum();
         if sum < best_sum {
             best_sum = sum;
             best_idx = i;
@@ -782,7 +758,15 @@ fn medoid_index_symmetric(metric: Metric, dim: usize, shard: &[EncodedCellRow]) 
     best_idx
 }
 
-fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
+fn medoid_index_symmetric(metric: Metric, dim: usize, shard: &[EncodedCellRow]) -> usize {
+    medoid_index_by(shard, |a, b| {
+        distance_encoded_rows_symmetric(metric, dim, a, b)
+    })
+}
+
+/// Sq8+ε row → `dim` fp32 components for manifest [`ClusterCentroids::from_fp32`]
+/// or IVF header centroids only (never a full-corpus decode).
+pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     (0..dim).map(|d| encoded_component_at(row, d)).collect()
 }
 

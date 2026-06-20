@@ -67,6 +67,10 @@ const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Upper bound on how long a hybrid-foreground read waits for a cache entry's
+/// background mmap promotion to finish before falling back to the lazy reader.
+const MMAP_PROMOTION_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Yield cadence in the background-fill upgrade loop. Gives a
 /// short-lived caller (e.g. a cold benchmark with a fresh cache per
 /// iteration) a scheduling turn to drop the cache before a
@@ -483,7 +487,7 @@ impl DiskCacheStore {
             // Hybrid foreground already reserved budget for this URI; a duplicate
             // cold_fetch double-reserves and fails at scale (calibration remap).
             drop(entry);
-            self.wait_until_mmap_promoted(uri, Duration::from_secs(600))
+            self.wait_until_mmap_promoted(uri, MMAP_PROMOTION_WAIT_TIMEOUT)
                 .await?;
             let entry = self.cached.get(uri).ok_or_else(|| {
                 DiskCacheError::SuperfileOpen(format!(
@@ -547,7 +551,6 @@ impl DiskCacheStore {
                 self.cold_fetch_hybrid(uri, fetch_storage).await
             })
             .await;
-        let fetch_storage = self.resolve_storage(storage);
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
             Err(DiskCacheError::BudgetExceeded) => {
@@ -555,7 +558,10 @@ impl DiskCacheStore {
                 Err(DiskCacheError::BudgetExceeded)
             }
             Err(_) => {
+                // Only the retry path needs the resolved storage handle; the Ok
+                // and BudgetExceeded arms skip the clone.
                 self.coordinators.remove(uri);
+                let fetch_storage = self.resolve_storage(storage);
                 self.cold_fetch_hybrid(uri, fetch_storage)
                     .await
                     .map(|entry| Arc::clone(&entry.reader))
@@ -563,14 +569,17 @@ impl DiskCacheStore {
         }
     }
 
-    /// Whether `uri` is cached with a finished mmap promotion
-    /// (`CachedEntry::mmap == Some`). False while
-    /// `LazyForegroundWithBackgroundFill` still holds the lazy
-    /// in-memory reader or the background download is in flight.
+    /// Whether `uri` has any cache entry — including a still-lazy
+    /// `LazyForegroundWithBackgroundFill` reader whose `mmap` is `None`.
+    /// Use [`Self::is_mmap_promoted`] to test for residency.
     pub fn is_cached(&self, uri: &SuperfileUri) -> bool {
         self.cached.contains_key(uri)
     }
 
+    /// Whether `uri` is cached with a finished mmap promotion
+    /// (`CachedEntry::mmap == Some`). False while
+    /// `LazyForegroundWithBackgroundFill` still holds the lazy
+    /// in-memory reader or the background download is in flight.
     pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
         self.cached
             .get(uri)
@@ -846,30 +855,6 @@ impl DiskCacheStore {
             }
         }
         Ok(())
-    }
-
-    /// Drop a cached superfile from the local disk cache (unmap +
-    /// unlink). Used after compaction removes superseded inputs.
-    /// No-op when `uri` is not cached.
-    pub fn evict_warm(&self, uri: &SuperfileUri) {
-        if let Some((_, entry)) = self.cached.remove(uri) {
-            self.current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
-            let _ = std::fs::remove_file(self.cache_path(uri));
-        }
-        self.coordinators.remove(uri);
-    }
-
-    /// Replace a cached superfile's bytes. Used when a fixed URI is
-    /// read-merge-write-replaced (cell-posting cells); [`insert_warm`]
-    /// would no-op and leave a stale reader.
-    pub async fn replace_warm(
-        self: &Arc<Self>,
-        uri: &SuperfileUri,
-        bytes: Bytes,
-    ) -> Result<(), DiskCacheError> {
-        self.evict_warm(uri);
-        self.insert_warm(uri, bytes).await
     }
 
     // ----- internals -----

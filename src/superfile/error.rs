@@ -73,7 +73,7 @@ pub enum BuildError {
     #[error("vectors could not be read")]
     VectorReadError,
 
-    #[error("vectors slice has {actual} entries but {expected} vector indexs are declared")]
+    #[error("vectors slice has {actual} entries but {expected} vector indexes are declared")]
     VectorCountMismatch { expected: usize, actual: usize },
 
     #[error("row arrow_values has {actual} entries but schema has {expected} columns")]

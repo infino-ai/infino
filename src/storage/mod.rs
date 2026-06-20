@@ -355,6 +355,23 @@ impl StorageProvider for PrefixedStorageProvider {
             .collect())
     }
 
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        // Must mirror `list_with_prefix` (prepend sub-prefix, delegate, strip):
+        // GC on the hidden vector index lists via this method, so without the
+        // override the trait default returns an empty list and GC reclaims
+        // nothing under the prefixed namespace.
+        let full = self.prefixed(prefix);
+        let results = self.inner.list_with_prefix_metadata(&full).await?;
+        let strip_len = self.sub_prefix.len();
+        Ok(results
+            .into_iter()
+            .map(|(key, meta)| (key[strip_len..].to_owned(), meta))
+            .collect())
+    }
+
     fn object_store_handle(
         &self,
         uri: &str,

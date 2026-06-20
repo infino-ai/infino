@@ -35,6 +35,7 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
@@ -50,6 +51,7 @@ use futures::future;
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
 pub use list::{FtsSummaryAgg, ScalarStatsAgg};
+use rayon::prelude::*;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -57,8 +59,9 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::vector::distance::{
-        COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq,
+    superfile::vector::{
+        distance::{COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq},
+        layout::VectorLayout,
     },
     supertable::{
         CommitError,
@@ -73,7 +76,7 @@ use crate::{
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
-            partition::{assign_partition, encode_partition_key},
+            partition::{PartitionKey, assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
     },
@@ -84,6 +87,11 @@ use crate::{
 /// keeps commit latency low while compressing the Avro-encoded
 /// manifest well. (Valid range is 1..=22.)
 pub const MANIFEST_ZSTD_LEVEL: i32 = 3;
+
+/// Object-store / LocalFS directory prefix under which committed superfile
+/// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
+/// and the GC live-set sweep so both agree on the superfile namespace.
+pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -755,11 +763,9 @@ impl Manifest {
         routed_cells: &[u32],
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for cell in routed_cells {
-            let pk = encode_partition_key(
-                &crate::supertable::manifest::partition::PartitionKey::VectorCell(*cell),
-            );
+            let pk = encode_partition_key(&PartitionKey::VectorCell(*cell));
             for sf in self.superfiles_for_partition_key(&pk).await? {
                 if seen.insert(sf.superfile_id) {
                     out.push(sf);
@@ -1075,7 +1081,7 @@ fn rebuild_part_and_entry(
 ) {
     let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
 
-    let aggregates = crate::supertable::manifest::aggregates::compute(&new_superfiles, base_part);
+    let aggregates = aggregates::compute(&new_superfiles, base_part);
     let superfiles = old_superfiles
         .into_iter()
         .chain(new_superfiles)
@@ -1265,7 +1271,7 @@ pub struct SuperfileEntry {
     /// then vec/fts in parallel) — see
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
-    pub vector_layout: crate::superfile::vector::layout::VectorLayout,
+    pub(crate) vector_layout: VectorLayout,
 }
 
 /// superfile layout offsets cached on the manifest.
@@ -1343,7 +1349,7 @@ impl SuperfileUri {
     /// footer), while the `.sf` marker flags it as a Superfile
     /// superfile without making the file look non-standard.
     pub fn storage_path(self) -> String {
-        format!("data/seg-{}.sf.parquet", self.0)
+        format!("{SUPERFILE_DATA_DIR}/seg-{}.sf.parquet", self.0)
     }
 
     /// Disk-cache filename for a promoted superfile.
@@ -1841,6 +1847,46 @@ impl ClusterCentroids {
         self
     }
 
+    /// Sq8-domain score of one cluster `c` against `query` — the per-cluster
+    /// kernel shared by [`Self::score_one`] and [`Self::score_clusters_into`].
+    /// `moments` is the per-cluster `(Σcode, Σcode²)` table and must be `Some`
+    /// for [`Metric::L2Sq`]; it is unused for Cosine/NegDot.
+    fn score_cluster_at(
+        &self,
+        metric: Metric,
+        c: usize,
+        query: &[f32],
+        sum_q: f32,
+        norm_q_sq: f32,
+        moments: Option<&[(f32, f32)]>,
+    ) -> f32 {
+        let d = self.dim as usize;
+        let codes = &self.codes[c * d..(c + 1) * d];
+        let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
+        match metric {
+            Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
+            Metric::NegDot => -dot_qc,
+            Metric::L2Sq => {
+                let (sum_c, sumsq_c) = moments.expect("L2 moments built by caller")[c];
+                let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
+                    + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
+                    + self.scales[c] * self.scales[c] * sumsq_c;
+                norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
+            }
+        }
+    }
+
+    /// Build (once, memoized) the per-cluster `(Σcode, Σcode²)` moments table
+    /// L2 scoring needs, returning it as a slice for [`Self::score_cluster_at`].
+    fn l2_code_moments(&self) -> &[(f32, f32)] {
+        let d = self.dim as usize;
+        self.code_moments.get_or_init(|| {
+            (0..self.n_cent as usize)
+                .map(|c| u8_sum_sumsq(&self.codes[c * d..(c + 1) * d]))
+                .collect()
+        })
+    }
+
     /// Score cluster `c` against `query` in the Sq8 domain (same kernel as
     /// [`Self::score_clusters_into`]).
     pub fn score_one(
@@ -1851,26 +1897,9 @@ impl ClusterCentroids {
         sum_q: f32,
         norm_q_sq: f32,
     ) -> f32 {
-        let d = self.dim as usize;
-        debug_assert_eq!(query.len(), d);
-        let codes = &self.codes[c * d..(c + 1) * d];
-        let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
-        match metric {
-            Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
-            Metric::NegDot => -dot_qc,
-            Metric::L2Sq => {
-                let moments = self.code_moments.get_or_init(|| {
-                    (0..self.n_cent as usize)
-                        .map(|i| u8_sum_sumsq(&self.codes[i * d..(i + 1) * d]))
-                        .collect()
-                });
-                let (sum_c, sumsq_c) = moments[c];
-                let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
-                    + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
-                    + self.scales[c] * self.scales[c] * sumsq_c;
-                norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
-            }
-        }
+        debug_assert_eq!(query.len(), self.dim as usize);
+        let moments = matches!(metric, Metric::L2Sq).then(|| self.l2_code_moments());
+        self.score_cluster_at(metric, c, query, sum_q, norm_q_sq, moments)
     }
 
     /// Adaptive cell selection for hidden-index routing: score every populated
@@ -1881,10 +1910,8 @@ impl ClusterCentroids {
         metric: Metric,
         query: &[f32],
         nprobe_floor: usize,
-        routing: crate::supertable::manifest::list::CellRoutingParams,
+        routing: list::CellRoutingParams,
     ) -> Vec<u32> {
-        use std::cmp::Ordering;
-
         let dim = self.dim as usize;
         if self.n_cent == 0 || dim == 0 || query.len() != dim {
             return (0..self.n_cent).collect();
@@ -1962,36 +1989,19 @@ impl ClusterCentroids {
         norm_q_sq: f32,
         mut emit: impl FnMut(u32, f32),
     ) {
-        let d = self.dim as usize;
-        debug_assert_eq!(query.len(), d);
+        debug_assert_eq!(query.len(), self.dim as usize);
         // L2 needs each cluster's query-independent code moments;
         // computed once per `ClusterCentroids` (first L2 query) so the
         // per-query, per-cluster O(dim) work stays a single Sq8 dot.
-        let moments = matches!(metric, Metric::L2Sq).then(|| {
-            self.code_moments.get_or_init(|| {
-                (0..self.n_cent as usize)
-                    .map(|c| u8_sum_sumsq(&self.codes[c * d..(c + 1) * d]))
-                    .collect()
-            })
-        });
+        let moments = matches!(metric, Metric::L2Sq).then(|| self.l2_code_moments());
         for c in 0..self.n_cent as usize {
             if self.counts[c] == 0 {
                 continue;
             }
-            let codes = &self.codes[c * d..(c + 1) * d];
-            let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
-            let score = match metric {
-                Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
-                Metric::NegDot => -dot_qc,
-                Metric::L2Sq => {
-                    let (sum_c, sumsq_c) = moments.expect("moments built for L2 above")[c];
-                    let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
-                        + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
-                        + self.scales[c] * self.scales[c] * sumsq_c;
-                    norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
-                }
-            };
-            emit(c as u32, score);
+            emit(
+                c as u32,
+                self.score_cluster_at(metric, c, query, sum_q, norm_q_sq, moments),
+            );
         }
     }
 
@@ -2014,7 +2024,6 @@ impl ClusterCentroids {
     /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
     /// each assignment uses [`Self::nearest_cell`].
     pub fn assign_rows(&self, metric: Metric, vectors: &[f32], assignments: &mut [u32]) {
-        use rayon::prelude::*;
         let dim = self.dim as usize;
         assert_eq!(vectors.len() % dim, 0, "assign_rows: vectors len mismatch");
         let n = vectors.len() / dim;
@@ -2026,14 +2035,15 @@ impl ClusterCentroids {
         if n == 0 {
             return;
         }
-        let new: Vec<u32> = (0..n)
-            .into_par_iter()
-            .map(|d| {
-                let v = &vectors[d * dim..(d + 1) * dim];
-                self.nearest_cell(metric, v)
-            })
-            .collect();
-        assignments.copy_from_slice(&new);
+        // Write nearest-cell directly into the caller's slice (no throwaway
+        // Vec + copy). Runs on whichever rayon pool the caller installs — the
+        // commit/build path wraps this in `writer_pool.install`.
+        assignments
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(d, slot)| {
+                *slot = self.nearest_cell(metric, &vectors[d * dim..(d + 1) * dim]);
+            });
     }
 
     /// Dequantize cluster `c`'s centroid into `out` (length `dim`).
@@ -2242,7 +2252,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -2887,7 +2897,7 @@ mod tests {
             vector_summary: Default::default(),
             partition_key: pk,
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -3551,7 +3561,7 @@ mod tests {
             vector_summary: Default::default(),
             partition_key: pk,
             partition_hint: Some(hint),
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

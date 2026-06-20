@@ -29,10 +29,14 @@ use crate::{
     Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
+    superfile::{
+        builder::SuperfileBuilder,
+        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
+    },
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
+        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         query::dispatch::open_reader,
         wal::{
             SealRecord, WalStore,
@@ -190,11 +194,7 @@ impl Supertable {
     ) -> Result<(), CompactionError> {
         Self::compact_one_table(self, cfg).await?;
         if let Some(hidden) = self.inner().vector_index_table.as_ref() {
-            Self::compact_one_table(
-                hidden,
-                &crate::supertable::handle::hidden_vector_index_compaction_settings(),
-            )
-            .await?;
+            Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
         }
         Ok(())
     }
@@ -333,7 +333,7 @@ impl Supertable {
                 reader.vec().and_then(|v| {
                     v.vector_columns_config()
                         .next()
-                        .map(|c| c.rerank_codec == crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon)
+                        .map(|c| c.rerank_codec == RerankCodec::Sq8ResidualEpsilon)
                 })
             });
             if sq8_merge == Some(true) {
@@ -520,7 +520,7 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
-                    if crate::supertable::handle::is_hidden_vector_index_table(&inner.options)
+                    if is_hidden_vector_index_table(&inner.options)
                         && let Some(cell_id) = partition_hint
                         && let Err(e) = split_overflow_cell_after_compaction(
                             Arc::clone(inner),
@@ -789,7 +789,7 @@ mod tests {
             s.partition_key = 3u32.to_le_bytes().to_vec();
             segs.push(s);
         }
-        let cfg = crate::supertable::handle::hidden_vector_index_compaction_settings();
+        let cfg = hidden_vector_index_compaction_settings();
         let jobs = select(&segs, &cfg);
         assert!(
             !jobs.is_empty(),

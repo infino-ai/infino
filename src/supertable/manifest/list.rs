@@ -29,7 +29,11 @@ use crate::supertable::manifest::{
     add_sum_arrays,
     bloom::Bloom,
     column_hll, column_min_max, column_sum,
-    encoding::{DecodeError, EncodeError, decode_length1_array, encode_length1_array},
+    encoding::{
+        DecodeError, EncodeError, decode_centroid_envelope, decode_cluster_centroids,
+        decode_length1_array, encode_centroid_envelope, encode_cluster_centroids,
+        encode_length1_array, l2_distance,
+    },
     hll::HllSketch,
     merge_min_max_arrays,
     part::{BLAKE3_DIGEST_BYTES, BLAKE3_HEX_LEN, ContentHash, PartId},
@@ -43,6 +47,14 @@ use crate::supertable::manifest::{
 /// shape as the [`super::part::FORMAT_VERSION`] policy for
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
+
+/// Default nearest cells always probed by the hidden VectorCell index — the
+/// recall floor before the radius-aware threshold widens the probe set.
+const DEFAULT_CELL_NPROBE_MIN: usize = 4;
+/// Default hard cap on cells probed per query (bounds the object-store GET fan).
+const DEFAULT_CELL_NPROBE_MAX: usize = 64;
+/// Default margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
+const DEFAULT_CELL_SLACK: f32 = 1.0;
 
 // ---------- Public in-memory shapes ----------
 
@@ -122,9 +134,9 @@ pub struct CellRoutingParams {
 impl Default for CellRoutingParams {
     fn default() -> Self {
         Self {
-            nprobe_min: 4,
-            nprobe_max: 64,
-            slack: 1.0,
+            nprobe_min: DEFAULT_CELL_NPROBE_MIN,
+            nprobe_max: DEFAULT_CELL_NPROBE_MAX,
+            slack: DEFAULT_CELL_SLACK,
         }
     }
 }
@@ -632,8 +644,8 @@ impl VectorSummaryAgg {
             self.envelope_radius = other.envelope_radius;
             return;
         }
-        let self_center = decode_le_f32(&self.centroid_envelope);
-        let other_center = decode_le_f32(&other.centroid_envelope);
+        let self_center = decode_centroid_envelope(&self.centroid_envelope);
+        let other_center = decode_centroid_envelope(&other.centroid_envelope);
         if self_center.len() != other_center.len() {
             // Dim mismatch; poison to always-keep.
             self.centroid_envelope.clear();
@@ -649,8 +661,11 @@ impl VectorSummaryAgg {
         }
         let self_reach = l2_distance(&self_center, &new_center) + self.envelope_radius;
         let other_reach = l2_distance(&other_center, &new_center) + other.envelope_radius;
-        self.centroid_envelope = encode_le_f32(&new_center);
-        self.n_vectors = (self.n_vectors as u64 + other.n_vectors as u64) as u32;
+        self.centroid_envelope = encode_centroid_envelope(&new_center);
+        // Saturate rather than wrap: this count only weights the running mean,
+        // so pinning at u32::MAX past the (practically unreachable) overflow is
+        // safe, whereas a silent wrap to a tiny value would skew the centroid.
+        self.n_vectors = self.n_vectors.saturating_add(other.n_vectors);
         self.envelope_radius = self_reach.max(other_reach);
     }
 
@@ -673,34 +688,6 @@ impl VectorSummaryAgg {
             }
         }
     }
-}
-
-/// Decode a packed LE-f32 centroid blob (as stored in
-/// [`VectorSummaryAgg::centroid_envelope`]) back to floats.
-fn decode_le_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// Pack floats into the LE-f32 blob form used on the wire.
-fn encode_le_f32(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-/// Euclidean (L2) distance — the metric the vector envelope uses for its
-/// bounding ball (cosine/negdot over normalized centroids reduce to L2).
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum::<f32>()
-        .sqrt()
 }
 
 // ---------- Errors ----------
@@ -1169,7 +1156,7 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
             clusters,
             routing,
         } => {
-            let enc = super::encoding::encode_cluster_centroids(clusters);
+            let enc = encode_cluster_centroids(clusters);
             PartitionStrategyDto::VectorCell {
                 column: column.clone(),
                 clusters_b64: encode_b64(&enc),
@@ -1207,7 +1194,7 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
             routing,
         } => {
             let bytes = decode_b64(&clusters_b64, "partition_strategy.clusters")?;
-            let clusters = super::encoding::decode_cluster_centroids(&bytes).map_err(|e| {
+            let clusters = decode_cluster_centroids(&bytes).map_err(|e| {
                 ListParseError::BadFieldValue("partition_strategy.clusters", e.to_string())
             })?;
             PartitionStrategy::VectorCell {
@@ -2511,7 +2498,7 @@ mod tests {
     #[test]
     fn vector_merge_empty_other_is_noop() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
             n_vectors: 5,
             envelope_radius: 0.5,
         };
@@ -2525,12 +2512,15 @@ mod tests {
     fn vector_merge_empty_self_adopts_other() {
         let mut agg = VectorSummaryAgg::default();
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
             n_vectors: 3,
             envelope_radius: 0.75,
         };
         agg.merge_with(&other);
-        assert_eq!(decode_le_f32(&agg.centroid_envelope), vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            decode_centroid_envelope(&agg.centroid_envelope),
+            vec![1.0, 2.0, 3.0]
+        );
         assert_eq!(agg.n_vectors, 3);
         assert_eq!(agg.envelope_radius, 0.75);
     }
@@ -2543,7 +2533,7 @@ mod tests {
             envelope_radius: 0.0,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
             n_vectors: 3,
             envelope_radius: 0.5,
         };
@@ -2556,17 +2546,17 @@ mod tests {
     #[test]
     fn vector_merge_weighted_mean_centroid() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0, 0.0]),
             n_vectors: 3,
             envelope_radius: 0.0,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[6.0, 6.0, 6.0]),
+            centroid_envelope: encode_centroid_envelope(&[6.0, 6.0, 6.0]),
             n_vectors: 3,
             envelope_radius: 0.0,
         };
         agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
         // Weighted mean: (0*3 + 6*3)/(3+3) = 3.0 per coordinate
         for &c in &merged_center {
             assert!((c - 3.0).abs() < 1e-4);
@@ -2577,17 +2567,17 @@ mod tests {
     #[test]
     fn vector_merge_unequal_weights() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
             n_vectors: 1,
             envelope_radius: 0.0,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 10.0]),
+            centroid_envelope: encode_centroid_envelope(&[10.0, 10.0]),
             n_vectors: 9,
             envelope_radius: 0.0,
         };
         agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
         // Weighted mean: (0*1 + 10*9)/(1+9) = 9.0 per coordinate
         for &c in &merged_center {
             assert!((c - 9.0).abs() < 1e-4);
@@ -2597,12 +2587,12 @@ mod tests {
     #[test]
     fn vector_merge_dimension_mismatch_poisons() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
             n_vectors: 2,
             envelope_radius: 0.5,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
             n_vectors: 3,
             envelope_radius: 0.4,
         };
@@ -2616,17 +2606,17 @@ mod tests {
     #[test]
     fn vector_merge_encloses_both_balls() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
             n_vectors: 1,
             envelope_radius: 1.0,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[10.0, 0.0]),
             n_vectors: 1,
             envelope_radius: 1.0,
         };
         agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
         // Center should be at (5, 0)
         assert!((merged_center[0] - 5.0).abs() < 1e-4);
         assert!(merged_center[1].abs() < 1e-4);
@@ -2638,17 +2628,17 @@ mod tests {
     fn vector_merge_radius_conservative_bound() {
         // Test that the radius is conservative (no false negatives)
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[5.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[5.0, 0.0]),
             n_vectors: 2,
             envelope_radius: 3.0,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[5.0, 4.0]),
+            centroid_envelope: encode_centroid_envelope(&[5.0, 4.0]),
             n_vectors: 2,
             envelope_radius: 2.0,
         };
         agg.merge_with(&other);
-        let merged_center = decode_le_f32(&agg.centroid_envelope);
+        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
         // Both original balls should be enclosed by the merged envelope
         let reach1 = l2_distance(&[5.0, 0.0], &merged_center) + 3.0;
         let reach2 = l2_distance(&[5.0, 4.0], &merged_center) + 2.0;
@@ -2665,12 +2655,12 @@ mod tests {
     #[test]
     fn vector_merge_updates_n_vectors_count() {
         let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0]),
             n_vectors: 7,
             envelope_radius: 0.1,
         };
         let other = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[2.0]),
+            centroid_envelope: encode_centroid_envelope(&[2.0]),
             n_vectors: 5,
             envelope_radius: 0.2,
         };
@@ -2693,7 +2683,7 @@ mod tests {
         let mut into = BTreeMap::new();
         let mut other = BTreeMap::new();
         let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
             n_vectors: 4,
             envelope_radius: 0.5,
         };
@@ -2708,7 +2698,7 @@ mod tests {
         let mut into = BTreeMap::new();
         let other = BTreeMap::new();
         let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
             n_vectors: 2,
             envelope_radius: 0.3,
         };
@@ -2723,12 +2713,12 @@ mod tests {
         let mut into = BTreeMap::new();
         let mut other = BTreeMap::new();
         let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[0.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
             n_vectors: 2,
             envelope_radius: 1.0,
         };
         let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[10.0, 0.0]),
+            centroid_envelope: encode_centroid_envelope(&[10.0, 0.0]),
             n_vectors: 2,
             envelope_radius: 1.0,
         };
@@ -2738,7 +2728,7 @@ mod tests {
         assert_eq!(into.len(), 1);
         // After merge: n_vectors should be sum, centroid should be weighted mean
         assert_eq!(into["shared"].n_vectors, 4);
-        let merged_center = decode_le_f32(&into["shared"].centroid_envelope);
+        let merged_center = decode_centroid_envelope(&into["shared"].centroid_envelope);
         assert!((merged_center[0] - 5.0).abs() < 1e-4);
     }
 
@@ -2747,12 +2737,12 @@ mod tests {
         let mut into = BTreeMap::new();
         let mut other = BTreeMap::new();
         let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0, 3.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
             n_vectors: 2,
             envelope_radius: 0.5,
         };
         let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
             n_vectors: 2,
             envelope_radius: 0.5,
         };
@@ -2772,7 +2762,7 @@ mod tests {
         into.insert(
             "vec1".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
                 n_vectors: 2,
                 envelope_radius: 0.1,
             },
@@ -2780,7 +2770,7 @@ mod tests {
         other.insert(
             "vec2".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
+                centroid_envelope: encode_centroid_envelope(&[3.0, 4.0]),
                 n_vectors: 2,
                 envelope_radius: 0.2,
             },
@@ -2796,7 +2786,7 @@ mod tests {
         let mut into = BTreeMap::new();
         let mut other = BTreeMap::new();
         let summary = VectorSummaryAgg {
-            centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
             n_vectors: 2,
             envelope_radius: 0.5,
         };
@@ -2816,7 +2806,7 @@ mod tests {
         into.insert(
             "vec1".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
                 n_vectors: 1,
                 envelope_radius: 0.1,
             },
@@ -2824,7 +2814,7 @@ mod tests {
         into.insert(
             "vec2".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[3.0, 4.0]),
+                centroid_envelope: encode_centroid_envelope(&[3.0, 4.0]),
                 n_vectors: 1,
                 envelope_radius: 0.2,
             },
@@ -2833,7 +2823,7 @@ mod tests {
         other.insert(
             "vec1".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[1.0, 2.0]),
+                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
                 n_vectors: 1,
                 envelope_radius: 0.1,
             },
@@ -2841,7 +2831,7 @@ mod tests {
         other.insert(
             "vec3".to_string(),
             VectorSummaryAgg {
-                centroid_envelope: encode_le_f32(&[5.0, 6.0]),
+                centroid_envelope: encode_centroid_envelope(&[5.0, 6.0]),
                 n_vectors: 1,
                 envelope_radius: 0.3,
             },

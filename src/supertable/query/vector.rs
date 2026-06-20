@@ -75,16 +75,24 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, Decimal128Array};
 use roaring::RoaringBitmap;
 
-use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::resolve_hits_named};
+use super::{
+    SuperfileHit,
+    candidate::CandidatePlan,
+    dispatch,
+    exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
+    hierarchical_iter,
+};
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
+    storage::StorageProvider,
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri},
+        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
 };
@@ -114,8 +122,7 @@ fn filter_superfiles_by_cells(
     if routed_cells.is_empty() {
         return superfiles.to_vec();
     }
-    let routed_keys: std::collections::HashSet<[u8; 4]> =
-        routed_cells.iter().map(|c| c.to_le_bytes()).collect();
+    let routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
     superfiles
         .iter()
         .filter(|sf| {
@@ -144,9 +151,23 @@ fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHi
     })
 }
 
+/// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
+fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .map(|a| a.values().to_vec())
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))
+}
+
 /// Resolve a stable row id from manifest span arithmetic when the superfile
-/// body stores rows in contiguous id order.
-fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Option<i128> {
+/// body stores rows in contiguous id order. `None` when the id span is gapped
+/// (not a single contiguous append), so the caller must read the `_id` column.
+pub(crate) fn row_id_from_manifest_entry(
+    entry: &SuperfileEntry,
+    local_doc_id: u32,
+) -> Option<i128> {
     let n_docs = i128::from(entry.n_docs);
     let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
     if n_docs == 0 || span != n_docs {
@@ -155,12 +176,34 @@ fn row_id_from_manifest_entry(entry: &SuperfileEntry, local_doc_id: u32) -> Opti
     Some(entry.id_min + i128::from(local_doc_id))
 }
 
+/// Stable `_id` for every row in `entry` (`local` → `id_min + local` when the
+/// manifest span is contiguous, else targeted column reads). Same tier order as
+/// [`hidden_hits_user_ids`]: span arithmetic → resident `take_by_local_doc_ids`
+/// → [`read_ids_for_locals`].
+pub(crate) async fn stable_ids_by_local_for_routing(
+    manifest: &Manifest,
+    entry: &SuperfileEntry,
+    reader: &SuperfileReader,
+) -> Result<Vec<i128>, QueryError> {
+    if row_id_from_manifest_entry(entry, 0).is_some() {
+        return Ok((0..entry.n_docs as u32)
+            .map(|local| entry.id_min + i128::from(local))
+            .collect());
+    }
+    let locals: Vec<u32> = (0..reader.n_docs() as u32).collect();
+    let id_column = reader.id_column();
+    if reader.parquet_bytes().is_some() {
+        let batch = reader
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
+        return id_values_from_batch(&batch);
+    }
+    read_ids_for_locals(manifest, entry, &locals, id_column).await
+}
+
 /// Read the `_id` column values at `local_ids` (in caller order) from one
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
-/// cache is attached, so warm queries serve locally instead of re-fetching the
-/// column from object storage; falls back to a direct object-store read
-/// otherwise. One read per call — callers dedup by superfile so a given
-/// superfile's `_id` column is read at most once per query.
+/// cache is attached; falls back to object-store range GETs on lazy readers.
 async fn read_ids_for_locals(
     manifest: &Manifest,
     entry: &SuperfileEntry,
@@ -172,26 +215,17 @@ async fn read_ids_for_locals(
         .storage
         .as_ref()
         .ok_or_else(|| QueryError::Execute("id remap needs a storage backend".into()))?;
-    let batch = if let Some(cache) = manifest.options.disk_cache.as_ref() {
-        if cache.is_mmap_promoted(&entry.uri) {
-            let sf = cache
-                .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
-            sf.take_by_local_doc_ids(local_ids, &[id_column])
-                .map_err(|e| QueryError::Execute(e.to_string()))?
-        } else {
-            read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage).await?
-        }
-    } else {
-        read_ids_batch_object_store(manifest, entry, local_ids, id_column, storage).await?
-    };
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow_array::Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
-    Ok(col.values().to_vec())
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.as_ref();
+    let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
+    if reader.parquet_bytes().is_some() {
+        let batch = reader
+            .take_by_local_doc_ids(local_ids, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
+        return id_values_from_batch(&batch);
+    }
+    let batch = read_ids_batch_object_store(entry, local_ids, id_column, storage, &reader).await?;
+    id_values_from_batch(&batch)
 }
 
 /// Read the `_id` column at `local_ids` from a superfile via object-store range
@@ -199,24 +233,22 @@ async fn read_ids_for_locals(
 /// both the no-disk-cache path and the fallback when a cached reader is still a
 /// lazy foreground reader (pre-mmap-promotion).
 async fn read_ids_batch_object_store(
-    manifest: &Manifest,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
-    storage: &Arc<dyn crate::storage::StorageProvider>,
+    storage: &Arc<dyn StorageProvider>,
+    reader: &SuperfileReader,
 ) -> Result<arrow_array::RecordBatch, QueryError> {
     let (obj_store, path) = storage
         .object_store_handle(&entry.uri.storage_path())
         .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
     let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
-    let store = Arc::clone(&manifest.options.store);
-    let sf = super::dispatch::open_reader(&store, None, Some(storage), entry).await?;
-    super::exec::common::take_rows_object_store(
+    take_rows_object_store(
         obj_store,
         path,
         file_size,
-        sf.schema(),
-        sf.n_docs(),
+        reader.schema(),
+        reader.n_docs(),
         local_ids,
         &[id_column],
     )
@@ -287,8 +319,7 @@ async fn hidden_hits_id_score_batch(
 
     let ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
     let scores: Vec<f32> = hidden_hits.iter().map(|h| h.score).collect();
-    super::exec::common::id_score_batch(user_reader, &ids, &scores)
-        .map_err(|e| QueryError::Execute(e.to_string()))
+    id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
 }
 
 /// Map hidden-index `(superfile, local_doc_id)` hits to user-table hits
@@ -315,7 +346,7 @@ async fn remap_hidden_hits_to_user_hits(
     // superfile by id range; arithmetic when its span is contiguous, else
     // binary-search the superfile's `_id` column — read once per superfile
     // (resident via the disk cache), grouped so a gapped superfile is never
-    // re-read per hit. A per-superfile id-run index (issue #164) would make the
+    // re-read per hit. A future per-superfile id-run index would make the
     // gapped case O(1) and drop the column read entirely.
     let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
@@ -380,7 +411,6 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
-        _metric: Metric,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if superfiles.is_empty() {
@@ -579,6 +609,7 @@ impl SupertableReader {
     /// that matches no row anywhere returns an empty `Vec`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
+    /// `vector_search` with a filter; this drives the cross-superfile fan-out.
     pub(crate) async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -851,14 +882,7 @@ impl SupertableReader {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        let metric = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
-        self.fanout_vector_clusters(&superfiles, column, query, k, metric, options)
+        self.fanout_vector_clusters(&superfiles, column, query, k, options)
             .await
     }
 
@@ -888,10 +912,8 @@ impl SupertableReader {
                     .map(|vc| vc.metric)
                     .unwrap_or(Metric::L2Sq);
                 let selected = match vit_manifest.get_partition_strategy() {
-                    crate::supertable::manifest::list::PartitionStrategy::VectorCell {
-                        clusters,
-                        routing,
-                        ..
+                    PartitionStrategy::VectorCell {
+                        clusters, routing, ..
                     } => {
                         let mut routed = clusters.select_cells_adaptive(
                             vit_metric,
@@ -903,7 +925,7 @@ impl SupertableReader {
                         // to the nprobe-routed cells: those rows have not been
                         // distributed into cells by maintenance yet, so routing
                         // by centroid can't see them.
-                        routed.push(crate::supertable::handle::INCOMING_VECTOR_CELL);
+                        routed.push(INCOMING_VECTOR_CELL);
                         if vit_manifest.superfiles.is_empty() {
                             vit_manifest
                                 .superfiles_for_routed_cells(&routed)
@@ -920,28 +942,20 @@ impl SupertableReader {
                                 .iter()
                                 .map(|e| e.part_id)
                                 .collect();
-                            crate::supertable::query::hierarchical_iter::load_and_flatten(
-                                vit_manifest,
-                                &part_ids,
-                            )
-                            .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
+                            hierarchical_iter::load_and_flatten(vit_manifest, &part_ids)
+                                .await
+                                .map_err(|e| QueryError::Execute(e.to_string()))?
                         } else {
                             vit_manifest.superfiles.to_vec()
                         }
                     }
                 };
                 if !selected.is_empty() {
-                    return Ok(top_k_ascending(
-                        vec![
-                            vit_reader
-                                .fanout_vector_clusters(
-                                    &selected, column, query, k, vit_metric, options,
-                                )
-                                .await?,
-                        ],
-                        k,
-                    ));
+                    // Already top-k ascending (same as the user-table path
+                    // below) — no second `top_k_ascending` pass needed.
+                    return vit_reader
+                        .fanout_vector_clusters(&selected, column, query, k, options)
+                        .await;
                 }
             }
         }
@@ -1148,7 +1162,7 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow::array::Array;
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
@@ -1437,8 +1451,7 @@ mod tests {
         let hits = r
             .vector_hits("emb", &q, 24, VectorSearchOptions::new(), None)
             .expect("query");
-        let superfile_uris: std::collections::HashSet<_> =
-            hits.iter().map(|h| h.superfile).collect();
+        let superfile_uris: HashSet<_> = hits.iter().map(|h| h.superfile).collect();
         // All three superfiles should contribute (high k pulls from
         // each).
         assert_eq!(superfile_uris.len(), 3);
@@ -1478,8 +1491,7 @@ mod tests {
         // reader below uses its sync public API.
         let oracle_hits =
             block_on(oracle.vector_hits_async("emb", &q, 2, opts)).expect("oracle query");
-        let oracle_globals: std::collections::HashSet<u32> =
-            oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());
 
         let st_reader = st.reader();
@@ -1487,7 +1499,7 @@ mod tests {
             .vector_hits("emb", &q, 2, opts, None)
             .expect("supertable query");
         let manifest = st_reader.manifest();
-        let st_globals: std::collections::HashSet<u32> = st_hits
+        let st_globals: HashSet<u32> = st_hits
             .iter()
             .map(|h| {
                 let seg_idx = manifest
@@ -1655,7 +1667,7 @@ mod tests {
         let schema = schema_with_vector(dim);
         let opts = options_one_superfile_per_commit(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let opts = opts.with_storage(storage);
         let st = Supertable::create(opts).expect("create");
@@ -1665,8 +1677,7 @@ mod tests {
         w.commit().expect("commit");
 
         let reader = st.reader();
-        let user_uris: std::collections::HashSet<_> =
-            reader.manifest().superfiles.iter().map(|e| e.uri).collect();
+        let user_uris: HashSet<_> = reader.manifest().superfiles.iter().map(|e| e.uri).collect();
         assert!(
             reader.vector_index_table().is_some(),
             "hidden index must exist"
@@ -1701,7 +1712,7 @@ mod tests {
         let schema = schema_with_vector(dim);
         let opts = options_one_superfile_per_commit(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let opts = opts.with_storage(storage);
         let st = Supertable::create(opts).expect("create");

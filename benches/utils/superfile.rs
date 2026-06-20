@@ -1051,24 +1051,7 @@ pub mod vector {
     }
 
     fn filtered_ground_truth(allow: &RoaringBitmap) -> Vec<Vec<u32>> {
-        let q_corr = queries_correctness();
-        let vecs = vectors();
-        q_corr
-            .iter()
-            .map(|q| {
-                let mut dists: Vec<(f32, u32)> = allow
-                    .iter()
-                    .map(|id| {
-                        let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                        let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                        (-dot, id)
-                    })
-                    .collect();
-                dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                dists.truncate(TOP_K);
-                dists.into_iter().map(|(_, id)| id).collect()
-            })
-            .collect()
+        corpus::filtered_ground_truth(vectors(), allow, queries_correctness(), TOP_K)
     }
 
     fn mean_filtered_recall(
@@ -1385,24 +1368,8 @@ pub mod vector {
                 // against that filtered ground truth.
                 {
                     let q_corr = queries_correctness();
-                    let vecs = vectors();
-                    let filtered_gt: Vec<Vec<u32>> = q_corr
-                        .iter()
-                        .map(|q| {
-                            let mut dists: Vec<(f32, u32)> = allow
-                                .iter()
-                                .map(|id| {
-                                    let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                    let dot: f32 =
-                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                                    (-dot, id)
-                                })
-                                .collect();
-                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                            dists.truncate(TOP_K);
-                            dists.into_iter().map(|(_, id)| id).collect()
-                        })
-                        .collect();
+                    let filtered_gt: Vec<Vec<u32>> =
+                        corpus::filtered_ground_truth(vectors(), &allow, q_corr, TOP_K);
                     let mut recalls = Vec::new();
                     for (q, gt) in q_corr.iter().zip(&filtered_gt) {
                         let hits = tiers::block_on(reader.vector_hits_filtered_async(
@@ -1432,22 +1399,8 @@ pub mod vector {
                 let vecs = vectors();
                 let q_corr = queries_correctness();
                 let unfiltered_gt = ground_truth_correctness();
-                let filtered_gt: Vec<Vec<u32>> = q_corr
-                    .iter()
-                    .map(|q| {
-                        let mut dists: Vec<(f32, u32)> = allow
-                            .iter()
-                            .map(|id| {
-                                let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                                (-dot, id)
-                            })
-                            .collect();
-                        dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                        dists.truncate(TOP_K);
-                        dists.into_iter().map(|(_, id)| id).collect()
-                    })
-                    .collect();
+                let filtered_gt: Vec<Vec<u32>> =
+                    corpus::filtered_ground_truth(vecs, &allow, q_corr, TOP_K);
 
                 /// Maximum multiplier applied by filtered search's
                 /// selectivity boost in the vector reader.

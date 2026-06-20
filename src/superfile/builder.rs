@@ -100,8 +100,13 @@ use crate::superfile::{
     },
     stats::SuperfileStats,
     vector::{
-        builder::VectorBuilder, cell_posting::CellPostingBuilder, distance::Metric,
-        layout::VectorLayout, reader::ColumnReader,
+        builder::VectorBuilder,
+        cell_posting::{CellPostingBuilder, MaterializedIvfRow},
+        distance::Metric,
+        ivf_merge::{MergedIvfSubsection, merge_sq8_ivf_subsections},
+        layout::VectorLayout,
+        reader::{ColumnReader, VectorReader},
+        rerank_codec::RerankCodec,
     },
 };
 
@@ -202,7 +207,7 @@ pub struct BuilderOptions {
     /// page headers + offset-index entries for the id column.
     pub id_page_size_limit: usize,
     /// Embedded vector blob layout. Default IVF.
-    pub vector_layout: VectorLayout,
+    pub(crate) vector_layout: VectorLayout,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -249,7 +254,7 @@ impl BuilderOptions {
         }
     }
 
-    pub fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+    pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
         self
     }
@@ -610,7 +615,7 @@ impl SuperfileBuilder {
     /// Sq8-native maintenance: feed preserved IVF rows into the normal vector builder.
     pub(crate) fn load_materialized_ivf_rows(
         &mut self,
-        rows: Vec<crate::superfile::vector::cell_posting::MaterializedIvfRow>,
+        rows: Vec<MaterializedIvfRow>,
     ) -> Result<(), BuildError> {
         let vb = self
             .vec_builder
@@ -624,7 +629,7 @@ impl SuperfileBuilder {
     pub(crate) fn set_prebuilt_ivf_subsection(
         &mut self,
         column_id: u32,
-        subsection: crate::superfile::vector::ivf_merge::MergedIvfSubsection,
+        subsection: MergedIvfSubsection,
     ) -> Result<(), BuildError> {
         let vb = self
             .vec_builder
@@ -639,10 +644,6 @@ impl SuperfileBuilder {
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
-        use crate::superfile::vector::{
-            ivf_merge::merge_sq8_ivf_subsections, rerank_codec::RerankCodec,
-        };
-
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
@@ -658,8 +659,7 @@ impl SuperfileBuilder {
         let column = vec_col.name.clone();
 
         let mut stats_collector = Vec::with_capacity(readers.len());
-        let mut merge_inputs: Vec<(&crate::superfile::vector::reader::VectorReader, String, u32)> =
-            Vec::with_capacity(readers.len());
+        let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(readers.len());
         let mut local_base = 0u32;
 
         for (reader, deleted) in readers {
@@ -676,11 +676,10 @@ impl SuperfileBuilder {
             local_base += record_batch.num_rows() as u32;
         }
 
-        let merge_refs: Vec<(&crate::superfile::vector::reader::VectorReader, &str, u32)> =
-            merge_inputs
-                .iter()
-                .map(|(v, col, off)| (*v, col.as_str(), *off))
-                .collect();
+        let merge_refs: Vec<(&VectorReader, &str, u32)> = merge_inputs
+            .iter()
+            .map(|(v, col, off)| (*v, col.as_str(), *off))
+            .collect();
         let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 

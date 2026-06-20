@@ -31,9 +31,20 @@
 //! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
 //! actix, etc.).
 
-use std::{future::Future, sync::Arc, thread};
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+    thread,
+};
 
-use tokio::{runtime, task::block_in_place};
+use tokio::{
+    runtime::{self, Handle, Runtime},
+    task::block_in_place,
+};
+
+/// Fallback worker count for [`build_query_runtime`] when the host's available
+/// parallelism can't be determined.
+const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
 
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
@@ -60,10 +71,7 @@ where
 /// one-shot one per call.
 ///
 /// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
-pub(crate) fn bridge_on_runtime<F: std::future::Future>(
-    fut: F,
-    runtime: &tokio::runtime::Runtime,
-) -> F::Output {
+pub(crate) fn bridge_on_runtime<F: Future>(fut: F, runtime: &Runtime) -> F::Output {
     // Always drive on the passed `runtime` — callers hand us the runtime the
     // future's async resources are bound to (e.g. `query_runtime`, where the
     // disk cache's coordination lives). Driving on a *different* ambient
@@ -71,8 +79,8 @@ pub(crate) fn bridge_on_runtime<F: std::future::Future>(
     // wakeup → deadlock (e.g. a cold disk-cache fetch during search). When an
     // ambient runtime is present, escape its worker via `block_in_place` so the
     // nested `block_on` is legal.
-    match tokio::runtime::Handle::try_current() {
-        Ok(_ambient) => tokio::task::block_in_place(|| runtime.handle().block_on(fut)),
+    match Handle::try_current() {
+        Ok(_ambient) => block_in_place(|| runtime.handle().block_on(fut)),
         Err(_) => runtime.block_on(fut),
     }
 }
@@ -116,7 +124,6 @@ where
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
 pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
-    const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
     let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
@@ -131,6 +138,27 @@ pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
                  catastrophic OS resource exhaustion",
             ),
     )
+}
+
+/// Get (or lazily build, named `name`) the shared query runtime stored in
+/// `slot`. Shared by the holders of a lazy `query_runtime` (`SupertableInner`,
+/// `ConnectionInner`) so the get-or-init lives in one place.
+pub(crate) fn get_or_init_query_runtime(
+    slot: &OnceLock<Arc<runtime::Runtime>>,
+    name: &str,
+) -> Arc<runtime::Runtime> {
+    Arc::clone(slot.get_or_init(|| build_query_runtime(name)))
+}
+
+/// `Drop`-safe shutdown for a lazily-built query runtime: take it out of `slot`
+/// and, only when this is the last owner, shut it down in the background
+/// (never blocking, so it is safe to call from inside an async context).
+pub(crate) fn shutdown_query_runtime_on_drop(slot: &mut OnceLock<Arc<runtime::Runtime>>) {
+    if let Some(rt) = slot.take()
+        && let Ok(rt) = Arc::try_unwrap(rt)
+    {
+        rt.shutdown_background();
+    }
 }
 
 fn build_current_thread_runtime() -> runtime::Runtime {

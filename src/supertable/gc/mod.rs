@@ -13,7 +13,10 @@ use crate::{
         Manifest,
         error::GcError,
         handle::SupertableInner,
-        manifest::commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+        manifest::{
+            SUPERFILE_DATA_DIR,
+            commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+        },
     },
 };
 
@@ -71,7 +74,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
 
     let mut report = GcReport::default();
 
-    for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, "data"] {
+    for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, SUPERFILE_DATA_DIR] {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live.contains(&key) {

@@ -812,6 +812,13 @@ pub mod vector {
     const QUERY_SIGMA: f32 = 0.05;
     /// Filtered vector bench allow-set density: keep every Nth row.
     const FILTER_KEEP_EVERY: usize = 10;
+    /// Filtered-search base config (mirrors the superfile tier): the engine
+    /// applies its own selectivity boost on top of these nominal values.
+    const FILTERED_DEFAULT_NPROBE: usize = 8;
+    const FILTERED_DEFAULT_RERANK_MULT: usize = 256;
+    /// Cap on the selectivity boost the vector reader applies to filtered
+    /// search — used only to report the *effective* `(nprobe, rerank)`.
+    const FILTER_MAX_MULT: usize = 64;
 
     /// `INFINO_BENCH_SKIP_CALIBRATION=1` measures only the fixed
     /// `(nprobe, rerank)` config — no correctness gate, no recall-target
@@ -836,6 +843,27 @@ pub mod vector {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RERANK_MULT)
+    }
+
+    fn log_hidden_stats(consumer: &Supertable, label: &str) {
+        if let Some((total, max_per_cell)) = consumer.hidden_vector_superfile_stats() {
+            eprintln!(
+                "[supertable_vector] hidden vector index {label}: {total} superfiles, max {max_per_cell} per cell"
+            );
+        }
+    }
+
+    /// Drain hidden incoming IVF into per-cell superfiles via the existing
+    /// SPFresh maintenance hook (same call integration tests use).
+    fn drain_hidden_incoming(consumer: &Supertable) {
+        let hidden = consumer
+            .vector_index_table()
+            .expect("vector table keeps hidden index");
+        eprintln!("[supertable_vector] draining hidden incoming IVF into cell superfiles...");
+        hidden
+            .await_incoming_routed_to_cells_sync()
+            .expect("hidden incoming drain");
+        log_hidden_stats(hidden, "after drain");
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
@@ -958,23 +986,8 @@ pub mod vector {
                     for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
                         allow.insert(i);
                     }
-                    let filtered_gt = q_correct
-                        .iter()
-                        .map(|q| {
-                            let mut dists: Vec<(f32, u32)> = allow
-                                .iter()
-                                .map(|id| {
-                                    let row = &vslice[id as usize * DIM..(id as usize + 1) * DIM];
-                                    let dot: f32 =
-                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                                    (-dot, id)
-                                })
-                                .collect();
-                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                            dists.truncate(TOP_K);
-                            dists.into_iter().map(|(_, id)| id).collect()
-                        })
-                        .collect();
+                    let filtered_gt =
+                        corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
                     (gt_all, gt_cal, Some(filtered_gt))
                 };
                 (q_correct, q_cal, gt_correct, gt_cal, filtered_gt)
@@ -999,46 +1012,108 @@ pub mod vector {
             // only.
             drop(corpus);
 
-            // One consumer drives correctness, calibration, and warm timing.
-            // Warm latency is query-driven: each config runs one untimed
-            // search (cache fill), then timed iterations — no global
-            // wait_until_warm that mmap-promotes every superfile.
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
-            if phases.warm {
-                if let Some((total, max_per_cell)) = consumer.hidden_vector_superfile_stats() {
-                    eprintln!(
-                        "[supertable_vector] hidden vector index at warm open: {total} superfiles, max {max_per_cell} per cell"
-                    );
-                }
-            }
+            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
+            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after SPFresh route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
+            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
 
-            let title = format!(
-                "Supertable vector — search, multi-superfile / object-store ({} docs × dim={})",
-                fmt_count(n_docs),
-                DIM
-            );
-            let recall_rows = exec_vec::run_search(
-                &mut report,
-                &consumer,
-                || SupertableVecColdGuard::open(&built),
-                supertable::VEC_COLUMN,
-                n_docs,
-                TOP_K,
-                nprobe,
-                rerank,
-                &q_correct,
-                &gt_correct,
-                &q_cal,
-                &gt_cal,
-                phases.warm,
-                phases.cold,
-                COLD_ITERS,
-                skip_cal,
-                "supertable_vector",
-                "bench/vector/supertable/search",
-                title,
-                "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.",
-            );
+            // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
+            // tables may already be post-drain — run the two-phase comparison only
+            // when we just built the table in this process.
+            let pre_post_drain = ingest_metrics.is_some();
+
+            let search_title = |phase: &str| {
+                format!(
+                    "Supertable vector — search {phase}, multi-superfile / object-store ({} docs × dim={})",
+                    fmt_count(n_docs),
+                    DIM
+                )
+            };
+
+            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
+
+            let recall_rows = if pre_post_drain {
+                if phases.warm {
+                    log_hidden_stats(&consumer, "at warm open (pre-drain)");
+                }
+                eprintln!("[supertable_vector] === pre-drain search (incoming staging) ===");
+                let _pre = exec_vec::run_search(
+                    &mut report,
+                    &consumer,
+                    || SupertableVecColdGuard::open(&built),
+                    supertable::VEC_COLUMN,
+                    n_docs,
+                    TOP_K,
+                    nprobe,
+                    rerank,
+                    &q_correct,
+                    &gt_correct,
+                    &q_cal,
+                    &gt_cal,
+                    phases.warm,
+                    phases.cold,
+                    COLD_ITERS,
+                    skip_cal,
+                    "supertable_vector/pre-drain",
+                    "bench/vector/supertable/search/pre-drain",
+                    search_title("pre-drain"),
+                    PRE_DRAIN_NOTE,
+                );
+
+                drain_hidden_incoming(&consumer);
+
+                if phases.warm {
+                    log_hidden_stats(&consumer, "at warm open (post-drain)");
+                }
+                eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
+                exec_vec::run_search(
+                    &mut report,
+                    &consumer,
+                    || SupertableVecColdGuard::open(&built),
+                    supertable::VEC_COLUMN,
+                    n_docs,
+                    TOP_K,
+                    nprobe,
+                    rerank,
+                    &q_correct,
+                    &gt_correct,
+                    &q_cal,
+                    &gt_cal,
+                    phases.warm,
+                    phases.cold,
+                    COLD_ITERS,
+                    skip_cal,
+                    "supertable_vector/post-drain",
+                    "bench/vector/supertable/search/post-drain",
+                    search_title("post-drain"),
+                    POST_DRAIN_NOTE,
+                )
+            } else {
+                if phases.warm {
+                    log_hidden_stats(&consumer, "at warm open");
+                }
+                exec_vec::run_search(
+                    &mut report,
+                    &consumer,
+                    || SupertableVecColdGuard::open(&built),
+                    supertable::VEC_COLUMN,
+                    n_docs,
+                    TOP_K,
+                    nprobe,
+                    rerank,
+                    &q_correct,
+                    &gt_correct,
+                    &q_cal,
+                    &gt_cal,
+                    phases.warm,
+                    phases.cold,
+                    COLD_ITERS,
+                    skip_cal,
+                    "supertable_vector",
+                    "bench/vector/supertable/search",
+                    search_title(""),
+                    LEGACY_NOTE,
+                )
+            };
             if phases.warm {
                 emit_cost_warm(
                     &mut report,
@@ -1084,7 +1159,10 @@ pub mod vector {
                         supertable::VEC_COLUMN,
                         q,
                         TOP_K,
-                        exec_vec::search_opts(nprobe, rerank),
+                        exec_vec::search_opts(
+                            FILTERED_DEFAULT_NPROBE,
+                            FILTERED_DEFAULT_RERANK_MULT,
+                        ),
                         Arc::clone(&allow),
                     ))
                     .expect("filtered recall query");
@@ -1109,7 +1187,12 @@ pub mod vector {
                     latencies.sort_unstable();
                     let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
                     let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
-                    let effective_rerank = rerank.saturating_mul(FILTER_KEEP_EVERY);
+                    // Effective config the engine actually runs after its
+                    // bounded selectivity boost (mirrors the superfile tier):
+                    // boost both dims by the clamped filter multiplier.
+                    let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
+                    let effective_nprobe = FILTERED_DEFAULT_NPROBE.saturating_mul(filter_mult);
+                    let effective_rerank = FILTERED_DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
 
                     eprintln!(
                         "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
@@ -1140,8 +1223,10 @@ pub mod vector {
                             ],
                             rows: vec![vec![
                                 text("filtered (~10%)"),
-                                text(format!("p={nprobe}, r={rerank}")),
-                                text(format!("p={nprobe}, r={effective_rerank}")),
+                                text(format!(
+                                    "p={FILTERED_DEFAULT_NPROBE}, r={FILTERED_DEFAULT_RERANK_MULT}"
+                                )),
+                                text(format!("p={effective_nprobe}, r={effective_rerank}")),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),
                                 metric(p50_ns, fmt_time(p50_ns), Better::Lower),

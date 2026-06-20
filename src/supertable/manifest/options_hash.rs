@@ -50,7 +50,7 @@
 use std::{error::Error, fmt};
 
 use crate::supertable::{
-    manifest::{list::PartitionStrategy, part::ContentHash},
+    manifest::{encoding::encode_cluster_centroids, list::PartitionStrategy, part::ContentHash},
     options::SupertableOptions,
 };
 
@@ -131,7 +131,7 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
         } => {
             push_tag(&mut buf, b"vector_cell");
             push_str(&mut buf, column);
-            let enc = super::encoding::encode_cluster_centroids(clusters);
+            let enc = encode_cluster_centroids(clusters);
             buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
             buf.extend_from_slice(&enc);
             buf.extend_from_slice(&(routing.nprobe_min as u64).to_le_bytes());
@@ -217,7 +217,7 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            manifest::{list::PartitionStrategy, part::ContentHash},
+            manifest::{ClusterCentroids, list::PartitionStrategy, part::ContentHash},
             options::SupertableOptions,
         },
         test_helpers::default_tokenizer,
@@ -483,7 +483,6 @@ mod tests {
 
     #[test]
     fn compute_options_hash_distinguishes_vector_cell() {
-        use crate::supertable::manifest::ClusterCentroids;
         let opts = fts_opts();
         let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
         let h_vc = compute_options_hash(

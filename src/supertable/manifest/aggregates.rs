@@ -35,6 +35,7 @@ use std::{
 
 use crate::supertable::manifest::{
     SuperfileEntry,
+    encoding::{encode_centroid_envelope, l2_distance},
     list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
 };
 
@@ -176,7 +177,7 @@ fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Ve
             envelope_radius = envelope_radius.max(dist + radius);
         }
 
-        let centroid_envelope = mean_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let centroid_envelope = encode_centroid_envelope(&mean_f32);
         out.insert(
             col,
             VectorSummaryAgg {
@@ -191,16 +192,6 @@ fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Ve
     out
 }
 
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
-    let mut sum = 0.0_f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum.sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -208,6 +199,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
 
     use super::*;
+    use crate::superfile::vector::layout::VectorLayout;
     use crate::supertable::manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
         part::{ContentHash, PartId},
@@ -270,7 +262,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -332,7 +324,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -382,7 +374,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
-                vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+                vector_layout: VectorLayout::Ivf,
                 subsection_offsets: None,
             })
         };

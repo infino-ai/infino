@@ -21,12 +21,12 @@
 //! score via [`distance_encoded_to_centroid`]; rows are re-spliced with
 //! [`encode_encoded_rows`], never decoded to fp32 corpora.
 
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::HashMap, env, sync::OnceLock};
 
 use crate::{
     superfile::vector::{
-        cell_posting::EncodedCellRow,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, distance_encoded_to_centroid},
+        cell_posting::{EncodedCellRow, manifest_centroid_components_from_row, medoid_index_by},
+        distance::{Metric, distance_encoded_to_centroid},
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -39,10 +39,9 @@ const CELL_SPLIT_KMEANS_ITERS: usize = 5;
 
 /// Overflow threshold for cell split. Override with `INFINO_CELL_SPLIT_DOC_CAP` in tests.
 pub(crate) fn cell_split_doc_cap() -> u64 {
-    use std::sync::OnceLock;
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("INFINO_CELL_SPLIT_DOC_CAP")
+        env::var("INFINO_CELL_SPLIT_DOC_CAP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(CELL_SPLIT_DOC_CAP_DEFAULT)
@@ -55,7 +54,7 @@ pub(crate) fn split_overflow_needed(n_docs: u64) -> bool {
 }
 
 /// Append-only count bookkeeping for touched cells.
-pub fn apply_cell_count_updates(
+pub(crate) fn apply_cell_count_updates(
     base: &ClusterCentroids,
     count_updates: &HashMap<u32, u32>,
 ) -> ClusterCentroids {
@@ -69,7 +68,7 @@ pub fn apply_cell_count_updates(
 }
 
 /// Apply count and radius updates from maintenance (incoming routing / compaction).
-pub fn apply_cell_updates(
+pub(crate) fn apply_cell_updates(
     base: &ClusterCentroids,
     count_updates: &HashMap<u32, u32>,
     radii_updates: &HashMap<u32, f32>,
@@ -123,20 +122,6 @@ fn centroid_prototype_from_row(
     ClusterCentroids::from_fp32(1, template.dim, &fp32, vec![1])
 }
 
-/// Sq8+ε row → dim fp32 components for manifest [`ClusterCentroids::from_fp32`]
-/// or IVF header centroids only (never a full-corpus decode).
-pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
-    (0..dim)
-        .map(|d| {
-            row.offset[d]
-                + row.scale[d]
-                    * (row.codes[d] as f32
-                        + (i8::from_le_bytes([row.residuals[d]]) as f32) * inv_div)
-        })
-        .collect()
-}
-
 fn distance_encoded_rows(
     metric: Metric,
     template: &ClusterCentroids,
@@ -147,21 +132,11 @@ fn distance_encoded_rows(
     score_row_against_cell(&proto, metric, 0, a)
 }
 
-/// Medoid index under Sq8+ε row↔row distance (discrete k-means centroid update).
+/// Medoid index under the asymmetric Sq8+ε row↔row distance (discrete k-means
+/// centroid update). Shares the all-pairs min-sum loop with the symmetric
+/// variant via [`medoid_index_by`]; only the distance kernel differs.
 fn medoid_index(template: &ClusterCentroids, metric: Metric, shard: &[EncodedCellRow]) -> usize {
-    let mut best_idx = 0usize;
-    let mut best_sum = f32::INFINITY;
-    for (i, row_i) in shard.iter().enumerate() {
-        let sum: f32 = shard
-            .iter()
-            .map(|row_j| distance_encoded_rows(metric, template, row_i, row_j))
-            .sum();
-        if sum < best_sum {
-            best_sum = sum;
-            best_idx = i;
-        }
-    }
-    best_idx
+    medoid_index_by(shard, |a, b| distance_encoded_rows(metric, template, a, b))
 }
 
 /// 2-way Lloyd k-means on Sq8+ε overflow rows. Returns manifest centroid
@@ -224,6 +199,14 @@ pub(crate) fn plan_sq8_split(
         cent1 = centroid_prototype_from_row(clusters, &shard1[m1]);
     }
 
+    // Re-assign against the converged centroids: the loop's last `assign` pass
+    // ran against the *previous* iteration's centroids (cent0/cent1 are updated
+    // after it), so the final shards must reflect one more assignment pass.
+    for (i, row) in rows.iter().enumerate() {
+        let d0 = score_row_against_cell(&cent0, metric, 0, row);
+        let d1 = score_row_against_cell(&cent1, metric, 0, row);
+        assign[i] = u8::from(d1 < d0);
+    }
     let mut shard0 = Vec::new();
     let mut shard1 = Vec::new();
     for (i, row) in rows.iter().enumerate() {

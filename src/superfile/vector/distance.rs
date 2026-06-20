@@ -108,6 +108,52 @@ pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_wide(a, b)
 }
 
+/// Distance under `metric` between two `dim`-length vectors given by per-index
+/// component accessors `a` and `b` (L2Sq returns the *squared* distance, no
+/// sqrt — matching the IVF assignment/medoid scan convention). Centralizes the
+/// per-metric reduction so the encoded-row scan paths share one definition
+/// instead of each hand-expanding the three-arm match.
+pub(crate) fn metric_distance_by<FA, FB>(metric: Metric, dim: usize, a: FA, b: FB) -> f32
+where
+    FA: Fn(usize) -> f32,
+    FB: Fn(usize) -> f32,
+{
+    match metric {
+        Metric::L2Sq => {
+            let mut s = 0.0f32;
+            for d in 0..dim {
+                let diff = a(d) - b(d);
+                s += diff * diff;
+            }
+            s
+        }
+        Metric::Cosine => {
+            let mut dot = 0.0f32;
+            let mut na = 0.0f32;
+            let mut nb = 0.0f32;
+            for d in 0..dim {
+                let (va, vb) = (a(d), b(d));
+                dot += va * vb;
+                na += va * va;
+                nb += vb * vb;
+            }
+            let denom = na.sqrt() * nb.sqrt();
+            if denom > 0.0 {
+                COSINE_DISTANCE_BASE - dot / denom
+            } else {
+                COSINE_DISTANCE_BASE - dot
+            }
+        }
+        Metric::NegDot => {
+            let mut dot = 0.0f32;
+            for d in 0..dim {
+                dot += a(d) * b(d);
+            }
+            -dot
+        }
+    }
+}
+
 /// Portable `wide::f32x8` (256-bit) dot product. The universal kernel
 /// the codebase has shipped since day one — runs on AVX2 / NEON /
 /// scalar. Public entry point [`dot`] dispatches here on every host

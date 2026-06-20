@@ -12,7 +12,7 @@
 //!   - `manifest-lists/list-NNNNNN.json` — immutable per
 //!     manifest version. Conditional-create on PUT (S3
 //!     `If-None-Match: *` / `O_EXCL` on LocalFS).
-//!   - `manifests/part-<content-hash>.avro.zst` — immutable,
+//!   - `manifest-parts/part-<content-hash>.avro.zst` — immutable,
 //!     content-addressed. Two writers that produce identical
 //!     bytes target the same URI; the second's `put_atomic`
 //!     surfaces `PreconditionFailed`, which is benign and

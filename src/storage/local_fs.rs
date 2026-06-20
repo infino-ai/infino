@@ -14,7 +14,11 @@
 //! `<root>/data/seg-abc.sf.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -193,7 +197,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 // thread, and the blocking `flock` (held across the head+put awaits)
                 // never releases. Per-directory locks keep distinct pointers
                 // independent while still serializing writers to the *same* pointer.
-                let lock_path = std::path::Path::new(uri)
+                let lock_path = Path::new(uri)
                     .parent()
                     .map(|d| self.root.join(d).join(".lock"))
                     .unwrap_or_else(|| self.root.join("_supertable").join(".lock"));

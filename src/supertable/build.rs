@@ -41,11 +41,10 @@ where
     E: Send,
     F: Fn(&T) -> Result<O, E> + Sync,
 {
-    if tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    pool.install(|| tasks.par_iter().map(&build_one).collect())
+    // Borrow `build_one` into the `install` closure (it is `Sync` but not
+    // necessarily `Send`); `&F` is itself `Fn + Sync`, so the in-scope variant
+    // accepts it and the empty-check + par_iter live in exactly one place.
+    pool.install(|| fanout_shards_in_pool_scope(tasks, &build_one))
 }
 
 /// Like [`fanout_shards`], but assumes the caller already holds

@@ -34,7 +34,10 @@ use super::{
     options::SupertableOptions,
 };
 use crate::{
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    runtime_bridge::{
+        bridge_on_runtime, bridge_sync_to_async, get_or_init_query_runtime,
+        shutdown_query_runtime_on_drop,
+    },
     storage::PrefixedStorageProvider,
     superfile::vector::kmeans::kmeans,
     supertable::{
@@ -168,11 +171,7 @@ impl Drop for SupertableInner {
     /// owner; otherwise an outstanding transient clone (never the
     /// last reference) just decrements normally.
     fn drop(&mut self) {
-        if let Some(rt) = self.query_runtime.take()
-            && let Ok(rt) = Arc::try_unwrap(rt)
-        {
-            rt.shutdown_background();
-        }
+        shutdown_query_runtime_on_drop(&mut self.query_runtime);
     }
 }
 
@@ -186,10 +185,7 @@ impl SupertableInner {
     /// serialize that fan-out and inflate cold latency. One worker per
     /// CPU lets those overlap, matching what an async caller gets.
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(
-            self.query_runtime
-                .get_or_init(|| build_query_runtime("supertable-query")),
-        )
+        get_or_init_query_runtime(&self.query_runtime, "supertable-query")
     }
 }
 
@@ -508,16 +504,23 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Block until every accumulated hidden incoming IVF superfile is
-    /// routed into per-cell IVF superfiles. Tests use this to
-    /// await background maintenance before compacting the hidden table.
+    // Gated to the same cfg as `writer::await_incoming_routed_to_cells`, which
+    // this calls: `test_visible!` only flips visibility (`pub` under
+    // test-helpers, else `pub(crate)`) and does not gate compilation, so
+    // without the cfg this would be compiled in plain builds and reference a
+    // function that only exists under test/test-helpers.
     #[cfg(any(test, feature = "test-helpers"))]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn await_incoming_routed_to_cells_sync(&self) -> Result<(), BuildError> {
+    test_visible! {
+    /// Block until every accumulated hidden incoming IVF superfile is
+    /// routed into per-cell IVF superfiles. Benches use this between
+    /// pre-drain and post-drain search phases; unit tests use it to
+    /// await background maintenance before compacting the hidden table.
+    fn await_incoming_routed_to_cells_sync(&self) -> Result<(), BuildError> {
         bridge_on_runtime(
             super::writer::await_incoming_routed_to_cells(Arc::clone(&self.inner)),
             &self.query_runtime(),
         )
+    }
     }
 
     /// Block until the on-disk cache has fully promoted every superfile
@@ -665,13 +668,12 @@ impl Supertable {
         }
     }
 
-    /// Diagnostic: `(total_hidden_superfiles, max_superfiles_in_one_cell)` for
-    /// the hidden vector-index table, or `None` when there is no hidden table.
-    /// Used by benches to observe how compacted the hidden cell index is.
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
     /// Force-open every user + hidden vector superfile reader on the
     /// pinned snapshot — the cold-open phase before a timed search.
     /// Hidden IVF superfiles use their prefixed storage provider.
-    pub fn open_all_superfiles(&self) {
+    fn open_all_superfiles(&self) {
         let reader = self.reader();
         let manifest = reader.manifest();
         let store = manifest.options.store.clone();
@@ -738,8 +740,14 @@ impl Supertable {
         })
         .expect("open_all_superfiles");
     }
+    }
 
-    pub fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Diagnostic: `(total_hidden_superfiles, max_superfiles_in_one_cell)` for
+    /// the hidden vector-index table, or `None` when there is no hidden table.
+    /// Used by benches to observe how compacted the hidden cell index is.
+    fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
@@ -751,6 +759,7 @@ impl Supertable {
         let total = manifest.superfiles.len();
         let max_per_cell = by_cell.values().copied().max().unwrap_or(0);
         Some((total, max_per_cell))
+    }
     }
 
     /// Internal accessor used by the writer module. Not part of
@@ -843,6 +852,22 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
+/// Eager-load every part of a hidden vector-index manifest entry whose part
+/// count is at or below this — the hidden index's per-cell superfiles are small
+/// and almost always touched together, so the lazy-open round-trips don't pay off.
+const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 128;
+
+/// Hidden vector-index compaction: target packed per-cell superfile size. Smaller
+/// than the user table's default — cell superfiles are many and individually small.
+const HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB: u64 = 8;
+
+/// Hidden vector-index compaction: merge a superfile once it drops below this
+/// fraction (percent) of the target size.
+const HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT: u8 = 40;
+
+/// Hidden vector-index compaction: per-pass memory ceiling.
+const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
+
 /// Train global VectorCell centroids from the user manifest and queue them
 /// on the hidden index table for its next commit.
 /// Aggressive compaction profile for the hidden vector-index table: keep
@@ -859,9 +884,9 @@ pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
 
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     crate::config::CompactionSettings {
-        target_superfile_size_mb: 8,
-        min_fill_percent: 40,
-        max_memory_mb: 512,
+        target_superfile_size_mb: HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
+        min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
+        max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
     }
 }
 
@@ -1003,7 +1028,7 @@ fn build_vector_index_options(
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_eager_load_threshold(128);
+        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }

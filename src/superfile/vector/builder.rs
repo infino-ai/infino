@@ -33,10 +33,11 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, cluster_quant_from_medoid, encoded_ivf_kmeans,
-            materialize_sq8_residual_row_into_cluster_quant,
+            MaterializedIvfRow, cluster_quant_from_medoid, encoded_component_at,
+            encoded_ivf_kmeans, materialize_sq8_residual_row_into_cluster_quant,
         },
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
+        ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
         rerank_codec::RerankCodec,
@@ -417,7 +418,7 @@ impl VectorBuilder {
     pub(crate) fn set_prebuilt_subsection(
         &mut self,
         column_id: u32,
-        subsection: crate::superfile::vector::ivf_merge::MergedIvfSubsection,
+        subsection: MergedIvfSubsection,
     ) -> Result<(), BuildError> {
         let idx = column_id as usize;
         let col = self
@@ -797,12 +798,9 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 /// Build one column's subsection from Sq8+ε maintenance rows. Reuses the same
 /// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
 fn build_subsection_from_materialized(
-    column_id: u32,
     cfg: VectorConfig,
     mut rows: Vec<MaterializedIvfRow>,
 ) -> Result<SubsectionBytes, BuildError> {
-    use crate::superfile::vector::cell_posting::encoded_component_at;
-
     rows.sort_by_key(|r| r.local_doc_id);
     let n_docs = rows.len();
     if n_docs == 0 {
@@ -845,40 +843,12 @@ fn build_subsection_from_materialized(
         let mut best_score = f32::INFINITY;
         for c in 0..n_cent {
             let cv = &centroids[c * dim..(c + 1) * dim];
-            let score = match cfg.metric {
-                Metric::L2Sq => {
-                    let mut s = 0.0f32;
-                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
-                        let diff = encoded_component_at(&row.encoded, d) - cv_d;
-                        s += diff * diff;
-                    }
-                    s
-                }
-                Metric::Cosine => {
-                    let mut dot = 0.0f32;
-                    let mut na = 0.0f32;
-                    let mut nb = 0.0f32;
-                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
-                        let va = encoded_component_at(&row.encoded, d);
-                        dot += va * cv_d;
-                        na += va * va;
-                        nb += cv_d * cv_d;
-                    }
-                    let denom = na.sqrt() * nb.sqrt();
-                    if denom > 0.0 {
-                        1.0 - dot / denom
-                    } else {
-                        1.0 - dot
-                    }
-                }
-                Metric::NegDot => {
-                    let mut dot = 0.0f32;
-                    for (d, &cv_d) in cv.iter().enumerate().take(dim) {
-                        dot += encoded_component_at(&row.encoded, d) * cv_d;
-                    }
-                    -dot
-                }
-            };
+            let score = metric_distance_by(
+                cfg.metric,
+                dim,
+                |d| encoded_component_at(&row.encoded, d),
+                |d| cv[d],
+            );
             if score < best_score {
                 best_score = score;
                 best_c = c;
@@ -921,50 +891,21 @@ fn build_subsection_from_materialized(
         .min(u32::MAX as f32) as u32;
 
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
-    let summary_size = dim * 4;
-    let centroids_size = n_cent * dim * 4;
-    let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
-    let per_cluster_blocks_size = n_docs * (code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes);
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    let total_size_before_crc = layout.total_size_before_crc;
 
-    let summary_off = SUB_HEADER_SIZE;
-    let centroids_off = summary_off + summary_size;
-    let cluster_idx_off = centroids_off + centroids_size;
-    let codec_meta_off = cluster_idx_off + cluster_idx_size;
-    let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+    let mut bytes = alloc_ivf_subsection_with_header(
+        &layout,
+        codec_meta_size,
+        summary_radius_x100,
+        &summary_centroid,
+        &centroids,
+    );
 
-    let total_size_before_crc = SUB_HEADER_SIZE
-        + summary_size
-        + centroids_size
-        + cluster_idx_size
-        + codec_meta_size
-        + per_cluster_blocks_size;
-
-    let mut bytes = vec![0u8; total_size_before_crc];
-
-    bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
-    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
-        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
-    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
-        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(summary_off as u64).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
-        .copy_from_slice(&summary_radius_x100.to_le_bytes());
-    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(centroids_off as u64).to_le_bytes());
-    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
-    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
-
-    bytes[summary_off..summary_off + summary_size]
-        .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
-    bytes[centroids_off..centroids_off + centroids_size]
-        .copy_from_slice(bytemuck::cast_slice(&centroids));
-
-    let sq8_scale_block_off = codec_meta_off;
+    let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
     let sq8_norms_block_off = match cfg.metric {
         Metric::L2Sq | Metric::Cosine => Some(sq8_offset_block_off + n_cent * dim * 4),
@@ -978,32 +919,24 @@ fn build_subsection_from_materialized(
         bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
     }
 
-    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let mut block_cursor = 0usize;
-    let mut acc_off = 0u32;
-    for &centroid_id in &cluster_order {
-        let cnt = bucket_counts[centroid_id];
-        let idx_base = cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
-        bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
-            .copy_from_slice(&acc_off.to_le_bytes());
-        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
-            .copy_from_slice(&cnt.to_le_bytes());
-
-        if cnt > 0 {
-            let cluster_count = cnt as usize;
-            let block_base = per_cluster_blocks_off + block_cursor;
-            let codes_len = cluster_count * code_bytes;
-            let ids_len = cluster_count * 4;
-            let full_chunk_base = block_base + codes_len + ids_len;
+    let store_norm = sq8_norms_block_off.is_some();
+    write_ivf_cluster_blocks(
+        &mut bytes,
+        &layout,
+        &cluster_order,
+        &bucket_counts,
+        code_bytes,
+        per_vec_bytes,
+        |bytes, centroid_id, blk| {
             let bucket = &buckets[centroid_id];
             let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
-            let store_norm = sq8_norms_block_off.is_some();
             let mut row_buf = vec![0u8; dim * 2];
             for (i, row) in bucket.iter().enumerate() {
-                let code_off = block_base + i * code_bytes;
+                let code_off = blk.codes_base + i * code_bytes;
                 bytes[code_off..code_off + code_bytes].copy_from_slice(&row.rabitq_code);
-                let id_off = block_base + codes_len + i * 4;
-                bytes[id_off..id_off + 4].copy_from_slice(&row.local_doc_id.to_le_bytes());
+                let id_off = blk.ids_base + i * format::vec::DOC_ID_BYTES;
+                bytes[id_off..id_off + format::vec::DOC_ID_BYTES]
+                    .copy_from_slice(&row.local_doc_id.to_le_bytes());
 
                 let norm_sq = materialize_sq8_residual_row_into_cluster_quant(
                     &row.encoded,
@@ -1013,18 +946,17 @@ fn build_subsection_from_materialized(
                     &mut row_buf,
                     store_norm,
                 );
-                let full_off = full_chunk_base + i * per_vec_bytes;
+                let full_off = blk.rerank_base + i * per_vec_bytes;
                 bytes[full_off..full_off + dim * 2].copy_from_slice(&row_buf);
                 if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm_sq) {
-                    let n_off = norms_off + (acc_off as usize + i) * 4;
+                    let n_off = norms_off + (blk.first_row + i) * 4;
                     bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                 }
             }
-            block_cursor += cluster_count * cluster_stride;
-        }
-        acc_off += cnt;
-    }
-    let _ = column_id;
+            Ok(())
+        },
+    )?;
+    debug_assert_eq!(bytes.len(), total_size_before_crc);
 
     let crc = crc32c(&bytes);
     let mut out = bytes;
@@ -1033,11 +965,11 @@ fn build_subsection_from_materialized(
     Ok(SubsectionBytes {
         bytes: out,
         n_cent,
-        summary_offset_in_sub: summary_off,
+        summary_offset_in_sub: layout.summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
             0
         } else {
-            codec_meta_off
+            layout.codec_meta_off
         },
         codec_meta_size,
     })
@@ -1061,7 +993,7 @@ fn build_subsection_streaming(
 
     if let Some(rows) = materialized_rows {
         drop(reservoir);
-        return build_subsection_from_materialized(column_id, cfg, rows);
+        return build_subsection_from_materialized(cfg, rows);
     }
 
     let dim = cfg.dim;
@@ -1274,9 +1206,6 @@ fn build_subsection_streaming(
     //            collapses to summary + centroids + cluster_idx
     //            + per-cluster blocks — the 1-bit shortlist's
     //            top-K is the final answer.
-    let summary_size = dim * 4;
-    let centroids_size = n_cent * dim * 4;
-    let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
     // v2 layout: each per-cluster block carries `codes_chunk +
@@ -1288,77 +1217,19 @@ fn build_subsection_streaming(
     // already fetches, dropping cold first-search from
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
-    let per_cluster_blocks_size = n_docs * (code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes);
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    let total_size_before_crc = layout.total_size_before_crc;
 
-    // Offsets relative to subsection start. Open-time region
-    // (everything before `per_cluster_blocks`) lands contiguously
-    // at the subsection head; the per-cluster blocks (codes +
-    // doc_ids + full, interleaved) fill the rest before the CRC.
-    let summary_off = SUB_HEADER_SIZE;
-    let centroids_off = summary_off + summary_size;
-    let cluster_idx_off = centroids_off + centroids_size;
-    let codec_meta_off = cluster_idx_off + cluster_idx_size;
-    let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+    let mut bytes = alloc_ivf_subsection_with_header(
+        &layout,
+        codec_meta_size,
+        summary_radius_x100,
+        &summary_centroid,
+        &centroids,
+    );
 
-    let total_size_before_crc = SUB_HEADER_SIZE
-        + summary_size
-        + centroids_size
-        + cluster_idx_size
-        + codec_meta_size
-        + per_cluster_blocks_size;
-
-    let mut bytes = vec![0u8; total_size_before_crc];
-
-    // Sub-header (56 bytes). See `format::vec::SUBSECTION_VERSION`
-    // for the byte-level spec.
-    //   [ 0.. 8] SUB_MAGIC
-    //   [ 8..12] SUBSECTION_VERSION
-    //   [12..16] codec_meta_size (u32 LE) — 0 when codec_meta empty
-    //   [16..24] summary_centroid_offset (u64 LE)
-    //   [24..28] summary_radius_x100 (u32 LE)
-    //   [28..32] reserved (u32)
-    //   [32..40] centroids_off (u64 LE)
-    //   [40..48] cluster_idx_off (u64 LE)
-    //   [48..56] per_cluster_blocks_off (u64 LE)
-    bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
-    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
-        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
-    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
-        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(summary_off as u64).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
-        .copy_from_slice(&summary_radius_x100.to_le_bytes());
-    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(centroids_off as u64).to_le_bytes());
-    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
-    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
-
-    bytes[summary_off..summary_off + summary_size]
-        .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
-    bytes[centroids_off..centroids_off + centroids_size]
-        .copy_from_slice(bytemuck::cast_slice(&centroids));
-
-    // Cluster index: one (doc_off, count) slot per centroid id.
-    let mut cluster_index: Vec<(usize, u32, u32)> = Vec::with_capacity(n_cent);
-    {
-        let mut acc_off = 0u32;
-        for &centroid_id in &cluster_order {
-            let cnt = bucket_counts[centroid_id];
-            let idx_base = cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
-            bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
-                .copy_from_slice(&acc_off.to_le_bytes());
-            bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
-                .copy_from_slice(&cnt.to_le_bytes());
-            cluster_index.push((centroid_id, acc_off, cnt));
-            acc_off += cnt;
-        }
-        debug_assert_eq!(acc_off as usize, n_docs);
-    }
-
-    let sq8_scale_block_off = codec_meta_off;
+    let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
     let sq8_norms_block_off = if sq8_family && matches!(cfg.metric, Metric::L2Sq | Metric::Cosine) {
         Some(sq8_offset_block_off + n_cent * dim * 4)
@@ -1376,72 +1247,70 @@ fn build_subsection_streaming(
     }
 
     let full_row_bytes_in_bucket = if codec.writes_full() { dim * 4 } else { 0 };
+    // Buffers reused across clusters (cleared/resized per cluster inside the
+    // writer) so the per-cluster file reads don't reallocate each iteration.
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
-    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
 
-    let mut block_cursor = 0usize;
-    for &(centroid_id, cluster_off_u32, cluster_count_u32) in &cluster_index {
-        if cluster_count_u32 == 0 {
-            continue;
-        }
-        let cluster_off = cluster_off_u32 as usize;
-        let cluster_count = cluster_count_u32 as usize;
+    write_ivf_cluster_blocks(
+        &mut bytes,
+        &layout,
+        &cluster_order,
+        &bucket_counts,
+        code_bytes,
+        per_vec_bytes,
+        |bytes, centroid_id, blk| {
+            let path = scratch.join(format!("infino_bucket_col{column_id}_c{centroid_id}.bin"));
+            let mut reader = BufReader::with_capacity(BUCKET_BUF_SIZE, File::open(&path)?);
 
-        let path = scratch.join(format!("infino_bucket_col{column_id}_c{centroid_id}.bin"));
-        let mut reader = BufReader::with_capacity(BUCKET_BUF_SIZE, File::open(&path)?);
-
-        id_block.resize(cluster_count * 4, 0);
-        code_block.resize(cluster_count * code_bytes, 0);
-        if full_row_bytes_in_bucket > 0 {
-            full_block.resize(cluster_count * full_row_bytes_in_bucket, 0);
-        }
-        for i in 0..cluster_count {
-            reader.read_exact(&mut id_block[i * 4..(i + 1) * 4])?;
-            reader.read_exact(&mut code_block[i * code_bytes..(i + 1) * code_bytes])?;
+            id_block.resize(blk.count * format::vec::DOC_ID_BYTES, 0);
+            code_block.resize(blk.count * code_bytes, 0);
             if full_row_bytes_in_bucket > 0 {
-                let off = i * full_row_bytes_in_bucket;
-                reader.read_exact(&mut full_block[off..off + full_row_bytes_in_bucket])?;
+                full_block.resize(blk.count * full_row_bytes_in_bucket, 0);
             }
-        }
-
-        let block_base = per_cluster_blocks_off + block_cursor;
-        let codes_len = cluster_count * code_bytes;
-        let ids_len = cluster_count * 4;
-        bytes[block_base..block_base + codes_len].copy_from_slice(&code_block);
-        bytes[block_base + codes_len..block_base + codes_len + ids_len].copy_from_slice(&id_block);
-
-        match codec {
-            RerankCodec::RabitqOnly => {}
-            RerankCodec::Fp32 => {
-                let full_base = block_base + codes_len + ids_len;
-                bytes[full_base..full_base + cluster_count * dim * 4].copy_from_slice(&full_block);
+            for i in 0..blk.count {
+                reader.read_exact(&mut id_block[i * 4..(i + 1) * 4])?;
+                reader.read_exact(&mut code_block[i * code_bytes..(i + 1) * code_bytes])?;
+                if full_row_bytes_in_bucket > 0 {
+                    let off = i * full_row_bytes_in_bucket;
+                    reader.read_exact(&mut full_block[off..off + full_row_bytes_in_bucket])?;
+                }
             }
-            RerankCodec::Sq8ResidualEpsilon => {
-                let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
-                let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
-                let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
-                let full_chunk_base = block_base + codes_len + ids_len;
-                encode_sq8_residual_cluster_simd(
-                    cluster_rows,
-                    dim,
-                    cluster_count,
-                    cluster_off,
-                    full_chunk_base,
-                    sq8_norms_block_off,
-                    &ec.inv_scale,
-                    &ec.c2,
-                    scale_c,
-                    offset_c,
-                    &mut bytes,
-                );
-            }
-        }
 
-        block_cursor += cluster_count * cluster_stride;
-    }
-    debug_assert_eq!(block_cursor, per_cluster_blocks_size);
+            bytes[blk.codes_base..blk.codes_base + blk.count * code_bytes]
+                .copy_from_slice(&code_block);
+            bytes[blk.ids_base..blk.ids_base + blk.count * format::vec::DOC_ID_BYTES]
+                .copy_from_slice(&id_block);
+
+            match codec {
+                RerankCodec::RabitqOnly => {}
+                RerankCodec::Fp32 => {
+                    bytes[blk.rerank_base..blk.rerank_base + blk.count * dim * 4]
+                        .copy_from_slice(&full_block);
+                }
+                RerankCodec::Sq8ResidualEpsilon => {
+                    let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
+                    let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
+                    let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
+                    encode_sq8_residual_cluster_simd(
+                        cluster_rows,
+                        dim,
+                        blk.count,
+                        blk.first_row,
+                        blk.rerank_base,
+                        sq8_norms_block_off,
+                        &ec.inv_scale,
+                        &ec.c2,
+                        scale_c,
+                        offset_c,
+                        bytes,
+                    );
+                }
+            }
+            Ok(())
+        },
+    )?;
     debug_assert_eq!(bytes.len(), total_size_before_crc);
 
     let crc = crc32c(&bytes);
@@ -1451,11 +1320,11 @@ fn build_subsection_streaming(
     Ok(SubsectionBytes {
         bytes: out,
         n_cent,
-        summary_offset_in_sub: summary_off,
+        summary_offset_in_sub: layout.summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
             0
         } else {
-            codec_meta_off
+            layout.codec_meta_off
         },
         codec_meta_size,
     })
@@ -1521,9 +1390,10 @@ fn encode_sq8_residual_cluster_simd(
     }
 }
 
-/// Sq8 per-cluster (min, max) → (scale, offset) derivation.
+/// Sq8 per-cluster (min, max) → (scale, offset) derivation. Shared with the
+/// cell-posting encode path so both derive the quantizer identically.
 #[inline]
-fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(min.len(), max.len());
     let dim = min.len();
     let mut scale = vec![0.0f32; dim];
@@ -1541,7 +1411,12 @@ fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec
     (scale, offset)
 }
 
-fn centroid_storage_order(centroids: &[f32], n_cent: usize, dim: usize) -> Vec<usize> {
+/// Physical storage order for centroids: a recursive widest-span median split
+/// that clusters spatially-near centroids together (better page locality for
+/// nprobe scans). The canonical ordering — shared with the byte-splice merge
+/// path (`ivf_merge`) so a merged subsection lays clusters out the same way a
+/// freshly-built one does.
+pub(crate) fn centroid_storage_order(centroids: &[f32], n_cent: usize, dim: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n_cent).collect();
     order_centroids_recursive(&mut order, centroids, dim);
     order
@@ -1580,6 +1455,149 @@ fn order_centroids_recursive(order: &mut [usize], centroids: &[f32], dim: usize)
     let (left, right) = order.split_at_mut(mid);
     order_centroids_recursive(left, centroids, dim);
     order_centroids_recursive(right, centroids, dim);
+}
+
+/// Byte offsets (relative to subsection start) of an IVF subsection's regions.
+/// Shared by every IVF subsection writer — the streaming fp32 build, the Sq8
+/// materialized rebuild, and the byte-splice merge — so the layout math lives
+/// in exactly one place.
+pub(crate) struct IvfSubsectionLayout {
+    pub summary_off: usize,
+    pub centroids_off: usize,
+    pub cluster_idx_off: usize,
+    /// Start of the codec-meta region; for the Sq8 family this is also the
+    /// per-cluster Sq8 `scale` block offset.
+    pub codec_meta_off: usize,
+    pub per_cluster_blocks_off: usize,
+    pub total_size_before_crc: usize,
+}
+
+impl IvfSubsectionLayout {
+    /// Compute the region offsets. `per_cluster_stride` is
+    /// `code_bytes + DOC_ID_BYTES + per_vec_bytes`; `codec_meta_size` is the
+    /// codec's metadata region size (0 when it has none).
+    pub(crate) fn compute(
+        dim: usize,
+        n_cent: usize,
+        n_docs: usize,
+        per_cluster_stride: usize,
+        codec_meta_size: usize,
+    ) -> Self {
+        let summary_off = SUB_HEADER_SIZE;
+        let centroids_off = summary_off + dim * 4;
+        let cluster_idx_off = centroids_off + n_cent * dim * 4;
+        let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+        let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+        let total_size_before_crc = per_cluster_blocks_off + n_docs * per_cluster_stride;
+        Self {
+            summary_off,
+            centroids_off,
+            cluster_idx_off,
+            codec_meta_off,
+            per_cluster_blocks_off,
+            total_size_before_crc,
+        }
+    }
+}
+
+/// Allocate the subsection buffer (sized to `total_size_before_crc`, CRC not yet
+/// appended) and write the fixed prefix every IVF subsection shares: the 56-byte
+/// sub-header, the summary centroid, and the per-cluster centroids. The caller
+/// fills the cluster index, codec-meta/per-cluster blocks, then appends the CRC.
+pub(crate) fn alloc_ivf_subsection_with_header(
+    layout: &IvfSubsectionLayout,
+    codec_meta_size: usize,
+    summary_radius_x100: u32,
+    summary_centroid: &[f32],
+    centroids: &[f32],
+) -> Vec<u8> {
+    let mut bytes = vec![0u8; layout.total_size_before_crc];
+    bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
+    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
+        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
+    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
+        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(layout.summary_off as u64).to_le_bytes());
+    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
+        .copy_from_slice(&summary_radius_x100.to_le_bytes());
+    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(layout.centroids_off as u64).to_le_bytes());
+    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(layout.cluster_idx_off as u64).to_le_bytes());
+    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
+        .copy_from_slice(&(layout.per_cluster_blocks_off as u64).to_le_bytes());
+    bytes[layout.summary_off..layout.summary_off + summary_centroid.len() * 4]
+        .copy_from_slice(bytemuck::cast_slice(summary_centroid));
+    bytes[layout.centroids_off..layout.centroids_off + centroids.len() * 4]
+        .copy_from_slice(bytemuck::cast_slice(centroids));
+    bytes
+}
+
+/// One cluster's `code‖doc_id‖rerank` sub-region offsets, handed to the
+/// per-cluster row writer by [`write_ivf_cluster_blocks`].
+pub(crate) struct ClusterBlock {
+    /// Byte offset of this cluster's 1-bit code sub-region.
+    pub codes_base: usize,
+    /// Byte offset of this cluster's doc-id sub-region.
+    pub ids_base: usize,
+    /// Byte offset of this cluster's rerank sub-region.
+    pub rerank_base: usize,
+    /// Global row index of this cluster's first row — equals the total row
+    /// count of all earlier clusters, i.e. the cluster's `doc_off`. Used to
+    /// index the trailing per-doc norms sidecar.
+    pub first_row: usize,
+    /// Row count in this cluster.
+    pub count: usize,
+}
+
+/// Write the cluster index and drive per-cluster block production for an IVF
+/// subsection — the codec-agnostic loop every IVF writer shares. Walks
+/// `cluster_order`, writes each centroid's `(doc_off, count)` index slot,
+/// computes the per-cluster `code‖doc_id‖rerank` sub-region offsets, and calls
+/// `write_cluster` to fill that cluster's rows. The cluster-index entries,
+/// block cursor, and stride math live here; only the row source (fp32 bucket
+/// file / encoded rows / source IVF bytes) and rerank transcode are
+/// caller-specific.
+pub(crate) fn write_ivf_cluster_blocks<F>(
+    bytes: &mut [u8],
+    layout: &IvfSubsectionLayout,
+    cluster_order: &[usize],
+    cluster_counts: &[u32],
+    code_bytes: usize,
+    per_vec_bytes: usize,
+    mut write_cluster: F,
+) -> Result<(), BuildError>
+where
+    F: FnMut(&mut [u8], usize, &ClusterBlock) -> Result<(), BuildError>,
+{
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let mut block_cursor = 0usize;
+    let mut acc_off = 0usize;
+    for &centroid_id in cluster_order {
+        let cnt = cluster_counts[centroid_id] as usize;
+        let idx_base = layout.cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
+        bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
+            .copy_from_slice(&(acc_off as u32).to_le_bytes());
+        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
+            .copy_from_slice(&(cnt as u32).to_le_bytes());
+        if cnt > 0 {
+            let block_base = layout.per_cluster_blocks_off + block_cursor;
+            let codes_len = cnt * code_bytes;
+            let ids_len = cnt * format::vec::DOC_ID_BYTES;
+            let block = ClusterBlock {
+                codes_base: block_base,
+                ids_base: block_base + codes_len,
+                rerank_base: block_base + codes_len + ids_len,
+                first_row: acc_off,
+                count: cnt,
+            };
+            write_cluster(bytes, centroid_id, &block)?;
+            block_cursor += cnt * cluster_stride;
+        }
+        acc_off += cnt;
+    }
+    Ok(())
 }
 
 /// Pass 2 of `build_subsection_streaming`: walk the input

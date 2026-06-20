@@ -30,6 +30,7 @@ use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    roaring::RoaringBitmap,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
@@ -852,6 +853,34 @@ pub fn ground_truth(
         .reduce(|| vec![Vec::new(); queries.len()], merge)
         .into_iter()
         .map(|top| top.into_iter().map(|(_, id)| id).collect())
+        .collect()
+}
+
+/// Brute-force *filtered* top-k: exact nearest neighbors by NegDot, restricted
+/// to the rows in `allow`. Shared by the superfile and supertable vector benches
+/// so both compute the filtered ground truth identically (same sort key + tie
+/// break as [`ground_truth`]).
+pub fn filtered_ground_truth(
+    vectors: &[f32],
+    allow: &RoaringBitmap,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Vec<Vec<u32>> {
+    queries
+        .iter()
+        .map(|q| {
+            let mut dists: Vec<(f32, u32)> = allow
+                .iter()
+                .map(|id| {
+                    let row = &vectors[id as usize * DIM..(id as usize + 1) * DIM];
+                    let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                    (-dot, id)
+                })
+                .collect();
+            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            dists.truncate(k);
+            dists.into_iter().map(|(_, id)| id).collect()
+        })
         .collect()
 }
 

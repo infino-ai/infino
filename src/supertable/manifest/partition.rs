@@ -13,6 +13,7 @@
 
 use crate::supertable::{
     error::{CommitError, ManifestError},
+    handle::INCOMING_VECTOR_CELL,
     manifest::{SuperfileEntry, list::PartitionStrategy},
 };
 
@@ -209,7 +210,7 @@ pub fn assign_partition(
             // `INCOMING_VECTOR_CELL` (u32::MAX) is the reserved "incoming"
             // append partition — deliberately outside `0..n_cells`. Real cells
             // must stay in range.
-            if cell != crate::supertable::handle::INCOMING_VECTOR_CELL && cell >= n_cells {
+            if cell != INCOMING_VECTOR_CELL && cell >= n_cells {
                 return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "VectorCell{{n_cells:{n_cells}}} got partition_hint={cell} (out of range)"
@@ -317,6 +318,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::superfile::vector::layout::VectorLayout;
     use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
 
     // ---- Helpers --------------------------------------------------------
@@ -333,7 +335,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         }
     }

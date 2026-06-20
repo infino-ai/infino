@@ -1203,6 +1203,8 @@ mod tests {
     use tokio::runtime;
 
     use super::*;
+
+    use crate::superfile::vector::layout::VectorLayout;
     use crate::{
         superfile::builder::FtsConfig,
         supertable::{
@@ -1701,7 +1703,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
-            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

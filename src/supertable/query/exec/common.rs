@@ -45,7 +45,9 @@ use crate::{
         handle::SupertableReader,
         manifest::SuperfileUri,
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
-        query::{SuperfileHit, superfile_reader::superfile_reader},
+        query::{
+            SuperfileHit, superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+        },
     },
 };
 
@@ -243,13 +245,11 @@ fn resolve_ids_arithmetic(
                     .superfiles
                     .iter()
                     .find(|e| e.uri == hit.superfile)?;
-                let n_docs = i128::from(entry.n_docs);
-                let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
-                if n_docs == 0 || span != n_docs {
-                    return None;
-                }
-                memo.push((hit.superfile, entry.id_min));
-                entry.id_min
+                // `None` when the span is gapped (not contiguous single-append),
+                // in which case arithmetic id resolution doesn't apply.
+                let base = row_id_from_manifest_entry(entry, 0)?;
+                memo.push((hit.superfile, base));
+                base
             }
         };
         ids.push(base + i128::from(hit.local_doc_id));

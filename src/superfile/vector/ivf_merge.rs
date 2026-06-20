@@ -7,28 +7,26 @@
 //! and Sq8-transcodes rerank rows only when a source cluster's quantizer
 //! differs from the destination — no fp32 corpus buffer and no re-kmeans.
 
+use bytemuck::cast_slice;
+
 use crate::superfile::{
     BuildError,
-    format::{
-        checksum::crc32c,
-        vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-            sub_hdr,
-        },
-    },
+    format::{checksum::crc32c, vec::DOC_ID_BYTES},
     vector::{
+        builder::{
+            IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
+            write_ivf_cluster_blocks,
+        },
         cell_posting::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
         distance::Metric,
         quant::BitQuantizer,
-        reader::VectorReader,
+        reader::{VectorReader, read_cluster_entry},
         rerank_codec::RerankCodec,
     },
 };
-
-const SUB_HEADER_SIZE: usize = crate::superfile::format::vec::SUB_HEADER_SIZE;
 
 /// One input superfile column for byte-splice merge.
 pub(crate) struct Sq8IvfMergeInput {
@@ -59,26 +57,13 @@ pub(crate) struct MergedIvfSubsection {
     pub codec_meta_size: usize,
 }
 
+/// `(doc_off, count)` for cluster `c` in one input, decoded via the shared
+/// reader-side [`read_cluster_entry`] (input shape adapted: full subsection
+/// buffer + cluster-index offset → the `n_cent × 8` index slice, widened to
+/// `usize` for the byte-offset arithmetic here).
 fn cluster_entry(sub: &[u8], cluster_idx_off: usize, c: usize) -> (usize, usize) {
-    let e = cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
-    let doc_off = u32::from_le_bytes([sub[e], sub[e + 1], sub[e + 2], sub[e + 3]]) as usize;
-    let cb = e + CLUSTER_IDX_COUNT_OFFSET;
-    let count = u32::from_le_bytes([sub[cb], sub[cb + 1], sub[cb + 2], sub[cb + 3]]) as usize;
-    (doc_off, count)
-}
-
-fn centroid_storage_order(centroids: &[f32], n_cent: usize, dim: usize) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..n_cent).collect();
-    order.sort_by(|&a, &b| {
-        let ca = &centroids[a * dim..(a + 1) * dim];
-        let cb = &centroids[b * dim..(b + 1) * dim];
-        ca.iter()
-            .zip(cb)
-            .map(|(x, y)| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
-            .find(|o| *o != std::cmp::Ordering::Equal)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    order
+    let (doc_off, count) = read_cluster_entry(&sub[cluster_idx_off..], c);
+    (doc_off as usize, count as usize)
 }
 
 /// Merge Sq8+ε IVF subsections by splicing per-cluster blocks.
@@ -178,50 +163,25 @@ pub(crate) fn merge_sq8_ivf_subsections(
         }
     }
 
-    let summary_size = dim * 4;
-    let centroids_size = n_cent * dim * 4;
-    let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, n_cent, metric);
-    let per_cluster_blocks_size = n_docs as usize
-        * (code_bytes + crate::superfile::format::vec::DOC_ID_BYTES + per_vec_bytes);
+    let cluster_stride = code_bytes + DOC_ID_BYTES + per_vec_bytes;
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs as usize,
+        cluster_stride,
+        codec_meta_size,
+    );
 
-    let summary_off = SUB_HEADER_SIZE;
-    let centroids_off = summary_off + summary_size;
-    let cluster_idx_off = centroids_off + centroids_size;
-    let codec_meta_off = cluster_idx_off + cluster_idx_size;
-    let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+    let mut bytes = alloc_ivf_subsection_with_header(
+        &layout,
+        codec_meta_size,
+        summary_radius_x100,
+        &summary_centroid,
+        &out_centroids,
+    );
 
-    let total_size_before_crc = SUB_HEADER_SIZE
-        + summary_size
-        + centroids_size
-        + cluster_idx_size
-        + codec_meta_size
-        + per_cluster_blocks_size;
-
-    let mut bytes = vec![0u8; total_size_before_crc];
-
-    bytes[0..MAGIC_BYTES].copy_from_slice(crate::superfile::format::vec::SUB_MAGIC);
-    bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
-        .copy_from_slice(&crate::superfile::format::vec::SUBSECTION_VERSION.to_le_bytes());
-    bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
-        .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(summary_off as u64).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
-        .copy_from_slice(&summary_radius_x100.to_le_bytes());
-    bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(centroids_off as u64).to_le_bytes());
-    bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(cluster_idx_off as u64).to_le_bytes());
-    bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
-        .copy_from_slice(&(per_cluster_blocks_off as u64).to_le_bytes());
-
-    bytes[summary_off..summary_off + summary_size]
-        .copy_from_slice(bytemuck::cast_slice(&summary_centroid));
-    bytes[centroids_off..centroids_off + centroids_size]
-        .copy_from_slice(bytemuck::cast_slice(&out_centroids));
-
-    let sq8_scale_block_off = codec_meta_off;
+    let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
     let sq8_norms_block_off = if store_norm {
         Some(sq8_offset_block_off + n_cent * dim * 4)
@@ -232,38 +192,34 @@ pub(crate) fn merge_sq8_ivf_subsections(
     for c in 0..n_cent {
         let sc_off = sq8_scale_block_off + c * dim * 4;
         bytes[sc_off..sc_off + dim * 4]
-            .copy_from_slice(bytemuck::cast_slice(&dst_scale[c * dim..c * dim + dim]));
+            .copy_from_slice(cast_slice(&dst_scale[c * dim..c * dim + dim]));
         let oc_off = sq8_offset_block_off + c * dim * 4;
         bytes[oc_off..oc_off + dim * 4]
-            .copy_from_slice(bytemuck::cast_slice(&dst_offset[c * dim..c * dim + dim]));
+            .copy_from_slice(cast_slice(&dst_offset[c * dim..c * dim + dim]));
     }
 
     let cluster_order = centroid_storage_order(&out_centroids, n_cent, dim);
-    let cluster_stride = code_bytes + crate::superfile::format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let mut block_cursor = 0usize;
-    let mut acc_off = 0u32;
+    // Merged per-cluster row counts (sum across inputs), so the shared
+    // cluster-block writer owns the index + cursor + offset math.
+    let merged_counts: Vec<u32> = (0..n_cent)
+        .map(|c| {
+            parsed
+                .iter()
+                .map(|inp| cluster_entry(&inp.sub, inp.cluster_idx_off, c).1 as u32)
+                .sum()
+        })
+        .collect();
+    let id_bytes = DOC_ID_BYTES;
     let mut row_buf = vec![0u8; dim * 2];
-    let id_bytes = crate::superfile::format::vec::DOC_ID_BYTES;
 
-    for &centroid_id in &cluster_order {
-        let mut cluster_count = 0u32;
-        for inp in &parsed {
-            let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, centroid_id);
-            cluster_count += count as u32;
-        }
-
-        let idx_base = cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
-        bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
-            .copy_from_slice(&acc_off.to_le_bytes());
-        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
-            .copy_from_slice(&cluster_count.to_le_bytes());
-
-        if cluster_count > 0 {
-            let cnt = cluster_count as usize;
-            let block_base = per_cluster_blocks_off + block_cursor;
-            let codes_len = cnt * code_bytes;
-            let ids_len = cnt * id_bytes;
-            let full_chunk_base = block_base + codes_len + ids_len;
+    write_ivf_cluster_blocks(
+        &mut bytes,
+        &layout,
+        &cluster_order,
+        &merged_counts,
+        code_bytes,
+        per_vec_bytes,
+        |bytes, centroid_id, blk| {
             let scale_c = &dst_scale[centroid_id * dim..centroid_id * dim + dim];
             let offset_c = &dst_offset[centroid_id * dim..centroid_id * dim + dim];
             let mut out_i = 0usize;
@@ -280,7 +236,8 @@ pub(crate) fn merge_sq8_ivf_subsections(
                 let full_at = block + count * (inp.code_bytes + id_bytes);
 
                 for i in 0..count {
-                    bytes[block_base + out_i * code_bytes..block_base + (out_i + 1) * code_bytes]
+                    bytes[blk.codes_base + out_i * code_bytes
+                        ..blk.codes_base + (out_i + 1) * code_bytes]
                         .copy_from_slice(
                             &inp.sub[block + i * inp.code_bytes..block + (i + 1) * inp.code_bytes],
                         );
@@ -292,11 +249,11 @@ pub(crate) fn merge_sq8_ivf_subsections(
                         inp.sub[idb + 2],
                         inp.sub[idb + 3],
                     ]) + inp.doc_id_offset;
-                    let id_off = block_base + codes_len + out_i * id_bytes;
+                    let id_off = blk.ids_base + out_i * id_bytes;
                     bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
 
                     let rowb = full_at + i * inp.per_vec_bytes;
-                    let full_off = full_chunk_base + out_i * per_vec_bytes;
+                    let full_off = blk.rerank_base + out_i * per_vec_bytes;
                     let norm_sq =
                         if sq8_quant_params_equal(src_scale, src_offset, scale_c, offset_c) {
                             bytes[full_off..full_off + dim * 2]
@@ -332,17 +289,16 @@ pub(crate) fn merge_sq8_ivf_subsections(
                         };
 
                     if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm_sq) {
-                        let n_off = norms_off + (acc_off as usize + out_i) * 4;
+                        let n_off = norms_off + (blk.first_row + out_i) * 4;
                         bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                     }
                     out_i += 1;
                 }
             }
-            debug_assert_eq!(out_i, cnt);
-            block_cursor += cnt * cluster_stride;
-        }
-        acc_off += cluster_count;
-    }
+            debug_assert_eq!(out_i, blk.count);
+            Ok(())
+        },
+    )?;
 
     let crc = crc32c(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());
@@ -351,11 +307,11 @@ pub(crate) fn merge_sq8_ivf_subsections(
         bytes,
         n_cent,
         n_docs,
-        summary_offset_in_sub: summary_off,
+        summary_offset_in_sub: layout.summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
             0
         } else {
-            codec_meta_off
+            layout.codec_meta_off
         },
         codec_meta_size,
     })

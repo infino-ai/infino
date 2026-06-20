@@ -84,7 +84,7 @@ use crate::{
             },
             tombstones_codec::TombstonesSidecar,
         },
-        writer::{build_subsection_offsets, persist_commit},
+        writer::{build_subsection_offsets, persist_commit, read_vector_layout_from_bytes},
     },
 };
 
@@ -429,7 +429,7 @@ async fn do_apply(
         // only if the bytes don't parse (same fallback as the
         // writer).
         subsection_offsets: build_subsection_offsets(&bytes),
-        vector_layout: crate::supertable::writer::read_vector_layout_from_bytes(&bytes),
+        vector_layout: read_vector_layout_from_bytes(&bytes),
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----

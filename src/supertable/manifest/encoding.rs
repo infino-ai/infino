@@ -36,7 +36,11 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
@@ -44,7 +48,7 @@ use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
 use crate::supertable::manifest::{
-    FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
 };
 
 /// Errors from the per-summary binary decoders.
@@ -457,7 +461,7 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 
 /// Sq8 cluster-centroid block (same layout as the tail of
 /// [`encode_vector_summary`], without the bounding-sphere header).
-pub fn encode_cluster_centroids(cl: &super::ClusterCentroids) -> Vec<u8> {
+pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
     let mut out = Vec::with_capacity(8 + nc * (4 + 4 + 4) + nc * cd);
@@ -481,7 +485,7 @@ pub fn encode_cluster_centroids(cl: &super::ClusterCentroids) -> Vec<u8> {
     out
 }
 
-pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids, DecodeError> {
+pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
     let cdim = read_u32(&mut c, "cluster_dim")? as usize;
@@ -527,7 +531,7 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids,
         Vec::new()
     };
 
-    Ok(super::ClusterCentroids {
+    Ok(ClusterCentroids {
         n_cent: n_cent as u32,
         dim: cdim as u32,
         codes: codes_b.to_vec(),
@@ -535,7 +539,7 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<super::ClusterCentroids,
         scales,
         counts,
         radii,
-        code_moments: std::sync::OnceLock::new(),
+        code_moments: OnceLock::new(),
     })
 }
 
@@ -581,6 +585,42 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
         radius,
         clusters,
     })
+}
+
+// ---------------------------------------------------------
+// Centroid-envelope blob helpers, shared by the vector
+// skip-summary aggregate (`VectorSummaryAgg`) writer
+// (`aggregates`), incremental merge (`list`), and reader-side
+// prune (`list_prune`). The blob is a packed little-endian
+// f32 array; `l2_distance` is the bounding-ball metric the
+// envelope uses (cosine/negdot over normalized centroids
+// reduce to L2).
+// ---------------------------------------------------------
+
+/// Pack floats into the packed little-endian f32 centroid-envelope blob.
+pub(crate) fn encode_centroid_envelope(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Decode a packed little-endian f32 centroid-envelope blob back to floats.
+pub(crate) fn decode_centroid_envelope(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Euclidean (L2) distance between two equal-length centroid vectors.
+pub(crate) fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
 }
 
 // ---------------------------------------------------------

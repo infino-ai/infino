@@ -20,7 +20,7 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{fmt, io, str, sync::Arc};
+use std::{collections::HashMap, fmt, io, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -62,7 +62,7 @@ use crate::{
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 
-fn vector_layout_from_kv(kv_map: &std::collections::HashMap<String, String>) -> VectorLayout {
+pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
         .get(kv::VEC_LAYOUT)
         .and_then(|s| VectorLayout::from_kv_value(s))
@@ -406,7 +406,7 @@ impl SuperfileReader {
                 Some(VectorReader::open_with(
                     blob,
                     cols_json,
-                    crate::superfile::vector::reader::OpenOptions {
+                    vector_reader::OpenOptions {
                         verify_crc: opts.verify_crc,
                     },
                 )?)

@@ -290,7 +290,7 @@ pub struct SupertableOptions {
     /// the persisted manifest list — config changes after
     /// creation have no effect.
     pub partition_strategy: Option<PartitionStrategy>,
-    pub vector_layout: VectorLayout,
+    pub(crate) vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -877,6 +877,12 @@ impl SupertableOptions {
         Ok(())
     }
 
+    /// Set the vector index layout passed through to the superfile builder.
+    pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+        self.vector_layout = layout;
+        self
+    }
+
     /// Construct a `superfile::BuilderOptions` for one rayon
     /// shard worker at commit time. The shard worker constructs
     /// its own `SuperfileBuilder` from this and feeds its slice
@@ -887,11 +893,6 @@ impl SupertableOptions {
     ///   ([`SupertableOptions::scalar_schema`]) — vector columns
     ///   live in the embedded vector blob, never in Parquet.
     ///   The id column is prepended (Decimal128(38, 0)).
-    pub fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
-        self.vector_layout = layout;
-        self
-    }
-
     pub fn builder_options(&self) -> BuilderOptions {
         BuilderOptions::new(
             self.scalar_schema(),

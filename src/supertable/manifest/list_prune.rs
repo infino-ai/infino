@@ -35,6 +35,7 @@
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::manifest::{
+        encoding::{decode_centroid_envelope, l2_distance},
         list::{ManifestList, ManifestPartEntry},
         part::PartId,
     },
@@ -229,30 +230,6 @@ pub fn prune_parts_for_vector(
             }
         })
         .collect()
-}
-
-fn decode_centroid_envelope(bytes: &[u8]) -> Vec<f32> {
-    let dim = bytes.len() / 4;
-    let mut out = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let s = i * 4;
-        out.push(f32::from_le_bytes([
-            bytes[s],
-            bytes[s + 1],
-            bytes[s + 2],
-            bytes[s + 3],
-        ]));
-    }
-    out
-}
-
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0_f32;
-    for i in 0..a.len().min(b.len()) {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum.sqrt()
 }
 
 #[cfg(test)]
