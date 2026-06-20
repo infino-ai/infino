@@ -399,7 +399,6 @@ fn release_asset_name(version: &str) -> Result<String, String> {
     };
     Ok(stem)
 }
-}
 
 fn reserve_loopback_port() -> Result<SocketAddr, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
