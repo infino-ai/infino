@@ -289,8 +289,9 @@ impl Backend {
         }
     }
 
-    /// Provider for a real backend, scoped to `prefix`. `None` for RustFS
-    /// (leased per fixture). `prefix = ""` gives the bucket/container root.
+    /// Provider for a production object store, scoped to `prefix`. `None` for
+    /// the local RustFS bench session (leased per fixture). `prefix = ""` gives
+    /// the bucket/container root.
     fn provider(&self, prefix: &str) -> Option<Arc<dyn StorageProvider>> {
         match self {
             Self::RustFs => None,
@@ -302,6 +303,12 @@ impl Backend {
                     .expect("real Azure provider"),
             )),
         }
+    }
+
+    /// True for the default `INFINO_BENCH_STORE=rustfs` path: a local daemon
+    /// with ephemeral per-run buckets, not a fixed production prefix.
+    fn uses_local_rustfs_bench_session(&self) -> bool {
+        matches!(self, Self::RustFs)
     }
 }
 
@@ -449,9 +456,18 @@ pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
 
 /// Full object-store prefix of an already-built supertable to open directly
 /// for the read phases. Set to a retained `INFINO_BENCH_KEEP_TABLE` prefix
-/// (e.g. `infino-supertable-bench/<pid>-<nanos>`) to skip corpus generation
-/// and ingest entirely and read against the existing artifact.
+/// on a **production object store** (remote S3, Azure Blob, or a production
+/// RustFS endpoint — not the default local RustFS bench session).
 const EXISTING_SUPERTABLE_PREFIX_ENV: &str = "INFINO_BENCH_EXISTING_PREFIX";
+
+/// Panic text when `INFINO_BENCH_EXISTING_PREFIX` is set with the local RustFS
+/// bench session (ephemeral per-run buckets).
+const EXISTING_PREFIX_REQUIRES_PRODUCTION_STORE: &str = "\
+INFINO_BENCH_EXISTING_PREFIX reopens a retained supertable on a production \
+object store only. The default local RustFS bench session uses ephemeral \
+per-run buckets and cannot address a fixed prefix. Configure a production \
+backend via INFINO_BENCH_STORE (remote S3, Azure Blob, or a production RustFS \
+endpoint) or unset INFINO_BENCH_EXISTING_PREFIX.";
 
 /// The configured existing-supertable prefix, if any (non-empty).
 fn existing_supertable_prefix() -> Option<String> {
@@ -462,13 +478,18 @@ fn existing_supertable_prefix() -> Option<String> {
 
 /// Storage scoped to an already-built supertable at the absolute prefix in
 /// `INFINO_BENCH_EXISTING_PREFIX`. `None` when the env is unset. No unique
-/// suffix and no cleanup — the data persists across runs. Real backend only,
-/// same guard as [`supertable_storage_fixture`].
+/// suffix and no cleanup — the data persists across runs. Production object
+/// store only (not the local RustFS bench session).
 pub(crate) async fn existing_supertable_storage_fixture() -> Option<StorageFixture> {
     let prefix = existing_supertable_prefix()?;
     let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if backend.uses_local_rustfs_bench_session() {
+        panic!("{EXISTING_PREFIX_REQUIRES_PRODUCTION_STORE}");
+    }
     let label = backend.label();
-    let storage = backend.provider(&prefix).expect("existing-prefix provider");
+    let storage = backend
+        .provider(&prefix)
+        .unwrap_or_else(|| panic!("existing-prefix provider for {label}"));
     eprintln!("[tiers] existing supertable {label} prefix={prefix} (read-only, no cleanup)");
     Some(StorageFixture {
         storage,

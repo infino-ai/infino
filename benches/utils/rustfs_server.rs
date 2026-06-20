@@ -50,6 +50,8 @@ const RUSTFS_SHA256SUMS_ASSET: &str = "SHA256SUMS";
 struct S3SignParams<'a> {
     method: &'a str,
     canonical_uri: &'a str,
+    /// Sorted, URI-encoded query string without leading `?` (empty when none).
+    canonical_query: &'a str,
     host: &'a str,
     amz_date: &'a str,
     payload_hash: &'a str,
@@ -341,28 +343,10 @@ fn provision_bucket(
 }
 
 fn empty_and_delete_bucket(session: &RustFsSession, bucket: &str) -> Result<(), String> {
-    let storage = build_rustfs_provider(
-        &session.endpoint,
-        bucket,
-        "",
-        &session.access_key,
-        &session.secret_key,
-        &session.ca_pem,
-    )?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async {
-        let keys = storage
-            .list_with_prefix("")
-            .await
-            .map_err(|e| e.to_string())?;
-        for key in keys {
-            storage.delete(&key).await.map_err(|e| e.to_string())?;
-        }
-        Ok::<(), String>(())
-    })?;
+    let keys = list_bucket_object_keys(session, bucket)?;
+    for key in keys {
+        delete_object(session, bucket, &key)?;
+    }
     delete_bucket(
         &session.endpoint,
         bucket,
@@ -371,6 +355,198 @@ fn empty_and_delete_bucket(session: &RustFsSession, bucket: &str) -> Result<(), 
         RUSTFS_REGION,
         &session.ca_pem,
     )
+}
+
+/// List every object key in `bucket` via blocking SigV4 GET (ListObjectsV2).
+fn list_bucket_object_keys(session: &RustFsSession, bucket: &str) -> Result<Vec<String>, String> {
+    let mut keys = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let (page, next, truncated) =
+            list_bucket_object_keys_page(session, bucket, continuation.as_deref())?;
+        keys.extend(page);
+        if truncated {
+            continuation = next;
+        } else {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+fn list_bucket_object_keys_page(
+    session: &RustFsSession,
+    bucket: &str,
+    continuation_token: Option<&str>,
+) -> Result<(Vec<String>, Option<String>, bool), String> {
+    let mut query_pairs = vec![("list-type", "2")];
+    if let Some(token) = continuation_token {
+        query_pairs.push(("continuation-token", token));
+    }
+    let canonical_query = canonical_query_string(&query_pairs);
+    let query_suffix = if canonical_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{canonical_query}")
+    };
+    let body = signed_s3_get(
+        session,
+        bucket,
+        &format!("/{bucket}{query_suffix}"),
+        &canonical_query,
+    )?;
+    parse_list_objects_v2_page(&body)
+}
+
+fn delete_object(session: &RustFsSession, bucket: &str, key: &str) -> Result<(), String> {
+    let encoded_key = percent_encode_path_segment(key);
+    let canonical_uri = format!("/{bucket}/{encoded_key}");
+    signed_s3_delete(session, &canonical_uri)
+}
+
+fn rustfs_blocking_client(ca_pem: &[u8]) -> Result<reqwest::blocking::Client, String> {
+    let cert = reqwest::Certificate::from_pem(ca_pem).map_err(|e| e.to_string())?;
+    reqwest::blocking::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn signed_s3_get(
+    session: &RustFsSession,
+    bucket: &str,
+    request_target: &str,
+    canonical_query: &str,
+) -> Result<String, String> {
+    let client = rustfs_blocking_client(&session.ca_pem)?;
+    let host = host_header(&session.endpoint)?;
+    let url = format!("{}{request_target}", session.endpoint);
+    let amz_date = amz_timestamp();
+    let payload_hash = sha256_hex(b"");
+    let canonical_uri = format!("/{bucket}");
+    let authorization = sign_s3_request(&S3SignParams {
+        method: "GET",
+        canonical_uri: &canonical_uri,
+        canonical_query,
+        host: &host,
+        amz_date: &amz_date,
+        payload_hash: &payload_hash,
+        access_key: &session.access_key,
+        secret_key: &session.secret_key,
+        region: RUSTFS_REGION,
+    })?;
+    let response = client
+        .get(&url)
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("authorization", authorization)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if status.is_success() {
+        return Ok(body);
+    }
+    Err(format!(
+        "ListObjectsV2 failed for {bucket}: HTTP {status} {body}"
+    ))
+}
+
+fn signed_s3_delete(session: &RustFsSession, canonical_uri: &str) -> Result<(), String> {
+    let client = rustfs_blocking_client(&session.ca_pem)?;
+    let host = host_header(&session.endpoint)?;
+    let url = format!("{}{canonical_uri}", session.endpoint);
+    let amz_date = amz_timestamp();
+    let payload_hash = sha256_hex(b"");
+    let authorization = sign_s3_request(&S3SignParams {
+        method: "DELETE",
+        canonical_uri,
+        canonical_query: "",
+        host: &host,
+        amz_date: &amz_date,
+        payload_hash: &payload_hash,
+        access_key: &session.access_key,
+        secret_key: &session.secret_key,
+        region: RUSTFS_REGION,
+    })?;
+    let response = client
+        .delete(&url)
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("authorization", authorization)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().ok();
+    if status.is_success() || status.as_u16() == 404 {
+        return Ok(());
+    }
+    Err(format!(
+        "DeleteObject failed for {canonical_uri}: HTTP {status} {body:?}"
+    ))
+}
+
+fn canonical_query_string(pairs: &[(&str, &str)]) -> String {
+    let mut encoded: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                percent_encode_query_component(k),
+                percent_encode_query_component(v)
+            )
+        })
+        .collect();
+    encoded.sort();
+    encoded.join("&")
+}
+
+fn percent_encode_query_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn parse_list_objects_v2_page(xml: &str) -> Result<(Vec<String>, Option<String>, bool), String> {
+    let mut keys = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Key>") {
+        rest = &rest[start + "<Key>".len()..];
+        let end = rest
+            .find("</Key>")
+            .ok_or("ListObjectsV2 response missing </Key>")?;
+        keys.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    let truncated = xml.contains("<IsTruncated>true</IsTruncated>");
+    let continuation = xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|tail| tail.split("</NextContinuationToken>").next())
+        .map(str::to_string);
+    Ok((keys, continuation, truncated))
 }
 
 /// Build an HTTPS S3 provider that trusts the bench-local CA.
@@ -666,6 +842,7 @@ fn create_bucket(
     let authorization = sign_s3_request(&S3SignParams {
         method: "PUT",
         canonical_uri: &format!("/{bucket}"),
+        canonical_query: "",
         host: &host,
         amz_date: &amz_date,
         payload_hash: &payload_hash,
@@ -713,6 +890,7 @@ fn delete_bucket(
     let authorization = sign_s3_request(&S3SignParams {
         method: "DELETE",
         canonical_uri: &format!("/{bucket}"),
+        canonical_query: "",
         host: &host,
         amz_date: &amz_date,
         payload_hash: &payload_hash,
@@ -771,8 +949,12 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
         params.host, params.payload_hash, params.amz_date
     );
     let canonical_request = format!(
-        "{}\n{}\n\n{}\n{signed_headers}\n{}",
-        params.method, params.canonical_uri, canonical_headers, params.payload_hash
+        "{}\n{}\n{}\n{}\n{signed_headers}\n{}",
+        params.method,
+        params.canonical_uri,
+        params.canonical_query,
+        canonical_headers,
+        params.payload_hash
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{credential_scope}\n{}",
@@ -817,6 +999,21 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_list_objects_v2_page_extracts_keys_and_continuation() {
+        let xml = "\
+<ListBucketResult>
+<IsTruncated>true</IsTruncated>
+<Contents><Key>a</Key></Contents>
+<Contents><Key>b/c</Key></Contents>
+<NextContinuationToken>tok</NextContinuationToken>
+</ListBucketResult>";
+        let (keys, next, truncated) = parse_list_objects_v2_page(xml).expect("parse");
+        assert_eq!(keys, vec!["a".to_string(), "b/c".to_string()]);
+        assert_eq!(next.as_deref(), Some("tok"));
+        assert!(truncated);
+    }
 
     #[test]
     fn parse_sha256_sums_finds_asset_line() {
