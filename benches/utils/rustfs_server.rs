@@ -404,11 +404,10 @@ fn release_asset_name(version: &str) -> Result<String, String> {
     Ok(stem)
 }
 
-fn reserve_loopback_port() -> Result<SocketAddr, String> {
+fn reserve_loopback_port() -> Result<(TcpListener, SocketAddr), String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    drop(listener);
-    Ok(addr)
+    Ok((listener, addr))
 }
 
 fn generate_tls_material() -> Result<(TempDir, Vec<u8>), String> {
