@@ -9,7 +9,7 @@
 
 use std::{
     io::Cursor,
-    net::{SocketAddr, TcpListener},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -38,8 +38,12 @@ const HEALTH_TIMEOUT_SECS: u64 = 60;
 const TEARDOWN_GRACE_MS: u64 = 2_000;
 /// Poll interval while waiting for a killed RustFS child to exit.
 const TEARDOWN_POLL_MS: u64 = 50;
-/// Spawn attempts when the reserved loopback port is taken before RustFS binds.
+/// Spawn attempts when the chosen loopback port is already in use or health check fails.
 const RUSTFS_SPAWN_MAX_ATTEMPTS: u32 = 5;
+/// Inclusive lower bound of the IANA ephemeral port range for random loopback picks.
+const EPHEMERAL_PORT_MIN: u16 = 49_152;
+/// Inclusive upper bound of the IANA ephemeral port range for random loopback picks.
+const EPHEMERAL_PORT_MAX: u16 = 65_535;
 /// Filename of the upstream checksum manifest on RustFS GitHub releases.
 const RUSTFS_SHA256SUMS_ASSET: &str = "SHA256SUMS";
 
@@ -132,7 +136,7 @@ pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
 
     let mut last_err = String::new();
     for attempt in 1..=RUSTFS_SPAWN_MAX_ATTEMPTS {
-        let addr = reserve_loopback_port()?;
+        let addr = random_loopback_addr();
         let port = addr.port();
         let address = format!("127.0.0.1:{port}");
         let endpoint = format!("https://{address}");
@@ -404,10 +408,16 @@ fn release_asset_name(version: &str) -> Result<String, String> {
     Ok(stem)
 }
 
-fn reserve_loopback_port() -> Result<(TcpListener, SocketAddr), String> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    Ok((listener, addr))
+/// Pick a random loopback port without binding in this process.
+///
+/// RustFS binds the port itself, so we cannot hold a listener open here.
+/// Pre-binding and dropping would also introduce a TOCTOU race. Instead we
+/// choose from the ephemeral range and rely on [`spawn_rustfs`] retries when
+/// the port is already taken.
+fn random_loopback_addr() -> SocketAddr {
+    use rand::RngExt;
+    let port = rand::rng().random_range(EPHEMERAL_PORT_MIN..=EPHEMERAL_PORT_MAX);
+    SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 fn generate_tls_material() -> Result<(TempDir, Vec<u8>), String> {
@@ -612,6 +622,20 @@ def456  other.zip
     #[test]
     fn parse_sha256_sums_missing_asset_errors() {
         assert!(parse_sha256_sums_entry("abc123  other.zip\n", "missing.zip").is_err());
+    }
+
+    #[test]
+    fn random_loopback_addr_is_ephemeral_loopback() {
+        let addr = random_loopback_addr();
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert!(
+            (EPHEMERAL_PORT_MIN..=EPHEMERAL_PORT_MAX).contains(&addr.port()),
+            "port {} outside ephemeral range",
+            addr.port()
+        );
     }
 
     #[test]
