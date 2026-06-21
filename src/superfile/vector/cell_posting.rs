@@ -16,7 +16,7 @@ use crate::superfile::{
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel, metric_distance_by},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, metric_distance_by},
     },
 };
 
@@ -298,7 +298,7 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
                     .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
             ),
         };
-        let kernel = Sq8ResidualEpsilonKernel::new(
+        let kernel = Sq8ResidualKernel::new(
             posting.metric,
             query,
             &posting.scale,

@@ -112,7 +112,7 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// `[0, SQ8_CODE_MAX]`.
 const SQ8_CODE_MAX: f32 = 255.0;
 
-/// Symmetric clamp bound for the Sq8ResidualEpsilon i8 leg. The residual is
+/// Symmetric clamp bound for the Sq8Residual i8 leg. The residual is
 /// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
 /// quantized magnitude stays symmetric about zero.
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
@@ -402,7 +402,7 @@ impl VectorBuilder {
                 column: format!("(unregistered vector column_id {column_id})"),
                 actual: "n/a".to_string(),
             })?;
-        if !matches!(col.config.rerank_codec, RerankCodec::Sq8ResidualEpsilon) {
+        if !matches!(col.config.rerank_codec, RerankCodec::Sq8Residual) {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.config.column.clone(),
                 codec: col.config.rerank_codec.name(),
@@ -835,7 +835,7 @@ fn build_subsection_from_materialized(
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let codec = cfg.rerank_codec;
-    debug_assert!(matches!(codec, RerankCodec::Sq8ResidualEpsilon));
+    debug_assert!(matches!(codec, RerankCodec::Sq8Residual));
 
     let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
     for row in &rows {
@@ -1069,9 +1069,9 @@ fn build_subsection_streaming(
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
     let codec = cfg.rerank_codec;
-    // `Sq8ResidualEpsilon` uses per-cluster scale/offset codec_meta plus
+    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
-    let sq8_family = matches!(codec, RerankCodec::Sq8ResidualEpsilon);
+    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
     let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -1289,7 +1289,7 @@ fn build_subsection_streaming(
                     bytes[blk.rerank_base..blk.rerank_base + blk.count * dim * 4]
                         .copy_from_slice(&full_block);
                 }
-                RerankCodec::Sq8ResidualEpsilon => {
+                RerankCodec::Sq8Residual => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                     let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                     let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
@@ -1330,7 +1330,7 @@ fn build_subsection_streaming(
     })
 }
 
-/// `Sq8ResidualEpsilon` per-cluster encode. Writes a row-interleaved
+/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
 /// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
 /// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
 /// `sq8_encode_row` quantization; the residual code captures the
@@ -1839,7 +1839,7 @@ mod tests {
             n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");

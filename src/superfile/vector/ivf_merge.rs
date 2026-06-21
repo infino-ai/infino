@@ -92,7 +92,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
     }
 
     let n_docs: u32 = parsed.iter().map(|p| p.n_docs).sum();
-    let codec = RerankCodec::Sq8ResidualEpsilon;
+    let codec = RerankCodec::Sq8Residual;
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);

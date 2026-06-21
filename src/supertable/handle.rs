@@ -995,7 +995,7 @@ fn build_vector_index_options(
         .vector_columns
         .iter()
         .map(|vc| crate::superfile::builder::VectorConfig {
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
             ..vc.clone()
         })
         .collect();
@@ -1924,7 +1924,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 // Production codec: the consolidation merge byte-splices Sq8+ε.
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -2084,7 +2084,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )

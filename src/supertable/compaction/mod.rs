@@ -426,7 +426,7 @@ impl Supertable {
                 reader.vec().and_then(|v| {
                     v.vector_columns_config()
                         .next()
-                        .map(|c| c.rerank_codec == RerankCodec::Sq8ResidualEpsilon)
+                        .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
                 })
             });
             if sq8_merge == Some(true) {

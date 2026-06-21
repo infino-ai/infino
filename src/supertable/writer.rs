@@ -308,7 +308,7 @@ fn materialized_ivf_rows_in_doc_order(
 ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
     let mut rows = vec_reader.materialized_index_rows(column).ok_or_else(|| {
         BuildError::Store(format!(
-            "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
+            "IVF maintenance: column '{column}' missing Sq8Residual index"
         ))
     })?;
     let n_rows = stable_ids_by_local.len();
