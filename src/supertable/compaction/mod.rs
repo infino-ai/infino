@@ -38,13 +38,15 @@ use crate::{
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         query::dispatch::open_reader,
+        spfresh::split_overflow_needed,
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, split_overflow_cell_after_compaction, try_commit_attempt,
+            prepare_superfile, refresh_cell_radius_after_compaction,
+            split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -522,16 +524,24 @@ impl Supertable {
                     .await;
                     if is_hidden_vector_index_table(&inner.options)
                         && let Some(cell_id) = partition_hint
-                        && let Err(e) = split_overflow_cell_after_compaction(
-                            Arc::clone(inner),
-                            &new_entries[0],
-                            cell_id,
-                        )
-                        .await
                     {
-                        tracing::warn!(
-                            "supertable: hidden cell split after compaction failed: {e}"
-                        );
+                        // Overflow → split (its redrive recomputes the new cells'
+                        // radii). Otherwise DeDrift-lazy: refresh this cell's
+                        // bounding-sphere radius so adaptive-nprobe pruning stays
+                        // accurate after members shift under the merge.
+                        let merged = &new_entries[0];
+                        let maint = if split_overflow_needed(merged.n_docs) {
+                            split_overflow_cell_after_compaction(Arc::clone(inner), merged, cell_id)
+                                .await
+                        } else {
+                            refresh_cell_radius_after_compaction(Arc::clone(inner), merged, cell_id)
+                                .await
+                        };
+                        if let Err(e) = maint {
+                            tracing::warn!(
+                                "supertable: hidden cell maintenance after compaction failed: {e}"
+                            );
+                        }
                     }
                     return Ok(());
                 }

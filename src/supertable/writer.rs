@@ -2263,7 +2263,7 @@ async fn persist_superfile_publish_batch_async(
 /// maintenance routes them into per-cell IVF superfiles. Amortizes the
 /// per-cell build so it isn't paid on every commit; until routing fires the
 /// incoming superfiles are simply scanned by queries (recall is unaffected).
-const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
+pub(crate) const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
 
 /// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
@@ -2741,6 +2741,85 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     // Step 9: redrive through incoming → route into per-cell IVF superfiles.
     // Step 6 neighborhood reassignment: restrict assignment to P−1/P/P₂/P+1.
     route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, Some(&neighborhood)).await
+}
+
+/// DeDrift-lazy radius refresh after a hidden-cell compaction that did NOT
+/// overflow into a split. Recomputes the merged cell's bounding-sphere radius
+/// (max member distance from the cell centroid) from its Sq8 members and writes
+/// it back to the manifest centroid, so adaptive-nprobe pruning stays accurate
+/// as members shift under merges/tombstones. Split cells skip this — their
+/// redrive re-routes rows and recomputes radii for the new cells. Reuses the
+/// drain's Sq8-native radius calc; the only cost is one strategy-only manifest
+/// commit, off the query path.
+pub(in crate::supertable) async fn refresh_cell_radius_after_compaction(
+    inner: Arc<SupertableInner>,
+    merged_entry: &Arc<SuperfileEntry>,
+    cell_id: u32,
+) -> Result<(), BuildError> {
+    let manifest = inner.manifest.load_full();
+    let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            let Some(vec_col) = inner.options.vector_columns.first() else {
+                return Ok(());
+            };
+            (clusters, column, routing, vec_col.metric)
+        }
+        _ => return Ok(()),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 || cell_id as usize >= clusters.n_cent as usize {
+        return Ok(());
+    }
+
+    let storage = inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| BuildError::Store("cell radius refresh requires storage".into()))?;
+
+    // Members of the just-merged cell (cache-warm after the merge); no fp32
+    // corpus decode — `encoded_shard_radius` scores Sq8 rows against the
+    // centroid directly.
+    let now = time::Instant::now();
+    let materialized =
+        load_materialized_rows_from_ivf_superfile(&inner, merged_entry, &column, now).await?;
+    if materialized.is_empty() {
+        return Ok(());
+    }
+    // The radius is a CPU wave (O(rows × dim) Sq8 distances) — run it on the
+    // maintenance rayon pool, not inline on the tokio worker (the rayon-for-CPU
+    // concurrency contract; same as the drain's radius calc and the split's
+    // k-means).
+    let radius = maint_pool().install(|| {
+        let encoded: Vec<EncodedCellRow> = materialized.iter().map(|r| r.encoded.clone()).collect();
+        spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded)
+    });
+    if radius <= 0.0 {
+        return Ok(());
+    }
+
+    let mut radii_updates: HashMap<u32, f32> = HashMap::new();
+    radii_updates.insert(cell_id, radius);
+    let updated_clusters = spfresh::apply_cell_updates(&clusters, &HashMap::new(), &radii_updates);
+    inner
+        .manifest
+        .store(Arc::new(manifest.with_partition_strategy(
+            PartitionStrategy::VectorCell {
+                column,
+                clusters: updated_clusters,
+                routing,
+            },
+        )));
+    // Strategy-only commit: no superfile changes, just the refreshed radius.
+    let new_manifest =
+        persist_commit_async(&inner, storage, Vec::new(), &[], Vec::new(), Vec::new())
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+    inner.manifest.store(Arc::new(new_manifest));
+    Ok(())
 }
 
 async fn publish_hidden_incoming_async(

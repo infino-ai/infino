@@ -1911,9 +1911,12 @@ mod tests {
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
         use arrow_schema::{DataType, Field, Schema};
 
-        use crate::superfile::{
-            builder::{FtsConfig, VectorConfig},
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::writer::INCOMING_ROUTE_MIN_SUPERFILES,
         };
 
         let dim = 16usize;
@@ -1955,7 +1958,13 @@ mod tests {
         .with_writer_pool(pool);
         let st = Supertable::create(options).expect("create");
 
-        for commit in 0..4 {
+        // Stay strictly below the auto-route threshold so the appended
+        // incoming files are observed in their pre-routing state. At or above
+        // `INCOMING_ROUTE_MIN_SUPERFILES`, each commit's spawned background
+        // maintenance routes the incoming files into per-cell superfiles and
+        // collapses them, which would race this assertion (the post-routing
+        // collapse is covered by `hidden_ivf_compaction_collapses_per_cell`).
+        for commit in 0..INCOMING_ROUTE_MIN_SUPERFILES - 1 {
             let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
             let flat = Float32Array::from(vec![1.0f32; dim]);
             let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
@@ -2134,6 +2143,163 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "vector search should still work after hidden compaction"
+        );
+    }
+
+    /// A non-split hidden-cell compaction routes through
+    /// `refresh_cell_radius_after_compaction`, which recomputes the merged
+    /// cell's bounding radius from its Sq8 members. The sibling test above uses
+    /// all-identical vectors (radius 0, which refresh skips); this one uses
+    /// spread vectors so the routed cells carry a real (> 0) radius, exercising
+    /// the refresh write path and guarding that it leaves the index sound:
+    /// compaction succeeds, every cell radius stays finite/non-negative, and
+    /// search still works after the refresh-instrumented merge.
+    #[test]
+    fn hidden_nonsplit_compaction_refreshes_cell_radius() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::CompactionSettings,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::manifest::list::PartitionStrategy,
+        };
+
+        let dim = 64usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 8,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Spread vectors: each row leans toward one of 8 base directions with a
+        // per-row magnitude bump, so rows cluster into a handful of cells whose
+        // members spread away from the centroid (a real, > 0 bounding radius).
+        let row_vector = |g: usize| -> Vec<f32> {
+            let mut v = vec![0.2f32; dim];
+            v[g % 8] = 1.0 + 0.5 * (g / 8) as f32;
+            v
+        };
+        let commits = 8usize;
+        let rows_per_commit = 8usize;
+        for c in 0..commits {
+            let mut flat = Vec::with_capacity(rows_per_commit * dim);
+            let mut titles_v = Vec::with_capacity(rows_per_commit);
+            for r in 0..rows_per_commit {
+                let g = c * rows_per_commit + r;
+                flat.extend_from_slice(&row_vector(g));
+                titles_v.push(format!("doc-{g}"));
+            }
+            let titles = LargeStringArray::from(titles_v);
+            let fsl = FixedSizeListArray::new(
+                item_field.clone(),
+                dim as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            );
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        hidden
+            .await_incoming_routed_to_cells_sync()
+            .expect("route hidden incoming into manifest cells");
+
+        // Cells hold far fewer than the split cap, so compaction takes the
+        // non-split branch (`refresh_cell_radius_after_compaction`), not split.
+        // This must not panic or error — the primary guard on the new fn.
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        };
+        hidden.compact(&cfg).expect("hidden compact");
+
+        // Refreshed radii are sane, and at least one spread cell carries a
+        // non-zero bounding radius (the refresh write path actually ran).
+        let after_reader = hidden.reader();
+        let after_manifest = after_reader.manifest();
+        match after_manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert!(
+                    clusters.radii.iter().all(|r| r.is_finite() && *r >= 0.0),
+                    "cell radii must be finite and non-negative after compaction: {:?}",
+                    clusters.radii
+                );
+                assert!(
+                    clusters.radii.iter().any(|r| *r > 0.0),
+                    "spread cells should carry a non-zero bounding radius after refresh, got {:?}",
+                    clusters.radii
+                );
+            }
+            other => panic!("hidden index should use VectorCell strategy, got {other:?}"),
+        }
+
+        // The index stays correct after the refresh-instrumented merge.
+        let hits = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &row_vector(0),
+                3,
+                crate::superfile::reader::VectorSearchOptions::new(),
+                None,
+            )
+            .expect("vector search after non-split hidden compaction");
+        assert!(
+            !hits.is_empty(),
+            "vector search should still work after the radius refresh"
         );
     }
 
