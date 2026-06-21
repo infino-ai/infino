@@ -898,19 +898,6 @@ pub mod vector {
         }
     }
 
-    /// Drain hidden incoming IVF into per-cell superfiles via the existing
-    /// SPFresh maintenance hook (same call integration tests use).
-    fn drain_hidden_incoming(consumer: &Supertable) {
-        let hidden = consumer
-            .vector_index_table()
-            .expect("vector table keeps hidden index");
-        eprintln!("[supertable_vector] draining hidden incoming IVF into cell superfiles...");
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("hidden incoming drain");
-        log_hidden_stats(hidden, "after drain");
-    }
-
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
     /// correctness recall gate — the same measurement the superfile vector
@@ -1057,14 +1044,11 @@ pub mod vector {
             // only.
             drop(corpus);
 
-            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
-            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after SPFresh route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
             const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
 
-            // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
-            // tables may already be post-drain — run the two-phase comparison only
-            // when we just built the table in this process.
-            let pre_post_drain = ingest_metrics.is_some();
+            // Only fresh-ingest runs price the optimize maintenance pass below;
+            // dataset / existing-prefix tables are read-only fixtures.
+            let fresh_ingest = ingest_metrics.is_some();
 
             let search_title = |phase: &str| {
                 format!(
@@ -1074,121 +1058,12 @@ pub mod vector {
                 )
             };
 
-            // Metered consumer so the drain + optimize maintenance passes below
-            // can be priced (object-store PUT/GET/DELETE traffic + bytes).
+            // Metered consumer so the optimize maintenance pass below can be
+            // priced (object-store PUT/GET/DELETE traffic + bytes).
             let (cache_dir, consumer, maint_meter) =
                 open_consumer_metered(Modality::Vector, &built);
 
-            let recall_rows = if pre_post_drain {
-                if phases.warm {
-                    log_hidden_stats(&consumer, "at warm open (pre-drain)");
-                }
-                eprintln!("[supertable_vector] === pre-drain search (incoming staging) ===");
-                let _pre = exec_vec::run_search(
-                    &mut report,
-                    &consumer,
-                    || SupertableVecColdGuard::open(&built),
-                    supertable::VEC_COLUMN,
-                    n_docs,
-                    TOP_K,
-                    nprobe,
-                    rerank,
-                    &q_correct,
-                    &gt_correct,
-                    &q_cal,
-                    &gt_cal,
-                    phases.warm,
-                    phases.cold,
-                    COLD_ITERS,
-                    skip_cal,
-                    "supertable_vector/pre-drain",
-                    "bench/vector/supertable/search/pre-drain",
-                    search_title("pre-drain"),
-                    PRE_DRAIN_NOTE,
-                );
-
-                // Drain cost: route accumulated incoming IVF superfiles into
-                // per-cell superfiles. Object-store traffic attributed via the
-                // meter delta around the call.
-                let drain_before = maint_meter.snapshot();
-                let drain_t0 = Instant::now();
-                drain_hidden_incoming(&consumer);
-                let drain_wall = drain_t0.elapsed();
-                let drain_cost = maint_meter.snapshot().delta(drain_before);
-
-                if phases.warm {
-                    log_hidden_stats(&consumer, "at warm open (post-drain)");
-                }
-                eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
-                let post_search = exec_vec::run_search(
-                    &mut report,
-                    &consumer,
-                    || SupertableVecColdGuard::open(&built),
-                    supertable::VEC_COLUMN,
-                    n_docs,
-                    TOP_K,
-                    nprobe,
-                    rerank,
-                    &q_correct,
-                    &gt_correct,
-                    &q_cal,
-                    &gt_cal,
-                    phases.warm,
-                    phases.cold,
-                    COLD_ITERS,
-                    skip_cal,
-                    "supertable_vector/post-drain",
-                    "bench/vector/supertable/search/post-drain",
-                    search_title("post-drain"),
-                    POST_DRAIN_NOTE,
-                );
-
-                // Optimize cost: full compaction over the (now cell-routed)
-                // table. Measured after the post-drain search so it does not
-                // perturb the recall/latency numbers above.
-                let opt_before = maint_meter.snapshot();
-                let opt_t0 = Instant::now();
-                consumer
-                    .optimize(&OptimizeOptions::compact(CompactionSettings {
-                        target_superfile_size_mb: 1,
-                        min_fill_percent: 1,
-                        ..CompactionSettings::default()
-                    }))
-                    .expect("optimize");
-                let opt_wall = opt_t0.elapsed();
-                let opt_cost = maint_meter.snapshot().delta(opt_before);
-
-                report.emit(&Section {
-                    anchor: "bench/vector/supertable/maintenance".into(),
-                    title: format!(
-                        "Supertable vector — maintenance cost ({} docs)",
-                        fmt_count(n_docs)
-                    ),
-                    note: "Object-store cost of write-path maintenance: SPFresh drain (route \
-                           incoming IVF superfiles into per-cell superfiles) and optimize (full \
-                           compaction). Per-pass PUT/GET/DELETE requests + bytes + wall. Δ vs the \
-                           previous run."
-                        .into(),
-                    blocks: vec![Block {
-                        subtitle: String::new(),
-                        headers: vec![
-                            "pass".into(),
-                            "PUTs".into(),
-                            "written".into(),
-                            "GETs".into(),
-                            "read".into(),
-                            "deletes".into(),
-                            "wall".into(),
-                        ],
-                        rows: vec![
-                            maint_cost_row("drain", drain_cost, drain_wall),
-                            maint_cost_row("optimize", opt_cost, opt_wall),
-                        ],
-                    }],
-                });
-
-                post_search
-            } else {
+            let recall_rows = {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open");
                 }
@@ -1215,6 +1090,57 @@ pub mod vector {
                     LEGACY_NOTE,
                 )
             };
+
+            // Fresh-ingest runs additionally price the new-design write-path
+            // maintenance: overlap consolidation via optimize (full compaction
+            // merges overlapping per-cell hidden IVF superfiles). There is no
+            // eager drain in the new design — each commit's hidden vectors are
+            // already immutable ~8 MB cells. Measured after the search so it
+            // does not perturb the latency numbers above; object-store traffic
+            // is attributed via the meter delta around the call. Dataset /
+            // existing-prefix tables are read-only fixtures and skip this.
+            if fresh_ingest {
+                let opt_before = maint_meter.snapshot();
+                let opt_t0 = Instant::now();
+                consumer
+                    .optimize(&OptimizeOptions::compact(CompactionSettings {
+                        target_superfile_size_mb: 1,
+                        min_fill_percent: 1,
+                        ..CompactionSettings::default()
+                    }))
+                    .expect("optimize");
+                let opt_wall = opt_t0.elapsed();
+                let opt_cost = maint_meter.snapshot().delta(opt_before);
+
+                if phases.warm {
+                    log_hidden_stats(&consumer, "after optimize");
+                }
+                report.emit(&Section {
+                    anchor: "bench/vector/supertable/maintenance".into(),
+                    title: format!(
+                        "Supertable vector — maintenance cost ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    note: "Object-store cost of write-path maintenance: overlap \
+                           consolidation via optimize (full compaction merges \
+                           overlapping per-cell hidden IVF superfiles). PUT/GET/DELETE \
+                           requests + bytes + wall. Δ vs the previous run."
+                        .into(),
+                    blocks: vec![Block {
+                        subtitle: String::new(),
+                        headers: vec![
+                            "pass".into(),
+                            "PUTs".into(),
+                            "written".into(),
+                            "GETs".into(),
+                            "read".into(),
+                            "deletes".into(),
+                            "wall".into(),
+                        ],
+                        rows: vec![maint_cost_row("optimize", opt_cost, opt_wall)],
+                    }],
+                });
+            }
             if phases.warm {
                 emit_cost_warm(
                     &mut report,

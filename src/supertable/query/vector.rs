@@ -83,7 +83,6 @@ use super::{
     candidate::CandidatePlan,
     dispatch,
     exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
-    hierarchical_iter,
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
@@ -91,8 +90,8 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        handle::{Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri},
         tombstones::SidecarCache,
     },
 };
@@ -113,31 +112,6 @@ pub struct VectorFilter<'a> {
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
-}
-
-fn filter_superfiles_by_cells(
-    superfiles: &[Arc<SuperfileEntry>],
-    routed_cells: &[u32],
-) -> Vec<Arc<SuperfileEntry>> {
-    if routed_cells.is_empty() {
-        return superfiles.to_vec();
-    }
-    let routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
-    superfiles
-        .iter()
-        .filter(|sf| {
-            if sf.partition_key.len() == 4 {
-                let mut key = [0u8; 4];
-                key.copy_from_slice(&sf.partition_key);
-                routed_keys.contains(&key)
-            } else if let Some(cell) = sf.partition_hint {
-                routed_keys.contains(&cell.to_le_bytes())
-            } else {
-                false
-            }
-        })
-        .cloned()
-        .collect()
 }
 
 /// Whether every hit already references a superfile in the user manifest.

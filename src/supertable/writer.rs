@@ -2366,12 +2366,6 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Minimum number of accumulated "incoming" IVF superfiles before background
-/// maintenance routes them into per-cell IVF superfiles. Amortizes the
-/// per-cell build so it isn't paid on every commit; until routing fires the
-/// incoming superfiles are simply scanned by queries (recall is unaffected).
-pub(crate) const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
-
 /// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
 /// `par_iter`/`join` to one thread instead of fanning out across every core, so
@@ -2386,76 +2380,6 @@ fn maint_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("hidden maintenance rayon pool")
     })
-}
-
-/// Background SPFresh maintenance: route the hidden index's "incoming" IVF
-/// superfiles into per-cell IVF superfiles and delete the incoming ones. Only
-/// runs once enough incoming superfiles accumulate so the per-cell build amortizes.
-///
-/// The routing future's async work (object-store + disk-cache I/O) MUST run on the same
-/// `query_runtime` as the foreground path: the disk cache's async coordination
-/// primitives (per-URI fetch coordinators, background-fill notifications) are
-/// bound to that runtime, and awaiting them from a *different* runtime loses
-/// wakeups and intermittently deadlocks the commit. A short-lived thread drives
-/// it via `block_on` (the routing future borrows through `write_superfile_list`,
-/// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
-/// not by a separate runtime. The `compaction_outstanding` single-flight guard
-/// makes concurrent invocations cheap no-ops, so threads don't pile up.
-fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
-    let runtime = inner.query_runtime();
-    std::thread::Builder::new()
-        .name("hidden-maint".into())
-        .spawn(move || {
-            if let Err(e) = runtime.block_on(route_incoming_to_manifest_cells(inner)) {
-                tracing::warn!(
-                    "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
-                );
-            }
-        })
-        .ok();
-}
-
-/// Read each accumulated incoming IVF superfile's Sq8+ε rows, assign every row
-/// to its nearest global cell, build one Sq8 IVF superfile per touched cell,
-/// then publish those cell superfiles and remove the routed incoming
-/// superfiles in one OCC commit.
-async fn route_incoming_to_manifest_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
-    route_incoming_to_manifest_cells_if_ready(inner, INCOMING_ROUTE_MIN_SUPERFILES, None).await
-}
-
-/// Route every accumulated incoming IVF superfile (threshold = 1). Used by
-/// tests and by [`await_incoming_routed_to_cells`] so maintenance can be awaited
-/// before compaction runs on the per-cell IVF superfiles.
-#[cfg(any(test, feature = "test-helpers"))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::supertable) async fn await_incoming_routed_to_cells(
-    inner: Arc<SupertableInner>,
-) -> Result<(), BuildError> {
-    const FLUSH_MAX_ROUNDS: usize = 64;
-    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
-        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
-            super::handle::INCOMING_VECTOR_CELL,
-        ),
-    );
-    for _ in 0..FLUSH_MAX_ROUNDS {
-        while inner.compaction_outstanding.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, None).await?;
-        let remaining = inner
-            .manifest
-            .load_full()
-            .get_all_superfiles()
-            .iter()
-            .filter(|e| e.partition_key == incoming_key)
-            .count();
-        if remaining == 0 {
-            return Ok(());
-        }
-    }
-    Err(BuildError::Store(
-        "hidden incoming routing flush exceeded round budget".into(),
-    ))
 }
 
 async fn route_incoming_to_manifest_cells_if_ready(
