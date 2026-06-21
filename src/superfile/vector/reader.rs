@@ -41,8 +41,7 @@ use crate::superfile::{
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualKernel, distance_bytes,
-            distance_bytes_codec,
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, distance_bytes, distance_bytes_codec,
         },
         ivf_merge::Sq8IvfMergeInput,
         quant::BitQuantizer,
@@ -60,11 +59,6 @@ const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 /// recovers the radius by dividing by this. Must match
 /// `builder::SUMMARY_RADIUS_SCALE`.
 const SUMMARY_RADIUS_SCALE: f32 = 100.0;
-
-/// Shortlist multiplier for the Sq8Residual refine pass. After the
-/// first-pass Sq8 scan, only the top `SQ8_RESIDUAL_REFINE_MULT × k`
-/// survivors are re-scored with the more expensive residual leg.
-const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
 
 /// JSON-deserialized form of one vector-index entry in the legacy `inf.vec.columns` metadata. The KV
 /// value is a JSON array of these in declaration order.
@@ -2499,7 +2493,7 @@ pub(crate) fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u3
 /// Dispatches on `col.rerank_codec`:
 /// - **Fp32**: flat dispatch via [`distance_bytes_codec`]
 ///   (fp32 zero-copy SIMD).
-/// - **Sq8**: builds a per-query [`Sq8Kernel`] from the column's
+/// - **Sq8Residual**: builds a per-query [`Sq8ResidualKernel`] from the column's
 ///   `codec_meta` once (folds scale/offset into the query so the
 ///   per-doc inner step is a plain u8→f32 widen + SIMD dot;
 ///   per-doc decoded-norm cached at encode time short-circuits
@@ -2669,64 +2663,24 @@ async fn rerank_candidates_from_blocks(
                         None
                     };
 
-                    let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
+                    // Score every candidate with the residual leg directly —
+                    // no Sq8-only coarse pass. One residual kernel per probed
+                    // cluster (built lazily, cached in `rk`); the per-doc norm
+                    // comes from the sparse `pos → norm` map. Post-match
+                    // sorts + truncates to top-k.
+                    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+                    candidates
                         .iter()
-                        .enumerate()
-                        .map(|(i, cand)| {
+                        .map(|cand| {
                             let row = candidate_full_bytes(
                                 cluster_blocks,
                                 survivor_full_rows,
                                 cand,
                                 stride,
                             );
-                            let code = &row[..dim];
-                            let (scale, offset) = scale_offset_by_cluster
-                                .get(&cand.cluster_id)
-                                .expect("cluster metadata fetched");
-                            let kernel = Sq8Kernel::new(
-                                col.metric,
-                                query,
-                                scale.as_slice(),
-                                offset.as_slice(),
-                                None,
-                            );
-                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&cand.pos).copied());
-                            (
-                                cand.did,
-                                kernel.distance_with_norm(code, norm),
-                                i,
-                                cand.pos,
-                                cand.cluster_id,
-                            )
-                        })
-                        .collect();
-                    // Refine the top final-set with the residual leg.
-                    // The residual kernel takes its per-doc norm
-                    // explicitly because the lazy norms live in a
-                    // sparse `pos → norm` map, not a contiguous slice.
-                    let mut scored = scored;
-                    scored
-                        .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-                    let final_refine = k
-                        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
-                        .max(k)
-                        .min(scored.len());
-                    scored.truncate(final_refine);
-                    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
-                    scored
-                        .into_iter()
-                        .map(|(did, _, i, pos, cluster_id)| {
-                            let row = candidate_full_bytes(
-                                cluster_blocks,
-                                survivor_full_rows,
-                                &candidates[i],
-                                stride,
-                            );
-                            let code = &row[..dim];
-                            let residual = &row[dim..dim * 2];
-                            let kernel = rk.entry(cluster_id).or_insert_with(|| {
+                            let kernel = rk.entry(cand.cluster_id).or_insert_with(|| {
                                 let (scale, offset) = scale_offset_by_cluster
-                                    .get(&cluster_id)
+                                    .get(&cand.cluster_id)
                                     .expect("cluster metadata fetched");
                                 Sq8ResidualKernel::new(
                                     col.metric,
@@ -2734,11 +2688,13 @@ async fn rerank_candidates_from_blocks(
                                     scale.as_slice(),
                                     offset.as_slice(),
                                     SQ8_RESIDUAL_DIVISOR,
-                                    None,
                                 )
                             });
-                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&pos).copied());
-                            (did, kernel.distance_with_norm(code, residual, norm))
+                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&cand.pos).copied());
+                            (
+                                cand.did,
+                                kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm),
+                            )
                         })
                         .collect()
                 }
@@ -2754,12 +2710,15 @@ async fn rerank_candidates_from_blocks(
     Ok(reranked)
 }
 
-/// Shared Sq8 first-pass scorer used by both the eager and
+/// Shared Sq8+residual scorer used by both the eager and
 /// lazy-with-parsed-cache arms of `rerank_candidates_from_blocks`.
-/// Builds one [`Sq8Kernel`] per distinct probed cluster from the
-/// provided `scale`/`offset` slices, scores every candidate (parallel
-/// when the shortlist exceeds [`PARALLEL_SCAN_MIN`]), then applies the
-/// residual refinement via [`residual_refine_from_blocks`].
+/// Builds one [`Sq8ResidualKernel`] per distinct probed cluster from the
+/// provided `scale`/`offset` slices, then scores *every* candidate with
+/// the residual-corrected distance (parallel when the shortlist exceeds
+/// [`PARALLEL_SCAN_MIN`]) and returns the top-`k`. There is no separate
+/// Sq8-only coarse pass: the residual leg is SIMD over codes+residual
+/// already interleaved in each fetched row, so the cheap-but-lossy
+/// shortlist can never drop a true top-k hit.
 ///
 /// Both code paths keep their own data-access strategy (eager mmap vs
 /// lazy range GETs); only the scoring math is shared here.
@@ -2779,122 +2738,69 @@ async fn sq8_score_and_refine(
     let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     cids.sort_unstable();
     cids.dedup();
-    let kernels: HashMap<u32, Sq8Kernel> = cids
+    // One residual kernel per probed cluster, built with `None` per-doc
+    // norms so each kernel is `'static` (it owns only its query-side
+    // precompute) and can move onto the rayon pool; the per-doc decoded
+    // norm is supplied explicitly per candidate via `distance_with_norm`.
+    let kernels: HashMap<u32, Sq8ResidualKernel> = cids
         .into_iter()
         .map(|cid| {
             let c = cid as usize;
-            let scale_c = &scale[c * dim..(c + 1) * dim];
-            let offset_c = &offset[c * dim..(c + 1) * dim];
             (
                 cid,
-                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms.clone()),
+                Sq8ResidualKernel::new(
+                    col.metric,
+                    query,
+                    &scale[c * dim..(c + 1) * dim],
+                    &offset[c * dim..(c + 1) * dim],
+                    SQ8_RESIDUAL_DIVISOR,
+                ),
             )
         })
         .collect();
-    let score_one = |(i, cand): (usize, &RerankCandidate)| {
+    let score_one = |cand: &RerankCandidate| -> (u32, f32) {
         let row = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
-        let code = &row[..dim];
         let kernel = kernels
             .get(&cand.cluster_id)
             .expect("kernel prebuilt for every probed cluster");
+        let norm = per_doc_norms.as_ref().map(|n| n[cand.pos as usize]);
         (
             cand.did,
-            kernel.distance_at(cand.pos, code),
-            i,
-            cand.pos,
-            cand.cluster_id,
+            kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm),
         )
     };
-    let scored: Vec<(u32, f32, usize, u32, u32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
-        // Order-independent first-pass Sq8 scoring across the rayon
-        // pool. Kernels are `'static` (norms shared by `Arc`), so each
-        // chunk runs on a rayon worker with no copy.
+    let mut scored: Vec<(u32, f32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
+        // Order-independent residual scoring across the rayon pool. The
+        // kernels carry no borrowed norms, so each chunk runs on a rayon
+        // worker with no copy; the per-doc norm is looked up from the
+        // shared `Arc` norm slice inside the closure.
         let kernels = Arc::new(kernels);
         let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
         let survivors: Option<Arc<Vec<Bytes>>> = survivor_full_rows.map(|s| Arc::new(s.to_vec()));
-        let items: Vec<(usize, RerankCandidate)> = candidates.iter().cloned().enumerate().collect();
-        par_map(items, move |item: &(usize, RerankCandidate)| {
-            let (i, cand) = (item.0, &item.1);
+        let norms = per_doc_norms.clone();
+        par_map(candidates.to_vec(), move |cand: &RerankCandidate| {
             let row = candidate_full_bytes(
                 &blocks,
                 survivors.as_deref().map(|s| s.as_slice()),
                 cand,
                 stride,
             );
-            let code = &row[..dim];
             let kernel = kernels
                 .get(&cand.cluster_id)
                 .expect("kernel prebuilt for every probed cluster");
+            let norm = norms.as_ref().map(|n| n[cand.pos as usize]);
             (
                 cand.did,
-                kernel.distance_at(cand.pos, code),
-                i,
-                cand.pos,
-                cand.cluster_id,
+                kernel.distance_with_norm(&row[..dim], &row[dim..dim * 2], norm),
             )
         })
         .await
     } else {
-        candidates.iter().enumerate().map(score_one).collect()
+        candidates.iter().map(score_one).collect()
     };
-    residual_refine_from_blocks(
-        scored,
-        cluster_blocks,
-        survivor_full_rows,
-        candidates,
-        stride,
-        dim,
-        k,
-        |cluster_id| {
-            let c = cluster_id as usize;
-            Sq8ResidualKernel::new(
-                col.metric,
-                query,
-                &scale[c * dim..(c + 1) * dim],
-                &offset[c * dim..(c + 1) * dim],
-                SQ8_RESIDUAL_DIVISOR,
-                per_doc_norms.as_deref(),
-            )
-        },
-    )
-}
-
-/// `Sq8Residual` final-refine pass. Takes the Sq8-scored shortlist
-/// (`(did, sq8_dist, candidate_idx, pos, cluster_id)`), keeps the lowest
-/// `2·k` by Sq8 distance, then re-scores just that set with the
-/// residual-corrected [`Sq8ResidualKernel`] (built per cluster via
-/// `make_kernel`). The candidate index points into `candidates`,
-/// whose row bytes are read directly from `cluster_blocks`.
-fn residual_refine_from_blocks<'a>(
-    mut scored: Vec<(u32, f32, usize, u32, u32)>,
-    cluster_blocks: &[Bytes],
-    survivor_full_rows: Option<&[Bytes]>,
-    candidates: &[RerankCandidate],
-    stride: usize,
-    dim: usize,
-    k: usize,
-    make_kernel: impl Fn(u32) -> Sq8ResidualKernel<'a>,
-) -> Vec<(u32, f32)> {
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let final_refine = k
-        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
-        .max(k)
-        .min(scored.len());
-    scored.truncate(final_refine);
-    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+    scored.truncate(k);
     scored
-        .into_iter()
-        .map(|(did, _, i, pos, cluster_id)| {
-            let row =
-                candidate_full_bytes(cluster_blocks, survivor_full_rows, &candidates[i], stride);
-            let code = &row[..dim];
-            let residual = &row[dim..dim * 2];
-            let kernel = rk
-                .entry(cluster_id)
-                .or_insert_with(|| make_kernel(cluster_id));
-            (did, kernel.distance_at(pos, code, residual))
-        })
-        .collect()
 }
 
 fn parse_sq8_meta_bytes(
@@ -3923,7 +3829,7 @@ mod tests {
 
     /// an Sq8 build + open + self-query recovers the
     /// planted self-vector at top-1. End-to-end through the
-    /// codec-aware rerank dispatch + Sq8Kernel — any layout drift
+    /// codec-aware rerank dispatch + Sq8ResidualKernel — any layout drift
     /// (codec_meta order, code stride, per-doc-norm indexing)
     /// would surface as wrong-doc or out-of-bounds.
     #[tokio::test]
@@ -3978,7 +3884,7 @@ mod tests {
     }
 
     /// Sq8 self-query top-1 round-trips under Cosine
-    /// too. Exercises the Cosine branch of `Sq8Kernel::distance_at`
+    /// too. Exercises the Cosine branch of `Sq8ResidualKernel::distance_with_norm`
     /// (no per-doc-norm lookup, `dist = 1 − dot`).
     ///
     /// Corpus design (matters!): unit-norm vectors drawn from

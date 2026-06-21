@@ -304,7 +304,6 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
             &posting.scale,
             &posting.offset,
             SQ8_RESIDUAL_DIVISOR,
-            norms_for_kernel,
         );
         let dim = posting.dim;
         for row in 0..posting.ids.len() {
