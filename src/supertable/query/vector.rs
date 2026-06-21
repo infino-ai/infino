@@ -396,6 +396,11 @@ async fn remap_hidden_hits_to_user_hits(
             });
         }
     }
+    // No user-tombstone filter here: user deletes are mirrored into the hidden
+    // cells' own tombstone sidecars at delete time, so the hidden fan-out's
+    // `apply_tombstone_filter` (already on the warm scan path) drops them before
+    // they ever reach this remap — keeping both the `_id`-only fast path and
+    // this path free of any extra query-time work.
     remapped
         .into_iter()
         .map(|h| h.ok_or_else(|| QueryError::Execute("hit remap incomplete".into())))
@@ -886,9 +891,13 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-index vector kNN: hidden manifest + cell filter + fan-out at
-    /// the hidden storage prefix. Falls back to the user table when the
-    /// hidden index is absent or empty.
+    /// Global-index vector kNN. Each hidden superfile is an immutable cell;
+    /// route by its per-cell centroids through the shared cross-superfile
+    /// fan-out — which prunes to the nearest cells and scans those — exactly the
+    /// user-table vector path, run over the hidden cell table. The hidden index
+    /// is dual-written with every vector, so when it holds data it is
+    /// authoritative; we fall back to the user table only when it is absent or
+    /// empty.
     pub(crate) async fn vector_search_global_index_async(
         &self,
         column: &str,
@@ -904,59 +913,9 @@ impl SupertableReader {
             let vit_manifest = vit_reader.manifest();
             let has_data = !vit_manifest.superfiles.is_empty() || vit_manifest.get_num_parts() > 0;
             if has_data {
-                let vit_metric = vit_manifest
-                    .options
-                    .vector_columns
-                    .iter()
-                    .find(|vc| vc.column == column)
-                    .map(|vc| vc.metric)
-                    .unwrap_or(Metric::L2Sq);
-                let selected = match vit_manifest.get_partition_strategy() {
-                    PartitionStrategy::VectorCell {
-                        clusters, routing, ..
-                    } => {
-                        let mut routed = clusters.select_cells_adaptive(
-                            vit_metric,
-                            query,
-                            options.resolve(false).0,
-                            routing,
-                        );
-                        // Always scan the "incoming" append region in addition
-                        // to the nprobe-routed cells: those rows have not been
-                        // distributed into cells by maintenance yet, so routing
-                        // by centroid can't see them.
-                        routed.push(INCOMING_VECTOR_CELL);
-                        if vit_manifest.superfiles.is_empty() {
-                            vit_manifest
-                                .superfiles_for_routed_cells(&routed)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
-                        }
-                    }
-                    _ => {
-                        if vit_manifest.superfiles.is_empty() {
-                            let part_ids: Vec<_> = vit_manifest
-                                .get_all_list_entries()
-                                .iter()
-                                .map(|e| e.part_id)
-                                .collect();
-                            hierarchical_iter::load_and_flatten(vit_manifest, &part_ids)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            vit_manifest.superfiles.to_vec()
-                        }
-                    }
-                };
-                if !selected.is_empty() {
-                    // Already top-k ascending (same as the user-table path
-                    // below) — no second `top_k_ascending` pass needed.
-                    return vit_reader
-                        .fanout_vector_clusters(&selected, column, query, k, options)
-                        .await;
-                }
+                return vit_reader
+                    .vector_search_user_table_async(column, query, k, options)
+                    .await;
             }
         }
         self.vector_search_user_table_async(column, query, k, options)

@@ -37,8 +37,10 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        manifest::Manifest,
+        options::SupertableOptions,
         query::dispatch::open_reader,
-        spfresh::split_overflow_needed,
+        spfresh::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups, split_overflow_needed},
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
@@ -96,6 +98,26 @@ pub struct CompactionJob {
     pub inputs: Vec<Uuid>,
     /// Estimated size of the merged superfile.
     pub estimated_output_bytes: u64,
+}
+
+/// Build a [`CompactionJob`] from a set of cell indices into `cells`. Shared by
+/// the overlap-consolidation packer. `idxs` must be non-empty.
+fn consolidation_job(cells: &[Arc<SuperfileEntry>], idxs: &[usize]) -> CompactionJob {
+    let estimated_output_bytes = idxs
+        .iter()
+        .map(|&i| {
+            cells[i]
+                .subsection_offsets
+                .as_ref()
+                .map(|o| o.total_size)
+                .unwrap_or(0)
+        })
+        .sum();
+    CompactionJob {
+        partition_key: cells[idxs[0]].partition_key.clone(),
+        inputs: idxs.iter().map(|&i| cells[i].superfile_id).collect(),
+        estimated_output_bytes,
+    }
 }
 
 /// Plan compaction: pack each partition's small superfiles into
@@ -274,7 +296,15 @@ impl Supertable {
             })
             .collect();
 
-        let jobs = select(&stats, cfg);
+        // Hidden vector-index cells consolidate by spatial overlap (merge cells
+        // whose bounding spheres cover the same region, so a query stops having
+        // to scan all of them); the user table packs by size. Both feed the same
+        // `run_compaction_job` merge + overflow-split.
+        let jobs = if is_hidden_vector_index_table(&inner.options) {
+            Self::overlap_consolidation_jobs(&manifest, &inner.options)
+        } else {
+            select(&stats, cfg)
+        };
 
         for job in jobs {
             table.run_compaction_job(job).await?;
@@ -285,6 +315,67 @@ impl Supertable {
         }
 
         Ok(())
+    }
+
+    /// Select overlap-driven consolidation jobs for the hidden vector-index
+    /// table: group cells whose bounding spheres overlap (via
+    /// [`spfresh::hot_overlap_groups`]) and emit one merge job per group. The
+    /// per-cell bounding centroid + radius already live in the manifest summary,
+    /// so this is pure selection — the actual merge + overflow-split is the
+    /// existing [`Self::run_compaction_job`] path.
+    fn overlap_consolidation_jobs(manifest: &Manifest, options: &SupertableOptions) -> Vec<CompactionJob> {
+        let Some(vec_col) = options.vector_columns.first() else {
+            return Vec::new();
+        };
+        let dim = vec_col.dim;
+        let metric = vec_col.metric;
+        let mut cells: Vec<Arc<SuperfileEntry>> = Vec::new();
+        let mut centroids: Vec<f32> = Vec::new();
+        let mut radii: Vec<f32> = Vec::new();
+        for e in manifest.get_all_superfiles() {
+            if let Some(vs) = e.vector_summary.get(&vec_col.column)
+                && vs.centroid.len() == dim
+            {
+                centroids.extend_from_slice(&vs.centroid);
+                radii.push(vs.radius);
+                cells.push(Arc::clone(e));
+            }
+        }
+        // Cap each merge job at roughly one target cell's worth of bytes.
+        // Greedy-pack each overlap group's cells into bounded jobs: this caps
+        // every `run_compaction_job` merge's resident memory (so a large overlap
+        // region is consolidated over several bounded passes rather than one
+        // giant in-memory merge — which would recreate the drain's
+        // all-corpus-in-RAM OOM at 10M) and keeps merged output near the 8 MB
+        // cell target so whole-cell scans stay cheap.
+        const MAX_CONSOLIDATION_JOB_BYTES: u64 = 8 * 1024 * 1024;
+        let cell_bytes = |i: usize| -> u64 {
+            cells[i]
+                .subsection_offsets
+                .as_ref()
+                .map(|o| o.total_size)
+                .unwrap_or(0)
+        };
+        let mut jobs: Vec<CompactionJob> = Vec::new();
+        for group in hot_overlap_groups(&centroids, &radii, dim, metric, CELL_OVERLAP_TAU_DEFAULT) {
+            let mut chunk: Vec<usize> = Vec::new();
+            let mut chunk_bytes: u64 = 0;
+            for i in group {
+                let sz = cell_bytes(i);
+                if chunk.len() >= 2 && chunk_bytes.saturating_add(sz) > MAX_CONSOLIDATION_JOB_BYTES {
+                    jobs.push(consolidation_job(&cells, &chunk));
+                    chunk.clear();
+                    chunk_bytes = 0;
+                }
+                chunk.push(i);
+                chunk_bytes = chunk_bytes.saturating_add(sz);
+            }
+            // A lone cell has nothing to merge with; only emit groups of >= 2.
+            if chunk.len() >= 2 {
+                jobs.push(consolidation_job(&cells, &chunk));
+            }
+        }
+        jobs
     }
 
     /// Merges the given superfiles into one

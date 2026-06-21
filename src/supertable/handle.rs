@@ -2045,7 +2045,8 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Fp32,
+                // Production codec: the consolidation merge byte-splices Sq8+ε.
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -2061,7 +2062,16 @@ mod tests {
                     .map(|row| format!("doc-{commit}-{row}"))
                     .collect::<Vec<_>>(),
             );
-            let flat = Float32Array::from(vec![1.0f32; rows_per_commit * dim]);
+            // All commits sit in the same region (lean toward lane 0 with a
+            // small per-row spread → radius > 0), so every commit's cell
+            // overlaps the others — exactly what overlap consolidation targets.
+            let mut flat: Vec<f32> = Vec::with_capacity(rows_per_commit * dim);
+            for row in 0..rows_per_commit {
+                let mut v = vec![0.1f32; dim];
+                v[0] = 1.0 + row as f32 * 0.02;
+                flat.extend_from_slice(&v);
+            }
+            let flat = Float32Array::from(flat);
             let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
             let batch = arrow_array::RecordBatch::try_new(
                 schema.clone(),
@@ -2092,13 +2102,11 @@ mod tests {
             }
             by_cell.values().copied().max().unwrap_or(0)
         };
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("route hidden incoming into manifest cells");
+        // New design: no eager drain — each commit is its own immutable cell.
         let before = count_by_cell(hidden.reader().manifest());
         assert!(
             before >= 2,
-            "need multiple append-only superfiles per cell before compaction, got {before}"
+            "need multiple overlapping cells before consolidation, got {before}"
         );
 
         let cfg = CompactionSettings {
@@ -2113,7 +2121,7 @@ mod tests {
         let after = count_by_cell(after_manifest);
         assert!(
             after < before,
-            "compaction should collapse per-cell superfiles: before={before} after={after}"
+            "overlap consolidation should merge overlapping cells: before={before} after={after}"
         );
         for entry in &after_manifest.superfiles {
             assert_eq!(
@@ -2143,6 +2151,139 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "vector search should still work after hidden compaction"
+        );
+    }
+
+    /// User deletes must not surface in hidden-index vector search. The hidden
+    /// path scans hidden cells (whose own tombstone cache is empty), so deletes
+    /// apply only after remapping hits back to user rows against the user
+    /// table's tombstone sidecars — this guards that path end to end through the
+    /// new per-cell routing.
+    #[test]
+    fn hidden_vector_search_excludes_deleted_rows() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::query::SuperfileHit,
+        };
+
+        let dim = 32usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Each row leans hard toward one of 4 lanes; doc-0 leans toward lane 0,
+        // which is also the query — the exact nearest.
+        let row_vec = |g: usize| -> Vec<f32> {
+            let mut v = vec![0.1f32; dim];
+            v[g % 4] = 1.0;
+            v
+        };
+        for c in 0..4 {
+            let mut flat: Vec<f32> = Vec::new();
+            let mut titles_v: Vec<String> = Vec::new();
+            for r in 0..8 {
+                let g = c * 8 + r;
+                flat.extend_from_slice(&row_vec(g));
+                titles_v.push(format!("doc-{g}"));
+            }
+            let fsl = FixedSizeListArray::new(
+                item_field.clone(),
+                dim as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            );
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(LargeStringArray::from(titles_v)) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // doc-0 owns the global-min `_id` → first user superfile, local 0.
+        let first_uri = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .min_by_key(|e| e.id_min)
+            .expect("a user superfile")
+            .uri;
+        let contains_doc0 = |hits: &[SuperfileHit]| {
+            hits.iter()
+                .any(|h| h.superfile == first_uri && h.local_doc_id == 0)
+        };
+        let q = row_vec(0);
+
+        let before = st
+            .reader()
+            .vector_hits("emb", &q, 10, VectorSearchOptions::new(), None)
+            .expect("vector search before delete");
+        assert!(
+            contains_doc0(&before),
+            "doc-0 (the exact nearest) must rank before deletion"
+        );
+
+        let stats = st.delete(col("title").eq(lit("doc-0"))).expect("delete doc-0");
+        assert_eq!(stats.n_tombstoned(), 1, "exactly one row deleted");
+
+        let after = st
+            .reader()
+            .vector_hits("emb", &q, 10, VectorSearchOptions::new(), None)
+            .expect("vector search after delete");
+        assert!(!after.is_empty(), "neighbours remain after deleting one row");
+        assert!(
+            !contains_doc0(&after),
+            "the deleted row must not reappear via the hidden vector path"
         );
     }
 

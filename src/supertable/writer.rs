@@ -335,9 +335,34 @@ fn materialized_ivf_rows_in_doc_order(
         .collect())
 }
 
-/// One commit's hidden-index batch, ready to build into a single
-/// "incoming" IVF superfile. No per-cell split happens here — that is deferred
-/// to background SPFresh maintenance.
+/// Target byte size for one immutable hidden vector-index cell. A commit's
+/// hidden vectors are split into this many bytes per cell so a probe reads a
+/// bounded amount in one whole-cell GET.
+const HIDDEN_CELL_TARGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Rough per-row byte estimate for sizing hidden cells before they are built:
+/// Sq8+ε stores roughly two bytes per dim (code + residual) plus the 1-bit
+/// estimate and a doc id. Over-estimating only makes cells smaller, so the
+/// target stays a safe ceiling rather than an exact size.
+const HIDDEN_CELL_EST_BYTES_PER_DIM: usize = 3;
+const HIDDEN_CELL_EST_ROW_OVERHEAD_BYTES: usize = 16;
+
+/// How many ~`HIDDEN_CELL_TARGET_BYTES` cells to split a commit's hidden
+/// vectors into. `sum_dim` is the total dim across all vector columns.
+fn hidden_cell_count(total_rows: usize, sum_dim: usize) -> usize {
+    if total_rows == 0 {
+        return 0;
+    }
+    let bytes_per_row = sum_dim * HIDDEN_CELL_EST_BYTES_PER_DIM + HIDDEN_CELL_EST_ROW_OVERHEAD_BYTES;
+    total_rows
+        .saturating_mul(bytes_per_row)
+        .div_ceil(HIDDEN_CELL_TARGET_BYTES)
+        .max(1)
+}
+
+/// One commit's hidden-index batch, ready to build into one or more immutable
+/// ~8 MB cell superfiles (each a leaf in the centroid index). No per-cell drain
+/// happens — overlap-triggered consolidation handles hot regions out-of-band.
 struct HiddenIncomingPlan {
     buffer: Vec<BufferedBatch>,
     clusters: ClusterCentroids,
@@ -373,22 +398,37 @@ fn execute_hidden_incoming_plan_in_scope(
             column,
         });
     }
-    // Normal IVF layout for the incoming append region (same as user-table vectors).
-    let shard = build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf)?;
-    let prepared = prepare_superfile(inner, shard)?
-        .ok_or_else(|| BuildError::Store("hidden incoming superfile unexpectedly empty".into()))?;
-    let entry = finish_superfile_entry(
-        inner,
-        prepared.entry,
-        Some(super::handle::INCOMING_VECTOR_CELL),
-    )?;
-    let prepared = PreparedSuperfile {
-        entry,
-        bytes_for_store: prepared.bytes_for_store,
-        bytes_for_storage: prepared.bytes_for_storage,
-        bytes_for_cache: prepared.bytes_for_cache,
-    };
-    let batch = collect_prepared_superfiles(inner, vec![prepared])?;
+    // New design: each commit's hidden vectors become one or more immutable
+    // ~8 MB cells (no drain). Split the buffer into that many row-balanced
+    // shards and build one normal-IVF cell per shard; `prepare_superfile`
+    // records each cell's centroid summary in the manifest, which is what
+    // queries route by.
+    let dims: Vec<usize> = inner.options.vector_columns.iter().map(|c| c.dim).collect();
+    let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+    let n_cells = hidden_cell_count(total_rows, dims.iter().sum());
+    let shards = split_buffer_into_row_shards(buffer, n_cells, &dims);
+    let mut prepared_cells: Vec<PreparedSuperfile> = Vec::with_capacity(shards.len());
+    for shard in shards {
+        if shard.is_empty() {
+            continue;
+        }
+        let built = build_one_shard_with_layout(&shard, &inner.options, VectorLayout::Ivf)?;
+        let prepared = prepare_superfile(inner, built)?.ok_or_else(|| {
+            BuildError::Store("hidden incoming superfile unexpectedly empty".into())
+        })?;
+        let entry = finish_superfile_entry(
+            inner,
+            prepared.entry,
+            Some(super::handle::INCOMING_VECTOR_CELL),
+        )?;
+        prepared_cells.push(PreparedSuperfile {
+            entry,
+            bytes_for_store: prepared.bytes_for_store,
+            bytes_for_storage: prepared.bytes_for_storage,
+            bytes_for_cache: prepared.bytes_for_cache,
+        });
+    }
+    let batch = collect_prepared_superfiles(inner, prepared_cells)?;
     Ok(HiddenIncomingPrepare {
         batch,
         // Counts are bumped by maintenance when rows actually land in cells.
@@ -1223,6 +1263,68 @@ impl SupertableWriter {
                     n_not_found,
                 } => (n_tombstoned, n_not_found),
             };
+
+            // Mirror the delete into the hidden vector index so its own scan-time
+            // tombstone filter (`apply_tombstone_filter`, already on the warm
+            // fan-out path) drops these rows — no query-side remap, no extra
+            // warm-path reads. Reuses the exact tombstone pipeline: the hidden
+            // manifest's [id_min, id_max] candidates + `_id`-column scan resolve
+            // each user `_id` to its hidden (superfile, local), even across the
+            // cells' overlapping id ranges. Best-effort, like the append
+            // dual-write — on failure vector search may transiently return a
+            // deleted row until maintenance drops it.
+            if let Some(hidden) = supertable.inner().vector_index_table.clone()
+                && let Some(hidden_storage) = hidden.inner().options.storage.clone()
+            {
+                let hidden_ws = WalStore::new(hidden_storage);
+                let hidden_wal_id = WalId(
+                    hidden
+                        .inner()
+                        .id_generator
+                        .lock()
+                        .expect("id_generator mutex poisoned")
+                        .next_id(),
+                );
+                let hidden_wal = WalStateDoc {
+                    wal_id: hidden_wal_id,
+                    schema_version: SCHEMA_VERSION,
+                    op_kind: OpKind::Delete,
+                    state: WalState::Intent,
+                    created_at: Utc::now(),
+                    lease: None,
+                    predicate_repr: "hidden vector-index delete mirror".into(),
+                    target_ids: wal_doc.target_ids.clone(),
+                    new_row_count: None,
+                    new_row_content_hash: None,
+                    preallocated_superfile_id: None,
+                    minted_id_spans: Vec::new(),
+                    tombstone_progress: wal_doc
+                        .target_ids
+                        .iter()
+                        .map(|&target_id| TombstoneEntry {
+                            target_id,
+                            outcome: TombstoneOutcome::Pending,
+                            tombstoned_in_superfile: None,
+                        })
+                        .collect(),
+                };
+                let mirror = async {
+                    let etag = hidden_ws
+                        .create(&hidden_wal)
+                        .await
+                        .map_err(MutationError::WalStore)?;
+                    pipeline::run_tombstone_phase(&hidden, &hidden_ws, &hidden_wal, &etag).await?;
+                    let _ = hidden_ws.delete_state(hidden_wal_id).await;
+                    Ok::<(), MutationError>(())
+                };
+                if let Err(e) = mirror.await {
+                    tracing::warn!(
+                        "supertable: hidden vector-index delete mirror failed: {e} \
+                         (vector search may be stale)"
+                    );
+                }
+            }
+
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -1528,7 +1630,12 @@ impl SupertableWriter {
                     user_res?;
                     match hidden_res {
                         Ok(()) => {
-                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
+                            // New design: each commit's hidden superfile is a
+                            // permanent cell, queried via per-cell centroid
+                            // routing — no eager drain into global cells.
+                            // Overlap-triggered consolidation handles hot
+                            // regions out-of-band.
+                            let _ = &hidden_inner;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -3508,6 +3615,18 @@ mod tests {
     }
 
     // ---- writer slot exclusion ---------------------------------------
+
+    #[test]
+    fn hidden_cell_count_caps_at_target_bytes() {
+        // No rows → no cells.
+        assert_eq!(hidden_cell_count(0, 64), 0);
+        // A small commit fits one ~8 MB cell.
+        assert_eq!(hidden_cell_count(100, 64), 1);
+        // ~40k dim-64 Sq8+ε rows fill one cell; 50k spills into a second.
+        assert_eq!(hidden_cell_count(50_000, 64), 2);
+        // And it keeps splitting as the commit grows.
+        assert!(hidden_cell_count(200_000, 64) >= 5);
+    }
 
     #[test]
     fn writer_slot_is_exclusive() {
