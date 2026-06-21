@@ -117,7 +117,7 @@ use crate::{
         },
         reader::vector_layout_from_kv,
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            cell_posting::{EncodedCellRow, MaterializedIvfRow, encoded_ivf_kmeans},
             distance::Metric,
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -2382,181 +2382,6 @@ fn maint_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-async fn route_incoming_to_manifest_cells_if_ready(
-    inner: Arc<SupertableInner>,
-    min_incoming: usize,
-    assign_among: Option<&[u32]>,
-) -> Result<(), BuildError> {
-    // Single-flight: skip if another routing/compaction pass is already running.
-    if inner
-        .compaction_outstanding
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        return Ok(());
-    }
-    struct Slot<'a>(&'a std::sync::atomic::AtomicBool);
-    impl Drop for Slot<'_> {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
-        }
-    }
-    let _slot = Slot(&inner.compaction_outstanding);
-
-    let manifest = inner.manifest.load_full();
-    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
-        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
-            super::handle::INCOMING_VECTOR_CELL,
-        ),
-    );
-    let incoming: Vec<Arc<SuperfileEntry>> = manifest
-        .get_all_superfiles()
-        .iter()
-        .filter(|e| e.partition_key == incoming_key)
-        .cloned()
-        .collect();
-    if incoming.len() < min_incoming {
-        return Ok(());
-    }
-
-    let (clusters, column, routing) = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell {
-            clusters,
-            column,
-            routing,
-        } => (clusters, column, routing),
-        _ => return Ok(()),
-    };
-    if clusters.n_cent == 0 || clusters.dim == 0 {
-        return Ok(());
-    }
-    let Some(vec_col) = inner.options.vector_columns.first().cloned() else {
-        return Ok(());
-    };
-    let metric = vec_col.metric;
-
-    let store = inner.options.store.clone();
-    let disk_cache = inner.options.disk_cache.clone();
-    let storage_opt = inner.options.storage.clone();
-    let storage = storage_opt
-        .clone()
-        .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
-
-    // Read Sq8+ε IVF rows from each incoming superfile — same open path as
-    // query fan-out (`dispatch::open_reader` → disk cache / in-memory tier).
-    let manifest = inner.manifest.load_full();
-    let column_name = column.clone();
-    // Bound the reader fan-out to the commit write-concurrency cap (rather than
-    // an unbounded `try_join_all`) so a routing pass over many accumulated
-    // incoming superfiles doesn't saturate the object-store connection pool
-    // while a concurrent ingest commit is in flight. `buffered` (not
-    // `buffer_unordered`) preserves input order so the concatenated rows stay
-    // deterministic.
-    let row_sets = stream::iter(incoming.iter().map(|entry| {
-        let entry = Arc::clone(entry);
-        let store = Arc::clone(&store);
-        let disk_cache = disk_cache.clone();
-        let storage_opt = storage_opt.clone();
-        let manifest = Arc::clone(&manifest);
-        let column_name = column_name.clone();
-        async move {
-            let reader = open_reader(&store, disk_cache.as_ref(), storage_opt.as_ref(), &entry)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            let vec_reader = reader.vec().ok_or_else(|| {
-                BuildError::Store("incoming superfile missing vector index".into())
-            })?;
-            materialized_ivf_rows_in_doc_order(vec_reader, &column_name, &stable_ids, None)
-        }
-    }))
-    .buffered(commit_write_concurrency())
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, BuildError>>()?;
-    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for mut rows in row_sets {
-        all_materialized.append(&mut rows);
-    }
-
-    // Assign rows to cells and build one IVF superfile per touched cell.
-    let (prepared, cell_updates, radii_updates): (
-        Vec<PreparedSuperfile>,
-        HashMap<u32, u32>,
-        HashMap<u32, f32>,
-    ) = maint_pool().install(|| -> Result<_, BuildError> {
-        let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-        for row in all_materialized {
-            let cell = if let Some(cands) = assign_among {
-                spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
-            } else {
-                spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
-            };
-            by_cell.entry(cell).or_default().push(row);
-        }
-        let mut prepared: Vec<PreparedSuperfile> = Vec::new();
-        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-        let mut radii_updates: HashMap<u32, f32> = HashMap::new();
-        for (cell_id, mut rows) in by_cell {
-            if rows.is_empty() {
-                continue;
-            }
-            rows.sort_by_key(|r| r.stable_id);
-            for (local, row) in rows.iter_mut().enumerate() {
-                row.local_doc_id = local as u32;
-            }
-            let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
-            let added = rows.len() as u32;
-            let shard_radius =
-                spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
-            if shard_radius > 0.0 {
-                radii_updates.insert(cell_id, shard_radius);
-            }
-            let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
-            let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
-            cell_updates.insert(cell_id, base.saturating_add(added));
-            prepared.push(p);
-        }
-        Ok((prepared, cell_updates, radii_updates))
-    })?;
-    if prepared.is_empty() {
-        return Ok(());
-    }
-    let batch = collect_prepared_superfiles(&inner, prepared)?;
-
-    // Bump per-cell counts so routing sees the now-populated cells.
-    let updated_clusters = spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
-    inner
-        .manifest
-        .store(Arc::new(inner.manifest.load().with_partition_strategy(
-            PartitionStrategy::VectorCell {
-                column,
-                clusters: updated_clusters,
-                routing,
-            },
-        )));
-
-    // Publish: add the cell superfiles, remove the routed incoming superfiles.
-    let new_manifest = persist_commit_async(
-        &inner,
-        Arc::clone(&storage),
-        batch.new_entries,
-        &incoming,
-        batch.pending_storage_writes,
-        Vec::new(),
-    )
-    .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
-    inner.manifest.store(Arc::new(new_manifest));
-
-    schedule_background_storage_reclaim(Arc::clone(&inner));
-    Ok(())
-}
-
-/// Load Sq8+ε IVF rows from one cell superfile (no fp32 reconstruction).
 async fn load_materialized_rows_from_ivf_superfile(
     inner: &SupertableInner,
     entry: &Arc<SuperfileEntry>,
@@ -2612,6 +2437,74 @@ fn build_prepared_ivf_from_materialized(
     })
 }
 
+/// Lloyd iterations for an overlap-region re-cluster — matches the per-cell IVF
+/// training budget.
+const RECLUSTER_KMEANS_ITERS: usize = 8;
+
+/// Re-cluster an overlapping region's cells into tight, disjoint cells, each
+/// under the ~8 MB target.
+///
+/// Reads the region's rows in through the mmap reader (`open_reader` →
+/// reader_cache, one bounded job at a time — never the corpus), runs Sq8+residual
+/// k-means over them into `k = hidden_cell_count(rows, dim)` shards, and builds
+/// one IVF cell per shard. Deliberately NOT a byte-splice merge (that combines
+/// by cluster index and would mix the cells' independently-trained clusters) and
+/// NOT a split: every output cell is freshly clustered and tight. The k-means +
+/// per-cell encode run on the maintenance rayon pool, off the tokio I/O workers.
+pub(in crate::supertable) async fn recluster_cells(
+    inner: &Arc<SupertableInner>,
+    inputs: &[Arc<SuperfileEntry>],
+) -> Result<Vec<PreparedSuperfile>, BuildError> {
+    let vec_col = inner
+        .options
+        .vector_columns
+        .first()
+        .ok_or_else(|| BuildError::Store("re-cluster requires a vector column".into()))?;
+    let column = vec_col.column.clone();
+    let metric = vec_col.metric;
+    let sum_dim: usize = inner.options.vector_columns.iter().map(|c| c.dim).sum();
+
+    // Stream the region's rows in through the mmap reader. Bounded by the job's
+    // input cap (one region at a time), so this never holds the corpus.
+    let now = time::Instant::now();
+    let mut rows: Vec<MaterializedIvfRow> = Vec::new();
+    for entry in inputs {
+        let mut r = load_materialized_rows_from_ivf_superfile(inner, entry, &column, now).await?;
+        rows.append(&mut r);
+    }
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let k = hidden_cell_count(rows.len(), sum_dim);
+
+    let inner = Arc::clone(inner);
+    maint_pool().install(move || -> Result<Vec<PreparedSuperfile>, BuildError> {
+        let encoded: Vec<EncodedCellRow> = rows.iter().map(|r| r.encoded.clone()).collect();
+        let (_centroids, assign) = encoded_ivf_kmeans(&encoded, metric, k, RECLUSTER_KMEANS_ITERS);
+        let k_actual = assign.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        let mut shards: Vec<Vec<MaterializedIvfRow>> = vec![Vec::new(); k_actual];
+        for (row, &a) in rows.into_iter().zip(assign.iter()) {
+            shards[a].push(row);
+        }
+        let mut out = Vec::with_capacity(shards.len());
+        for mut shard in shards {
+            if shard.is_empty() {
+                continue;
+            }
+            shard.sort_by_key(|r| r.stable_id);
+            for (local, row) in shard.iter_mut().enumerate() {
+                row.local_doc_id = local as u32;
+            }
+            out.push(build_prepared_ivf_from_materialized(
+                &inner,
+                super::handle::INCOMING_VECTOR_CELL,
+                shard,
+            )?);
+        }
+        Ok(out)
+    })
+}
+
 /// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
 /// into the normal vector builder — no fp32 corpus decode.
 fn build_one_shard_from_materialized(
@@ -2649,208 +2542,6 @@ fn build_one_shard_from_materialized(
         id_max,
         scalar_stats,
     })
-}
-
-/// Minimum overflow rows required to split a cell into two sub-cells — a split
-/// needs at least one row per side, so fewer than this is a no-op.
-const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
-
-/// SPFresh steps 7–9: Sq8-native split, centroid extension, neighborhood
-/// reassign, then redrive rows through incoming staging (not direct cell publish).
-pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
-    inner: Arc<SupertableInner>,
-    merged_entry: &Arc<SuperfileEntry>,
-    split_cell: u32,
-) -> Result<(), BuildError> {
-    if !spfresh::split_overflow_needed(merged_entry.n_docs) {
-        return Ok(());
-    }
-
-    let manifest = inner.manifest.load_full();
-    let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell {
-            clusters,
-            column,
-            routing,
-        } => {
-            let Some(vec_col) = inner.options.vector_columns.first() else {
-                return Ok(());
-            };
-            (clusters, column, routing, vec_col.metric, vec_col.dim)
-        }
-        _ => return Ok(()),
-    };
-    if clusters.n_cent == 0 || clusters.dim == 0 {
-        return Ok(());
-    }
-
-    let storage = inner
-        .options
-        .storage
-        .clone()
-        .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
-
-    let now = time::Instant::now();
-    let overflow_materialized =
-        load_materialized_rows_from_ivf_superfile(&inner, merged_entry, &column, now).await?;
-    if overflow_materialized.len() < MIN_ROWS_TO_SPLIT_CELL {
-        return Ok(());
-    }
-    let overflow_encoded: Vec<EncodedCellRow> = overflow_materialized
-        .iter()
-        .map(|r| r.encoded.clone())
-        .collect();
-
-    let (sub0, sub1) = maint_pool()
-        .install(|| spfresh::plan_sq8_split(&overflow_encoded, &clusters, split_cell, metric));
-    let mut sub_centroids = sub0;
-    sub_centroids.extend_from_slice(&sub1);
-
-    let old_n_cent = clusters.n_cent;
-    let (mut updated_clusters, new_cell_id) =
-        spfresh::insert_split_centroid(&clusters, split_cell, &sub_centroids);
-    let neighborhood = spfresh::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
-
-    let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
-    for entry in manifest.superfiles.iter() {
-        if entry
-            .partition_hint
-            .is_some_and(|hint| neighborhood.contains(&hint))
-        {
-            to_remove.push(Arc::clone(entry));
-        }
-    }
-
-    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for entry in &to_remove {
-        let mut rows =
-            load_materialized_rows_from_ivf_superfile(&inner, entry, &column, now).await?;
-        all_materialized.append(&mut rows);
-    }
-    if all_materialized.is_empty() {
-        return Ok(());
-    }
-
-    // Rows leave the neighborhood cells; counts reset until routing lands them.
-    spfresh::zero_cell_counts(&mut updated_clusters, &neighborhood);
-
-    let incoming_prepared = maint_pool().install(|| -> Result<PreparedSuperfile, BuildError> {
-        let mut rows = all_materialized;
-        rows.sort_by_key(|r| r.stable_id);
-        for (local, row) in rows.iter_mut().enumerate() {
-            row.local_doc_id = local as u32;
-        }
-        build_prepared_ivf_from_materialized(&inner, super::handle::INCOMING_VECTOR_CELL, rows)
-    })?;
-
-    let batch = collect_prepared_superfiles(&inner, vec![incoming_prepared])?;
-
-    inner
-        .manifest
-        .store(Arc::new(manifest.with_partition_strategy(
-            PartitionStrategy::VectorCell {
-                column: column.clone(),
-                clusters: updated_clusters.clone(),
-                routing,
-            },
-        )));
-
-    let new_manifest = persist_commit_async(
-        &inner,
-        Arc::clone(&storage),
-        batch.new_entries,
-        &to_remove,
-        batch.pending_storage_writes,
-        Vec::new(),
-    )
-    .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
-    inner.manifest.store(Arc::new(new_manifest));
-
-    schedule_background_storage_reclaim(Arc::clone(&inner));
-
-    // Step 9: redrive through incoming → route into per-cell IVF superfiles.
-    // Step 6 neighborhood reassignment: restrict assignment to P−1/P/P₂/P+1.
-    route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, Some(&neighborhood)).await
-}
-
-/// DeDrift-lazy radius refresh after a hidden-cell compaction that did NOT
-/// overflow into a split. Recomputes the merged cell's bounding-sphere radius
-/// (max member distance from the cell centroid) from its Sq8 members and writes
-/// it back to the manifest centroid, so adaptive-nprobe pruning stays accurate
-/// as members shift under merges/tombstones. Split cells skip this — their
-/// redrive re-routes rows and recomputes radii for the new cells. Reuses the
-/// drain's Sq8-native radius calc; the only cost is one strategy-only manifest
-/// commit, off the query path.
-pub(in crate::supertable) async fn refresh_cell_radius_after_compaction(
-    inner: Arc<SupertableInner>,
-    merged_entry: &Arc<SuperfileEntry>,
-    cell_id: u32,
-) -> Result<(), BuildError> {
-    let manifest = inner.manifest.load_full();
-    let (clusters, column, routing, metric) = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell {
-            clusters,
-            column,
-            routing,
-        } => {
-            let Some(vec_col) = inner.options.vector_columns.first() else {
-                return Ok(());
-            };
-            (clusters, column, routing, vec_col.metric)
-        }
-        _ => return Ok(()),
-    };
-    if clusters.n_cent == 0 || clusters.dim == 0 || cell_id as usize >= clusters.n_cent as usize {
-        return Ok(());
-    }
-
-    let storage = inner
-        .options
-        .storage
-        .clone()
-        .ok_or_else(|| BuildError::Store("cell radius refresh requires storage".into()))?;
-
-    // Members of the just-merged cell (cache-warm after the merge); no fp32
-    // corpus decode — `encoded_shard_radius` scores Sq8 rows against the
-    // centroid directly.
-    let now = time::Instant::now();
-    let materialized =
-        load_materialized_rows_from_ivf_superfile(&inner, merged_entry, &column, now).await?;
-    if materialized.is_empty() {
-        return Ok(());
-    }
-    // The radius is a CPU wave (O(rows × dim) Sq8 distances) — run it on the
-    // maintenance rayon pool, not inline on the tokio worker (the rayon-for-CPU
-    // concurrency contract; same as the drain's radius calc and the split's
-    // k-means).
-    let radius = maint_pool().install(|| {
-        let encoded: Vec<EncodedCellRow> = materialized.iter().map(|r| r.encoded.clone()).collect();
-        spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded)
-    });
-    if radius <= 0.0 {
-        return Ok(());
-    }
-
-    let mut radii_updates: HashMap<u32, f32> = HashMap::new();
-    radii_updates.insert(cell_id, radius);
-    let updated_clusters = spfresh::apply_cell_updates(&clusters, &HashMap::new(), &radii_updates);
-    inner
-        .manifest
-        .store(Arc::new(manifest.with_partition_strategy(
-            PartitionStrategy::VectorCell {
-                column,
-                clusters: updated_clusters,
-                routing,
-            },
-        )));
-    // Strategy-only commit: no superfile changes, just the refreshed radius.
-    let new_manifest =
-        persist_commit_async(&inner, storage, Vec::new(), &[], Vec::new(), Vec::new())
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-    inner.manifest.store(Arc::new(new_manifest));
-    Ok(())
 }
 
 async fn publish_hidden_incoming_async(

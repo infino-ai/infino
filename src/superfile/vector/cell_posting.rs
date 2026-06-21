@@ -775,9 +775,9 @@ pub(crate) fn encoded_ivf_kmeans(
     metric: Metric,
     k: usize,
     iters: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<usize>) {
     if rows.is_empty() || k == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let dim = rows[0].codes.len();
     let k = k.min(rows.len());
@@ -833,12 +833,28 @@ pub(crate) fn encoded_ivf_kmeans(
         }
     }
 
+    // Final assignment against the converged medoids: the loop's last `assign`
+    // pass ran before the final medoid update, so re-assign once more so the
+    // returned shards match the returned centroids.
+    for (i, row) in rows.iter().enumerate() {
+        let mut best_c = 0usize;
+        let mut best_score = f32::INFINITY;
+        for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
+            let score = distance_encoded_rows_symmetric(metric, dim, row, &rows[mid]);
+            if score < best_score {
+                best_score = score;
+                best_c = c;
+            }
+        }
+        assign[i] = best_c;
+    }
+
     let mut out = vec![0f32; k * dim];
     for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
         let fp32 = manifest_centroid_components_from_row(&rows[mid], dim);
         out[c * dim..(c + 1) * dim].copy_from_slice(&fp32);
     }
-    out
+    (out, assign)
 }
 
 /// Load live Sq8+ε rows from a cell-posting blob aligned with scalar `_id` order.

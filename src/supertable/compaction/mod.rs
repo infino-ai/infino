@@ -40,15 +40,14 @@ use crate::{
         manifest::Manifest,
         options::SupertableOptions,
         query::dispatch::open_reader,
-        spfresh::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups, split_overflow_needed},
+        spfresh::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups},
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, refresh_cell_radius_after_compaction,
-            split_overflow_cell_after_compaction, try_commit_attempt,
+            prepare_superfile, recluster_cells, try_commit_attempt,
         },
     },
 };
@@ -341,14 +340,13 @@ impl Supertable {
                 cells.push(Arc::clone(e));
             }
         }
-        // Cap each merge job at roughly one target cell's worth of bytes.
-        // Greedy-pack each overlap group's cells into bounded jobs: this caps
-        // every `run_compaction_job` merge's resident memory (so a large overlap
-        // region is consolidated over several bounded passes rather than one
-        // giant in-memory merge — which would recreate the drain's
-        // all-corpus-in-RAM OOM at 10M) and keeps merged output near the 8 MB
-        // cell target so whole-cell scans stay cheap.
-        const MAX_CONSOLIDATION_JOB_BYTES: u64 = 8 * 1024 * 1024;
+        // Cap how much of an overlap region one re-cluster job reads into
+        // memory at once. A job streams its cells' rows in through the mmap
+        // reader, re-clusters them, writes the tight output cells, then drops
+        // them — so resident memory is bounded by this cap, never the corpus
+        // (that was the old eager drain's OOM at 10M). Set above one cell so a
+        // pair of already-full 8 MB cells can be re-clustered together.
+        const MAX_RECLUSTER_INPUT_BYTES: u64 = 4 * 8 * 1024 * 1024;
         let cell_bytes = |i: usize| -> u64 {
             cells[i]
                 .subsection_offsets
@@ -356,13 +354,20 @@ impl Supertable {
                 .map(|o| o.total_size)
                 .unwrap_or(0)
         };
+        // Pack each overlapping region's cells into byte-bounded re-cluster
+        // jobs. The cap bounds how much of a region is read into memory at once
+        // (one bounded region at a time — never the corpus): each job's rows are
+        // streamed in through the mmap reader, re-clustered, written back out as
+        // tight cells, then dropped. A job may exceed one cell's worth (e.g. two
+        // already-full 8 MB cells that overlap) — that re-clusters into k =
+        // ceil(bytes / 8 MB) tight cells, which is the whole point.
         let mut jobs: Vec<CompactionJob> = Vec::new();
         for group in hot_overlap_groups(&centroids, &radii, dim, metric, CELL_OVERLAP_TAU_DEFAULT) {
             let mut chunk: Vec<usize> = Vec::new();
             let mut chunk_bytes: u64 = 0;
             for i in group {
                 let sz = cell_bytes(i);
-                if chunk.len() >= 2 && chunk_bytes.saturating_add(sz) > MAX_CONSOLIDATION_JOB_BYTES {
+                if chunk.len() >= 2 && chunk_bytes.saturating_add(sz) > MAX_RECLUSTER_INPUT_BYTES {
                     jobs.push(consolidation_job(&cells, &chunk));
                     chunk.clear();
                     chunk_bytes = 0;
@@ -518,50 +523,66 @@ impl Supertable {
             }
         }
 
-        let merged_segment = match self.merge_superfiles(&inputs).await {
-            Ok(segment) => segment,
-            Err(e) => {
-                for entry in &inputs {
-                    if let Err(unseal_err) =
-                        tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
-                            .await
-                    {
-                        tracing::warn!(
-                            superfile_id = %entry.superfile_id,
-                            "compaction merge failed; unseal also failed: {unseal_err}"
-                        );
-                    }
-                }
-                return Err(CompactionError::Build(e.to_string()));
-            }
-        };
-
         let partition_key = job.partition_key.clone();
         let partition_hint = inputs.first().and_then(|e| e.partition_hint);
-        let merged_old = merged_segment.entry.as_ref();
-        let merged_entry = Arc::new(SuperfileEntry {
-            superfile_id: merged_old.superfile_id,
-            uri: merged_old.uri,
-            n_docs: merged_old.n_docs,
-            id_min: merged_old.id_min,
-            id_max: merged_old.id_max,
-            scalar_stats: merged_old.scalar_stats.clone(),
-            fts_summary: merged_old.fts_summary.clone(),
-            vector_summary: merged_old.vector_summary.clone(),
-            partition_key,
-            partition_hint,
-            subsection_offsets: merged_old.subsection_offsets.clone(),
-            vector_layout: inputs
-                .first()
-                .map(|e| e.vector_layout)
-                .unwrap_or(VectorLayout::Ivf),
-        });
-        let new_entries = vec![merged_entry];
-        let mut pending_storage_writes = vec![
-            merged_segment
-                .bytes_for_storage
-                .ok_or(CompactionError::EmptyMergedSuperfile)?,
-        ];
+        let vector_layout = inputs
+            .first()
+            .map(|e| e.vector_layout)
+            .unwrap_or(VectorLayout::Ivf);
+
+        // Hidden vector index: re-cluster the overlapping region into tight,
+        // disjoint cells (rows streamed in through the mmap reader; no split, no
+        // byte-splice merge — that would mix the cells' independently-trained
+        // clusters). Every other table: the standard byte-splice merge into one
+        // larger superfile.
+        let prepared: Vec<PreparedSuperfile> =
+            match if is_hidden_vector_index_table(&inner.options) {
+                recluster_cells(inner, &inputs).await
+            } else {
+                self.merge_superfiles(&inputs).await.map(|seg| vec![seg])
+            } {
+                Ok(p) => p,
+                Err(e) => {
+                    for entry in &inputs {
+                        if let Err(unseal_err) =
+                            tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                superfile_id = %entry.superfile_id,
+                                "compaction failed; unseal also failed: {unseal_err}"
+                            );
+                        }
+                    }
+                    return Err(CompactionError::Build(e.to_string()));
+                }
+            };
+
+        let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
+        let mut pending_storage_writes = Vec::with_capacity(prepared.len());
+        let mut pending_cache_inserts_all = Vec::new();
+        for p in prepared {
+            let e = p.entry.as_ref();
+            new_entries.push(Arc::new(SuperfileEntry {
+                superfile_id: e.superfile_id,
+                uri: e.uri,
+                n_docs: e.n_docs,
+                id_min: e.id_min,
+                id_max: e.id_max,
+                scalar_stats: e.scalar_stats.clone(),
+                fts_summary: e.fts_summary.clone(),
+                vector_summary: e.vector_summary.clone(),
+                partition_key: partition_key.clone(),
+                partition_hint,
+                subsection_offsets: e.subsection_offsets.clone(),
+                vector_layout,
+            }));
+            pending_storage_writes
+                .push(p.bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?);
+            if let Some(c) = p.bytes_for_cache {
+                pending_cache_inserts_all.push(c);
+            }
+        }
 
         let opts = Arc::clone(&inner.options);
         let max_retries = opts.max_commit_retries.max(1);
@@ -601,39 +622,14 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
-                    let pending_cache_inserts = merged_segment
-                        .bytes_for_cache
-                        .into_iter()
-                        .collect::<Vec<_>>();
                     finalize_compaction_commit(
                         Arc::clone(inner),
                         &storage,
                         &new_entries,
                         &entries_to_remove,
-                        pending_cache_inserts,
+                        pending_cache_inserts_all.clone(),
                     )
                     .await;
-                    if is_hidden_vector_index_table(&inner.options)
-                        && let Some(cell_id) = partition_hint
-                    {
-                        // Overflow → split (its redrive recomputes the new cells'
-                        // radii). Otherwise DeDrift-lazy: refresh this cell's
-                        // bounding-sphere radius so adaptive-nprobe pruning stays
-                        // accurate after members shift under the merge.
-                        let merged = &new_entries[0];
-                        let maint = if split_overflow_needed(merged.n_docs) {
-                            split_overflow_cell_after_compaction(Arc::clone(inner), merged, cell_id)
-                                .await
-                        } else {
-                            refresh_cell_radius_after_compaction(Arc::clone(inner), merged, cell_id)
-                                .await
-                        };
-                        if let Err(e) = maint {
-                            tracing::warn!(
-                                "supertable: hidden cell maintenance after compaction failed: {e}"
-                            );
-                        }
-                    }
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {

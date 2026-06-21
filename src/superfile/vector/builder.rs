@@ -815,7 +815,7 @@ fn build_subsection_from_materialized(
         .max(1)
         .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1));
-    let centroids = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
+    let (centroids, _assign) = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
