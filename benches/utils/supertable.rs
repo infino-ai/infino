@@ -37,15 +37,16 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
-use std::time::Instant;
+#[allow(unused_imports)]
+// `Instant`/`Duration` are consumed by the child mods via `use super::*`
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     process::{Command, Stdio},
     sync::Arc,
 };
 
-use infino::supertable::Supertable;
+use infino::{CompactionSettings, OptimizeOptions, supertable::Supertable};
 use tempfile::TempDir;
 
 use crate::{
@@ -513,6 +514,50 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
         cache,
     );
     (cache_dir, tiers::open_consumer(opts))
+}
+
+/// Like [`open_consumer`] but routes the consumer (and its hidden-index
+/// `PrefixedStorageProvider`) through a [`storage_meter::MeteredStorage`], so
+/// the object-store traffic of write-path maintenance — SPFresh drain, optimize
+/// — can be attributed by snapshotting the returned meter before and after.
+fn open_consumer_metered(
+    modality: Modality,
+    built: &supertable::IngestResult,
+) -> (TempDir, Supertable, storage_meter::MeteredStorage) {
+    let meter = storage_meter::wrap(Arc::clone(&built.storage));
+    let provider = meter.provider();
+    let (cache_dir, cache) =
+        tiers::fresh_supertable_search_cache(Arc::clone(&provider), Some(built.total_index_bytes));
+    let opts = tiers::consumer_options(supertable::options_for(modality, None), provider, cache);
+    (cache_dir, tiers::open_consumer(opts), meter)
+}
+
+/// One row of the maintenance-cost table: object-store traffic + wall for a
+/// single maintenance pass (drain / optimize). All columns are lower-is-better.
+fn maint_cost_row(op: &str, c: storage_meter::ObjectStoreMeter, wall: Duration) -> Vec<Cell> {
+    let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
+    let wall_ns = wall.as_secs_f64() * 1e9;
+    vec![
+        text(op),
+        metric(
+            c.put_count as f64,
+            fmt_count(c.put_count as usize),
+            Better::Lower,
+        ),
+        metric(c.put_bytes as f64, mib(c.put_bytes), Better::Lower),
+        metric(
+            c.get_count as f64,
+            fmt_count(c.get_count as usize),
+            Better::Lower,
+        ),
+        metric(c.get_bytes as f64, mib(c.get_bytes), Better::Lower),
+        metric(
+            c.delete_count as f64,
+            fmt_count(c.delete_count as usize),
+            Better::Lower,
+        ),
+        metric(wall_ns, fmt_time(wall_ns), Better::Lower),
+    ]
 }
 
 pub mod fts {
@@ -1029,7 +1074,10 @@ pub mod vector {
                 )
             };
 
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
+            // Metered consumer so the drain + optimize maintenance passes below
+            // can be priced (object-store PUT/GET/DELETE traffic + bytes).
+            let (cache_dir, consumer, maint_meter) =
+                open_consumer_metered(Modality::Vector, &built);
 
             let recall_rows = if pre_post_drain {
                 if phases.warm {
@@ -1059,13 +1107,20 @@ pub mod vector {
                     PRE_DRAIN_NOTE,
                 );
 
+                // Drain cost: route accumulated incoming IVF superfiles into
+                // per-cell superfiles. Object-store traffic attributed via the
+                // meter delta around the call.
+                let drain_before = maint_meter.snapshot();
+                let drain_t0 = Instant::now();
                 drain_hidden_incoming(&consumer);
+                let drain_wall = drain_t0.elapsed();
+                let drain_cost = maint_meter.snapshot().delta(drain_before);
 
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (post-drain)");
                 }
                 eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
-                exec_vec::run_search(
+                let post_search = exec_vec::run_search(
                     &mut report,
                     &consumer,
                     || SupertableVecColdGuard::open(&built),
@@ -1086,7 +1141,53 @@ pub mod vector {
                     "bench/vector/supertable/search/post-drain",
                     search_title("post-drain"),
                     POST_DRAIN_NOTE,
-                )
+                );
+
+                // Optimize cost: full compaction over the (now cell-routed)
+                // table. Measured after the post-drain search so it does not
+                // perturb the recall/latency numbers above.
+                let opt_before = maint_meter.snapshot();
+                let opt_t0 = Instant::now();
+                consumer
+                    .optimize(&OptimizeOptions::compact(CompactionSettings {
+                        target_superfile_size_mb: 1,
+                        min_fill_percent: 1,
+                        ..CompactionSettings::default()
+                    }))
+                    .expect("optimize");
+                let opt_wall = opt_t0.elapsed();
+                let opt_cost = maint_meter.snapshot().delta(opt_before);
+
+                report.emit(&Section {
+                    anchor: "bench/vector/supertable/maintenance".into(),
+                    title: format!(
+                        "Supertable vector — maintenance cost ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    note: "Object-store cost of write-path maintenance: SPFresh drain (route \
+                           incoming IVF superfiles into per-cell superfiles) and optimize (full \
+                           compaction). Per-pass PUT/GET/DELETE requests + bytes + wall. Δ vs the \
+                           previous run."
+                        .into(),
+                    blocks: vec![Block {
+                        subtitle: String::new(),
+                        headers: vec![
+                            "pass".into(),
+                            "PUTs".into(),
+                            "written".into(),
+                            "GETs".into(),
+                            "read".into(),
+                            "deletes".into(),
+                            "wall".into(),
+                        ],
+                        rows: vec![
+                            maint_cost_row("drain", drain_cost, drain_wall),
+                            maint_cost_row("optimize", opt_cost, opt_wall),
+                        ],
+                    }],
+                });
+
+                post_search
             } else {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open");
