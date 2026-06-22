@@ -30,10 +30,18 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use infino::{
     config::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
@@ -42,9 +50,10 @@ use infino::{
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
         Supertable,
+        manifest::disk_cache::ManifestDiskCache,
         query::VectorSearchOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
-        storage::{AzureStorageProvider, StorageProvider},
+        storage::{AzureStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
     test_helpers::{build_title_batch, default_supertable_options},
 };
@@ -53,6 +62,12 @@ use tempfile::TempDir;
 use super::azure_helpers::{
     EMULATOR_ENDPOINT, delete_emulator_container, ensure_emulator_container,
 };
+
+/// Substring identifying a manifest-part object URI
+/// (`<prefix>/manifest-parts/part-<hex>.avro.zst`). Lets the counting
+/// wrapper tell a manifest-part GET apart from pointer / manifest-list /
+/// superfile GETs.
+const MANIFEST_PART_URI_MARKER: &str = "manifest-parts/part-";
 
 /// Single-thread rayon pool for deterministic Azure smoke runs.
 const RAYON_POOL_THREADS: usize = 1;
@@ -496,4 +511,291 @@ async fn supertable_real_azure_round_trip() {
     }
     eprintln!("[real-azure] cleanup OK; deleted keys under prefix={prefix}");
     result.expect("real Azure integration failed");
+}
+
+/// A [`StorageProvider`] decorator that delegates to an inner provider
+/// and counts GETs, separating manifest-part GETs from everything else.
+/// Used to prove the manifest disk cache eliminates Azure round-trips
+/// for part bytes on a warm open.
+#[derive(Debug)]
+struct CountingStorage {
+    inner: Arc<dyn StorageProvider>,
+    part_gets: AtomicUsize,
+    total_gets: AtomicUsize,
+}
+
+impl CountingStorage {
+    fn new(inner: Arc<dyn StorageProvider>) -> Self {
+        Self {
+            inner,
+            part_gets: AtomicUsize::new(0),
+            total_gets: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.part_gets.store(0, Ordering::Release);
+        self.total_gets.store(0, Ordering::Release);
+    }
+
+    fn part_gets(&self) -> usize {
+        self.part_gets.load(Ordering::Acquire)
+    }
+
+    fn note_get(&self, uri: &str) {
+        self.total_gets.fetch_add(1, Ordering::AcqRel);
+        if uri.contains(MANIFEST_PART_URI_MARKER) {
+            self.part_gets.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[async_trait]
+impl StorageProvider for CountingStorage {
+    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+        self.inner.head(uri).await
+    }
+
+    async fn get(&self, uri: &str) -> Result<(bytes::Bytes, ObjectMeta), StorageError> {
+        self.note_get(uri);
+        self.inner.get(uri).await
+    }
+
+    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<bytes::Bytes, StorageError> {
+        // Manifest parts load via `get` (full object); count any
+        // part-range GETs too so the warm-path assertion stays honest.
+        self.note_get(uri);
+        self.inner.get_range(uri, range).await
+    }
+
+    async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {
+        self.inner.tail(uri, len).await
+    }
+
+    async fn put_atomic(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner.put_atomic(uri, bytes).await
+    }
+
+    async fn put_if_match(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+        expected_etag: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner.put_if_match(uri, bytes, expected_etag).await
+    }
+
+    async fn put_multipart(
+        &self,
+        uri: &str,
+    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        self.inner.put_multipart(uri).await
+    }
+
+    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        self.inner.delete(uri).await
+    }
+
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        self.inner.list_with_prefix_metadata(prefix).await
+    }
+}
+
+/// Real-Azure validation of the manifest-part disk cache.
+///
+/// 1. A producer commits a batch to Azure (creates ≥1 manifest part).
+/// 2. A cold consumer opens with a fresh [`ManifestDiskCache`] — the
+///    eager part load fetches the part from Azure (≥1 part GET) and
+///    populates the cache.
+/// 3. A warm consumer opens with a **new** `ManifestDiskCache` instance
+///    over the **same** cache directory (models a process restart): the
+///    index is rebuilt from disk, the eager load is served from local
+///    disk, and **zero** Azure part GETs occur.
+///
+/// Gated on `INFINO_TEST_REAL_AZURE=1` + `AZURE_STORAGE_CONTAINER_NAME`
+/// (with the standard `AZURE_STORAGE_*` credential env chain).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
+    if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "manifest_disk_cache_serves_parts_without_azure_refetch: skipped \
+             (set INFINO_TEST_REAL_AZURE=1 and AZURE_STORAGE_CONTAINER_NAME to enable)"
+        );
+        return;
+    }
+    let container = match std::env::var("AZURE_STORAGE_CONTAINER_NAME") {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!(
+                "manifest_disk_cache_serves_parts_without_azure_refetch: skipped \
+                 (missing AZURE_STORAGE_CONTAINER_NAME)"
+            );
+            return;
+        }
+    };
+    let prefix_root = std::env::var("INFINO_TEST_REAL_AZURE_PREFIX")
+        .unwrap_or_else(|_| "infino-real-azure-manifest-cache".to_string());
+    let prefix = format!("{}/{}", prefix_root.trim_matches('/'), uuid::Uuid::new_v4());
+    eprintln!("[real-azure mcache] container={container} prefix={prefix}");
+
+    let dim = EMB_DIM;
+    let cache_dir = TempDir::new().expect("manifest-cache tempdir");
+    // The manifest cache's own subdirectory; reused across both opens so
+    // the warm open's fresh instance scans the cold open's files.
+    let manifest_cache_root = cache_dir.path().join("manifest-parts");
+
+    let result = async {
+        let azure: Arc<dyn StorageProvider> = Arc::new(
+            AzureStorageProvider::new_with_prefix(&container, &prefix)
+                .map_err(|e| format!("azure provider: {e}"))?,
+        );
+        let counting = Arc::new(CountingStorage::new(Arc::clone(&azure)));
+        let counting_dyn: Arc<dyn StorageProvider> =
+            Arc::clone(&counting) as Arc<dyn StorageProvider>;
+
+        // 1. Producer commit → ≥1 manifest part on Azure.
+        {
+            let producer =
+                Supertable::create(real_azure_options(dim).with_storage(Arc::clone(&counting_dyn)))
+                    .map_err(|e| format!("create producer: {e}"))?;
+            let mut writer = producer
+                .writer()
+                .map_err(|e| format!("producer writer: {e}"))?;
+            writer
+                .append(&real_azure_batch(dim))
+                .map_err(|e| format!("append: {e}"))?;
+            writer.commit().map_err(|e| format!("commit: {e}"))?;
+            if producer.manifest_id() != 1 {
+                return Err(format!("producer manifest_id={}", producer.manifest_id()));
+            }
+            eprintln!("[real-azure mcache] producer commit OK; manifest_id=1");
+        }
+
+        // 2. Cold open: fresh manifest cache → part fetched from Azure.
+        let cold_cache_dir = cache_dir.path().join("cold-superfiles");
+        {
+            let manifest_cache = ManifestDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+                .map_err(|e| format!("cold manifest cache: {e}"))?;
+            let disk_cache = make_cache(Arc::clone(&counting_dyn), &cold_cache_dir);
+            counting.reset();
+            let consumer = Supertable::open(
+                real_azure_options(dim)
+                    .with_storage(Arc::clone(&counting_dyn))
+                    .with_disk_cache(disk_cache)
+                    .with_manifest_disk_cache(Arc::clone(&manifest_cache)),
+            )
+            .map_err(|e| format!("cold open: {e}"))?;
+
+            if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+                return Err(format!(
+                    "cold n_docs_total mismatch: {}",
+                    consumer.reader().n_docs_total()
+                ));
+            }
+            let cold_part_gets = counting.part_gets();
+            let stats = manifest_cache.stats();
+            if cold_part_gets < 1 {
+                return Err(format!(
+                    "cold open should fetch ≥1 part from Azure; part_gets={cold_part_gets}"
+                ));
+            }
+            if stats.n_entries < 1 {
+                return Err(format!(
+                    "cold open did not populate manifest cache; {stats:?}"
+                ));
+            }
+            eprintln!(
+                "[real-azure mcache] cold open OK; azure_part_gets={cold_part_gets} \
+                 cache_entries={} cache_misses={}",
+                stats.n_entries, stats.n_misses
+            );
+        }
+
+        // 3. Warm open: NEW cache instance over the same dir (restart).
+        let warm_cache_dir = cache_dir.path().join("warm-superfiles");
+        {
+            let manifest_cache = ManifestDiskCache::new(manifest_cache_root.clone(), 1 << 30)
+                .map_err(|e| format!("warm manifest cache: {e}"))?;
+            // Restart survival: the index is rebuilt from the cold open's
+            // files at construction, before any load.
+            let scanned = manifest_cache.stats();
+            if scanned.n_entries < 1 {
+                return Err(format!(
+                    "warm cache did not rebuild index from disk; {scanned:?}"
+                ));
+            }
+
+            let disk_cache = make_cache(Arc::clone(&counting_dyn), &warm_cache_dir);
+            counting.reset();
+            let consumer = Supertable::open(
+                real_azure_options(dim)
+                    .with_storage(Arc::clone(&counting_dyn))
+                    .with_disk_cache(disk_cache)
+                    .with_manifest_disk_cache(Arc::clone(&manifest_cache)),
+            )
+            .map_err(|e| format!("warm open: {e}"))?;
+
+            if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+                return Err(format!(
+                    "warm n_docs_total mismatch: {}",
+                    consumer.reader().n_docs_total()
+                ));
+            }
+            let warm_part_gets = counting.part_gets();
+            let stats = manifest_cache.stats();
+            if warm_part_gets != 0 {
+                return Err(format!(
+                    "warm open must serve parts from disk cache; \
+                     got {warm_part_gets} Azure part GETs (expected 0)"
+                ));
+            }
+            if stats.n_hits < 1 {
+                return Err(format!("warm open recorded no cache hit; {stats:?}"));
+            }
+            eprintln!(
+                "[real-azure mcache] warm open OK; azure_part_gets=0 \
+                 cache_hits={} (parts served from disk)",
+                stats.n_hits
+            );
+
+            // Collect cleanup keys from the warm consumer's manifest.
+            let reader = consumer.reader();
+            let manifest = reader.manifest();
+            let mut keys = vec![
+                "_supertable/current".to_string(),
+                infino::supertable::manifest::commit::manifest_uri(consumer.manifest_id()),
+            ];
+            keys.extend(
+                manifest
+                    .get_all_list_entries()
+                    .iter()
+                    .map(|p| p.uri.clone()),
+            );
+            keys.extend(manifest.superfiles.iter().map(|e| e.uri.storage_path()));
+            Ok::<Vec<String>, String>(keys)
+        }
+    }
+    .await;
+
+    let cleanup = AzureStorageProvider::new_with_prefix(&container, &prefix)
+        .expect("real Azure cleanup provider");
+    match &result {
+        Ok(keys) => {
+            for key in keys {
+                let _ = cleanup.delete(key).await;
+            }
+        }
+        Err(_) => {
+            let _ = cleanup.delete("_supertable/current").await;
+        }
+    }
+    eprintln!("[real-azure mcache] cleanup done under prefix={prefix}");
+    result.expect("real Azure manifest-cache test failed");
 }

@@ -58,7 +58,7 @@ use crate::{
         builder::{BuilderOptions, FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
     },
-    supertable::manifest::list::PartitionStrategy,
+    supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -122,6 +122,11 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// Default: eager-load manifest parts at open when there are at most
 /// this many (open latency vs memory trade-off).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Subdirectory under the disk-cache root that holds the
+/// content-addressed manifest-part byte cache. Kept separate from the
+/// superfile cache files so the two budgets and eviction sets don't
+/// interfere.
+const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
@@ -242,6 +247,14 @@ pub struct SupertableOptions {
     /// storage is a configuration error caught at
     /// [`Supertable::create`] / [`Supertable::open`] time.
     pub disk_cache: Option<Arc<DiskCacheStore>>,
+    /// On-disk cache for compressed manifest-part bytes. When set,
+    /// [`ManifestPartLoader`](crate::supertable::manifest::ManifestPartLoader)
+    /// reads a part's bytes from local disk on a hit instead of
+    /// round-tripping to object storage. Parts are content-addressed,
+    /// so cached files are never stale and the cache survives process
+    /// restarts. Independent of `disk_cache` (which caches superfile
+    /// content) and uses its own byte budget. `None` disables it.
+    pub manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -512,6 +525,7 @@ impl SupertableOptions {
             store,
             storage: None,
             disk_cache: None,
+            manifest_disk_cache: None,
             memory_budget_bytes: None,
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
@@ -651,6 +665,17 @@ impl SupertableOptions {
     /// resulting `Arc<DiskCacheStore>` here.
     pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
         self.disk_cache = Some(cache);
+        self
+    }
+
+    /// Attach an on-disk cache for compressed manifest-part bytes.
+    /// On a cache hit the part loader reads bytes from local disk
+    /// instead of round-tripping to object storage. Construction stays
+    /// user-managed — build the [`ManifestDiskCache`] with the cache
+    /// root and byte budget that fit the deployment and pass the
+    /// resulting `Arc` here.
+    pub fn with_manifest_disk_cache(mut self, cache: Arc<ManifestDiskCache>) -> Self {
+        self.manifest_disk_cache = Some(cache);
         self
     }
 
@@ -868,6 +893,16 @@ impl SupertableOptions {
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
             self.disk_cache = Some(cache);
+
+            // Manifest-part bytes get their own content-addressed cache
+            // under a sibling subdirectory, with an independent budget.
+            let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
+            let manifest_cache =
+                ManifestDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
+                    .map_err(|e| {
+                        BuildError::Store(format!("manifest disk cache construction: {e}"))
+                    })?;
+            self.manifest_disk_cache = Some(manifest_cache);
         }
 
         self.storage = Some(storage);

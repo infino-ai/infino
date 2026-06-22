@@ -112,6 +112,22 @@ impl ContentHash {
         }
         out
     }
+
+    /// Parse a lower/upper-case hex string back into a `ContentHash`.
+    /// Returns `None` unless `hex` is exactly [`BLAKE3_HEX_LEN`]
+    /// hex characters. Inverse of [`Self::to_hex`]; used to recover a
+    /// hash from a content-addressed cache file name.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != BLAKE3_HEX_LEN {
+            return None;
+        }
+        let mut out = [0u8; BLAKE3_DIGEST_BYTES];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let byte = hex.get(i * 2..i * 2 + 2)?;
+            *slot = u8::from_str_radix(byte, 16).ok()?;
+        }
+        Some(Self(out))
+    }
 }
 
 impl fmt::Debug for ContentHash {

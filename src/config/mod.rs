@@ -247,6 +247,12 @@ pub struct StorageSettings {
     /// through the object-store lazy/cached path.
     pub disk_cache_root: Option<PathBuf>,
     pub disk_budget_bytes: u64,
+    /// Byte budget for the content-addressed manifest-part cache, kept
+    /// in a `manifest-parts/` subdirectory of `disk_cache_root`. The
+    /// loader reads part bytes from local disk on a hit instead of
+    /// fetching from object storage. Independent of `disk_budget_bytes`
+    /// (which sizes the superfile-content cache). Default 2 GiB.
+    pub manifest_disk_budget_bytes: u64,
     pub cold_fetch_mode: StorageColdFetchMode,
     pub cold_fetch_streams: usize,
     pub cold_fetch_chunk_bytes: u64,
@@ -274,6 +280,7 @@ impl Default for StorageSettings {
             prefix: String::new(),
             disk_cache_root: None,
             disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
+            manifest_disk_budget_bytes: DEFAULT_MANIFEST_DISK_BUDGET_BYTES,
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
             cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,
             cold_fetch_chunk_bytes: DEFAULT_COLD_FETCH_CHUNK_BYTES,
@@ -286,6 +293,9 @@ impl Default for StorageSettings {
 
 /// Default disk-cache byte budget exposed in the shipped config (10 GiB).
 const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
+/// Default manifest-part cache byte budget (2 GiB). Parts are small
+/// (KB–few MB each), so this holds a large working set of parts.
+const DEFAULT_MANIFEST_DISK_BUDGET_BYTES: u64 = 2 * (1 << 30);
 /// Default parallel cold-fetch streams at the config layer.
 const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default cold-fetch range chunk size (4 MiB).

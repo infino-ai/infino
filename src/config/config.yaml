@@ -87,6 +87,12 @@ storage:
   # while background fill promotes the full superfile to mmap.
   disk_cache_root:
   disk_budget_bytes: 10737418240
+  # Byte budget for the content-addressed manifest-part cache, held in a
+  # manifest-parts/ subdirectory of disk_cache_root. On a hit the part
+  # loader reads bytes from local disk instead of object storage; parts
+  # are content-addressed, so cached files are never stale and survive
+  # restarts. Independent of disk_budget_bytes. Default 2 GiB.
+  manifest_disk_budget_bytes: 2147483648
   cold_fetch_mode: lazy_foreground_with_background_fill
   cold_fetch_streams: 8
   cold_fetch_chunk_bytes: 4194304

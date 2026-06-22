@@ -25,6 +25,7 @@
 pub mod aggregates;
 pub mod bloom;
 pub mod commit;
+pub mod disk_cache;
 pub mod encoding;
 pub mod hll;
 pub mod list;
@@ -68,6 +69,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_part_bytes, write_pointer,
             },
+            disk_cache::ManifestDiskCache,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
@@ -219,7 +221,12 @@ impl ManifestSnapshot {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
+            let loader = Arc::new(ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &list,
+                manifest_cache,
+            ));
             Self {
                 superfile_list,
                 list: Some(list),
@@ -352,7 +359,11 @@ impl ManifestSnapshot {
         }
 
         // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let loader = Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::clone(&storage),
+            &list,
+            options.manifest_disk_cache.clone(),
+        ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
         if let Some(current_manifest) = &current_manifest {
@@ -865,10 +876,13 @@ impl ManifestSnapshot {
             options: self.get_opts(),
             superfiles: new_superfile_list,
         };
-        let loader = opts
-            .storage
-            .as_ref()
-            .map(|storage| Arc::new(ManifestPartLoader::new(storage.clone(), &new_list)));
+        let loader = opts.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &new_list,
+                opts.manifest_disk_cache.clone(),
+            ))
+        });
         // Inherit only the cached parts the new list still
         // references — entries for rewritten/removed parts are
         // dropped rather than carried forward, so the in-memory
@@ -955,15 +969,32 @@ fn rebuild_part_and_entry(
 /// One `ManifestPartLoader` per `Manifest`. The same `Arc<dyn
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
+///
+/// An optional [`ManifestDiskCache`] short-circuits the storage GET
+/// when the part's compressed bytes are already on local disk. Because
+/// parts are content-addressed, a cache hit can never be stale.
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`Manifest`.
     parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// On-disk cache for compressed part bytes. `None` disables the
+    /// cache (in-process-only supertables, tests, or storage attached
+    /// without a `disk_cache_root` configured).
+    manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
 }
 
 impl ManifestPartLoader {
     pub fn new(storage: Arc<dyn StorageProvider>, list: &Manifest) -> Self {
+        Self::new_with_cache(storage, list, None)
+    }
+
+    /// Like [`Self::new`] but attaches an on-disk part-bytes cache.
+    pub fn new_with_cache(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
@@ -971,16 +1002,31 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
+            manifest_disk_cache,
         }
     }
 
     /// Fetch + verify + decode one part. Returns the parsed
     /// `Arc<ManifestPart>`.
+    ///
+    /// Consults the on-disk cache first (a hit skips the storage GET);
+    /// on a miss the freshly-fetched bytes are written back to the
+    /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let (expected_hash, uri) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+
+        // Disk-cache hit: bytes are verified against `expected_hash`
+        // inside `get`, so they're known-good here.
+        if let Some(cache) = &self.manifest_disk_cache
+            && let Some(bytes) = cache.get(expected_hash).await
+        {
+            let parsed = part::decode(&bytes)?;
+            return Ok(Arc::new(parsed));
+        }
+
         let (bytes, _) = self
             .storage
             .get(uri)
@@ -992,6 +1038,11 @@ impl ManifestPartLoader {
                 expected: expected_hash.to_hex(),
                 actual: actual_hash.to_hex(),
             });
+        }
+        // Populate the cache for next time (best-effort; the hash is
+        // already verified, satisfying `put`'s contract).
+        if let Some(cache) = &self.manifest_disk_cache {
+            cache.put(actual_hash, &bytes).await;
         }
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
@@ -2358,6 +2409,72 @@ mod tests {
                 storage.get_call_count(),
                 0,
                 "missing-id check happens before any storage.get"
+            );
+        }
+
+        #[tokio::test]
+        async fn disk_cache_hit_serves_second_loader_without_storage_get() {
+            // Two independent loaders sharing one on-disk manifest cache
+            // (models a fresh manifest snapshot, or a process restart):
+            // the first populates the cache from storage, the second
+            // reads the part bytes off local disk with zero storage GETs.
+            let part = make_test_part(23);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let cache_root = std::env::temp_dir()
+                .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = ManifestDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+
+            // Loader A: cold — one storage GET, cache populated.
+            let loader_a = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let a = loader_a.load(part.part_id).await.expect("first load");
+            assert_eq!(a.part_id, part.part_id);
+            assert_eq!(storage.get_call_count(), 1, "first loader fetches once");
+            assert_eq!(cache.stats().n_entries, 1, "part bytes cached on disk");
+
+            // Loader B: fresh loader, same cache — disk hit, no new GET.
+            let loader_b = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let b = loader_b.load(part.part_id).await.expect("second load");
+            assert_eq!(b.part_id, part.part_id);
+            assert_eq!(
+                storage.get_call_count(),
+                1,
+                "disk-cache hit ⇒ no additional storage.get"
+            );
+            assert!(cache.stats().n_hits >= 1, "recorded a cache hit");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn loader_without_cache_always_hits_storage() {
+            // Sanity: with no cache attached, each loader load is a
+            // storage GET — confirms the cache is what removes them.
+            let part = make_test_part(29);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let loader = ManifestPartLoader::new(Arc::clone(&storage_dyn), &list);
+            loader.load(part.part_id).await.expect("load 1");
+            loader.load(part.part_id).await.expect("load 2");
+            assert_eq!(
+                storage.get_call_count(),
+                2,
+                "no cache ⇒ every load round-trips to storage"
             );
         }
 
