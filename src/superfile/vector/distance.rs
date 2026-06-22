@@ -911,6 +911,32 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
+/// Decode `Sq8ResidualEpsilon` per-vector bytes back to fp32.
+///
+/// `codes` — `dim` u8 quantization codes; `residuals` — `dim` i8 residuals
+/// stored as raw bytes (each byte reinterpreted as `i8`).
+/// `scale`/`offset` are the per-cluster quantizer arrays (length `dim`).
+pub(crate) fn decode_sq8_residual(
+    codes: &[u8],
+    residuals: &[u8],
+    dim: usize,
+    scale: &[f32],
+    offset: &[f32],
+    residual_divisor: f32,
+) -> Vec<f32> {
+    codes
+        .iter()
+        .zip(residuals.iter())
+        .enumerate()
+        .map(|(i, (&c, &r))| {
+            let d = i % dim;
+            (c as f32) * scale[d]
+                + offset[d]
+                + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,30 +1109,6 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &c)| (c as f32) * scale[i % dim] + offset[i % dim])
-            .collect()
-    }
-
-    /// Decode `Sq8ResidualEpsilon` codes (`code * scale + offset + residual
-    /// * scale / divisor`) — the reference the residual kernel must
-    /// agree with.
-    fn decode_sq8_residual(
-        codes: &[u8],
-        residuals: &[u8],
-        dim: usize,
-        scale: &[f32],
-        offset: &[f32],
-        residual_divisor: f32,
-    ) -> Vec<f32> {
-        codes
-            .iter()
-            .zip(residuals.iter())
-            .enumerate()
-            .map(|(i, (&c, &r))| {
-                let d = i % dim;
-                (c as f32) * scale[d]
-                    + offset[d]
-                    + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
-            })
             .collect()
     }
 

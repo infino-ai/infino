@@ -40,8 +40,8 @@ use crate::superfile::{
     lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
     vector::{
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
-            distance_bytes_codec,
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, decode_sq8_residual,
+            distance_bytes, distance_bytes_codec,
         },
         quant::BitQuantizer,
         rerank_codec::RerankCodec,
@@ -1752,6 +1752,150 @@ impl VectorReader {
         }
 
         // Convert to final result, checking all vectors were found
+        result
+            .into_iter()
+            .enumerate()
+            .map(|(idx, vec_opt)| {
+                vec_opt.ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "missing vector for doc_id {}",
+                        idx
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    /// Retrieve vectors in insertion order, decoding from the on-disk codec.
+    ///
+    /// - `Fp32`: returns exact values via [`Self::get_vectors_fp32`].
+    /// - `Sq8ResidualEpsilon`: decodes each vector from its u8 codes +
+    ///   i8 residuals using the per-cluster scale/offset quantizer.
+    /// - `RabitqOnly`: returns an error (no rerank bytes on disk).
+    pub(crate) fn get_vectors_decoded(&self, column: &str) -> Result<Vec<Vec<f32>>, VectorError> {
+        let cid = *self
+            .column_id_by_name
+            .get(column)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let col = &self.columns[cid as usize];
+
+        match col.rerank_codec {
+            RerankCodec::Fp32 => return self.get_vectors_fp32(column),
+            RerankCodec::RabitqOnly => {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' uses RabitqOnly codec which has no rerank vectors to decode",
+                    col.name,
+                ))));
+            }
+            RerankCodec::Sq8ResidualEpsilon => {}
+        }
+
+        if col.n_docs == 0 {
+            return Ok(Vec::new());
+        }
+
+        let dim = col.dim;
+        let n_cent = col.n_cent as usize;
+        let meta = col
+            .sq8_meta
+            .as_ref()
+            .expect("Sq8ResidualEpsilon column must carry sq8_meta");
+
+        let (scale, offset): (Vec<f32>, Vec<f32>) = match meta {
+            Sq8ColumnMeta::Eager { scale, offset, .. } => (scale.clone(), offset.clone()),
+            Sq8ColumnMeta::Lazy { .. } => {
+                let range = lazy_sq8_meta_range(col).expect(
+                    "Sq8ResidualEpsilon with Lazy sq8_meta must have a valid codec_meta range",
+                );
+                let bytes = self
+                    .source
+                    .get_range(range)
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let parsed = parse_sq8_meta_bytes(
+                    &bytes,
+                    n_cent,
+                    dim,
+                    col.n_docs as usize,
+                    matches!(col.metric, Metric::L2Sq | Metric::Cosine),
+                );
+                (parsed.scale, parsed.offset)
+            }
+        };
+
+        let sub_start = col.subsection_range.start;
+        let idx_start = sub_start + col.cluster_idx_off;
+        let idx_end = idx_start + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+        let cluster_idx = self
+            .source
+            .get_range(idx_start..idx_end)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        let cb = col.quant.code_bytes();
+        let per_vec_bytes = col.rerank_codec.per_vector_bytes(dim);
+
+        let mut cluster_ranges: Vec<Range<usize>> = Vec::new();
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::new();
+
+        for c in 0..n_cent {
+            let (off, cnt) = read_cluster_entry(&cluster_idx, c);
+            if cnt == 0 {
+                continue;
+            }
+            cluster_ranges.push(col.cluster_block_range(off, cnt));
+            cluster_meta.push((c, off, cnt));
+        }
+
+        if cluster_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cluster_blocks = self
+            .source
+            .get_ranges_parallel(&cluster_ranges)
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+
+        let mut result: Vec<Option<Vec<f32>>> = vec![None; col.n_docs as usize];
+
+        for (bi, block) in cluster_blocks.iter().enumerate() {
+            let (c, _off, cnt) = cluster_meta[bi];
+            let cnt_usize = cnt as usize;
+            let codes_len = cnt_usize * cb;
+            let doc_ids_len = cnt_usize * 4;
+            let full_start = codes_len + doc_ids_len;
+
+            let scale_c = &scale[c * dim..(c + 1) * dim];
+            let offset_c = &offset[c * dim..(c + 1) * dim];
+
+            let doc_ids_slice = block.slice(codes_len..codes_len + doc_ids_len);
+
+            for i in 0..cnt_usize {
+                let doc_id = u32::from_le_bytes([
+                    doc_ids_slice[i * 4],
+                    doc_ids_slice[i * 4 + 1],
+                    doc_ids_slice[i * 4 + 2],
+                    doc_ids_slice[i * 4 + 3],
+                ]) as usize;
+
+                // Sq8ResidualEpsilon full[] layout per row: [dim u8 codes][dim i8 residuals]
+                let row_start = full_start + i * per_vec_bytes;
+                let codes = block.slice(row_start..row_start + dim);
+                let residuals = block.slice(row_start + dim..row_start + per_vec_bytes);
+
+                let vec_f32 = decode_sq8_residual(
+                    codes.as_ref(),
+                    residuals.as_ref(),
+                    dim,
+                    scale_c,
+                    offset_c,
+                    SQ8_RESIDUAL_DIVISOR,
+                );
+
+                if doc_id < col.n_docs as usize {
+                    result[doc_id] = Some(vec_f32);
+                }
+            }
+        }
+
         result
             .into_iter()
             .enumerate()
