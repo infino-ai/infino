@@ -31,6 +31,9 @@ as Python and Node.js bindings.
 
 ## Reference
 
+- [FAQ](docs/faq.md): operational and architecture answers for evaluating
+  Infino — whether it needs a server, durability and crash-safety, concurrency,
+  Parquet compatibility, and how SQL runs in-process.
 - [Tradeoffs and limits](docs/tradeoffs.md): the honest envelope — what Infino
   is good at (warm-query speed, multi-modal retrieval, flat storage cost) and
   what it is not built for (cold first-touch latency, write-dominated and

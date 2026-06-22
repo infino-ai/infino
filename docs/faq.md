@@ -90,18 +90,12 @@ table-valued functions (`bm25_search`, `vector_search`, `token_match`,
 `exact_match`, `hybrid_search`), so search composes into a SQL plan as a
 relation.
 
-```python
-import infino
-
-db = infino.connect("memory://")          # in-process; no server, no daemon
-
-# Search is a table function, so it composes into the SQL plan as a relation:
-# rank `docs` by BM25, then group and count — one query, no separate service.
-rows = db.query_sql("""
-    SELECT source, COUNT(*) AS hits
-    FROM bm25_search('docs', 'body', 'cancel subscription', 50)
-    GROUP BY source
-""")
+```sql
+-- Search is a table function, so it composes into a SQL plan as a relation:
+-- rank `docs` by BM25, then group and count — one query, no separate service.
+SELECT source, COUNT(*) AS hits
+FROM bm25_search('docs', 'body', 'cancel subscription', 50)
+GROUP BY source
 ```
 
 See [Queries](architecture/supertable.md#queries).
