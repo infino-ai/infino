@@ -258,21 +258,50 @@ pub fn scalar_skip(
         .collect()
 }
 
+/// Keep each superfile whose `column` min/max could hold *any* of
+/// `values` (an `IN` list is a disjunction). Empty `values` keeps all.
+/// The SQL-side sibling of [`scalar_skip`] for the `IN` shape.
+pub fn scalar_in_list_skip(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    values: &[ScalarValue],
+) -> Vec<bool> {
+    if values.is_empty() {
+        return vec![true; superfiles.len()];
+    }
+
+    superfiles
+        .iter()
+        .map(|entry| match superfile_minmax(entry, column) {
+            None => true,
+            Some((min, max)) => values
+                .iter()
+                .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
+        })
+        .collect()
+}
+
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
 /// only from the superfile's persisted min/max. Conservative: any
 /// uncertainty returns `true` (keep).
 fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
-    let Some(agg) = entry.scalar_stats.get(&pred.column) else {
-        // No stats for this column — can't prove irrelevance.
-        return true;
-    };
-    let (Ok(min), Ok(max)) = (
+    match superfile_minmax(entry, &pred.column) {
+        None => true,
+        Some((min, max)) => scalar_value_may_match(&min, &max, pred.op, &pred.value),
+    }
+}
+
+/// The superfile's persisted min/max for `column`, or `None` when the
+/// column has no stats or the bounds don't decode (caller keeps).
+fn superfile_minmax(entry: &SuperfileEntry, column: &str) -> Option<(ScalarValue, ScalarValue)> {
+    let agg = entry.scalar_stats.get(column)?;
+    match (
         ScalarValue::try_from_array(agg.min.as_ref(), 0),
         ScalarValue::try_from_array(agg.max.as_ref(), 0),
-    ) else {
-        return true;
-    };
-    scalar_value_may_match(&min, &max, pred.op, &pred.value)
+    ) {
+        (Ok(min), Ok(max)) => Some((min, max)),
+        _ => None,
+    }
 }
 
 /// Conservative `min`/`max`-vs-`value` comparison core, shared by the
@@ -639,6 +668,32 @@ mod tests {
             seg_with_int_stats("x", 100, 110),
         ];
         assert_eq!(scalar_skip(&segs, &[]), vec![true, true]);
+    }
+
+    #[test]
+    fn scalar_in_list_skip_keeps_superfiles_holding_any_listed_value() {
+        let segs = vec![
+            seg_with_int_stats("x", 0, 10),
+            seg_with_int_stats("x", 100, 110),
+            seg_with_int_stats("x", 200, 210),
+        ];
+        let i = |n| ScalarValue::Int64(Some(n));
+        // IN (5, 205) → A's [0,10] and C's [200,210], not B.
+        assert_eq!(
+            scalar_in_list_skip(&segs, "x", &[i(5), i(205)]),
+            vec![true, false, true]
+        );
+        // IN (50) → matches no range.
+        assert_eq!(
+            scalar_in_list_skip(&segs, "x", &[i(50)]),
+            vec![false, false, false]
+        );
+        // Empty list and unknown column both keep all (conservative).
+        assert_eq!(scalar_in_list_skip(&segs, "x", &[]), vec![true, true, true]);
+        assert_eq!(
+            scalar_in_list_skip(&segs, "missing", &[i(5)]),
+            vec![true, true, true]
+        );
     }
 
     #[test]

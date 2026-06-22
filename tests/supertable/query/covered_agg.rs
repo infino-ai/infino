@@ -266,3 +266,145 @@ fn tombstoned_covered_segment_demotes_to_residual() {
     assert_eq!(scalar_i64(&st, &count_sql), commit_range_count(1, 2) - 1);
     assert_eq!(scalar_i64(&st, &sum_sql), commit_range_sum(1, 2) - 1005);
 }
+
+/// `IN`-list scalar pruning must keep every superfile holding a listed
+/// value (the disjoint rating blocks put each value in its own superfile):
+///  - a wrong prune would drop a superfile and undercount.
+///  - `FilterExec` verifies rows, so the count is the exact oracle.
+#[test]
+fn in_list_filter_returns_every_matching_row_across_superfiles() {
+    let st = build_table();
+
+    // 5 → commit 0, 1005 → commit 1, 3005 → commit 3: three superfiles.
+    let spanning = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (5, 1005, 3005)",
+    );
+    assert_eq!(spanning, 3, "one row per value, across three superfiles");
+
+    // A value outside every superfile's range matches nothing.
+    let absent = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (99999)",
+    );
+    assert_eq!(absent, 0);
+
+    // Mixed present/absent → only the present values contribute.
+    let mixed = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (5, 99999, 2005)",
+    );
+    assert_eq!(mixed, 2);
+}
+
+// ---- How DataFusion reshapes a numeric IN before the provider ----
+//
+// Verified against DataFusion 53.1.0 source (`datafusion-optimizer`):
+// `ShortenInListSimplifier` in `simplify_expressions/inlist_simplifier.rs`
+// rewrites `expr IN (list)` when:
+//   * `list.len() == 1`            → `expr = A` (any expr), OR
+//   * `list.len() <= THRESHOLD_INLINE_INLIST` (=3) AND `expr` is a bare
+//     column → `expr = A OR expr = B OR …` (negated → AND of `!=`).
+// Otherwise the node is kept as `Expr::InList` (len ≥ 4, or a 2–3 list
+// over a non-column expression).
+//
+// So, for a plain `col IN (...)` the scan sees:
+//   IN (x)         → `col = x`               (BinaryExpr Eq)
+//   IN (a,b,c) ≤3  → OR-of-equalities        (top-level Operator::Or)
+//   IN (a,b,c,d)≥4 → `Expr::InList`          (kept)
+//   IN (SELECT …)  → `Expr::InSubquery`, decorrelated to a LeftSemi join
+//                    by `DecorrelatePredicateSubquery` → the OUTER scan
+//                    gets ZERO pushed filters.
+//
+// Correctness pins — the count is identical regardless of shape, since
+// `FilterExec` verifies above the scan.
+
+#[test]
+fn numeric_in_single_value_rewrites_to_equality() {
+    let st = build_table();
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (5)",
+    );
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn numeric_in_small_list_lowers_to_or() {
+    // 2 elements → `rating=5 OR rating=1005`.
+    let st = build_table();
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (5, 1005)",
+    );
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn numeric_in_large_list_stays_inlist() {
+    // 6 elements → kept as `Expr::InList` (≥ 4). 1,2,3 in commit 0;
+    // 1001,1002 in commit 1; 2001 in commit 2.
+    let st = build_table();
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating IN (1, 2, 3, 1001, 1002, 2001)",
+    );
+    assert_eq!(n, 6);
+}
+
+#[test]
+fn subquery_in_becomes_a_semi_join_not_a_pushed_filter() {
+    // `rating IN (SELECT rating FROM supertable WHERE rating < 10)` →
+    // a semi-join: the inner scan filters `rating < 10` (commit 0's
+    // ratings 0..9 = 10 rows), the outer scan gets no pushed filter, and
+    // they join. The IN never reaches the provider as a prunable filter.
+    let st = build_table();
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable \
+         WHERE rating IN (SELECT rating FROM supertable WHERE rating < 10)",
+    );
+    assert_eq!(n, 10);
+}
+
+#[test]
+fn function_wrapped_small_in_stays_inlist_not_or() {
+    // A 2-value IN over a *function* expression stays `Expr::InList`:
+    //  - the 2-3 element OR rewrite requires a bare column
+    //    (`expr.try_as_col()` in ShortenInListSimplifier).
+    //  - `lower(category)` fails that, so no OR rewrite.
+    // category = 'cat{idx}_{r:03}'; 'cat0_005' + 'cat1_005' → 2 rows.
+    let st = build_table();
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable \
+         WHERE lower(category) IN ('cat0_005', 'cat1_005')",
+    );
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn not_in_returns_the_complement() {
+    // NOT IN never prunes here:
+    //  - small (≤3) → AND of `!=`; ≥4 → a negated InList.
+    //  - `collect_in_list_leaves` bails on `negated`, and `!=` doesn't
+    //    prune meaningfully → full scan + FilterExec.
+    // So just assert the exact complement (no rows wrongly dropped).
+    // 4 commits × 50 = 200 rows; ratings are unique.
+    let st = build_table();
+    let total = (COMMITS * ROWS_PER_COMMIT) as i64;
+
+    // Small NOT IN (2 values) → `rating != 5 AND rating != 1005`.
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating NOT IN (5, 1005)",
+    );
+    assert_eq!(n, total - 2);
+
+    // Large NOT IN (≥4) → negated InList (kept as-is, no leaf emitted).
+    let n = scalar_i64(
+        &st,
+        "SELECT COUNT(*) AS n FROM supertable WHERE rating NOT IN (1, 2, 3, 1001)",
+    );
+    assert_eq!(n, total - 4);
+}
