@@ -29,9 +29,12 @@ on:
         type: choice
         options: [pypi, testpypi]
 
-# One release per index at a time; never cancel a publish in flight.
+# One release per index at a time; never cancel a publish in flight. A tag push
+# always targets PyPI (see the validate step), so derive the index from the
+# event — `inputs.target` is empty on a push and would otherwise split tag
+# releases into a separate group from manual PyPI runs.
 concurrency:
-  group: publish-python-${{ inputs.target }}
+  group: publish-python-${{ github.event_name == 'push' && 'pypi' || inputs.target }}
   cancel-in-progress: false
 
 # Least privilege by default; the publish job widens to `id-token: write`
