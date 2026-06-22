@@ -33,7 +33,7 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, cluster_quant_from_medoid, encoded_component_at,
+            MaterializedIvfRow, encoded_component_at,
             materialize_sq8_residual_row_into_cluster_quant,
         },
         distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
@@ -893,14 +893,27 @@ fn build_subsection_from_materialized(
         }
     }
 
+    // Per-cluster Sq8 quantizer: calibrate from the cluster's per-dim min/max,
+    // exactly as the user/streaming build does (`derive_sq8_quantizer_from_min_max`
+    // over `update_min_max`). This is O(rows · dim); the previous medoid-based
+    // derivation was O(rows² · dim) (summed pairwise distances per cluster) and
+    // single-threaded — it spun for minutes on a large post-routing cluster.
     let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = buckets
         .iter()
         .map(|bucket| {
             if bucket.is_empty() {
-                (vec![1.0f32; dim], vec![0.0f32; dim])
-            } else {
-                cluster_quant_from_medoid(cfg.metric, dim, bucket)
+                return (vec![1.0f32; dim], vec![0.0f32; dim]);
             }
+            let mut min = vec![f32::INFINITY; dim];
+            let mut max = vec![f32::NEG_INFINITY; dim];
+            let mut row_fp = vec![0.0f32; dim];
+            for row in bucket.iter() {
+                for (d, slot) in row_fp.iter_mut().enumerate() {
+                    *slot = encoded_component_at(&row.encoded, d);
+                }
+                update_min_max(&row_fp, &mut min, &mut max);
+            }
+            derive_sq8_quantizer_from_min_max(&min, &max)
         })
         .collect();
 
@@ -912,7 +925,18 @@ fn build_subsection_from_materialized(
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    // The materialized build is the hidden-cell path: inline the stable `_id`
+    // as a trailing i128-per-doc region so id+score queries and the drain read
+    // it straight from the blob (no scalar `_id` column resolution).
+    let stable_ids_region_bytes = n_docs * format::vec::STABLE_ID_BYTES;
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs,
+        cluster_stride,
+        codec_meta_size,
+        stable_ids_region_bytes,
+    );
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes = alloc_ivf_subsection_with_header(
@@ -974,6 +998,20 @@ fn build_subsection_from_materialized(
             Ok(())
         },
     )?;
+
+    // Inline stable-`_id` region: one i128 per doc, indexed by `local_doc_id`
+    // (the same index a hidden hit's positional doc-id resolves through), so an
+    // id+score query and the drain read the stable `_id` straight from the blob
+    // instead of resolving it through a scalar `_id` column. It sits between
+    // codec_meta and the per-cluster blocks (see `IvfSubsectionLayout`); the
+    // whole subsection is CRC'd below, so the region is covered.
+    if let Some(stable_ids_off) = layout.stable_ids_off {
+        for row in &rows {
+            let off = stable_ids_off + (row.local_doc_id as usize) * format::vec::STABLE_ID_BYTES;
+            bytes[off..off + format::vec::STABLE_ID_BYTES]
+                .copy_from_slice(&row.stable_id.to_le_bytes());
+        }
+    }
     debug_assert_eq!(bytes.len(), total_size_before_crc);
 
     let crc = crc32c(&bytes);
@@ -1236,7 +1274,9 @@ fn build_subsection_streaming(
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    // Streaming (user-superfile) build: no inline stable-`_id` region.
+    let layout =
+        IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size, 0);
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes = alloc_ivf_subsection_with_header(
@@ -1487,25 +1527,40 @@ pub(crate) struct IvfSubsectionLayout {
     /// per-cluster Sq8 `scale` block offset.
     pub codec_meta_off: usize,
     pub per_cluster_blocks_off: usize,
+    /// Offset of the inline stable-`_id` region (one i128 per doc, indexed by
+    /// `local_doc_id`), present only for the materialized (hidden-cell) build.
+    /// `None` when no region was requested. The region sits *between* the
+    /// codec-meta region and the per-cluster blocks, so the per-cluster blocks
+    /// stay the last data region before the CRC — the reader still derives
+    /// `n_docs` from that trailing region's length, and infers this region's
+    /// presence/size from the offset gap (no header flag).
+    pub stable_ids_off: Option<usize>,
     pub total_size_before_crc: usize,
 }
 
 impl IvfSubsectionLayout {
     /// Compute the region offsets. `per_cluster_stride` is
     /// `code_bytes + DOC_ID_BYTES + per_vec_bytes`; `codec_meta_size` is the
-    /// codec's metadata region size (0 when it has none).
+    /// codec's metadata region size (0 when it has none). `stable_ids_region_bytes`
+    /// is `n_docs * STABLE_ID_BYTES` for the materialized (hidden-cell) build that
+    /// inlines the stable `_id`, and 0 for the streaming/merge builds.
     pub(crate) fn compute(
         dim: usize,
         n_cent: usize,
         n_docs: usize,
         per_cluster_stride: usize,
         codec_meta_size: usize,
+        stable_ids_region_bytes: usize,
     ) -> Self {
         let summary_off = SUB_HEADER_SIZE;
         let centroids_off = summary_off + dim * 4;
         let cluster_idx_off = centroids_off + n_cent * dim * 4;
         let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
-        let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
+        // The stable-`_id` region (if any) goes between codec_meta and the
+        // per-cluster blocks, so the blocks remain the trailing data region.
+        let codec_meta_end = codec_meta_off + codec_meta_size;
+        let stable_ids_off = (stable_ids_region_bytes > 0).then_some(codec_meta_end);
+        let per_cluster_blocks_off = codec_meta_end + stable_ids_region_bytes;
         let total_size_before_crc = per_cluster_blocks_off + n_docs * per_cluster_stride;
         Self {
             summary_off,
@@ -1513,6 +1568,7 @@ impl IvfSubsectionLayout {
             cluster_idx_off,
             codec_meta_off,
             per_cluster_blocks_off,
+            stable_ids_off,
             total_size_before_crc,
         }
     }
@@ -1740,6 +1796,17 @@ mod tests {
 
     use super::*;
 
+    /// Drive an async reader call to completion. The materialized read-back is
+    /// async (the drain fetches-on-miss); these tests use in-memory readers, so
+    /// every fetch resolves without yielding and a current-thread runtime is
+    /// enough.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(f)
+    }
+
     fn cfg(name: &str, dim: usize) -> VectorConfig {
         VectorConfig {
             column: name.to_string(),
@@ -1840,6 +1907,175 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&blob[16..24]);
         assert_eq!(u64::from_le_bytes(buf), 0);
+    }
+
+    /// The materialized (hidden-cell) build inlines the stable `_id` as a
+    /// trailing i128-per-doc region; a streaming build emits none. Round-trip
+    /// both through `materialized_index_rows`: the materialized rebuild must
+    /// carry each row's stable `_id` straight from the blob (no scalar column),
+    /// while the streaming blob reports `0` (region absent).
+    #[test]
+    fn materialized_build_round_trips_inline_stable_ids() {
+        use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
+
+        let dim = 16;
+        let n = 24usize;
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
+        );
+        let cfg = || VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+        };
+
+        // Streaming build: distinct vectors at local_doc_ids 0..n.
+        let mut b = VectorBuilder::new();
+        b.register_column(cfg()).expect("register");
+        for i in 0..n {
+            let mut v = vec![0.0f32; dim];
+            v[i % dim] = 1.0 + (i as f32);
+            v[(i * 7) % dim] += 0.5;
+            // arg 0 is the column id; local_doc_ids auto-assign as 0..n.
+            b.add(0, &v).expect("add");
+        }
+        let stream_blob = b.finish().expect("finish streaming");
+        let stream_reader =
+            VectorReader::open(Bytes::from(stream_blob), &json).expect("open streaming");
+        let mut stream_rows = block_on(stream_reader.materialized_index_rows_async("v"))
+            .expect("streaming rows");
+        // Streaming subsection has no inline region.
+        assert!(
+            stream_rows.iter().all(|r| r.stable_id == 0),
+            "streaming build must not carry inline stable_ids"
+        );
+
+        // Assign a distinct, nonzero stable `_id` per row (keyed by local id),
+        // then rebuild through the materialized path so the region is written.
+        let want = |local: u32| -> i128 { 1_700_000_000_000i128 + local as i128 };
+        for r in &mut stream_rows {
+            r.stable_id = want(r.local_doc_id);
+            r.encoded.stable_id = r.stable_id;
+        }
+
+        let mut mb = VectorBuilder::new();
+        mb.register_column(cfg()).expect("register mat");
+        mb.load_materialized_rows(0, stream_rows)
+            .expect("load materialized");
+        let mat_blob = mb.finish().expect("finish materialized");
+        let mat_reader =
+            VectorReader::open(Bytes::from(mat_blob), &json).expect("open materialized");
+        assert_eq!(mat_reader.n_docs(), n as u64);
+
+        let mat_rows = block_on(mat_reader.materialized_index_rows_async("v"))
+            .expect("materialized rows");
+        assert_eq!(mat_rows.len(), n);
+        for r in &mat_rows {
+            assert_eq!(
+                r.stable_id,
+                want(r.local_doc_id),
+                "inline stable_id must round-trip for local {}",
+                r.local_doc_id
+            );
+            assert_eq!(
+                r.encoded.stable_id, r.stable_id,
+                "EncodedCellRow.stable_id must match"
+            );
+        }
+    }
+
+    /// A byte-splice compaction merge of two materialized (hidden-cell)
+    /// subsections must carry the inline stable-`_id` region forward, rewritten
+    /// in merged local-id order (each input's ids shifted by its `doc_id_offset`).
+    /// Without carry-through a compacted cell would silently lose its inline ids.
+    #[test]
+    fn sq8_merge_carries_inline_stable_ids_through_compaction() {
+        use bytes::Bytes;
+
+        use crate::superfile::vector::{
+            ivf_merge::merge_sq8_ivf_subsections, reader::VectorReader,
+        };
+
+        let dim = 16;
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
+        );
+        let cfg = || VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+        };
+
+        // Build one materialized cell blob of `n` rows whose stable `_id`s are
+        // `id_base + local`, by streaming then rebuilding through the
+        // materialized path (which writes the inline region).
+        let build_cell = |n: usize, id_base: i128| -> Bytes {
+            let mut b = VectorBuilder::new();
+            b.register_column(cfg()).expect("register");
+            for i in 0..n {
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 1.0 + (i as f32);
+                v[(i * 5) % dim] += 0.25;
+                b.add(0, &v).expect("add");
+            }
+            let stream = b.finish().expect("finish streaming");
+            let r = VectorReader::open(Bytes::from(stream), &json).expect("open streaming");
+            let mut rows = block_on(r.materialized_index_rows_async("v")).expect("rows");
+            for row in &mut rows {
+                row.stable_id = id_base + row.local_doc_id as i128;
+                row.encoded.stable_id = row.stable_id;
+            }
+            let mut mb = VectorBuilder::new();
+            mb.register_column(cfg()).expect("register mat");
+            mb.load_materialized_rows(0, rows).expect("load materialized");
+            Bytes::from(mb.finish().expect("finish materialized"))
+        };
+
+        let (na, nb) = (10usize, 8usize);
+        let blob_a = build_cell(na, 5_000);
+        let blob_b = build_cell(nb, 9_000);
+        let reader_a = VectorReader::open(blob_a, &json).expect("open A");
+        let reader_b = VectorReader::open(blob_b, &json).expect("open B");
+
+        // Merge: B's local ids shift by `na` (its doc_id_offset).
+        let merged = merge_sq8_ivf_subsections(&[
+            (&reader_a, "v", 0),
+            (&reader_b, "v", na as u32),
+        ])
+        .expect("merge");
+        assert_eq!(merged.n_docs as usize, na + nb);
+
+        let mut wb = VectorBuilder::new();
+        wb.register_column(cfg()).expect("register merged");
+        wb.set_prebuilt_subsection(0, merged)
+            .expect("set prebuilt");
+        let merged_blob = wb.finish().expect("finish merged");
+        let reader_m = VectorReader::open(Bytes::from(merged_blob), &json).expect("open merged");
+
+        let rows = block_on(reader_m.materialized_index_rows_async("v")).expect("merged rows");
+        assert_eq!(rows.len(), na + nb);
+        for r in &rows {
+            // A occupies merged locals 0..na (id 5000+local); B occupies
+            // na..na+nb (id 9000+(local-na)).
+            let want = if (r.local_doc_id as usize) < na {
+                5_000 + r.local_doc_id as i128
+            } else {
+                9_000 + (r.local_doc_id as i128 - na as i128)
+            };
+            assert_eq!(
+                r.stable_id, want,
+                "merged inline stable_id wrong for local {}",
+                r.local_doc_id
+            );
+        }
     }
 
     #[test]

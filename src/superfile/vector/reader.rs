@@ -150,6 +150,16 @@ pub struct ColumnReader {
     /// region) so one range GET per probed cluster covers the
     /// estimate codes, doc-ids, and rerank vectors together.
     per_cluster_blocks_off: usize,
+    /// Relative offset of the inline stable-`_id` region — one i128 per doc,
+    /// indexed by `local_doc_id` — present only on materialized (hidden-cell)
+    /// subsections. `None` when the subsection carries no region (every
+    /// streaming/merge build). The region sits *between* the codec-meta region
+    /// and the per-cluster blocks; its presence/size are derived at parse time
+    /// from the offset gap `per_cluster_blocks_off − codec_meta_end` (no header
+    /// flag). Read via [`Self::stable_ids_region_range`] /
+    /// [`VectorReader::inline_stable_ids_for_locals`] so an id+score query (and
+    /// the drain) skips resolving the stable `_id` through a scalar `_id` column.
+    stable_ids_off: Option<usize>,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -238,6 +248,23 @@ impl ColumnReader {
         self.quant.code_bytes()
             + format::vec::DOC_ID_BYTES
             + self.rerank_codec.per_vector_bytes(self.dim)
+    }
+
+    /// `true` when this subsection carries an inline stable-`_id` region
+    /// (materialized/hidden-cell builds). When so, a hidden hit's positional
+    /// `local_doc_id` resolves straight to its stable `_id` via
+    /// [`Self::stable_id_at`] — no scalar `_id` column read.
+    pub(super) fn has_inline_stable_ids(&self) -> bool {
+        self.stable_ids_off.is_some()
+    }
+
+    /// Absolute byte range of the whole inline stable-`_id` region, for a
+    /// single batched fetch before resolving many locals. `None` when absent.
+    pub(super) fn stable_ids_region_range(&self) -> Option<Range<usize>> {
+        let off = self.stable_ids_off?;
+        let start = self.subsection_range.start + off;
+        let len = (self.n_docs as usize) * format::vec::STABLE_ID_BYTES;
+        Some(start..start + len)
     }
 }
 
@@ -529,10 +556,19 @@ impl VectorReader {
                 ) as usize;
                 let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
                 let codec_meta_abs_off = subsection_off + codec_meta_off;
-                if codec_meta_abs_off + codec_meta_size != open_time_abs_end {
+                // codec_meta ends at or before per_cluster_blocks_off; any gap
+                // is the inline stable-`_id` region (one i128 per doc). The full
+                // parse validates the exact size against n_docs — here we only
+                // require a well-formed (non-negative, 16-aligned) gap.
+                let codec_meta_abs_end = codec_meta_abs_off + codec_meta_size;
+                let stable_ids_gap = open_time_abs_end.checked_sub(codec_meta_abs_end);
+                if !stable_ids_gap
+                    .is_some_and(|gap| gap.is_multiple_of(format::vec::STABLE_ID_BYTES))
+                {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "subsection {i} codec_meta_size {codec_meta_size} does not end at \
-                         per_cluster_blocks_off {per_cluster_blocks_off}"
+                        "subsection {i} codec_meta_size {codec_meta_size} does not end at or a \
+                         whole number of stable-`_id`s before per_cluster_blocks_off \
+                         {per_cluster_blocks_off}"
                     ))));
                 }
                 if dir_codec_meta_off != codec_meta_off || dir_codec_meta_size != codec_meta_size {
@@ -954,29 +990,33 @@ impl VectorReader {
             // non-empty); 0 means "no codec_meta" and skips the
             // sq8_meta parse below.
             let cluster_idx_size = (n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-            let codec_meta_off = if codec_meta_size == 0 {
-                0
+            let codec_meta_off = if codec_meta_size == 0 { 0 } else { cluster_idx_off + cluster_idx_size };
+            // End of the last fixed region before the per-cluster blocks: the
+            // codec_meta region (Sq8), else the cluster index (Fp32/RabitqOnly).
+            let preceding_end = if codec_meta_size == 0 {
+                cluster_idx_off + cluster_idx_size
             } else {
-                let off = cluster_idx_off + cluster_idx_size;
-                // codec_meta must immediately precede the
-                // per-cluster blocks region by exactly its
-                // declared size. Any gap is a malformed superfile.
-                if off + codec_meta_size != per_cluster_blocks_off {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "column '{}' codec_meta region [{off}..{}) does not abut \
-                         per_cluster_blocks_off={per_cluster_blocks_off}",
-                        cfg.column,
-                        off + codec_meta_size
-                    ))));
-                }
-                off
+                codec_meta_off + codec_meta_size
             };
+            // Anything between `preceding_end` and `per_cluster_blocks_off` is
+            // the inline stable-`_id` region (materialized/hidden-cell builds);
+            // `0` means none. Validated against n_docs below. Self-describing
+            // from the offsets — no header flag.
+            let stable_ids_region_bytes =
+                per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "column '{}' regions before per_cluster_blocks_off={per_cluster_blocks_off} \
+                         overrun it (preceding_end={preceding_end})",
+                        cfg.column
+                    )))
+                })?;
 
-            // Per-cluster blocks fill [per_cluster_blocks_off..
-            // sub_crc_pos). Each doc contributes
-            // `code_bytes + 4 (doc_id) + per_vec_bytes (full)` —
-            // codes, doc-id, and rerank vector interleaved per
-            // cluster. Solve for n_docs from the region size.
+            // Per-cluster blocks fill [per_cluster_blocks_off..sub_crc_pos) —
+            // the trailing data region. Each doc contributes
+            // `code_bytes + 4 (doc_id) + per_vec_bytes (full)` — codes, doc-id,
+            // and rerank vector interleaved per cluster. Solve for n_docs from
+            // the region size (the stable-`_id` region, if any, is *before*
+            // per_cluster_blocks_off and so does not perturb this).
             let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
             let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
             if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
@@ -987,6 +1027,17 @@ impl VectorReader {
                 ))));
             }
             let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
+            // The stable-`_id` region, when present, is exactly one i128 per doc.
+            let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
+            if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
+                     bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
+                    cfg.column
+                ))));
+            }
+            // Relative offset of the stable-`_id` region (start of the i128s).
+            let stable_ids_off = (stable_ids_region_bytes != 0).then_some(preceding_end);
             let actual_codec_meta_size = codec_meta_size;
 
             // Sq8 + L2Sq adds the per-doc norms tail to codec_meta
@@ -1089,6 +1140,7 @@ impl VectorReader {
                 cluster_idx_off,
                 codec_meta_off,
                 per_cluster_blocks_off,
+                stable_ids_off,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -1186,6 +1238,31 @@ impl VectorReader {
         Some((col.n_cent, dim as u32, centroids, counts))
     }
 
+    /// Resolve the stable `_id` for each `local_doc_id` straight from the inline
+    /// stable-`_id` region of this blob's (single) materialized/hidden-cell
+    /// vector column — no scalar `_id` column read. `None` when no column
+    /// carries a region, or the region bytes are not resident (a lazy reader the
+    /// caller hasn't warmed); the caller then falls back to the scalar column.
+    /// The region is indexed by `local_doc_id`, matching the positional doc-id a
+    /// hidden hit carries.
+    pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
+        let col = self.columns.iter().find(|c| c.has_inline_stable_ids())?;
+        let region = self
+            .source
+            .try_get_range_sync(col.stable_ids_region_range()?)?;
+        let mut out = Vec::with_capacity(locals.len());
+        for &local in locals {
+            let p = (local as usize) * format::vec::STABLE_ID_BYTES;
+            let end = p + format::vec::STABLE_ID_BYTES;
+            if end > region.len() {
+                return None;
+            }
+            let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
+            out.push(i128::from_le_bytes(arr));
+        }
+        Some(out)
+    }
+
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
     pub(crate) fn sq8_ivf_merge_input(
         &self,
@@ -1237,6 +1314,21 @@ impl VectorReader {
             sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 2],
             sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 3],
         ]);
+        // Inline stable-`_id` region (materialized/hidden cells): parse it out of
+        // the already-materialized `sub` so a compaction merge can carry it
+        // forward. Indexed by local doc id; one i128 per doc.
+        let stable_ids = col.stable_ids_off.map(|so| {
+            (0..col.n_docs as usize)
+                .map(|local| {
+                    let p = so + local * format::vec::STABLE_ID_BYTES;
+                    i128::from_le_bytes(
+                        sub[p..p + format::vec::STABLE_ID_BYTES]
+                            .try_into()
+                            .expect("16-byte stable_id slice"),
+                    )
+                })
+                .collect()
+        });
         Ok(Sq8IvfMergeInput {
             sub: sub.as_ref().to_vec(),
             dim,
@@ -1253,12 +1345,23 @@ impl VectorReader {
             scale,
             offset,
             summary_radius_x100,
+            stable_ids,
         })
     }
 
     /// Read Sq8+ε rerank rows plus preserved 1-bit RaBitQ codes for maintenance
     /// rebuilds through the normal IVF writer (no fp32 reconstruction).
-    pub(crate) fn materialized_index_rows(
+    ///
+    /// Async because this is the SPFresh drain/maintenance read-back: the hidden
+    /// incoming superfile it reads is routinely evicted from the disk cache by
+    /// the pre-drain search, so it must fetch-on-miss — and the drain's source
+    /// (`StorageRangeSource`) has no sync-resident tier, so a resident-only read
+    /// would spuriously fail. It fetches the subsection (and any non-resident
+    /// Sq8 meta) via `range_async`, awaited directly on the caller's runtime,
+    /// then parses the rows from those bytes. It deliberately avoids the sync
+    /// `get_range` bridge, whose nested `block_in_place` + `block_on` deadlocks
+    /// when called inside the drain's async task.
+    pub(crate) async fn materialized_index_rows_async(
         &self,
         index_name: &str,
     ) -> Option<Vec<MaterializedIvfRow>> {
@@ -1268,7 +1371,6 @@ impl VectorReader {
             return None;
         }
         let dim = col.dim;
-        let metric = col.metric;
         let so_block_bytes = (col.n_cent as usize) * dim * 4;
         let (scale_buf, offset_buf) = match &col.sq8_meta {
             Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
@@ -1279,10 +1381,14 @@ impl VectorReader {
             }) => {
                 let scale_bytes = self
                     .source
-                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)?;
+                    .range_async(*scale_abs_off..*scale_abs_off + so_block_bytes)
+                    .await
+                    .ok()?;
                 let offset_bytes = self
                     .source
-                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)?;
+                    .range_async(*offset_abs_off..*offset_abs_off + so_block_bytes)
+                    .await
+                    .ok()?;
                 (
                     parse_f32_le_vec(scale_bytes.as_ref()),
                     parse_f32_le_vec(offset_bytes.as_ref()),
@@ -1290,17 +1396,42 @@ impl VectorReader {
             }
             _ => return None,
         };
-        let scale = scale_buf.as_slice();
-        let offset = offset_buf.as_slice();
         let sub = self
             .source
-            .try_get_range_sync(col.subsection_range.clone())?;
+            .range_async(col.subsection_range.clone())
+            .await
+            .ok()?;
+        Some(Self::parse_materialized_index_rows(
+            col,
+            sub.as_ref(),
+            &scale_buf,
+            &offset_buf,
+        ))
+    }
+
+    /// Decode every IVF row from `sub` (the full subsection bytes) using the
+    /// column's per-cluster Sq8 `scale`/`offset`, carrying the inline stable
+    /// `_id` when the subsection has the region. Pure/sync — fed pre-fetched
+    /// bytes by [`Self::materialized_index_rows_async`].
+    fn parse_materialized_index_rows(
+        col: &ColumnReader,
+        sub: &[u8],
+        scale: &[f32],
+        offset: &[f32],
+    ) -> Vec<MaterializedIvfRow> {
+        let dim = col.dim;
         let code_bytes = col.quant.code_bytes();
         let stride = col.per_cluster_doc_stride();
         let id_bytes = format::vec::DOC_ID_BYTES;
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
         let n_cent = col.n_cent as usize;
-        let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
+        let store_norm = matches!(col.metric, Metric::L2Sq | Metric::Cosine);
+
+        // Inline stable-`_id` region (relative offset into `sub`), when this is
+        // a materialized/hidden-cell subsection. Lets the read-back carry the
+        // stable `_id` straight from the blob instead of a `0` placeholder the
+        // caller later overlays from a scalar `_id` column.
+        let stable_ids_rel = col.stable_ids_off;
 
         let mut out = Vec::with_capacity(col.n_docs as usize);
         for c in 0..n_cent {
@@ -1329,12 +1460,22 @@ impl VectorReader {
                 let residuals = sub[rowb + dim..rowb + dim + dim].to_vec();
                 let norm_sq =
                     store_norm.then(|| sq8_residual_norm_sq(dim, &sc, &of, &codes, &residuals));
+                let stable_id = stable_ids_rel
+                    .map(|so| {
+                        let p = so + (local_id as usize) * format::vec::STABLE_ID_BYTES;
+                        i128::from_le_bytes(
+                            sub[p..p + format::vec::STABLE_ID_BYTES]
+                                .try_into()
+                                .expect("16-byte stable_id slice"),
+                        )
+                    })
+                    .unwrap_or(0);
                 out.push(MaterializedIvfRow {
                     local_doc_id: local_id,
-                    stable_id: 0,
+                    stable_id,
                     rabitq_code: rabitq,
                     encoded: EncodedCellRow {
-                        stable_id: 0,
+                        stable_id,
                         scale: sc.clone(),
                         offset: of.clone(),
                         codes,
@@ -1344,7 +1485,7 @@ impl VectorReader {
                 });
             }
         }
-        Some(out)
+        out
     }
 
     /// Single-column kNN search. Returns `(local_doc_id,

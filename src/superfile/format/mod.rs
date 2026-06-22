@@ -131,6 +131,18 @@ pub mod vec {
     /// of quantized code followed by [`DOC_ID_BYTES`] of doc-id, so the
     /// stride is `code_bytes + DOC_ID_BYTES`.
     pub const DOC_ID_BYTES: usize = 4;
+    /// Width in bytes of an inline stable `_id` (an `i128` Snowflake value,
+    /// little-endian). The materialized (hidden-cell) build inserts an
+    /// `n_docs`-long region of these *between* the codec-meta region and the
+    /// per-cluster blocks, indexed by `local_doc_id`, so an id+score query (and
+    /// the drain) can read the stable `_id` straight from the cell blob instead
+    /// of resolving it through a scalar `_id` column. Placing it before the
+    /// per-cluster blocks keeps that (trailing) region the sole input to the
+    /// reader's `n_docs` derivation; the region's presence and size are then
+    /// self-describing from the offset gap `per_cluster_blocks_off −
+    /// codec_meta_end` (`0` or `n_docs * STABLE_ID_BYTES`), needing no header
+    /// flag. The streaming/merge builds emit no such region.
+    pub const STABLE_ID_BYTES: usize = 16;
     /// Outer-blob version. Written at bytes [8..12] of the outer
     /// header. Bump on outer-blob-shape changes (currently 1).
     pub const VERSION: u32 = 1;
@@ -264,6 +276,7 @@ pub mod vec {
         pub const SUMMARY_OFF_OFF: usize = 16;
         /// `[24..28]` summary radius ×100 (`u32` LE).
         pub const SUMMARY_RADIUS_X100_OFF: usize = 24;
+        // `[28..32]` reserved (`u32`).
         /// `[32..40]` centroids offset (`u64` LE).
         pub const CENTROIDS_OFF_OFF: usize = 32;
         /// `[40..48]` cluster-index offset (`u64` LE).

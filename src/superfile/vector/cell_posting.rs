@@ -16,7 +16,7 @@ use crate::superfile::{
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel, metric_distance_by},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel},
     },
 };
 
@@ -633,18 +633,6 @@ pub(crate) fn sq8_quant_params_equal(
         && offset_a == offset_b
 }
 
-/// Per-cluster (scale, offset) taken from the medoid Sq8 row in `bucket`.
-pub(crate) fn cluster_quant_from_medoid(
-    metric: Metric,
-    dim: usize,
-    bucket: &[&MaterializedIvfRow],
-) -> (Vec<f32>, Vec<f32>) {
-    debug_assert!(!bucket.is_empty());
-    let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
-    let mid = medoid_index_symmetric(metric, dim, &encoded);
-    (encoded[mid].scale.to_vec(), encoded[mid].offset.to_vec())
-}
-
 /// Copy or Sq8-transcode one row into `out` (`[codes | residuals]`, length `2·dim`).
 ///
 /// When source quant matches the destination cluster quantizer, copies bytes
@@ -731,43 +719,41 @@ pub(crate) fn encoded_component_at(row: &EncodedCellRow, d: usize) -> f32 {
             * (row.codes[d] as f32 + (i8::from_le_bytes([row.residuals[d]]) as f32) * inv_div)
 }
 
-fn distance_encoded_rows_symmetric(
-    metric: Metric,
-    dim: usize,
-    a: &EncodedCellRow,
-    b: &EncodedCellRow,
-) -> f32 {
-    metric_distance_by(
-        metric,
-        dim,
-        |d| encoded_component_at(a, d),
-        |d| encoded_component_at(b, d),
-    )
-}
+/// Cap on the medoid all-pairs search. A medoid here is only a centroid *seed*
+/// (the split's discrete k-means update), so a representative sample suffices —
+/// and the exact O(n²) loop would otherwise spin for minutes on a split-cap
+/// shard (~50k rows). Same bounded-sample rationale as the k-means training.
+const MEDOID_SAMPLE_CAP: usize = 512;
 
 /// Index of the medoid row — the one minimizing the summed pairwise distance to
-/// all others — under an arbitrary row↔row distance `dist`. Shared by the
-/// symmetric kernel here and the asymmetric variant in `supertable::spfresh`.
+/// all others — under an arbitrary row↔row distance `dist`. Used as a centroid
+/// seed by the split's discrete k-means in `supertable::spfresh`.
+///
+/// Bounded to O(cap²): on a shard larger than [`MEDOID_SAMPLE_CAP`] it evaluates
+/// a strided sample of candidate rows against a strided sample of reference rows
+/// (the same strided-sample shape the materialized k-means uses), and returns an
+/// index into the *original* shard. For `len <= cap` it is the exact all-pairs
+/// medoid (`step == 1`), so small shards are unchanged.
 pub(crate) fn medoid_index_by<F>(shard: &[EncodedCellRow], dist: F) -> usize
 where
     F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,
 {
+    let n = shard.len();
+    let step = n.div_ceil(MEDOID_SAMPLE_CAP).max(1);
+    let refs: Vec<&EncodedCellRow> = shard.iter().step_by(step).collect();
     let mut best_idx = 0usize;
     let mut best_sum = f32::INFINITY;
-    for (i, row_i) in shard.iter().enumerate() {
-        let sum: f32 = shard.iter().map(|row_j| dist(row_i, row_j)).sum();
+    let mut i = 0usize;
+    while i < n {
+        let row_i = &shard[i];
+        let sum: f32 = refs.iter().map(|row_j| dist(row_i, row_j)).sum();
         if sum < best_sum {
             best_sum = sum;
             best_idx = i;
         }
+        i += step;
     }
     best_idx
-}
-
-fn medoid_index_symmetric(metric: Metric, dim: usize, shard: &[EncodedCellRow]) -> usize {
-    medoid_index_by(shard, |a, b| {
-        distance_encoded_rows_symmetric(metric, dim, a, b)
-    })
 }
 
 /// Sq8+ε row → `dim` fp32 components for manifest [`ClusterCentroids::from_fp32`]

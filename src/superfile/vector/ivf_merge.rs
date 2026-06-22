@@ -11,7 +11,10 @@ use bytemuck::cast_slice;
 
 use crate::superfile::{
     BuildError,
-    format::{checksum::crc32c, vec::DOC_ID_BYTES},
+    format::{
+        checksum::crc32c,
+        vec::{DOC_ID_BYTES, STABLE_ID_BYTES},
+    },
     vector::{
         builder::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
@@ -45,6 +48,11 @@ pub(crate) struct Sq8IvfMergeInput {
     pub scale: Vec<f32>,
     pub offset: Vec<f32>,
     pub summary_radius_x100: u32,
+    /// Inline stable-`_id`s for this input, indexed by its local doc id, when
+    /// the source subsection carries the region (materialized/hidden cells).
+    /// `None` for region-less sources (streaming/incoming). The merge produces a
+    /// merged region only when every input has one.
+    pub stable_ids: Option<Vec<i128>>,
 }
 
 /// Output of a byte-splice merge, ready for [`super::builder::VectorBuilder::set_prebuilt_subsection`].
@@ -165,12 +173,25 @@ pub(crate) fn merge_sq8_ivf_subsections(
 
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, n_cent, metric);
     let cluster_stride = code_bytes + DOC_ID_BYTES + per_vec_bytes;
+    // Carry the inline stable-`_id` region through the splice when every input
+    // has one (materialized/hidden cells always do; streaming/incoming sources
+    // don't). All-or-nothing: a merged region must cover every merged local id,
+    // so a single region-less input means we emit none and the merged cell
+    // falls back to the scalar `_id` column (still correct). The region is
+    // rewritten in merged local-id order in the cluster-block loop below.
+    let produce_region = parsed.iter().all(|p| p.stable_ids.is_some());
+    let stable_ids_region_bytes = if produce_region {
+        n_docs as usize * STABLE_ID_BYTES
+    } else {
+        0
+    };
     let layout = IvfSubsectionLayout::compute(
         dim,
         n_cent,
         n_docs as usize,
         cluster_stride,
         codec_meta_size,
+        stable_ids_region_bytes,
     );
 
     let mut bytes = alloc_ivf_subsection_with_header(
@@ -211,6 +232,10 @@ pub(crate) fn merge_sq8_ivf_subsections(
         .collect();
     let id_bytes = DOC_ID_BYTES;
     let mut row_buf = vec![0u8; dim * 2];
+    // Relative offset of the merged stable-`_id` region (start of the i128s),
+    // `Some` exactly when `produce_region`. Written per row below, indexed by
+    // the merged local doc id.
+    let stable_ids_region_off = layout.stable_ids_off;
 
     write_ivf_cluster_blocks(
         &mut bytes,
@@ -243,14 +268,25 @@ pub(crate) fn merge_sq8_ivf_subsections(
                         );
 
                     let idb = doc_ids_at + i * id_bytes;
-                    let local_id = u32::from_le_bytes([
+                    let src_local = u32::from_le_bytes([
                         inp.sub[idb],
                         inp.sub[idb + 1],
                         inp.sub[idb + 2],
                         inp.sub[idb + 3],
-                    ]) + inp.doc_id_offset;
+                    ]);
+                    let local_id = src_local + inp.doc_id_offset;
                     let id_off = blk.ids_base + out_i * id_bytes;
                     bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
+
+                    // Carry the stable `_id` to the merged region at the same
+                    // (remapped) local id. `produce_region` guarantees every
+                    // input has `stable_ids`, so the index is in range.
+                    if let Some(region_off) = stable_ids_region_off {
+                        let sid = inp.stable_ids.as_ref().expect("produce_region")
+                            [src_local as usize];
+                        let p = region_off + (local_id as usize) * STABLE_ID_BYTES;
+                        bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&sid.to_le_bytes());
+                    }
 
                     let rowb = full_at + i * inp.per_vec_bytes;
                     let full_off = blk.rerank_base + out_i * per_vec_bytes;

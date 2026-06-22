@@ -300,17 +300,20 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
 
 /// Sq8+ε IVF rows aligned to scalar `_id` row order. Optional tombstone bitmap
 /// skips deleted locals (cell maintenance); incoming routing passes `None`.
-fn materialized_ivf_rows_in_doc_order(
+async fn materialized_ivf_rows_in_doc_order(
     vec_reader: &VectorReader,
     column: &str,
     stable_ids_by_local: &[i128],
     tombstones: Option<&roaring::RoaringBitmap>,
 ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
-    let mut rows = vec_reader.materialized_index_rows(column).ok_or_else(|| {
-        BuildError::Store(format!(
-            "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
-        ))
-    })?;
+    let mut rows = vec_reader
+        .materialized_index_rows_async(column)
+        .await
+        .ok_or_else(|| {
+            BuildError::Store(format!(
+                "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
+            ))
+        })?;
     let n_rows = stable_ids_by_local.len();
     let mut by_local = vec![None; n_rows];
     for row in &mut rows {
@@ -319,7 +322,14 @@ fn materialized_ivf_rows_in_doc_order(
         }
         let slot = row.local_doc_id as usize;
         if slot < n_rows {
-            row.stable_id = stable_ids_by_local[slot];
+            // Cell superfiles inline the stable `_id` in the IVF blob, so the
+            // read-back already carries it (nonzero). Region-less incoming
+            // superfiles return 0 here and fall back to the scalar `_id` column
+            // resolved into `stable_ids_by_local`.
+            if row.stable_id == 0 {
+                row.stable_id = stable_ids_by_local[slot];
+                row.encoded.stable_id = row.stable_id;
+            }
             by_local[slot] = Some(row.clone());
         }
     }
@@ -2438,7 +2448,7 @@ async fn route_incoming_to_manifest_cells_if_ready(
             let vec_reader = reader.vec().ok_or_else(|| {
                 BuildError::Store("incoming superfile missing vector index".into())
             })?;
-            materialized_ivf_rows_in_doc_order(vec_reader, &column_name, &stable_ids, None)
+            materialized_ivf_rows_in_doc_order(vec_reader, &column_name, &stable_ids, None).await
         }
     }))
     .buffered(commit_write_concurrency())
@@ -2558,7 +2568,7 @@ async fn load_materialized_rows_from_ivf_superfile(
     let vec_reader = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF cell superfile missing vector index".into()))?;
-    materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref())
+    materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref()).await
 }
 
 /// Build one Sq8 IVF superfile via the normal superfile/vector builder.

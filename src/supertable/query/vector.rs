@@ -191,6 +191,15 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .collect());
     }
     let locals: Vec<u32> = (0..reader.n_docs() as u32).collect();
+    // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
+    // straight from it (resident; no scalar `_id` column read) before falling
+    // back to the column.
+    if let Some(ids) = reader
+        .vec()
+        .and_then(|v| v.inline_stable_ids_for_locals(&locals))
+    {
+        return Ok(ids);
+    }
     let id_column = reader.id_column();
     if reader.parquet_bytes().is_some() {
         let batch = reader
@@ -218,6 +227,14 @@ async fn read_ids_for_locals(
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
     let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
+    // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
+    // straight from it (resident; no scalar `_id` column read) when available.
+    if let Some(ids) = reader
+        .vec()
+        .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
+    {
+        return Ok(ids);
+    }
     if reader.parquet_bytes().is_some() {
         let batch = reader
             .take_by_local_doc_ids(local_ids, &[id_column])
