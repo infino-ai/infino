@@ -88,7 +88,8 @@ jobs:
           docker run --rm -v "$PWD:/build" -w /build/infino-node \
             ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine \
             sh -c "apk add --no-cache bash >/dev/null && \
-                   npm install && \
+                   rustup target add ${{ matrix.musl }} && \
+                   npm install --ignore-scripts && \
                    npx napi build --platform --release --strip --target ${{ matrix.musl }} --js native.js --dts native.d.ts infino && \
                    npx tsc && \
                    bash ./scripts/verify-pack.sh"
