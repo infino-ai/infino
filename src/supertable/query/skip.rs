@@ -51,7 +51,7 @@ use datafusion::scalar::ScalarValue;
 use crate::{
     superfile::{
         fts::reader::BoolMode,
-        vector::distance::{Metric, distance},
+        vector::distance::Metric,
     },
     supertable::manifest::{Manifest, SuperfileEntry},
 };
@@ -174,8 +174,8 @@ pub fn superfiles_sorted_by_centroid_distance(
         .iter()
         .enumerate()
         .map(|(i, entry)| match entry.vector_summary.get(column) {
-            Some(vs) if vs.centroid.len() == query.len() => {
-                (i, distance(metric, query, &vs.centroid))
+            Some(vs) if !vs.centroid.is_empty() && vs.centroid.dim as usize == query.len() => {
+                (i, vs.centroid.score_one(metric, 0, query))
             }
             _ => (i, f32::INFINITY),
         })
@@ -442,7 +442,7 @@ mod tests {
         e.vector_summary.insert(
             column.to_string(),
             VectorSummary {
-                centroid,
+                centroid: ClusterCentroids::single(Metric::L2Sq, &centroid),
                 radius,
                 clusters: ClusterCentroids::empty(),
             },

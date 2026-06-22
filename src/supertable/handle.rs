@@ -39,7 +39,6 @@ use crate::{
         shutdown_query_runtime_on_drop,
     },
     storage::PrefixedStorageProvider,
-    superfile::vector::kmeans::kmeans,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
@@ -277,31 +276,25 @@ impl Supertable {
                     "VectorIndexSuperTable requires options.storage".into(),
                 ))
             })?;
-            match crate::supertable::manifest::commit::read_pointer(&*hidden_storage).await {
-                Ok(Some(_)) => {
+            // A vector table's hidden index is mandatory — open it (creating it
+            // if absent) and propagate any failure; never silently drop it.
+            let pointer = crate::supertable::manifest::commit::read_pointer(&*hidden_storage)
+                .await
+                .map_err(|e| {
+                    OpenError::Build(BuildError::Store(format!(
+                        "hidden vector-index pointer read failed: {e}"
+                    )))
+                })?;
+            let hidden = match pointer {
+                Some(_) => {
                     let hidden_arc = Arc::new(hidden_opts);
-                    match Manifest::load(None, hidden_storage, Some(hidden_arc.clone())).await {
-                        Ok(hidden_manifest) => open_table_async(hidden_arc, hidden_manifest, None)
-                            .await
-                            .ok()
-                            .map(Arc::new),
-                        Err(e) => {
-                            tracing::warn!(
-                                "supertable: hidden vector-index table unavailable: {e}"
-                            );
-                            None
-                        }
-                    }
+                    let hidden_manifest =
+                        Manifest::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
+                    open_table_async(hidden_arc, hidden_manifest, None).await?
                 }
-                Ok(None) => create_table_async(hidden_opts, None, None)
-                    .await
-                    .ok()
-                    .map(Arc::new),
-                Err(e) => {
-                    tracing::warn!("supertable: hidden vector-index table unavailable: {e}");
-                    None
-                }
-            }
+                None => create_table_async(hidden_opts, None, None).await?,
+            };
+            Some(Arc::new(hidden))
         } else {
             None
         };
@@ -887,55 +880,6 @@ pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool 
     true
 }
 
-/// Open-time bootstrap only: derive initial global centroids from an
-/// existing user-table IVF summary. Hidden commits use
-/// [`super::spfresh`] MVCC maintenance — never call this per commit.
-pub(crate) fn train_global_centroids(
-    user_opts: &SupertableOptions,
-    manifest: &super::manifest::Manifest,
-    n_cells: usize,
-) -> Option<super::manifest::ClusterCentroids> {
-    let vc = user_opts.vector_columns.first()?;
-    let mut all_centroids = Vec::new();
-    let mut dim = 0usize;
-    for entry in manifest.superfiles.iter() {
-        let Some(vs) = entry.vector_summary.get(&vc.column) else {
-            continue;
-        };
-        let cc = &vs.clusters;
-        if cc.is_empty() {
-            continue;
-        }
-        dim = cc.dim as usize;
-        let mut row = vec![0f32; dim];
-        for c in 0..cc.n_cent as usize {
-            if cc.counts[c] == 0 {
-                continue;
-            }
-            cc.dequantize_into(c, &mut row);
-            all_centroids.extend_from_slice(&row);
-        }
-    }
-    if all_centroids.is_empty() || dim == 0 {
-        return None;
-    }
-    let n_src = all_centroids.len() / dim;
-    let n = n_cells.min(n_src).max(1);
-    let centroids = kmeans(
-        &all_centroids,
-        dim,
-        n,
-        GLOBAL_VECTOR_KMEANS_ITERS,
-        GLOBAL_VECTOR_KMEANS_SEED,
-    );
-    Some(super::manifest::ClusterCentroids::from_fp32(
-        n as u32,
-        dim as u32,
-        &centroids,
-        vec![1u32; n],
-    ))
-}
-
 pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
     "_vector_index"
 }
@@ -1012,18 +956,6 @@ fn build_vector_index_options(
         .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
-    }
-    if let Some(manifest) = user_manifest
-        && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, GLOBAL_VECTOR_CELL_COUNT)
-    {
-        hidden_opts = hidden_opts.with_partition_strategy(
-            crate::supertable::manifest::list::PartitionStrategy::VectorCell {
-                column: user_opts.vector_columns[0].column.clone(),
-                clusters,
-                routing: Default::default(),
-            },
-        );
     }
     Some(hidden_opts)
 }
@@ -2151,14 +2083,19 @@ mod tests {
             "doc-0 (the exact nearest) must rank before deletion"
         );
 
-        let stats = st.delete(col("title").eq(lit("doc-0"))).expect("delete doc-0");
+        let stats = st
+            .delete(col("title").eq(lit("doc-0")))
+            .expect("delete doc-0");
         assert_eq!(stats.n_tombstoned(), 1, "exactly one row deleted");
 
         let after = st
             .reader()
             .vector_hits("emb", &q, 10, VectorSearchOptions::new(), None)
             .expect("vector search after delete");
-        assert!(!after.is_empty(), "neighbours remain after deleting one row");
+        assert!(
+            !after.is_empty(),
+            "neighbours remain after deleting one row"
+        );
         assert!(
             !contains_doc0(&after),
             "the deleted row must not reappear via the hidden vector path"

@@ -68,7 +68,13 @@ pub(crate) const CELL_OVERLAP_TAU_DEFAULT: f32 = 3.0;
 /// score `d` to a radius `r`. (These are fp32 centroids; the stored radii were
 /// measured in the Sq8 domain, but the two differ only by quantization noise,
 /// which is immaterial for a consolidation *trigger*.)
-fn centroid_pair_distance(centroids: &[f32], dim: usize, i: usize, j: usize, metric: Metric) -> f32 {
+fn centroid_pair_distance(
+    centroids: &[f32],
+    dim: usize,
+    i: usize,
+    j: usize,
+    metric: Metric,
+) -> f32 {
     metric_distance_by(
         metric,
         dim,

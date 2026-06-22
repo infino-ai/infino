@@ -13,20 +13,19 @@ use roaring::RoaringBitmap;
 use crate::superfile::{
     BuildError,
     builder::VectorConfig,
-    format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, metric_distance_by},
+        distance::{
+            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, SQ8_RESIDUAL_I8_CLAMP, Sq8ResidualKernel,
+            metric_distance_by, metric_from_id, metric_to_id,
+        },
+        sq8_simd::Sq8EncodeConsts,
     },
 };
 
 const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
 const SEGMENTED_MAGIC: &[u8] = b"infino.cell_posting.segments.v1\n";
-const SQ8_CODE_MAX: f32 = 255.0;
-const EPSILON_I8_CLAMP: f32 = 127.0;
-/// Symmetric clamp bound for the Sq8+ε i8 residual leg (matches IVF builder).
-const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
-const ROW_BYTES_PER_DIM: usize = 2;
+pub(crate) const ROW_BYTES_PER_DIM: usize = 2;
 
 fn u32_le(body: &[u8]) -> Result<u32, String> {
     let arr: [u8; 4] = body.try_into().map_err(|_| "truncated u32".to_string())?;
@@ -142,7 +141,7 @@ pub fn encode_blob(
     let posting = encode_rows(metric, vectors, ids, dim, &rows);
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.push(metric_id(metric));
+    out.push(metric_id_byte(metric));
     out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for v in &posting.scale {
         out.extend_from_slice(&v.to_le_bytes());
@@ -186,7 +185,7 @@ fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
         return Err("segmented cell posting header truncated".into());
     }
     let dim = u32_le(&body[0..4])? as usize;
-    let metric = metric_from_id(body[4])?;
+    let metric = metric_from_id_byte(body[4])?;
     let n_segments = u32_le(&body[5..9])? as usize;
     let mut off = 9;
     let mut segments = Vec::with_capacity(n_segments);
@@ -202,7 +201,7 @@ fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
         }
         let seg_body = [
             &(dim as u32).to_le_bytes()[..],
-            &[metric_id(metric)][..],
+            &[metric_id_byte(metric)][..],
             &(n_docs as u32).to_le_bytes()[..],
             &body[off..off + segment_len],
         ]
@@ -226,7 +225,7 @@ fn parse_segment_body(
         return Err("cell posting header truncated".into());
     }
     let dim = u32_le(&body[0..4])? as usize;
-    let metric = metric_from_id(body[4])?;
+    let metric = metric_from_id_byte(body[4])?;
     let n_docs = u32_le(&body[5..9])? as usize;
     let header = 9 + dim * 8;
     let rows_len = n_docs * dim * ROW_BYTES_PER_DIM;
@@ -414,7 +413,7 @@ fn encode_segmented_blob(
 ) -> Result<Vec<u8>, String> {
     let mut out = SEGMENTED_MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.push(metric_id(metric));
+    out.push(metric_id_byte(metric));
     out.extend_from_slice(&(segments.len() as u32).to_le_bytes());
     for segment in segments {
         if segment.dim != dim || segment.metric != metric {
@@ -473,15 +472,19 @@ fn decode_ids(bytes: &[u8]) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-struct EncodedRows {
-    ids: Vec<u32>,
-    scale: Vec<f32>,
-    offset: Vec<f32>,
-    rows: Vec<u8>,
-    per_doc_norms: Option<Vec<f32>>,
+/// Sq8+ε encoding of a set of fp32 vectors under one shared quantizer: per-dim
+/// `scale`/`offset` from the set's min/max, then `rows` = `[codes(dim) ‖
+/// residuals(dim)]` per vector. This is the canonical shared encoder for both
+/// cell payloads and any centroid-routing layer built on top of them.
+pub(crate) struct EncodedRows {
+    pub(crate) ids: Vec<u32>,
+    pub(crate) scale: Vec<f32>,
+    pub(crate) offset: Vec<f32>,
+    pub(crate) rows: Vec<u8>,
+    pub(crate) per_doc_norms: Option<Vec<f32>>,
 }
 
-fn encode_rows(
+pub(crate) fn encode_rows(
     metric: Metric,
     vectors: &[f32],
     ids: &[u32],
@@ -528,18 +531,11 @@ fn encode_rows(
             };
             let base = offset[d] + q as f32 * scale[d];
             let step = scale[d] / SQ8_RESIDUAL_DIVISOR;
-            let eps = if step > 0.0 {
-                ((src[d] - base) / step)
-                    .round()
-                    .clamp(-EPSILON_I8_CLAMP, EPSILON_I8_CLAMP) as i8
-            } else {
-                0
-            };
+            let (eps_byte, norm_contrib) = encode_sq8_residual_dim(src[d], base, step, store_norms);
             encoded[code_start + d] = q;
-            encoded[eps_start + d] = eps.to_le_bytes()[0];
-            if store_norms {
-                let x = base + (eps as f32) * step;
-                acc += (x as f64) * (x as f64);
+            encoded[eps_start + d] = eps_byte;
+            if let Some(c) = norm_contrib {
+                acc += c;
             }
         }
         if let Some(norms) = per_doc_norms.as_mut() {
@@ -574,22 +570,52 @@ fn cmp_f32(a: f32, b: f32) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
-fn metric_id(m: Metric) -> u8 {
-    // Same metric↔id mapping as the IVF directory entry (format::vec).
-    match m {
-        Metric::L2Sq => METRIC_ID_L2SQ as u8,
-        Metric::Cosine => METRIC_ID_COSINE as u8,
-        Metric::NegDot => METRIC_ID_NEGDOT as u8,
-    }
+/// Cell-posting metric id is the single on-disk byte form of the
+/// shared metric↔id mapping (`distance::metric_to_id`). The cell
+/// posting header carries it in one byte, so we narrow the shared
+/// `u32` discriminator here.
+fn metric_id_byte(m: Metric) -> u8 {
+    metric_to_id(m) as u8
 }
 
-fn metric_from_id(id: u8) -> Result<Metric, String> {
-    match id as u32 {
-        METRIC_ID_L2SQ => Ok(Metric::L2Sq),
-        METRIC_ID_COSINE => Ok(Metric::Cosine),
-        METRIC_ID_NEGDOT => Ok(Metric::NegDot),
-        _ => Err(format!("unknown cell posting metric id {id}")),
-    }
+/// Inverse of [`metric_id_byte`]: decode the one-byte on-disk metric
+/// id, mapping an unknown id to this layer's `Result<_, String>`
+/// boundary.
+fn metric_from_id_byte(id: u8) -> Result<Metric, String> {
+    metric_from_id(id as u32).ok_or_else(|| format!("unknown cell posting metric id {id}"))
+}
+
+/// Encode the Sq8+ε residual leg for one dimension.
+///
+/// Given the dequantized Sq8 `base` for this dim and the per-dim
+/// residual `step` (`scale[d] / SQ8_RESIDUAL_DIVISOR`), quantize the
+/// residual `v - base` to a symmetric i8 (`±SQ8_RESIDUAL_I8_CLAMP`)
+/// and return its little-endian byte. When `store_norm` is set, also
+/// return the residual-corrected `x²` contribution to `‖x‖²`, where
+/// `x = base + eps·step` is the value the residual reconstructs.
+///
+/// This is the one definition of the residual arithmetic shared by the
+/// IVF builder and both cell-posting encode paths; the differing *code*
+/// legs (SIMD / scalar / transcode) stay at the call sites.
+#[inline]
+pub(crate) fn encode_sq8_residual_dim(
+    v: f32,
+    base: f32,
+    step: f32,
+    store_norm: bool,
+) -> (u8, Option<f64>) {
+    let eps = if step > 0.0 {
+        ((v - base) / step)
+            .round()
+            .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
+    } else {
+        0
+    };
+    let norm_contrib = store_norm.then(|| {
+        let x = base + eps as f32 * step;
+        (x as f64) * (x as f64)
+    });
+    (eps.to_le_bytes()[0], norm_contrib)
 }
 
 /// One Sq8+ε row carried through SPFresh maintenance without fp32 reconstruction.
@@ -666,31 +692,21 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         });
     }
 
-    let inv_scale: Vec<f32> = dst_scale.iter().map(|s| 1.0 / s).collect();
-    let c2: Vec<f32> = dst_scale
-        .iter()
-        .zip(dst_offset.iter())
-        .map(|(s, o)| (-o).mul_add(1.0 / s, 0.5))
-        .collect();
+    let ec = Sq8EncodeConsts::from_scale_offset(dst_scale, dst_offset);
     let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let mut acc = 0.0f64;
     for d in 0..dim {
         let v = encoded_component_at(row, d);
-        let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
+        let q = v
+            .mul_add(ec.inv_scale[d], ec.c2[d])
+            .clamp(0.0, SQ8_CODE_MAX);
         out[code_off + d] = q as u8;
         let base = q.mul_add(dst_scale[d], dst_offset[d]);
         let step = dst_scale[d] / residual_divisor;
-        let rq = if step > 0.0 {
-            ((v - base) / step)
-                .round()
-                .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
-        } else {
-            0
-        };
-        out[res_off + d] = rq.to_le_bytes()[0];
-        if store_norm {
-            let x = base + (rq as f32) * step;
-            acc += (x as f64) * (x as f64);
+        let (res_byte, norm_contrib) = encode_sq8_residual_dim(v, base, step, store_norm);
+        out[res_off + d] = res_byte;
+        if let Some(c) = norm_contrib {
+            acc += c;
         }
     }
     store_norm.then_some(acc as f32)

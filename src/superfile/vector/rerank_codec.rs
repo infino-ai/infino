@@ -183,10 +183,7 @@ impl RerankCodec {
     /// writing a byte format that the reader can't decode.
     #[inline]
     pub const fn is_implemented(self) -> bool {
-        matches!(
-            self,
-            Self::Fp32 | Self::Sq8Residual | Self::RabitqOnly
-        )
+        matches!(self, Self::Fp32 | Self::Sq8Residual | Self::RabitqOnly)
     }
 
     /// Recommended **lower bound** on `rerank_mult` for this

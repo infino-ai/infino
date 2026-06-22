@@ -137,13 +137,18 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
 // ---------------------------------------------------------
 
 fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, VectorSummaryAgg> {
-    let mut per_column: HashMap<String, Vec<(&[f32], f32)>> = HashMap::new();
+    let mut per_column: HashMap<String, Vec<(Vec<f32>, f32)>> = HashMap::new();
     for seg in superfiles {
         for (col, summary) in &seg.vector_summary {
+            if summary.centroid.is_empty() {
+                continue;
+            }
+            let mut c = vec![0f32; summary.centroid.dim as usize];
+            summary.centroid.dequantize_into(0, &mut c);
             per_column
                 .entry(col.clone())
                 .or_default()
-                .push((summary.centroid.as_slice(), summary.radius));
+                .push((c, summary.radius));
         }
     }
     let mut out = BTreeMap::new();

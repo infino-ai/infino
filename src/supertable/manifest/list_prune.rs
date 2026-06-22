@@ -240,6 +240,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::superfile::vector::distance::Metric;
     use crate::supertable::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         manifest::{
@@ -300,7 +301,7 @@ mod tests {
             vec_summary.insert(
                 "emb".into(),
                 VectorSummary {
-                    centroid: c,
+                    centroid: ClusterCentroids::single(Metric::L2Sq, &c),
                     radius: vec_radius,
                     clusters: ClusterCentroids::empty(),
                 },
@@ -470,16 +471,14 @@ mod tests {
             "envelope radius must dominate each seg ball; got {}",
             v.envelope_radius
         );
-        let decoded: Vec<f32> = v
-            .centroid_envelope
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // The envelope center is stored Sq8+residual; decode it through the
+        // codec, and allow one quantization step of error vs the true mean.
+        let decoded = decode_centroid_envelope(&v.centroid_envelope);
         assert_eq!(decoded.len(), 3);
         for (i, x) in decoded.iter().enumerate() {
             assert!(
-                (x - mean[i]).abs() < 1e-5,
-                "envelope[{}]={} expected {}",
+                (x - mean[i]).abs() < 0.05,
+                "envelope[{}]={} expected ~{}",
                 i,
                 x,
                 mean[i]

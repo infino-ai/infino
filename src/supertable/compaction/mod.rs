@@ -322,7 +322,10 @@ impl Supertable {
     /// per-cell bounding centroid + radius already live in the manifest summary,
     /// so this is pure selection — the actual merge + overflow-split is the
     /// existing [`Self::run_compaction_job`] path.
-    fn overlap_consolidation_jobs(manifest: &Manifest, options: &SupertableOptions) -> Vec<CompactionJob> {
+    fn overlap_consolidation_jobs(
+        manifest: &Manifest,
+        options: &SupertableOptions,
+    ) -> Vec<CompactionJob> {
         let Some(vec_col) = options.vector_columns.first() else {
             return Vec::new();
         };
@@ -333,9 +336,12 @@ impl Supertable {
         let mut radii: Vec<f32> = Vec::new();
         for e in manifest.get_all_superfiles() {
             if let Some(vs) = e.vector_summary.get(&vec_col.column)
-                && vs.centroid.len() == dim
+                && !vs.centroid.is_empty()
+                && vs.centroid.dim as usize == dim
             {
-                centroids.extend_from_slice(&vs.centroid);
+                let mut c = vec![0f32; dim];
+                vs.centroid.dequantize_into(0, &mut c);
+                centroids.extend_from_slice(&c);
                 radii.push(vs.radius);
                 cells.push(Arc::clone(e));
             }
@@ -535,28 +541,28 @@ impl Supertable {
         // byte-splice merge — that would mix the cells' independently-trained
         // clusters). Every other table: the standard byte-splice merge into one
         // larger superfile.
-        let prepared: Vec<PreparedSuperfile> =
-            match if is_hidden_vector_index_table(&inner.options) {
-                recluster_cells(inner, &inputs).await
-            } else {
-                self.merge_superfiles(&inputs).await.map(|seg| vec![seg])
-            } {
-                Ok(p) => p,
-                Err(e) => {
-                    for entry in &inputs {
-                        if let Err(unseal_err) =
-                            tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
-                                .await
-                        {
-                            tracing::warn!(
-                                superfile_id = %entry.superfile_id,
-                                "compaction failed; unseal also failed: {unseal_err}"
-                            );
-                        }
+        let prepared: Vec<PreparedSuperfile> = match if is_hidden_vector_index_table(&inner.options)
+        {
+            recluster_cells(inner, &inputs).await
+        } else {
+            self.merge_superfiles(&inputs).await.map(|seg| vec![seg])
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                for entry in &inputs {
+                    if let Err(unseal_err) =
+                        tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
+                            .await
+                    {
+                        tracing::warn!(
+                            superfile_id = %entry.superfile_id,
+                            "compaction failed; unseal also failed: {unseal_err}"
+                        );
                     }
-                    return Err(CompactionError::Build(e.to_string()));
                 }
-            };
+                return Err(CompactionError::Build(e.to_string()));
+            }
+        };
 
         let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
         let mut pending_storage_writes = Vec::with_capacity(prepared.len());
@@ -577,8 +583,10 @@ impl Supertable {
                 subsection_offsets: e.subsection_offsets.clone(),
                 vector_layout,
             }));
-            pending_storage_writes
-                .push(p.bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?);
+            pending_storage_writes.push(
+                p.bytes_for_storage
+                    .ok_or(CompactionError::EmptyMergedSuperfile)?,
+            );
             if let Some(c) = p.bytes_for_cache {
                 pending_cache_inserts_all.push(c);
             }

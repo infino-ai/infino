@@ -1957,10 +1957,12 @@ mod tests {
     #[test]
     fn partition_strategy_vector_cell_roundtrip() {
         use super::super::ClusterCentroids;
+        use crate::superfile::vector::distance::Metric;
         let mut list = empty_list();
         list.partition_strategy = PartitionStrategy::VectorCell {
             column: "emb".into(),
             clusters: ClusterCentroids::from_fp32(
+                Metric::L2Sq,
                 2,
                 4,
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],

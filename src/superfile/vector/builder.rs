@@ -33,10 +33,14 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, cluster_quant_from_medoid, encoded_component_at,
-            encoded_ivf_kmeans, materialize_sq8_residual_row_into_cluster_quant,
+            MaterializedIvfRow, cluster_quant_from_medoid, encode_sq8_residual_dim,
+            encoded_component_at, encoded_ivf_kmeans,
+            materialize_sq8_residual_row_into_cluster_quant,
         },
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
+        centroid_block,
+        distance::{
+            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by, metric_to_id,
+        },
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
@@ -107,16 +111,6 @@ const N_CENT_SMALL: usize = 64;
 /// back by the reader as `value / 100.0`.
 const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 
-/// Maximum Sq8 code value: each component quantizes to one unsigned
-/// byte, so the per-dim scale maps a cluster's value span onto
-/// `[0, SQ8_CODE_MAX]`.
-const SQ8_CODE_MAX: f32 = 255.0;
-
-/// Symmetric clamp bound for the Sq8Residual i8 leg. The residual is
-/// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
-/// quantized magnitude stays symmetric about zero.
-const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
-
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
         N_CENT_LARGE
@@ -124,16 +118,6 @@ fn n_cent_row_count_cap(n_docs: usize) -> usize {
         N_CENT_MEDIUM
     } else {
         N_CENT_SMALL
-    }
-}
-
-/// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
-/// 2 = NegDot.
-fn metric_id(m: Metric) -> u32 {
-    match m {
-        Metric::L2Sq => format::vec::METRIC_ID_L2SQ,
-        Metric::Cosine => format::vec::METRIC_ID_COSINE,
-        Metric::NegDot => format::vec::METRIC_ID_NEGDOT,
     }
 }
 
@@ -639,7 +623,7 @@ impl VectorBuilder {
             directory.extend_from_slice(&(i as u32).to_le_bytes()); // column_id
             directory.extend_from_slice(&(cfg.dim as u32).to_le_bytes()); // dim
             directory.extend_from_slice(&(sub.n_cent as u32).to_le_bytes()); // physical n_cent
-            directory.extend_from_slice(&metric_id(cfg.metric).to_le_bytes()); // metric_id
+            directory.extend_from_slice(&metric_to_id(cfg.metric).to_le_bytes()); // metric_id
             directory.extend_from_slice(&cfg.rot_seed.to_le_bytes()); // rot_seed (8)
             directory.extend_from_slice(&subsection_start_off.to_le_bytes()); // subsection_offset (8)
             directory.extend_from_slice(&(sub.bytes.len() as u64).to_le_bytes()); // subsection_length (8)
@@ -768,8 +752,12 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///
 /// ```text
 ///   [Sub-header — 56 bytes]
-///   [Summary centroid + radius]   — dim f32s
-///   [IVF centroids]               — n_cent × dim × f32
+///   [Centroid block]              — Sq8+ε, one shared quantizer over the
+///                                   summary centroid (row 0) + n_cent IVF
+///                                   centroids (rows 1..=n_cent):
+///                                     scale[dim] f32, offset[dim] f32,
+///                                     rows[(n_cent+1) × dim × 2] (codes ‖ eps),
+///                                     norms[(n_cent+1)] f32 (L2Sq/Cosine only)
 ///   [Cluster index]               — n_cent × (u32 doc_off, u32 doc_count)
 ///   [1-bit codes]                 — n_docs × ceil(dim/8) (cluster-contiguous)
 ///   [Full-precision vectors]      — n_docs × dim × f32 (cluster-contiguous)
@@ -894,13 +882,23 @@ fn build_subsection_from_materialized(
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs,
+        cluster_stride,
+        codec_meta_size,
+        cfg.metric,
+    );
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        cfg.metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &centroids,
     );
@@ -1218,13 +1216,23 @@ fn build_subsection_streaming(
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let layout = IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size);
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs,
+        cluster_stride,
+        codec_meta_size,
+        cfg.metric,
+    );
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        cfg.metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &centroids,
     );
@@ -1355,6 +1363,7 @@ fn encode_sq8_residual_cluster_simd(
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
     let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let row_bytes = dim * 2;
+    let store_norm = sq8_norms_block_off.is_some();
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
@@ -1370,17 +1379,10 @@ fn encode_sq8_residual_cluster_simd(
             let qc = bytes[code_off + d];
             let base = (qc as f32) * scale_c[d] + offset_c[d];
             let step = scale_c[d] / residual_divisor;
-            let rq = if step > 0.0 {
-                ((src[d] - base) / step)
-                    .round()
-                    .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
-            } else {
-                0
-            };
-            bytes[res_off + d] = rq.to_le_bytes()[0];
-            if sq8_norms_block_off.is_some() {
-                let x = base + (rq as f32) * step;
-                acc += (x as f64) * (x as f64);
+            let (res_byte, norm_contrib) = encode_sq8_residual_dim(src[d], base, step, store_norm);
+            bytes[res_off + d] = res_byte;
+            if let Some(c) = norm_contrib {
+                acc += c;
             }
         }
         if let Some(norms_off) = sq8_norms_block_off {
@@ -1462,7 +1464,14 @@ fn order_centroids_recursive(order: &mut [usize], centroids: &[f32], dim: usize)
 /// materialized rebuild, and the byte-splice merge — so the layout math lives
 /// in exactly one place.
 pub(crate) struct IvfSubsectionLayout {
+    /// Start of the Sq8+ε centroid block (the block's `scale` sub-region). The
+    /// summary centroid and IVF centroids share one quantizer and live here as
+    /// one block — see [`centroid_block`]. Recorded in the sub-header's
+    /// `summary_off` slot for backward-compatible field reuse.
     pub summary_off: usize,
+    /// Start of the centroid block's `rows` sub-region (codes ‖ residuals; row 0
+    /// = summary, rows `1..=n_cent` = IVF centroids). Recorded in the
+    /// sub-header's `centroids_off` slot.
     pub centroids_off: usize,
     pub cluster_idx_off: usize,
     /// Start of the codec-meta region; for the Sq8 family this is also the
@@ -1475,17 +1484,20 @@ pub(crate) struct IvfSubsectionLayout {
 impl IvfSubsectionLayout {
     /// Compute the region offsets. `per_cluster_stride` is
     /// `code_bytes + DOC_ID_BYTES + per_vec_bytes`; `codec_meta_size` is the
-    /// codec's metadata region size (0 when it has none).
+    /// codec's metadata region size (0 when it has none). `metric` sizes the
+    /// centroid block's optional per-row norms sidecar.
     pub(crate) fn compute(
         dim: usize,
         n_cent: usize,
         n_docs: usize,
         per_cluster_stride: usize,
         codec_meta_size: usize,
+        metric: Metric,
     ) -> Self {
         let summary_off = SUB_HEADER_SIZE;
-        let centroids_off = summary_off + dim * 4;
-        let cluster_idx_off = centroids_off + n_cent * dim * 4;
+        let centroids_off = summary_off + centroid_block::rows_rel_off(dim);
+        let cluster_idx_off =
+            summary_off + centroid_block::centroid_block_bytes(dim, n_cent, metric);
         let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
         let per_cluster_blocks_off = codec_meta_off + codec_meta_size;
         let total_size_before_crc = per_cluster_blocks_off + n_docs * per_cluster_stride;
@@ -1502,12 +1514,20 @@ impl IvfSubsectionLayout {
 
 /// Allocate the subsection buffer (sized to `total_size_before_crc`, CRC not yet
 /// appended) and write the fixed prefix every IVF subsection shares: the 56-byte
-/// sub-header, the summary centroid, and the per-cluster centroids. The caller
+/// sub-header and the Sq8+ε centroid block (summary centroid + per-cluster
+/// centroids under one shared quantizer — see [`centroid_block`]). The caller
 /// fills the cluster index, codec-meta/per-cluster blocks, then appends the CRC.
+///
+/// `summary_centroid` (`dim`) and `centroids` (`n_cent × dim`) are fp32 at the
+/// ingest boundary only; they are quantized to Sq8+ε before being written, so no
+/// fp32 centroid bytes survive into the subsection.
 pub(crate) fn alloc_ivf_subsection_with_header(
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
     summary_radius_x100: u32,
+    metric: Metric,
+    dim: usize,
+    n_cent: usize,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) -> Vec<u8> {
@@ -1527,10 +1547,15 @@ pub(crate) fn alloc_ivf_subsection_with_header(
         .copy_from_slice(&(layout.cluster_idx_off as u64).to_le_bytes());
     bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
         .copy_from_slice(&(layout.per_cluster_blocks_off as u64).to_le_bytes());
-    bytes[layout.summary_off..layout.summary_off + summary_centroid.len() * 4]
-        .copy_from_slice(bytemuck::cast_slice(summary_centroid));
-    bytes[layout.centroids_off..layout.centroids_off + centroids.len() * 4]
-        .copy_from_slice(bytemuck::cast_slice(centroids));
+    centroid_block::write_centroid_block(
+        &mut bytes,
+        layout.summary_off,
+        metric,
+        dim,
+        n_cent,
+        summary_centroid,
+        centroids,
+    );
     bytes
 }
 

@@ -951,10 +951,7 @@ async fn compare_fp32_and_sq8_on_1m_bench_workload() {
     }
     drop(fp32_reader);
 
-    for codec in [
-        RerankCodec::Sq8Residual,
-        RerankCodec::Sq8Residual,
-    ] {
+    for codec in [RerankCodec::Sq8Residual, RerankCodec::Sq8Residual] {
         eprintln!("\ndebug: building {codec:?} reader");
         let reader = build_reader(vectors, codec);
         for (nprobe, rerank_mult, label) in configs {

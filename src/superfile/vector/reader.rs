@@ -40,8 +40,9 @@ use crate::superfile::{
     lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
+        centroid_block::{self, CentroidBlock},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, distance_bytes, distance_bytes_codec,
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, distance_bytes_codec, metric_from_id,
         },
         ivf_merge::Sq8IvfMergeInput,
         quant::BitQuantizer,
@@ -119,9 +120,16 @@ pub struct ColumnReader {
     lazy_sq8_parsed: OnceLock<Arc<Sq8ParsedMeta>>,
     /// Byte range of this column's subsection within the outer blob.
     subsection_range: Range<usize>,
-    /// Offsets relative to the subsection start.
+    /// Offsets relative to the subsection start. `summary_off` is the start of
+    /// the Sq8+ε centroid block (the block's `scale`); the summary centroid and
+    /// IVF centroids both live there under one shared quantizer.
     summary_off: usize,
     summary_radius: f32,
+    /// Start of the centroid block's `rows` region (parsed from the on-disk
+    /// header for layout completeness). The query path derives every centroid
+    /// sub-region from `summary_off` via [`centroid_block`], so this cached copy
+    /// is not read directly.
+    #[allow(dead_code)]
     centroids_off: usize,
     cluster_idx_off: usize,
     /// relative offset of the per-column
@@ -222,6 +230,13 @@ impl ColumnReader {
         let start =
             block_start + prefix_len + local_idx * self.rerank_codec.per_vector_bytes(self.dim);
         start..start + self.rerank_codec.per_vector_bytes(self.dim)
+    }
+
+    /// Byte length of the Sq8+ε centroid block (summary + IVF centroids under
+    /// one shared quantizer). The block begins at `summary_off` and is
+    /// immediately followed by the cluster index.
+    pub(super) fn centroid_block_bytes(&self) -> usize {
+        centroid_block::centroid_block_bytes(self.dim, self.n_cent as usize, self.metric)
     }
 
     /// Per-doc byte stride inside a cluster block:
@@ -811,11 +826,9 @@ impl VectorReader {
                     cfg.column
                 ))));
             }
-            let metric = match metric_id {
-                format::vec::METRIC_ID_L2SQ => Metric::L2Sq,
-                format::vec::METRIC_ID_COSINE => Metric::Cosine,
-                format::vec::METRIC_ID_NEGDOT => Metric::NegDot,
-                _ => {
+            let metric = match metric_from_id(metric_id) {
+                Some(m) => m,
+                None => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "unknown metric_id {metric_id} for column '{}'",
                         cfg.column
@@ -885,10 +898,15 @@ impl VectorReader {
             // byte-level spec.
             //   [ 8..12] SUBSECTION_VERSION
             //   [12..16] codec_meta_size (u32 LE)
-            //   [16..24] summary_centroid_offset (u64 LE)
+            //   [16..24] centroid_block_offset (u64 LE) — start of the Sq8+ε
+            //            centroid block (`scale`); the summary centroid is
+            //            row 0 of that block. Kept in the legacy `summary_off`
+            //            slot for field reuse.
             //   [24..28] summary_radius_x100 (u32 LE)
             //   [28..32] reserved (u32)
-            //   [32..40] centroids_off (u64 LE)
+            //   [32..40] centroids_off (u64 LE) — start of the centroid block's
+            //            `rows` region (row 0 = summary, rows 1..=n_cent = IVF
+            //            centroids, each codes(dim) ‖ residuals(dim))
             //   [40..48] cluster_idx_off (u64 LE)
             //   [48..56] per_cluster_blocks_off (u64 LE)
             let subsection_version =
@@ -1112,25 +1130,29 @@ impl VectorReader {
         base
     }
 
-    /// Per-column summary centroid + radius, used by the storage plan
-    /// for cross-superfile skip pruning.
-    pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
+    /// Per-column summary centroid + radius for cross-superfile skip pruning,
+    /// returned in the stored Sq8+residual form: `(dim, scale, offset, row,
+    /// norm, radius)` — a byte copy of centroid-block row 0, no fp32 decode, so
+    /// the manifest carries the summary centroid in the one internal codec.
+    pub fn summary(
+        &self,
+        column: &str,
+    ) -> Option<(u32, Vec<f32>, Vec<f32>, Vec<u8>, Option<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
-        // byte access routed through `Source::try_get_range_sync`
-        // — zero-copy on `InMemory`, lazy on `Source::Lazy`.
         let sub = self
             .source
             .try_get_range_sync(col.subsection_range.clone())?;
-        let off = col.summary_off;
-        let dim = col.dim;
-        let centroid: Vec<f32> = (0..dim)
-            .map(|i| {
-                let s = off + i * 4;
-                f32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]])
-            })
-            .collect();
-        Some((centroid, col.summary_radius))
+        let block =
+            CentroidBlock::new(&sub[col.summary_off..], col.metric, col.dim, col.n_cent as usize);
+        Some((
+            col.dim as u32,
+            block.scale(),
+            block.offset(),
+            block.summary_row().to_vec(),
+            block.summary_norm(),
+            col.summary_radius,
+        ))
     }
 
     /// The column's per-cluster IVF centroids (fp32, cluster-major,
@@ -1147,21 +1169,16 @@ impl VectorReader {
             .try_get_range_sync(col.subsection_range.clone())?;
         let n_cent = col.n_cent as usize;
         let dim = col.dim;
-        let stride = dim * 4;
 
-        // Centroids: fp32, cluster-major, at `centroids_off`.
+        // Centroids are stored Sq8+ε (rows 1..=n_cent of the shared centroid
+        // block). Decode to fp32 cluster-major here at the manifest-staging
+        // boundary — the manifest re-quantizes them into its own per-cluster
+        // routing form. This is not the query hot path; no fp32 centroid bytes
+        // exist on disk.
+        let block = CentroidBlock::new(&sub[col.summary_off..], col.metric, dim, n_cent);
         let mut centroids = Vec::with_capacity(n_cent * dim);
         for c in 0..n_cent {
-            let base = col.centroids_off + c * stride;
-            for d in 0..dim {
-                let s = base + d * 4;
-                centroids.push(f32::from_le_bytes([
-                    sub[s],
-                    sub[s + 1],
-                    sub[s + 2],
-                    sub[s + 3],
-                ]));
-            }
+            centroids.extend_from_slice(&block.cluster_components(c));
         }
 
         // cluster_idx: `n_cent` × `(doc_off: u32, count: u32)`; we want
@@ -1178,6 +1195,48 @@ impl VectorReader {
         }
 
         Some((col.n_cent, dim as u32, centroids, counts))
+    }
+
+    /// The column's per-cluster IVF centroids in their stored Sq8+residual form:
+    /// `(n_cent, dim, scale, offset, rows, norms, counts)` — a byte copy of the
+    /// centroid block's cluster rows (excludes the summary row), so the manifest
+    /// can carry the routing centroids without any fp32 decode / re-quantize.
+    /// `None` if the column is unknown or its bytes aren't resident.
+    pub fn cluster_centroids_encoded(
+        &self,
+        column: &str,
+    ) -> Option<(
+        u32,
+        u32,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<u8>,
+        Option<Vec<f32>>,
+        Vec<u32>,
+    )> {
+        let cid = *self.column_id_by_name.get(column)?;
+        let col = &self.columns[cid as usize];
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let n_cent = col.n_cent as usize;
+        let dim = col.dim;
+        let block = CentroidBlock::new(&sub[col.summary_off..], col.metric, dim, n_cent);
+        let scale = block.scale();
+        let offset = block.offset();
+        let rows = block.cluster_rows().to_vec();
+        let norms = block.cluster_norms();
+        let mut counts = Vec::with_capacity(n_cent);
+        for c in 0..n_cent {
+            let b = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES + CLUSTER_IDX_COUNT_OFFSET;
+            counts.push(u32::from_le_bytes([
+                sub[b],
+                sub[b + 1],
+                sub[b + 2],
+                sub[b + 3],
+            ]));
+        }
+        Some((col.n_cent, dim as u32, scale, offset, rows, norms, counts))
     }
 
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
@@ -1239,7 +1298,7 @@ impl VectorReader {
             metric: col.metric,
             doc_id_offset,
             cluster_idx_off: col.cluster_idx_off,
-            centroids_off: col.centroids_off,
+            centroid_block_off: col.summary_off,
             per_cluster_blocks_off: col.per_cluster_blocks_off,
             code_bytes: col.quant.code_bytes(),
             per_vec_bytes: col.rerank_codec.per_vector_bytes(dim),
@@ -1383,26 +1442,24 @@ impl VectorReader {
         if !validated {
             return Ok(Vec::new());
         }
-        // Centroids are always fp32 (4 bytes/dim) regardless of codec.
-        let centroid_stride = col.dim * 4;
         let sub_start = col.subsection_range.start;
 
-        // 1. Centroids + cluster_idx region. These are contiguous
-        //    in the subsection, and search needs both before it can
-        //    issue per-cluster range requests. Fetching them as one
-        //    span saves one request and one foreground RTT batch on
-        //    cold object-store search.
-        let centroids_start = sub_start + col.centroids_off;
-        let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
+        // 1. Centroid block + cluster_idx region. The Sq8+ε centroid block
+        //    (summary + IVF centroids under one shared quantizer) is
+        //    immediately followed by the cluster index, and search needs both
+        //    before it can issue per-cluster range requests. Fetching them as
+        //    one span saves one request and one foreground RTT batch on cold
+        //    object-store search.
+        let block_start = sub_start + col.summary_off;
+        let block_end = block_start + col.centroid_block_bytes();
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let centroid_idx_region = self
             .source
-            .get_range(centroids_start..idx_end)
+            .get_range(block_start..idx_end)
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
-        let cluster_idx =
-            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
+        let centroids = centroid_idx_region.slice(0..block_end - block_start);
+        let cluster_idx = centroid_idx_region.slice(idx_start - block_start..idx_end - block_start);
 
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
         // 2. Score centroids → top `nprobe` clusters. Only the
@@ -1582,22 +1639,20 @@ impl VectorReader {
         if !validated {
             return Ok(Vec::new());
         }
-        let centroid_stride = col.dim * 4;
         let sub_start = col.subsection_range.start;
 
-        // 1. Centroids + cluster_idx region (one contiguous span).
-        let centroids_start = sub_start + col.centroids_off;
-        let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
+        // 1. Centroid block + cluster_idx region (one contiguous span).
+        let block_start = sub_start + col.summary_off;
+        let block_end = block_start + col.centroid_block_bytes();
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let centroid_idx_region = self
             .source
-            .range_async(centroids_start..idx_end)
+            .range_async(block_start..idx_end)
             .await
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
-        let cluster_idx =
-            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
+        let centroids = centroid_idx_region.slice(0..block_end - block_start);
+        let cluster_idx = centroid_idx_region.slice(idx_start - block_start..idx_end - block_start);
 
         // Filtered search: boost nprobe and rerank_mult inversely with
         // selectivity so probed clusters and the rerank shortlist cover
@@ -2224,30 +2279,28 @@ fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usi
         .min(MAX_EFFECTIVE_FILTERED_RERANK_MULT)
 }
 
-/// Score `query` against every centroid in `centroids_bytes` and
-/// return the top `nprobe` `(cluster_id, distance)` pairs sorted by
-/// ascending distance (closest first).
+/// Score `query` against every centroid in `block_bytes` (the Sq8+ε centroid
+/// block, starting at the block's first byte) and return the top `nprobe`
+/// `(cluster_id, distance)` pairs sorted by ascending distance (closest first).
 ///
-/// Takes a `&[u8]` view so the caller can hand in either an
-/// in-memory subsection slice or the just-fetched centroids
-/// region bytes from [`Source::get_range`] — both reach this
-/// helper through the same shape.
+/// Centroids are stored Sq8+ε under one shared quantizer — identical to cell
+/// payloads — so scoring goes through [`Sq8ResidualKernel`] with no fp32
+/// centroid decode in this hot path.
+///
+/// Takes a `&[u8]` view so the caller can hand in either an in-memory
+/// subsection slice or the just-fetched centroid-block bytes from
+/// [`Source::get_range`] — both reach this helper through the same shape.
 #[inline]
 fn score_centroids(
-    centroids_bytes: &[u8],
+    block_bytes: &[u8],
     col: &ColumnReader,
     query: &[f32],
     nprobe: usize,
 ) -> Vec<(usize, f32)> {
-    // Centroids are stored as fp32 regardless of the column's rerank
-    // codec — only the per-doc `full[]` region compresses. `distance_bytes`
-    // assumes fp32, which is correct here.
-    let centroid_stride = col.dim * 4;
+    let block = CentroidBlock::new(block_bytes, col.metric, col.dim, col.n_cent as usize);
+    let kernel = block.kernel(query);
     let mut scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
-        .map(|c| {
-            let bytes = &centroids_bytes[c * centroid_stride..(c + 1) * centroid_stride];
-            (c, distance_bytes(col.metric, query, bytes))
-        })
+        .map(|c| (c, block.cluster_distance(&kernel, c)))
         .collect();
     if nprobe < scores.len() {
         scores.select_nth_unstable_by(nprobe, |a, b| {
@@ -3261,8 +3314,12 @@ mod tests {
     fn summary_returns_dim_centroid_and_radius() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
-        let (centroid, radius) = r.summary("embedding").expect("vector summary");
-        assert_eq!(centroid.len(), 16);
+        let (dim, scale, offset, row, _norm, radius) =
+            r.summary("embedding").expect("vector summary");
+        assert_eq!(dim, 16);
+        assert_eq!(scale.len(), 16);
+        assert_eq!(offset.len(), 16);
+        assert_eq!(row.len(), 16 * 2); // [codes(dim) ‖ residuals(dim)]
         assert!(radius >= 0.0);
         assert!(r.summary("nonexistent").is_none());
     }
@@ -6169,13 +6226,8 @@ mod tests {
         // shortlist (k·rerank_mult ≥ PARALLEL_SCAN_MIN) on an Sq8 column.
         let n_docs = 3000u32;
         let n_cent = 4usize;
-        let (blob, json, all) = build_large_corpus(
-            16,
-            n_cent,
-            n_docs,
-            RerankCodec::Sq8Residual,
-            Metric::L2Sq,
-        );
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("v", &all[2001], 64, n_cent, 40)
@@ -6534,8 +6586,9 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         assert!(r.summary("missing").is_none());
         // Sanity on the present column too.
-        let (centroid, radius) = r.summary("embedding").expect("present");
-        assert_eq!(centroid.len(), 16);
+        let (dim, _scale, _offset, _row, _norm, radius) =
+            r.summary("embedding").expect("present");
+        assert_eq!(dim, 16);
         assert!(radius >= 0.0);
     }
 
@@ -6680,8 +6733,9 @@ mod tests {
             .source
             .try_get_range_sync(col.subsection_range.clone())
             .expect("subsection bytes");
-        let centroids_bytes =
-            &sub[col.centroids_off..col.centroids_off + (n_cent as usize) * dim * 4];
+        // `score_centroids` now takes the Sq8+ε centroid block (starting at the
+        // block's first byte = `summary_off`), not a flat fp32 centroid array.
+        let centroids_bytes = &sub[col.summary_off..col.summary_off + col.centroid_block_bytes()];
 
         let nprobe = 2usize;
         let scored = score_centroids(centroids_bytes, col, &q0, nprobe);

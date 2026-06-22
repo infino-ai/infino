@@ -353,7 +353,8 @@ fn hidden_cell_count(total_rows: usize, sum_dim: usize) -> usize {
     if total_rows == 0 {
         return 0;
     }
-    let bytes_per_row = sum_dim * HIDDEN_CELL_EST_BYTES_PER_DIM + HIDDEN_CELL_EST_ROW_OVERHEAD_BYTES;
+    let bytes_per_row =
+        sum_dim * HIDDEN_CELL_EST_BYTES_PER_DIM + HIDDEN_CELL_EST_ROW_OVERHEAD_BYTES;
     total_rows
         .saturating_mul(bytes_per_row)
         .div_ceil(HIDDEN_CELL_TARGET_BYTES)
@@ -658,7 +659,8 @@ fn bootstrap_centroids_from_batch(
     for &a in &assignments {
         counts[a as usize] += 1;
     }
-    let clusters = ClusterCentroids::from_fp32(k as u32, vec_dim as u32, &centroids, counts);
+    let clusters =
+        ClusterCentroids::from_fp32(metric, k as u32, vec_dim as u32, &centroids, counts);
     Some(clusters.clone().with_radii(per_cell_radii(
         &clusters,
         &vectors,
@@ -683,9 +685,7 @@ fn per_cell_radii(
             continue;
         }
         let member = &vectors[doc_idx * vec_dim..(doc_idx + 1) * vec_dim];
-        let sum_m: f32 = member.iter().sum();
-        let norm_m_sq: f32 = member.iter().map(|v| v * v).sum();
-        let dist = clusters.score_one(metric, c, member, sum_m, norm_m_sq);
+        let dist = clusters.score_one(metric, c, member);
         if dist > radii[c] {
             radii[c] = dist;
         }
@@ -1317,12 +1317,10 @@ impl SupertableWriter {
                     let _ = hidden_ws.delete_state(hidden_wal_id).await;
                     Ok::<(), MutationError>(())
                 };
-                if let Err(e) = mirror.await {
-                    tracing::warn!(
-                        "supertable: hidden vector-index delete mirror failed: {e} \
-                         (vector search may be stale)"
-                    );
-                }
+                // The delete must reach the hidden index too — otherwise vector
+                // search would keep returning deleted rows. Fail the whole
+                // delete if the mirror fails; never let the index drift.
+                mirror.await?;
             }
 
             let _ = wal_store.delete_state(wal_id).await;
@@ -1474,35 +1472,30 @@ impl SupertableWriter {
         // publish via tokio::join).
         let mut hidden_writer = None;
         if let Some(vit) = self.inner.vector_index_table.as_ref() {
-            match vit.writer() {
-                Ok(mut vw) => {
-                    for batch in &buffer {
-                        let Some(ids) = batch
-                            .scalar
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Decimal128Array>()
-                        else {
-                            tracing::warn!(
-                                "supertable: hidden vector-index dual-write missing _id column"
-                            );
-                            continue;
-                        };
-                        if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
-                            tracing::warn!(
-                                "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
-                            );
-                            break;
-                        }
-                    }
-                    hidden_writer = Some(vw);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "supertable: hidden vector-index writer unavailable: {e} (vector search may be stale)"
-                    );
-                }
+            // A vector table always has its hidden vector-index sibling; the
+            // dual-write is part of the commit, not best-effort. Any failure
+            // fails the whole commit — vector search must never silently drift
+            // from the user table.
+            let mut vw = vit.writer().map_err(|e| {
+                BuildError::Store(format!("hidden vector-index writer unavailable: {e}"))
+            })?;
+            for batch in &buffer {
+                let ids = batch
+                    .scalar
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        BuildError::Store(
+                            "hidden vector-index dual-write missing _id column".into(),
+                        )
+                    })?;
+                vw.append_dual_write_batch(ids, &batch.vectors)
+                    .map_err(|e| {
+                        BuildError::Store(format!("hidden vector-index append failed: {e}"))
+                    })?;
             }
+            hidden_writer = Some(vw);
         }
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
@@ -1627,22 +1620,11 @@ impl SupertableWriter {
                             prep
                         ),
                     );
+                    // Both halves of the dual-write must land. If the hidden
+                    // commit fails, the whole vector commit fails — the index
+                    // is never allowed to drift from the user table.
                     user_res?;
-                    match hidden_res {
-                        Ok(()) => {
-                            // New design: each commit's hidden superfile is a
-                            // permanent cell, queried via per-cell centroid
-                            // routing — no eager drain into global cells.
-                            // Overlap-triggered consolidation handles hot
-                            // regions out-of-band.
-                            let _ = &hidden_inner;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                            );
-                        }
-                    }
+                    hidden_res?;
                     Ok::<(), BuildError>(())
                 }
                 None => persist_superfile_publish_batch_async(&user_inner, user_batch).await,
@@ -2139,15 +2121,39 @@ pub(super) fn prepare_superfile_with_uri(
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-                // Stage the per-cluster centroids (Sq8) into the
-                // manifest so a query can rank this superfile's clusters
-                // globally without opening the superfile.
+            if let Some((c_dim, c_scale, c_offset, c_rows, c_norm, radius)) =
+                vec_reader.summary(&vc.column)
+            {
+                // The summary centroid is a single Sq8+residual centroid
+                // (n_cent = 1) — a byte copy of the stored block, no fp32.
+                let centroid = ClusterCentroids {
+                    n_cent: 1,
+                    dim: c_dim,
+                    scale: c_scale,
+                    offset: c_offset,
+                    rows: c_rows,
+                    norms: c_norm.map(|n| vec![n]),
+                    counts: vec![1],
+                    radii: Vec::new(),
+                };
+                // Copy the superfile's Sq8+residual cluster centroids straight
+                // into the manifest (a byte copy of the stored quantized form)
+                // so a query ranks this superfile's clusters globally without
+                // opening it — no fp32 decode / re-quantize round-trip.
                 let clusters = vec_reader
-                    .cluster_centroids(&vc.column)
-                    .map(|(n_cent, dim, fp32, counts)| {
-                        ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
-                    })
+                    .cluster_centroids_encoded(&vc.column)
+                    .map(
+                        |(n_cent, dim, scale, offset, rows, norms, counts)| ClusterCentroids {
+                            n_cent,
+                            dim,
+                            scale,
+                            offset,
+                            rows,
+                            norms,
+                            counts,
+                            radii: Vec::new(),
+                        },
+                    )
                     .unwrap_or_default();
                 vector_summary.insert(
                     vc.column.clone(),
@@ -3424,7 +3430,7 @@ mod tests {
             .vector_summary
             .get("emb")
             .expect("emb vector summary present");
-        assert_eq!(vs.centroid.len(), dim);
+        assert_eq!(vs.centroid.dim as usize, dim);
         assert!(vs.radius >= 0.0);
         // Per-cluster centroids are staged into the manifest for
         // cross-superfile global cluster selection.
@@ -3435,9 +3441,13 @@ mod tests {
         assert_eq!(vs.clusters.dim as usize, dim);
         assert!(vs.clusters.n_cent >= 1);
         assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.mins.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.scales.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.codes.len(), vs.clusters.n_cent as usize * dim);
+        assert_eq!(vs.clusters.scale.len(), dim);
+        assert_eq!(vs.clusters.offset.len(), dim);
+        // rows = n_cent × [codes(dim) u8 ‖ residuals(dim) i8].
+        assert_eq!(
+            vs.clusters.rows.len(),
+            vs.clusters.n_cent as usize * dim * 2
+        );
         // Every indexed doc lands in exactly one cluster, so the
         // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();

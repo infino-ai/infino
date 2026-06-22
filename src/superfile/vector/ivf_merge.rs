@@ -21,6 +21,7 @@ use crate::superfile::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
+        centroid_block::CentroidBlock,
         distance::Metric,
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry},
@@ -37,7 +38,8 @@ pub(crate) struct Sq8IvfMergeInput {
     pub metric: Metric,
     pub doc_id_offset: u32,
     pub cluster_idx_off: usize,
-    pub centroids_off: usize,
+    /// Byte offset (within `sub`) of the Sq8+ε centroid block's first byte.
+    pub centroid_block_off: usize,
     pub per_cluster_blocks_off: usize,
     pub code_bytes: usize,
     pub per_vec_bytes: usize,
@@ -98,24 +100,34 @@ pub(crate) fn merge_sq8_ivf_subsections(
     let per_vec_bytes = codec.per_vector_bytes(dim);
     let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
 
+    // Per-input centroid block views. Centroids are Sq8+ε on disk; decode
+    // each cluster centroid to fp32 here (the merge boundary, not the query
+    // hot path) to count-weight-average across inputs, then re-quantize the
+    // result through the output centroid block below.
+    let centroid_blocks: Vec<CentroidBlock> = parsed
+        .iter()
+        .map(|inp| {
+            CentroidBlock::new(
+                &inp.sub[inp.centroid_block_off..],
+                inp.metric,
+                inp.dim,
+                inp.n_cent,
+            )
+        })
+        .collect();
+
     let mut out_centroids = vec![0.0f32; n_cent * dim];
     for c in 0..n_cent {
         let mut acc = vec![0.0f64; dim];
         let mut total = 0u64;
-        for inp in &parsed {
+        for (inp, block) in parsed.iter().zip(&centroid_blocks) {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count == 0 {
                 continue;
             }
             total += count as u64;
-            let co = inp.centroids_off + c * dim * 4;
-            for (d, acc_d) in acc.iter_mut().enumerate().take(dim) {
-                let v = f32::from_le_bytes([
-                    inp.sub[co + d * 4],
-                    inp.sub[co + d * 4 + 1],
-                    inp.sub[co + d * 4 + 2],
-                    inp.sub[co + d * 4 + 3],
-                ]);
+            let cv = block.cluster_components(c);
+            for (acc_d, &v) in acc.iter_mut().zip(&cv) {
                 *acc_d += v as f64 * count as f64;
             }
         }
@@ -171,12 +183,16 @@ pub(crate) fn merge_sq8_ivf_subsections(
         n_docs as usize,
         cluster_stride,
         codec_meta_size,
+        metric,
     );
 
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &out_centroids,
     );
