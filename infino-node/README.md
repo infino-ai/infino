@@ -211,14 +211,14 @@ console.log(stats.matched, stats.nTombstoned, stats.nNotFound);
 number you supply, otherwise it throws. Both methods return `{ matched,
 nTombstoned, nNotFound }`.
 
-## Compaction
+## Optimization
 
-Many small appends produce many small files. `compact` merges small or
+Many small appends produce many small files. `optimize` merges small or
 underfilled files into larger ones, which keeps reads efficient.
 
 ```javascript
-docs.compact();                                                  // engine defaults
-docs.compact({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
+docs.optimize();                                                 // engine defaults
+docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
 ```
 
 ## Storage backends
@@ -290,7 +290,7 @@ const db = connect("s3://bucket/prefix", {
   - `update(predicate, data)` / `delete(predicate)` — mutate rows matching a SQL
     predicate; return `{ matched, nTombstoned, nNotFound }`; require durable
     storage.
-  - `compact({ maxMemoryMb?, minFillPercent?, targetSuperfileSizeMb? })`.
+  - `optimize({ maxMemoryMb?, minFillPercent?, targetSuperfileSizeMb? })`.
   - `schema()` — the table's apache-arrow `Schema`.
 - `IndexSpec().fts(col).vector(col, dim, nCent, metric)`.
 - `BUILDER_ID` (named export) — the engine's build identifier string.
