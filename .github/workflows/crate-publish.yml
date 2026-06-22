@@ -3,11 +3,14 @@ name: Publish crate
 # Publishes the core `infino` crate to crates.io (and, transitively, triggers
 # the docs.rs build).
 #
+# The engine is the only artifact released by tag; the Node and Python bindings
+# publish independently via their own manually-triggered workflows (no tags),
+# so a bare `v*` tag is unambiguous here.
+#
 # Two ways to run:
-#   - Push a `crate-v<version>` tag (e.g. `crate-v0.1.0`) — the per-artifact
-#     release tag from docs/versioning.md — to publish for real. The job
-#     asserts the tag version matches the version in Cargo.toml before it
-#     uploads anything.
+#   - Push a `v<version>` tag (e.g. `v0.1.0`) — the engine release tag from
+#     docs/versioning.md — to publish for real. The job asserts the tag version
+#     matches the version in Cargo.toml before it uploads anything.
 #   - Run it manually (workflow_dispatch). The default is a DRY RUN: it packs
 #     and verify-builds the crate exactly as a downstream `cargo add` would
 #     receive it, but uploads nothing. Re-run with `dry_run` unchecked to
@@ -18,7 +21,10 @@ name: Publish crate
 
 on:
   push:
-    tags: ["crate-v*"]
+    # Version tags only (`v0.1.0`, `v1.2.3`); `v[0-9]*` ignores stray v-prefixed
+    # tags. The engine is the sole tag-released artifact (bindings publish via
+    # their own manual workflows), so no `crate-`/`node-`/`py-` prefix is needed.
+    tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -76,7 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Resolve the published version from Cargo.toml and, on a tag push,
-      # assert the tag matches it (`crate-v0.1.0` -> `0.1.0`). Guards against
+      # assert the tag matches it (`v0.1.0` -> `0.1.0`). Guards against
       # tagging one version and shipping another.
       - name: Resolve & check version
         id: version
@@ -86,9 +92,9 @@ jobs:
           echo "Cargo.toml version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${GITHUB_REF_NAME#crate-v}"
+            tag="${GITHUB_REF_NAME#v}"
             if [ "$tag" != "$version" ]; then
-              echo "::error::tag crate-v$tag does not match Cargo.toml version $version"
+              echo "::error::tag v$tag does not match Cargo.toml version $version"
               exit 1
             fi
           fi

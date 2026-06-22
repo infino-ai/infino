@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "homepage": "https://github.com/infino-ai/infino#readme",
   "repository": {
     "type": "git",

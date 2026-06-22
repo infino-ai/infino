@@ -54,9 +54,12 @@ contract for how their versions relate.
 
 For a **patch**, release only the package that needs it:
 
-- **Rust** — bump `version` in the root `Cargo.toml`, then publish to crates.io.
-  *(There is no Rust publish workflow yet — see "Open gaps" below. Until one
-  exists this is a manual `cargo publish` by a designated owner.)*
+- **Rust** — bump `version` in the root `Cargo.toml`, then push a matching
+  `v<version>` tag (e.g. `v0.1.1`). The `Publish crate` workflow
+  (`.github/workflows/crate-publish.yml`) asserts the tag matches `Cargo.toml`
+  and publishes to crates.io. The engine is the **only** artifact released by a
+  tag; a bare `v*` tag is therefore unambiguous. (You can also run the workflow
+  manually from the Actions tab — the default is a dry run.)
 - **Node** — bump `version` in `infino-node/package.json`, then run the
   `Node publish` workflow (`.github/workflows/node-publish.yml`). `napi
   prepublish` derives the per-platform package versions and rewrites the
@@ -66,8 +69,11 @@ For a **patch**, release only the package that needs it:
   `publish-python` workflow.
 
 For a **minor** (feature or breaking change), do all three in the same release
-cycle so `major.minor` never drifts: bump the crate, then the two bindings to
-the matching `0.<minor>.0`, and publish all three.
+cycle so `major.minor` never drifts: land the engine change first, then **update
+the Node and Python binding code to cover any new or changed engine surface**,
+bump the crate and the two bindings to the matching `0.<minor>.0`, and publish
+all three. The bindings must never be released on a new minor before their code
+actually exposes that minor's engine changes.
 
 ## Worked example
 
@@ -97,10 +103,11 @@ Patches diverge between coordinated minors; a minor bump realigns everything on
 
 ## Open gaps
 
-- **No Rust publish automation.** There is a `node-publish` and a
-  `publish-python` workflow but no crates.io publish workflow, and no clear owner
-  for the engine's version bumps. Assign an owner and add a publish workflow so
-  the crate doesn't fall behind the bindings on the shared release line.
+- **Rust publish automation: done.** The `Publish crate` workflow
+  (`.github/workflows/crate-publish.yml`) publishes the engine to crates.io on a
+  `v<version>` tag; Node and Python still publish via their own manual workflows.
+  Still worth naming a clear owner for the engine's version bumps so the crate
+  doesn't fall behind the bindings on the shared release line.
 - **No drift guard yet.** A small CI check that asserts the `major.minor` of the
   root `Cargo.toml`, `infino-node/package.json`, and `infino-python/Cargo.toml`
   all agree (patch ignored) would enforce rule 2 cheaply. Recommended.

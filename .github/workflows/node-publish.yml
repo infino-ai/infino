@@ -155,7 +155,7 @@ jobs:
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release --dry-run
-          npm publish --dry-run --tag latest
+          npm publish --dry-run --tag latest --access public
       # Publishes the per-platform packages and pins them in the main
       # package's optionalDependencies, then publishes the main package.
       # `--tag latest` is required (not just default): the name's history
@@ -166,7 +166,7 @@ jobs:
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release
-          npm publish --tag latest
+          npm publish --tag latest --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # Emit provenance for the main package AND every per-platform package
