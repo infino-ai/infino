@@ -1217,23 +1217,33 @@ pub mod vector {
             // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
             // high-recall correctness gate, no recall-target grid — only
             // the fixed `(default_nprobe, default_rerank)` recall sample.
-            eprintln!(
-                "[{log_prefix}] skip-calibration: VectorSearchOptions::default() → unfiltered p={default_nprobe}, r={default_rerank} ({} queries)...",
-                q_correct.len(),
-            );
-            let default = mean_recall(
-                warm_reader,
-                column,
-                q_correct,
-                gt_correct,
-                k,
-                default_nprobe,
-                default_rerank,
-            );
-            eprintln!(
-                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
-            );
-            default_recall = Some(default);
+            if gt_correct.is_empty() {
+                // No brute-force ground truth was built (skip-calibration / no
+                // corpus). Recall is not measured — render "—", not a bogus 0.000.
+                eprintln!(
+                    "[{log_prefix}] skip-calibration: p={default_nprobe}, r={default_rerank} \
+                     — no ground truth, recall not measured",
+                );
+                default_recall = None;
+            } else {
+                eprintln!(
+                    "[{log_prefix}] skip-calibration: VectorSearchOptions::default() → unfiltered p={default_nprobe}, r={default_rerank} ({} queries)...",
+                    q_correct.len(),
+                );
+                let default = mean_recall(
+                    warm_reader,
+                    column,
+                    q_correct,
+                    gt_correct,
+                    k,
+                    default_nprobe,
+                    default_rerank,
+                );
+                eprintln!(
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
+                );
+                default_recall = Some(default);
+            }
         } else {
             eprintln!(
                 "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
