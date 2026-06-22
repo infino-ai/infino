@@ -594,11 +594,17 @@ fn metric_from_id(id: u8) -> Result<Metric, String> {
 }
 
 /// One Sq8+ε row carried through SPFresh maintenance without fp32 reconstruction.
+///
+/// `scale`/`offset` are the per-cluster dequant params (length `dim`), identical
+/// for every row in a cluster, so they are stored as a shared `Arc<[f32]>`: all
+/// rows decoded from one cluster point at a single backing buffer instead of each
+/// carrying its own `dim`-length copy. At dim=1024 that is ~8 KiB/row of
+/// duplication removed — material when a drain materializes millions of rows.
 #[derive(Debug, Clone)]
 pub struct EncodedCellRow {
     pub stable_id: i128,
-    pub scale: Vec<f32>,
-    pub offset: Vec<f32>,
+    pub scale: std::sync::Arc<[f32]>,
+    pub offset: std::sync::Arc<[f32]>,
     pub codes: Vec<u8>,
     pub residuals: Vec<u8>,
     pub norm_sq: Option<f32>,
@@ -636,7 +642,7 @@ pub(crate) fn cluster_quant_from_medoid(
     debug_assert!(!bucket.is_empty());
     let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
     let mid = medoid_index_symmetric(metric, dim, &encoded);
-    (encoded[mid].scale.clone(), encoded[mid].offset.clone())
+    (encoded[mid].scale.to_vec(), encoded[mid].offset.to_vec())
 }
 
 /// Copy or Sq8-transcode one row into `out` (`[codes | residuals]`, length `2·dim`).
@@ -852,6 +858,10 @@ pub fn load_encoded_rows_from_blob(
     let mut row_idx = 0usize;
     let mut out = Vec::new();
     for posting in &postings {
+        // One shared backing per segment — every row in this segment clones the
+        // Arc (a refcount bump), not the dim-length scale/offset buffers.
+        let scale_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(posting.scale.as_slice());
+        let offset_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(posting.offset.as_slice());
         for local_row in 0..posting.ids.len() {
             if deleted.is_some_and(|bm| bm.contains(posting.ids[local_row])) {
                 row_idx += 1;
@@ -867,8 +877,8 @@ pub fn load_encoded_rows_from_blob(
             let norm_sq = posting.per_doc_norms.as_ref().map(|norms| norms[local_row]);
             out.push(EncodedCellRow {
                 stable_id: stable_ids[row_idx],
-                scale: posting.scale.clone(),
-                offset: posting.offset.clone(),
+                scale: scale_arc.clone(),
+                offset: offset_arc.clone(),
                 codes,
                 residuals,
                 norm_sq,
@@ -907,6 +917,46 @@ mod tests {
         let hits = search_blob(&blob, &q, 5).expect("search");
         assert_eq!(hits.len(), 5);
         assert_eq!(hits[0].0, 31);
+    }
+
+    #[test]
+    fn loaded_rows_share_one_scale_offset_backing_per_segment() {
+        // The drain materializes millions of EncodedCellRows; scale/offset are
+        // per-cluster (length `dim`), so rows of one segment must share a single
+        // Arc<[f32]> backing rather than each carrying its own copy. Per-row
+        // copies would give one distinct pointer per row.
+        let dim = 8usize;
+        let n = 16u32;
+        let mut ids = Vec::new();
+        let mut vecs = Vec::new();
+        for i in 0..n {
+            ids.push(i);
+            for d in 0..dim {
+                vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
+            }
+        }
+        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
+        let stable_ids: Vec<i128> = (0..n as i128).collect();
+        let rows = load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load");
+        assert_eq!(rows.len(), n as usize);
+        assert_eq!(rows[0].scale.len(), dim, "scale is per-dim, not per-row sized");
+
+        let distinct_scale: std::collections::HashSet<*const f32> =
+            rows.iter().map(|r| r.scale.as_ptr()).collect();
+        let distinct_offset: std::collections::HashSet<*const f32> =
+            rows.iter().map(|r| r.offset.as_ptr()).collect();
+        assert!(
+            distinct_scale.len() < rows.len(),
+            "scale backing not shared: {} distinct buffers for {} rows",
+            distinct_scale.len(),
+            rows.len()
+        );
+        assert!(
+            distinct_offset.len() < rows.len(),
+            "offset backing not shared: {} distinct buffers for {} rows",
+            distinct_offset.len(),
+            rows.len()
+        );
     }
 
     #[test]

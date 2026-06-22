@@ -1315,8 +1315,10 @@ impl VectorReader {
             let block = col.per_cluster_blocks_off + doc_off * stride;
             let doc_ids_at = block + count * code_bytes;
             let full_at = block + count * (code_bytes + id_bytes);
-            let sc = scale[c * dim..c * dim + dim].to_vec();
-            let of = offset[c * dim..c * dim + dim].to_vec();
+            // Shared per-cluster backing: each row clones the Arc (refcount bump),
+            // not the dim-length scale/offset buffers.
+            let sc: std::sync::Arc<[f32]> = std::sync::Arc::from(&scale[c * dim..c * dim + dim]);
+            let of: std::sync::Arc<[f32]> = std::sync::Arc::from(&offset[c * dim..c * dim + dim]);
             for i in 0..count {
                 let idb = doc_ids_at + i * id_bytes;
                 let local_id =
