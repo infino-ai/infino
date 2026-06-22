@@ -70,6 +70,7 @@ use futures::{
 };
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 use tokio::time::sleep;
 
 use super::{
@@ -104,7 +105,8 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::{
         SuperfileReader,
-        builder::SuperfileBuilder,
+        builder::{BuilderOptions, SuperfileBuilder},
+        stats::SuperfileStats,
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -134,7 +136,7 @@ use crate::{
             part::{self as part_mod, PartId},
             partition::{assign_partition, encode_partition_key},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{dispatch::open_compaction_input, vector::stable_ids_by_local_for_routing},
         reader_cache::DiskCacheStore,
     },
 };
@@ -300,7 +302,7 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
 
 /// Sq8+ε IVF rows aligned to scalar `_id` row order. Optional tombstone bitmap
 /// skips deleted locals (cell maintenance); incoming routing passes `None`.
-fn materialized_ivf_rows_in_doc_order(
+pub(in crate::supertable) fn materialized_ivf_rows_in_doc_order(
     vec_reader: &VectorReader,
     column: &str,
     stable_ids_by_local: &[i128],
@@ -2409,7 +2411,11 @@ async fn load_materialized_rows_from_ivf_superfile(
         .transpose()
         .map_err(|e| BuildError::Store(e.to_string()))?;
 
-    let reader = open_reader(&store, disk_cache, Some(storage), entry)
+    // Compaction re-reads each input's IVF subsection synchronously
+    // (`try_get_range_sync`), so the bytes must be mmap-resident — force
+    // promotion via `open_compaction_input` rather than the query path's lazy
+    // reader, whose bytes only go sync-available after a racing background fill.
+    let reader = open_compaction_input(&store, disk_cache, Some(storage), entry)
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
 
@@ -2441,6 +2447,88 @@ fn build_prepared_ivf_from_materialized(
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
     })
+}
+
+/// Rebuild ONE merged superfile from a set of user-table Sq8 IVF inputs:
+/// re-cluster the union of Sq8+residual rows into a fresh IVF and rebuild FTS
+/// from each input's record batch.
+///
+/// User-table superfiles are independently clustered per commit (so they don't
+/// share `n_cent`) and may carry an FTS index, which is why the index-aligned
+/// byte-splice merge (`build_from_sq8_ivf_readers`) does not apply here. Instead
+/// this feeds the materialized Sq8 rows through `load_materialized_ivf_rows` —
+/// `SuperfileBuilder::finish` re-clusters them into a single fresh IVF whose
+/// `n_cent` is derived from the union row count — and rebuilds FTS by routing
+/// each input's record-batch text columns through `add_batch_fts_and_scalar`.
+/// No fp32 reconstruction: the Sq8+residual bytes are carried through verbatim.
+///
+/// `readers` is index-aligned with `entries` (same input order).
+pub(in crate::supertable) async fn rebuild_sq8_superfile_from_readers(
+    inner: &SupertableInner,
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+    let column = inner
+        .options
+        .vector_columns
+        .first()
+        .ok_or_else(|| BuildError::Store("sq8 rebuild requires a vector column".into()))?
+        .column
+        .clone();
+    let first = &readers
+        .first()
+        .ok_or_else(|| BuildError::Store("sq8 rebuild requires at least one input".into()))?
+        .0;
+    let mut builder = SuperfileBuilder::new(BuilderOptions::new_from_reader(first))?;
+    let manifest = inner.manifest.load_full();
+
+    let mut all_rows: Vec<MaterializedIvfRow> = Vec::new();
+    let mut base: u32 = 0;
+    let mut stats_collector = Vec::with_capacity(readers.len());
+
+    for ((reader, bitmap), entry) in readers.iter().zip(entries) {
+        let rb = reader
+            .get_record_batch(bitmap.clone())
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        stats_collector.push(SuperfileStats::try_compute_from_record_batch(&rb)?);
+        let n = rb.num_rows() as u32;
+        // FTS + scalar for docs base..base+n. Vectors arrive below via
+        // `load_materialized_ivf_rows`, so this routes only FTS + the cursor.
+        builder.add_batch_fts_and_scalar(&rb)?;
+
+        let stable_ids = stable_ids_by_local_for_routing(&manifest, entry, reader)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let vec_reader = reader
+            .vec()
+            .ok_or_else(|| BuildError::Store("sq8 rebuild input missing vector index".into()))?;
+        let mut rows =
+            materialized_ivf_rows_in_doc_order(vec_reader, &column, &stable_ids, bitmap.as_deref())?;
+
+        // The j-th kept vector row corresponds to the j-th record-batch row
+        // (both tombstone-filtered, in doc order), so re-assign the local doc id
+        // by Vec position rather than the original id.
+        if rows.len() as u32 != n {
+            return Err(BuildError::Store(format!(
+                "sq8 rebuild: vector rows {} != scalar rows {} for one input",
+                rows.len(),
+                n
+            )));
+        }
+        for (j, row) in rows.iter_mut().enumerate() {
+            row.local_doc_id = base + j as u32;
+        }
+        all_rows.append(&mut rows);
+        base += n;
+    }
+
+    if all_rows.is_empty() {
+        return Ok((Vec::new(), SuperfileStats::from_children(&stats_collector)));
+    }
+    builder.load_materialized_ivf_rows(all_rows)?;
+    let bytes = builder.finish()?;
+    let stats = SuperfileStats::from_children(&stats_collector);
+    Ok((bytes, stats))
 }
 
 /// Lloyd iterations for an overlap-region re-cluster — matches the per-cell IVF

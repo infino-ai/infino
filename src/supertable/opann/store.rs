@@ -168,4 +168,46 @@ mod tests {
         write_pages(&storage, &split).await.expect("first write");
         write_pages(&storage, &split).await.expect("idempotent rewrite");
     }
+
+    #[tokio::test]
+    async fn multi_version_pages_load_consistently() {
+        // The bench writes a fresh tree on every commit into the same store
+        // (16 commits). Pages are content-addressed, so versions share unchanged
+        // pages and accumulate the changed ones; loading the *latest* root must
+        // still descend cleanly — no content-hash mismatch, no missing page.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("local fs");
+        let (dim, n) = (24usize, 200usize);
+        let mut latest: Option<(crate::supertable::manifest::part::ContentHash, usize)> = None;
+        for round in 0..16u32 {
+            let mut cells = synth_cells(n, dim);
+            // Perturb so each round's tree (and its pages) differ, like the
+            // shifting cell centroids/radii across successive commits.
+            for (i, cell) in cells.iter_mut().enumerate() {
+                cell.0[i % dim] += round as f32 * 0.017;
+            }
+            let tree = build_tree(Metric::L2Sq, dim, &cells).expect("tree");
+            let split = tree.to_pages(8);
+            write_pages(&storage, &split).await.expect("write");
+            latest = Some((split.root, split.pages.len()));
+        }
+        let (root, n_pages) = latest.expect("root");
+        let source = load_resident(&storage, root)
+            .await
+            .expect("load latest root from accumulated multi-version store");
+        assert_eq!(
+            source.len(),
+            n_pages,
+            "latest root must reach exactly its own page set"
+        );
+        let paged = PagedTree::new(source, root);
+        for &t in &[0usize, 37, 99, 199] {
+            let q: Vec<f32> = (0..dim)
+                .map(|d| (((t * 31 + d * 7 + 3) % 101) as f32) / 50.0 - 1.0)
+                .collect();
+            paged
+                .select_probes(&q, n)
+                .expect("descend without content-hash mismatch");
+        }
+    }
 }

@@ -555,6 +555,46 @@ impl SuperfileBuilder {
             }
         }
 
+        // Route vectors. This block does NOT read `next_local_doc_id`, so
+        // routing it before the FTS + cursor-advance step (which `add_batch_fts_and_scalar`
+        // performs and which uses `next_local_doc_id` as its pre-advance base)
+        // preserves the original observable behavior of `add_batch`.
+        if let Some(vb) = self.vec_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    vb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
+        } else if let Some(cb) = self.cell_posting_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    cb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
+        }
+
+        self.add_batch_fts_and_scalar(batch)
+    }
+
+    /// `add_batch` minus the vector payload: validates the batch schema, routes
+    /// the FTS columns (`fb.add_doc(col_id, next_local_doc_id + row, text)`),
+    /// advances the local-doc cursor, and pushes the batch. Used by the Sq8
+    /// rebuild merge in compaction, where the vectors arrive separately via
+    /// [`Self::load_materialized_ivf_rows`] (rebuilt from each input's
+    /// `load_materialized_ivf_rows` rows) rather than as `&[&[f32]]` slices.
+    pub(crate) fn add_batch_fts_and_scalar(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<(), BuildError> {
+        if batch.schema().fields() != self.opts.schema.fields() {
+            return Err(BuildError::BatchSchemaMismatch);
+        }
+        let n_rows = batch.num_rows() as u32;
+
         // Route FTS columns. Pull each column's LargeStringArray once.
         if let Some(fb) = self.fts_builder.as_mut() {
             for (col_id, &schema_idx) in self.fts_col_idxs.iter().enumerate() {
@@ -573,25 +613,6 @@ impl SuperfileBuilder {
                         strs.value(row)
                     };
                     fb.add_doc(col_id as u32, local_doc_id, text)?;
-                }
-            }
-        }
-
-        // Route vectors.
-        if let Some(vb) = self.vec_builder.as_mut() {
-            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
-                let dim = vc.dim;
-                for row in 0..(n_rows as usize) {
-                    let start = row * dim;
-                    vb.add(i as u32, &vectors[i][start..start + dim])?;
-                }
-            }
-        } else if let Some(cb) = self.cell_posting_builder.as_mut() {
-            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
-                let dim = vc.dim;
-                for row in 0..(n_rows as usize) {
-                    let start = row * dim;
-                    cb.add(i as u32, &vectors[i][start..start + dim])?;
                 }
             }
         }

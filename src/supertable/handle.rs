@@ -848,12 +848,12 @@ const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
 /// ~one compact superfile per cell instead of many shard-sized files.
 /// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
 pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
-    !opts.vector_columns.is_empty()
-        && opts.fts_columns.is_empty()
-        && matches!(
-            opts.partition_strategy,
-            Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
-        )
+    // Explicit identity, set at construction by `build_vector_index_options`.
+    // (Previously sniffed `partition_strategy == VectorCell` — a spfresh-era
+    // heuristic that lived in the manifest, not these options, so it was always
+    // false here and sent hidden-index compaction down the user index-merge
+    // path instead of re-clustering.)
+    opts.is_hidden_vector_index
 }
 
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
@@ -953,7 +953,8 @@ fn build_vector_index_options(
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
+        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD)
+        .as_hidden_vector_index();
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }

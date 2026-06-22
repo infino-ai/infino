@@ -40,14 +40,15 @@ use crate::{
         manifest::Manifest,
         opann::maintenance::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups},
         options::SupertableOptions,
-        query::dispatch::open_reader,
+        query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, recluster_cells, try_commit_attempt,
+            prepare_superfile, rebuild_sq8_superfile_from_readers, recluster_cells,
+            try_commit_attempt,
         },
     },
 };
@@ -403,7 +404,15 @@ impl Supertable {
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
             let open_fut = async {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
+                // Compaction reads each input synchronously (IVF subsection via
+                // `try_get_range_sync`, id column via `get_record_batch`), so its
+                // bytes must be mmap-resident — not the query path's lazy reader,
+                // whose bytes only go sync-available after a racing background
+                // promotion. `open_compaction_input` forces mmap promotion
+                // (NVMe-backed, paged, budget-bounded — not a heap load).
+                let r =
+                    open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+                        .await;
                 (entry.superfile_id, r)
             };
             superfile_readers_fut.push(open_fut);
@@ -441,7 +450,12 @@ impl Supertable {
                 })
             });
             if sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
+                rebuild_sq8_superfile_from_readers(
+                    self.inner().as_ref(),
+                    &readers_with_tombstones,
+                    superfiles,
+                )
+                .await?
             } else {
                 SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
             }

@@ -291,6 +291,17 @@ pub struct SupertableOptions {
     /// creation have no effect.
     pub partition_strategy: Option<PartitionStrategy>,
     pub(crate) vector_layout: VectorLayout,
+    /// True only for the hidden vector-index sibling table built by
+    /// `build_vector_index_options` — never for a user table. It is the
+    /// explicit identity signal the compaction dispatch keys off: the hidden
+    /// index consolidates by re-clustering (`recluster_cells`), never by the
+    /// user index-aligned IVF merge. Replaces a fragile heuristic that sniffed
+    /// `partition_strategy == VectorCell` (a leftover from the spfresh cell-split
+    /// design) — which lives in the manifest, not these options, so the sniff
+    /// was always false here. Deliberately excluded from `compute_options_hash`
+    /// (a role marker, not a data config), so it never trips the options-drift
+    /// guard on reopen.
+    pub(crate) is_hidden_vector_index: bool,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -518,6 +529,7 @@ impl SupertableOptions {
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             vector_layout: VectorLayout::Ivf,
+            is_hidden_vector_index: false,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
@@ -683,6 +695,15 @@ impl SupertableOptions {
     /// single-bucket Hash default.
     pub fn with_partition_strategy(mut self, strategy: PartitionStrategy) -> Self {
         self.partition_strategy = Some(strategy);
+        self
+    }
+
+    /// Mark these options as the hidden vector-index sibling table (set only by
+    /// `build_vector_index_options`). The compaction dispatch reads this to
+    /// consolidate by re-clustering (`recluster_cells`) instead of the user
+    /// index-aligned IVF merge.
+    pub(crate) fn as_hidden_vector_index(mut self) -> Self {
+        self.is_hidden_vector_index = true;
         self
     }
 
