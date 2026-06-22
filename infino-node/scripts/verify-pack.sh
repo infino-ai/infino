@@ -27,12 +27,19 @@ cd "$ROOT"
 PKG_NAME="$(node -p "require('./package.json').name")"
 BIN_NAME="$(node -p "require('./package.json').napi.name")"
 
-# Host platform in napi's node-platform naming (glibc Linux only).
+# Host platform in napi's node-platform naming.
 PLATFORM="$(node -p 'process.platform')"
 ARCH="$(node -p 'process.arch')"
 case "$PLATFORM" in
   darwin) TRIPLE="darwin-${ARCH}" ;;
-  linux)  TRIPLE="linux-${ARCH}-gnu" ;;
+  linux)
+    # glibc vs musl (Alpine) — napi names the binary/package per libc. Detect it
+    # the same way napi's loader does: glibcVersionRuntime is absent under musl.
+    if node -e 'try{process.exit(process.report.getReport().header.glibcVersionRuntime?0:1)}catch{process.exit(1)}'; then
+      TRIPLE="linux-${ARCH}-gnu"
+    else
+      TRIPLE="linux-${ARCH}-musl"
+    fi ;;
   *) echo "verify-pack: unsupported host platform '$PLATFORM'" >&2; exit 1 ;;
 esac
 PKG_DIR="npm/${TRIPLE}"

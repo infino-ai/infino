@@ -27,10 +27,11 @@ npm install infino
 A prebuilt native binary is selected automatically at install time — no Rust
 toolchain required. Supported platforms:
 
-| Platform      | Architectures |
-| ------------- | ------------- |
-| macOS         | x64, arm64    |
-| Linux (glibc) | x64, arm64    |
+| Platform              | Architectures |
+| --------------------- | ------------- |
+| macOS                 | x64, arm64    |
+| Linux (glibc)         | x64, arm64    |
+| Linux (musl / Alpine) | x64, arm64    |
 
 `apache-arrow` is installed as a dependency and used at the boundary (passing in
 `Table`s, or `{ arrow: true }` results). Requires Node.js >= 18.

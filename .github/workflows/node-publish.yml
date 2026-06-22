@@ -29,14 +29,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # One native runner per target — `make node-build` builds for the host,
-      # no cross-compilation. These four cover every published platform.
+      # glibc + macOS build natively, one runner per target (`make node-build`
+      # builds for the host). musl (Alpine) has no native GitHub runner, so it
+      # builds inside the napi-rs Alpine image where the system `cc` is musl —
+      # the crate has C-based deps (e.g. zstd), so a native musl toolchain is
+      # simpler and more reliable than cross-compiling from glibc.
       matrix:
         include:
           - { os: ubuntu-latest, target: linux-x64-gnu }
           - { os: ubuntu-24.04-arm, target: linux-arm64-gnu }
           - { os: macos-15-intel, target: darwin-x64 }
           - { os: macos-14, target: darwin-arm64 }
+          - { os: ubuntu-latest, target: linux-x64-musl, musl: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: linux-arm64-musl, musl: aarch64-unknown-linux-musl }
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -50,14 +55,43 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
+      # --- native build (glibc / macOS) ---
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.musl }}
       - uses: actions/setup-node@v4
+        if: ${{ !matrix.musl }}
         with:
           node-version: "20"
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.musl }}
         with:
           workspaces: infino-node
-      - run: make node-build
+      - name: Build addon (native)
+        if: ${{ !matrix.musl }}
+        run: make node-build
+      # Smoke-test the AS-SHIPPED package on this platform: pack the tarballs,
+      # install them into a throwaway project, and run a real query — proving the
+      # loader resolves the per-platform binary from a clean install (not the
+      # sibling build `npm test` uses). Reuses the build above (no rebuild).
+      - name: Verify packaged binary (native)
+        if: ${{ !matrix.musl }}
+        run: make node-verify
+      # --- musl build (Alpine, via the napi-rs builder image; cc is musl) ---
+      # Runs on the host runner (so the disk-free step above still applies) but
+      # compiles inside Alpine, where the target arch matches the runner arch —
+      # so this is a native musl build, not a cross-compile. Same install→load→
+      # query smoke-test as the native legs, run inside the container (bash is
+      # not in the base image, so add it for verify-pack.sh).
+      - name: Build addon (musl, in Alpine) + verify packaged binary
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD:/build" -w /build/infino-node \
+            ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine \
+            sh -c "apk add --no-cache bash >/dev/null && \
+                   npm install && \
+                   npx napi build --platform --release --strip --target ${{ matrix.musl }} --js native.js --dts native.d.ts infino && \
+                   npx tsc && \
+                   bash ./scripts/verify-pack.sh"
       - name: Upload addon
         uses: actions/upload-artifact@v4
         with:
