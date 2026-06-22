@@ -618,7 +618,7 @@ pub(crate) fn encode_sq8_residual_dim(
     (eps.to_le_bytes()[0], norm_contrib)
 }
 
-/// One Sq8+ε row carried through SPFresh maintenance without fp32 reconstruction.
+/// One Sq8+ε row carried through hidden-index maintenance without fp32 reconstruction.
 #[derive(Debug, Clone)]
 pub struct EncodedCellRow {
     pub stable_id: i128,

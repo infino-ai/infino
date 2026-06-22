@@ -270,19 +270,30 @@ pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
-/// PUT pre-encoded part bytes to storage.
+/// Conditional-create PUT of an immutable, content-addressed blob. A blob whose
+/// object already exists (identical content from a racing or retried writer) is
+/// a benign collision and treated as success. This is the one write primitive
+/// shared by manifest parts and OPANN routing pages — both are blake3-named
+/// immutable objects written in the commit's parallel pre-pointer wave.
+pub(crate) async fn put_immutable_blob(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    match storage.put_atomic(uri, bytes).await {
+        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// PUT pre-encoded part bytes to storage at their content-addressed URI.
 pub(crate) async fn write_part_bytes(
     storage: &dyn StorageProvider,
     encoded: &[u8],
 ) -> Result<(), CommitError> {
     let uri = part_uri(&ContentHash::of(encoded));
-    match storage
-        .put_atomic(&uri, Bytes::copy_from_slice(encoded))
-        .await
-    {
-        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    put_immutable_blob(storage, &uri, Bytes::copy_from_slice(encoded)).await?;
+    Ok(())
 }
 
 /// Encode + write a manifest list. Conditional-create

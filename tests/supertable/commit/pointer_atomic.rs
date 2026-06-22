@@ -100,7 +100,7 @@ async fn commit_manifest(
         Some(new_list.clone()),
     );
     manifest
-        .write(storage.as_ref(), expected_prev_etag, &encoded_refs)
+        .write(storage.as_ref(), expected_prev_etag, &encoded_refs, &[])
         .await?;
 
     // Hand back the pointer the commit just published.

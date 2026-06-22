@@ -13,7 +13,6 @@
 
 use crate::supertable::{
     error::{CommitError, ManifestError},
-    handle::INCOMING_VECTOR_CELL,
     manifest::{SuperfileEntry, list::PartitionStrategy},
 };
 
@@ -207,10 +206,7 @@ pub fn assign_partition(
                             seg.uri.0
                         ),
                     })?;
-            // `INCOMING_VECTOR_CELL` (u32::MAX) is the reserved "incoming"
-            // append partition — deliberately outside `0..n_cells`. Real cells
-            // must stay in range.
-            if cell != INCOMING_VECTOR_CELL && cell >= n_cells {
+            if cell >= n_cells {
                 return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "VectorCell{{n_cells:{n_cells}}} got partition_hint={cell} (out of range)"

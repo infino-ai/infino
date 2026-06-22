@@ -35,7 +35,6 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
@@ -45,6 +44,7 @@ use std::{
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::DataType;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -69,8 +69,9 @@ use crate::{
         error::ManifestError,
         manifest::{
             commit::{
-                EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
-                translate_contention, write_manifest_list, write_part_bytes, write_pointer,
+                EncodedPart, PointerFile, frame_content_size, part_uri, put_immutable_blob,
+                read_pointer, translate_contention, write_manifest_list, write_part_bytes,
+                write_pointer,
             },
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
@@ -606,23 +607,30 @@ impl Manifest {
         storage: &dyn StorageProvider,
         expected_prev_etag: Option<&str>,
         parts_to_write: &[&[u8]],
+        page_blobs: &[(String, Bytes)],
     ) -> Result<(), CommitError> {
         let Some(list_to_write) = self.list.as_ref() else {
             return Ok(());
         };
-        // Step 1+2: parallel write of (list, parts).
+        // Step 1+2: parallel write of (list, parts, OPANN routing pages).
         //
-        // Both futures are independent — the list's references to
-        // each part's URI are content-addressable from the
-        // in-memory bytes before any I/O, so there's no
-        // happens-before edge between them.
+        // All are independent — the list's references to each part's URI (and
+        // the OPANN root's reference to its page hashes) are content-addressable
+        // from the in-memory bytes before any I/O, so there's no happens-before
+        // edge between them. The pages ride the same wave as the parts because
+        // they are the same kind of object: blake3-named immutable blobs that
+        // must exist before the pointer makes the new manifest visible.
         let list_fut = write_manifest_list(storage, list_to_write);
         let part_futs = parts_to_write
             .iter()
             .map(|encoded| write_part_bytes(storage, encoded));
         let part_join = future::join_all(part_futs);
+        let page_futs = page_blobs
+            .iter()
+            .map(|(uri, bytes)| put_immutable_blob(storage, uri, bytes.clone()));
+        let page_join = future::join_all(page_futs);
 
-        let (list_res, part_results) = tokio::join!(list_fut, part_join);
+        let (list_res, part_results, page_results) = tokio::join!(list_fut, part_join, page_join);
         // Translate `Storage(PreconditionFailed)` from sub-writes
         // into `WriteContentionExhausted` so callers (and the
         // writer's OCC retry loop) can match on one variant
@@ -630,6 +638,9 @@ impl Manifest {
         let list_res = list_res.map_err(translate_contention)?;
         for part_result in part_results {
             part_result.map_err(translate_contention)?;
+        }
+        for page_result in page_results {
+            page_result.map_err(|e| translate_contention(e.into()))?;
         }
 
         // Step 3: build pointer.
@@ -684,18 +695,24 @@ impl Manifest {
         }
     }
 
+    /// All candidate superfiles for a vector query (no vector-distance prune).
+    ///
+    /// OPANN routes the unfiltered hot path through the resident routing tree
+    /// (`SupertableReader::vector_search_user_table_async`), so the old
+    /// fp32-envelope part scan is gone — superfile selection by vector distance
+    /// is the tree's job. This enumerates the full superfile set for the paths
+    /// that still need one without tree routing: the genuine user table
+    /// (storage-less / no hidden index) fallback and the text/SQL-filtered
+    /// vector paths, where every superfile may hold a matching row and per-
+    /// superfile pruning would risk dropping it. `column`/`query` are unused
+    /// (kept for call-site symmetry).
     pub(crate) async fn get_pruned_superfiles_for_vector(
         &self,
-        column: &str,
-        query: &[f32],
+        _column: &str,
+        _query: &[f32],
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        match &self.list {
-            Some(list) => {
-                let kept = list_prune::prune_parts_for_vector(list, column, query, f32::INFINITY);
-                hierarchical_iter::load_and_flatten(self, &kept).await
-            }
-            None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
-        }
+        // Empty leaves → no part pruning → every part's superfiles, in order.
+        self.get_pruned_superfiles(&[]).await
     }
 
     pub fn get_all_list_entries(&self) -> &[ManifestPartEntry] {
@@ -2000,63 +2017,6 @@ impl ClusterCentroids {
         self.cluster_distance(&kernel, c)
     }
 
-    /// Adaptive cell selection for hidden-index routing: score every populated
-    /// cell, apply the triangle-inequality lower bound (`d − r`), and return
-    /// the probe set (nearest-first by centroid distance).
-    pub fn select_cells_adaptive(
-        &self,
-        metric: Metric,
-        query: &[f32],
-        nprobe_floor: usize,
-        routing: list::CellRoutingParams,
-    ) -> Vec<u32> {
-        let dim = self.dim as usize;
-        if self.n_cent == 0 || dim == 0 || query.len() != dim {
-            return (0..self.n_cent).collect();
-        }
-        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(self.n_cent as usize);
-        self.score_clusters_into(metric, query, |c, score| {
-            scored.push((c, score));
-        });
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        if scored.is_empty() {
-            return Vec::new();
-        }
-        let d_star = scored[0].1;
-        let r_star = self.radii.get(scored[0].0 as usize).copied().unwrap_or(0.0);
-        let tau = if r_star > 0.0 {
-            d_star + routing.slack * r_star
-        } else {
-            d_star * (1.0 + routing.slack)
-        };
-        let lb = |idx: usize| {
-            let (c, d) = scored[idx];
-            let r = self.radii.get(c as usize).copied().unwrap_or(0.0);
-            (d - r).max(0.0)
-        };
-        let nprobe_min = nprobe_floor.max(routing.nprobe_min).max(1);
-        let nprobe_max = routing.nprobe_max.max(nprobe_min);
-        let n = scored.len();
-        let floor = nprobe_min.min(n);
-        let mut chosen = vec![false; n];
-        let mut order: Vec<usize> = Vec::with_capacity(nprobe_max.min(n));
-        for (i, slot) in chosen.iter_mut().enumerate().take(floor) {
-            *slot = true;
-            order.push(i);
-        }
-        let mut by_lb: Vec<usize> = (0..n).filter(|&i| !chosen[i]).collect();
-        by_lb.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
-        for i in by_lb {
-            if order.len() >= nprobe_max {
-                break;
-            }
-            if lb(i) <= tau {
-                order.push(i);
-            }
-        }
-        order.sort_unstable();
-        order.into_iter().map(|i| scored[i].0).collect()
-    }
 
     /// Score every populated cluster against `query` through the single
     /// Sq8+residual scorer ([`Sq8ResidualKernel`]) — the same kernel used for
@@ -2189,8 +2149,8 @@ mod tests {
     /// (the prior selection path) up to f32 association order, for all
     /// three metrics, and must skip count-0 clusters.
     #[test]
-    fn cluster_centroids_radii_roundtrip_and_adaptive_floor() {
-        use crate::supertable::manifest::{encoding, list::CellRoutingParams};
+    fn cluster_centroids_radii_roundtrip_and_nearest_cell() {
+        use crate::supertable::manifest::encoding;
 
         let clusters = ClusterCentroids::from_fp32(
             Metric::L2Sq,
@@ -2206,16 +2166,11 @@ mod tests {
         let decoded = encoding::decode_cluster_centroids(&bytes).expect("decode");
         assert_eq!(decoded.radii, clusters.radii);
 
+        // The query sits next to cell 0; `nearest_cell` (the single
+        // Sq8+residual scorer, still used by the user-table VectorCell
+        // pre-shard) must route it there.
         let query = [0.1, 0.0, 0.0, 0.0];
-        let routing = CellRoutingParams {
-            nprobe_min: 2,
-            nprobe_max: 4,
-            slack: 0.0,
-        };
-        let routed = decoded.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
-        assert!(routed.len() >= 2);
-        assert!(routed.len() <= 4);
-        assert_eq!(routed[0], decoded.nearest_cell(Metric::L2Sq, &query));
+        assert_eq!(decoded.nearest_cell(Metric::L2Sq, &query), 0);
     }
 
     #[test]

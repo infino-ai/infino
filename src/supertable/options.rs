@@ -296,9 +296,9 @@ pub struct SupertableOptions {
     /// explicit identity signal the compaction dispatch keys off: the hidden
     /// index consolidates by re-clustering (`recluster_cells`), never by the
     /// user index-aligned IVF merge. Replaces a fragile heuristic that sniffed
-    /// `partition_strategy == VectorCell` (a leftover from the spfresh cell-split
-    /// design) — which lives in the manifest, not these options, so the sniff
-    /// was always false here. Deliberately excluded from `compute_options_hash`
+    /// `partition_strategy == VectorCell` — which lives in the manifest, not
+    /// these options, so the sniff was always false here. Deliberately excluded
+    /// from `compute_options_hash`
     /// (a role marker, not a data config), so it never trips the options-drift
     /// guard on reopen.
     pub(crate) is_hidden_vector_index: bool,

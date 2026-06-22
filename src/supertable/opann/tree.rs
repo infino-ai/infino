@@ -16,7 +16,7 @@
 //! **never** come from decoding stored Sq8 centroids back to fp32: cell
 //! centroids are read from the (mmap'd) manifest as Sq8+residual and stay that
 //! way, scored through the kernel against the fp32 query — exactly like
-//! `ClusterCentroids::select_cells_adaptive`. Reconstructing fp32 from stored
+//! `ClusterCentroids::score_clusters_into`. Reconstructing fp32 from stored
 //! bytes would bypass the mmap'd manifest and is not allowed.
 //!
 //! This is the in-memory structure + descent (Phase 1). The paged,
@@ -33,6 +33,7 @@ use crate::superfile::vector::distance::Metric;
 use crate::supertable::manifest::ClusterCentroids;
 use crate::supertable::manifest::part::ContentHash;
 
+#[cfg(test)]
 use super::descent::best_first;
 use super::paged::SplitPages;
 use super::page::{ChildLink, NodeTopo, encode_page};
@@ -127,6 +128,11 @@ impl CentroidTree {
     /// `n_probe` leaves reached are the routed cells (their ancestors are the
     /// nearest routing points). Approximate by design — `n_probe` is the recall
     /// knob; the caller GETs one object per returned cell.
+    ///
+    /// Test-only: production descent runs over the paged on-disk form
+    /// ([`super::paged::PagedTree::select_probes`]); this in-memory descent is
+    /// the oracle the page round-trip tests compare against.
+    #[cfg(test)]
     pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(u128, f32)> {
         if n_probe == 0 || self.nodes.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
@@ -155,6 +161,10 @@ impl CentroidTree {
     /// `encode_cluster_centroids`; the topology leg adds only each node's kind
     /// and child ids. Round-trips through [`super::page::Page`] to an identical
     /// descent.
+    ///
+    /// Test-only: production serializes through the multi-page splitter
+    /// ([`Self::to_pages`]); this single-page form is the round-trip oracle.
+    #[cfg(test)]
     pub(crate) fn to_page_bytes(&self) -> Vec<u8> {
         let topo: Vec<NodeTopo> = self
             .nodes
@@ -264,7 +274,9 @@ impl CentroidTree {
     }
 
     /// Distance from `query` to node `node`'s centroid via the single
-    /// Sq8+residual scorer.
+    /// Sq8+residual scorer. Test-only — used by the in-memory [`Self::select_probes`]
+    /// oracle; production descent scores off the paged form.
+    #[cfg(test)]
     #[inline]
     fn score(&self, node: u32, query: &[f32]) -> f32 {
         self.centroids.score_one(self.metric, node as usize, query)

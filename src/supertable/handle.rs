@@ -148,9 +148,6 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
-    /// One-shot partition strategy for the next hidden-index commit
-    /// (synced from the user table's trained global centroids).
-    pub(super) pending_partition_strategy: Mutex<Option<super::manifest::list::PartitionStrategy>>,
 }
 
 impl Drop for SupertableInner {
@@ -807,20 +804,8 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Default number of global vector-index cells for routed search.
-pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
-
-/// Reserved VectorCell partition id for the hidden index's "incoming" append
-/// region. Each hidden commit writes one IVF superfile under this sentinel
-/// partition holding that whole batch (all cells mixed, unsorted). Queries
-/// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles; background SPFresh maintenance later routes incoming into the
-/// per-cell IVF superfiles and deletes it. `u32::MAX` is out of the
-/// valid cell range `0..n_cent`, so it never collides with a real cell.
-pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
-
-/// Lloyd iterations when folding per-superfile cluster centroids into the
-/// global cell grid at open/create time.
+/// Lloyd iterations when training a hidden commit's vector-local partition
+/// centroids (k-means over the commit batch at the ingestion surface).
 pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
@@ -849,7 +834,7 @@ const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
 /// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
 pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
     // Explicit identity, set at construction by `build_vector_index_options`.
-    // (Previously sniffed `partition_strategy == VectorCell` — a spfresh-era
+    // (Previously sniffed `partition_strategy == VectorCell` — a fragile
     // heuristic that lived in the manifest, not these options, so it was always
     // false here and sent hidden-index compaction down the user index-merge
     // path instead of re-clustering.)
@@ -862,22 +847,6 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
         min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
         max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
     }
-}
-
-pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
-    let strategy = inner
-        .pending_partition_strategy
-        .lock()
-        .expect("pending_partition_strategy mutex poisoned")
-        .take();
-    let Some(strategy) = strategy else {
-        return false;
-    };
-    let current = inner.manifest.load_full();
-    inner
-        .manifest
-        .store(Arc::new(current.with_partition_strategy(strategy)));
-    true
 }
 
 pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
@@ -982,7 +951,6 @@ async fn build_handle(
         handle_id,
         vector_index_table,
         last_pointer_check: Mutex::new(None),
-        pending_partition_strategy: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

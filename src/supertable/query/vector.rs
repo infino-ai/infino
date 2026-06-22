@@ -88,10 +88,10 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     storage::StorageProvider,
-    superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
+    superfile::{SuperfileReader, fts::reader::BoolMode},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        handle::{Supertable, SupertableReader},
         manifest::{Manifest, SuperfileEntry, SuperfileUri, part::PartId},
         opann::paged::PagedTree,
         tombstones::SidecarCache,
@@ -111,9 +111,59 @@ pub struct VectorFilter<'a> {
     pub mode: BoolMode,
 }
 
-enum Probe {
-    Clusters(Vec<u32>),
-    Nprobe,
+/// Radius-aware adaptive probe selection (§7.3): the set of partition cells to
+/// fetch for a query, from each candidate's centroid distance `d` and its
+/// partition's covering radius `r`. Restores the removed `select_cells_adaptive`
+/// behavior over the OPANN tree's descended candidates:
+///
+/// - always probe the `nprobe_min` nearest cells (a recall floor);
+/// - then admit any further cell whose radius-aware lower bound
+///   `lb = (d − r).max(0)` is within `τ = d* + slack·r*` (`d*`/`r*` = the nearest
+///   cell's distance/radius), in ascending-`lb` order, up to `nprobe_max`.
+///
+/// The lower bound is the point: a far-centroid but large-radius partition can
+/// still hold a true neighbor, and ranking purely by centroid distance drops it.
+/// A cell with no recorded radius falls back to a distance-only bound.
+fn adaptive_probe_cells(
+    candidates: Vec<(u128, f32)>,
+    radius_of: &HashMap<u128, f32>,
+    nprobe_min: usize,
+    nprobe_max: usize,
+    slack: f32,
+) -> HashSet<u128> {
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let mut scored = candidates;
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    let radius = |cell: u128| radius_of.get(&cell).copied().unwrap_or(0.0);
+    let lb = |i: usize| {
+        let (cell, d) = scored[i];
+        (d - radius(cell)).max(0.0)
+    };
+    let (c0, d_star) = scored[0];
+    let r_star = radius(c0);
+    let tau = if r_star > 0.0 {
+        d_star + slack * r_star
+    } else {
+        d_star * (1.0 + slack)
+    };
+    let nprobe_min = nprobe_min.max(1);
+    let nprobe_max = nprobe_max.max(nprobe_min);
+    let n = scored.len();
+    let floor = nprobe_min.min(n);
+    let mut chosen: HashSet<u128> = scored[..floor].iter().map(|(c, _)| *c).collect();
+    let mut rest: Vec<usize> = (floor..n).collect();
+    rest.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
+    for i in rest {
+        if chosen.len() >= nprobe_max {
+            break;
+        }
+        if lb(i) <= tau {
+            chosen.insert(scored[i].0);
+        }
+    }
+    chosen
 }
 
 /// Whether every hit already references a superfile in the user manifest.
@@ -410,101 +460,21 @@ impl SupertableReader {
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let filtered = allow.is_some();
-        let (nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
 
-        // ---- Global cross-superfile cluster selection.
+        // The caller already chose the superfiles to probe — the OPANN tree
+        // descent for the hidden index, or the candidate enumeration for the
+        // filtered user-table paths. There is NO cross-superfile cluster
+        // re-ranking here: each kept superfile is probed directly with its own
+        // within-superfile IVF `nprobe` + rerank. (Routing across superfiles
+        // lives in the tree now, not in a second per-cluster scoring pass over
+        // the manifest summaries.)
         //
-        // Each kept superfile's manifest summary carries its per-cluster
-        // (Sq8) centroids. Rank every (superfile, cluster) by centroid
-        // distance to the query and probe only the globally-closest
-        // clusters — so a query touches just the superfiles that own a
-        // near cluster, instead of running `nprobe` in every superfile.
-        // (A single per-superfile centroid can't do this: a time-ordered
-        // superfile is a broad mix, so its mean sits near the global
-        // centroid. Per-cluster centroids are fine-grained enough to
-        // rank.) A superfile whose summary has no cluster centroids falls
-        // back to a normal per-superfile `nprobe` probe — never dropped.
-        let metric = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
-
-        let mut scored: Vec<(usize, u32, f32)> = Vec::new();
-        let mut fallback: Vec<usize> = Vec::new();
-        // Cross-superfile cluster scoring via the single Sq8+residual kernel
-        // (`ClusterCentroids::score_clusters_into`): one kernel per superfile
-        // summary, one `distance_with_norm` per cluster — no fp32 centroid.
-        for (si, entry) in superfiles.iter().enumerate() {
-            // Filtered search: a superfile whose predicate matched no row
-            // (absent from `allow`) is dropped here — it never scores a
-            // cluster, never enters the fan-out, and issues zero GETs.
-            if allow.as_ref().is_some_and(|m| !m.contains_key(&entry.uri)) {
-                continue;
-            }
-            match entry.vector_summary.get(column) {
-                Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
-                    vs.clusters.score_clusters_into(metric, query, |c, score| {
-                        scored.push((si, c, score));
-                    });
-                }
-                _ => fallback.push(si),
-            }
-        }
-
-        // Global probe budget: the closest `nprobe × (eligible superfiles)`
-        // clusters — the same total probe count as the old per-superfile
-        // `nprobe`, but selected globally, so near superfiles get more
-        // probes and far superfiles are skipped entirely. (Stage-4 recall
-        // tuning may lower this.) Eligible = superfiles that actually
-        // scored a cluster (filtered-out superfiles produce neither a
-        // scored cluster nor a fallback, so they don't inflate the
-        // budget).
-        let n_eligible = {
-            let mut segs: Vec<usize> = scored.iter().map(|&(si, _, _)| si).collect();
-            segs.sort_unstable();
-            segs.dedup();
-            segs.len()
-        };
-        let budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
-        if scored.len() > budget {
-            scored.select_nth_unstable_by(budget, |a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
-            });
-            scored.truncate(budget);
-        }
-        let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
-        for (si, c, _) in scored {
-            per_seg.entry(si).or_default().push(c);
-        }
-
-        // Build fan-out units: selected superfiles probe their chosen
-        // clusters; fallback superfiles probe `nprobe` normally; superfiles
-        // with centroids but no globally-selected cluster are skipped
-        // (the cross-superfile win). For filtered search each unit also
-        // carries its per-superfile allow-set (a superfile reaching here
-        // is guaranteed present in `allow` — empties were dropped above).
-        let fallback: HashSet<usize> = fallback.into_iter().collect();
-        // Look the allow-set up only for a superfile that is actually
-        // selected (scored a kept cluster, or is a fallback) — a superfile
-        // that survived vector pruning but whose predicate matched no row
-        // is absent from `allow`, and must never be probed. Resolving the
-        // bitmap eagerly for every entry would `expect`-panic on exactly
-        // those filtered-out superfiles; gating it behind the selection
-        // guards keeps the lookup on the path where presence is invariant.
-        let mut units: Vec<(Arc<SuperfileEntry>, (Probe, Option<Arc<RoaringBitmap>>))> = Vec::new();
-        for (si, entry) in superfiles.iter().enumerate() {
-            let probe = if let Some(ids) = per_seg.remove(&si) {
-                Probe::Clusters(ids)
-            } else if fallback.contains(&si) {
-                Probe::Nprobe
-            } else {
-                continue;
-            };
+        // For filtered search each unit carries its per-superfile allow-set; a
+        // superfile whose predicate matched no row (absent from `allow`) is
+        // dropped — it never enters the fan-out and issues zero GETs.
+        let mut units: Vec<(Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>)> = Vec::new();
+        for entry in &superfiles {
             let bitmap = match allow.as_ref() {
                 Some(m) => match m.get(&entry.uri) {
                     Some(bm) => Some(Arc::clone(bm)),
@@ -512,7 +482,7 @@ impl SupertableReader {
                 },
                 None => None,
             };
-            units.push((Arc::clone(entry), (probe, bitmap)));
+            units.push((Arc::clone(entry), bitmap));
         }
         if units.is_empty() {
             return Ok(Vec::new());
@@ -527,29 +497,16 @@ impl SupertableReader {
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
-        let kernel =
-            move |reader: Arc<SuperfileReader>,
-                  (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
-                let column = Arc::clone(&column_arc);
-                let query = Arc::clone(&query_arc);
-                async move {
-                    let res = match probe {
-                        Probe::Clusters(ids) => {
-                            reader
-                                .vector_search_clusters_filtered(
-                                    &column, &query, k, &ids, options, bitmap,
-                                )
-                                .await
-                        }
-                        Probe::Nprobe => {
-                            reader
-                                .vector_hits_filtered_async(&column, &query, k, options, bitmap)
-                                .await
-                        }
-                    };
-                    res.map_err(|e| QueryError::Parquet(e.to_string()))
-                }
-            };
+        let kernel = move |reader: Arc<SuperfileReader>, bitmap: Option<Arc<RoaringBitmap>>| {
+            let column = Arc::clone(&column_arc);
+            let query = Arc::clone(&query_arc);
+            async move {
+                reader
+                    .vector_hits_filtered_async(&column, &query, k, options, bitmap)
+                    .await
+                    .map_err(|e| QueryError::Parquet(e.to_string()))
+            }
+        };
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
@@ -861,38 +818,69 @@ impl SupertableReader {
             .opann_resident_tree()
             .await
             .map_err(|e| QueryError::Store(format!("opann tree load: {e}")))?;
-        let opann = manifest
-            .opann_routing()
-            .map(|r| (r.root_page, r.routing.nprobe_max));
+        let opann = manifest.opann_routing().map(|r| (r.root_page, r.routing));
         let superfiles = match (tree, opann) {
-            // OPANN (§10): descend the compute-resident Sq8 routing tree to the
-            // nearest cells, then keep only superfiles in those cells. Replaces
-            // the coarse fp32 `prune_parts_for_vector` envelope scan with the
-            // O(log n) tree descent.
-            (Some(source), Some((root, n_probe))) => {
-                let cells = PagedTree::new(source, root)
-                    .select_probes(query, n_probe)
+            // OPANN: descend the compute-resident Sq8 routing tree to the nearest
+            // partition leaves, then keep ONLY the hidden superfiles those leaves
+            // name (`cell_id == superfile_id.as_u128()`). One leaf per superfile;
+            // the descent's `cell_set` is authoritative — no `partition_hint`
+            // match, no always-scan, no keep-all fallback.
+            (Some(source), Some((root, routing))) => {
+                // Descend the resident tree for ALL candidate partition leaves
+                // (cell id + centroid distance), then choose the probe set by
+                // radius-aware adaptive admission (§7.3) rather than a fixed
+                // top-N: a far-centroid but large-radius partition can still hold
+                // a true neighbor, and pure centroid-distance ranking drops it.
+                let candidates = PagedTree::new(source, root)
+                    .select_probes(query, usize::MAX)
                     .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
-                let cell_set: HashSet<u32> = cells.into_iter().map(|(c, _)| c as u32).collect();
                 let part_ids: Vec<PartId> = manifest
                     .get_all_list_entries()
                     .iter()
                     .map(|e| e.part_id)
                     .collect();
-                hierarchical_iter::load_and_flatten(manifest, &part_ids)
+                let entries = hierarchical_iter::load_and_flatten(manifest, &part_ids)
                     .await
-                    .map_err(QueryError::ManifestLoad)?
-                    .into_iter()
-                    // Keep the routed cells plus the always-scanned "incoming"
-                    // superfiles (sentinel cell, not yet routed to a per-cell
-                    // IVF); a superfile with no cell hint is kept too, never
-                    // silently dropped.
-                    .filter(|sf| match sf.partition_hint {
-                        Some(h) => h == INCOMING_VECTOR_CELL || cell_set.contains(&h),
-                        None => true,
+                    .map_err(QueryError::ManifestLoad)?;
+                // Each candidate cell's covering radius is its partition's
+                // vector-summary radius (the same value stamped as the leaf
+                // radius at write — never decoded from a stored centroid).
+                let radius_of: HashMap<u128, f32> = entries
+                    .iter()
+                    .filter_map(|sf| {
+                        sf.vector_summary
+                            .get(column)
+                            .map(|vs| (sf.superfile_id.as_u128(), vs.radius))
                     })
+                    .collect();
+                // The search `nprobe` is the fetch budget (the cap); the floor
+                // and slack come from the routing record. With no search nprobe,
+                // fall back to the routing cap.
+                let cap = options.nprobe.unwrap_or(routing.nprobe_max);
+                let cell_set = adaptive_probe_cells(
+                    candidates,
+                    &radius_of,
+                    routing.nprobe_min,
+                    cap,
+                    routing.slack,
+                );
+                entries
+                    .into_iter()
+                    .filter(|sf| cell_set.contains(&sf.superfile_id.as_u128()))
                     .collect()
             }
+            // No tree. For the hidden vector index this means routing isn't
+            // published yet: only the in-process (pre-first-durable-commit) shape
+            // has data without a tree, and it has no manifest list to flatten —
+            // fall through to the flat path, which reads its in-memory
+            // superfiles. A durable hidden table always carries a tree, so a
+            // durable hidden table reaching here with a published list returns
+            // empty rather than brute-force scanning the whole index.
+            _ if manifest.options.is_hidden_vector_index && !manifest.is_in_process_only() => {
+                return Ok(Vec::new());
+            }
+            // Genuine user table (no hidden index — e.g. a storage-less
+            // `memory://` table): the existing flat per-superfile cluster prune.
             _ => manifest
                 .get_pruned_superfiles_for_vector(column, query)
                 .await
@@ -1135,7 +1123,10 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use arrow::array::Array;
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
@@ -1150,6 +1141,38 @@ mod tests {
         supertable::{Supertable, SupertableOptions, error::QueryError},
         test_helpers::default_tokenizer as tok,
     };
+
+    use super::adaptive_probe_cells;
+
+    /// Radius-aware admission must pull in a far-centroid, large-radius cell
+    /// (which pure centroid-distance ranking would drop) ahead of a closer
+    /// small-radius one — the recall behavior fixed-top-N lost.
+    #[test]
+    fn adaptive_probe_admits_far_centroid_large_radius() {
+        // c_near: d=1, r=0; c_far_wide: d=10 but r=9.5 → lb=0.5; c_mid: d=3, r=0.
+        let candidates = vec![(1u128, 1.0f32), (2, 10.0), (3, 3.0)];
+        let radius_of: HashMap<u128, f32> = [(1u128, 0.0f32), (2, 9.5), (3, 0.0)].into_iter().collect();
+        // nprobe_min=1 (floor = c1), slack=1 → τ = d*·2 = 2.0; cap=2.
+        let chosen = adaptive_probe_cells(candidates, &radius_of, 1, 2, 1.0);
+        assert!(chosen.contains(&1), "nearest cell is the floor");
+        assert!(
+            chosen.contains(&2),
+            "far-centroid large-radius cell (lb=0.5 ≤ τ=2.0) must be admitted over the closer small-radius one"
+        );
+        assert!(!chosen.contains(&3), "cap=2 reached; c3 (lb=3.0 > τ) excluded");
+        assert_eq!(chosen.len(), 2, "respects the nprobe_max cap");
+    }
+
+    /// The floor (`nprobe_min`) is always probed even when nothing else clears τ.
+    #[test]
+    fn adaptive_probe_honors_nprobe_min_floor() {
+        let candidates = vec![(1u128, 1.0f32), (2, 100.0), (3, 200.0)];
+        let radius_of: HashMap<u128, f32> = [(1u128, 0.0f32), (2, 0.0), (3, 0.0)].into_iter().collect();
+        // τ = 2.0; only c1 within τ, but nprobe_min=2 forces the 2 nearest.
+        let chosen = adaptive_probe_cells(candidates, &radius_of, 2, 8, 1.0);
+        assert!(chosen.contains(&1) && chosen.contains(&2), "two nearest are the floor");
+        assert_eq!(chosen.len(), 2, "nothing else clears τ");
+    }
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`

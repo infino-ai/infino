@@ -50,9 +50,17 @@ impl ResidentPageSource {
         Self { pages }
     }
 
-    /// Number of resident pages.
+    /// Number of resident pages. Test/observability only.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Content hashes of every resident page — i.e. every page reachable from
+    /// the root this source was loaded for. GC uses this to mark the live
+    /// routing-tree pages so it can sweep the orphaned ones.
+    pub(crate) fn page_hashes(&self) -> impl Iterator<Item = ContentHash> + '_ {
+        self.pages.keys().copied()
     }
 }
 

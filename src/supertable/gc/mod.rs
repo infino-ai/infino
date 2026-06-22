@@ -17,6 +17,7 @@ use crate::{
             SUPERFILE_DATA_DIR,
             commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
         },
+        opann::store::{OPANN_PAGES_DIR, reachable_page_uris},
     },
 };
 
@@ -67,14 +68,34 @@ pub(super) async fn gc_storage_sweep_for_inner(
 ) -> Result<GcReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
     let manifest = inner.manifest.load_full();
-    let live = build_live_set(&manifest);
+    let mut live = build_live_set(&manifest);
+    // OPANN routing-tree pages reachable from the current root are live; the
+    // copy-on-write-superseded versions are the orphans to collect. If the live
+    // set can't be enumerated (e.g. a transiently missing page), skip sweeping
+    // the page dir entirely this pass rather than risk deleting a live page —
+    // the orphans are reclaimed on a later pass. With no routing tree the page
+    // dir is absent/empty, so sweeping it is a harmless no-op.
+    let sweep_pages = match manifest.opann_routing() {
+        Some(routing) => match reachable_page_uris(storage.as_ref(), routing.root_page).await {
+            Ok(uris) => {
+                live.extend(uris);
+                true
+            }
+            Err(_) => false,
+        },
+        None => true,
+    };
     let cutoff = SystemTime::now()
         .checked_sub(safety_gap)
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let mut report = GcReport::default();
 
-    for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, SUPERFILE_DATA_DIR] {
+    let mut prefixes = vec![MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, SUPERFILE_DATA_DIR];
+    if sweep_pages {
+        prefixes.push(OPANN_PAGES_DIR);
+    }
+    for prefix in prefixes {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live.contains(&key) {

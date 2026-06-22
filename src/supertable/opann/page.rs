@@ -42,6 +42,7 @@ use crate::supertable::manifest::encoding::{
 };
 use crate::supertable::manifest::part::{BLAKE3_DIGEST_BYTES, ContentHash};
 
+#[cfg(test)]
 use super::descent::best_first;
 
 /// Magic at the start of every OPANN routing-tree page.
@@ -278,6 +279,11 @@ impl Page {
     /// page: child *page* links (`NodeTopo::Internal.pages`) are not followed
     /// here — crossing a page boundary needs a page resolver, wired with the
     /// multi-page tree. A single self-contained page has none.
+    ///
+    /// Test-only: production descent crosses pages via
+    /// [`super::paged::PagedTree::select_probes`]; this single-page descent is a
+    /// round-trip oracle.
+    #[cfg(test)]
     pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(u128, f32)> {
         if n_probe == 0 || self.topo.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
@@ -307,14 +313,22 @@ impl Page {
         )
     }
 
-    /// Metric this page's centroids are scored under.
-    pub(crate) fn metric(&self) -> Metric {
-        self.metric
-    }
 
     /// Centroid dimension.
     pub(crate) fn dim(&self) -> usize {
         self.centroids.dim as usize
+    }
+
+    /// The page's node centroids (Sq8+residual, one shared per-page quantizer).
+    /// Exposed so a copy-on-write insert can re-emit the page with the existing
+    /// centroid bytes verbatim and only the topology changed — no decode.
+    pub(crate) fn centroids(&self) -> &ClusterCentroids {
+        &self.centroids
+    }
+
+    /// The page's per-node topology, index-aligned with [`Self::centroids`].
+    pub(crate) fn topo(&self) -> &[NodeTopo] {
+        &self.topo
     }
 
     /// Node index at which descent enters this page.
@@ -333,7 +347,8 @@ impl Page {
         self.centroids.score_one(self.metric, local as usize, query)
     }
 
-    /// Total node count parsed from the page.
+    /// Total node count parsed from the page. Test/observability only.
+    #[cfg(test)]
     pub(crate) fn n_nodes(&self) -> usize {
         self.topo.len()
     }

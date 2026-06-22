@@ -148,11 +148,17 @@ impl Default for CellRoutingParams {
 
 /// OPANN routing-tree reference stamped into the manifest: the content hash of
 /// the root page (the entry into the paged hierarchical cell router, stored
-/// under the hidden vector-index prefix) plus the probe tuning. `dim` and
-/// `metric` are deliberately **not** duplicated here — they live in the page
-/// header and are read when the root page loads, so the page stays the single
-/// source of truth for them. `ManifestList::opann_routing == None` means the
-/// table has no OPANN tree, and the reader falls back to flat cell selection.
+/// under the hidden vector-index prefix) plus the probe tuning.
+/// `ManifestList::opann_routing == None` means the table has no OPANN tree.
+///
+/// The tree itself — every leaf's cell id (`= superfile_id.as_u128()`),
+/// Sq8+residual centroid, and covering radius — lives entirely in the
+/// content-addressed pages reachable from `root_page`. **Nothing fp32 is
+/// persisted here.** A commit or compaction updates the tree by a copy-on-write
+/// insert/delete against the page graph (`supertable::opann::insert`): the new
+/// partitions' centroids are captured fp32 at the ingestion surface, quantized
+/// once into the page they join, and only the affected leaf→root path is
+/// rewritten — never a full rebuild from persisted copies.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpannRouting {
     /// Content hash of the root routing page.

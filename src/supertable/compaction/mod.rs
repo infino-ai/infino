@@ -46,9 +46,9 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, rebuild_sq8_superfile_from_readers, recluster_cells,
-            try_commit_attempt,
+            OpannRoutingCommit, PartitionRoutingCopy, PreparedSuperfile, ShardOutput, backoff_delay,
+            finalize_compaction_commit, opann_routing_update, prepare_superfile,
+            rebuild_sq8_superfile_from_readers, recluster_cells, try_commit_attempt,
         },
     },
 };
@@ -550,17 +550,30 @@ impl Supertable {
             .map(|e| e.vector_layout)
             .unwrap_or(VectorLayout::Ivf);
 
+        let is_hidden = is_hidden_vector_index_table(&inner.options);
         // Hidden vector index: re-cluster the overlapping region into tight,
         // disjoint cells (rows streamed in through the mmap reader; no split, no
         // byte-splice merge — that would mix the cells' independently-trained
-        // clusters). Every other table: the standard byte-splice merge into one
-        // larger superfile.
-        let prepared: Vec<PreparedSuperfile> = match if is_hidden_vector_index_table(&inner.options)
-        {
-            recluster_cells(inner, &inputs).await
+        // clusters). Each reclustered output is a new OPANN routing-tree leaf,
+        // carrying its fp32 routing copy captured at recluster. Every other
+        // table: the standard byte-splice merge into one larger superfile.
+        let build = if is_hidden {
+            recluster_cells(inner, &inputs).await.map(|parts| {
+                let mut prepared = Vec::with_capacity(parts.len());
+                let mut routing = Vec::with_capacity(parts.len());
+                for p in parts {
+                    prepared.push(p.prepared);
+                    routing.push(p.routing);
+                }
+                (prepared, routing)
+            })
         } else {
-            self.merge_superfiles(&inputs).await.map(|seg| vec![seg])
-        } {
+            self.merge_superfiles(&inputs)
+                .await
+                .map(|seg| (vec![seg], Vec::new()))
+        };
+        let (prepared, new_routing): (Vec<PreparedSuperfile>, Vec<PartitionRoutingCopy>) = match build
+        {
             Ok(p) => p,
             Err(e) => {
                 for entry in &inputs {
@@ -629,6 +642,20 @@ impl Supertable {
                 return Ok(());
             }
 
+            // Hidden vector index: copy-on-write update the routing tree against
+            // THIS attempt's base — drop the merged-away inputs' leaves, splice
+            // in the reclustered outputs — and stamp the new root into the same
+            // commit as the superfile swap. Recomputed per attempt so an OCC
+            // retry rebuilds against the winning base.
+            let routing_commit = if is_hidden {
+                let removed: Vec<u128> = job.inputs.iter().map(|id| id.as_u128()).collect();
+                opann_routing_update(inner, current.as_ref(), &removed, &new_routing)
+                .await
+                .map_err(|e| CompactionError::Build(e.to_string()))?
+            } else {
+                OpannRoutingCommit::Inherit
+            };
+
             let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
             match try_commit_attempt(
@@ -639,6 +666,7 @@ impl Supertable {
                 &entries_to_remove,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
+                &routing_commit,
             )
             .await
             {

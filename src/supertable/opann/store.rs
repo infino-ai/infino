@@ -10,33 +10,35 @@
 //! vector-index supertable's storage (the caller passes that already-prefixed
 //! [`StorageProvider`]); within it they sit in an [`OPANN_PAGES_DIR`] subdir.
 //!
-//! Two operations:
-//! - [`write_pages`] persists a [`SplitPages`] (write side, run at commit).
+//! The page *write* side rides the commit: the changed pages of a copy-on-write
+//! tree update travel in [`crate::supertable::writer::OpannRoutingCommit`] and
+//! are PUT in the commit's parallel pre-pointer wave via
+//! [`crate::supertable::manifest::commit::put_immutable_blob`] — the same
+//! content-addressed blob writer manifest parts use. This module owns only the
+//! page object name ([`page_uri`]) and the *read* side:
 //! - [`load_resident`] walks the page graph from the root and returns a
 //!   [`ResidentPageSource`] holding the whole tree in memory — the warm routing
 //!   layer that descent then runs against with zero further object I/O.
-//!
-//! This module does not touch the manifest, commit, or query paths; stamping
-//! the root hash into the manifest and routing `vector_search` through it are
-//! later increments.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use bytes::Bytes;
 use futures::future::try_join_all;
 
 use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::manifest::part::ContentHash;
 
 use super::page::{Page, PageError};
-use super::paged::{ResidentPageSource, SplitPages};
+use super::paged::ResidentPageSource;
 
 /// Subdirectory (under the hidden vector-index prefix) that holds OPANN pages.
-const OPANN_PAGES_DIR: &str = "opann-pages";
+pub(crate) const OPANN_PAGES_DIR: &str = "opann-pages";
 
 /// Storage URI for the page with content hash `hash`. Mirrors the manifest
-/// part scheme (`manifest-parts/part-<hash>.…`): a fixed dir plus the hex hash.
-fn page_uri(hash: &ContentHash) -> String {
+/// part scheme (`manifests/part-<hash>.…`): a fixed dir plus the hex hash.
+/// Pages are written through the commit's content-addressed blob path
+/// ([`crate::supertable::manifest::commit::put_immutable_blob`], the same one
+/// manifest parts use); this just names the object.
+pub(crate) fn page_uri(hash: &ContentHash) -> String {
     format!("{OPANN_PAGES_DIR}/page-{}.opann", hash.to_hex())
 }
 
@@ -47,31 +49,6 @@ pub(crate) enum OpannStoreError {
     Storage(#[from] StorageError),
     #[error("page error: {0}")]
     Page(#[from] PageError),
-}
-
-/// Persist every page of `pages` to object storage, content-addressed. A page
-/// whose object already exists (identical content, racing or retried writer)
-/// is a benign collision and is treated as success — exactly as manifest parts
-/// handle [`StorageError::PreconditionFailed`].
-///
-/// Pages are PUT sequentially here; the routing tree is small and this runs off
-/// the query path at commit time. (Overlapping the PUTs is a later refinement.)
-pub(crate) async fn write_pages(
-    storage: &dyn StorageProvider,
-    pages: &SplitPages,
-) -> Result<(), OpannStoreError> {
-    for (hash, bytes) in &pages.pages {
-        match storage
-            .put_atomic(&page_uri(hash), Bytes::from(bytes.clone()))
-            .await
-        {
-            Ok(_) => {}
-            // Content-addressed: same hash → same bytes already there.
-            Err(StorageError::PreconditionFailed { .. }) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
 }
 
 /// Load the whole routing tree reachable from `root` into memory and return it
@@ -137,13 +114,39 @@ pub(crate) async fn load_resident(
     Ok(ResidentPageSource::from_pages(pages))
 }
 
+/// Storage URIs of every routing-tree page reachable from `root` — the live
+/// page set for GC. Walks the page graph (reusing [`load_resident`]) and maps
+/// each reachable page hash to its object URI. GC adds these to its live set so
+/// it sweeps only orphaned pages (superseded copy-on-write versions) and never
+/// a page the current root still references.
+pub(crate) async fn reachable_page_uris(
+    storage: &dyn StorageProvider,
+    root: ContentHash,
+) -> Result<HashSet<String>, OpannStoreError> {
+    let resident = load_resident(storage, root).await?;
+    Ok(resident.page_hashes().map(|h| page_uri(&h)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::storage::LocalFsStorageProvider;
     use crate::superfile::vector::distance::Metric;
-    use crate::supertable::opann::paged::PagedTree;
+    use crate::supertable::manifest::commit::put_immutable_blob;
+    use crate::supertable::opann::paged::{PagedTree, SplitPages};
     use crate::supertable::opann::test_util::{build_tree, synth_cells};
+
+    /// Write a tree's pages to `storage` through the shared content-addressed
+    /// blob primitive (the production commit path), so the store round-trip
+    /// tests exercise the same writer manifest parts use.
+    async fn put_test_pages(storage: &dyn StorageProvider, split: &SplitPages) {
+        for (hash, bytes) in &split.pages {
+            put_immutable_blob(storage, &page_uri(hash), Bytes::from(bytes.clone()))
+                .await
+                .expect("put page");
+        }
+    }
 
     #[tokio::test]
     async fn storage_round_trip_descends_like_in_memory() {
@@ -160,12 +163,23 @@ mod tests {
             let root = split.root;
             let n_pages = split.pages.len();
 
-            write_pages(&storage, &split).await.expect("write pages");
+            put_test_pages(&storage, &split).await;
             let source = load_resident(&storage, root).await.expect("load pages");
             assert_eq!(
                 source.len(),
                 n_pages,
                 "{metric:?}: load must reach every page from the root"
+            );
+            // The GC live-page set is exactly the reachable pages' URIs.
+            let live = reachable_page_uris(&storage, root).await.expect("live uris");
+            assert_eq!(
+                live.len(),
+                n_pages,
+                "{metric:?}: reachable_page_uris must cover every live page"
+            );
+            assert!(
+                split.pages.keys().all(|h| live.contains(&page_uri(h))),
+                "{metric:?}: every written page URI must be marked live"
             );
 
             let paged = PagedTree::new(source, root);
@@ -190,8 +204,8 @@ mod tests {
         let cells = synth_cells(64, 16);
         let tree = build_tree(Metric::L2Sq, 16, &cells).expect("tree");
         let split = tree.to_pages(8);
-        write_pages(&storage, &split).await.expect("first write");
-        write_pages(&storage, &split).await.expect("idempotent rewrite");
+        put_test_pages(&storage, &split).await;
+        put_test_pages(&storage, &split).await;
     }
 
     #[tokio::test]
@@ -213,7 +227,7 @@ mod tests {
             }
             let tree = build_tree(Metric::L2Sq, dim, &cells).expect("tree");
             let split = tree.to_pages(8);
-            write_pages(&storage, &split).await.expect("write");
+            put_test_pages(&storage, &split).await;
             latest = Some((split.root, split.pages.len()));
         }
         let (root, n_pages) = latest.expect("root");

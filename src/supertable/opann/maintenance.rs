@@ -10,52 +10,9 @@
 //! cells — that work lives in [`crate::supertable::compaction`]
 //! (`overlap_consolidation_jobs`) + [`crate::supertable::writer`]
 //! (`recluster_cells`). This module owns the overlap detection
-//! ([`hot_overlap_groups`]) and the manifest cell-summary bookkeeping
-//! ([`apply_cell_updates`]).
+//! ([`hot_overlap_groups`]).
 
-use std::collections::HashMap;
-
-use crate::{
-    superfile::vector::distance::{Metric, metric_distance_by},
-    supertable::manifest::ClusterCentroids,
-};
-
-/// Append-only count bookkeeping for touched cells.
-pub(crate) fn apply_cell_count_updates(
-    base: &ClusterCentroids,
-    count_updates: &HashMap<u32, u32>,
-) -> ClusterCentroids {
-    let mut updated = base.clone();
-    for (&cell, &count) in count_updates {
-        if let Some(slot) = updated.counts.get_mut(cell as usize) {
-            *slot = count;
-        }
-    }
-    updated
-}
-
-/// Apply count and radius updates from maintenance (incoming routing / compaction).
-pub(crate) fn apply_cell_updates(
-    base: &ClusterCentroids,
-    count_updates: &HashMap<u32, u32>,
-    radii_updates: &HashMap<u32, f32>,
-) -> ClusterCentroids {
-    let mut updated = apply_cell_count_updates(base, count_updates);
-    if radii_updates.is_empty() {
-        return updated;
-    }
-    if updated.radii.len() != updated.n_cent as usize {
-        updated.radii = vec![0.0; updated.n_cent as usize];
-    }
-    for (&cell, &radius) in radii_updates {
-        if let Some(slot) = updated.radii.get_mut(cell as usize)
-            && radius > *slot
-        {
-            *slot = radius;
-        }
-    }
-    updated
-}
+use crate::superfile::vector::distance::{Metric, metric_distance_by};
 
 /// Default mean-overlap-degree at or above which a region is consolidated. A
 /// query landing in such a region must, on average, scan this many overlapping
@@ -63,11 +20,10 @@ pub(crate) fn apply_cell_updates(
 pub(crate) const CELL_OVERLAP_TAU_DEFAULT: f32 = 3.0;
 
 /// Distance between two cell centroids, in the same metric units the stored
-/// cell radii were measured in — so it is directly comparable to `r_i + r_j`,
-/// exactly as [`ClusterCentroids::select_cells_adaptive`] compares a centroid
-/// score `d` to a radius `r`. (These are fp32 centroids; the stored radii were
-/// measured in the Sq8 domain, but the two differ only by quantization noise,
-/// which is immaterial for a consolidation *trigger*.)
+/// cell radii were measured in — so it is directly comparable to `r_i + r_j`
+/// (a centroid score `d` against a radius `r`). (These are fp32 centroids; the
+/// stored radii were measured in the Sq8 domain, but the two differ only by
+/// quantization noise, which is immaterial for a consolidation *trigger*.)
 fn centroid_pair_distance(
     centroids: &[f32],
     dim: usize,

@@ -13,16 +13,8 @@
 //! `Sq8ResidualKernel`. SPANN is disk-partitioned ANN; OPANN is
 //! object-partitioned ANN.
 
-// OPANN lands incrementally: the routing tree (`tree`) and the on-disk page
-// format (`page`) are built and tested before the query-path wiring that will
-// consume them. Until that wiring lands, these items have no non-test caller,
-// so the module would trip `dead_code` under CI's `-D warnings`. This allow
-// (it propagates to the child modules) keeps the in-progress subsystem
-// compiling and under test; remove it once `vector_search` routes through the
-// tree.
-#![allow(dead_code)]
-
 mod descent;
+pub(crate) mod insert;
 pub(crate) mod maintenance;
 pub(crate) mod paged;
 pub(crate) mod page;
