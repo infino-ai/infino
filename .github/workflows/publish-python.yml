@@ -4,7 +4,7 @@ name: Publish Python package
 # wheel per platform/arch, then upload. A `v<version>` tag publishes to real
 # PyPI with the version derived from the tag (a coordinated release with the
 # crate + Node); a manual run (workflow_dispatch) chooses the version and the
-# TestPyPI (default) / PyPI target.
+# PyPI (default) / TestPyPI target.
 #
 # Two facts shape the whole pipeline:
 #   - abi3 (pyo3 `abi3-py39`) → a single wheel per platform/arch covers all
@@ -25,9 +25,9 @@ on:
       target:
         description: "Index to publish to"
         required: true
-        default: testpypi
+        default: pypi
         type: choice
-        options: [testpypi, pypi]
+        options: [pypi, testpypi]
 
 # One release per index at a time; never cancel a publish in flight.
 concurrency:
@@ -53,7 +53,7 @@ jobs:
       target: ${{ steps.check.outputs.target }}
     steps:
       # On a tag push, derive the version from the tag (`v0.1.0` -> `0.1.0`) and
-      # publish to real PyPI; a manual run uses its inputs (TestPyPI default).
+      # publish to real PyPI; a manual run uses its inputs (PyPI default).
       # Reject a non-SemVer version before the matrix spins up: Cargo's
       # `version` requires SemVer (it rejects PEP 440 like `0.1.0rc1`), and
       # maturin renders SemVer to the wheel's PEP 440 (`0.1.0-rc.1` → `0.1.0rc1`).
