@@ -1,0 +1,110 @@
+name: Publish crate
+
+# Publishes the core `infino` crate to crates.io (and, transitively, triggers
+# the docs.rs build).
+#
+# Two ways to run:
+#   - Push a `crate-v<version>` tag (e.g. `crate-v0.1.0`) — the per-artifact
+#     release tag from docs/versioning.md — to publish for real. The job
+#     asserts the tag version matches the version in Cargo.toml before it
+#     uploads anything.
+#   - Run it manually (workflow_dispatch). The default is a DRY RUN: it packs
+#     and verify-builds the crate exactly as a downstream `cargo add` would
+#     receive it, but uploads nothing. Re-run with `dry_run` unchecked to
+#     publish without cutting a tag.
+#
+# A real publish needs the CARGO_REGISTRY_TOKEN secret (a crates.io API token
+# with publish rights to `infino`). The very first publish claims the name.
+
+on:
+  push:
+    tags: ["crate-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate only — package + verify-build, publish nothing"
+        type: boolean
+        default: true
+
+# One publish at a time; never cancel one in flight.
+concurrency:
+  group: publish-crate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crate pulls deps that may emit transitive deprecation warnings; a
+  # warning must not fail a release build (matches the python/node lanes).
+  RUSTFLAGS: ""
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # CARGO_REGISTRY_TOKEN is read from a repository secret. To gate real
+    # publishes behind required reviewers, move that secret into a GitHub
+    # Environment and add `environment: <name>` back on this job.
+    steps:
+      - uses: actions/checkout@v5
+
+      # The dep graph (datafusion + arrow + parquet) plus the verify build's
+      # target dir overflows the ~14 GB free on a stock Linux runner; reclaim
+      # ~30 GB before compiling (same as the python/node publish lanes).
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # Honor the toolchain pinned in rust-toolchain.toml (1.95.0) — `rustup
+      # show` materializes it from the committed file, so the release build
+      # uses the exact same compiler as CI and local dev.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # Restore the dep graph so the verify build mostly relinks rather than
+      # recompiling datafusion/arrow from scratch.
+      - uses: Swatinem/rust-cache@v2
+
+      # Resolve the published version from Cargo.toml and, on a tag push,
+      # assert the tag matches it (`crate-v0.1.0` -> `0.1.0`). Guards against
+      # tagging one version and shipping another.
+      - name: Resolve & check version
+        id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "infino") | .version')"
+          echo "Cargo.toml version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#crate-v}"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag crate-v$tag does not match Cargo.toml version $version"
+              exit 1
+            fi
+          fi
+
+      # The real gate: package the crate and compile it from the extracted
+      # tarball, exactly as crates.io will. Catches anything that builds in the
+      # workspace but not from the shipped package. `--locked` keeps the
+      # committed Cargo.lock authoritative.
+      - name: Verify (cargo publish --dry-run)
+        run: cargo publish --dry-run --locked
+
+      # Real publish: a tag push, or a manual run with dry_run unchecked. The
+      # dry-run step above already built the package, so this reuses the target
+      # dir rather than recompiling. The token is injected only here.
+      - name: Publish to crates.io
+        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

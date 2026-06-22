@@ -16,7 +16,16 @@ categories = ["database", "database-implementations"]
 # `cargo publish` packages the package directory; the workspace `exclude`
 # below does NOT keep the standalone Python bindings out of the crate
 # tarball, so exclude them from the package explicitly.
-exclude = ["infino-python/"]
+#
+# The locomo-recall example loads an 18 MB frozen-vector fixture (and a
+# small JS script that regenerates it) at runtime; both are kept out of
+# the published crate — they would push the tarball past the registry
+# size limit and aren't needed to build the library or the example.
+exclude = [
+    "infino-python/",
+    "examples/locomo-recall/fixture.json",
+    "examples/locomo-recall/embed.mjs",
+]
 # Disable cargo's auto-discovery of `benches/*.rs` as bench
 # binaries — every bench target is declared explicitly via
 # `[[bench]]` below. Without this, shared helper files like

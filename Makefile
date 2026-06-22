@@ -1,4 +1,4 @@
-.PHONY: check fmt test doctest \
+.PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
@@ -103,6 +103,13 @@ asan:
 # exercises the same curated public API a downstream user sees.
 doctest:
 	cargo test --doc
+
+# Build the API docs locally, exactly as docs.rs renders them: crate only
+# (`--no-deps`), default features, opened in a browser. The landing page is
+# the README (lib.rs pulls it in via `include_str!`); the rest is rustdoc
+# from the public items' doc comments. Output: target/doc/infino/index.html.
+doc:
+	cargo doc --no-deps --open
 
 # Python bindings (PyO3 + maturin). Built standalone — `infino-python` is
 # excluded from the cargo workspace, so the core crate never needs a

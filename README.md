@@ -1,5 +1,7 @@
 # infino
 
+[![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
+[![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -53,6 +55,13 @@ or in `Cargo.toml`:
 [dependencies]
 infino = "0.1"
 ```
+
+The full Rust API reference is on [docs.rs/infino](https://docs.rs/infino).
+
+infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
+global allocator by default. If you embed infino in a process that already
+sets a global allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
 
 ## Quickstart
 
@@ -387,12 +396,16 @@ reviewed as a contract change in the same pull request.
   Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
   arrow / datafusion that changes an exposed type is a breaking change to
   infino. The supported version range is documented and CI-tested.
-- **MSRV.** Raising the minimum Rust version is a minor bump, never a
+- **MSRV.** The minimum supported Rust version is **1.95** (enforced by
+  `rust-version` in `Cargo.toml`). Raising it is a minor bump, never a
   patch.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
-- **Python.** The wheel tracks the crate version 1:1.
-- **Node.** The npm package tracks the crate version 1:1.
+- **Bindings version independently.** The Python (`pip install infino`)
+  and Node (`npm install infino`) packages are versioned on their own
+  SemVer lines — each embeds its own copy of the engine, so a binding
+  version need not match this crate's. See
+  [`docs/versioning.md`](https://github.com/infino-ai/infino/blob/main/docs/versioning.md).
 
 ## Development
 
@@ -406,7 +419,8 @@ cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read 
 The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
 the right stable Rust on first build. Run `cargo test --features test-helpers`
 for the suite (integration tests use `infino::test_helpers`) and `make ci`
-before opening a pull request.
+before opening a pull request. Browse the full API locally with `make doc`
+(`cargo doc --no-deps --open` — the same docs [docs.rs](https://docs.rs/infino) renders).
 
 For an enhanced local development experience, install and configure
 [pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`
