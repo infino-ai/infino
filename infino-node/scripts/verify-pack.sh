@@ -44,8 +44,18 @@ case "$PLATFORM" in
       if [ "$status" = "1" ]; then
         TRIPLE="linux-${ARCH}-musl"
       else
-        echo "verify-pack: could not determine libc (glibc vs musl) for linux-${ARCH}" >&2
-        exit 1
+        # process.report unavailable — fall back to an authoritative libc probe.
+        # (Capture ldd's output first: musl's `ldd --version` exits non-zero, which
+        # `set -o pipefail` would otherwise treat as "no match".)
+        ldd_out="$(ldd --version 2>&1 || true)"
+        if printf '%s' "$ldd_out" | grep -qi musl; then
+          TRIPLE="linux-${ARCH}-musl"
+        elif printf '%s' "$ldd_out" | grep -qi 'glibc\|gnu libc'; then
+          TRIPLE="linux-${ARCH}-gnu"
+        else
+          echo "verify-pack: could not determine libc (glibc vs musl) for linux-${ARCH}" >&2
+          exit 1
+        fi
       fi
     fi ;;
   *) echo "verify-pack: unsupported host platform '$PLATFORM'" >&2; exit 1 ;;
