@@ -21,7 +21,7 @@ for an apache-arrow `Table` instead.
 ## Install
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install infino
 ```
 
 A prebuilt native binary is selected automatically at install time — no Rust

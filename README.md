@@ -39,7 +39,7 @@ uv pip install --index-url https://test.pypi.org/simple/ --extra-index-url https
 **Node.js**
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install infino
 ```
 
 **Rust**

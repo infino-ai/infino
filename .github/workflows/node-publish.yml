@@ -82,6 +82,11 @@ jobs:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-latest
+    # OIDC token for npm provenance — the "built from this repo at this commit"
+    # attestation shown on npmjs.org. A real supply-chain trust signal at launch.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -129,3 +134,6 @@ jobs:
           npm publish --tag latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Emit provenance for the main package AND every per-platform package
+          # (napi's prepublish shells out to `npm publish`, which honors this).
+          NPM_CONFIG_PROVENANCE: "true"
