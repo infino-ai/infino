@@ -177,6 +177,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
         vector_index_storage_prefix: None,
+        opann_routing: None,
         parts,
     }
 }

@@ -93,6 +93,11 @@ pub struct ManifestList {
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
     /// for how the field is resolved.
     pub partition_strategy: PartitionStrategy,
+    /// OPANN routing-tree root (the paged hierarchical cell router) and its
+    /// probe tuning. `None` on tables without an OPANN tree — readers then use
+    /// flat cell selection. Optional + defaulted in the wire form, so manifests
+    /// written before OPANN still decode.
+    pub opann_routing: Option<OpannRouting>,
     /// Object-storage prefix for the hidden vector-index sibling
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
@@ -139,6 +144,21 @@ impl Default for CellRoutingParams {
             slack: DEFAULT_CELL_SLACK,
         }
     }
+}
+
+/// OPANN routing-tree reference stamped into the manifest: the content hash of
+/// the root page (the entry into the paged hierarchical cell router, stored
+/// under the hidden vector-index prefix) plus the probe tuning. `dim` and
+/// `metric` are deliberately **not** duplicated here — they live in the page
+/// header and are read when the root page loads, so the page stays the single
+/// source of truth for them. `ManifestList::opann_routing == None` means the
+/// table has no OPANN tree, and the reader falls back to flat cell selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpannRouting {
+    /// Content hash of the root routing page.
+    pub root_page: ContentHash,
+    /// Probe tuning — reuses the cell-routing knobs.
+    pub routing: CellRoutingParams,
 }
 
 /// How superfiles are routed into manifest parts. Stamped into
@@ -758,6 +778,8 @@ struct ManifestListDto {
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     partition_strategy: PartitionStrategyDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opann_routing: Option<OpannRoutingDto>,
     parts: Vec<ManifestPartEntryDto>,
 }
 
@@ -850,6 +872,13 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpannRoutingDto {
+    root_page: String, // "blake3:<64hex>"
+    #[serde(default)]
+    routing: CellRoutingParamsDto,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1238,6 +1267,10 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        opann_routing: l.opann_routing.as_ref().map(|r| OpannRoutingDto {
+            root_page: encode_hash(&r.root_page),
+            routing: r.routing.into(),
+        }),
         parts,
     })
 }
@@ -1269,6 +1302,15 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             })
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
+        opann_routing: d
+            .opann_routing
+            .map(|r| -> Result<OpannRouting, ListParseError> {
+                Ok(OpannRouting {
+                    root_page: decode_hash(&r.root_page)?,
+                    routing: r.routing.into(),
+                })
+            })
+            .transpose()?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         parts,
     })
@@ -1743,6 +1785,7 @@ mod tests {
 
     fn empty_list() -> ManifestList {
         ManifestList {
+            opann_routing: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2219,6 +2262,39 @@ mod tests {
             got.vector_index_storage_prefix,
             list.vector_index_storage_prefix
         );
+    }
+
+    #[test]
+    fn opann_routing_roundtrip() {
+        let mut list = empty_list();
+        list.opann_routing = Some(OpannRouting {
+            root_page: ContentHash([0x5c; 32]),
+            routing: CellRoutingParams {
+                nprobe_min: 4,
+                nprobe_max: 32,
+                slack: 1.5,
+            },
+        });
+        let got = decode(&encode(&list).expect("encode")).expect("decode");
+        assert_eq!(got.opann_routing, list.opann_routing);
+    }
+
+    #[test]
+    fn opann_routing_absent_is_omitted_and_backward_compatible() {
+        // A manifest with no OPANN tree must encode without the field at all
+        // (skip_serializing_if), so a pre-OPANN manifest decodes to `None` and
+        // re-encodes byte-identically — content-addressing stays stable.
+        let list = empty_list();
+        assert!(list.opann_routing.is_none());
+        let bytes = encode(&list).expect("encode");
+        let json = from_utf8(&bytes).expect("utf8");
+        assert!(
+            !json.contains("opann_routing"),
+            "absent OPANN routing must be omitted from the wire form:\n{json}"
+        );
+        let got = decode(&bytes).expect("decode");
+        assert!(got.opann_routing.is_none());
+        assert_eq!(encode(&got).expect("re-encode"), bytes, "re-encode must be byte-identical");
     }
 
     #[test]

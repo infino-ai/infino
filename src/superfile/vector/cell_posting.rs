@@ -740,7 +740,7 @@ pub(crate) fn encoded_component_at(row: &EncodedCellRow, d: usize) -> f32 {
             * (row.codes[d] as f32 + (i8::from_le_bytes([row.residuals[d]]) as f32) * inv_div)
 }
 
-fn distance_encoded_rows_symmetric(
+pub(crate) fn distance_encoded_rows_symmetric(
     metric: Metric,
     dim: usize,
     a: &EncodedCellRow,
@@ -756,7 +756,7 @@ fn distance_encoded_rows_symmetric(
 
 /// Index of the medoid row — the one minimizing the summed pairwise distance to
 /// all others — under an arbitrary row↔row distance `dist`. Shared by the
-/// symmetric kernel here and the asymmetric variant in `supertable::spfresh`.
+/// symmetric kernel here and the asymmetric variant in `supertable::opann::maintenance`.
 pub(crate) fn medoid_index_by<F>(shard: &[EncodedCellRow], dist: F) -> usize
 where
     F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,

@@ -84,8 +84,8 @@ use super::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
         PendingDelete, PendingUpdate,
     },
+    opann::{maintenance, store, tree::CentroidTree},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
-    spfresh,
     utils::vector_split::split_vectors,
     wal::{
         WalStore,
@@ -130,7 +130,7 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::PartitionStrategy,
+            list::{CellRoutingParams, OpannRouting, PartitionStrategy},
             part::{self as part_mod, PartId},
             partition::{assign_partition, encode_partition_key},
         },
@@ -2550,6 +2550,41 @@ fn build_one_shard_from_materialized(
     })
 }
 
+/// Max routing nodes per OPANN page. Pages are the compute-resident routing
+/// layer (not payload), so they stay small — the leaf→root path is a handful of
+/// pages even at large scale.
+const OPANN_PAGE_MAX_NODES: usize = 256;
+
+/// Build the OPANN routing tree over the (encoded) cell centroids, persist its
+/// content-addressed pages under `storage`, and return the routing record to
+/// stamp into the manifest. `None` when there are no cells. The build is pure
+/// encoded-domain — it never reconstructs fp32 (see `opann::tree`).
+async fn build_and_persist_opann_pages(
+    storage: &dyn crate::storage::StorageProvider,
+    metric: Metric,
+    clusters: &ClusterCentroids,
+    routing: CellRoutingParams,
+) -> Result<Option<OpannRouting>, BuildError> {
+    let n = clusters.n_cent as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    // Leaf cell id = cluster index, matching what `select_cells_adaptive`
+    // already routes on; the query path maps it to the cell's superfiles.
+    let cell_ids: Vec<u128> = (0..n as u128).collect();
+    let Some(tree) = CentroidTree::build(metric, clusters, &cell_ids) else {
+        return Ok(None);
+    };
+    let split = tree.to_pages(OPANN_PAGE_MAX_NODES);
+    store::write_pages(storage, &split)
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    Ok(Some(OpannRouting {
+        root_page: split.root,
+        routing,
+    }))
+}
+
 async fn publish_hidden_incoming_async(
     inner: Arc<SupertableInner>,
     storage: Arc<dyn crate::storage::StorageProvider>,
@@ -2564,14 +2599,31 @@ async fn publish_hidden_incoming_async(
         _ => Default::default(),
     };
     let updated_clusters =
-        spfresh::apply_cell_updates(&prep.clusters, &prep.cell_updates, &prep.radii_updates);
+        maintenance::apply_cell_updates(&prep.clusters, &prep.cell_updates, &prep.radii_updates);
+    // Build + persist the OPANN routing tree over the updated cell centroids
+    // (encoded domain, no fp32) and stamp its root, so the manifest swap below
+    // publishes the new tree atomically — pages are durable before the pointer
+    // moves. Skipped pre-first-commit (no list yet to carry the root); routing
+    // then falls back to flat cell selection until the next commit.
+    let opann_routing = if manifest_before.is_in_process_only() {
+        None
+    } else {
+        match inner.options.vector_columns.first().map(|c| c.metric) {
+            Some(metric) => {
+                build_and_persist_opann_pages(&*storage, metric, &updated_clusters, routing).await?
+            }
+            None => None,
+        }
+    };
     let updated_strategy = PartitionStrategy::VectorCell {
         column: prep.column,
         clusters: updated_clusters,
         routing,
     };
     inner.manifest.store(Arc::new(
-        manifest_before.with_partition_strategy(updated_strategy),
+        manifest_before
+            .with_partition_strategy(updated_strategy)
+            .with_opann_routing(opann_routing),
     ));
     // We already hold the incoming superfile's bytes here. Warm them onto local
     // disk so the background SPFresh routing pass reads them via mmap instead of

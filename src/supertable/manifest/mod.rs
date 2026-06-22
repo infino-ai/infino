@@ -326,6 +326,13 @@ impl Manifest {
             .unwrap_or(self.superfile_list.options.effective_partition_strategy())
     }
 
+    /// The stamped OPANN routing-tree record, if any — the hidden vector index's
+    /// paged cell router (root page hash + probe tuning). `None` means no OPANN
+    /// tree is published yet; vector search falls back to flat cell selection.
+    pub(crate) fn opann_routing(&self) -> Option<&list::OpannRouting> {
+        self.list.as_ref().and_then(|l| l.opann_routing.as_ref())
+    }
+
     pub fn get_num_parts(&self) -> usize {
         self.list.as_ref().map(|l| l.parts.len()).unwrap_or(0)
     }
@@ -698,6 +705,31 @@ impl Manifest {
         }
     }
 
+    /// Stamp (or clear) the OPANN routing-tree root on this manifest snapshot's
+    /// persisted list. [`Manifest::update`] carries `opann_routing` forward from
+    /// the list, so stamping it here before a commit publishes the new tree with
+    /// the next manifest write. A no-op when there is no list yet
+    /// (pre-first-commit); the routing tree then lands on the following commit.
+    pub(crate) fn with_opann_routing(&self, opann_routing: Option<list::OpannRouting>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.opann_routing = opann_routing.clone();
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+        }
+    }
+
     /// Lazy-load entry point for manifest parts.
     ///
     /// Concurrent callers on the same not-yet-loaded `part_id`
@@ -958,6 +990,9 @@ impl Manifest {
                 })
                 .collect(),
             partition_strategy: strategy,
+            // Carried forward from the current manifest; the OPANN commit hook
+            // (a later step) replaces it when it rewrites the routing tree.
+            opann_routing: self.list.as_ref().and_then(|l| l.opann_routing.clone()),
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
             parts: out_list_entries_after_removal,
         };
@@ -1810,6 +1845,65 @@ impl ClusterCentroids {
         self
     }
 
+    /// A new block holding only clusters `ids` (in the given order) under the
+    /// **same shared quantizer** — `scale`/`offset` are kept verbatim and the
+    /// per-cluster rows / norms / counts / radii are *sliced*, never
+    /// re-quantized, so the carved block is bit-exact. Out-of-range ids are
+    /// skipped (a defensive no-op rather than a panic). Used to carve a routing
+    /// page's node centroids out of the whole-tree block.
+    pub fn select_rows(&self, ids: &[u32]) -> ClusterCentroids {
+        let d = self.dim as usize;
+        let stride = d * CENTROID_ROW_BYTES_PER_DIM;
+        let n_cent = self.n_cent as usize;
+        let mut rows = Vec::with_capacity(ids.len() * stride);
+        let mut counts = Vec::with_capacity(ids.len());
+        let mut norms_out = self.norms.as_ref().map(|_| Vec::with_capacity(ids.len()));
+        let has_radii = self.radii.len() == n_cent;
+        let mut radii_out = Vec::with_capacity(if has_radii { ids.len() } else { 0 });
+        for &id in ids {
+            let i = id as usize;
+            if i >= n_cent {
+                continue;
+            }
+            rows.extend_from_slice(&self.rows[i * stride..(i + 1) * stride]);
+            counts.push(self.counts.get(i).copied().unwrap_or(0));
+            if let (Some(out), Some(src)) = (norms_out.as_mut(), self.norms.as_ref()) {
+                out.push(src[i]);
+            }
+            if has_radii {
+                radii_out.push(self.radii[i]);
+            }
+        }
+        ClusterCentroids {
+            n_cent: counts.len() as u32,
+            dim: self.dim,
+            scale: self.scale.clone(),
+            offset: self.offset.clone(),
+            rows,
+            norms: norms_out,
+            counts,
+            radii: radii_out,
+        }
+    }
+
+    /// One [`EncodedCellRow`] per cluster, each sharing this block's quantizer —
+    /// the form the encoded-domain centroid kernels (`medoid_index_by`,
+    /// `encoded_ivf_kmeans`, `distance_encoded_rows_symmetric`) consume.
+    /// `stable_id` is the cluster index. Codes/residuals are copied as-is; no
+    /// fp32 vector is reconstructed.
+    pub(crate) fn to_encoded_rows(&self) -> Vec<EncodedCellRow> {
+        (0..self.n_cent as usize)
+            .map(|c| EncodedCellRow {
+                stable_id: c as i128,
+                scale: self.scale.clone(),
+                offset: self.offset.clone(),
+                codes: self.codes(c).to_vec(),
+                residuals: self.residuals(c).to_vec(),
+                norm_sq: self.norm(c),
+            })
+            .collect()
+    }
+
     /// Codes (`dim` u8) for cluster `c`.
     #[inline]
     fn codes(&self, c: usize) -> &[u8] {
@@ -2505,6 +2599,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
             ManifestList {
+                opann_routing: None,
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2734,6 +2829,7 @@ mod tests {
         use list::{ManifestList, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2883,6 +2979,7 @@ mod tests {
         Arc::new(Manifest {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
+                opann_routing: None,
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -2978,6 +3075,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3125,6 +3223,7 @@ mod tests {
         // entry for partition A (the rewrite candidate); A_old is the
         // frozen older entry; B is an untouched partition.
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3334,6 +3433,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3429,6 +3529,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3562,6 +3663,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3691,6 +3793,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3822,6 +3925,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3974,6 +4078,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4130,6 +4235,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4221,6 +4327,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4328,6 +4435,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4466,6 +4574,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4594,6 +4703,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4676,6 +4786,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4779,6 +4890,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4903,6 +5015,7 @@ mod tests {
             })
             .collect();
         ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

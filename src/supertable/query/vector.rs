@@ -83,6 +83,7 @@ use super::{
     candidate::CandidatePlan,
     dispatch,
     exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
+    hierarchical_iter,
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
@@ -90,8 +91,9 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri},
+        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri, part::PartId},
+        opann::{paged::PagedTree, store},
         tombstones::SidecarCache,
     },
 };
@@ -851,10 +853,49 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
+        // Copy the routing record out and clone the storage handle so neither
+        // borrows `manifest` across the awaits below.
+        let opann = manifest
+            .opann_routing()
+            .map(|r| (r.root_page, r.routing.nprobe_max));
+        let storage = manifest.options.storage.clone();
+        let superfiles = match (opann, storage) {
+            // OPANN (§10): descend the compute-resident Sq8 routing tree to the
+            // nearest cells, then keep only superfiles in those cells. Replaces
+            // the coarse fp32 `prune_parts_for_vector` envelope scan with the
+            // O(log n) tree descent.
+            (Some((root, n_probe)), Some(storage)) => {
+                let source = store::load_resident(&*storage, root)
+                    .await
+                    .map_err(|e| QueryError::Store(format!("opann page load: {e}")))?;
+                let cells = PagedTree::new(source, root)
+                    .select_probes(query, n_probe)
+                    .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
+                let cell_set: HashSet<u32> = cells.into_iter().map(|(c, _)| c as u32).collect();
+                let part_ids: Vec<PartId> = manifest
+                    .get_all_list_entries()
+                    .iter()
+                    .map(|e| e.part_id)
+                    .collect();
+                hierarchical_iter::load_and_flatten(manifest, &part_ids)
+                    .await
+                    .map_err(QueryError::ManifestLoad)?
+                    .into_iter()
+                    // Keep the routed cells plus the always-scanned "incoming"
+                    // superfiles (sentinel cell, not yet routed to a per-cell
+                    // IVF); a superfile with no cell hint is kept too, never
+                    // silently dropped.
+                    .filter(|sf| match sf.partition_hint {
+                        Some(h) => h == INCOMING_VECTOR_CELL || cell_set.contains(&h),
+                        None => true,
+                    })
+                    .collect()
+            }
+            _ => manifest
+                .get_pruned_superfiles_for_vector(column, query)
+                .await
+                .map_err(QueryError::ManifestLoad)?,
+        };
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }

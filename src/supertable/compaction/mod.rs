@@ -38,9 +38,9 @@ use crate::{
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         manifest::Manifest,
+        opann::maintenance::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups},
         options::SupertableOptions,
         query::dispatch::open_reader,
-        spfresh::{CELL_OVERLAP_TAU_DEFAULT, hot_overlap_groups},
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
@@ -318,7 +318,7 @@ impl Supertable {
 
     /// Select overlap-driven consolidation jobs for the hidden vector-index
     /// table: group cells whose bounding spheres overlap (via
-    /// [`spfresh::hot_overlap_groups`]) and emit one merge job per group. The
+    /// [`hot_overlap_groups`]) and emit one merge job per group. The
     /// per-cell bounding centroid + radius already live in the manifest summary,
     /// so this is pure selection — the actual merge + overflow-split is the
     /// existing [`Self::run_compaction_job`] path.

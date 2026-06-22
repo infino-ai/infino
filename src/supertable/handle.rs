@@ -1611,6 +1611,98 @@ mod tests {
         assert!(!hits.is_empty(), "search should find committed vectors");
     }
 
+    /// The commit hook must build the OPANN routing tree over the hidden index's
+    /// cell centroids, persist its pages, and stamp the root into the hidden
+    /// manifest. (If `write_pages` errored the commit would fail; a stamped root
+    /// means the whole encoded build → persist → stamp path ran.)
+    #[test]
+    fn opann_routing_root_stamped_after_vector_commits() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Two commits: the first hidden commit can predate the hidden manifest
+        // list (the root then lands on the next), so commit twice. Varied
+        // vectors keep the cells non-degenerate.
+        for round in 0..2u32 {
+            let n = 12usize;
+            let titles =
+                LargeStringArray::from((0..n).map(|i| format!("t{round}_{i}")).collect::<Vec<_>>());
+            let mut vals = vec![0.0f32; n * dim];
+            for (i, row) in vals.chunks_mut(dim).enumerate() {
+                row[i % dim] = 1.0 + round as f32;
+                row[(i + round as usize) % dim] += 0.5;
+            }
+            let flat = Float32Array::from(vals);
+            let fsl =
+                FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader();
+        let hidden = reader.vector_index_table().expect("hidden index");
+        let hidden_manifest = hidden.inner.manifest.load_full();
+        assert!(
+            hidden_manifest.opann_routing().is_some(),
+            "OPANN routing root must be stamped into the hidden manifest after vector commits"
+        );
+    }
+
     /// The hidden IVF superfiles must be made *resident* in the
     /// disk cache by a vector query, and a warm re-query must serve from
     /// that resident mmap without re-fetching from storage.

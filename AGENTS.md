@@ -50,6 +50,10 @@ cargo bench --bench bench -- tombstone
   - **rayon owns the CPU waves**: Parquet page decode, BM25 / vector scoring, rerank, encode. Run them on `options.reader_pool` (the configurable pool — not the global rayon pool) via `pool.install(|| … par_iter …)`.
   - **Bridge with a oneshot**: when an async task needs a CPU wave, hand the work to the rayon pool and `await` a `tokio::sync::oneshot` for the result, so tokio workers keep driving I/O instead of blocking under the compute. Don't call `par_iter` (or any long compute) inline in an async fn.
   - If you change where work runs, benchmark before and after (`cargo bench --bench bench -- supertable search` plus the `INFINO_DIAG_QUERY_SQL_OVERHEAD` diagnostic for the SQL resolve path) — a prior change silently moved warm decodes back onto tokio and cost ~5× on `resolve_hits`.
+- **Vectors are Sq8+residual everywhere inside the engine; the only fp32 is at the surface.** Raw fp32 vectors exist *only* where data enters or leaves: the ingestion boundary, and the query vector at search time. Everything stored and everything computed internally is Sq8+residual — payload rows, cell centroids, summary centroids, and routing/tree centroids alike.
+  - **All internal vector arithmetic goes through `Sq8ResidualKernel`** (`superfile/vector/distance.rs`): distances, scoring, routing, any centroid comparison. The kernel scores an fp32 *query* straight against the stored `[codes ‖ residuals]` bytes — that fp32 query is the search surface, not an internal vector.
+  - **Never reconstruct a stored vector to fp32 to do math on it.** No `to_single_fp32` / `dequantize_into` / fresh decode of manifest or centroid bytes for a distance, mean, or clustering step. Centroids read from the (mmap'd) manifest stay Sq8+residual and are scored via the kernel, exactly as `ClusterCentroids::select_cells_adaptive` does — decoding them back to fp32 bypasses the mmap'd representation and is a correctness *and* performance regression.
+  - At build time, fp32 appears **only** as the ingestion-surface k-means input (raw vectors / the reservoir sample), quantized once into Sq8+residual before storage. It is never sourced by decoding centroids already stored in the engine.
 - **No magic numbers.** Numeric (and other opaque) literals that carry semantic meaning must be named `const`s with a short doc-comment, never inlined mid-expression. Declare them at the **top of the file** for runtime code; for test code, at the top of the file or at the top of the relevant test section / module. Trivial values in obvious arithmetic and indexing (`i + 1`, `len - 1`, `x / 2`, index `0`) are exempt.
 - **Imports at the top of the file.** All `use` statements live at the top of the file (or, for an inline `#[cfg(test)]` module, at the top of that module) — never function-local, block-scoped, or otherwise inline. A file's full dependency surface should be readable in one place. If you find yourself reaching for a fully-qualified path mid-expression only to avoid an import, add the `use` at the top instead.
 - **No inline fully-qualified paths.** Don't name an item by its full module path mid-expression — not crate-internal (`crate::…`, `self::…`, `super::…`) and not external/std (`std::…`, `core::…`, `alloc::…`, `arrow::…`, `datafusion::…`, …). Import the item at the top (`use …::foo;`) and call the short name (`foo(…)`). Applies to functions, types, consts, struct/enum literals, and trait paths alike. Four exceptions only: (1) **disambiguation** of two same-named items used in one file — import both *parent modules* and qualify by the last segment (`vector::reader::OpenOptions` vs `fts::reader::OpenOptions`), never deep-path either; (2) **UFCS / trait disambiguation** (`<T as Trait>::method`, `<Self as …>`) where no import can remove the qualification; (3) `#[from]` and other **attribute paths** inside `#[derive(Error)]` enums (idiomatic thiserror, collision-prone — leave fully-qualified); (4) `Self::` associated items (not a module path). When two imports would collide outside an error enum, alias with `as` rather than fall back to an inline path.
@@ -143,7 +147,7 @@ src/
 │   ├── tombstones/        ← runtime tombstone cache (filtering deleted rows)
 │   ├── wal/               ← write-ahead log for update/delete pipeline
 │   ├── reader_cache/      ← per-process superfile cache
-│   ├── spfresh.rs         ← MVCC SPFresh maintenance for the hidden vector cell index
+│   ├── opann/             ← OPANN: routing tree (pages, descent, store) + hidden-index maintenance
 │   ├── compaction/        ← merge small superfiles toward a packed base
 │   ├── gc/                ← post-commit cleanup of orphaned superfiles
 │   └── optimize/          ← explicit table optimize / full-compaction entry
@@ -175,7 +179,7 @@ Rule of thumb for landing a change in the right place:
 | Partition strategy                          | `src/supertable/manifest/partition.rs`                                |
 | Skip pruning (Bloom / min-max / term range) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
 | Commit / writer slot / handle               | `src/supertable/writer.rs` + `src/supertable/handle.rs`               |
-| Hidden vector-index (SPFresh) maintenance   | `src/supertable/spfresh.rs` + hidden-index path in `writer.rs`        |
+| Hidden vector-index (OPANN) maintenance     | `src/supertable/opann/maintenance.rs` + hidden-index path in `writer.rs` |
 | Superfile merge / compaction                | `src/supertable/compaction/mod.rs`                                    |
 | Tombstones (delete-path / query-filter)     | `src/supertable/{wal,tombstones}/`                                    |
 | New storage backend                         | `src/storage/`                                                        |
@@ -208,18 +212,18 @@ Rule of thumb for landing a change in the right place:
 - **Non-Parquet file format** (e.g. a proprietary columnar layout like Lance). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
 - **WAL-based ingest** (per-row durability before commit). Rejected as a different architectural model; commit-as-durability-boundary is deliberate. Note: a WAL *does* exist in `src/supertable/wal/` for the **updates/deletes** pipeline — that's orchestration state, not ingest durability. Don't conflate.
 - **HNSW graph inside each IVF partition.** Memory cost is 80 MB / 1M docs for an 18% warm-search win; not worth it given our high-`n_cent` + 1-bit-code shape.
-- **SPFresh-style in-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones.
-- **In-place mutation of a committed superfile's bytes.** Superfiles are immutable by design; the user table stays append-only and time-ordered. Updates to user data = delete + insert via tombstones. (This is *not* a ban on SPFresh maintenance — see below — only on rewriting committed user-superfile bytes in place.)
+- **In-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones. (OPANN hidden-index maintenance does *not* do this — it appends + MVCC-swaps, never edits bytes in place; see below.)
+- **In-place mutation of a committed superfile's bytes.** Superfiles are immutable by design; the user table stays append-only and time-ordered. Updates to user data = delete + insert via tombstones. (This is *not* a ban on OPANN hidden-index maintenance — see below — only on rewriting committed user-superfile bytes in place.)
 - **Multi-vector / ColBERT-style per-token vectors.** Niche; better as a sidecar pattern than a format primitive.
 - `**range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
 
-#### SPFresh hidden vector index (implemented — was previously on this list)
+#### OPANN hidden vector index (implemented — was previously on this list)
 
-SPFresh-style IVF maintenance used to be rejected as "in-place IVF rebalance." It now ships, but as an **MVCC, immutable-superfile** design that does *not* mutate anything in place — so the immutability principle above is preserved:
+Object-partitioned hidden-index maintenance (OPANN) used to be rejected as "in-place IVF rebalance." It now ships, but as an **MVCC, immutable-superfile** design that does *not* mutate anything in place — so the immutability principle above is preserved:
 
 - Vector search runs over a **hidden, derived vector-index supertable** (a cell-ordered acceleration layer), dual-written alongside the immutable, time-ordered user table. The user table is never rebalanced.
-- Maintenance (`src/supertable/spfresh.rs` + the hidden-index path in `writer.rs`/`handle.rs`) expresses SPFresh/LIRE logical updates as **physical append + MVCC swap**: each commit appends per-cell delta IVF superfiles; background maintenance merges small per-cell superfiles toward a packed base (via the standard `compaction::merge_superfiles` path), refreshes touched-cell centroids/radii, and splits overflow cells (Sq8+ε k-means, N→N+1 centroids) by writing new superfiles and atomically swapping the manifest — never editing existing bytes.
-- All split/reassign math stays on stored **Sq8+ε** bytes (`distance_encoded_to_centroid`, `encode_encoded_rows`), never a full-corpus fp32 decode.
+- Maintenance (`src/supertable/opann/maintenance.rs` + the hidden-index path in `writer.rs`/`handle.rs`) expresses logical updates as **physical append + MVCC swap**: each commit appends per-cell delta IVF superfiles; background maintenance merges small per-cell superfiles toward a packed base (via the standard `compaction::merge_superfiles` path), refreshes touched-cell centroids/radii, and splits overflow cells (Sq8+residual k-means, N→N+1 centroids) by writing new superfiles and atomically swapping the manifest — never editing existing bytes.
+- All split/reassign and centroid math stays on the stored **Sq8+residual** bytes, scored through `Sq8ResidualKernel` (`superfile/vector/distance.rs`) — never a decode of stored vectors back to fp32 (see the "Vectors are Sq8+residual everywhere" rule above).
 
 Revisiting the *thesis* (immutable superfiles, commit-as-durability) still needs an issue first; extending the existing hidden-index maintenance does not.
 
