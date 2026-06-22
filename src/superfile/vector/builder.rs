@@ -34,7 +34,7 @@ use crate::superfile::{
     vector::{
         cell_posting::{
             MaterializedIvfRow, cluster_quant_from_medoid, encoded_component_at,
-            encoded_ivf_kmeans, materialize_sq8_residual_row_into_cluster_quant,
+            materialize_sq8_residual_row_into_cluster_quant,
         },
         distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
         ivf_merge::MergedIvfSubsection,
@@ -809,13 +809,31 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
-    let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
     let n_cent = cfg
         .n_cent
         .max(1)
         .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1));
-    let centroids = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
+    // Train centroids the same way the user-superfile build does: on a bounded
+    // sample (NOT every row), via the shared `kmeans` (random init + parallel).
+    // The previous bespoke `encoded_ivf_kmeans` trained over every row with
+    // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
+    // on large cells. Only the sampled rows are decoded to fp32, so there is no
+    // full-corpus fp32 buffer.
+    let sample_size = default_kmeans_sample_size(n_cent).min(n_docs);
+    let mut sample = vec![0f32; sample_size * dim];
+    for s in 0..sample_size {
+        let idx = if sample_size == n_docs {
+            s
+        } else {
+            s * n_docs / sample_size
+        };
+        let enc = &rows[idx].encoded;
+        for (d, slot) in sample[s * dim..(s + 1) * dim].iter_mut().enumerate() {
+            *slot = encoded_component_at(enc, d);
+        }
+    }
+    let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
