@@ -35,10 +35,18 @@ case "$PLATFORM" in
   linux)
     # glibc vs musl (Alpine) — napi names the binary/package per libc. Detect it
     # the same way napi's loader does: glibcVersionRuntime is absent under musl.
-    if node -e 'try{process.exit(process.report.getReport().header.glibcVersionRuntime?0:1)}catch{process.exit(1)}'; then
+    # exit 0 = glibc, 1 = musl, 2 = couldn't tell (don't guess — that would
+    # stage the wrong per-platform binary and fail confusingly).
+    if node -e 'try{process.exit(process.report.getReport().header.glibcVersionRuntime?0:1)}catch{process.exit(2)}'; then
       TRIPLE="linux-${ARCH}-gnu"
     else
-      TRIPLE="linux-${ARCH}-musl"
+      status=$?
+      if [ "$status" = "1" ]; then
+        TRIPLE="linux-${ARCH}-musl"
+      else
+        echo "verify-pack: could not determine libc (glibc vs musl) for linux-${ARCH}" >&2
+        exit 1
+      fi
     fi ;;
   *) echo "verify-pack: unsupported host platform '$PLATFORM'" >&2; exit 1 ;;
 esac
