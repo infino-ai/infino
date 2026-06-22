@@ -15,9 +15,17 @@ as Python and Node.js bindings.
 
 - [README](README.md): what Infino is, install, and a copy-paste quickstart in
   Rust, Python, and Node.js.
+
+## Concepts
+
 - [Object-storage-native retrieval](docs/concepts/object-storage-native-retrieval.md):
   the core idea — search that runs directly on data in object storage instead
   of in a database or cluster that owns its own copy.
+- [Hybrid search](docs/concepts/hybrid-search.md): keyword (BM25) + vector
+  retrieval fused into one ranked list, in one engine over one copy of the data.
+- [Retrieval for agents](docs/concepts/retrieval-for-agents.md): the read path
+  an agent calls hundreds of times per task — why speed-per-dollar compounds and
+  what to reach for.
 
 ## Architecture
 
