@@ -91,12 +91,9 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, OpannResident, Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, part::ContentHash, part::PartId},
-        opann::{
-            paged::{PagedTree, ResidentPageSource},
-            store,
-        },
+        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri, part::PartId},
+        opann::paged::PagedTree,
         tombstones::SidecarCache,
     },
 };
@@ -845,32 +842,6 @@ impl SupertableReader {
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect())
     }
-    /// The resident OPANN routing tree for `root`, loaded once and reused.
-    /// Reloads only when the routing root changed (a commit) or nothing is
-    /// cached yet. Concurrent first-callers may both load the same root
-    /// (benign, identical content); last write wins.
-    async fn opann_resident_source(
-        &self,
-        root: ContentHash,
-        storage: &Arc<dyn StorageProvider>,
-    ) -> Result<Arc<ResidentPageSource>, QueryError> {
-        if let Some(cur) = self.inner().opann_resident.load_full()
-            && cur.root == root
-        {
-            return Ok(Arc::clone(&cur.source));
-        }
-        let source = Arc::new(
-            store::load_resident(storage.as_ref(), root)
-                .await
-                .map_err(|e| QueryError::Store(format!("opann page load: {e}")))?,
-        );
-        self.inner().opann_resident.store(Some(Arc::new(OpannResident {
-            root,
-            source: Arc::clone(&source),
-        })));
-        Ok(source)
-    }
-
     pub(crate) async fn vector_search_user_table_async(
         &self,
         column: &str,
@@ -882,19 +853,23 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        // Copy the routing record out and clone the storage handle so neither
-        // borrows `manifest` across the awaits below.
+        // The resident OPANN routing tree swaps with the manifest — loaded once
+        // at open and reused by every query (not a per-query / inner-cache
+        // load). Copy the routing root + probe budget out of the same routing
+        // record so neither borrows `manifest` across the awaits below.
+        let tree = manifest
+            .opann_resident_tree()
+            .await
+            .map_err(|e| QueryError::Store(format!("opann tree load: {e}")))?;
         let opann = manifest
             .opann_routing()
             .map(|r| (r.root_page, r.routing.nprobe_max));
-        let storage = manifest.options.storage.clone();
-        let superfiles = match (opann, storage) {
+        let superfiles = match (tree, opann) {
             // OPANN (§10): descend the compute-resident Sq8 routing tree to the
             // nearest cells, then keep only superfiles in those cells. Replaces
             // the coarse fp32 `prune_parts_for_vector` envelope scan with the
             // O(log n) tree descent.
-            (Some((root, n_probe)), Some(storage)) => {
-                let source = self.opann_resident_source(root, &storage).await?;
+            (Some(source), Some((root, n_probe))) => {
                 let cells = PagedTree::new(source, root)
                     .select_probes(query, n_probe)
                     .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;

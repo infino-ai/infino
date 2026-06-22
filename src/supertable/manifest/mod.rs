@@ -79,6 +79,10 @@ use crate::{
             part::{ContentHash, ManifestPart, PartId},
             partition::{assign_partition, encode_partition_key},
         },
+        opann::{
+            paged::ResidentPageSource,
+            store::{OpannStoreError, load_resident},
+        },
         query::{hierarchical_iter, prune::PruneLeaf},
     },
 };
@@ -207,6 +211,10 @@ pub struct Manifest {
     /// Stamped partition strategy before the first list lands, or
     /// when updating strategy without rebuilding options.
     stamped_partition_strategy: Option<PartitionStrategy>,
+    /// Resident OPANN routing tree for this manifest version — loaded once at
+    /// open and reused by every query, swapping with the manifest like the
+    /// centroids. Empty for tables without an OPANN routing root.
+    opann_tree: OnceCell<Arc<ResidentPageSource>>,
 }
 
 impl fmt::Debug for Manifest {
@@ -256,6 +264,7 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
+                opann_tree: OnceCell::new(),
             }
         } else {
             Self {
@@ -264,6 +273,7 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: None,
                 stamped_partition_strategy: None,
+                opann_tree: OnceCell::new(),
             }
         }
     }
@@ -285,6 +295,7 @@ impl Manifest {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         }
     }
 
@@ -301,6 +312,7 @@ impl Manifest {
             parts: dashmap::DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         }
     }
 
@@ -331,6 +343,29 @@ impl Manifest {
     /// tree is published yet; vector search falls back to flat cell selection.
     pub(crate) fn opann_routing(&self) -> Option<&list::OpannRouting> {
         self.list.as_ref().and_then(|l| l.opann_routing.as_ref())
+    }
+
+    /// The resident OPANN routing tree for this manifest, loaded once (through
+    /// [`load_resident`] against this manifest's storage) and reused.
+    /// `Ok(None)` if there is no OPANN routing root or no storage backend.
+    pub(crate) async fn opann_resident_tree(
+        &self,
+    ) -> Result<Option<Arc<ResidentPageSource>>, OpannStoreError> {
+        let Some(routing) = self.opann_routing() else {
+            return Ok(None);
+        };
+        let Some(storage) = self.options.storage.as_ref() else {
+            return Ok(None);
+        };
+        let root = routing.root_page;
+        let storage = Arc::clone(storage);
+        let source = self
+            .opann_tree
+            .get_or_try_init(|| async move {
+                load_resident(storage.as_ref(), root).await.map(Arc::new)
+            })
+            .await?;
+        Ok(Some(Arc::clone(source)))
     }
 
     pub fn get_num_parts(&self) -> usize {
@@ -532,9 +567,16 @@ impl Manifest {
             parts,
             loader: Some(loader),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         };
 
-        Ok(Arc::new(new_manifest))
+        let manifest = Arc::new(new_manifest);
+        // Pull the OPANN routing tree onto compute as part of opening the
+        // manifest (one load per manifest version, reused by every query).
+        // Best-effort: a load failure here just leaves it lazy for the first
+        // query to retry.
+        let _ = manifest.opann_resident_tree().await;
+        Ok(manifest)
     }
 
     /// Commit a new manifest version.
@@ -676,6 +718,7 @@ impl Manifest {
             parts: DashMap::new(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            opann_tree: OnceCell::new(),
         }
     }
 
@@ -702,6 +745,7 @@ impl Manifest {
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: Some(strategy),
+            opann_tree: OnceCell::new(),
         }
     }
 
@@ -727,6 +771,7 @@ impl Manifest {
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            opann_tree: OnceCell::new(),
         }
     }
 
@@ -1046,6 +1091,7 @@ impl Manifest {
             parts,
             loader,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         };
 
         Ok((new_manifest, parts_to_write))
@@ -2636,6 +2682,7 @@ mod tests {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
+                opann_tree: OnceCell::new(),
             }
         }
 
@@ -2862,6 +2909,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -2997,6 +3045,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         })
     }
 
@@ -3120,6 +3169,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3267,6 +3317,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Commit one new superfile into partition A. Keep `new_entry`
@@ -3478,6 +3529,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3574,6 +3626,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3723,6 +3776,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Add one new entry for the partition
@@ -3856,6 +3910,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let new_entries = vec![
@@ -3988,6 +4043,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // Only touch partition A
@@ -4167,6 +4223,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let new_entries = vec![
@@ -4279,6 +4336,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4371,6 +4429,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4498,6 +4557,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4641,6 +4701,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4747,6 +4808,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4830,6 +4892,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -4957,6 +5020,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -5039,6 +5103,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            opann_tree: OnceCell::new(),
         }
     }
 
