@@ -16,5 +16,7 @@ lcov.info
 infino-python/target/
 infino-python/.venv/
 infino-python/dist/
+# Compiled extension dropped into the source package by `maturin develop`.
+infino-python/python/infino/*.so
 **/__pycache__/
 **/.pytest_cache/

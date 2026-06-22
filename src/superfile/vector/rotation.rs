@@ -40,8 +40,9 @@
 //! about the rotation is persisted — swapping the construction is not an
 //! on-disk format change.
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use std::cell::RefCell;
+
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use wide::f32x8;
 
@@ -134,7 +135,7 @@ thread_local! {
     /// Per-thread reusable transform buffer (length = `padded_dim`).
     /// Avoids an allocation on every `apply` (the per-vector hot path
     /// at build and per-query at search).
-    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `buf[i] *= signs[i]` (`±1` flip), 8 lanes at a time.

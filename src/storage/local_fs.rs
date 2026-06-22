@@ -14,16 +14,15 @@
 //! `<root>/data/seg-abc.sf.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
-use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use fs4::tokio::AsyncFileExt;
 use futures::TryStreamExt;
-use object_store::path::Path as ObjPath;
 use object_store::{
-    Error as ObjError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider};
@@ -31,7 +30,7 @@ use super::{ObjectMeta, StorageError, StorageProvider};
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
     root: PathBuf,
-    store: Arc<object_store::local::LocalFileSystem>,
+    store: Arc<LocalFileSystem>,
 }
 
 impl LocalFsStorageProvider {
@@ -47,12 +46,11 @@ impl LocalFsStorageProvider {
             uri: root.display().to_string(),
             source: Box::new(e),
         })?;
-        let store = object_store::local::LocalFileSystem::new_with_prefix(&root).map_err(|e| {
-            StorageError::Permanent {
+        let store =
+            LocalFileSystem::new_with_prefix(&root).map_err(|e| StorageError::Permanent {
                 uri: root.display().to_string(),
                 source: Box::new(e),
-            }
-        })?;
+            })?;
         Ok(Self {
             root,
             store: Arc::new(store),
@@ -111,6 +109,7 @@ impl StorageProvider for LocalFsStorageProvider {
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
+            last_modified: meta.last_modified.into(),
         })
     }
 
@@ -122,6 +121,7 @@ impl StorageProvider for LocalFsStorageProvider {
         let meta = ObjectMeta {
             size: result.meta.size as u64,
             etag: result.meta.e_tag.clone(),
+            last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
         Ok((bytes, meta))
@@ -183,7 +183,6 @@ impl StorageProvider for LocalFsStorageProvider {
             // don't need this scaffolding — see
             // `S3StorageProvider::put_if_match`.
             Some(expected) => {
-                use fs4::tokio::AsyncFileExt;
                 let lock_path = self.root.join("_supertable").join(".lock");
                 // The pointer commit path already creates
                 // `_supertable/` on the first write; doing it
@@ -249,10 +248,7 @@ impl StorageProvider for LocalFsStorageProvider {
         }
     }
 
-    async fn put_multipart(
-        &self,
-        uri: &str,
-    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+    async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = Self::path(uri)?;
         self.store
             .put_multipart(&path)
@@ -269,12 +265,22 @@ impl StorageProvider for LocalFsStorageProvider {
         }
     }
 
-    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
-        let mut out: Vec<String> = Vec::new();
+        let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
-            out.push(meta.location.to_string());
+            out.push((
+                meta.location.to_string(),
+                ObjectMeta {
+                    size: meta.size,
+                    etag: meta.e_tag,
+                    last_modified: meta.last_modified.into(),
+                },
+            ));
         }
         Ok(out)
     }
@@ -302,9 +308,15 @@ mod tests {
     //! `get_range` return `NotFound` on missing; advisory
     //! flock file is created on `put_if_match` (the TOCTOU-
     //! closing path); `put_multipart` returns a handle.
-    use super::*;
+    use std::{
+        error::Error,
+        time::{Duration, SystemTime},
+    };
+
     use bytes::Bytes;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn provider() -> (TempDir, LocalFsStorageProvider) {
         let dir = TempDir::new().expect("tempdir");
@@ -554,6 +566,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_with_prefix_metadata_returns_mtime_and_size() {
+        let (_dir, p) = provider();
+        let before = SystemTime::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("parsing failed");
+        p.put_atomic("data/a.parquet", Bytes::from_static(b"hello"))
+            .await
+            .expect("put");
+        let after = SystemTime::now()
+            .checked_add(Duration::from_secs(2))
+            .expect("parsing failed");
+
+        let mut entries = p
+            .list_with_prefix_metadata("data/")
+            .await
+            .expect("list metadata");
+        assert_eq!(entries.len(), 1);
+        entries.sort_by_key(|(key, _)| key.clone());
+        let (key, meta) = &entries[0];
+        assert_eq!(key, "data/a.parquet");
+        assert!(meta.last_modified >= before, "mtime too old");
+        assert!(meta.last_modified <= after, "mtime in future");
+        assert_eq!(meta.size, 5);
+    }
+
+    #[tokio::test]
     async fn object_store_handle_exposes_store_and_key() {
         let (_dir, p) = provider();
         let (_store, path) = p
@@ -576,7 +614,7 @@ mod tests {
         // `object_store` retries transient failures internally per its
         // RetryConfig; a `Generic` reaching `translate` is post-retry,
         // so it maps to `TransientExhausted`.
-        let boxed: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        let boxed: Box<dyn Error + Send + Sync> = "boom".into();
         let e = ObjError::Generic {
             store: "test",
             source: boxed,

@@ -30,11 +30,16 @@ use std::sync::Arc;
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use rayon::ThreadPoolBuilder;
 
-use crate::superfile::builder::{FtsConfig, VectorConfig};
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::superfile::vector::distance::Metric;
-use crate::supertable::SupertableOptions;
+use crate::{
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::SupertableOptions,
+};
 
 /// Build a `Decimal128Array(38, 0)` from `u64` ids.
 ///
@@ -88,7 +93,7 @@ pub fn default_vector_config(column: &str, rot_seed: u64) -> VectorConfig {
         n_cent: 4,
         rot_seed,
         metric: Metric::Cosine,
-        rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+        rerank_codec: RerankCodec::Fp32,
     }
 }
 
@@ -127,7 +132,7 @@ pub fn build_title_batch(titles: &[&str]) -> RecordBatch {
 /// explicitly whether to attach storage.
 pub fn default_supertable_options() -> SupertableOptions {
     let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
+        ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("rayon ThreadPoolBuilder with num_threads(1) builds"),

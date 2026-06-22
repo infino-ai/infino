@@ -3,7 +3,7 @@
 
 //! Manifest-level skip pruning helpers.
 //!
-//! Each helper takes a pinned [`Manifest`] snapshot plus a query
+//! Each helper takes a pinned [`ManifestSnapshot`] snapshot plus a query
 //! shape and returns a `Vec<bool>` mask — one slot per superfile, in
 //! manifest order — where `true` means "keep" and `false` means
 //! "prune".  The masks are pure functions of manifest metadata
@@ -44,15 +44,17 @@
 //! without yet committing to a specific early-termination
 //! algorithm.
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use datafusion::scalar::ScalarValue;
 
-use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::vector::distance::{Metric, distance};
-
-use crate::supertable::manifest::{Manifest, SuperfileEntry, term_range::prefix_overlaps_range};
+use crate::{
+    superfile::{
+        fts::reader::BoolMode,
+        vector::distance::{Metric, distance},
+    },
+    supertable::manifest::{ManifestSnapshot, SuperfileEntry},
+};
 
 /// Bloom-skip mask for an exact-term BM25 search.
 ///
@@ -89,10 +91,10 @@ pub fn fts_bloom_skip(
             Some(summary) => match mode {
                 BoolMode::Or => query_terms
                     .iter()
-                    .any(|t| summary.term_bloom.contains(t.as_bytes())),
+                    .any(|t| summary.may_contain(t.as_bytes())),
                 BoolMode::And => query_terms
                     .iter()
-                    .all(|t| summary.term_bloom.contains(t.as_bytes())),
+                    .all(|t| summary.may_contain(t.as_bytes())),
             },
         })
         .collect()
@@ -101,17 +103,17 @@ pub fn fts_bloom_skip(
 /// Term-range skip mask for a prefix BM25 search.
 ///
 /// For each superfile, check whether `[prefix, prefix_upper_bound)`
-/// overlaps the superfile's lex term range
-/// `[fts_summary.term_range.0, fts_summary.term_range.1]`. A
-/// non-overlapping superfile cannot contain any term beginning with
-/// `prefix` and is pruned.
+/// overlaps the superfile's lex term range (via
+/// [`FtsSummaryAgg::may_match_prefix`]). A non-overlapping superfile
+/// cannot contain any term beginning with `prefix` and is pruned.
 ///
-/// `prefix` is the same lowercased byte sequence the prefix
-/// search uses against the FST — see [`prefix_overlaps_range`]
-/// for the exact comparison semantics.
+/// `prefix` is the same lowercased byte sequence the prefix search uses
+/// against the FST.
 ///
 /// An empty `prefix` (every term matches) short-circuits to
 /// all-keep.
+///
+/// [`FtsSummaryAgg::may_match_prefix`]: crate::supertable::manifest::FtsSummaryAgg::may_match_prefix
 pub fn fts_prefix_skip(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
@@ -124,15 +126,9 @@ pub fn fts_prefix_skip(
         .iter()
         .map(|entry| match entry.fts_summary.get(column) {
             None => true,
-            Some(summary) => {
-                let (min_term, max_term) = &summary.term_range;
-                if min_term.is_empty() && max_term.is_empty() {
-                    // 0-term superfile — bloom build also flags
-                    // this; nothing matches. Prune.
-                    return false;
-                }
-                prefix_overlaps_range(prefix, min_term, max_term)
-            }
+            // `may_match_prefix` returns false for a `None` range (0-term
+            // superfile — nothing matches, prune).
+            Some(summary) => summary.may_match_prefix(prefix),
         })
         .collect()
 }
@@ -151,7 +147,11 @@ pub fn fts_prefix_skip(
 /// [`superfiles_sorted_by_centroid_distance`] to bias fan-out
 /// order toward likely-close superfiles — that alone gives a
 /// near-cutoff result fast for cache-aware top-k merging.
-pub fn vector_centroid_skip(manifest: &Manifest, _column: &str, _query: &[f32]) -> Vec<bool> {
+pub fn vector_centroid_skip(
+    manifest: &ManifestSnapshot,
+    _column: &str,
+    _query: &[f32],
+) -> Vec<bool> {
     vec![true; manifest.superfiles.len()]
 }
 
@@ -168,7 +168,7 @@ pub fn vector_centroid_skip(manifest: &Manifest, _column: &str, _query: &[f32]) 
 /// of how to materialize the ordered fan-out (rayon `par_iter`
 /// over indices is the typical shape).
 pub fn superfiles_sorted_by_centroid_distance(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     column: &str,
     query: &[f32],
     metric: Metric,
@@ -186,7 +186,7 @@ pub fn superfiles_sorted_by_centroid_distance(
         .collect();
     // pdqsort: per-query superfile skip ordering. (superfile_idx, dist)
     // tuples are unique by superfile_idx, so any tie-break is fine.
-    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
@@ -262,13 +262,13 @@ pub fn scalar_skip(
 /// only from the superfile's persisted min/max. Conservative: any
 /// uncertainty returns `true` (keep).
 fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
-    let Some((min_arr, max_arr)) = entry.scalar_stats.cols.get(&pred.column) else {
+    let Some(agg) = entry.scalar_stats.get(&pred.column) else {
         // No stats for this column — can't prove irrelevance.
         return true;
     };
     let (Ok(min), Ok(max)) = (
-        ScalarValue::try_from_array(min_arr.as_ref(), 0),
-        ScalarValue::try_from_array(max_arr.as_ref(), 0),
+        ScalarValue::try_from_array(agg.min.as_ref(), 0),
+        ScalarValue::try_from_array(agg.max.as_ref(), 0),
     ) else {
         return true;
     };
@@ -324,25 +324,28 @@ pub(crate) fn scalar_value_may_match(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use uuid::Uuid;
-
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
-    use crate::supertable::SupertableOptions;
-    use crate::supertable::manifest::{
-        FtsSummary, Manifest, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary,
-        bloom::BloomBuilder,
-    };
-    use arrow_schema::{DataType, Field, Schema};
-
-    use super::*;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{
+            SupertableOptions,
+            manifest::{
+                ClusterCentroids, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
+                SuperfileUri, VectorSummary, bloom::BloomBuilder,
+            },
+        },
+        test_helpers::default_tokenizer,
+    };
 
     fn opts_simple() -> Arc<SupertableOptions> {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -350,7 +353,7 @@ mod tests {
             DataType::LargeUtf8,
             false,
         )]));
-        let tk = crate::test_helpers::default_tokenizer();
+        let tk = default_tokenizer();
         Arc::new(
             SupertableOptions::new(
                 schema,
@@ -385,7 +388,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 0,
                     metric: Metric::Cosine,
-                    rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                    rerank_codec: RerankCodec::Fp32,
                 }],
                 None,
             )
@@ -401,7 +404,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -411,7 +414,7 @@ mod tests {
     }
 
     /// Build a one-column FTS summary with the given indexed terms.
-    fn fts_summary_with(column: &str, terms: &[&str]) -> (String, FtsSummary) {
+    fn fts_summary_with(column: &str, terms: &[&str]) -> (String, FtsSummaryAgg) {
         let mut bb = BloomBuilder::new();
         for t in terms {
             bb.insert(t.as_bytes());
@@ -420,11 +423,7 @@ mod tests {
             (Some(min), Some(max)) => (min.as_bytes().to_vec(), max.as_bytes().to_vec()),
             _ => (Vec::new(), Vec::new()),
         };
-        let summary = FtsSummary {
-            term_bloom: bb.finish(),
-            n_terms_distinct: terms.len() as u32,
-            term_range,
-        };
+        let summary = FtsSummaryAgg::new_with_params(bb.finish(), terms.len() as u32, term_range);
         (column.to_string(), summary)
     }
 
@@ -446,21 +445,10 @@ mod tests {
             VectorSummary {
                 centroid,
                 radius,
-                clusters: crate::supertable::manifest::ClusterCentroids::empty(),
+                clusters: ClusterCentroids::empty(),
             },
         );
         Arc::new(e)
-    }
-
-    fn manifest_with(
-        opts: Arc<SupertableOptions>,
-        superfiles: Vec<Arc<SuperfileEntry>>,
-    ) -> Manifest {
-        // build via `with_appended` so the new outer
-        // Manifest's metadata fields (list, parts, loader) get
-        // initialized correctly. Equivalent to the old direct-
-        // field-assignment helper for the test's purposes.
-        Manifest::empty(opts).with_appended(superfiles)
     }
 
     // ---- fts_bloom_skip ----------------------------------------------
@@ -469,7 +457,7 @@ mod tests {
     fn bloom_skip_keeps_superfiles_with_any_query_term_in_or_mode() {
         let s_a = superfile_with_terms("title", &["alpha", "beta"]);
         let s_b = superfile_with_terms("title", &["gamma", "delta"]);
-        let m = manifest_with(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "missing"], BoolMode::Or);
         // Superfile A has alpha → keep. Superfile B has neither → prune.
         assert_eq!(mask, vec![true, false]);
@@ -479,7 +467,7 @@ mod tests {
     fn bloom_skip_requires_all_terms_present_in_and_mode() {
         let s_a = superfile_with_terms("title", &["alpha", "beta"]);
         let s_b = superfile_with_terms("title", &["alpha", "gamma"]);
-        let m = manifest_with(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha", "beta"], BoolMode::And);
         // Superfile A has both. Superfile B is missing 'beta' → prune.
         assert_eq!(mask, vec![true, false]);
@@ -488,7 +476,7 @@ mod tests {
     #[test]
     fn bloom_skip_unknown_column_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "no_such_column", &["alpha"], BoolMode::Or);
         assert_eq!(mask, vec![true]);
     }
@@ -496,14 +484,14 @@ mod tests {
     #[test]
     fn bloom_skip_empty_terms_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &[], BoolMode::Or);
         assert_eq!(mask, vec![true]);
     }
 
     #[test]
     fn bloom_skip_with_no_superfiles_returns_empty_vec() {
-        let m = manifest_with(opts_simple(), vec![]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![]);
         let mask = fts_bloom_skip(&m.superfiles, "title", &["alpha"], BoolMode::Or);
         assert!(mask.is_empty());
     }
@@ -518,7 +506,7 @@ mod tests {
         //            overlaps the upper end.
         let s_a = superfile_with_terms("title", &["apple", "banana"]);
         let s_b = superfile_with_terms("title", &["python", "rust"]);
-        let m = manifest_with(opts_simple(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s_a, s_b]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![false, true]);
     }
@@ -527,7 +515,7 @@ mod tests {
     fn prefix_skip_keeps_superfiles_with_matching_prefix_inside_range() {
         // Terms ['rusting', 'rusty'] → prefix "rust" overlaps.
         let s = superfile_with_terms("title", &["rusting", "rusty"]);
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         assert_eq!(mask, vec![true]);
     }
@@ -535,7 +523,7 @@ mod tests {
     #[test]
     fn prefix_skip_empty_prefix_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"");
         assert_eq!(mask, vec![true]);
     }
@@ -543,7 +531,7 @@ mod tests {
     #[test]
     fn prefix_skip_unknown_column_keeps_all() {
         let s = superfile_with_terms("title", &["alpha"]);
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "no_such_column", b"alp");
         assert_eq!(mask, vec![true]);
     }
@@ -552,7 +540,7 @@ mod tests {
     fn prefix_skip_zero_term_superfile_pruned() {
         // Empty term_range = no terms indexed. Prefix can't match.
         let s = Arc::new(empty_superfile());
-        let m = manifest_with(opts_simple(), vec![s]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_simple(), vec![s]);
         let mask = fts_prefix_skip(&m.superfiles, "title", b"rust");
         // No FTS summary on the superfile → keep (column-missing
         // path). Sanity: this is the "unknown column" path, not
@@ -566,7 +554,7 @@ mod tests {
     fn vector_centroid_skip_v1_keeps_all_superfiles() {
         let s_a = superfile_with_centroid("emb", vec![0.0; 16], 0.5);
         let s_b = superfile_with_centroid("emb", vec![10.0; 16], 0.5);
-        let m = manifest_with(opts_with_vector(), vec![s_a, s_b]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![s_a, s_b]);
         let q = vec![0.0f32; 16];
         let mask = vector_centroid_skip(&m, "emb", &q);
         assert_eq!(mask, vec![true, true]);
@@ -594,7 +582,7 @@ mod tests {
             },
             0.0,
         );
-        let m = manifest_with(opts, vec![far.clone(), near.clone()]);
+        let m = ManifestSnapshot::new_from_superfiles(opts, vec![far.clone(), near.clone()]);
         let q = {
             let mut v = vec![0.0f32; 16];
             v[0] = 1.0;
@@ -609,7 +597,7 @@ mod tests {
     fn superfiles_sorted_by_centroid_distance_pushes_missing_summary_to_end() {
         let with_v = superfile_with_centroid("emb", vec![1.0f32; 16], 0.0);
         let without_v = Arc::new(empty_superfile());
-        let m = manifest_with(opts_with_vector(), vec![without_v, with_v]);
+        let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![without_v, with_v]);
         let q = vec![1.0f32; 16];
         let order = superfiles_sorted_by_centroid_distance(&m, "emb", &q, Metric::L2Sq);
         // Index 1 (has summary) sorted before index 0 (missing).
@@ -622,7 +610,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
-        e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
+        e.scalar_stats
+            .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(e)
     }
 
@@ -630,7 +619,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
         let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
-        e.scalar_stats.cols.insert(col.to_string(), (mn, mx));
+        e.scalar_stats
+            .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(e)
     }
 
@@ -763,7 +753,8 @@ mod tests {
         let mut e = empty_superfile();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
-        e.scalar_stats.cols.insert("x".to_string(), (mn, mx));
+        e.scalar_stats
+            .insert("x".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         let segs = vec![Arc::new(e)];
         let mask = scalar_skip(
             &segs,

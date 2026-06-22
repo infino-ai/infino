@@ -24,34 +24,31 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::fs::FileExt;
-use std::sync::Arc;
-use std::time::Instant;
-
-use rayon::prelude::*;
+use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use memmap2::Mmap;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand_distr::{Distribution, StandardNormal};
-use tempfile::TempDir;
-
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{
-    BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
+use infino::{
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
+        fts::builder::FtsBuilder,
+        reader::VectorSearchOptions,
+        vector::{
+            builder::{VectorBuilder, VectorConfig},
+            distance::{Metric, distance, normalize},
+            reader::{OpenOptions, VectorReader},
+            rerank_codec::RerankCodec,
+        },
+    },
+    test_helpers::default_tokenizer,
 };
-use infino::superfile::fts::builder::FtsBuilder;
-use infino::superfile::reader::VectorSearchOptions;
-use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, distance, normalize};
-use infino::superfile::vector::reader::{OpenOptions, VectorReader};
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::test_helpers::default_tokenizer;
+use memmap2::Mmap;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
+use tempfile::TempDir;
 
 // ─── Async bridge for in-memory bench helpers ─────────────────────────
 

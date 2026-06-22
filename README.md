@@ -1,5 +1,7 @@
 # infino
 
+[![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
+[![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -29,14 +31,16 @@
 **Python**
 
 ```sh
-# Install from TestPyPI.
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+pip install infino
+
+# Or with uv (https://docs.astral.sh/uv/):
+uv pip install infino
 ```
 
 **Node.js**
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install infino
 ```
 
 **Rust**
@@ -51,6 +55,13 @@ or in `Cargo.toml`:
 [dependencies]
 infino = "0.1"
 ```
+
+The full Rust API reference is on [docs.rs/infino](https://docs.rs/infino).
+
+infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
+global allocator by default. If you embed infino in a process that already
+sets a global allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
 
 ## Quickstart
 
@@ -87,9 +98,11 @@ docs.append([
     {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": embed(1)},
 ])
 
-# Three ways to retrieve context to ground the agent's next answer:
+# Retrieve context to ground the agent's next answer:
 keyword  = docs.bm25_search("body", "cancel subscription", 5)               # BM25
 semantic = docs.vector_search("embedding", embed(0), 5)                     # vector kNN
+# vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+filtered = docs.vector_search("embedding", embed(0), 5, filter_column="body", filter_query="billing")
 billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  # SQL filter
 ```
 
@@ -118,9 +131,11 @@ docs.append([
   { source: "blog",        body: "Enable dark mode under Settings then Appearance.",        embedding: embed(1) },
 ]);
 
-// Three ways to retrieve context to ground the agent's next answer:
+// Retrieve context to ground the agent's next answer:
 const keyword  = docs.bm25Search("body", "cancel subscription", 5);            // BM25
 const semantic = docs.vectorSearch("embedding", embed(0), 5);                  // vector kNN
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+const filtered = docs.vectorSearch("embedding", embed(0), 5, { filter: { column: "body", query: "billing" } });
 const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
 ```
 
@@ -131,7 +146,7 @@ use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{connect, BoolMode, IndexSpec, Metric, VectorSearchOptions};
+use infino::{connect, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
 
 // Tiny stand-in for your embedding model so this runs as-is — a 16-dim
 // one-hot by topic. Real embeddings are dense and higher-dimensional.
@@ -172,12 +187,18 @@ docs.append(&RecordBatch::try_new(
     ],
 )?)?;
 
-// Three ways to retrieve context to ground the agent's next answer:
+// Retrieve context to ground the agent's next answer:
 let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
-let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None)?;
+let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+// vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
+let filtered = docs.vector_search(
+    "embedding", &embed(0), 5, VectorSearchOptions::new(),
+    Some(VectorFilter { column: "body", query: "billing", mode: BoolMode::Or }), None,
+)?;
 let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
 assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
 assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert_eq!(filtered.iter().map(|b| b.num_rows()).sum::<usize>(), 1);  // vector + keyword filter
 assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
 # Ok(())
 # }
@@ -384,12 +405,16 @@ reviewed as a contract change in the same pull request.
   Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
   arrow / datafusion that changes an exposed type is a breaking change to
   infino. The supported version range is documented and CI-tested.
-- **MSRV.** Raising the minimum Rust version is a minor bump, never a
+- **MSRV.** The minimum supported Rust version is **1.95** (enforced by
+  `rust-version` in `Cargo.toml`). Raising it is a minor bump, never a
   patch.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
-- **Python.** The wheel tracks the crate version 1:1.
-- **Node.** The npm package tracks the crate version 1:1.
+- **Bindings version independently.** The Python (`pip install infino`)
+  and Node (`npm install infino`) packages are versioned on their own
+  SemVer lines — each embeds its own copy of the engine, so a binding
+  version need not match this crate's. See
+  [`docs/versioning.md`](https://github.com/infino-ai/infino/blob/main/docs/versioning.md).
 
 ## Development
 
@@ -403,7 +428,8 @@ cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read 
 The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
 the right stable Rust on first build. Run `cargo test --features test-helpers`
 for the suite (integration tests use `infino::test_helpers`) and `make ci`
-before opening a pull request.
+before opening a pull request. Browse the full API locally with `make doc`
+(`cargo doc --no-deps --open` — the same docs [docs.rs](https://docs.rs/infino) renders).
 
 For an enhanced local development experience, install and configure
 [pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`

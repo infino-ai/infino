@@ -50,11 +50,20 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use datafusion::execution::context::SessionContext;
+use datafusion::{execution::context::SessionContext, prelude::Expr};
 
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::query::provider::{SupertableProvider, TABLE_NAME};
+use crate::supertable::{
+    error::QueryError,
+    handle::{Supertable, SupertableReader},
+    query::{
+        covered_agg::CoveredAggregateRewrite,
+        exec::{
+            fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
+            match_exec::register_match, vector_exec::register_vector_search,
+        },
+        provider::{SupertableProvider, TABLE_NAME},
+    },
+};
 
 impl SupertableReader {
     /// Run a SQL query against this reader's pinned snapshot.
@@ -149,35 +158,17 @@ impl SupertableReader {
         // aggregates answer covered segments from manifest statistics
         // and scan only the boundary segments. Appended after the
         // built-in rules so it sees pushed-down, normalized plans.
-        ctx.add_optimizer_rule(Arc::new(
-            crate::supertable::query::covered_agg::CoveredAggregateRewrite,
-        ));
+        ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(|e| QueryError::Plan(e.to_string()))?;
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
         // the pinned snapshot. They lower to custom `ExecutionPlan`
         // nodes that call the async kernels inside `execute()`.
-        crate::supertable::query::exec::vector_exec::register_vector_search(
-            &ctx,
-            Arc::clone(&reader),
-            Arc::clone(&scalar_schema),
-        );
-        crate::supertable::query::exec::fts_exec::register_bm25(
-            &ctx,
-            Arc::clone(&reader),
-            Arc::clone(&scalar_schema),
-        );
+        register_vector_search(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
+        register_bm25(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
         // Unranked token / exact match TVFs (siblings of bm25_search).
-        crate::supertable::query::exec::match_exec::register_match(
-            &ctx,
-            Arc::clone(&reader),
-            Arc::clone(&scalar_schema),
-        );
-        crate::supertable::query::exec::hybrid_exec::register_hybrid_search(
-            &ctx,
-            Arc::clone(&reader),
-            Arc::clone(&scalar_schema),
-        );
+        register_match(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
+        register_hybrid_search(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
         *guard = Some((Arc::clone(&manifest), ctx.clone()));
         Ok(ctx)
     }
@@ -201,10 +192,7 @@ impl SupertableReader {
     /// the eventual `commit()` are NOT in the returned set —
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
-    pub(crate) fn scan_ids_matching(
-        &self,
-        expr: datafusion::prelude::Expr,
-    ) -> Result<Vec<i128>, QueryError> {
+    pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
@@ -297,16 +285,19 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
-    use crate::supertable::{Supertable, SupertableOptions};
-
-    use crate::test_helpers::default_tokenizer as tok;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{Supertable, SupertableOptions, error::QueryError},
+        test_helpers::default_tokenizer as tok,
+    };
 
     /// Schema with id + scalar + FTS column. No vector; query_sql
     /// is scalar-only by design.
@@ -475,12 +466,9 @@ mod tests {
         let extract = |i: usize| -> String {
             if let Some(a) = cat_col.as_any().downcast_ref::<LargeStringArray>() {
                 a.value(i).to_string()
-            } else if let Some(a) = cat_col.as_any().downcast_ref::<arrow_array::StringArray>() {
+            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringArray>() {
                 a.value(i).to_string()
-            } else if let Some(a) = cat_col
-                .as_any()
-                .downcast_ref::<arrow_array::StringViewArray>()
-            {
+            } else if let Some(a) = cat_col.as_any().downcast_ref::<StringViewArray>() {
                 a.value(i).to_string()
             } else {
                 panic!("unexpected category column type: {:?}", cat_col.data_type())
@@ -782,7 +770,7 @@ mod tests {
                 let a = b
                     .column(0)
                     .as_any()
-                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .downcast_ref::<Decimal128Array>()
                     .expect("_id is Decimal128");
                 (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
             })
@@ -840,7 +828,7 @@ mod tests {
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
-            matches!(err, crate::supertable::error::QueryError::Plan(_)),
+            matches!(err, QueryError::Plan(_)),
             "expected Plan variant; got {err:?}"
         );
     }
@@ -883,7 +871,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 0,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
             }],
             Some(tok()),
         )
@@ -947,7 +935,7 @@ mod tests {
             .query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(
-            matches!(err, crate::supertable::error::QueryError::Plan(_)),
+            matches!(err, QueryError::Plan(_)),
             "expected Plan variant; got {err:?}"
         );
     }

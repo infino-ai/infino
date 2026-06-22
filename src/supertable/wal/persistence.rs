@@ -43,9 +43,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::storage::{StorageError, StorageProvider};
-use crate::supertable::wal::state_doc::{WalId, WalStateDoc};
-use crate::supertable::wal::tombstones_codec::{self, SidecarCodecError, TombstonesSidecar};
+use crate::{
+    storage::{StorageError, StorageProvider},
+    supertable::wal::{
+        state_doc::{WalId, WalStateDoc},
+        tombstones_codec::{self, SidecarCodecError, TombstonesSidecar},
+    },
+};
 
 /// Storage backend's opaque version identifier. Treated as a
 /// type alias rather than a newtype because:
@@ -535,13 +539,16 @@ impl WalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::LocalFsStorageProvider;
-    use crate::supertable::wal::state_doc::{
-        OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState,
-    };
     use chrono::Utc;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        supertable::wal::state_doc::{
+            OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalState,
+        },
+    };
 
     fn store() -> (TempDir, WalStore) {
         let dir = TempDir::new().expect("tempdir");

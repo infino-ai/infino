@@ -8,19 +8,21 @@
 //! subsequent SQL + FTS queries reflect the mutation (deleted
 //! rows are gone, updated rows show the replacement payload).
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::Array;
 use datafusion::prelude::{Expr, col, lit};
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        mutations::MutationError,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 use tempfile::TempDir;
-
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::mutations::MutationError;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 /// Disk-cache byte budget (1 GiB) for the mutation integration cache.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;

@@ -67,23 +67,39 @@
 //! `SuperfileReaderCache::reader` call. Vector + SQL skip remain
 //! deferred (see those modules' headers).
 
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::slice;
-use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    slice,
+    sync::{
+        Arc, Mutex,
+        atomic::{self, AtomicU32},
+    },
+    time::Instant,
+};
 
 use arrow::record_batch::RecordBatch;
+use uuid::Uuid;
 
-use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::{Supertable, SupertableReader};
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::query::SuperfileHit;
-use crate::supertable::query::exec::common::resolve_hits_named;
-use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
+use crate::{
+    InfinoError,
+    superfile::{
+        SuperfileReader,
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+    },
+    supertable::{
+        error::QueryError,
+        handle::{Supertable, SupertableReader},
+        manifest::SuperfileEntry,
+        query::{
+            SuperfileHit, dispatch,
+            exec::common::resolve_hits_named,
+            prune::{PruneLeaf, select_superfiles},
+        },
+    },
+};
 
 /// Cross-segment top-k score sharing for the BM25 fan-out.
 ///
@@ -107,10 +123,10 @@ use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
 struct SharedTopK {
     k: usize,
     /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
-    heap: std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<OrdScore>>>,
+    heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
     /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
     /// have been seen. Monotonically non-decreasing.
-    floor_bits: std::sync::atomic::AtomicU32,
+    floor_bits: AtomicU32,
 }
 
 /// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
@@ -119,12 +135,12 @@ struct SharedTopK {
 struct OrdScore(f32);
 impl Eq for OrdScore {}
 impl PartialOrd for OrdScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for OrdScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.0.total_cmp(&other.0)
     }
 }
@@ -133,14 +149,14 @@ impl SharedTopK {
     fn new(k: usize) -> Arc<Self> {
         Arc::new(Self {
             k,
-            heap: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
-            floor_bits: std::sync::atomic::AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            heap: Mutex::new(BinaryHeap::new()),
+            floor_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         })
     }
 
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
-        f32::from_bits(self.floor_bits.load(std::sync::atomic::Ordering::Acquire))
+        f32::from_bits(self.floor_bits.load(atomic::Ordering::Acquire))
     }
 
     /// Merge one finished segment's (tombstone-surviving) scores and
@@ -149,21 +165,21 @@ impl SharedTopK {
         let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
         for s in scores {
             if heap.len() < self.k {
-                heap.push(std::cmp::Reverse(OrdScore(s)));
-            } else if let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+                heap.push(Reverse(OrdScore(s)));
+            } else if let Some(Reverse(OrdScore(min))) = heap.peek()
                 && s > *min
             {
                 heap.pop();
-                heap.push(std::cmp::Reverse(OrdScore(s)));
+                heap.push(Reverse(OrdScore(s)));
             }
         }
         if heap.len() == self.k
-            && let Some(std::cmp::Reverse(OrdScore(min))) = heap.peek()
+            && let Some(Reverse(OrdScore(min))) = heap.peek()
         {
             // The heap min only rises, so a plain store stays monotone
             // under the lock.
             self.floor_bits
-                .store(min.to_bits(), std::sync::atomic::Ordering::Release);
+                .store(min.to_bits(), atomic::Ordering::Release);
         }
     }
 }
@@ -240,7 +256,7 @@ impl SupertableReader {
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         let fanout = fanout_for(mode, positives.len(), !negatives.is_empty());
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, uuid::Uuid))> = work_units
+        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
             .into_iter()
             .map(|u| {
                 let suid = u.entry.superfile_id;
@@ -259,7 +275,7 @@ impl SupertableReader {
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
         let tombstones = self.tombstone_cache.clone();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
@@ -268,8 +284,7 @@ impl SupertableReader {
         // tombstone-filters each unit's hits. The per-unit `params` is
         // the optional doc-id sub-range (`None` searches the whole
         // superfile) plus the superfile id for the tombstone-aware merge.
-        let kernel = move |r: Arc<SuperfileReader>,
-                           (range, suid): (Option<(u32, u32)>, uuid::Uuid)| {
+        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
             let neg_arc = Arc::clone(&neg_arc);
@@ -336,7 +351,7 @@ impl SupertableReader {
                 Ok(hits)
             }
         };
-        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_unit = dispatch::fanout(self, units, kernel).await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -378,9 +393,9 @@ impl SupertableReader {
         // Superfile selection via the shared two-tier prune — the
         // single-`Prefix`-leaf case (part-level term-range skip →
         // lazy-load surviving parts → per-superfile term-range skip).
-        let kept = crate::supertable::query::prune::select_superfiles(
+        let kept = select_superfiles(
             manifest.as_ref(),
-            &[crate::supertable::query::prune::PruneLeaf::Prefix {
+            &[PruneLeaf::Prefix {
                 column: column_owned.clone(),
                 prefix: prefix_lower.as_bytes().to_vec(),
             }],
@@ -418,7 +433,7 @@ impl SupertableReader {
                 }
             }
         };
-        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_unit = dispatch::fanout(self, units, kernel).await?;
 
         Ok(top_k_descending(per_unit, k))
     }
@@ -442,9 +457,9 @@ impl SupertableReader {
         if term_strings.is_empty() {
             return Ok(Vec::new());
         }
-        let kept = crate::supertable::query::prune::select_superfiles(
+        let kept = select_superfiles(
             manifest.as_ref(),
-            &[crate::supertable::query::prune::PruneLeaf::TermPresence {
+            &[PruneLeaf::TermPresence {
                 column: column.to_owned(),
                 terms: term_strings.clone(),
                 mode,
@@ -469,8 +484,104 @@ impl SupertableReader {
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
-        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_unit = dispatch::fanout(self, units, kernel).await?;
         Ok(per_unit.into_iter().flatten().collect())
+    }
+
+    /// Count documents whose `column` matches `query`'s tokens under
+    /// `mode` (`Or` = any token, `And` = every token), over this reader's
+    /// pinned snapshot — **count only, no scoring and no row
+    /// materialization**.
+    ///
+    /// Fast path: a single-token query against a superfile with no
+    /// tombstones resolves from the term dictionary's stored document
+    /// frequency ([`SuperfileReader::term_df`]) — O(1) per superfile, no
+    /// posting decode. A multi-token query, or a superfile with deletes,
+    /// falls back to materializing the matching local doc ids and
+    /// counting those not tombstoned. Tombstoned (deleted) rows are
+    /// always excluded so the count matches what a search would return.
+    pub(crate) async fn token_match_count_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<u64, QueryError> {
+        let manifest = self.manifest();
+        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
+        if term_strings.is_empty() {
+            return Ok(0);
+        }
+        let kept = select_superfiles(
+            manifest.as_ref(),
+            &[PruneLeaf::TermPresence {
+                column: column.to_owned(),
+                terms: term_strings.clone(),
+                mode,
+            }],
+        )
+        .await?;
+        if kept.is_empty() {
+            return Ok(0);
+        }
+
+        let single_term = term_strings.len() == 1;
+        let column_arc = Arc::new(column.to_owned());
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+
+        // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
+        // spawns + opens each superfile concurrently, and short-circuits
+        // on the first error. The per-superfile body returns this
+        // superfile's match count; the totals are summed.
+        let per_superfile = dispatch::fanout_with(
+            self,
+            units,
+            move |r, entry, tombstone_cache, now, _params: ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let term_arc = Arc::clone(&term_arc);
+                async move {
+                    // Tombstone bitmap for this superfile (None = no deletes).
+                    let tomb = match tombstone_cache.as_ref() {
+                        Some(c) => {
+                            let b = c
+                                .bitmap_for(entry.superfile_id, now)
+                                .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                            if b.is_empty() { None } else { Some(b) }
+                        }
+                        None => None,
+                    };
+                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                    // Deletes present: materialize the matching ids and
+                    // subtract the tombstoned ones (a df read or a bare
+                    // match count would over-count the deleted rows).
+                    if let Some(b) = tomb {
+                        let docs = r
+                            .token_match(&column_arc, &refs, mode)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                        return Ok::<u64, QueryError>(
+                            docs.iter().filter(|d| !b.contains(**d)).count() as u64,
+                        );
+                    }
+                    // No deletes (the common case): count without
+                    // materializing ids — a single token resolves O(1)
+                    // from the stored df, multi-token tallies the match
+                    // walk through the counting sink.
+                    let n = if single_term {
+                        r.term_df(&column_arc, &term_arc[0])
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    } else {
+                        r.token_match_count(&column_arc, &refs, mode)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    };
+                    Ok(n)
+                }
+            },
+        )
+        .await?;
+        Ok(per_superfile.into_iter().sum())
     }
 
     /// Unranked two-pass exact match of the **raw string** `value`
@@ -493,14 +604,13 @@ impl SupertableReader {
         let leaves = if term_strings.is_empty() {
             Vec::new()
         } else {
-            vec![crate::supertable::query::prune::PruneLeaf::TermPresence {
+            vec![PruneLeaf::TermPresence {
                 column: column.to_owned(),
                 terms: term_strings,
                 mode: BoolMode::And,
             }]
         };
-        let kept =
-            crate::supertable::query::prune::select_superfiles(manifest.as_ref(), &leaves).await?;
+        let kept = select_superfiles(manifest.as_ref(), &leaves).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -518,7 +628,7 @@ impl SupertableReader {
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
-        let per_unit = crate::supertable::query::dispatch::fanout(self, units, kernel).await?;
+        let per_unit = dispatch::fanout(self, units, kernel).await?;
         Ok(per_unit.into_iter().flatten().collect())
     }
 }
@@ -598,6 +708,15 @@ impl SupertableReader {
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         self.block_on(self.token_match_async(column, query, mode))
+    }
+
+    /// Count documents matching `query`'s tokens under `mode` over this
+    /// reader's pinned snapshot — count only, no scoring or row
+    /// materialization. A single-token query on a delete-free superfile
+    /// resolves in O(1) from the stored document frequency. Drives the
+    /// async kernel via the sync→async bridge.
+    pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
+        self.block_on(self.token_match_count_async(column, query, mode))
     }
 
     /// Unranked exact match of the raw string `value` against `column`
@@ -794,10 +913,10 @@ impl Supertable {
         k: usize,
         mode: BoolMode,
         projection: Option<&[&str]>,
-    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         self.reader()
             .bm25_search(column, query, k, mode, projection)
-            .map_err(crate::InfinoError::from)
+            .map_err(InfinoError::from)
     }
 
     /// Unranked token match over one FTS column: every row whose
@@ -812,11 +931,11 @@ impl Supertable {
         query: &str,
         mode: BoolMode,
         projection: Option<&[&str]>,
-    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         let reader = self.reader();
         let hits = reader
             .token_match(column, query, mode)
-            .map_err(crate::InfinoError::from)?;
+            .map_err(InfinoError::from)?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -824,7 +943,7 @@ impl Supertable {
                 projection,
                 "token_match",
             ))
-            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
         Ok(vec![batch])
     }
 
@@ -838,11 +957,11 @@ impl Supertable {
         column: &str,
         value: &str,
         projection: Option<&[&str]>,
-    ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         let reader = self.reader();
         let hits = reader
             .exact_match(column, value)
-            .map_err(crate::InfinoError::from)?;
+            .map_err(InfinoError::from)?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -850,33 +969,71 @@ impl Supertable {
                 projection,
                 "exact_match",
             ))
-            .map_err(|e| crate::InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
         Ok(vec![batch])
+    }
+
+    /// Count documents whose `column` matches `query`'s tokens under
+    /// `mode` (`Or` = any token, `And` = every token) over the current
+    /// snapshot — count only, no scoring or row materialization. A
+    /// single-token query on a delete-free snapshot resolves in O(1) per
+    /// superfile from the term dictionary's document frequency, so
+    /// counting a high-frequency term is cheap.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema,
+    /// #     vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox", "a lazy dog"]))],
+    /// # )?)?;
+    /// let n = posts.count("body", "fox", BoolMode::Or)?;
+    /// assert_eq!(n, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
+        self.reader()
+            .count(column, query, mode)
+            .map_err(InfinoError::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, future::Future, sync::Arc};
 
-    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use datafusion::prelude::{col, lit};
+    use tokio::runtime::Builder;
 
-    use crate::superfile::builder::{FtsConfig, SuperfileBuilder};
-
-    use crate::supertable::error::QueryError;
-    use crate::supertable::{Supertable, SupertableOptions};
-
-    use super::BoolMode;
-
-    use crate::test_helpers::default_tokenizer as tok;
+    use super::{BoolMode, FanOut, build_work_units, fanout_for};
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        },
+        supertable::{
+            Supertable, SupertableOptions,
+            error::QueryError,
+            options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        },
+        test_helpers::default_tokenizer as tok,
+    };
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`
     /// oracle, whose search surface is async-only; the supertable
     /// reader's own search methods are sync and need no runtime here.
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime")
@@ -918,23 +1075,20 @@ mod tests {
     /// Build a single SuperfileBuilder containing the same docs as
     /// the supertable across all superfiles. Used as the oracle for
     /// per-superfile-vs-global BM25 set-membership tests.
-    fn build_oracle_superfile(titles: &[&str]) -> Arc<crate::superfile::SuperfileReader> {
+    fn build_oracle_superfile(titles: &[&str]) -> Arc<SuperfileReader> {
         // The oracle path goes directly through SuperfileBuilder
         // (not through Supertable::append's auto-injection), so
         // we build the effective schema by hand: `_id` is
         // `Decimal128(38, 0)`, ids are 0..n.
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "_id",
-                DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
-                ),
+                DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
                 false,
             ),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = crate::superfile::builder::BuilderOptions::new(
+        let opts = BuilderOptions::new(
             schema.clone(),
             "_id",
             vec![FtsConfig {
@@ -945,18 +1099,15 @@ mod tests {
         );
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let n = titles.len();
-        let ids = arrow_array::Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
-            .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
-            )
+        let ids = Decimal128Array::from((0..n as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
             .expect("decimal128");
         let titles_arr = LargeStringArray::from(titles.to_vec());
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles_arr)]).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
-        let bytes = bytes::Bytes::from(b.finish().expect("finish"));
-        Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        Arc::new(SuperfileReader::open(bytes).expect("open"))
     }
 
     #[test]
@@ -1141,8 +1292,7 @@ mod tests {
             .expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
-        let oracle_set: std::collections::HashSet<u32> =
-            oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_set: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_set, [0u32, 4, 8].iter().copied().collect());
 
         let st_reader = st.reader();
@@ -1153,7 +1303,7 @@ mod tests {
         // Resolve supertable hits to global doc-ids via superfile
         // ordering (superfiles appear in append order; chunk size = 4).
         let manifest = st_reader.manifest();
-        let st_globals: std::collections::HashSet<u32> = st_hits
+        let st_globals: HashSet<u32> = st_hits
             .iter()
             .map(|h| {
                 let seg_idx = manifest
@@ -1191,15 +1341,14 @@ mod tests {
 
         let oracle = build_oracle_superfile(&titles);
         let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
-        let oracle_globals: std::collections::HashSet<u32> =
-            oracle_hits.iter().map(|(d, _)| *d).collect();
+        let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
 
         let st_reader = st.reader();
         let st_hits = st_reader
             .bm25_search_prefix("title", "rust", 5)
             .expect("supertable query");
         let manifest = st_reader.manifest();
-        let st_globals: std::collections::HashSet<u32> = st_hits
+        let st_globals: HashSet<u32> = st_hits
             .iter()
             .map(|h| {
                 let seg_idx = manifest
@@ -1375,31 +1524,33 @@ mod tests {
     fn fanout_for_only_multi_term_or_without_negation_subranges() {
         // Multi-term OR, no negation → sub-range eligible.
         assert!(matches!(
-            super::fanout_for(BoolMode::Or, 2, false),
-            super::FanOut::SubRanges
+            fanout_for(BoolMode::Or, 2, false),
+            FanOut::SubRanges
         ));
         // Single-term OR stays per-superfile.
         assert!(matches!(
-            super::fanout_for(BoolMode::Or, 1, false),
-            super::FanOut::PerSuperfile
+            fanout_for(BoolMode::Or, 1, false),
+            FanOut::PerSuperfile
         ));
         // Negation disables sub-ranges.
         assert!(matches!(
-            super::fanout_for(BoolMode::Or, 2, true),
-            super::FanOut::PerSuperfile
+            fanout_for(BoolMode::Or, 2, true),
+            FanOut::PerSuperfile
         ));
         // And mode stays per-superfile.
         assert!(matches!(
-            super::fanout_for(BoolMode::And, 2, false),
-            super::FanOut::PerSuperfile
+            fanout_for(BoolMode::And, 2, false),
+            FanOut::PerSuperfile
         ));
     }
 
     #[test]
     fn build_work_units_per_superfile_is_one_unranged_unit_each() {
-        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
         use std::collections::HashMap;
+
         use uuid::Uuid;
+
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
 
         fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
@@ -1409,7 +1560,7 @@ mod tests {
                 n_docs,
                 id_min: 0,
                 id_max: n_docs.saturating_sub(1) as i128,
-                scalar_stats: ScalarStatsTable::new(),
+                scalar_stats: HashMap::new(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -1424,28 +1575,30 @@ mod tests {
 
         // PerSuperfile always yields exactly one un-ranged unit per kept
         // superfile regardless of pool width.
-        let units = super::build_work_units(&kept, super::FanOut::PerSuperfile, 8);
+        let units = build_work_units(&kept, FanOut::PerSuperfile, 8);
         assert_eq!(units.len(), 2);
         assert!(units.iter().all(|u| u.range.is_none()));
 
         // SubRanges with one pool thread collapses to per-superfile too
         // (no spare threads to slice across).
-        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 1);
+        let units = build_work_units(&kept, FanOut::SubRanges, 1);
         assert_eq!(units.len(), 2);
         assert!(units.iter().all(|u| u.range.is_none()));
 
         // Tiny superfiles below SUBRANGE_MIN_DOCS never slice even with
         // spare threads.
-        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 16);
+        let units = build_work_units(&kept, FanOut::SubRanges, 16);
         assert_eq!(units.len(), 2);
         assert!(units.iter().all(|u| u.range.is_none()));
     }
 
     #[test]
     fn build_work_units_slices_large_superfiles_when_threads_spare() {
-        use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
         use std::collections::HashMap;
+
         use uuid::Uuid;
+
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
 
         let id = Uuid::new_v4();
         // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
@@ -1455,7 +1608,7 @@ mod tests {
             n_docs: 200_000,
             id_min: 0,
             id_max: 199_999,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1465,7 +1618,7 @@ mod tests {
         let kept = vec![&big];
         // 4 spare threads, 1 superfile → slice into multiple ranged units
         // that tile [0, n_docs) without gaps.
-        let units = super::build_work_units(&kept, super::FanOut::SubRanges, 4);
+        let units = build_work_units(&kept, FanOut::SubRanges, 4);
         assert!(units.len() > 1, "large superfile sliced into sub-ranges");
         let mut cursor = 0u32;
         for u in &units {
@@ -1474,5 +1627,172 @@ mod tests {
             cursor = end;
         }
         assert_eq!(cursor, 200_000, "sub-ranges tile the whole superfile");
+    }
+
+    #[test]
+    fn count_single_term_sums_df_across_superfiles() {
+        // 3 commits → 3 superfiles. Single-term count takes the O(1)
+        // term_df fast path (no deletes) and sums across superfiles.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["alpha delta"])).expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(3, &["beta gamma"])).expect("append");
+        w.commit().expect("commit");
+
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("count"), 3);
+        assert_eq!(st.count("title", "beta", BoolMode::Or).expect("count"), 2);
+        assert_eq!(st.count("title", "gamma", BoolMode::Or).expect("count"), 2);
+        assert_eq!(st.count("title", "absent", BoolMode::Or).expect("count"), 0);
+    }
+
+    #[test]
+    fn count_multi_term_sums_across_superfiles() {
+        // 3 commits → 3 superfiles. Multi-term queries take the general
+        // `token_match` branch (not the single-term df fast path), so this
+        // exercises summing per-superfile match counts across superfiles
+        // for both OR (union spans all three) and AND (intersection lands
+        // in one). Doc ids are globally unique across commits.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["beta gamma", "delta"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(4, &["alpha delta", "beta"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        // OR "alpha beta": alpha∪beta matches in all three superfiles
+        // (2 + 1 + 2) — proves the per-superfile counts are summed.
+        assert_eq!(st.count("title", "alpha beta", BoolMode::Or).expect("c"), 5);
+        // OR "gamma delta": 1 + 2 + 1 across the three superfiles.
+        assert_eq!(
+            st.count("title", "gamma delta", BoolMode::Or).expect("c"),
+            4
+        );
+        // AND "alpha beta": both terms only in the first superfile's
+        // "alpha beta" doc → 1 (the other superfiles contribute 0).
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::And).expect("c"),
+            1
+        );
+        // AND "alpha delta": both terms only in the third superfile.
+        assert_eq!(
+            st.count("title", "alpha delta", BoolMode::And).expect("c"),
+            1
+        );
+
+        // Cross-check every shape against token_match cardinality.
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha beta", BoolMode::Or),
+            ("gamma delta", BoolMode::Or),
+            ("alpha beta", BoolMode::And),
+            ("alpha delta", BoolMode::And),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn count_honors_or_and_modes() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha beta", "alpha gamma", "beta delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+
+        // OR: docs containing alpha OR delta → all three.
+        assert_eq!(
+            st.count("title", "alpha delta", BoolMode::Or).expect("c"),
+            3
+        );
+        // AND: docs containing both alpha AND beta → just "alpha beta".
+        assert_eq!(
+            st.count("title", "alpha beta", BoolMode::And).expect("c"),
+            1
+        );
+        // AND with no doc holding both → 0.
+        assert_eq!(
+            st.count("title", "gamma delta", BoolMode::And).expect("c"),
+            0
+        );
+    }
+
+    #[test]
+    fn count_agrees_with_token_match_len() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha beta", "alpha gamma", "beta delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha", BoolMode::Or),
+            ("alpha delta", BoolMode::Or),
+            ("alpha beta", BoolMode::And),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn count_empty_query_and_empty_supertable_are_zero() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        // Empty supertable: nothing matches.
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("c"), 0);
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta"])).expect("append");
+        w.commit().expect("commit");
+        // Token-less queries produce no terms → 0.
+        assert_eq!(st.count("title", "", BoolMode::Or).expect("c"), 0);
+        assert_eq!(st.count("title", "   ", BoolMode::Or).expect("c"), 0);
+    }
+
+    #[test]
+    fn count_excludes_tombstoned_docs() {
+        // Storage-backed so delete (tombstones) is available. After a
+        // delete, the single-term count must drop the term_df fast path
+        // and subtract the tombstone — df would over-count.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha one", "alpha two", "alpha three"]))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer slot so `delete` can acquire it
+
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("count"), 3);
+
+        let stats = st
+            .delete(col("title").eq(lit("alpha two")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+
+        // term_df still says 3; the count must subtract the tombstone → 2.
+        assert_eq!(
+            st.count("title", "alpha", BoolMode::Or)
+                .expect("count after delete"),
+            2
+        );
     }
 }

@@ -32,18 +32,24 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::future::Future;
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Instant};
 
-use crate::storage::StorageProvider;
-use crate::superfile::SuperfileReader;
-use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::reader_cache::{DiskCacheStore, SuperfileReaderCache};
-use crate::supertable::tombstones::SidecarCache;
+use futures::future::try_join_all;
+use uuid::Uuid;
 
 use super::SuperfileHit;
+use crate::{
+    storage::StorageProvider,
+    superfile::SuperfileReader,
+    supertable::{
+        error::QueryError,
+        handle::SupertableReader,
+        manifest::SuperfileEntry,
+        query::superfile_reader::superfile_reader,
+        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        tombstones::SidecarCache,
+    },
+};
 
 /// Open one superfile's `SuperfileReader` through the reader cache.
 /// Warm opens are in-memory cache hits (microseconds); cold opens
@@ -55,7 +61,7 @@ pub(crate) async fn open_reader(
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(
+    superfile_reader(
         store,
         disk_cache,
         storage,
@@ -85,7 +91,7 @@ pub(crate) fn apply_tombstone_filter(
     cache: Option<&Arc<SidecarCache>>,
     entry: &SuperfileEntry,
     hits: &mut Vec<SuperfileHit>,
-    now: std::time::Instant,
+    now: Instant,
 ) -> Result<(), QueryError> {
     let Some(cache) = cache else {
         return Ok(());
@@ -130,6 +136,54 @@ where
     K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
 {
+    fanout_with(
+        reader,
+        units,
+        move |r, entry, tombstone_cache, now, params| {
+            let kernel = kernel.clone();
+            async move {
+                let hits = kernel(r, params).await?;
+                let mut tagged = tag_hits(&entry, hits);
+                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        },
+    )
+    .await
+}
+
+/// Lower-level fan-out primitive: the shared orchestration behind
+/// [`fanout`] and the count path, generic over the per-superfile result
+/// `R`.
+///
+/// It warms the tombstone sidecar cache for every distinct superfile in
+/// one batch, `tokio::spawn`s one task per unit on the shared query
+/// runtime (each opening its reader concurrently), then collects every
+/// task with [`futures::future::try_join_all`] — so the **first**
+/// per-superfile error (in time, not spawn order) short-circuits the
+/// whole fan-out and returns early.
+///
+/// `body` runs inside each task with the opened reader, the superfile
+/// entry, the (warmed) tombstone cache + the batch `now` instant, and
+/// the unit's params. Resolving the per-superfile tombstone bitmap and
+/// applying it is the body's job, since callers differ: [`fanout`]
+/// tags + retains hits, while the count path either takes the O(1)
+/// `term_df` fast path (no tombstones) or counts the matching ids minus
+/// tombstones.
+pub(crate) async fn fanout_with<P, R, B, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    body: B,
+) -> Result<Vec<R>, QueryError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    B: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, Option<Arc<SidecarCache>>, Instant, P) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
+{
     if units.is_empty() {
         return Ok(Vec::new());
     }
@@ -138,41 +192,34 @@ where
     let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
     let storage = manifest.options.storage.as_ref().map(Arc::clone);
     let tombstone_cache = reader.tombstone_cache.clone();
-    let now = std::time::Instant::now();
+    let now = Instant::now();
 
     // Warm the tombstone sidecars for every distinct superfile in one
     // concurrent batch before the per-superfile fan-out.
     if let Some(cache) = tombstone_cache.as_ref() {
-        let mut ids: Vec<uuid::Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
         ids.sort_unstable();
         ids.dedup();
         cache.prefetch(&ids, now).await;
     }
 
-    let handles: Vec<_> = units
-        .into_iter()
-        .map(|(entry, params)| {
-            let store = Arc::clone(&store);
-            let disk_cache = disk_cache.clone();
-            let storage = storage.clone();
-            let tombstone_cache = tombstone_cache.clone();
-            let kernel = kernel.clone();
-            tokio::spawn(async move {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            })
-        })
-        .collect();
-
-    let mut out: Vec<Vec<SuperfileHit>> = Vec::with_capacity(handles.len());
-    for h in handles {
-        let tagged = h
-            .await
-            .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))??;
-        out.push(tagged);
-    }
-    Ok(out)
+    let handles = units.into_iter().map(|(entry, params)| {
+        let store = Arc::clone(&store);
+        let disk_cache = disk_cache.clone();
+        let storage = storage.clone();
+        let tombstone_cache = tombstone_cache.clone();
+        let body = body.clone();
+        let handle = tokio::spawn(async move {
+            let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            body(r, entry, tombstone_cache, now, params).await
+        });
+        // Flatten the join error into a QueryError so `try_join_all`
+        // short-circuits on the first failing superfile.
+        async move {
+            handle
+                .await
+                .map_err(|e| QueryError::Store(format!("fan-out task join: {e}")))?
+        }
+    });
+    try_join_all(handles).await
 }

@@ -51,21 +51,26 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::env;
-use std::ops::Range;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    env,
+    ops::Range,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
+use infino::{
+    supertable::{
+        OpenError, Supertable,
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::supertable::{OpenError, Supertable};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 
 const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
 const ENV_KILL_POINT: &str = "INFINO_M12_CRASH_KILL_POINT";
@@ -175,9 +180,9 @@ impl StorageProvider for CrashStorage {
 fn kill_point_config(kp: &str) -> (&'static str, usize, usize) {
     match kp {
         KP_SEG_FIRST => ("data/", 1, 1),
-        KP_LIST_FIRST => ("manifest-lists/", 1, 1),
+        KP_LIST_FIRST => ("manifest/", 1, 1),
         KP_SEG_SECOND => ("data/", 2, 2),
-        KP_LIST_SECOND => ("manifest-lists/", 2, 2),
+        KP_LIST_SECOND => ("manifest/", 2, 2),
         KP_POINTER_SECOND => ("_supertable/current", 2, 2),
         other => panic!("unknown kill point {other}"),
     }
@@ -320,14 +325,14 @@ fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
         "expected PointerUnreadable, got {err:?}"
     );
 
-    // The orphan manifest list is on disk but unreferenced.
-    let lists_dir = dir.join("manifest-lists");
-    let n_orphan_lists = std::fs::read_dir(&lists_dir)
+    // The orphan manifest is on disk but unreferenced.
+    let manifest_dir = dir.join("manifest");
+    let n_orphan_manifests = std::fs::read_dir(&manifest_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert!(
-        n_orphan_lists >= 1,
-        "orphan manifest list must be present; found {n_orphan_lists} in {lists_dir:?}"
+        n_orphan_manifests >= 1,
+        "orphan manifest must be present; found {n_orphan_manifests} in {manifest_dir:?}"
     );
 }
 
@@ -369,8 +374,8 @@ fn crash_post_list_on_second_commit_yields_v1() {
 
     // Orphan v2 manifest list and v2 part are on disk —
     // tolerated here; compaction GCs them later.
-    let lists_dir = dir.join("manifest-lists");
-    let n_lists = std::fs::read_dir(&lists_dir)
+    let manifest_dir = dir.join("manifest");
+    let n_lists = std::fs::read_dir(&manifest_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert!(

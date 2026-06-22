@@ -22,8 +22,7 @@
 //! the pool width (`n_shards ≤ n_threads`); intra-shard work fills cores
 //! as shards drain.
 
-use rayon::ThreadPool;
-use rayon::prelude::*;
+use rayon::{ThreadPool, prelude::*};
 
 /// Run shard build tasks on `pool`, preserving input order.
 ///

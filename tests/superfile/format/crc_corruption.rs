@@ -17,14 +17,19 @@
 //! is to surface them as errors, not to plough on with truncated
 //! posting lists or scrambled centroids.
 
+use std::sync::Arc;
+
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::superfile::SuperfileReader;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::superfile::vector::distance::normalize;
-use infino::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-use std::sync::Arc;
+use infino::{
+    superfile::{
+        SuperfileReader,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        vector::distance::normalize,
+    },
+    test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+};
 
 /// Decimal128 precision / scale for the `doc_id` column.
 const ID_DECIMAL_PRECISION: u8 = 38;

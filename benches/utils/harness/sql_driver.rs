@@ -12,8 +12,10 @@
 use std::time::{Duration, Instant};
 
 use super::{SqlEngine, SqlRow};
-use crate::markdown::fmt_count;
-use crate::rss::{PeakSampler, RssStats};
+use crate::{
+    markdown::fmt_count,
+    rss::{PeakSampler, RssStats},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SqlQuery {

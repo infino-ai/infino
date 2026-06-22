@@ -32,17 +32,18 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::thread;
+use std::{collections::HashSet, sync::Arc, thread};
 
 use arrow_array::{LargeStringArray, RecordBatch};
-
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::utils::idgen::IdGenerator;
-use infino::test_helpers::{default_supertable_options, schema_id_title};
+use infino::{
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{LocalFsStorageProvider, StorageProvider},
+        utils::idgen::IdGenerator,
+    },
+    test_helpers::{default_supertable_options, schema_id_title},
+};
 
 /// Explicit shared worker id forcing the worst-case collision scenario.
 const SHARED_WORKER_ID: u64 = 0xABCD;

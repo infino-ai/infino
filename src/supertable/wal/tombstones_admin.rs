@@ -25,9 +25,11 @@
 
 use uuid::Uuid;
 
-use crate::supertable::wal::persistence::{WalStore, WalStoreError};
-use crate::supertable::wal::state_doc::SealRecord;
-use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+use crate::supertable::wal::{
+    persistence::{WalStore, WalStoreError},
+    state_doc::SealRecord,
+    tombstones_codec::TombstonesSidecar,
+};
 
 /// Typed failures from the compaction helpers.
 #[derive(Debug, thiserror::Error)]
@@ -161,11 +163,13 @@ pub async fn live_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use tempfile::TempDir;
+
     use super::*;
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use chrono::Utc;
-    use std::sync::Arc;
-    use tempfile::TempDir;
 
     fn fixture() -> (TempDir, WalStore) {
         let dir = TempDir::new().expect("tempdir");

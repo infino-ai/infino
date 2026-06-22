@@ -9,9 +9,7 @@
 //! When `INFINO_BENCH_UPDATE_README=1` is set, the same block also
 //! replaces the matching section in `benches/README.md` in place.
 
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::{fs, io::Write, path::Path};
 
 /// One markdown section to emit. `anchor_id` is the stable key that
 /// matches the `<!-- BEGIN/END: ... -->` markers in

@@ -36,15 +36,20 @@
 //! query sees the new bitmap immediately. Other processes pick
 //! up the change on their next refresh.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
+use futures::future::join_all;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::runtime_bridge::bridge_sync_to_async;
-use crate::supertable::wal::{SealRecord, WalStore};
+use crate::{
+    runtime_bridge::bridge_sync_to_async,
+    supertable::wal::{SealRecord, WalStore},
+};
 
 /// Default refresh interval — 1 second. Bounds how stale the
 /// cache's view can be on a query path that didn't write its
@@ -184,7 +189,7 @@ impl SidecarCache {
             let wal_store = self.wal_store.clone();
             async move { (id, wal_store.get_tombstones(id).await) }
         });
-        let results = futures::future::join_all(fetches).await;
+        let results = join_all(fetches).await;
         for (id, result) in results {
             let (bitmap, seal, etag) = match result {
                 Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
@@ -332,10 +337,15 @@ impl SidecarCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::{LocalFsStorageProvider, StorageProvider};
-    use crate::supertable::wal::tombstones_codec::TombstonesSidecar;
+    use std::iter::once;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::wal::tombstones_codec::TombstonesSidecar,
+    };
 
     fn fixture() -> (TempDir, WalStore, SidecarCache) {
         let dir = TempDir::new().expect("tempdir");
@@ -424,7 +434,7 @@ mod tests {
         ws.put_tombstones(present, None, &TombstonesSidecar { seal: None, bitmap })
             .await
             .expect("put");
-        let ids: Vec<Uuid> = std::iter::once(present)
+        let ids: Vec<Uuid> = once(present)
             .chain((2..32u128).map(Uuid::from_u128))
             .collect();
 
@@ -506,6 +516,22 @@ mod tests {
         let ws = WalStore::new(storage);
         let cache = SidecarCache::new(ws, DEFAULT_REFRESH_TTL);
         assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// `clear` drops every cached entry, returning the cache to its
+    /// empty state after a lookup has populated it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_empties_the_cache() {
+        let (_dir, _ws, cache) = fixture();
+        // A lookup against an absent sidecar still primes one cached
+        // "known 404" entry.
+        let _ = cache
+            .bitmap_for(Uuid::from_u128(0x1234), Instant::now())
+            .expect("lookup");
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty(), "clear drops all entries");
         assert_eq!(cache.len(), 0);
     }
 }

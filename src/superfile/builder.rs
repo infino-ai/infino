@@ -79,23 +79,30 @@
 //! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
-use crate::superfile::format::footer::{encode_parquet_body, splice_index_blobs};
-use crate::superfile::format::{self, kv};
-use crate::superfile::fts::builder::FtsBuilder;
-use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
-use crate::superfile::stats::SuperfileStats;
-use crate::superfile::vector::builder::VectorBuilder;
-use crate::superfile::vector::reader::ColumnReader;
-use crate::superfile::{BuildError, SuperfileReader};
+use std::{collections::HashSet, fmt, sync::Arc};
+
+use arrow_array::{Array, LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Schema};
+use parquet::basic::{Compression, ZstdLevel};
+use roaring::RoaringBitmap;
+
 // `VectorConfig` lives in `vector::builder` and is re-exported below
 // (single source of truth post-collapse — see the `pub use` line).
 pub use crate::superfile::vector::builder::VectorConfig;
-use crate::superfile::vector::distance::Metric;
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Schema};
-use parquet::basic::Compression;
-use roaring::RoaringBitmap;
-use std::sync::Arc;
+use crate::superfile::{
+    BuildError, SuperfileReader,
+    format::{
+        self,
+        footer::{encode_parquet_body, splice_index_blobs},
+        kv,
+    },
+    fts::{
+        builder::FtsBuilder,
+        tokenize::{AsciiLowerTokenizer, Tokenizer},
+    },
+    stats::SuperfileStats,
+    vector::{builder::VectorBuilder, distance::Metric, reader::ColumnReader},
+};
 
 /// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8`.
@@ -232,8 +239,7 @@ impl BuilderOptions {
             tokenizer,
             row_group_size: 65_536,
             compression: Compression::ZSTD(
-                parquet::basic::ZstdLevel::try_new(3)
-                    .expect("zstd level 3 is in the valid 1..=22 range"),
+                ZstdLevel::try_new(3).expect("zstd level 3 is in the valid 1..=22 range"),
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
         }
@@ -263,6 +269,7 @@ impl BuilderOptions {
                         v.rot_seed,
                         v.metric,
                     )
+                    .with_rerank_codec(v.rerank_codec)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -352,8 +359,8 @@ impl BuilderOptions {
     }
 }
 
-impl std::fmt::Debug for SuperfileBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SuperfileBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SuperfileBuilder")
             .field("id_column", &self.opts.id_column)
             .field("n_fts_columns", &self.opts.fts_columns.len())
@@ -423,7 +430,7 @@ impl SuperfileBuilder {
         // 3. No reserved separator / prefix / duplication across the
         //    combined logical-name namespace (FTS + vector + any
         //    schema-name-vs-vector collision).
-        let mut seen_logical: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_logical: HashSet<&str> = HashSet::new();
         for fc in &opts.fts_columns {
             check_user_column_name(&fc.column)?;
             if !seen_logical.insert(fc.column.as_str()) {
@@ -536,7 +543,7 @@ impl SuperfileBuilder {
                 let arr = batch.column(schema_idx);
                 let strs = arr
                     .as_any()
-                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .downcast_ref::<LargeStringArray>()
                     .expect("schema validated as LargeUtf8");
                 for row in 0..(n_rows as usize) {
                     let local_doc_id = self.next_local_doc_id + row as u32;
@@ -641,7 +648,7 @@ impl SuperfileBuilder {
 
                 let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
                 let result = v
-                    .get_vectors_fp32(&reader_col.name)
+                    .get_vectors_decoded(&reader_col.name)
                     .map_err(|_| BuildError::VectorReadError)?;
                 for (row_idx, single_row) in result.iter().enumerate() {
                     // Skip deleted documents: only include rows not in the deleted_docs_bitmap
@@ -899,13 +906,21 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_helpers::{decimal128_ids, default_tokenizer, default_vector_config};
-    use arrow_array::{Decimal128Array, LargeStringArray};
+    use std::sync::Arc;
+
+    use arrow_array::{Decimal128Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
     use roaring::RoaringBitmap;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        superfile::{
+            format::footer::read_kv_metadata, fts::reader::BoolMode,
+            vector::rerank_codec::RerankCodec,
+        },
+        test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
+    };
 
     fn schema_with_fts() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1102,11 +1117,8 @@ mod tests {
             DataType::UInt64,
             false,
         )]));
-        let bad = RecordBatch::try_new(
-            other,
-            vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
-        )
-        .expect("build RecordBatch");
+        let bad = RecordBatch::try_new(other, vec![Arc::new(UInt64Array::from(vec![1u64]))])
+            .expect("build RecordBatch");
         let err = b.add_batch(&bad, &[]).expect_err("expected error");
         assert!(matches!(err, BuildError::BatchSchemaMismatch));
     }
@@ -1173,8 +1185,7 @@ mod tests {
         let batch = batch_two_rows(&schema);
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = b.finish().expect("finish builder");
-        let kv =
-            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
         assert_eq!(
             kv.get("inf.format").map(String::as_str),
             Some("infino-superfile")
@@ -1206,8 +1217,7 @@ mod tests {
         v[16 + 1] = 1.0;
         b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
         let bytes = b.finish().expect("finish builder");
-        let kv =
-            crate::superfile::format::footer::read_kv_metadata(&bytes).expect("read kv metadata");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
         assert!(kv.contains_key("inf.vec.offset"));
         assert!(kv.contains_key("inf.vec.length"));
         assert!(kv.contains_key("inf.vec.columns"));
@@ -1239,7 +1249,7 @@ mod tests {
             n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Fp32,
         }];
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
@@ -1296,29 +1306,29 @@ mod tests {
 
         // Verify scalar_stats contains entries for all scalar columns
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("doc_id"),
+            stats.scalar_stats.contains_key("doc_id"),
             "scalar_stats should contain id_column"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("title"),
+            stats.scalar_stats.contains_key("title"),
             "scalar_stats should contain FTS column"
         );
         assert!(
-            stats.scalar_stats.cols.contains_key("body"),
+            stats.scalar_stats.contains_key("body"),
             "scalar_stats should contain body column"
         );
 
         // Verify scalar_stats values match expected min/max
         // doc_id: IDs are [10, 11], so min=10, max=11
-        let (id_min_arr, id_max_arr) = stats
+        let id_agg = stats
             .scalar_stats
-            .cols
             .get("doc_id")
             .expect("doc_id should have stats");
+        let (id_min_arr, id_max_arr) = (&id_agg.min, &id_agg.max);
         let id_min = id_min_arr
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -1333,11 +1343,11 @@ mod tests {
         assert_eq!(id_max, 11i128, "doc_id max should be 11");
 
         // title: ["hello world", "rust async"], so min="hello world", max="rust async"
-        let (title_min_arr, title_max_arr) = stats
+        let title_agg = stats
             .scalar_stats
-            .cols
             .get("title")
             .expect("title should have stats");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -1355,11 +1365,11 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // body: ["foo bar", "baz quux"], so min="baz quux", max="foo bar"
-        let (body_min_arr, body_max_arr) = stats
+        let body_agg = stats
             .scalar_stats
-            .cols
             .get("body")
             .expect("body should have stats");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_any()
             .downcast_ref::<LargeStringArray>()
@@ -1415,7 +1425,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1463,7 +1473,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1488,8 +1498,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_adds_fts_correctly() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1523,7 +1531,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b2.finish().expect("finish builder");
@@ -1541,8 +1549,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_to_non_empty_builder_includes_both_datasets() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1594,7 +1600,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = merged.finish().expect("finish builder");
@@ -1692,14 +1698,13 @@ mod tests {
             schema_with_fts(),
             "doc_id",
             vec![],
-            vec![crate::superfile::vector::builder::VectorConfig {
+            vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
-                rerank_codec:
-                    crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
             }],
             None,
         );
@@ -1721,8 +1726,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_batch_from_reader_queries_work_correctly() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -1755,7 +1758,7 @@ mod tests {
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 11, "id_max should be 11");
         assert!(
-            !stats.scalar_stats.cols.is_empty(),
+            !stats.scalar_stats.is_empty(),
             "scalar_stats should have column entries"
         );
         let merged_bytes = b_merged.finish().expect("finish builder");
@@ -1840,9 +1843,9 @@ mod tests {
         assert_eq!(stats.n_docs, 2);
         assert_eq!(stats.id_min, 10);
         assert_eq!(stats.id_max, 11);
-        assert!(stats.scalar_stats.cols.contains_key("doc_id"));
-        assert!(stats.scalar_stats.cols.contains_key("title"));
-        assert!(stats.scalar_stats.cols.contains_key("body"));
+        assert!(stats.scalar_stats.contains_key("doc_id"));
+        assert!(stats.scalar_stats.contains_key("title"));
+        assert!(stats.scalar_stats.contains_key("body"));
 
         // Verify data is preserved
         let merged_reader =
@@ -1898,7 +1901,7 @@ mod tests {
         assert_eq!(stats.n_docs, 4, "should have 4 total documents");
         assert_eq!(stats.id_min, 10, "id_min should be 10");
         assert_eq!(stats.id_max, 21, "id_max should be 21");
-        assert_eq!(stats.scalar_stats.cols.len(), 3, "should have 3 columns");
+        assert_eq!(stats.scalar_stats.len(), 3, "should have 3 columns");
 
         // Verify merged superfile
         let merged_reader =
@@ -1960,8 +1963,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_from_readers_preserves_fts_search_functionality() {
-        use crate::superfile::fts::reader::BoolMode;
-
         let opts = BuilderOptions::new(
             schema_with_fts(),
             "doc_id",
@@ -2243,29 +2244,26 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify doc_id min/max (10, 11)
-        let (doc_id_min_arr, doc_id_max_arr) = stats
-            .scalar_stats
-            .cols
-            .get("doc_id")
-            .expect("doc_id column");
+        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         let doc_id_max = doc_id_max_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         assert_eq!(doc_id_min, 10, "doc_id min should be 10");
         assert_eq!(doc_id_max, 11, "doc_id max should be 11");
 
         // Verify title min/max (from batch_two_rows: ["hello world", "rust async"])
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2285,8 +2283,8 @@ mod tests {
         assert_eq!(title_max, "rust async", "title max should be 'rust async'");
 
         // Verify body min/max (from batch_two_rows: ["foo bar", "baz quux"])
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()
@@ -2345,29 +2343,26 @@ mod tests {
         .expect("build_from_readers");
 
         // Verify doc_id: min should be 10, max should be 21 (merged from both readers)
-        let (doc_id_min_arr, doc_id_max_arr) = stats
-            .scalar_stats
-            .cols
-            .get("doc_id")
-            .expect("doc_id column");
+        let doc_id_agg = stats.scalar_stats.get("doc_id").expect("doc_id column");
+        let (doc_id_min_arr, doc_id_max_arr) = (&doc_id_agg.min, &doc_id_agg.max);
         let doc_id_min = doc_id_min_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         let doc_id_max = doc_id_max_arr
             .as_ref()
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<Decimal128Array>()
             .expect("downcast to Decimal128")
             .value(0);
         assert_eq!(doc_id_min, 10, "merged doc_id min should be 10");
         assert_eq!(doc_id_max, 21, "merged doc_id max should be 21");
 
         // Verify title: min should be "alpha", max should be "zeta" (lexicographically from both readers)
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2384,8 +2379,8 @@ mod tests {
         assert_eq!(title_max, "zeta", "merged title max should be 'zeta'");
 
         // Verify body: min should be "aaa", max should be "zzz" (lexicographically from both readers)
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()
@@ -2434,8 +2429,8 @@ mod tests {
                 .expect("build_from_readers");
 
         // Verify title min/max (values: ["zebra", "apple"] => min="apple", max="zebra")
-        let (title_min_arr, title_max_arr) =
-            stats.scalar_stats.cols.get("title").expect("title column");
+        let title_agg = stats.scalar_stats.get("title").expect("title column");
+        let (title_min_arr, title_max_arr) = (&title_agg.min, &title_agg.max);
         let title_min = title_min_arr
             .as_ref()
             .as_any()
@@ -2452,8 +2447,8 @@ mod tests {
         assert_eq!(title_max, "zebra", "title max should be 'zebra'");
 
         // Verify body min/max (values: ["xyz", "abc"] => min="abc", max="xyz")
-        let (body_min_arr, body_max_arr) =
-            stats.scalar_stats.cols.get("body").expect("body column");
+        let body_agg = stats.scalar_stats.get("body").expect("body column");
+        let (body_min_arr, body_max_arr) = (&body_agg.min, &body_agg.max);
         let body_min = body_min_arr
             .as_ref()
             .as_any()
@@ -2468,5 +2463,142 @@ mod tests {
             .value(0);
         assert_eq!(body_min, "abc", "body min should be 'abc'");
         assert_eq!(body_max, "xyz", "body max should be 'xyz'");
+    }
+
+    /// The `Debug` impl reports the builder's shape (column counts and
+    /// doc-id cursor) without panicking, and `set_fts_spill_threshold_bytes`
+    /// forwards to the live FTS builder.
+    // --- Sq8 compaction coverage -------------------------------------------
+
+    #[tokio::test]
+    async fn add_batch_from_reader_sq8_succeeds_and_search_works() {
+        // Sq8 source superfile must be mergeable; before the fix, get_vectors_fp32
+        // rejected any non-Fp32 codec and compaction silently failed.
+        let sq8_opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![
+                default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8ResidualEpsilon),
+            ],
+            None,
+        );
+        let mut b1 = SuperfileBuilder::new(sq8_opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0; // doc 0 → axis 0
+        v[16 + 1] = 1.0; // doc 1 → axis 1
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let source_bytes = b1.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open source reader");
+
+        let mut b2 = SuperfileBuilder::new(sq8_opts).expect("new SuperfileBuilder");
+        b2.add_batch_from_reader(&reader, None)
+            .expect("add_batch_from_reader must succeed for Sq8 source");
+        let merged_bytes = b2.finish().expect("finish merged builder");
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        assert_eq!(merged.n_docs(), 2);
+
+        // Sq8 codec must be preserved in the merged output.
+        let col = merged
+            .vec()
+            .expect("vector index present")
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.rerank_codec,
+            RerankCodec::Sq8ResidualEpsilon,
+            "merged superfile must carry Sq8ResidualEpsilon codec"
+        );
+
+        // Self-query: axis-0 vector must be top hit.
+        let mut query = vec![0.0f32; 16];
+        query[0] = 1.0;
+        let hits = merged
+            .vec()
+            .expect("vector reader")
+            .search("emb", &query, 1, 4, 100)
+            .await
+            .expect("vector search on merged Sq8 superfile");
+        assert!(!hits.is_empty(), "search should return at least one result");
+        assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_fp32_codec_preserved_by_new_from_reader() {
+        // new_from_reader previously omitted .with_rerank_codec, so an Fp32 source
+        // produced a Sq8 merged output.  After the fix the codec round-trips exactly.
+        let fp32_opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)], // Fp32 is the default_vector_config codec
+            None,
+        );
+        let mut b = SuperfileBuilder::new(fp32_opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32];
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        assert_eq!(stats.n_docs, 2);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // Fp32 codec must survive the round-trip through new_from_reader.
+        let col = merged
+            .vec()
+            .expect("vector index")
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.rerank_codec,
+            RerankCodec::Fp32,
+            "build_from_readers must preserve Fp32 codec from source superfile"
+        );
+
+        // Search must still work on the Fp32 merged output.
+        let mut query = vec![0.0f32; 16];
+        query[0] = 1.0;
+        let hits = merged
+            .vec()
+            .expect("vector reader")
+            .search("emb", &query, 1, 4, 100)
+            .await
+            .expect("vector search on merged Fp32 superfile");
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    #[test]
+    fn debug_and_set_fts_spill_threshold() {
+        const FORCE_SPILL_THRESHOLD: usize = 1;
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        // A 1-byte threshold forces the FTS column onto the spill path;
+        // reaches the `Some(fb)` branch since opts_minimal registers a
+        // column. (Zero is rejected by the FtsBuilder.)
+        b.set_fts_spill_threshold_bytes(FORCE_SPILL_THRESHOLD);
+
+        let rendered = format!("{b:?}");
+        assert!(
+            rendered.contains("SuperfileBuilder"),
+            "debug output names the struct: {rendered}"
+        );
+        assert!(
+            rendered.contains("n_fts_columns"),
+            "debug output lists fts columns: {rendered}"
+        );
     }
 }

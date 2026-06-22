@@ -20,15 +20,17 @@
 //! `assign_to_centroids` plumbing were broken, recall would
 //! collapse here long before it would in the bench harness.
 
-use bytes::Bytes;
-use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, distance, normalize};
-use infino::superfile::vector::reader::VectorReader;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand_distr::{Distribution, StandardNormal};
 use std::collections::HashSet;
+
+use bytes::Bytes;
+use infino::superfile::vector::{
+    builder::{VectorBuilder, VectorConfig},
+    distance::{Metric, distance, normalize},
+    reader::VectorReader,
+    rerank_codec::RerankCodec,
+};
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
 
 /// Random-rotation seed shared by both reservoir-recall fixtures.
 const ROT_SEED: u64 = 7;

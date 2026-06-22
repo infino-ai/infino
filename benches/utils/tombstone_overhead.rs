@@ -37,26 +37,37 @@
 //!
 //! Invoked as `cargo bench -- tombstone`.
 
-use std::hint::black_box;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    hint::black_box,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::RecordBatch;
 use chrono::Utc;
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::wal::WalStore;
-use infino::supertable::wal::pipeline::run_tombstone_phase;
-use infino::supertable::wal::state_doc::{
-    OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState, WalStateDoc,
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        wal::{
+            WalStore,
+            pipeline::run_tombstone_phase,
+            state_doc::{
+                OpKind, RowId, SCHEMA_VERSION, TombstoneEntry, TombstoneOutcome, WalId, WalState,
+                WalStateDoc,
+            },
+        },
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
 };
-use infino::test_helpers::{build_title_batch, default_supertable_options};
 use tempfile::TempDir;
 
-use crate::markdown::fmt_time;
-use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-use crate::rss::{self, PeakSampler, RssStats};
+use crate::{
+    markdown::fmt_time,
+    report::{Better, Block, Cell, Report, Section, metric, text},
+    rss::{self, PeakSampler, RssStats},
+};
 
 // ─── Sizing ───────────────────────────────────────────────────────────
 

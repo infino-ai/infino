@@ -18,26 +18,31 @@
 //! `FROM` alias — the TVF is a relation source, so joins / self-joins
 //! compose on its output.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use arrow_schema::SchemaRef;
-use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::Expr;
+use datafusion::{
+    catalog::{TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::context::SessionContext,
+    logical_expr::Expr,
+};
 
 use super::Connection;
-use crate::supertable::handle::SupertableReader;
-use crate::supertable::query::exec::common::arg_to_string;
-use crate::supertable::query::exec::fts_exec::{
-    BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc,
+use crate::supertable::{
+    handle::SupertableReader,
+    query::exec::{
+        common::arg_to_string,
+        fts_exec::{BM25_PREFIX_UDTF, BM25_SEARCH_UDTF, Bm25PrefixFunc, Bm25SearchFunc},
+        hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc},
+        match_exec::{EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc},
+        vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc},
+    },
 };
-use crate::supertable::query::exec::hybrid_exec::{HYBRID_SEARCH_UDTF, HybridSearchFunc};
-use crate::supertable::query::exec::match_exec::{
-    EXACT_MATCH_UDTF, ExactMatchFunc, TOKEN_MATCH_UDTF, TokenMatchFunc,
-};
-use crate::supertable::query::exec::vector_exec::{VECTOR_SEARCH_UDTF, VectorSearchFunc};
 
 /// A resolved table's pinned snapshot: the reader the search kernels run
 /// against plus its scalar schema (the TVF's output columns).
@@ -54,8 +59,8 @@ struct TableResolver {
     cache: Mutex<HashMap<String, ResolvedTable>>,
 }
 
-impl std::fmt::Debug for TableResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TableResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TableResolver").finish_non_exhaustive()
     }
 }

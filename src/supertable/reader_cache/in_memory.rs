@@ -26,15 +26,15 @@
 //! same bytes (caller's contract). Re-inserting doesn't re-parse
 //! the bytes or re-build the reader.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use bytes::Bytes;
 
-use crate::superfile::SuperfileReader;
-use crate::supertable::manifest::SuperfileUri;
-
 use super::{ReaderCacheError, SuperfileReaderCache};
+use crate::{superfile::SuperfileReader, supertable::manifest::SuperfileUri};
 
 /// Per-URI entry. Holds the raw bytes alongside the parsed reader
 /// so `resident_bytes()` can attribute storage back to specific
@@ -135,14 +135,16 @@ impl SuperfileReaderCache for InMemoryReaderCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{Field, Schema};
 
-    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder};
-    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+    use super::*;
+    use crate::{
+        superfile::builder::{BuilderOptions, SuperfileBuilder},
+        test_helpers::{decimal128_id_field, decimal128_ids},
+    };
 
     /// Build minimal valid superfile bytes (no FTS, no vectors —
     /// just the parquet body + KV metadata that

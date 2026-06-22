@@ -7,4 +7,5 @@ pub mod open_refresh;
 pub mod partition_assignment;
 pub mod persistence;
 pub mod pointer_atomic;
+pub mod same_handle_query;
 pub mod stats;

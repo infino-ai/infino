@@ -45,7 +45,7 @@ pub struct SupertableStats {
     pub n_superfiles: usize,
 
     /// Number of manifest parts referenced in the currently
-    /// pinned [`crate::supertable::manifest::list::ManifestList`].
+    /// pinned persisted Manifest.
     pub n_manifest_parts: usize,
 
     /// Number of manifest parts that have been hydrated in

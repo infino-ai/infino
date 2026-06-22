@@ -15,26 +15,37 @@
 //! constructed per call (cheap; the FST validates its header in O(1) and
 //! then it's a borrowed view).
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::ops::Range;
-use std::sync::Arc;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::superfile::format::checksum::crc32c;
-use crate::superfile::format::fts::{
-    HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry, term_meta,
+use crate::superfile::{
+    ReadError,
+    error::FtsError,
+    format::{
+        self, FST_SEPARATOR,
+        checksum::crc32c,
+        fts::{
+            HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry,
+            term_meta,
+        },
+    },
+    fts::{
+        bm25,
+        builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE},
+        dict::{DictReader, make_key},
+        fst_value::FstValue,
+        posting::{BLOCK_LEN, decode_block},
+        tokenize::{AsciiLowerTokenizer, Tokenizer as _},
+    },
+    lazy_source::{LazyByteSource, PrefetchedSource, Source},
 };
-use crate::superfile::format::{self, FST_SEPARATOR};
-use crate::superfile::fts::builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE};
-use crate::superfile::fts::dict::{DictReader, make_key};
-use crate::superfile::fts::fst_value::FstValue;
-use crate::superfile::fts::posting::{BLOCK_LEN, decode_block};
-use crate::superfile::fts::tokenize::Tokenizer as _;
-use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource, Source};
-use crate::superfile::{ReadError, error::FtsError};
 
 /// Boolean-mode for multi-term queries.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -454,9 +465,8 @@ impl FtsReader {
                 let inv_avgdl = 1.0_f32 / avgdl;
                 for d in 0..(n_docs as usize) {
                     let dl = read_u32_le(&array_region[d * 4..d * 4 + 4]) as f32;
-                    let norm = 1.0 - crate::superfile::fts::bm25::B
-                        + crate::superfile::fts::bm25::B * dl * inv_avgdl;
-                    dl_norm_k1.push(crate::superfile::fts::bm25::K1 * norm);
+                    let norm = 1.0 - bm25::B + bm25::B * dl * inv_avgdl;
+                    dl_norm_k1.push(bm25::K1 * norm);
                 }
             }
             columns.push(ColumnMeta {
@@ -766,10 +776,11 @@ impl FtsReader {
     /// ascending doc-id order.
     ///
     /// Reuses the same [`build_term_cursors`](Self::build_term_cursors)
-    /// the scored path uses, then walks the cursors with
-    /// [`walk_cursors_unranked`] — no BM25 scoring and no top-k heap, so
-    /// nothing is ranked. Cursors traverse blocks in doc-id order, so
-    /// the result is already ascending (no re-sort).
+    /// the scored path uses, then walks the cursors —
+    /// [`collect_and_intersect`](Self::collect_and_intersect) for `And`,
+    /// [`or_merge_unranked`] for `Or` — with no BM25 scoring and no
+    /// top-k heap, so nothing is ranked. Cursors traverse blocks in
+    /// doc-id order, so the result is already ascending (no re-sort).
     pub async fn token_match(
         &self,
         column: &str,
@@ -781,11 +792,46 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = self.build_term_cursors(column_id, tokens).await?;
-        // AND needs every token present; a missing token ⇒ empty set.
-        if mode == BoolMode::And && cursors.len() != tokens.len() {
-            return Ok(Vec::new());
+        Ok(match mode {
+            BoolMode::And => {
+                // AND needs every token present; a missing token ⇒ empty
+                // set. Otherwise intersect via the same optimized
+                // block flat-merge the ranked scorer uses.
+                if cursors.len() != tokens.len() {
+                    return Ok(Vec::new());
+                }
+                self.collect_and_intersect(column_id, cursors)
+            }
+            BoolMode::Or => or_merge_unranked(cursors),
+        })
+    }
+
+    /// Unranked token-match **count** — the cardinality
+    /// [`token_match`](Self::token_match) would return, without
+    /// materializing the doc-id `Vec`. The AND path tallies through a
+    /// [`CountSink`], the OR path counts the union walk; both skip the
+    /// `Vec<u32>` so a high-cardinality count doesn't allocate one id
+    /// per match.
+    pub async fn token_match_count(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+    ) -> Result<u64, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(0);
         }
-        Ok(walk_cursors_unranked(cursors, mode))
+        let cursors = self.build_term_cursors(column_id, tokens).await?;
+        Ok(match mode {
+            BoolMode::And => {
+                if cursors.len() != tokens.len() {
+                    return Ok(0);
+                }
+                self.count_and_intersect(column_id, cursors)
+            }
+            BoolMode::Or => or_count_unranked(cursors),
+        })
     }
 
     /// Document frequency of `token` in `column` — the number of docs
@@ -911,7 +957,7 @@ impl FtsReader {
         // One tokenizer for all columns; per-column tokenizers would
         // require splitting this call to use the column's configured
         // tokenizer.
-        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+        let tok = AsciiLowerTokenizer;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
 
@@ -965,8 +1011,8 @@ impl FtsReader {
                 // skip-table, no PFOR decode. The single doc's score
                 // is the entire result for any k ≥ 1 (unless it sits
                 // strictly below the caller's floor).
-                let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, 1);
-                let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
+                let idf_t = bm25::idf(self.n_docs as u64, 1);
+                let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
@@ -974,8 +1020,7 @@ impl FtsReader {
                     return Ok(Vec::new());
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
-                let score =
-                    crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok(Vec::new());
                 }
@@ -1001,8 +1046,8 @@ impl FtsReader {
 
         let term_meta = TermMeta::parse(postings, metadata_offset)?;
 
-        let idf_t = crate::superfile::fts::bm25::idf(self.n_docs as u64, term_meta.df);
-        let idf_x_k1p1 = idf_t * (crate::superfile::fts::bm25::K1 + 1.0);
+        let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
+        let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
@@ -1047,11 +1092,8 @@ impl FtsReader {
                     continue;
                 }
                 let tf = buf_t[j];
-                let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                    idf_x_k1p1,
-                    tf,
-                    dl_norm_k1[doc_id as usize],
-                );
+                let score =
+                    bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1[doc_id as usize]);
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.
@@ -1316,7 +1358,7 @@ impl FtsReader {
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                         idfs = [0.0; 4];
                         tfs = [0.0; 4];
                         packed = 0;
@@ -1324,7 +1366,7 @@ impl FtsReader {
                 }
             }
             if packed > 0 {
-                score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                score += bm25::score_simd_x4(idfs, tfs, norm);
             }
 
             // Update heap.
@@ -1440,30 +1482,70 @@ impl FtsReader {
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-
-        // 2-term shape gets a specialized flat-merge inner loop: when
-        // both cursors sit in their decoded block buffers, we walk the
-        // two sorted `block_doc_ids` arrays with two index pointers
-        // instead of calling `skip_to` per leader doc. That removes
-        // the function-call + within-block linear-scan overhead on the
-        // hottest AND case (rare ∧ common). The general path is kept
-        // for n >= 3 because flat-merge across N arrays doesn't
-        // straightforwardly generalize and the per-doc leapfrog still
-        // amortizes well with the block-max pruning below.
-        if cursors.len() == 2 {
-            self.run_and_intersect_2term(&mut cursors, dl_norm_k1, k, &mut heap, filter, floor_eff);
-        } else {
-            self.run_and_intersect_general(
-                &mut cursors,
-                dl_norm_k1,
-                k,
-                &mut heap,
-                filter,
-                floor_eff,
-            );
-        }
-
+        let mut sink = ScoreSink {
+            heap: &mut heap,
+            k,
+            filter,
+            floor_eff,
+        };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// Unranked multi-term AND: the matching doc ids in ascending order
+    /// via the block flat-merge in [`and_flat_merge`](Self::and_flat_merge),
+    /// with no BM25 scoring and no top-k heap. Because it shares that
+    /// traversal with the ranked [`run_and_intersect`](Self::run_and_intersect),
+    /// the two always agree on which docs match, and an unranked count
+    /// over high-frequency terms costs the same posting-list work as the
+    /// ranked search minus the scoring.
+    fn collect_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> Vec<u32> {
+        if cursors.is_empty() {
+            return Vec::new();
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        cursors.sort_by_key(|c| c.block_count());
+        let mut sink = CollectSink { out: Vec::new() };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        sink.out
+    }
+
+    /// Unranked multi-term AND **count**: the size of the intersection
+    /// via the same flat-merge as [`collect_and_intersect`](Self::collect_and_intersect),
+    /// but through a [`CountSink`] that tallies hits instead of
+    /// collecting them — no `Vec<u32>` materialized.
+    fn count_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> u64 {
+        if cursors.is_empty() {
+            return 0;
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        cursors.sort_by_key(|c| c.block_count());
+        let mut sink = CountSink { n: 0 };
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        sink.n
+    }
+
+    /// Dispatch to the 2-term specialization or the general `n >= 3`
+    /// (and `n == 1`) flat-merge. The 2-term shape walks the two sorted
+    /// `block_doc_ids` arrays with two index pointers instead of calling
+    /// `skip_to` per leader doc — removing the function-call +
+    /// within-block linear-scan overhead on the hottest AND case
+    /// (rare ∧ common). The general path keeps the per-doc leapfrog,
+    /// which amortizes well with the block-max pruning a scoring sink
+    /// drives.
+    fn and_flat_merge<S: AndSink>(
+        &self,
+        cursors: &mut [TermCursor],
+        dl_norm_k1: &[f32],
+        sink: &mut S,
+    ) {
+        if cursors.len() == 2 {
+            self.and_flat_merge_2term(cursors, dl_norm_k1, sink);
+        } else {
+            self.and_flat_merge_general(cursors, dl_norm_k1, sink);
+        }
     }
 
     /// General `n >= 3`-term AND path. Same shape as the 2-term path:
@@ -1475,32 +1557,27 @@ impl FtsReader {
     /// overhead per leader doc, just integer comparisons over the
     /// already-decoded buffers. When any cursor exhausts its block,
     /// the outer loop crosses blocks via `next()` and re-aligns.
-    fn run_and_intersect_general(
+    fn and_flat_merge_general<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        k: usize,
-        heap: &mut BinaryHeap<TopKEntry>,
-        mut filter: Option<&mut ExcludeFilter>,
-        floor_eff: f32,
+        sink: &mut S,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
                 break;
             }
 
-            // Block-max-AND pruning. The bar is the kth-best once the
-            // heap fills, or the caller's seeded floor before that —
-            // whichever is higher. If the leader's current block can't
-            // possibly produce a bar-beating score, skip the whole
-            // block — the safest UB sums leader's block_max with each
-            // other cursor's max block_max across all blocks that
-            // overlap the leader's block doc-id range.
-            let bar = if heap.len() >= k {
-                heap.peek().expect("heap len == k").0.max(floor_eff)
-            } else {
-                floor_eff
-            };
+            // Block-max-AND pruning (scoring sinks only; the unranked
+            // sink's `bar()` is NEG_INFINITY, so this whole block is
+            // skipped). The bar is the kth-best once the heap fills, or
+            // the caller's seeded floor before that — whichever is
+            // higher. If the leader's current block can't possibly
+            // produce a bar-beating score, skip the whole block — the
+            // safest UB sums leader's block_max with each other cursor's
+            // max block_max across all blocks that overlap the leader's
+            // block doc-id range.
+            let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let range_start = cursors[0].current_doc_id();
                 let range_end = cursors[0].current_block_last_doc_id();
@@ -1584,24 +1661,19 @@ impl FtsReader {
                     break;
                 }
                 if all_match {
-                    let norm = dl_norm_k1[a as usize];
-                    let mut score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c0.idf_x_k1p1,
-                        c0.block_tfs[i],
-                        norm,
-                    );
-                    for o in others.iter() {
-                        score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                            o.idf_x_k1p1,
-                            o.block_tfs[o.pos],
-                            norm,
-                        );
-                    }
-                    // Floor gate: strictly-below-floor docs are dead to
-                    // the caller.
-                    if score > floor_eff {
-                        and_heap_push(heap, k, filter.as_deref_mut(), score, a);
-                    }
+                    let score = if sink.needs_score() {
+                        let norm = dl_norm_k1[a as usize];
+                        let mut score =
+                            bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.block_tfs[i], norm);
+                        for o in others.iter() {
+                            score +=
+                                bm25::score_with_dl_norm_k1(o.idf_x_k1p1, o.block_tfs[o.pos], norm);
+                        }
+                        score
+                    } else {
+                        0.0
+                    };
+                    sink.emit(a, score);
                     i += 1;
                     for o in others.iter_mut() {
                         o.pos += 1;
@@ -1633,14 +1705,11 @@ impl FtsReader {
     /// scan — just two index pointers walking forward. When either
     /// block exhausts, the cursor crosses to its next block (decoding
     /// on demand) and the merge resumes.
-    fn run_and_intersect_2term(
+    fn and_flat_merge_2term<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &[f32],
-        k: usize,
-        heap: &mut BinaryHeap<TopKEntry>,
-        mut filter: Option<&mut ExcludeFilter>,
-        floor_eff: f32,
+        sink: &mut S,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -1655,14 +1724,12 @@ impl FtsReader {
                 break;
             }
 
-            // Block-max-AND pruning at the leader's current block. The
-            // bar is the kth-best once the heap fills, or the caller's
-            // seeded floor before that — whichever is higher.
-            let bar = if heap.len() >= k {
-                heap.peek().expect("heap len == k").0.max(floor_eff)
-            } else {
-                floor_eff
-            };
+            // Block-max-AND pruning at the leader's current block
+            // (scoring sinks only; the unranked sink's `bar()` is
+            // NEG_INFINITY, so this is skipped). The bar is the kth-best
+            // once the heap fills, or the caller's seeded floor before
+            // that — whichever is higher.
+            let bar = sink.bar();
             if bar > f32::NEG_INFINITY {
                 let range_start = c0.current_doc_id();
                 let range_end = c0.current_block_last_doc_id();
@@ -1715,21 +1782,14 @@ impl FtsReader {
                 } else if a > b {
                     j += 1;
                 } else {
-                    let norm = dl_norm_k1[a as usize];
-                    let score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c0_idf,
-                        c0.block_tfs[i],
-                        norm,
-                    ) + crate::superfile::fts::bm25::score_with_dl_norm_k1(
-                        c1_idf,
-                        c1.block_tfs[j],
-                        norm,
-                    );
-                    // Floor gate: strictly-below-floor docs are dead to
-                    // the caller.
-                    if score > floor_eff {
-                        and_heap_push(heap, k, filter.as_deref_mut(), score, a);
-                    }
+                    let score = if sink.needs_score() {
+                        let norm = dl_norm_k1[a as usize];
+                        bm25::score_with_dl_norm_k1(c0_idf, c0.block_tfs[i], norm)
+                            + bm25::score_with_dl_norm_k1(c1_idf, c1.block_tfs[j], norm)
+                    } else {
+                        0.0
+                    };
+                    sink.emit(a, score);
                     i += 1;
                     j += 1;
                 }
@@ -1890,7 +1950,7 @@ impl FtsReader {
                         continue;
                     }
                     let norm = dl_norm_k1[candidate as usize];
-                    let essential_score = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                    let essential_score = bm25::score_with_dl_norm_k1(
                         cursors[0].idf_x_k1p1,
                         cursors[0].current_tf(),
                         norm,
@@ -1914,8 +1974,7 @@ impl FtsReader {
                             tfs[packed] = cursor.current_tf() as f32;
                             packed += 1;
                             if packed == 4 {
-                                score +=
-                                    crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                                score += bm25::score_simd_x4(idfs, tfs, norm);
                                 idfs = [0.0; 4];
                                 tfs = [0.0; 4];
                                 packed = 0;
@@ -1923,7 +1982,7 @@ impl FtsReader {
                         }
                     }
                     if packed > 0 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
 
                     if heap.len() < k {
@@ -2040,7 +2099,7 @@ impl FtsReader {
                         tfs[packed] = cursor.current_tf() as f32;
                         packed += 1;
                         if packed == 4 {
-                            score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                            score += bm25::score_simd_x4(idfs, tfs, norm);
                             idfs = [0.0; 4];
                             tfs = [0.0; 4];
                             packed = 0;
@@ -2048,7 +2107,7 @@ impl FtsReader {
                     }
                 }
                 if packed > 0 {
-                    score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                    score += bm25::score_simd_x4(idfs, tfs, norm);
                 }
 
                 // Per-doc UB tightening: bound the doc's max possible
@@ -2080,7 +2139,7 @@ impl FtsReader {
                             }
                             cursor.skip_to(candidate);
                             if cursor.current_doc_id() == candidate {
-                                score += crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                                score += bm25::score_with_dl_norm_k1(
                                     cursor.idf_x_k1p1,
                                     cursor.current_tf(),
                                     norm,
@@ -2227,7 +2286,7 @@ impl FtsReader {
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
                     if packed == 4 {
-                        score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                        score += bm25::score_simd_x4(idfs, tfs, norm);
                         idfs = [0.0; 4];
                         tfs = [0.0; 4];
                         packed = 0;
@@ -2236,7 +2295,7 @@ impl FtsReader {
                 }
             }
             if packed > 0 {
-                score += crate::superfile::fts::bm25::score_simd_x4(idfs, tfs, norm);
+                score += bm25::score_simd_x4(idfs, tfs, norm);
             }
 
             // Top-K update. `threshold` mirrors `heap.peek().0` so
@@ -2428,6 +2487,112 @@ impl ExcludeFilter {
     }
 }
 
+/// Per-hit action for the multi-term AND flat-merge intersection.
+///
+/// The traversal in [`FtsReader::and_flat_merge_general`] /
+/// [`FtsReader::and_flat_merge_2term`] — cursor alignment, block
+/// crossing, and the in-block pointer walk — runs identically whether
+/// the caller wants ranked hits or just the matching doc ids. Only the
+/// action at each converged doc differs, so both go through one
+/// traversal parameterized by this trait and cannot disagree on which
+/// docs match.
+///
+/// [`ScoreSink`] computes BM25 and feeds a top-k heap (the ranked
+/// search path); [`CollectSink`] records the doc id and computes no
+/// score (the unranked `token_match` / count path). The traversal is
+/// monomorphized per sink, so `needs_score()` folds to a constant: the
+/// scorer compiles to a dedicated copy with scoring inlined, and the
+/// collector's copy drops the scoring arithmetic as dead code.
+trait AndSink {
+    /// Block-max pruning bar: docs whose block can't reach this score
+    /// are skipped. Returning `NEG_INFINITY` (the default) disables
+    /// pruning, which is what an unranked sink wants — it has no score
+    /// threshold to prune against.
+    fn bar(&self) -> f32 {
+        f32::NEG_INFINITY
+    }
+
+    /// Whether the traversal should compute a hit's BM25 score. A sink
+    /// that returns `false` skips all scoring arithmetic — what makes an
+    /// unranked count over a large intersection cheaper than ranking it.
+    fn needs_score(&self) -> bool;
+
+    /// Record one doc in the intersection. `score` is meaningful only
+    /// when [`needs_score`](AndSink::needs_score) returns `true`;
+    /// otherwise it is `0.0` and ignored.
+    fn emit(&mut self, doc: u32, score: f32);
+}
+
+/// Ranked sink: floor-gates each hit and pushes it into the top-k heap.
+struct ScoreSink<'a> {
+    heap: &'a mut BinaryHeap<TopKEntry>,
+    k: usize,
+    filter: Option<&'a mut ExcludeFilter>,
+    floor_eff: f32,
+}
+
+impl AndSink for ScoreSink<'_> {
+    fn bar(&self) -> f32 {
+        // kth-best once the heap fills, else the caller's seeded floor —
+        // whichever is higher.
+        if self.heap.len() >= self.k {
+            self.heap
+                .peek()
+                .expect("heap len == k")
+                .0
+                .max(self.floor_eff)
+        } else {
+            self.floor_eff
+        }
+    }
+
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, doc: u32, score: f32) {
+        // Floor gate: strictly-below-floor docs are dead to the caller.
+        if score > self.floor_eff {
+            and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+        }
+    }
+}
+
+/// Unranked sink: collect the matching doc ids in ascending order, no
+/// scoring, no top-k. Drives the `token_match` AND path through the
+/// same optimized flat-merge the scorer uses.
+struct CollectSink {
+    out: Vec<u32>,
+}
+
+impl AndSink for CollectSink {
+    fn needs_score(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, doc: u32, _score: f32) {
+        self.out.push(doc);
+    }
+}
+
+/// Unranked counting sink: tally the intersection size without
+/// materializing the ids. Drives the count path through the same
+/// flat-merge as [`CollectSink`] but skips the `Vec<u32>` — for a
+/// high-cardinality count that allocation (4 bytes/doc) is pure waste.
+struct CountSink {
+    n: u64,
+}
+
+impl AndSink for CountSink {
+    fn needs_score(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, _doc: u32, _score: f32) {
+        self.n += 1;
+    }
+}
+
 /// Push `(score, doc_id)` into the top-k AND heap with the same
 /// tie-break (asc doc_id) the OR paths use, so AND and OR rankings
 /// agree on score-tied docs.
@@ -2521,6 +2686,44 @@ fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Unranked multi-term OR walk: the union of the cursors' doc ids in
+/// ascending order. A k-way merge — each step finds the minimum current
+/// doc id across the live cursors, hands it to `emit`, and advances
+/// every cursor sitting on it (so the next minimum is strictly greater
+/// and `emit` is called exactly once per distinct doc). No scoring; the
+/// caller wants membership, not rank.
+fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+    loop {
+        let min_doc = cursors
+            .iter()
+            .filter(|c| !c.is_exhausted())
+            .map(TermCursor::current_doc_id)
+            .min();
+        let Some(min_doc) = min_doc else { break };
+        emit(min_doc);
+        for c in cursors.iter_mut() {
+            if !c.is_exhausted() && c.current_doc_id() == min_doc {
+                c.next();
+            }
+        }
+    }
+}
+
+/// The union's doc ids ([`or_walk_unranked`] collected into a `Vec`).
+fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
+    let mut out = Vec::new();
+    or_walk_unranked(cursors, |doc| out.push(doc));
+    out
+}
+
+/// The union's cardinality ([`or_walk_unranked`] counted) — no `Vec`
+/// materialized, for the count path.
+fn or_count_unranked(cursors: Vec<TermCursor>) -> u64 {
+    let mut n = 0u64;
+    or_walk_unranked(cursors, |_| n += 1);
+    n
+}
+
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
 /// see [`TERM_META_SIZE`] in `builder.rs` — this struct is its
@@ -2529,61 +2732,9 @@ fn read_u64_le(b: &[u8]) -> u64 {
 /// [`TermMeta::parse`] is the single place that validates untrusted
 /// offsets (the FST value points here) against the postings region:
 /// both the fixed 20-byte header and the skip table it declares are
-/// Drive already-built [`TermCursor`]s to their matching doc-ids with no
-/// scoring and no heap — the unranked analog of
-/// [`FtsReader::run_and_intersect`] (And) / the OR merge. Cursors
-/// traverse blocks in doc-id order, so the result is ascending with no
-/// extra sort. Used by [`FtsReader::token_match`].
-fn walk_cursors_unranked(mut cursors: Vec<TermCursor>, mode: BoolMode) -> Vec<u32> {
-    let mut out = Vec::new();
-    match mode {
-        BoolMode::And => {
-            // Rarest term leads so the leapfrog converges fastest — the
-            // same cursor ordering `run_and_intersect` uses.
-            cursors.sort_by_key(|c| c.block_count());
-            'and: loop {
-                if cursors[0].is_exhausted() {
-                    break;
-                }
-                let leader = cursors[0].current_doc_id();
-                let mut max_doc = leader;
-                for c in cursors[1..].iter_mut() {
-                    c.skip_to(leader);
-                    if c.is_exhausted() {
-                        break 'and;
-                    }
-                    max_doc = max_doc.max(c.current_doc_id());
-                }
-                if max_doc == leader {
-                    out.push(leader);
-                    cursors.iter_mut().for_each(TermCursor::next);
-                } else {
-                    cursors[0].skip_to(max_doc);
-                }
-            }
-        }
-        BoolMode::Or => loop {
-            let min_doc = cursors
-                .iter()
-                .filter(|c| !c.is_exhausted())
-                .map(TermCursor::current_doc_id)
-                .min();
-            let Some(min_doc) = min_doc else { break };
-            out.push(min_doc);
-            for c in cursors.iter_mut() {
-                if !c.is_exhausted() && c.current_doc_id() == min_doc {
-                    c.next();
-                }
-            }
-        },
-    }
-    out
-}
-
 /// bounds-checked before any caller touches a byte. Both the
 /// single-term BMW path and [`TermCursor::new`] go through here, so
 /// the header layout is interpreted in exactly one spot.
-
 #[derive(Debug, Copy, Clone)]
 struct TermMeta {
     /// Document frequency — number of docs containing the term.
@@ -2771,7 +2922,7 @@ impl TermCursor {
         let metadata_offset = 0usize;
 
         let term_meta = TermMeta::parse(postings, metadata_offset)?;
-        let idf = crate::superfile::fts::bm25::idf(n_docs, term_meta.df);
+        let idf = bm25::idf(n_docs, term_meta.df);
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
         let mut term_max_bm25: f32 = 0.0;
@@ -2789,7 +2940,7 @@ impl TermCursor {
         }
 
         let mut cursor = Self {
-            idf_x_k1p1: idf * (crate::superfile::fts::bm25::K1 + 1.0),
+            idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
             blocks,
             block_doc_ids: vec![0u32; BLOCK_LEN],
@@ -2814,10 +2965,9 @@ impl TermCursor {
     /// formula collapses to the score itself). Computed at query time
     /// since there's no skip-table entry stored for inline terms.
     fn new_inline(doc_id: u32, tf: u32, n_docs: u64, dl_norm_k1: f32) -> Self {
-        let idf = crate::superfile::fts::bm25::idf(n_docs, 1);
-        let idf_x_k1p1 = idf * (crate::superfile::fts::bm25::K1 + 1.0);
-        let block_max_bm25 =
-            crate::superfile::fts::bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+        let idf = bm25::idf(n_docs, 1);
+        let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
+        let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
         let blocks = vec![BlockMeta {
             last_doc_id: doc_id,
@@ -3077,10 +3227,10 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::Arc};
+
     use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-    use std::sync::Arc;
+    use crate::superfile::{BytesLazyByteSource, fts::builder::FtsBuilder};
 
     fn build_blob() -> (Bytes, String) {
         // 3 docs, 1 column.
@@ -3196,6 +3346,36 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn token_match_count_matches_token_match_len() {
+        // The counting path (CountSink for AND, or_count_unranked for OR)
+        // must agree with token_match's materialized length on every
+        // shape — single token, OR union, AND intersection, absent
+        // tokens, and the empty list.
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let cases: &[(&[&str], BoolMode)] = &[
+            (&["rust"], BoolMode::Or),
+            (&["rust", "java"], BoolMode::Or),
+            (&["rust", "runtime"], BoolMode::And),
+            (&["rust", "zzz"], BoolMode::And),
+            (&["java", "zzz"], BoolMode::Or),
+            (&[], BoolMode::And),
+        ];
+        for (tokens, mode) in cases {
+            let len = r
+                .token_match("body", tokens, *mode)
+                .await
+                .expect("token_match")
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, *mode)
+                .await
+                .expect("token_match_count");
+            assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
+        }
     }
 
     #[tokio::test]
@@ -3407,7 +3587,7 @@ mod tests {
         ) as usize;
         // FST bytes occupy [fst_off, postings_off - 4) (last 4 = FST CRC).
         let fst_bytes = &blob[fst_off..postings_off - 4];
-        let dict = crate::superfile::fts::dict::DictReader::open(fst_bytes).expect("open dict");
+        let dict = DictReader::open(fst_bytes).expect("open dict");
         assert_eq!(header_size, 48);
 
         let val_common = dict.lookup(b"body\x1Fcommon").expect("common in FST");
@@ -3821,7 +4001,7 @@ mod tests {
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
             .await
             .expect("multi");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -3845,7 +4025,7 @@ mod tests {
             .search_or_range_pretokenized("body", &["alpha", "beta"], 100, 2, 5)
             .await
             .expect("ranged search");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(
             ids,
             [2u32, 3, 4].into_iter().collect(),
@@ -3936,6 +4116,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wand_bmw_exercises_block_skips_on_multi_block_lists() {
+        // A corpus large enough that the common terms span several
+        // 128-doc posting blocks, with five query terms of differing
+        // document frequency and a handful of docs carrying all five.
+        // Running WAND+BMW at a small k forces the pivot to move, the
+        // block-upper-bound skip to fire, lagging cursors to re-align,
+        // and the 4-wide SIMD scoring pack to be used on the
+        // all-terms docs — then cross-checks the result against BMM.
+
+        /// Total planted docs; well over several `BLOCK_LEN` (128) so
+        /// the dense-term posting lists occupy multiple blocks.
+        const N_DOCS: u32 = 400;
+        /// Requested top-K — small, so the heap fills early and the
+        /// score threshold starts pruning blocks.
+        const K: usize = 5;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            // `alpha` in ~every doc, `beta` in ~half, `gamma` every
+            // 5th, `delta` every 13th, `epsilon` every 29th — a
+            // descending-df mix that makes the WAND pivot non-trivial.
+            text.push_str("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 5 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 13 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 29 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta", "epsilon"];
+        let wand = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::WandBmw)
+            .await
+            .expect("wand");
+        let bmm = r
+            .search_with_algo_for_bench("body", terms, K, OrAlgo::Bmm)
+            .await
+            .expect("bmm");
+        assert_eq!(wand.len(), bmm.len(), "result length mismatch");
+        assert_eq!(wand.len(), K, "expected a full top-K");
+        for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+            assert_eq!(dw, db, "doc_id mismatch wand={dw} bmm={db}");
+            assert!((sw - sb).abs() < 1e-4, "score mismatch {sw} vs {sb}");
+        }
+    }
+
+    #[tokio::test]
     async fn search_with_algo_empty_and_zero_k_short_circuit() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
@@ -3998,8 +4239,7 @@ mod tests {
         // open path (header + FST + doc-length tail prefetch) runs and
         // serves a real query.
         let (blob, json) = build_blob();
-        let src: Arc<dyn LazyByteSource> =
-            Arc::new(crate::superfile::BytesLazyByteSource::new(blob));
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
@@ -4008,7 +4248,7 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("search over lazy reader");
-        let ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
     }
 }

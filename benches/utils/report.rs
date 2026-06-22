@@ -24,9 +24,7 @@
 //! numbers need "is this run better or worse than my last one, on every
 //! number".
 
-use std::collections::HashMap;
-use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::{collections::HashMap, io::IsTerminal, path::PathBuf};
 
 use serde_json::Value;
 

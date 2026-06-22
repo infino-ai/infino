@@ -10,18 +10,22 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use infino::superfile::builder::{FtsConfig, VectorConfig};
-use infino::superfile::fts::tokenize::Tokenizer;
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::rerank_codec::RerankCodec;
-use infino::supertable::storage::StorageProvider;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::default_tokenizer;
+use infino::{
+    superfile::{
+        builder::{FtsConfig, VectorConfig},
+        fts::tokenize::Tokenizer,
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    },
+    supertable::{Supertable, SupertableOptions, storage::StorageProvider},
+    test_helpers::default_tokenizer,
+};
 
-use crate::corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus};
-use crate::harness::{emb_for, scatter_key, sql_options, sql_schema};
-use crate::markdown::fmt_count;
-use crate::tiers;
+use crate::{
+    corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus},
+    harness::{emb_for, scatter_key, sql_options, sql_schema},
+    markdown::fmt_count,
+    tiers,
+};
 
 /// Supertable-shape document count — the supplied parameter. Default 10M
 /// ([`crate::corpus::supertable_docs`]); override with

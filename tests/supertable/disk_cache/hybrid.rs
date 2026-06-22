@@ -23,22 +23,29 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder};
-use infino::supertable::SuperfileUri;
-use infino::supertable::reader_cache::disk::DiskCacheError;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
+use infino::{
+    superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+    supertable::{
+        SuperfileUri,
+        reader_cache::{
+            ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy, disk::DiskCacheError,
+        },
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    },
+    test_helpers::{decimal128_ids, default_tokenizer},
 };
-use infino::test_helpers::{decimal128_ids, default_tokenizer};
 use tempfile::TempDir;
 
 // ============================================================

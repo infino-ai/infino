@@ -28,20 +28,21 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, LazyLock},
+};
 
 use arrow_array::{LargeStringArray, RecordBatch};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-
-use infino::superfile::builder::FtsConfig;
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::fts::tokenize::Tokenizer;
-use infino::supertable::query::SuperfileHit;
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::brute_force_bm25::BruteForceBm25;
-use infino::test_helpers::{default_tokenizer, schema_id_title};
+use infino::{
+    superfile::{
+        builder::FtsConfig,
+        fts::{reader::BoolMode, tokenize::Tokenizer},
+    },
+    supertable::{Supertable, SupertableOptions, query::SuperfileHit},
+    test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer, schema_id_title},
+};
+use rand::{SeedableRng, rngs::StdRng};
 
 /// Fixed planted corpus, 60 docs. Sharded into 4 superfiles of 15
 /// docs each.

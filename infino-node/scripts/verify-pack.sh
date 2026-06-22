@@ -27,12 +27,41 @@ cd "$ROOT"
 PKG_NAME="$(node -p "require('./package.json').name")"
 BIN_NAME="$(node -p "require('./package.json').napi.name")"
 
-# Host platform in napi's node-platform naming (glibc Linux only).
+# Host platform in napi's node-platform naming.
 PLATFORM="$(node -p 'process.platform')"
 ARCH="$(node -p 'process.arch')"
 case "$PLATFORM" in
   darwin) TRIPLE="darwin-${ARCH}" ;;
-  linux)  TRIPLE="linux-${ARCH}-gnu" ;;
+  linux)
+    # glibc vs musl (Alpine) — napi names the binary/package per libc. Detect it
+    # the same way napi's loader does: glibcVersionRuntime is absent under musl.
+    # exit 0 = glibc, 1 = musl, 2 = couldn't tell (don't guess — that would
+    # stage the wrong per-platform binary and fail confusingly).
+    if node -e 'try{process.exit(process.report.getReport().header.glibcVersionRuntime?0:1)}catch{process.exit(2)}'; then
+      TRIPLE="linux-${ARCH}-gnu"
+    else
+      status=$?
+      if [ "$status" = "1" ]; then
+        TRIPLE="linux-${ARCH}-musl"
+      else
+        # process.report unavailable — fall back to an authoritative libc probe.
+        if ! command -v ldd >/dev/null 2>&1; then
+          echo "verify-pack: could not determine libc for linux-${ARCH}: ldd is unavailable" >&2
+          exit 1
+        fi
+        # Capture ldd's output first: musl's `ldd --version` exits non-zero, which
+        # `set -o pipefail` would otherwise treat as "no match".
+        ldd_out="$(ldd --version 2>&1 || true)"
+        if printf '%s' "$ldd_out" | grep -qi musl; then
+          TRIPLE="linux-${ARCH}-musl"
+        elif printf '%s' "$ldd_out" | grep -qi 'glibc\|gnu libc'; then
+          TRIPLE="linux-${ARCH}-gnu"
+        else
+          echo "verify-pack: could not determine libc (glibc vs musl) for linux-${ARCH}" >&2
+          exit 1
+        fi
+      fi
+    fi ;;
   *) echo "verify-pack: unsupported host platform '$PLATFORM'" >&2; exit 1 ;;
 esac
 PKG_DIR="npm/${TRIPLE}"

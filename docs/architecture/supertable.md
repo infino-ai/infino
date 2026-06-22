@@ -67,7 +67,11 @@ feeding a follow-up fetch).
 - **Vector search.** k-nearest-neighbor over a vector column for a
 query vector, returning the `k` closest rows ordered by ascending
 distance. Per-query recall/latency knobs (number of clusters probed,
-rerank breadth) are passed as search options.
+rerank breadth) are passed as search options. An optional text predicate
+(an FTS-indexed column, a query string, and a boolean mode) restricts the
+search to matching rows — pushed into the ranking, not applied as a
+post-filter, so the `k` returned are the nearest rows that satisfy the
+predicate rather than a thinned-out slice of the global top-`k`.
 - **Full-text search.** BM25 over a text column for a query string,
 returning the `k` highest-scoring rows ordered by descending score.
 Search options carry the boolean combination mode (match any term or

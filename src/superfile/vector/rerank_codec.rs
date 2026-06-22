@@ -37,6 +37,8 @@
 //! `codec_meta_off: u32`. `Fp32` / `RabitqOnly` superfiles
 //! write `codec_meta_off = 0`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::superfile::vector::distance::Metric;
@@ -269,8 +271,8 @@ impl RerankCodec {
     }
 }
 
-impl std::fmt::Display for RerankCodec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RerankCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
 }
@@ -407,6 +409,23 @@ mod tests {
             RerankCodec::Sq8ResidualEpsilon.recommended_rerank_mult_floor(385),
             Some(100)
         );
+    }
+
+    /// `Display` renders the stable [`RerankCodec::name`] for every
+    /// variant — the same string used in JSON config + error messages.
+    #[test]
+    fn display_renders_stable_name() {
+        assert_eq!(RerankCodec::Fp32.to_string(), "fp32");
+        assert_eq!(RerankCodec::Sq8ResidualEpsilon.to_string(), "sq8_residual");
+        assert_eq!(RerankCodec::RabitqOnly.to_string(), "rabitq_only");
+        // `Display` must agree with `name` byte-for-byte.
+        for c in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::RabitqOnly,
+        ] {
+            assert_eq!(c.to_string(), c.name());
+        }
     }
 
     /// Sq8ResidualEpsilon's codec_meta size: `8·n_cent·dim` for negdot,

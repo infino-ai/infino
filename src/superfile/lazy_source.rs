@@ -38,10 +38,13 @@
 //!
 //! [`SuperfileReader::open_lazy`]: crate::superfile::reader::SuperfileReader::open_lazy
 
+use std::{fmt, ops::Range, sync::Arc};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::ops::Range;
-use std::sync::Arc;
+use futures::future::try_join_all;
+
+use crate::runtime_bridge::bridge_sync_to_async_send;
 
 /// Source of byte ranges from an arbitrary backing.
 ///
@@ -167,8 +170,8 @@ pub(crate) enum Source {
     Lazy(Arc<dyn LazyByteSource>),
 }
 
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
             Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
@@ -224,7 +227,7 @@ impl Source {
         // bridge in `runtime_bridge`. Clone the `Arc` into the future
         // so it is `Send + 'static`.
         let src = Arc::clone(s);
-        crate::runtime_bridge::bridge_sync_to_async_send(async move { src.range(start, len).await })
+        bridge_sync_to_async_send(async move { src.range(start, len).await })
     }
 
     /// Concurrent multi-range fetch. Sync-resident ranges are served
@@ -270,11 +273,11 @@ impl Source {
                         async move { s.range(start, len).await }
                     })
                     .collect::<Vec<_>>();
-                futures::future::try_join_all(futs).await
+                try_join_all(futs).await
             };
             // Shared bridge handles every runtime context; the future
             // owns its `Arc` clones so it is `Send + 'static`.
-            let bytes: Vec<Bytes> = crate::runtime_bridge::bridge_sync_to_async_send(fut)?;
+            let bytes: Vec<Bytes> = bridge_sync_to_async_send(fut)?;
             for (slot, b) in order.into_iter().zip(bytes) {
                 out[slot] = Some(b);
             }
@@ -349,7 +352,7 @@ impl Source {
                     async move { s.range(start, len).await }
                 })
                 .collect::<Vec<_>>();
-            let bytes = futures::future::try_join_all(futs).await?;
+            let bytes = try_join_all(futs).await?;
             for (slot, b) in order.into_iter().zip(bytes) {
                 out[slot] = Some(b);
             }
@@ -444,8 +447,8 @@ impl LazySubSource {
     }
 }
 
-impl std::fmt::Debug for LazySubSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LazySubSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LazySubSource")
             .field("offset", &self.offset)
             .field("len", &self.len)
@@ -539,8 +542,8 @@ impl PrefetchedSource {
     }
 }
 
-impl std::fmt::Debug for PrefetchedSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PrefetchedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefetchedSource")
             .field("size", &self.inner.size())
             .field("prefetched_count", &self.prefetched.len())
@@ -744,5 +747,81 @@ mod tests {
             2,
             "an overlay miss must reach the underlying source exactly once"
         );
+    }
+
+    /// The `Debug` impls on `Source`, `LazySubSource`, and
+    /// `PrefetchedSource` render without panicking and name their type.
+    #[test]
+    fn debug_impls_render_each_source_kind() {
+        let payload = Bytes::from(vec![0u8; 16]);
+        let in_mem = Source::InMemory(payload.clone());
+        assert!(format!("{in_mem:?}").contains("InMemory"));
+
+        let inner: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let lazy = Source::Lazy(Arc::clone(&inner));
+        assert!(format!("{lazy:?}").contains("Lazy"));
+
+        let sub = LazySubSource::new(Arc::clone(&inner), 4, 8);
+        assert!(format!("{sub:?}").contains("LazySubSource"));
+
+        let mut overlay = PrefetchedSource::new(Arc::clone(&inner));
+        overlay.install(0, payload.slice(0..4));
+        assert!(format!("{overlay:?}").contains("PrefetchedSource"));
+    }
+
+    /// The `Source` enum's sync + async fetch surface: in-memory happy
+    /// paths, the empty-range fast path, and the out-of-bounds error
+    /// branches that the non-`Source` tests above never reach.
+    #[tokio::test]
+    async fn source_enum_fetch_surface_and_bounds() {
+        let payload = Bytes::from((0u8..16).collect::<Vec<_>>());
+        let src = Source::InMemory(payload.clone());
+        assert_eq!(src.len(), 16);
+        assert_eq!(
+            src.try_get_range_sync(2..6)
+                .expect("in-bounds sync")
+                .as_ref(),
+            &payload[2..6]
+        );
+        assert_eq!(
+            src.get_range(0..4).expect("get_range").as_ref(),
+            &payload[0..4]
+        );
+
+        // Out-of-bounds on an in-memory source surfaces a typed error
+        // (no lazy fallback).
+        assert!(matches!(
+            src.get_range(8..100),
+            Err(LazyByteSourceError::OutOfBounds { .. })
+        ));
+
+        // Multi-range: empty fast path, happy path, and OOB.
+        assert!(src.get_ranges_parallel(&[]).expect("empty").is_empty());
+        let got = src.get_ranges_parallel(&[0..2, 4..8]).expect("multi-range");
+        assert_eq!(got.len(), 2);
+        assert!(matches!(
+            src.get_ranges_parallel(&[0..2, 8..100]),
+            Err(LazyByteSourceError::OutOfBounds { .. })
+        ));
+
+        // Async siblings: happy, empty, and OOB.
+        assert_eq!(
+            src.range_async(4..8).await.expect("range_async").as_ref(),
+            &payload[4..8]
+        );
+        assert!(matches!(
+            src.range_async(8..100).await,
+            Err(LazyByteSourceError::OutOfBounds { .. })
+        ));
+        assert!(
+            src.get_ranges_parallel_async(&[])
+                .await
+                .expect("empty async")
+                .is_empty()
+        );
+        assert!(matches!(
+            src.get_ranges_parallel_async(&[0..2, 8..100]).await,
+            Err(LazyByteSourceError::OutOfBounds { .. })
+        ));
     }
 }

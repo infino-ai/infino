@@ -32,8 +32,7 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 
-use crate::supertable::error::BuildError;
-use crate::supertable::options::SupertableOptions;
+use crate::supertable::{error::BuildError, options::SupertableOptions};
 
 /// Maximum number of null row offsets collected into a
 /// `VectorColumnHasNulls` error. Bounds the error payload so a batch
@@ -191,15 +190,16 @@ fn collect_first_nulls_primitive(arr: &Float32Array, max: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use arrow_array::{Array, Float32Array, LargeStringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-
-    use crate::superfile::vector::distance::Metric;
+    use super::*;
+    use crate::superfile::{
+        builder::{FtsConfig, VectorConfig},
+        vector::{distance::Metric, rerank_codec::RerankCodec},
+    };
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -222,7 +222,7 @@ mod tests {
             n_cent: 4,
             rot_seed: 0,
             metric: Metric::Cosine,
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Fp32,
         }
     }
 
@@ -434,6 +434,135 @@ mod tests {
         // The two vector slices are disjoint (different fill).
         assert_eq!(vectors[0][0], 0.0);
         assert_eq!(vectors[1][0], 1.0);
+    }
+
+    #[test]
+    fn split_rejects_inner_lane_null() {
+        // An FSL whose list-level null buffer is all-valid, but whose
+        // inner Float32Array carries a null lane. This bypasses the
+        // FSL-level no-nulls check and exercises the inner-null branch
+        // (and `collect_first_nulls_primitive`).
+        let dim = 16;
+        let schema = schema_id_title_emb(dim);
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![fc("title")],
+            vec![vc("emb", dim)],
+            Some(tok()),
+        )
+        .expect("valid options");
+
+        // Three rows; the inner f32 buffer has a null at flat index 1
+        // (row 0, lane 1). The FSL itself has no row-level nulls.
+        const NULL_LANE_FLAT_INDEX: usize = 1;
+        let n_rows = 3;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let mut builder = Float32Array::builder(n_rows * dim);
+        for i in 0..(n_rows * dim) {
+            if i == NULL_LANE_FLAT_INDEX {
+                builder.append_null();
+            } else {
+                builder.append_value(i as f32);
+            }
+        }
+        let values = builder.finish();
+        let fsl = FixedSizeListArray::try_new(item_field, dim as i32, Arc::new(values), None)
+            .expect("build FSL with inner null");
+
+        let titles = LargeStringArray::from(vec!["a", "b", "c"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)])
+            .expect("build batch");
+
+        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        match err {
+            BuildError::VectorColumnHasNulls {
+                column,
+                first_nulls,
+            } => {
+                assert_eq!(column, "emb");
+                // The first null lives at flat index 1.
+                assert_eq!(first_nulls, vec![NULL_LANE_FLAT_INDEX]);
+            }
+            other => panic!("expected VectorColumnHasNulls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn split_rejects_missing_vector_column() {
+        // Drive the `VectorColumnMissing` defensive branch: build valid
+        // options, then point the declared vector column at a name that
+        // is not in the (otherwise schema-matching) batch.
+        let dim = 16;
+        let schema = schema_id_title_emb(dim);
+        let mut opts = SupertableOptions::new(
+            schema.clone(),
+            vec![fc("title")],
+            vec![vc("emb", dim)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        opts.vector_columns[0].column = "not_a_column".into();
+
+        let batch = build_batch(schema, 2, dim);
+        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        assert!(matches!(
+            err,
+            BuildError::VectorColumnMissing { column } if column == "not_a_column"
+        ));
+    }
+
+    #[test]
+    fn split_rejects_non_fixed_size_list_column() {
+        // Drive the `VectorColumnNotFixedSizeList` branch: declare the
+        // scalar `title` column as the vector column. At split time the
+        // downcast to FixedSizeListArray fails.
+        let dim = 16;
+        let schema = schema_id_title_emb(dim);
+        let mut opts = SupertableOptions::new(
+            schema.clone(),
+            vec![fc("title")],
+            vec![vc("emb", dim)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        opts.vector_columns[0].column = "title".into();
+
+        let batch = build_batch(schema, 2, dim);
+        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        assert!(matches!(
+            err,
+            BuildError::VectorColumnNotFixedSizeList { column, .. } if column == "title"
+        ));
+    }
+
+    #[test]
+    fn split_rejects_dim_mismatch() {
+        // Drive the `VectorColumnDimMismatch` branch: the FSL on disk is
+        // sized `dim`, but the declared config asks for a different dim.
+        let dim = 16;
+        // A different, still-valid declared dim so the only mismatch is
+        // against the batch's FSL list_size.
+        const WRONG_DIM: usize = 32;
+        let schema = schema_id_title_emb(dim);
+        let mut opts = SupertableOptions::new(
+            schema.clone(),
+            vec![fc("title")],
+            vec![vc("emb", dim)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        opts.vector_columns[0].dim = WRONG_DIM;
+
+        let batch = build_batch(schema, 2, dim);
+        let err = split_vectors(&batch, &opts).expect_err("expected error");
+        assert!(matches!(
+            err,
+            BuildError::VectorColumnDimMismatch {
+                expected: WRONG_DIM,
+                actual,
+                column,
+            } if actual == dim && column == "emb"
+        ));
     }
 
     #[test]

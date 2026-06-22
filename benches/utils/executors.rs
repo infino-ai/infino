@@ -85,17 +85,20 @@ pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
 }
 
 pub mod fts {
-    use super::*;
     use std::collections::HashMap;
 
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::fts::reader::BoolMode as InfinoBoolMode;
-    use infino::supertable::SupertableReader;
+    use infino::{
+        superfile::{SuperfileReader, fts::reader::BoolMode as InfinoBoolMode},
+        supertable::SupertableReader,
+    };
 
-    use crate::harness::{BoolMode, FtsQuery};
-    use crate::markdown::fmt_time;
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{BoolMode, FtsQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Nanoseconds per second, for time-cell formatting.
     const NS_PER_SEC: f64 = 1e9;
@@ -284,6 +287,13 @@ pub mod fts {
             k: usize,
             mode: InfinoBoolMode,
         ) -> usize;
+
+        /// Count phase: the matching-doc count from the dedicated count
+        /// primitives — single-term `term_df` (O(1) from the dictionary
+        /// header), multi-term `token_match` cardinality — with no BM25
+        /// scoring and no row materialization. `terms` are the
+        /// already-tokenized query terms.
+        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64;
     }
 
     /// Fetch-phase measurement for a raw superfile reader: kernel hits,
@@ -325,6 +335,24 @@ pub mod fts {
         ) -> usize {
             superfile_rows_fetched(self, column, query, k, mode)
         }
+
+        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            crate::tiers::block_on(async {
+                // Single term: df is the exact match count, read O(1)
+                // from the dictionary header. Multi-term: the union /
+                // intersection cardinality from `token_match`.
+                if terms.len() == 1 {
+                    self.term_df(column, terms[0])
+                        .await
+                        .expect("superfile term_df")
+                } else {
+                    self.token_match(column, terms, mode)
+                        .await
+                        .expect("superfile token_match")
+                        .len() as u64
+                }
+            })
+        }
     }
 
     impl FtsRead for SupertableReader {
@@ -348,6 +376,11 @@ pub mod fts {
                 .iter()
                 .map(|b| b.num_rows())
                 .sum()
+        }
+
+        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+            let query = terms.join(" ");
+            self.count(column, &query, mode).expect("supertable count")
         }
     }
 
@@ -580,21 +613,111 @@ pub mod fts {
             blocks,
         });
     }
+
+    /// Warm count timing for one query: `p50` is the dedicated count
+    /// path's per-call p50; `n` is the matching-doc count it returned.
+    #[derive(Clone, Debug)]
+    pub struct CountStat {
+        pub name: &'static str,
+        pub p50: Duration,
+        pub n: u64,
+    }
+
+    /// Measure the count battery against an already-warm reader: for
+    /// each query, `iters` timed iterations of the dedicated count path.
+    pub fn measure_count<R: FtsRead>(
+        reader: &R,
+        battery: &[FtsQuery],
+        column: &str,
+        iters: usize,
+        log_prefix: &str,
+    ) -> Vec<CountStat> {
+        battery
+            .iter()
+            .map(|q| {
+                eprintln!("[{log_prefix}] count: query {}...", q.name);
+                let mode = to_infino_mode(q.mode);
+                let n = reader.count_matching(column, q.terms, mode);
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let got = reader.count_matching(column, q.terms, mode);
+                    samples.push(t.elapsed());
+                    std::hint::black_box(got);
+                }
+                CountStat {
+                    name: q.name,
+                    p50: p50(&mut samples),
+                    n,
+                }
+            })
+            .collect()
+    }
+
+    fn count_row(name: &'static str, stats: &HashMap<&'static str, CountStat>) -> Vec<Cell> {
+        match stats.get(&name) {
+            Some(c) => {
+                let ns = c.p50.as_secs_f64() * NS_PER_SEC;
+                vec![
+                    text(name),
+                    text(fmt_count(c.n as usize)),
+                    metric(ns, fmt_time(ns), Better::Lower),
+                ]
+            }
+            None => vec![text(name), text("—"), text("—")],
+        }
+    }
+
+    /// Render the count battery: the dedicated count path's p50 per
+    /// query, alongside the matching-doc count. infino-only — the same
+    /// table shape for both tiers.
+    pub fn emit_count(
+        report: &mut Report,
+        anchor: &str,
+        title: String,
+        note: &str,
+        counts: &[CountStat],
+    ) {
+        let map: HashMap<&'static str, CountStat> =
+            counts.iter().map(|c| (c.name, c.clone())).collect();
+        let headers: Vec<String> = ["Query", "matches", "count()"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let or_block = Block {
+            subtitle: "OR queries".into(),
+            headers: headers.clone(),
+            rows: OR_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        let and_block = Block {
+            subtitle: "AND queries".into(),
+            headers,
+            rows: AND_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        report.emit(&Section {
+            anchor: anchor.into(),
+            title,
+            note: note.into(),
+            blocks: vec![or_block, and_block],
+        });
+    }
 }
 
 pub mod vector {
+    use std::{collections::HashMap, hint::black_box};
+
+    use infino::{
+        superfile::{SuperfileReader, reader::VectorSearchOptions},
+        supertable::Supertable,
+    };
+
     use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
-
-    use infino::superfile::SuperfileReader;
-    use infino::superfile::reader::VectorSearchOptions;
-    use infino::supertable::Supertable;
-
-    use crate::corpus::{self, Calibrated};
-    use crate::markdown::fmt_time;
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use crate::{
+        corpus::{self, Calibrated},
+        markdown::fmt_time,
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Recall correctness gate (shared by both tiers).
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
@@ -667,7 +790,7 @@ pub mod vector {
         ) -> Vec<(u32, f32)> {
             let reader = self.reader();
             let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank))
+                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
                 .expect("supertable vector_hits");
             let manifest = reader.manifest();
             // Per-superfile global-id base offsets in manifest order.
@@ -1112,15 +1235,28 @@ pub mod vector {
     ) -> Vec<RecallRow> {
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
+        let default_recall: Option<f32>;
         if skip_calibration {
             // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
-            // correctness gate, no recall-target grid — just the fixed
-            // `(default_nprobe, default_rerank)` row below. Needs no ground
-            // truth and no warmed reader, so a cold-only run is fast and
-            // prod-shaped.
+            // high-recall correctness gate, no recall-target grid — only
+            // the fixed `(default_nprobe, default_rerank)` recall sample.
             eprintln!(
-                "[{log_prefix}] skip-calibration: measuring only fixed (p={default_nprobe}, r={default_rerank})",
+                "[{log_prefix}] skip-calibration: default-config recall@{k} at p={default_nprobe}, r={default_rerank} ({} queries)...",
+                q_correct.len(),
             );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            eprintln!(
+                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
+            );
+            default_recall = Some(default);
         } else {
             eprintln!(
                 "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
@@ -1140,6 +1276,26 @@ pub mod vector {
                 "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+
+            eprintln!(
+                "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
+                q_correct.len(),
+            );
+            let default = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                default_nprobe,
+                default_rerank,
+            );
+            assert!(
+                default >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
+            default_recall = Some(default);
 
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)
@@ -1189,7 +1345,9 @@ pub mod vector {
         rows.push(RecallRow {
             target: "default".into(),
             params: format!("p={default_nprobe}, r={default_rerank}"),
-            recall: "—".into(),
+            recall: default_recall
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "—".into()),
             warm: include_warm
                 .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
             cold: include_cold.then(|| {
@@ -1219,16 +1377,17 @@ pub mod vector {
 }
 
 pub mod sql {
-    use super::*;
-    use std::collections::HashMap;
-    use std::hint::black_box;
+    use std::{collections::HashMap, hint::black_box};
 
     use infino::supertable::Supertable;
 
-    use crate::harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery};
-    use crate::markdown::{fmt_count, fmt_time};
-    use crate::report::{Better, Block, Cell, Report, Section, metric, text};
-    use crate::rss::{self, PeakSampler, RssStats};
+    use super::*;
+    use crate::{
+        harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
+        markdown::{fmt_count, fmt_time},
+        report::{Better, Block, Cell, Report, Section, metric, text},
+        rss::{self, PeakSampler, RssStats},
+    };
 
     /// Timed query repetitions per query (after one warmup).
     pub const ITERS: usize = 10;

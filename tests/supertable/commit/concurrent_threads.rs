@@ -55,14 +55,17 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{LargeStringArray, RecordBatch};
-
-use infino::supertable::{Supertable, SupertableOptions};
-use infino::test_helpers::{default_supertable_options, schema_id_title};
+use infino::{
+    supertable::{Supertable, SupertableOptions},
+    test_helpers::{default_supertable_options, schema_id_title},
+};
 
 /// Contending writer threads in the single-winner commit race.
 const CONTENDER_THREADS: usize = 4;

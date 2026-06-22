@@ -12,17 +12,19 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Array, Float64Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    supertable::{
+        Supertable, SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    },
+};
 use tempfile::TempDir;
-
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::{Supertable, SupertableOptions};
 
 /// Commits in the fixture; each commit's ratings occupy a disjoint
 /// thousand-block so range filters can align with (or deliberately

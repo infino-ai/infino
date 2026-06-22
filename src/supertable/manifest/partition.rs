@@ -11,12 +11,15 @@
 //! different partitions go into separate parts so a
 //! single-partition commit rewrites exactly one part.
 
-use crate::supertable::error::CommitError;
-use crate::supertable::manifest::SuperfileEntry;
-use crate::supertable::manifest::list::PartitionStrategy;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::supertable::{
+    error::{CommitError, ManifestError},
+    manifest::{SuperfileEntry, list::PartitionStrategy},
+};
 
 /// Opaque partition identifier. Encoded into
-/// `SuperfileEntry.partition_key` + `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` + `ManifestPartEntry.partition_key`
 /// for the manifest layer; the writer uses this typed shape
 /// in-memory to group superfiles before encoding.
 ///
@@ -36,7 +39,7 @@ pub enum PartitionKey {
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
-/// `SuperfileEntry.partition_key` and `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` and `ManifestPartEntry.partition_key`
 /// carry: 8-byte LE u64 for TimeRange, 4-byte LE u32 for
 /// Hash, 2-byte LE u16 for ColumnRange.
 pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {
@@ -83,6 +86,15 @@ pub fn decode_partition_key(
             })?;
             Ok(PartitionKey::ColumnRange(u16::from_le_bytes(arr)))
         }
+        PartitionStrategy::IngestionTime { .. } => {
+            let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                CommitError::PointerParse(format!(
+                    "IngestionTime partition_key must be 8 bytes; got {}",
+                    bytes.len()
+                ))
+            })?;
+            Ok(PartitionKey::TimeRange(u64::from_le_bytes(arr)))
+        }
     }
 }
 
@@ -112,14 +124,14 @@ pub fn decode_partition_key(
 pub fn assign_partition(
     seg: &SuperfileEntry,
     strategy: &PartitionStrategy,
-) -> Result<PartitionKey, CommitError> {
+) -> Result<PartitionKey, ManifestError> {
     match strategy {
         PartitionStrategy::TimeRange {
             column,
             granularity_secs,
         } => {
             if *granularity_secs <= 0 {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "TimeRange granularity_secs must be > 0; got {granularity_secs}"
                     ),
@@ -130,7 +142,7 @@ pub fn assign_partition(
             let min_bucket = min.div_euclid(g);
             let max_bucket = max.div_euclid(g);
             if min_bucket != max_bucket {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "superfile {} column {column:?} [{min}, {max}] spans buckets \
                          {min_bucket}..={max_bucket}; reduce commit_threshold_size_mb \
@@ -155,7 +167,7 @@ pub fn assign_partition(
             // partition_hint at pre-shard time.
             let bucket =
                 seg.partition_hint
-                    .ok_or_else(|| CommitError::SuperfileSpansPartition {
+                    .ok_or_else(|| ManifestError::SuperfileSpansPartition {
                         detail: format!(
                             "Hash{{n_buckets:{n_buckets}}} strategy requires pre-sharded \
                          superfiles; SuperfileEntry.partition_hint must be Some(bucket) \
@@ -164,7 +176,7 @@ pub fn assign_partition(
                         ),
                     })?;
             if bucket >= *n_buckets {
-                return Err(CommitError::SuperfileSpansPartition {
+                return Err(ManifestError::SuperfileSpansPartition {
                     detail: format!(
                         "Hash{{n_buckets:{n_buckets}}} got partition_hint={bucket} \
                          (out of range)"
@@ -177,16 +189,35 @@ pub fn assign_partition(
         PartitionStrategy::ColumnRange {
             column: _,
             boundaries: _,
-        } => Err(CommitError::SuperfileSpansPartition {
+        } => Err(ManifestError::SuperfileSpansPartition {
             detail: "ColumnRange partition assignment lands in a follow-up; \
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
         }),
+
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            if *granularity_secs <= 0 {
+                return Err(ManifestError::SuperfileSpansPartition {
+                    detail: format!(
+                        "IngestionTime granularity_secs must be > 0; got {granularity_secs}"
+                    ),
+                });
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ManifestError::SuperfileSpansPartition {
+                    detail: "failed to get current system time".into(),
+                })?
+                .as_secs() as i64;
+            let g = *granularity_secs;
+            let bucket = now.div_euclid(g);
+            Ok(PartitionKey::TimeRange(bucket as u64))
+        }
     }
 }
 
 /// Extract the superfile's `(min, max)` for `column` as `i64`.
-/// `ScalarStatsTable.cols[column]` carries Arrow length-1
+/// `scalar_stats[column]` carries Arrow length-1
 /// `ArrayRef`s; this helper downcasts against the column's
 /// actual Arrow type and returns the value at index 0.
 ///
@@ -200,20 +231,19 @@ pub fn assign_partition(
 /// `granularity_secs` are responsible for matching it to
 /// the column's actual unit (seconds for `Int64`,
 /// microseconds for `TimestampMicrosecond`, etc.).
-fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), CommitError> {
-    let (mn_arr, mx_arr) =
+fn scalar_i64_minmax(seg: &SuperfileEntry, column: &str) -> Result<(i64, i64), ManifestError> {
+    let agg =
         seg.scalar_stats
-            .cols
             .get(column)
-            .ok_or_else(|| CommitError::SuperfileSpansPartition {
+            .ok_or_else(|| ManifestError::SuperfileSpansPartition {
                 detail: format!(
                     "TimeRange strategy: superfile {} has no scalar_stats \
                      for column {column:?}",
                     seg.uri.0
                 ),
             })?;
-    let min = downcast_i64(mn_arr.as_ref(), column, seg)?;
-    let max = downcast_i64(mx_arr.as_ref(), column, seg)?;
+    let min = downcast_i64(agg.min.as_ref(), column, seg)?;
+    let max = downcast_i64(agg.max.as_ref(), column, seg)?;
     Ok((min, max))
 }
 
@@ -221,11 +251,11 @@ fn downcast_i64(
     arr: &dyn arrow_array::Array,
     column: &str,
     seg: &SuperfileEntry,
-) -> Result<i64, CommitError> {
+) -> Result<i64, ManifestError> {
     use arrow_array::*;
     use arrow_schema::DataType;
     if arr.is_empty() || arr.is_null(0) {
-        return Err(CommitError::SuperfileSpansPartition {
+        return Err(ManifestError::SuperfileSpansPartition {
             detail: format!(
                 "TimeRange strategy: superfile {} column {column:?} stats array \
                  is empty or null at index 0",
@@ -255,7 +285,7 @@ fn downcast_i64(
             .downcast_ref::<TimestampNanosecondArray>()
             .map(|a| a.value(0)),
         other => {
-            return Err(CommitError::SuperfileSpansPartition {
+            return Err(ManifestError::SuperfileSpansPartition {
                 detail: format!(
                     "TimeRange strategy: superfile {} column {column:?} has \
                      unsupported type {other:?}; expected Int64 or Timestamp*",
@@ -264,7 +294,7 @@ fn downcast_i64(
             });
         }
     };
-    v.ok_or_else(|| CommitError::SuperfileSpansPartition {
+    v.ok_or_else(|| ManifestError::SuperfileSpansPartition {
         detail: format!(
             "TimeRange strategy: superfile {} column {column:?} downcast failed",
             seg.uri.0
@@ -274,14 +304,15 @@ fn downcast_i64(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::supertable::manifest::{ScalarStatsTable, SuperfileEntry, SuperfileUri};
+    use std::{collections::HashMap, sync::Arc};
+
     use arrow_array::{
         ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
     };
-    use std::collections::HashMap;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
 
     // ---- Helpers --------------------------------------------------------
 
@@ -292,7 +323,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: ScalarStatsTable::new(),
+            scalar_stats: HashMap::new(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -305,13 +336,14 @@ mod tests {
         let mut s = empty_seg();
         let mn: ArrayRef = Arc::new(Int64Array::from(vec![min]));
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
-        s.scalar_stats.cols.insert(column.to_string(), (mn, mx));
+        s.scalar_stats
+            .insert(column.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         s
     }
 
-    fn assert_spans_partition(err: CommitError, needle: &str) {
+    fn assert_spans_partition(err: ManifestError, needle: &str) {
         match err {
-            CommitError::SuperfileSpansPartition { detail } => assert!(
+            ManifestError::SuperfileSpansPartition { detail } => assert!(
                 detail.contains(needle),
                 "expected `{needle}` in detail; got: {detail}"
             ),
@@ -519,7 +551,8 @@ mod tests {
         ];
         for (mn, mx) in cases {
             let mut seg = empty_seg();
-            seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+            seg.scalar_stats
+                .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             let key = assign_partition(&seg, &strategy).expect("assign");
             assert_eq!(key, PartitionKey::TimeRange(0));
         }
@@ -536,7 +569,8 @@ mod tests {
         let mut seg = empty_seg();
         let mn: ArrayRef = Arc::new(Int32Array::from(vec![100]));
         let mx: ArrayRef = Arc::new(Int32Array::from(vec![200]));
-        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        seg.scalar_stats
+            .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
         let err = assign_partition(&seg, &strategy).expect_err("unsupported");
         assert_spans_partition(err, "unsupported type");
     }
@@ -552,7 +586,8 @@ mod tests {
         let nulls: Vec<Option<i64>> = vec![None];
         let mn: ArrayRef = Arc::new(Int64Array::from(nulls.clone()));
         let mx: ArrayRef = Arc::new(Int64Array::from(nulls));
-        seg.scalar_stats.cols.insert("ts".into(), (mn, mx));
+        seg.scalar_stats
+            .insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
         let err = assign_partition(&seg, &strategy).expect_err("null stats");
         assert_spans_partition(err, "empty or null at index 0");
     }

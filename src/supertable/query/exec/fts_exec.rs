@@ -26,28 +26,29 @@
 //! descending). The optional `mode` is `'or'` (default) or `'and'`;
 //! prefix search always runs OR over the expanded term set.
 
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+use datafusion::{
+    catalog::{Session, TableFunctionImpl, TableProvider},
+    error::{DataFusionError, Result as DfResult},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{Expr, TableType},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
 };
 
 use super::common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits};
-use crate::superfile::fts::reader::BoolMode;
-use crate::supertable::handle::{SupertableReader, WeakReader};
+use crate::{
+    superfile::fts::reader::BoolMode,
+    supertable::handle::{SupertableReader, WeakReader},
+};
 
 /// SQL name for the term-based BM25 TVF.
 pub(crate) const BM25_SEARCH_UDTF: &str = "bm25_search";
@@ -412,15 +413,16 @@ pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::lit;
 
-    use crate::superfile::builder::FtsConfig;
-    use crate::supertable::{Supertable, SupertableOptions};
-    use crate::test_helpers::default_tokenizer as tok;
+    use super::*;
+    use crate::{
+        superfile::builder::FtsConfig,
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
 
     fn title_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -670,6 +672,42 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Construct `Bm25Table` directly through the TVF `call` path and
+    /// exercise its `TableProvider` metadata methods (`Debug`,
+    /// `as_any`, `table_type`) plus the lowered `Bm25Exec`'s `name` /
+    /// `Debug` — none of which normal query execution touches.
+    #[tokio::test]
+    async fn bm25_table_and_exec_trait_methods() {
+        let st = demo_corpus();
+        let reader = Arc::new(st.reader());
+        let scalar_schema = reader.options().scalar_schema();
+        let func = Bm25SearchFunc::new(reader, scalar_schema);
+        let table = func
+            .call(&[lit("title"), lit("rust"), lit(10_i64)])
+            .expect("bm25 table");
+
+        // TableProvider metadata.
+        let dbg = format!("{table:?}");
+        assert!(dbg.contains("Bm25Table"), "Debug missing: {dbg}");
+        assert!(
+            table.as_any().downcast_ref::<Bm25Table>().is_some(),
+            "as_any downcasts to Bm25Table"
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+
+        // Lower to the ExecutionPlan and hit its name / Debug.
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(plan.name(), "Bm25Exec");
+        assert!(
+            format!("{plan:?}").contains("Bm25Exec"),
+            "Exec Debug missing"
+        );
     }
 
     #[test]

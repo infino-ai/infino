@@ -21,8 +21,7 @@
 //! bytes. `DictReader` opens those bytes (zero-copy via `Bytes`) and
 //! exposes exact lookup + prefix iteration.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::{collections::BTreeMap, io::Write};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
@@ -567,5 +566,31 @@ mod tests {
         assert_eq!(r.lookup(&make_key("title", "rust")), Some(1));
         assert_eq!(r.lookup(&make_key("body", "rust")), Some(2));
         assert_eq!(r.lookup(&make_key("tag", "rust")), Some(3));
+    }
+
+    /// `DictBuilder` tracks key counts + emptiness, which round-trip
+    /// through `DictReader::{len, is_empty}`; the streaming builder
+    /// tracks `n_keys` as sorted keys arrive.
+    #[test]
+    fn builder_and_reader_track_key_counts() {
+        let mut b = DictBuilder::new();
+        assert!(b.is_empty(), "fresh builder is empty");
+        assert_eq!(b.len(), 0);
+        b.insert(b"alpha", 1);
+        b.insert(b"beta", 2);
+        assert!(!b.is_empty());
+        assert_eq!(b.len(), 2);
+        let bytes = b.finish();
+        let r = DictReader::open(&bytes).expect("open dict");
+        assert_eq!(r.len(), 2);
+        assert!(!r.is_empty());
+
+        // Streaming builder counts keys fed in strictly-sorted order.
+        let mut sb = StreamingDictBuilder::new(Vec::new()).expect("streaming builder");
+        assert_eq!(sb.n_keys(), 0);
+        sb.insert_sorted(b"a", 1).expect("sorted insert");
+        sb.insert_sorted(b"b", 2).expect("sorted insert");
+        assert_eq!(sb.n_keys(), 2);
+        let _ = sb.finish().expect("finish streaming builder");
     }
 }

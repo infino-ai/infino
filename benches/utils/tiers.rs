@@ -10,21 +10,25 @@
 //! `s3` | `azure`) — never inferred from which credential is set. `s3` reads
 //! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use bytes::Bytes;
-use infino::superfile::SuperfileReader;
-use infino::supertable::manifest::SubsectionOffsets;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{AzureStorageProvider, S3StorageProvider, StorageProvider};
-use infino::supertable::{SuperfileUri, Supertable, SupertableOptions};
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
+use infino::{
+    superfile::SuperfileReader,
+    supertable::{
+        SuperfileUri, Supertable, SupertableOptions,
+        manifest::SubsectionOffsets,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{AzureStorageProvider, S3StorageProvider, StorageProvider},
+    },
+};
+use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
+use tokio::{net::TcpListener, runtime::Runtime};
 
 const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -324,8 +328,10 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
-        use hyper_util::rt::{TokioExecutor, TokioIo};
-        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto::Builder as ConnBuilder,
+        };
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
             let (stream, _peer) = match listener.accept().await {

@@ -44,8 +44,8 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionError, CompactionSettings, InfinoError, Metric,
-    VectorSearchOptions,
+    BoolMode, ColdFetchMode, CompactionSettings, InfinoError, Metric, OptimizeError,
+    OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,14 +78,11 @@ fn arrow_err(e: ArrowError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
 }
 
-/// Map a [`CompactionError`] (a distinct error type from `InfinoError`) to a
-/// JS error. `NoStorage` is a bad-argument case (compaction needs durable
-/// storage); everything else is a runtime failure carrying the message.
-fn compact_err(e: CompactionError) -> Error {
+fn optimize_err(e: OptimizeError) -> Error {
     match e {
-        CompactionError::NoStorage => Error::new(
+        OptimizeError::NoStorage => Error::new(
             Status::InvalidArg,
-            "compact requires durable storage (not memory://)",
+            "optimize requires durable storage (not memory://)",
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
@@ -205,9 +202,9 @@ pub struct ConnectOptions {
     pub cold_fetch_mode: Option<String>,
 }
 
-/// Tuning for `compact`; all fields optional (omitted ⇒ engine default).
+/// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
 #[napi(object)]
-pub struct CompactOptions {
+pub struct OptimizeOptions {
     /// Build-time memory budget, in MB.
     pub max_memory_mb: Option<u32>,
     /// Only compact superfiles below this fill percent (0–100).
@@ -235,6 +232,19 @@ impl From<infino::MutationStats> for MutationStats {
             n_not_found: s.n_not_found() as i64,
         }
     }
+}
+
+/// Text-predicate filter for `vectorSearch` — a pushdown pre-filter, not a
+/// post-filter: kNN ranks only among rows whose FTS-indexed `column` matches
+/// `query`. `mode` is `"or"` (default) or `"and"`.
+#[napi(object)]
+pub struct VectorFilter {
+    /// FTS-indexed column the predicate applies to.
+    pub column: String,
+    /// Query terms, tokenized by the index tokenizer.
+    pub query: String,
+    /// Token matching mode: `"or"` (default) or `"and"`.
+    pub mode: Option<String>,
 }
 
 /// Declares which columns are full-text (BM25) and which are vector (IVF
@@ -445,6 +455,7 @@ impl Table {
     /// returned columns (`["_id", "score"]` for just id + score, or omit
     /// for full rows).
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn vector_search(
         &self,
         column: String,
@@ -453,6 +464,7 @@ impl Table {
         nprobe: Option<u32>,
         rerank_mult: Option<u32>,
         projection: Option<Vec<String>>,
+        filter: Option<VectorFilter>,
     ) -> Result<Buffer> {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
@@ -461,11 +473,20 @@ impl Table {
         if let Some(m) = rerank_mult {
             opts = opts.with_rerank_mult(m as usize);
         }
+        // Optional text-predicate filter (pushdown), borrowing the JS object.
+        let vfilter = match &filter {
+            Some(f) => Some(infino::VectorFilter {
+                column: &f.column,
+                query: &f.query,
+                mode: parse_mode(f.mode.as_deref())?,
+            }),
+            None => None,
+        };
         let proj: Option<Vec<&str>> =
             projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, proj.as_deref())
+            .vector_search(&column, query.as_ref(), k as usize, opts, vfilter, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
@@ -539,7 +560,7 @@ impl Table {
     /// the memory budget, fill threshold, and target size (omit for engine
     /// defaults).
     #[napi]
-    pub fn compact(&self, settings: Option<CompactOptions>) -> Result<()> {
+    pub fn optimize(&self, settings: Option<OptimizeOptions>) -> Result<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
@@ -552,7 +573,8 @@ impl Table {
                 s.target_superfile_size_mb = v as u64;
             }
         }
-        self.inner.compact(&s).map_err(compact_err)
+        let opts = InfinoOptimizeOptions::compact(s);
+        self.inner.optimize(&opts).map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

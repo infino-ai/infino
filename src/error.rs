@@ -14,13 +14,17 @@
 //! the `std::error::Error` trait at call sites and to read consistently
 //! alongside `DataFusionError` / `ArrowError`.
 
-use crate::storage::StorageError;
-use crate::superfile::BuildError as SuperfileBuildError;
-use crate::superfile::ReadError as SuperfileReadError;
-use crate::supertable::error::{
-    BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError, QueryError,
+use crate::{
+    storage::StorageError,
+    superfile::{BuildError as SuperfileBuildError, ReadError as SuperfileReadError},
+    supertable::{
+        error::{
+            BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError,
+            QueryError,
+        },
+        mutations::{CommitError as MutationCommitError, MutationError},
+    },
 };
-use crate::supertable::mutations::{CommitError as MutationCommitError, MutationError};
 
 /// Coarse, stable error type returned by every public infino method.
 ///

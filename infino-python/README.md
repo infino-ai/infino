@@ -23,6 +23,13 @@ as `pyarrow` objects, and every search returns a `pyarrow.Table`.
 pip install infino
 ```
 
+Or with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv add infino            # add to a uv-managed project
+uv pip install infino    # install into the active environment
+```
+
 Requires Python 3.9 or newer. `pyarrow` is installed as a dependency;
 `pandas` is optional and used only if you pass DataFrames.
 
@@ -100,6 +107,16 @@ vecs.vector_search("emb", query_vector, k=10)              # query_vector: list[
 vecs.vector_search("emb", query_vector, k=10, nprobe=32)   # probe more partitions
 ```
 
+To restrict the kNN to rows matching a text predicate, pass `filter_column`
+and `filter_query` together (the column must be FTS-indexed) — a pushdown
+pre-filter, so results are the nearest *matching* rows, not a post-filter over
+the global top-k. `filter_mode` is `"or"` (default) or `"and"`:
+
+```python
+vecs.vector_search("emb", query_vector, k=10,
+                   filter_column="body", filter_query="cancel subscription")
+```
+
 ## SQL
 
 Run SQL across the catalog's tables for analytics and filtering. Results
@@ -109,6 +126,46 @@ come back as a `pyarrow.Table`.
 db.query_sql("SELECT COUNT(*) AS n FROM docs")
 db.query_sql("SELECT title FROM docs WHERE title = 'a lazy dog'")
 ```
+
+### Search inside SQL
+
+Search is also exposed as table-valued functions, so a ranked retrieval is
+a relation you can join, filter, and aggregate over. Each takes the table
+name as its first argument and yields `_id`, any scalar columns, and a
+trailing `score`:
+
+| Function                                                        | Returns                                  |
+| --------------------------------------------------------------- | ---------------------------------------- |
+| `bm25_search(table, column, query, k)`                          | Ranked BM25 (higher score is better)     |
+| `bm25_search_prefix(table, column, prefix, k)`                  | BM25 with the last term prefix-expanded  |
+| `vector_search(table, column, query_vector, k)`                 | kNN (smaller score is nearer)            |
+| `hybrid_search(table, text_col, query, vec_col, query_vector, k)` | BM25 + vector fused with RRF (higher is better) |
+| `token_match(table, column, query)`                             | Unranked term match (`score` is `0.0`)   |
+| `exact_match(table, column, value)`                             | Unranked exact-value match               |
+
+A query vector is written as a comma-separated string or a SQL array
+literal; build it from a Python list with `",".join(map(str, vec))`.
+
+```python
+# Hybrid search: lexical + vector, fused by reciprocal-rank fusion.
+qv = ",".join(map(str, query_vector))
+db.query_sql(f"""
+    SELECT _id, score
+    FROM hybrid_search('docs', 'title', 'quick fox', 'emb', '{qv}', 10)
+    ORDER BY score DESC
+""")
+
+# Compose retrieval with relational filtering and the catalog's other tables.
+db.query_sql("""
+    SELECT s._id, s.score
+    FROM bm25_search('docs', 'title', 'fox', 50) AS s
+    WHERE s._id IN (SELECT _id FROM docs WHERE title <> 'a lazy dog')
+""")
+```
+
+`hybrid_search` and `bm25_search_prefix` are reachable only through SQL.
+The SQL `vector_search` takes no `nprobe` or filter arguments — use the
+`Table.vector_search` method when you need those.
 
 ## Projections
 
@@ -142,15 +199,15 @@ matches must equal the number of rows you supply, otherwise it raises.
 Both methods return a `MutationStats` with `matched`, `n_tombstoned`, and
 `n_not_found`.
 
-## Compaction
+## Optimization
 
-Many small appends produce many small files. `compact` merges small or
+Many small appends produce many small files. `optimize` merges small or
 underfilled files into larger ones, which keeps reads efficient.
 
 ```python
-docs.compact()                                              # engine defaults
-docs.compact(infino.CompactOptions(target_superfile_size_mb=256,
-                                   min_fill_percent=50))
+docs.optimize()                                             # engine defaults
+docs.optimize(infino.OptimizeOptions(target_superfile_size_mb=256,
+                                     min_fill_percent=50))
 ```
 
 ## Storage backends
@@ -177,6 +234,22 @@ db = infino.connect(
 )
 ```
 
+### Local disk cache
+
+For object-storage-backed catalogs, a local disk cache keeps hot data on
+fast local storage. `cold_fetch_mode` controls how cache misses are
+served: `"hybrid_with_prefetch"`, `"range_only"`, or
+`"lazy_foreground_with_background_fill"`.
+
+```python
+db = infino.connect(
+    "s3://bucket/prefix",
+    cache_dir="/mnt/nvme/infino-cache",
+    cache_budget_bytes=64 * 1024**3,
+    cold_fetch_mode="lazy_foreground_with_background_fill",
+)
+```
+
 ## Schema and type requirements
 
 - Full-text columns must be Arrow `large_utf8`.
@@ -189,25 +262,29 @@ db = infino.connect(
 
 ## API reference
 
-- `infino.connect(uri, *, endpoint=None, region=None, access_key=None, secret_key=None) -> Connection`
+- `infino.connect(uri, *, endpoint=None, region=None, access_key=None, secret_key=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None) -> Connection`
 - `Connection`
   - `create_table(name, schema, index_spec) -> Table`
   - `open_table(name) -> Table`
   - `drop_table(name, purge=False)` — `purge=True` also deletes the data
   - `list_tables() -> list[str]`
-  - `query_sql(sql) -> pyarrow.Table`
+  - `query_sql(sql) -> pyarrow.Table` — also exposes the search
+    table-valued functions `bm25_search`, `bm25_search_prefix`,
+    `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
+    (each takes the table name first; `hybrid_search` and
+    `bm25_search_prefix` are SQL-only)
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
-  - `vector_search(column, query, k, nprobe=None, projection=None) -> pyarrow.Table`
+  - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
   - `delete(predicate) -> MutationStats`
   - `update(predicate, new_rows) -> MutationStats`
-  - `compact(settings=None)`
+  - `optimize(settings=None)`
   - `schema() -> pyarrow.Schema`
 - `IndexSpec().fts(column).vector(column, dim, n_cent, metric)`
-- `CompactOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
+- `OptimizeOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
 - `MutationStats` — returned by `delete` / `update`; read-only attributes `matched`, `n_tombstoned`, `n_not_found`
 
 ## Building from source
@@ -220,6 +297,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install maturin pytest pyarrow
 maturin develop          # compile the extension and install it into the venv
 pytest tests/
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv venv && source .venv/bin/activate
+uv pip install maturin pytest pyarrow
+maturin develop          # compile the extension and install it into the venv
+uv run pytest tests/
 ```
 
 ## License

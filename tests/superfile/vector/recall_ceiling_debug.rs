@@ -2,10 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 use bytes::Bytes;
-use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::reader::{OpenOptions, VectorReader};
-use infino::superfile::vector::rerank_codec::RerankCodec;
+use infino::superfile::vector::{
+    builder::{VectorBuilder, VectorConfig},
+    distance::Metric,
+    reader::{OpenOptions, VectorReader},
+    rerank_codec::RerankCodec,
+};
 use infino_bench_utils::corpus;
 
 const N_DOCS: usize = 1_000_000;

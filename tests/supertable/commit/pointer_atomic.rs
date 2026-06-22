@@ -26,28 +26,39 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use infino::{
+    storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+    supertable::{
+        CommitError, ManifestLoadError, ManifestSnapshot,
+        manifest::{
+            commit::{
+                self, MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, manifest_uri,
+                part_uri, read_pointer, write_pointer,
+            },
+            list::{
+                FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
+                PartitionStrategy,
+            },
+            part::{self as part_mod, ContentHash, ManifestPart, PartId},
+        },
+    },
+    test_helpers::default_supertable_options,
+};
+// Note: Manifest is the persisted data struct; ManifestSnapshot is the wrapper with lazy-loading.
+use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
-
-use infino::supertable::manifest::commit::{
-    self, MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, list_uri, part_uri,
-    read_pointer, write_pointer,
-};
-use infino::supertable::manifest::list::{
-    FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestListEntry, PartitionStrategy,
-};
-use infino::supertable::manifest::part::{self as part_mod, ContentHash, ManifestPart, PartId};
-use infino::supertable::storage::{
-    LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider,
-};
-use infino::supertable::{CommitError, ManifestLoadError};
-use tempfile::TempDir;
 
 /// Manifest id used by the pointer-file round-trip fixture.
 const POINTER_ROUNDTRIP_MANIFEST_ID: u64 = 42;
@@ -68,14 +79,37 @@ const PARALLEL_PUT_POLL_TIMEOUT_SECS: u64 = 5;
 const PARALLEL_PUT_POLL_INTERVAL_MS: u64 = 10;
 
 async fn commit_manifest(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     expected_prev_etag: Option<&str>,
-    new_list: &ManifestList,
+    new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
     let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
     let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
-    commit::commit_manifest(storage, expected_prev_etag, new_list, &encoded_refs).await
+
+    // Start from an empty manifest (no superfiles) carrying the
+    // new list, then commit it via the production persistence
+    // path. `ManifestSnapshot::write` issues the part + list PUTs in
+    // parallel and finishes with the conditional pointer PUT (the
+    // visibility barrier). It only serializes the attached list,
+    // so the default options suffice for the persistence side.
+    let manifest = ManifestSnapshot::new(
+        new_list.manifest_id,
+        Arc::new(default_supertable_options()),
+        Vec::new(),
+        Some(Arc::clone(storage)),
+        Some(new_list.clone()),
+    );
+    manifest
+        .write(storage.as_ref(), expected_prev_etag, &encoded_refs)
+        .await?;
+
+    // Hand back the pointer the commit just published.
+    let (pointer, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("pointer readable after commit")
+        .expect("pointer present after commit");
+    Ok(pointer)
 }
 
 // ============================================================
@@ -86,7 +120,7 @@ async fn commit_manifest(
 fn pointer_file_text_format_roundtrip() {
     let p = PointerFile {
         manifest_id: POINTER_ROUNDTRIP_MANIFEST_ID,
-        manifest_list_uri: "manifest-lists/list-000042.json".into(),
+        manifest_uri: "manifest/manifest-000042.json".into(),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
     };
     let bytes = p.to_bytes();
@@ -95,7 +129,7 @@ fn pointer_file_text_format_roundtrip() {
         s.contains("manifest_id=42"),
         "must spell out manifest_id; got {s:?}"
     );
-    assert!(s.contains("manifest_list_uri=manifest-lists/list-000042.json"));
+    assert!(s.contains("manifest_uri=manifest/manifest-000042.json"));
     assert!(s.contains("content_hash=blake3:"));
     let parsed = PointerFile::from_bytes(&bytes).expect("parse");
     assert_eq!(parsed, p);
@@ -103,7 +137,7 @@ fn pointer_file_text_format_roundtrip() {
 
 #[test]
 fn pointer_file_rejects_truncated() {
-    let bad = b"manifest_id=1\nmanifest_list_uri=foo\n"; // missing content_hash
+    let bad = b"manifest_id=1\nmanifest_uri=foo\n"; // missing content_hash
     let err = PointerFile::from_bytes(bad).expect_err("must reject");
     assert!(matches!(err, ManifestLoadError::PointerParse(_)), "{err:?}");
 }
@@ -111,11 +145,11 @@ fn pointer_file_rejects_truncated() {
 #[test]
 fn pointer_file_tolerates_unknown_keys_for_forward_compat() {
     let s = b"manifest_id=7\n\
-              manifest_list_uri=manifest-lists/list-000007.json\n\
+              manifest_uri=manifest/manifest-000007.json\n\
               content_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n\
               future_field=whatever\n";
     let p = PointerFile::from_bytes(s).expect("parse");
-    assert_eq!(p.manifest_id, POINTER_FORWARD_COMPAT_MANIFEST_ID);
+    assert_eq!(p.get_manifest_id(), POINTER_FORWARD_COMPAT_MANIFEST_ID);
 }
 
 // ============================================================
@@ -130,8 +164,8 @@ fn fresh_part(seed: u8) -> ManifestPart {
     }
 }
 
-fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
-    ManifestList {
+fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
+    Manifest {
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
@@ -149,7 +183,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestListEntry>) -> ManifestList {
 
 /// Build a manifest list entry referencing an already-encoded
 /// part. Skip-summary aggregates left empty here.
-fn entry_for(part: &ManifestPart) -> ManifestListEntry {
+fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
     let encoded = part_mod::encode(part, 3);
     let hash = ContentHash::of(&encoded);
     let uri = part_uri(&hash);
@@ -157,7 +191,7 @@ fn entry_for(part: &ManifestPart) -> ManifestListEntry {
     let size_uncompressed = zstd::stream::decode_all(encoded.as_slice())
         .expect("self-decode")
         .len() as u64;
-    ManifestListEntry {
+    ManifestPartEntry {
         part_id: part.part_id,
         uri,
         n_superfiles: part.superfiles.len() as u64,
@@ -175,7 +209,8 @@ fn entry_for(part: &ManifestPart) -> ManifestListEntry {
 #[tokio::test]
 async fn initial_commit_writes_list_part_pointer() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part = fresh_part(1);
     let list = empty_list(0, vec![entry_for(&part)]);
@@ -184,14 +219,17 @@ async fn initial_commit_writes_list_part_pointer() {
         .await
         .expect("initial commit");
 
-    assert_eq!(pointer.manifest_id, 0);
-    assert_eq!(pointer.manifest_list_uri, list_uri(0));
+    assert_eq!(pointer.get_manifest_id(), 0);
+    assert_eq!(pointer.manifest_uri, manifest_uri(0));
 
     // Pointer is readable.
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
     assert_eq!(read, pointer);
     // List + part are at their expected URIs.
-    let (list_bytes, _) = storage.get(&list_uri(0)).await.expect("list bytes");
+    let (list_bytes, _) = storage.get(&manifest_uri(0)).await.expect("list bytes");
     assert!(!list_bytes.is_empty());
     let (part_bytes, _) = storage
         .get(&entry_for(&part).uri)
@@ -211,7 +249,8 @@ async fn no_prior_pointer_is_none() {
 #[tokio::test]
 async fn second_commit_with_valid_prev_etag_succeeds() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part_v0 = fresh_part(2);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
@@ -233,16 +272,20 @@ async fn second_commit_with_valid_prev_etag_succeeds() {
     let pointer = commit_manifest(&storage, Some(&etag_v0), &list_v1, &[&part_v1])
         .await
         .expect("v1");
-    assert_eq!(pointer.manifest_id, 1);
+    assert_eq!(pointer.get_manifest_id(), 1);
 
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
-    assert_eq!(read.manifest_id, 1);
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
+    assert_eq!(read.get_manifest_id(), 1);
 }
 
 #[tokio::test]
 async fn stale_prev_etag_surfaces_write_contention_exhausted() {
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
     let part_v0 = fresh_part(4);
     let list_v0 = empty_list(0, vec![entry_for(&part_v0)]);
@@ -279,7 +322,8 @@ async fn stale_prev_etag_surfaces_write_contention_exhausted() {
 async fn part_reuse_writes_zero_new_part_files() {
     // Setup: v0 with one part already published.
     let dir = TempDir::new().expect("tempdir");
-    let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let part = fresh_part(7);
     let list_v0 = empty_list(0, vec![entry_for(&part)]);
     commit_manifest(&storage, None, &list_v0, &[&part])
@@ -312,8 +356,11 @@ async fn part_reuse_writes_zero_new_part_files() {
     );
 
     // But manifest_id 1 is published.
-    let (read, _) = read_pointer(&storage).await.expect("read").expect("some");
-    assert_eq!(read.manifest_id, 1);
+    let (read, _) = read_pointer(storage.as_ref())
+        .await
+        .expect("read")
+        .expect("some");
+    assert_eq!(read.get_manifest_id(), 1);
 }
 
 #[tokio::test]
@@ -373,6 +420,7 @@ impl StorageProvider for BarrierMockStorage {
             Some(b) => Ok(ObjectMeta {
                 size: b.len() as u64,
                 etag: Some("mock-etag".into()),
+                last_modified: SystemTime::now(),
             }),
             None => Err(StorageError::NotFound { uri: uri.into() }),
         }
@@ -386,6 +434,7 @@ impl StorageProvider for BarrierMockStorage {
                 ObjectMeta {
                     size: b.len() as u64,
                     etag: Some("mock-etag".into()),
+                    last_modified: SystemTime::now(),
                 },
             )),
             None => Err(StorageError::NotFound { uri: uri.into() }),
@@ -492,9 +541,7 @@ async fn commit_issues_list_and_part_in_parallel() {
         let storage_dyn = Arc::clone(&storage_dyn);
         let part = part.clone();
         let list = list.clone();
-        tokio::spawn(
-            async move { commit_manifest(storage_dyn.as_ref(), None, &list, &[&part]).await },
-        )
+        tokio::spawn(async move { commit_manifest(&storage_dyn, None, &list, &[&part]).await })
     };
 
     // Wait for both PUTs (list + part) to arrive at the
@@ -526,7 +573,7 @@ async fn commit_issues_list_and_part_in_parallel() {
     // pointer PUT which is a third put_calls hit; allowed
     // because barrier(2) is reusable on the next .wait()).
     let pointer = commit_handle.await.expect("join").expect("commit");
-    assert_eq!(pointer.manifest_id, 0);
+    assert_eq!(pointer.get_manifest_id(), 0);
     // Total: 2 PUTs (list+part) + 1 PUT (pointer) = 3.
     assert_eq!(
         storage.put_calls.load(Ordering::Acquire),
@@ -545,7 +592,7 @@ async fn write_pointer_initial_then_update() {
 
     let p0 = PointerFile {
         manifest_id: 0,
-        manifest_list_uri: list_uri(0),
+        manifest_uri: manifest_uri(0),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
     };
     write_pointer(&storage, &p0, None).await.expect("initial");
@@ -559,7 +606,7 @@ async fn write_pointer_initial_then_update() {
 
     let p1 = PointerFile {
         manifest_id: 1,
-        manifest_list_uri: list_uri(1),
+        manifest_uri: manifest_uri(1),
         content_hash: ContentHash([0xcd; 32]),
     };
     write_pointer(&storage, &p1, Some(&etag))
@@ -576,7 +623,7 @@ async fn write_pointer_initial_rejects_existing() {
     let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
     let p0 = PointerFile {
         manifest_id: 0,
-        manifest_list_uri: list_uri(0),
+        manifest_uri: manifest_uri(0),
         content_hash: ContentHash([0u8; 32]),
     };
     write_pointer(&storage, &p0, None).await.expect("first");
@@ -592,16 +639,16 @@ async fn write_pointer_initial_rejects_existing() {
 #[test]
 fn directory_layout_constants_match_plan() {
     assert_eq!(POINTER_PATH, "_supertable/current");
-    assert_eq!(MANIFEST_LISTS_DIR, "manifest-lists");
-    assert_eq!(MANIFEST_PARTS_DIR, "manifests");
+    assert_eq!(MANIFEST_DIR, "manifest");
+    assert_eq!(MANIFEST_PARTS_DIR, "manifest-parts");
     assert_eq!(
-        list_uri(POINTER_ROUNDTRIP_MANIFEST_ID),
-        "manifest-lists/list-000042.json"
+        manifest_uri(POINTER_ROUNDTRIP_MANIFEST_ID),
+        "manifest/manifest-000042.json"
     );
     // part_uri is hash-shaped — just sanity-check the prefix +
     // suffix.
     let h = ContentHash([0u8; 32]);
     let u = part_uri(&h);
-    assert!(u.starts_with("manifests/part-"));
+    assert!(u.starts_with("manifest-parts/part-"));
     assert!(u.ends_with(".avro.zst"));
 }

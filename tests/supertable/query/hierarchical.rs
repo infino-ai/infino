@@ -31,15 +31,17 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use std::collections::HashSet;
-
-use infino::superfile::fts::reader::BoolMode;
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    superfile::fts::reader::BoolMode,
+    supertable::{
+        Supertable,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 
 /// Disk-cache byte budget (1 GiB) for the hierarchical-manifest tests.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
@@ -48,7 +50,7 @@ const COLD_FETCH_STREAMS: usize = 4;
 /// Cold-fetch range chunk size (1 MiB).
 const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 /// One superfile per manifest part (forces a multi-part list).
-const TARGET_SUPERFILES_PER_PARTITION: u64 = 1;
+const TARGET_SUPERFILES_PER_PART: u64 = 1;
 /// Eager-load threshold of 0 forces lazy part loading.
 const EAGER_LOAD_THRESHOLD_FORCE_LAZY: u32 = 0;
 /// Part count for the multi-part list fixture.
@@ -88,7 +90,7 @@ fn build_5_parts_with_distinct_terms(storage_dir: &std::path::Path) {
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
     let opts = default_supertable_options()
         .with_storage(Arc::clone(&storage))
-        .with_target_superfiles_per_partition(TARGET_SUPERFILES_PER_PARTITION);
+        .with_target_superfiles_per_part(TARGET_SUPERFILES_PER_PART);
     let producer = Supertable::create(opts).expect("create");
 
     // Each commit's batch uses a distinct vocabulary so the

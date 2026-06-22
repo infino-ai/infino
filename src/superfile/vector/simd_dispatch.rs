@@ -21,7 +21,7 @@
 //! Flipping the env var after the first call has **no effect** —
 //! gates are sticky once cached.
 
-use std::sync::OnceLock;
+use std::{env, sync::OnceLock};
 
 /// True iff this binary should use AVX-512 fast-path kernels.
 /// Checks the CPUID baseline that *every* AVX-512 kernel in the
@@ -137,7 +137,7 @@ pub fn avx2_enabled() -> bool {
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 fn disable_env_set() -> bool {
-    std::env::var("INFINO_DISABLE_AVX512")
+    env::var("INFINO_DISABLE_AVX512")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -146,7 +146,7 @@ fn disable_env_set() -> bool {
 /// values as [`disable_env_set`]; see that function for the contract.
 #[inline]
 fn disable_avx2_env_set() -> bool {
-    std::env::var("INFINO_DISABLE_AVX2")
+    env::var("INFINO_DISABLE_AVX2")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

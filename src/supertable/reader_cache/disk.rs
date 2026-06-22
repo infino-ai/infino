@@ -5,27 +5,46 @@
 //! [`StorageProvider`] with parallel cold-fetch + LRU
 //! eviction.
 
-use std::collections::HashSet;
-use std::io::SeekFrom;
-use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    env, fmt, fs, io,
+    io::SeekFrom,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
-use futures::stream::{FuturesUnordered, StreamExt};
+use dashmap::{DashMap, mapref::entry::Entry};
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
+use memmap2::{Mmap, UncheckedAdvice};
 use thiserror::Error;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::OnceCell;
+use tokio::{
+    io::{AsyncSeekExt, AsyncWriteExt},
+    sync::{OnceCell, Semaphore, oneshot},
+    task::{JoinHandle, spawn_blocking},
+};
 
 use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
-use crate::storage::{StorageError, StorageProvider};
-use crate::superfile::PrefetchedSource;
-use crate::superfile::reader::{OpenOptions, SuperfileReader};
-use crate::supertable::manifest::{SubsectionOffsets, SuperfileUri};
+use crate::{
+    storage::{StorageError, StorageProvider},
+    superfile::{
+        LazyByteSource, PrefetchedSource,
+        reader::{OpenOptions, SuperfileReader},
+    },
+    supertable::{
+        StorageRangeSource,
+        manifest::{SubsectionOffsets, SuperfileUri},
+    },
+};
 
 /// Parquet footer tail-speculation length for cold opens. Must match
 /// `SuperfileReader::open_lazy_with` so the cold-fetch overlay covers
@@ -106,7 +125,7 @@ struct CachedEntry {
     /// — both share the underlying OS mapping, so `madvise`
     /// on either path affects the cached entry's resident
     /// pages.
-    mmap: Option<Arc<memmap2::Mmap>>,
+    mmap: Option<Arc<Mmap>>,
     size_bytes: u64,
     last_access_us: AtomicU64,
 }
@@ -172,11 +191,11 @@ pub struct DiskCacheStore {
     /// background fill acquires one permit for its whole
     /// duration; foreground per-query range reads don't. Sized
     /// `config.prefetch_concurrency` at construction.
-    prefetch_semaphore: Arc<tokio::sync::Semaphore>,
+    prefetch_semaphore: Arc<Semaphore>,
 }
 
-impl std::fmt::Debug for DiskCacheStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DiskCacheStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiskCacheStore")
             .field("cache_root", &self.config.cache_root)
             .field("budget_bytes", &self.config.disk_budget_bytes)
@@ -201,12 +220,10 @@ impl DiskCacheStore {
         config: DiskCacheConfig,
         pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>,
     ) -> Result<Arc<Self>, DiskCacheError> {
-        std::fs::create_dir_all(&config.cache_root)?;
+        fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
-        let prefetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            config.prefetch_concurrency.max(1),
-        ));
+        let prefetch_semaphore = Arc::new(Semaphore::new(config.prefetch_concurrency.max(1)));
         let store = Arc::new(Self {
             storage,
             config,
@@ -234,11 +251,11 @@ impl DiskCacheStore {
         // Tokio runtime on the calling thread.
         if threshold_secs > 0 {
             let weak = Arc::downgrade(&store);
-            let _ = std::thread::Builder::new()
+            let _ = thread::Builder::new()
                 .name("infino-disk-cache-sweep".into())
                 .spawn(move || {
                     loop {
-                        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+                        thread::sleep(Duration::from_secs(interval_secs));
                         match weak.upgrade() {
                             None => break,
                             Some(strong) => {
@@ -281,7 +298,7 @@ impl DiskCacheStore {
         let now_us = self.now_us();
         // Snapshot: clone the Arc<Mmap> + last-access into an
         // owned Vec, then drop the iterator.
-        let snapshot: Vec<(SuperfileUri, Arc<memmap2::Mmap>, u64)> = self
+        let snapshot: Vec<(SuperfileUri, Arc<Mmap>, u64)> = self
             .cached
             .iter()
             .filter_map(|e| {
@@ -310,7 +327,7 @@ impl DiskCacheStore {
                 // file is immutable for the lifetime of this
                 // mapping; pages dropped by `MADV_DONTNEED`
                 // re-fault from disk on next read.
-                let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+                let _ = unsafe { mmap.unchecked_advise(UncheckedAdvice::DontNeed) };
                 n_advised += 1;
             }
         }
@@ -399,15 +416,13 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-        let range_src: Arc<dyn crate::superfile::LazyByteSource> = match offsets {
-            Some(o) if o.total_size > 0 => {
-                Arc::new(crate::supertable::StorageRangeSource::with_known_size(
-                    Arc::clone(&self.storage),
-                    storage_uri,
-                    o.total_size,
-                ))
-            }
-            _ => Arc::new(crate::supertable::StorageRangeSource::with_unknown_size(
+        let range_src: Arc<dyn LazyByteSource> = match offsets {
+            Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
+                Arc::clone(&self.storage),
+                storage_uri,
+                o.total_size,
+            )),
+            _ => Arc::new(StorageRangeSource::with_unknown_size(
                 Arc::clone(&self.storage),
                 storage_uri,
             )),
@@ -602,7 +617,7 @@ impl DiskCacheStore {
         // Snapshot candidates: (uri, mmap_arc, last_access,
         // size). Drop the iterator before madvise calls so
         // we don't hold shard guards across the syscall.
-        let mut candidates: Vec<(SuperfileUri, Arc<memmap2::Mmap>, u64, u64)> = self
+        let mut candidates: Vec<(SuperfileUri, Arc<Mmap>, u64, u64)> = self
             .cached
             .iter()
             .filter_map(|e| {
@@ -629,7 +644,7 @@ impl DiskCacheStore {
             // disk on next read. Identical safety argument
             // to the `sweep_once` path; see that fn for the
             // full discussion.
-            let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+            let _ = unsafe { mmap.unchecked_advise(UncheckedAdvice::DontNeed) };
             self.n_madvise_calls.fetch_add(1, Ordering::AcqRel);
             total = total.saturating_sub(size);
             n_advised += 1;
@@ -763,16 +778,16 @@ impl DiskCacheStore {
         // already-present entry — release our reservation
         // for the duplicate bytes.
         match self.cached.entry(*uri) {
-            dashmap::mapref::entry::Entry::Vacant(v) => {
+            Entry::Vacant(v) => {
                 v.insert(entry);
             }
-            dashmap::mapref::entry::Entry::Occupied(_) => {
+            Entry::Occupied(_) => {
                 // Lost the race; release our reservation +
                 // unlink the just-written file (or leave it
                 // — the existing entry mmaps a different
                 // file on disk).
                 self.current_bytes.fetch_sub(size, Ordering::Release);
-                let _ = std::fs::remove_file(self.cache_path(uri));
+                let _ = fs::remove_file(self.cache_path(uri));
             }
         }
         Ok(())
@@ -861,9 +876,7 @@ impl DiskCacheStore {
             // Spawn the fetch task. It captures a Sender for
             // its pwrite handle so the outer task can join
             // pwrites separately from fetches.
-            let (write_tx, write_rx) = tokio::sync::oneshot::channel::<
-                tokio::task::JoinHandle<Result<(), DiskCacheError>>,
-            >();
+            let (write_tx, write_rx) = oneshot::channel::<JoinHandle<Result<(), DiskCacheError>>>();
             write_handles.push(write_rx);
 
             fetch_handles.push(tokio::spawn(async move {
@@ -1063,12 +1076,11 @@ impl DiskCacheStore {
             // size baked in (no HEAD, no suffix-range discovery)
             // wrapped in a `PrefetchedSource` overlay carrying the
             // open-time byte ranges at their absolute offsets.
-            let inner: Arc<dyn crate::superfile::LazyByteSource> =
-                Arc::new(crate::supertable::StorageRangeSource::with_known_size(
-                    Arc::clone(&self.storage),
-                    storage_uri.clone(),
-                    total_size,
-                ));
+            let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+                Arc::clone(&self.storage),
+                storage_uri.clone(),
+                total_size,
+            ));
             let mut overlay = PrefetchedSource::new(inner);
 
             if !offsets.open_blob.is_empty() {
@@ -1117,7 +1129,7 @@ impl DiskCacheStore {
                     overlay.install(off, bytes);
                 }
             }
-            let source: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(overlay);
+            let source: Arc<dyn LazyByteSource> = Arc::new(overlay);
 
             // Every internal read inside `open_lazy_with` (parquet tail,
             // vec subsection head, fts subsection) hits the overlay sync
@@ -1137,8 +1149,8 @@ impl DiskCacheStore {
             // The first `tail()` inside `open_lazy_with` is a native
             // suffix-range GET that returns both footer bytes and total
             // object size, then patches the source's size atomic.
-            let range_src: Arc<dyn crate::superfile::LazyByteSource> =
-                Arc::new(crate::supertable::StorageRangeSource::with_unknown_size(
+            let range_src: Arc<dyn LazyByteSource> =
+                Arc::new(StorageRangeSource::with_unknown_size(
                     Arc::clone(&self.storage),
                     storage_uri.clone(),
                 ));
@@ -1325,7 +1337,7 @@ impl DiskCacheStore {
             // double-decrement current_bytes.
             if let Some((_, entry)) = self.cached.remove(&uri) {
                 let path = self.cache_path(&uri);
-                let _ = std::fs::remove_file(&path);
+                let _ = fs::remove_file(&path);
                 self.current_bytes
                     .fetch_sub(entry.size_bytes, Ordering::Release);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
@@ -1341,7 +1353,7 @@ impl DiskCacheStore {
     async fn cold_fetch_to_disk(
         &self,
         storage_uri: &str,
-        dest_path: &std::path::Path,
+        dest_path: &Path,
         size: u64,
     ) -> Result<(), DiskCacheError> {
         let n_streams = self.config.cold_fetch_streams.max(1);
@@ -1355,7 +1367,7 @@ impl DiskCacheStore {
         // so chunk writers can use positioned (`pwrite`) writes
         // off the async reactor without a shared file lock.
         let file = {
-            let f = std::fs::OpenOptions::new()
+            let f = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
@@ -1385,7 +1397,7 @@ impl DiskCacheStore {
                     DiskCacheError::SuperfileOpen(format!("stream semaphore closed: {e}"))
                 })?;
                 let bytes = storage.get_range(&uri, start..end).await?;
-                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
+                spawn_blocking(move || file.write_all_at(&bytes, start))
                     .await
                     .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
@@ -1395,7 +1407,7 @@ impl DiskCacheStore {
             h.await
                 .map_err(|e| DiskCacheError::SuperfileOpen(format!("join error: {e}")))??;
         }
-        tokio::task::spawn_blocking(move || file.sync_all())
+        spawn_blocking(move || file.sync_all())
             .await
             .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
         Ok(())
@@ -1450,12 +1462,10 @@ impl Drop for PromotionWaitGuard<'_> {
 async fn finalize_to_mmap(
     store: Arc<DiskCacheStore>,
     uri: SuperfileUri,
-    tmp_path: std::path::PathBuf,
-    final_path: std::path::PathBuf,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
     file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
-    pwrite_handles: Vec<
-        tokio::sync::oneshot::Receiver<tokio::task::JoinHandle<Result<(), DiskCacheError>>>,
-    >,
+    pwrite_handles: Vec<oneshot::Receiver<JoinHandle<Result<(), DiskCacheError>>>>,
     size: u64,
     reserved_bytes: u64,
 ) -> Result<(), DiskCacheError> {
@@ -1506,7 +1516,7 @@ async fn finalize_to_mmap(
                 });
             }
             Entry::Vacant(_) => {
-                let _ = std::fs::remove_file(&final_path);
+                let _ = fs::remove_file(&final_path);
             }
         }
         store.coordinators.remove(&uri);
@@ -1537,16 +1547,19 @@ async fn fetch_hint_ranges(
     storage_uri: String,
     ranges: Vec<(u64, u64)>,
 ) -> Result<Vec<(u64, Bytes)>, StorageError> {
-    futures::future::try_join_all(ranges.into_iter().filter(|&(_, len)| len > 0).map(
-        |(off, len)| {
-            let storage = Arc::clone(&storage);
-            let storage_uri = storage_uri.clone();
-            async move {
-                let bytes = storage.get_range(&storage_uri, off..off + len).await?;
-                Ok::<_, StorageError>((off, bytes))
-            }
-        },
-    ))
+    try_join_all(
+        ranges
+            .into_iter()
+            .filter(|&(_, len)| len > 0)
+            .map(|(off, len)| {
+                let storage = Arc::clone(&storage);
+                let storage_uri = storage_uri.clone();
+                async move {
+                    let bytes = storage.get_range(&storage_uri, off..off + len).await?;
+                    Ok::<_, StorageError>((off, bytes))
+                }
+            }),
+    )
     .await
 }
 
@@ -1591,13 +1604,13 @@ async fn wait_for_lazy_foreground_release(
 async fn cold_fetch_to_disk_cancelable(
     store: &Arc<DiskCacheStore>,
     storage_uri: &str,
-    dest_path: &std::path::Path,
+    dest_path: &Path,
     size: u64,
 ) -> Result<bool, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
     let file = {
-        let f = std::fs::OpenOptions::new()
+        let f = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -1630,7 +1643,7 @@ async fn cold_fetch_to_disk_cancelable(
             let uri = storage_uri.to_string();
             in_flight.push(async move {
                 let bytes = storage.get_range(&uri, start..end).await?;
-                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
+                spawn_blocking(move || file.write_all_at(&bytes, start))
                     .await
                     .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
                 Ok::<(), DiskCacheError>(())
@@ -1652,24 +1665,20 @@ async fn cold_fetch_to_disk_cancelable(
     }
     // `write_all_at` writes directly through an unbuffered `std::fs::File`;
     // there is no `BufWriter` layer to flush before syncing durability.
-    tokio::task::spawn_blocking(move || file.sync_all())
+    spawn_blocking(move || file.sync_all())
         .await
         .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
     Ok(true)
 }
 
-fn rollback_lazy_background_fill(
-    store: &Arc<DiskCacheStore>,
-    uri: &SuperfileUri,
-    tmp: &std::path::Path,
-) {
+fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
     if let Some((_, entry)) = store.cached.remove(uri) {
         store
             .current_bytes
             .fetch_sub(entry.size_bytes, Ordering::Release);
     }
     store.coordinators.remove(uri);
-    let _ = std::fs::remove_file(tmp);
+    let _ = fs::remove_file(tmp);
 }
 
 /// background promotion path for the
@@ -1688,9 +1697,9 @@ fn rollback_lazy_background_fill(
 /// the cold fan-out cost in isolation from the competing
 /// full-superfile fills.
 pub(crate) fn skip_background_fill() -> bool {
-    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SKIP: OnceLock<bool> = OnceLock::new();
     *SKIP.get_or_init(|| {
-        std::env::var("INFINO_DISABLE_BG_FILL")
+        env::var("INFINO_DISABLE_BG_FILL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -1776,7 +1785,7 @@ async fn lazy_background_fill(
                 });
             }
             Entry::Vacant(_) => {
-                let _ = std::fs::remove_file(&final_path);
+                let _ = fs::remove_file(&final_path);
             }
         }
         store.coordinators.remove(&uri);
@@ -1791,7 +1800,7 @@ async fn lazy_background_fill(
         rollback_lazy_background_fill(&store, &uri, &tmp);
         // Clean up the temp file if cold_fetch_to_disk failed
         // mid-way.
-        let _ = std::fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp);
     }
     let _ = reserved_bytes; // retained for future observability
     res
@@ -1803,7 +1812,7 @@ async fn lazy_background_fill(
 /// same `Arc<Mmap>` — both refer to the same OS mapping, so
 /// `madvise` on the cache's handle affects the reader's
 /// resident pages (the idle-threshold sweep relies on this).
-struct ArcMmapOwner(Arc<memmap2::Mmap>);
+struct ArcMmapOwner(Arc<Mmap>);
 
 impl AsRef<[u8]> for ArcMmapOwner {
     fn as_ref(&self) -> &[u8] {
@@ -1811,27 +1820,34 @@ impl AsRef<[u8]> for ArcMmapOwner {
     }
 }
 
-fn open_readonly_mmap(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> {
-    let file = std::fs::File::open(path)?;
+fn open_readonly_mmap(path: &Path) -> io::Result<Mmap> {
+    let file = fs::File::open(path)?;
     // SAFETY: the cache file is created + filled + fsync'd
     // before this mmap call. The file is owned by us; no
     // other process modifies it. Once mmap'd we never write
     // to it (eviction unlinks + drops the Arc<Mmap>, which
     // unmaps cleanly under POSIX even if the file's already
     // unlinked).
-    unsafe { memmap2::Mmap::map(&file) }
+    unsafe { Mmap::map(&file) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::LocalFsStorageProvider;
-    use crate::superfile::SuperfileReader;
-    use crate::superfile::builder::{BuilderOptions, SuperfileBuilder};
-    use crate::test_helpers::{decimal128_id_field, decimal128_ids};
+    use std::io::Error as IoError;
+
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, SuperfileBuilder},
+        },
+        test_helpers::{decimal128_id_field, decimal128_ids},
+    };
 
     /// Poll turns the test lets elapse while the reader is held — the
     /// pre-fix code returned after a single grace sleep, so anything
@@ -2423,7 +2439,7 @@ mod tests {
         let variants = [
             DiskCacheError::SuperfileOpen("x".into()),
             DiskCacheError::BudgetExceeded,
-            DiskCacheError::Io(std::io::Error::other("boom")),
+            DiskCacheError::Io(IoError::other("boom")),
         ];
         for v in variants {
             assert!(!format!("{v}").is_empty());

@@ -4,10 +4,13 @@
 //! Disk-cache runtime configuration + pluggable eviction
 //! policy.
 
-use std::collections::HashSet;
-use std::fmt::Debug;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::{
+    collections::HashSet,
+    env::temp_dir,
+    fmt::{self, Debug},
+    path::PathBuf,
+    sync::atomic::AtomicU64,
+};
 
 use crate::supertable::manifest::SuperfileUri;
 
@@ -140,7 +143,7 @@ const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
 impl Default for DiskCacheConfig {
     fn default() -> Self {
         Self {
-            cache_root: std::env::temp_dir().join("infino-disk-cache"),
+            cache_root: temp_dir().join("infino-disk-cache"),
             disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
             cold_fetch_mode: ColdFetchMode::default(),
             cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,
@@ -155,7 +158,7 @@ impl Default for DiskCacheConfig {
 }
 
 impl Debug for DiskCacheConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiskCacheConfig")
             .field("cache_root", &self.cache_root)
             .field("disk_budget_bytes", &self.disk_budget_bytes)

@@ -8,16 +8,34 @@
 //! Compaction is single-level — a target-sized superfile is never
 //! re-compacted.
 
+use std::{
+    collections::{BTreeMap, HashMap},
+    mem,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
+
+use bytes::Bytes;
+use chrono::Utc;
+use futures::future::join_all;
+use roaring::RoaringBitmap;
+use tokio::time;
+use uuid::Uuid;
+
 use crate::{
     Supertable,
     config::CompactionSettings,
+    runtime_bridge::bridge_on_runtime,
     superfile::builder::SuperfileBuilder,
     supertable::{
         BuildError, CommitError, SuperfileEntry,
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
-            WalStore,
+            SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -25,11 +43,8 @@ use crate::{
         },
     },
 };
-use bytes::Bytes;
-use std::{collections::BTreeMap, sync::Arc, sync::atomic::Ordering};
-use uuid::Uuid;
 
-struct CompactionSlot<'a>(&'a std::sync::atomic::AtomicBool);
+struct CompactionSlot<'a>(&'a AtomicBool);
 
 impl Drop for CompactionSlot<'_> {
     fn drop(&mut self) {
@@ -150,7 +165,7 @@ impl PendingJob {
         if self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes {
             jobs.push(CompactionJob {
                 partition_key: key.to_vec(),
-                inputs: std::mem::take(&mut self.inputs),
+                inputs: mem::take(&mut self.inputs),
                 estimated_output_bytes: self.live_bytes,
             });
         }
@@ -164,11 +179,8 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
-    pub fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
-        crate::runtime_bridge::bridge_on_runtime(
-            self.compact_async(cfg),
-            &self.inner().query_runtime(),
-        )
+    pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
+        bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
     }
 
     pub(crate) async fn compact_async(
@@ -199,29 +211,24 @@ impl Supertable {
             .map(|e| e.superfile_id)
             .collect();
 
-        let sidecar_map: std::collections::HashMap<
-            Uuid,
-            (
-                Arc<roaring::RoaringBitmap>,
-                Option<crate::supertable::wal::SealRecord>,
-            ),
-        > = if let Some(cache) = &inner.tombstone_cache {
-            let now = std::time::Instant::now();
-            cache.prefetch(&superfile_ids, now).await;
+        let sidecar_map: HashMap<Uuid, (Arc<RoaringBitmap>, Option<SealRecord>)> =
+            if let Some(cache) = &inner.tombstone_cache {
+                let now = Instant::now();
+                cache.prefetch(&superfile_ids, now).await;
 
-            // Build a map of superfile_id → (bitmap, seal) by checking the cache.
-            // Cache hits are O(1); any misses are already prefetched above.
-            superfile_ids
-                .iter()
-                .filter_map(|id| match cache.sidecar_for(*id, now) {
-                    Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
-                    Err(_) => None,
-                })
-                .collect()
-        } else {
-            // Fallback for in-memory-only tables (no storage, no tombstone cache).
-            std::collections::HashMap::new()
-        };
+                // Build a map of superfile_id → (bitmap, seal) by checking the cache.
+                // Cache hits are O(1); any misses are already prefetched above.
+                superfile_ids
+                    .iter()
+                    .filter_map(|id| match cache.sidecar_for(*id, now) {
+                        Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
+                        Err(_) => None,
+                    })
+                    .collect()
+            } else {
+                // Fallback for in-memory-only tables (no storage, no tombstone cache).
+                HashMap::new()
+            };
 
         // Build SuperfileStats for every superfile in the snapshot.
         let stats: Vec<SuperfileStats> = manifest
@@ -231,7 +238,7 @@ impl Supertable {
                 let (bitmap, seal) = sidecar_map
                     .get(&entry.superfile_id)
                     .cloned()
-                    .unwrap_or_else(|| (Arc::new(roaring::RoaringBitmap::new()), None));
+                    .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
                 let tombstoned_docs = bitmap.len();
                 let sealed_by_other = seal.is_some();
                 SuperfileStats {
@@ -280,9 +287,9 @@ impl Supertable {
             };
             superfile_readers_fut.push(open_fut);
         }
-        let readers = futures::future::join_all(superfile_readers_fut).await;
+        let readers = join_all(superfile_readers_fut).await;
 
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if let Some(tombstone_cache) = &tombstone_cache {
             let superfile_ids = superfiles
                 .iter()
@@ -354,7 +361,7 @@ impl Supertable {
         // and this seal flag helps to prevent overlapping compactions
         // on same files
         let compaction_id = Uuid::new_v4();
-        let sealed_at = chrono::Utc::now();
+        let sealed_at = Utc::now();
         for entry in &inputs {
             loop {
                 match tombstones_admin::seal(
@@ -430,7 +437,6 @@ impl Supertable {
                 current,
                 &new_entries,
                 &entries_to_remove,
-                inner.manifest.load().manifest_id + 1,
                 &mut pending_storage_writes,
             )
             .await
@@ -440,7 +446,7 @@ impl Supertable {
                     self.refresh()
                         .await
                         .map_err(|e| CompactionError::Refresh(e.to_string()))?;
-                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    time::sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => return Err(CompactionError::Commit(e.to_string())),
             }
@@ -454,15 +460,21 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::BoolMode;
-    use crate::Supertable;
-    use crate::supertable::error::CompactionError;
-    use crate::supertable::storage::LocalFsStorageProvider;
-    use crate::test_helpers::{build_title_batch, default_supertable_options};
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::{collections::HashSet, mem, str, sync::Arc};
+
+    use arrow_array::LargeStringArray;
     use tempfile::TempDir;
+    use tokio::task;
+
+    use super::*;
+    use crate::{
+        BoolMode, Supertable,
+        supertable::{
+            error::CompactionError,
+            storage::{LocalFsStorageProvider, StorageProvider},
+        },
+        test_helpers::{build_title_batch, default_supertable_options},
+    };
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -638,7 +650,7 @@ mod tests {
             .await
             .expect_err("must error on unknown input");
         assert!(
-            matches!(err, crate::supertable::error::CompactionError::SuperfileNotFound(id) if id == bogus),
+            matches!(err, CompactionError::SuperfileNotFound(id) if id == bogus),
             "{err:?}"
         );
     }
@@ -667,7 +679,7 @@ mod tests {
         }
         let before = st.manifest_id();
         let cfg = small_compact_cfg();
-        tokio::task::spawn_blocking(move || st.compact(&cfg).map(|_| st.manifest_id()))
+        task::spawn_blocking(move || st.compact(&cfg).map(|_| st.manifest_id()))
             .await
             .expect("join")
             .map(|after| {
@@ -702,7 +714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_merges_two_superfiles() {
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -746,7 +758,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_preserves_scalar_stats() {
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -814,20 +826,19 @@ mod tests {
         let title_stats = merged_superfile
             .entry
             .scalar_stats
-            .cols
             .get("title")
             .expect("merged entry should have title column stats");
 
         // Extract min and max string values from the arrays
         let title_min_arr = title_stats
-            .0
+            .min
             .as_any()
-            .downcast_ref::<arrow_array::LargeStringArray>()
+            .downcast_ref::<LargeStringArray>()
             .expect("title column should be LargeStringArray");
         let title_max_arr = title_stats
-            .1
+            .max
             .as_any()
-            .downcast_ref::<arrow_array::LargeStringArray>()
+            .downcast_ref::<LargeStringArray>()
             .expect("title column should be LargeStringArray");
 
         // Verify exact min/max values (apple is min across all data, date is max)
@@ -840,7 +851,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_combines_multiple_superfiles() {
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -907,7 +918,7 @@ mod tests {
         // Each batch has 2 docs sharing a unique word — search for each batch's unique term
         for term in &["alpha", "beta", "gamma"] {
             let hits = merged_reader
-                .token_match("title", &[*term], crate::BoolMode::And)
+                .token_match("title", &[*term], BoolMode::And)
                 .await
                 .unwrap_or_else(|_| panic!("token_match for '{term}'"));
             assert_eq!(hits.len(), 2, "term '{term}' should match exactly 2 docs");
@@ -917,7 +928,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_superfiles_single_superfile() {
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -976,7 +987,7 @@ mod tests {
         assert_eq!(merged_reader.n_docs(), 2, "reader should report 2 docs");
 
         let only_hits = merged_reader
-            .token_match("title", &["only"], crate::BoolMode::And)
+            .token_match("title", &["only"], BoolMode::And)
             .await
             .expect("token_match for 'only'");
         assert_eq!(
@@ -986,7 +997,7 @@ mod tests {
         );
 
         let second_hits = merged_reader
-            .token_match("title", &["second"], crate::BoolMode::And)
+            .token_match("title", &["second"], BoolMode::And)
             .await
             .expect("token_match for 'second'");
         assert_eq!(
@@ -996,10 +1007,36 @@ mod tests {
         );
     }
 
+    /// An in-memory supertable (no storage, no tombstone cache) takes
+    /// the empty-sidecar-map fallback arm in `compact_async`: it still
+    /// builds per-superfile stats and runs `select`, and with a single
+    /// committed superfile `select` finds nothing to do, so the call
+    /// returns `Ok(())` without touching storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_in_memory_table_takes_empty_sidecar_fallback() {
+        let st =
+            Supertable::create(default_supertable_options()).expect("create in-memory supertable");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&["alpha first", "alpha second"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("in-memory compact is a no-op, not an error");
+        assert_eq!(
+            st.manifest_id(),
+            before,
+            "single superfile yields no compaction job"
+        );
+    }
+
     // ─── Helpers shared by the end-to-end compact() tests ─────────────────
 
     fn make_st(dir: &TempDir) -> Supertable {
-        let storage: Arc<dyn crate::supertable::storage::StorageProvider> =
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("create supertable")
@@ -1094,7 +1131,7 @@ mod tests {
         // Race a writer commit against compaction. The compactor will
         // hit WriteContentionExhausted on its first pointer CAS attempt
         // (or succeed before the writer — either way both must succeed).
-        let writer_handle = tokio::task::spawn_blocking(move || {
+        let writer_handle = task::spawn_blocking(move || {
             commit_titles(&st2, &["kilo first", "kilo second"]);
         });
 
@@ -1218,14 +1255,14 @@ mod tests {
             b"sierra",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
-                std::str::from_utf8(term).expect("term literal is valid utf-8")
+                str::from_utf8(term).expect("term literal is valid utf-8")
             );
         }
 
         // Box::leak(dir);
-        std::mem::forget(dir);
+        mem::forget(dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1415,9 +1452,9 @@ mod tests {
             b"juliet",
         ] {
             assert!(
-                fts.term_bloom.contains(term),
+                fts.may_contain(term),
                 "bloom missing term '{}'",
-                std::str::from_utf8(term).expect("term literal is valid utf-8")
+                str::from_utf8(term).expect("term literal is valid utf-8")
             );
         }
     }

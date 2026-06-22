@@ -6,16 +6,14 @@
 //! Covers:
 //!   - Fresh `create` returns the empty-supertable stats:
 //!     `manifest_id == 0`, `n_superfiles == 0`,
-//!     `n_manifest_parts == None`.
+//!     `n_manifest_parts == 0`.
 //!   - Stats track commits: each `writer.commit()` advances
 //!     `manifest_id` + grows `n_superfiles`.
 //!   - With storage attached, after the first commit
-//!     `n_manifest_parts == Some(1)` and
-//!     `n_manifest_parts_loaded == 0` (the writer's commit
-//!     path doesn't currently hydrate the part it just wrote
-//!     — `Supertable::open` is what populates the parts
-//!     cache; the writer just rebuilds the in-memory state
-//!     from `new_superfile_list`).
+//!     `n_manifest_parts == 1` and `n_manifest_parts_loaded == 1`:
+//!     the commit path seeds the freshly-written part(s) into the
+//!     in-memory cache, so a same-handle query serves them without
+//!     re-reading any manifest part from storage.
 //!   - `Supertable::open`'s eager-fetch populates
 //!     `n_manifest_parts_loaded == n_manifest_parts`.
 //!   - `process_rss_bytes` is non-zero and falls within a
@@ -29,9 +27,13 @@
 
 use std::sync::Arc;
 
-use infino::supertable::Supertable;
-use infino::supertable::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use infino::{
+    supertable::{
+        Supertable,
+        storage::{LocalFsStorageProvider, StorageProvider},
+    },
+    test_helpers::{build_title_batch, default_supertable_options},
+};
 
 /// Disk-cache byte budget (1 GiB) for the stats integration cache.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
@@ -49,7 +51,7 @@ fn fresh_supertable_returns_empty_stats() {
     assert_eq!(s.n_superfiles, 0);
     assert_eq!(
         s.n_manifest_parts, 0,
-        "fresh in-process supertable has no ManifestList"
+        "fresh in-process supertable has no persisted Manifest"
     );
     assert_eq!(s.n_manifest_parts_loaded, 0);
     assert!(s.process_rss_bytes > 0, "RSS must be non-zero");
@@ -83,7 +85,7 @@ fn stats_track_commits_on_in_process_supertable() {
     );
     assert_eq!(
         s2.n_manifest_parts, 0,
-        "in-process supertable never has a ManifestList"
+        "in-process supertable never has a persisted Manifest"
     );
 }
 
@@ -101,19 +103,19 @@ fn stats_show_manifest_parts_when_storage_attached() {
         w.commit().expect("commit");
     }
 
-    // Producer's in-memory state after commit: list is set,
-    // parts cache is empty (writer rebuilds state via
-    // new_superfile_list, doesn't hydrate the freshly-written
-    // part). Contract: report what's actually in memory.
+    // Producer's in-memory state after commit: the list is set and
+    // the commit path seeds the freshly-written part into the parts
+    // cache, so it's already loaded — a same-handle query needs no
+    // refetch from storage.
     let producer_stats = producer.stats();
     assert_eq!(producer_stats.manifest_id, 1);
     assert_eq!(
         producer_stats.n_manifest_parts, 1,
-        "post-commit ManifestList exists with one part"
+        "post-commit persisted Manifest exists with one part"
     );
     assert_eq!(
-        producer_stats.n_manifest_parts_loaded, 0,
-        "writer's commit path doesn't hydrate the parts cache"
+        producer_stats.n_manifest_parts_loaded, 1,
+        "commit path seeds the freshly-written part into the cache"
     );
     drop(producer);
 
@@ -226,11 +228,12 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
     // before any activity, so downstream consumers can
     // sample them on a timer without worrying about
     // initialization order.
-    use infino::supertable::SuperfileUri;
-    use infino::supertable::reader_cache::{
-        ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy,
-    };
     use std::collections::HashSet;
+
+    use infino::supertable::{
+        SuperfileUri,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    };
 
     let storage_dir = TempDir::new().expect("storage dir");
     let cache_dir = TempDir::new().expect("cache dir");

@@ -386,8 +386,9 @@ impl Version {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashSet;
+
+    use super::*;
 
     #[test]
     fn project_magic_is_three_bytes() {

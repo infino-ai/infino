@@ -1,13 +1,21 @@
-.PHONY: check test doctest \
+.PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update \
-        python-test python-wheel \
-        node-test node-build node-verify
+        python-test python-typecheck python-wheel python-examples-test \
+        node-test node-build node-verify node-example
+
+# Import layout: group into std / external / crate blocks and merge each
+# crate into one `use` tree.
+RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 
 check:
-	cargo fmt --check
+	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+
+# Apply formatting, including the import-layout rules above.
+fmt:
+	cargo fmt --all -- --config $(RUSTFMT_OPTS)
 
 # Public-API surface guard. Regenerates the curated public surface and
 # fails if it drifts from the committed `public-api.txt` snapshot. The
@@ -29,7 +37,7 @@ test:
 
 # Coverage (cargo-llvm-cov; install: cargo install cargo-llvm-cov)
 coverage:                      # CI gate: ≥90% lines/functions/regions + lcov.info for codecov upload
-	cargo llvm-cov --summary-only --features test-helpers --fail-under-lines 90 --fail-under-functions 85 --fail-under-regions 90
+	cargo llvm-cov --summary-only --features test-helpers --fail-under-lines 90 --fail-under-functions 90 --fail-under-regions 90 --ignore-filename-regex "test_helpers/"
 
 coverage-summary:              # quick terminal summary
 	cargo llvm-cov --summary-only --features test-helpers
@@ -96,6 +104,13 @@ asan:
 doctest:
 	cargo test --doc
 
+# Build the API docs locally, exactly as docs.rs renders them: crate only
+# (`--no-deps`), default features, opened in a browser. The landing page is
+# the README (lib.rs pulls it in via `include_str!`); the rest is rustdoc
+# from the public items' doc comments. Output: target/doc/infino/index.html.
+doc:
+	cargo doc --no-deps --open
+
 # Python bindings (PyO3 + maturin). Built standalone — `infino-python` is
 # excluded from the cargo workspace, so the core crate never needs a
 # Python toolchain. These targets are self-contained: they create a
@@ -109,12 +124,50 @@ python-test:
 	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
 	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
 
+# Type-check the package and a sample consumer under `mypy --strict`,
+# against the source stubs (no extension build needed). Checking
+# `__init__.py` verifies its re-exports match the `_infino` stub; checking
+# the sample fails the run if the surface drifts or a `Literal` argument
+# widens to plain `str`.
+python-typecheck:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip mypy
+	MYPYPATH=infino-python/python infino-python/.venv/bin/mypy \
+		--config-file infino-python/pyproject.toml \
+		infino-python/python/infino/__init__.py \
+		infino-python/tests/typing/quickstart.py
+
 # Build a release abi3 wheel for the current platform into
 # `infino-python/dist/` (one wheel covers CPython >= 3.9).
 python-wheel:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
+
+# Concurrent example notebooks; lower it on smaller runners.
+CONCURRENT_EXAMPLE_TESTS ?= 4
+
+# Build the bindings from source and execute every example notebook (a failing
+# cell fails the target). Notebooks run in parallel — each uses a distinct
+# scratch dir. The venv is a reused throwaway (gitignored).
+python-examples-test:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip maturin
+	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
+	# Drop infino from the requirements; the from-source build above is what runs.
+	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q nbconvert ipykernel
+	# Warm the shared embedding model so parallel workers don't race the download.
+	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
+		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
+	@ls infino-python/examples/*/[0-9]*.ipynb | \
+	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
+		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \
+	status=$$?; \
+	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
+	exit $$status
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
 # from the cargo workspace, so the core crate never needs a Node
@@ -127,6 +180,14 @@ node-test:
 # Build a release addon for the current platform.
 node-build:
 	cd infino-node && npm install && npm run build
+
+# Run the Node examples as end-to-end smoke tests. Assumes the addon is already
+# built (run `make node-test` or `make node-build` first); each example's
+# `file:../..` dependency links that build. The hybrid-search-api example runs
+# with SMOKE=1 so it self-checks and exits instead of serving forever.
+node-example:
+	cd infino-node/examples/agent-memory && npm install && node index.mjs
+	cd infino-node/examples/hybrid-search-api && npm install && SMOKE=1 node index.mjs
 
 # Verify the published package shape: pack the thin main package + the
 # host platform package, install them into a throwaway project, and run a

@@ -7,7 +7,7 @@
 //! `ContentHash` over the load-bearing options fields — the
 //! Arrow schema, id column, FTS / vector column declarations,
 //! and the resolved partition strategy. Stamped onto
-//! [`ManifestList::options_hash`] at commit time; verified
+//! `Manifest::options_hash` at commit time; verified
 //! at [`Supertable::open`] against the caller's options so a
 //! schema mismatch surfaces as a clean
 //! [`OpenError::OptionsHashMismatch`] instead of a parquet /
@@ -43,13 +43,16 @@
 //! [`verify_options_hash`] — older manifests + test fixtures that
 //! construct lists manually keep opening cleanly.
 //!
-//! [`ManifestList::options_hash`]: super::list::ManifestList
+//! `Manifest::options_hash`: see super::list::Manifest
 //! [`Supertable::open`]: crate::supertable::Supertable::open
 //! [`OpenError::OptionsHashMismatch`]: crate::supertable::OpenError::OptionsHashMismatch
 
-use crate::supertable::manifest::list::PartitionStrategy;
-use crate::supertable::manifest::part::ContentHash;
-use crate::supertable::options::SupertableOptions;
+use std::{error::Error, fmt};
+
+use crate::supertable::{
+    manifest::{list::PartitionStrategy, part::ContentHash},
+    options::SupertableOptions,
+};
 
 /// Compute the canonical options-hash from `opts` + the
 /// resolved `strategy`. See the module-level docs for the
@@ -121,6 +124,10 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
                 buf.extend_from_slice(b);
             }
         }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            push_tag(&mut buf, b"ingestion_time");
+            buf.extend_from_slice(&granularity_secs.to_le_bytes());
+        }
     }
 
     let h = blake3::hash(&buf);
@@ -160,8 +167,8 @@ pub struct OptionsHashMismatch {
     pub actual: String,
 }
 
-impl std::fmt::Display for OptionsHashMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for OptionsHashMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "options_hash mismatch: caller=blake3:{} list=blake3:{}",
@@ -170,7 +177,7 @@ impl std::fmt::Display for OptionsHashMismatch {
     }
 }
 
-impl std::error::Error for OptionsHashMismatch {}
+impl Error for OptionsHashMismatch {}
 
 #[inline]
 fn push_tag(buf: &mut Vec<u8>, tag: &[u8]) {
@@ -189,16 +196,22 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::superfile::builder::{FtsConfig, VectorConfig};
-    use crate::superfile::vector::distance::Metric;
-    use crate::superfile::vector::rerank_codec::RerankCodec;
-    use crate::supertable::manifest::list::PartitionStrategy;
-    use crate::supertable::manifest::part::ContentHash;
-    use crate::supertable::options::SupertableOptions;
-    use crate::test_helpers::default_tokenizer;
-    use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+    use crate::{
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        },
+        supertable::{
+            manifest::{list::PartitionStrategy, part::ContentHash},
+            options::SupertableOptions,
+        },
+        test_helpers::default_tokenizer,
+    };
 
     fn schema_title_only() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -566,7 +579,7 @@ mod tests {
         let h_a = ContentHash([3u8; 32]);
         let h_b = ContentHash([4u8; 32]);
         let err = verify_options_hash(h_a, h_b).expect_err("mismatch");
-        let dyn_err: Box<dyn std::error::Error> = Box::new(err);
+        let dyn_err: Box<dyn Error> = Box::new(err);
         assert!(dyn_err.to_string().contains("options_hash mismatch"));
     }
 

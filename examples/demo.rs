@@ -22,13 +22,17 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use datafusion::prelude::*;
-use infino::superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig};
-use infino::superfile::fts::reader::BoolMode;
-use infino::superfile::vector::distance::{Metric, normalize};
-use infino::superfile::{SuperfileReader, VectorSearchOptions};
-use infino::supertable::Supertable;
-use infino::test_helpers::{
-    build_title_batch, decimal128_ids, default_supertable_options, default_tokenizer,
+use infino::{
+    superfile::{
+        SuperfileReader, VectorSearchOptions,
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+        fts::reader::BoolMode,
+        vector::distance::{Metric, normalize},
+    },
+    supertable::Supertable,
+    test_helpers::{
+        build_title_batch, decimal128_ids, default_supertable_options, default_tokenizer,
+    },
 };
 use tempfile::NamedTempFile;
 
