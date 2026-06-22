@@ -1796,17 +1796,22 @@ impl VectorReader {
 
         let dim = col.dim;
         let n_cent = col.n_cent as usize;
-        let meta = col
-            .sq8_meta
-            .as_ref()
-            .expect("Sq8ResidualEpsilon column must carry sq8_meta");
+        let meta = col.sq8_meta.as_ref().ok_or_else(|| {
+            VectorError::Read(ReadError::MalformedVersion(format!(
+                "column '{}' is Sq8ResidualEpsilon but has no sq8 metadata",
+                col.name
+            )))
+        })?;
 
         let (scale, offset): (Vec<f32>, Vec<f32>) = match meta {
             Sq8ColumnMeta::Eager { scale, offset, .. } => (scale.clone(), offset.clone()),
             Sq8ColumnMeta::Lazy { .. } => {
-                let range = lazy_sq8_meta_range(col).expect(
-                    "Sq8ResidualEpsilon with Lazy sq8_meta must have a valid codec_meta range",
-                );
+                let range = lazy_sq8_meta_range(col).ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "column '{}' has no codec metadata range",
+                        col.name
+                    )))
+                })?;
                 let bytes = self
                     .source
                     .get_range(range)
