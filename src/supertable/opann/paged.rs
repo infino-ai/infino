@@ -14,6 +14,7 @@
 //! abstract byte fetcher (in tests, an in-memory map).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::supertable::manifest::part::ContentHash;
 
@@ -61,6 +62,16 @@ impl PageSource for ResidentPageSource {
             .get(hash)
             .cloned()
             .ok_or_else(|| PageError::MissingPage(hash.to_hex()))
+    }
+}
+
+/// A shared, reference-counted [`PageSource`] is itself a [`PageSource`] — it
+/// just forwards to the pointee. Lets a cached `Arc<ResidentPageSource>` be
+/// handed to [`PagedTree::new`] (which takes its source by value) without
+/// cloning the whole resident page map per query.
+impl<T: PageSource + ?Sized> PageSource for Arc<T> {
+    fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, PageError> {
+        (**self).fetch(hash)
     }
 }
 

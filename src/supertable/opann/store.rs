@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use futures::future::try_join_all;
 
 use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::manifest::part::ContentHash;
@@ -78,36 +79,60 @@ pub(crate) async fn write_pages(
 /// pages by hash), fetching and **hash-verifying** every page exactly once.
 /// This is the warm-up: after it returns, descent runs entirely in memory.
 ///
-/// Fetches are sequential for now (the tree is small and this is a one-time,
-/// amortized warm-up); level-parallel fetching is a later refinement.
+/// Fetches go level-by-level: every distinct page of one tree level is fetched
+/// concurrently (`try_join_all`), then its children seed the next level. A page
+/// already resident (loaded as a shared child of an earlier level) is skipped,
+/// so each page is fetched and verified exactly once even when the graph is a
+/// DAG rather than a strict tree.
 pub(crate) async fn load_resident(
     storage: &dyn StorageProvider,
     root: ContentHash,
 ) -> Result<ResidentPageSource, OpannStoreError> {
     let mut pages: HashMap<ContentHash, Vec<u8>> = HashMap::new();
     let mut frontier: Vec<ContentHash> = vec![root];
-    while let Some(hash) = frontier.pop() {
-        if pages.contains_key(&hash) {
-            continue;
-        }
-        let (bytes, _meta) = storage.get(&page_uri(&hash)).await?;
-        let actual = ContentHash::of(bytes.as_ref());
-        if actual != hash {
-            return Err(PageError::ContentHashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
+    while !frontier.is_empty() {
+        // Dedup this level against what's already resident and against itself,
+        // preserving first-seen order, so we fetch each distinct hash once.
+        let mut seen: HashMap<ContentHash, ()> = HashMap::new();
+        let mut to_fetch: Vec<ContentHash> = Vec::new();
+        for hash in frontier {
+            if pages.contains_key(&hash) {
+                continue;
             }
-            .into());
-        }
-        // Parse to discover the page's child pages, then keep the raw bytes
-        // (descent re-parses from them through the PageSource).
-        let page = Page::parse(bytes.as_ref())?;
-        for child in page.referenced_pages() {
-            if !pages.contains_key(&child) {
-                frontier.push(child);
+            if seen.insert(hash, ()).is_none() {
+                to_fetch.push(hash);
             }
         }
-        pages.insert(hash, bytes.to_vec());
+        if to_fetch.is_empty() {
+            break;
+        }
+        // Fetch every distinct page of this level concurrently.
+        let fetched = try_join_all(to_fetch.iter().map(|h| async move {
+            let (bytes, _meta) = storage.get(&page_uri(h)).await?;
+            Ok::<_, OpannStoreError>((*h, bytes))
+        }))
+        .await?;
+        let mut next_frontier: Vec<ContentHash> = Vec::new();
+        for (hash, bytes) in fetched {
+            let actual = ContentHash::of(bytes.as_ref());
+            if actual != hash {
+                return Err(PageError::ContentHashMismatch {
+                    expected: hash.to_hex(),
+                    actual: actual.to_hex(),
+                }
+                .into());
+            }
+            // Parse to discover the page's child pages, then keep the raw bytes
+            // (descent re-parses from them through the PageSource).
+            let page = Page::parse(bytes.as_ref())?;
+            for child in page.referenced_pages() {
+                if !pages.contains_key(&child) {
+                    next_frontier.push(child);
+                }
+            }
+            pages.insert(hash, bytes.to_vec());
+        }
+        frontier = next_frontier;
     }
     Ok(ResidentPageSource::from_pages(pages))
 }

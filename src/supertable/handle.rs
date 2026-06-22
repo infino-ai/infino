@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
@@ -41,6 +41,7 @@ use crate::{
     storage::PrefixedStorageProvider,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
+        opann::store,
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -60,6 +61,14 @@ use crate::{
 #[derive(Clone)]
 pub struct Supertable {
     inner: Arc<SupertableInner>,
+}
+
+/// A loaded OPANN routing tree kept resident across queries, tagged with the
+/// routing-root hash it was loaded for so a commit that changes the root
+/// invalidates it.
+pub(super) struct OpannResident {
+    pub(super) root: crate::supertable::manifest::part::ContentHash,
+    pub(super) source: Arc<crate::supertable::opann::paged::ResidentPageSource>,
 }
 
 /// Internal shared state. Every `Supertable` clone holds one Arc
@@ -151,6 +160,10 @@ pub(super) struct SupertableInner {
     /// One-shot partition strategy for the next hidden-index commit
     /// (synced from the user table's trained global centroids).
     pub(super) pending_partition_strategy: Mutex<Option<super::manifest::list::PartitionStrategy>>,
+    /// Resident OPANN routing tree, loaded once per routing-root and reused
+    /// across queries — the compute-resident routing layer. `None` until first
+    /// load / for tables without an OPANN tree.
+    pub(super) opann_resident: ArcSwapOption<OpannResident>,
 }
 
 impl Drop for SupertableInner {
@@ -954,7 +967,7 @@ fn build_vector_index_options(
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
         .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD)
-        .as_hidden_vector_index();
+        .mark_hidden_vector_index();
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
@@ -983,8 +996,21 @@ async fn build_handle(
         vector_index_table,
         last_pointer_check: Mutex::new(None),
         pending_partition_strategy: Mutex::new(None),
+        opann_resident: ArcSwapOption::empty(),
     });
     install_disk_cache_pinning(&inner);
+    // Warm the resident OPANN routing tree once at open so the first vector
+    // query doesn't pay the (parallel, but still object-store) load. Best-effort:
+    // a load error just leaves the cache empty and the query path retries.
+    if let (Some(routing), Some(storage)) =
+        (inner.manifest.load().opann_routing().cloned(), inner.options.storage.clone())
+        && let Ok(source) = store::load_resident(storage.as_ref(), routing.root_page).await
+    {
+        inner.opann_resident.store(Some(Arc::new(OpannResident {
+            root: routing.root_page,
+            source: Arc::new(source),
+        })));
+    }
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
         let _ = st.run_recovery_sweep_once().await;
@@ -1175,6 +1201,14 @@ impl SupertableReader {
             tombstone_cache,
             inner,
         }
+    }
+
+    /// The shared `Arc<SupertableInner>` backing this reader. `pub(super)`
+    /// so query modules in `crate::supertable` can reach shared, snapshot-
+    /// independent state (e.g. the resident OPANN routing tree cache) without
+    /// widening `SupertableInner` past the `supertable` module.
+    pub(super) fn inner(&self) -> &Arc<SupertableInner> {
+        &self.inner
     }
 
     /// Per-supertable configuration for this reader's snapshot.

@@ -702,7 +702,7 @@ impl SupertableOptions {
     /// `build_vector_index_options`). The compaction dispatch reads this to
     /// consolidate by re-clustering (`recluster_cells`) instead of the user
     /// index-aligned IVF merge.
-    pub(crate) fn as_hidden_vector_index(mut self) -> Self {
+    pub(crate) fn mark_hidden_vector_index(mut self) -> Self {
         self.is_hidden_vector_index = true;
         self
     }
