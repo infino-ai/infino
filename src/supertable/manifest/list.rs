@@ -659,9 +659,15 @@ impl VectorSummaryAgg {
                 + other_center[i] * other.n_vectors as f32)
                 / n_total;
         }
-        let self_reach = l2_distance(&self_center, &new_center) + self.envelope_radius;
-        let other_reach = l2_distance(&other_center, &new_center) + other.envelope_radius;
         self.centroid_envelope = encode_centroid_envelope(&new_center);
+        // Reach bounds measured against the DECODED (stored) center so the
+        // merged ball still encloses both inputs after Sq8+ε quantization.
+        let center = {
+            let d = decode_centroid_envelope(&self.centroid_envelope);
+            if d.len() == new_center.len() { d } else { new_center }
+        };
+        let self_reach = l2_distance(&self_center, &center) + self.envelope_radius;
+        let other_reach = l2_distance(&other_center, &center) + other.envelope_radius;
         // Saturate rather than wrap: this count only weights the running mean,
         // so pinning at u32::MAX past the (practically unreachable) overflow is
         // safe, whereas a silent wrap to a tiny value would skew the centroid.

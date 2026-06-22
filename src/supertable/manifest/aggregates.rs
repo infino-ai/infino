@@ -35,7 +35,7 @@ use std::{
 
 use crate::supertable::manifest::{
     SuperfileEntry,
-    encoding::{encode_centroid_envelope, l2_distance},
+    encoding::{decode_centroid_envelope, encode_centroid_envelope, l2_distance},
     list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
 };
 
@@ -176,13 +176,20 @@ fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Ve
         // normalized centroids is equivalent to L2 distance).
         // Conservative: a metric-specific tightening is a
         // follow-up optimization.
+        // Store the center Sq8+residual, then size the radius against the
+        // DECODED center — the query-time prune uses the decoded center, so the
+        // ball must enclose every superfile relative to *that* point, not the
+        // exact fp32 mean (quantization only ever loosens it).
+        let centroid_envelope = encode_centroid_envelope(&mean_f32);
+        let center = {
+            let d = decode_centroid_envelope(&centroid_envelope);
+            if d.len() == first_dim { d } else { mean_f32 }
+        };
         let mut envelope_radius: f32 = 0.0;
         for (centroid, radius) in &entries {
-            let dist = l2_distance(centroid, &mean_f32);
+            let dist = l2_distance(centroid, &center);
             envelope_radius = envelope_radius.max(dist + radius);
         }
-
-        let centroid_envelope = encode_centroid_envelope(&mean_f32);
         out.insert(
             col,
             VectorSummaryAgg {
