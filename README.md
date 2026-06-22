@@ -40,7 +40,7 @@ uv pip install infino
 **Node.js**
 
 ```sh
-npm install infino
+npm install @infino-ai/infino
 ```
 
 **Rust**
@@ -109,7 +109,7 @@ billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  #
 **Node.js**
 
 ```javascript
-import { connect, IndexSpec } from "infino";
+import { connect, IndexSpec } from "@infino-ai/infino";
 
 // A knowledge base your agent retrieves over. "memory://" is in-process;
 // use "./data" or "s3://bucket/prefix" to persist.
@@ -402,7 +402,7 @@ reviewed as a contract change in the same pull request.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
 - **Bindings version independently.** The Python (`pip install infino`)
-  and Node (`npm install infino`) packages are versioned on their own
+  and Node (`npm install @infino-ai/infino`) packages are versioned on their own
   SemVer lines — each embeds its own copy of the engine, so a binding
   version need not match this crate's. See
   [`docs/versioning.md`](https://github.com/infino-ai/infino/blob/main/docs/versioning.md).

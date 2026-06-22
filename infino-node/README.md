@@ -21,7 +21,7 @@ for an apache-arrow `Table` instead.
 ## Install
 
 ```sh
-npm install infino
+npm install @infino-ai/infino
 ```
 
 A prebuilt native binary is selected automatically at install time — no Rust
@@ -39,7 +39,7 @@ toolchain required. Supported platforms:
 ## Quickstart
 
 ```javascript
-import { connect, IndexSpec } from "infino";
+import { connect, IndexSpec } from "@infino-ai/infino";
 
 // Connect to a catalog. Use a local path or an S3 URI for durable storage;
 // "memory://" is ephemeral and handy for tests.
@@ -70,7 +70,7 @@ const semantic = docs.vectorSearch("embedding", embed(0), 5);                  /
 const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'");  // SQL filter
 ```
 
-CommonJS works too — `const { connect, IndexSpec } = require("infino");`.
+CommonJS works too — `const { connect, IndexSpec } = require("@infino-ai/infino");`.
 
 ## Examples
 
