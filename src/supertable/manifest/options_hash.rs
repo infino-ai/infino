@@ -124,6 +124,10 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
                 buf.extend_from_slice(b);
             }
         }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            push_tag(&mut buf, b"ingestion_time");
+            buf.extend_from_slice(&granularity_secs.to_le_bytes());
+        }
     }
 
     let h = blake3::hash(&buf);
