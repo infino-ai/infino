@@ -299,8 +299,11 @@ impl StorageProvider for S3StorageProvider {
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
         // etag and bytes are atomically paired in the same response, so
-        // no follow-up HEAD is needed.
-        retry::with_reissue(|| async {
+        // no follow-up HEAD is needed. `complete_get` re-issues if the
+        // streamed body comes back shorter than the response's declared size
+        // (a dropped socket can surface as a truncated-but-successful body),
+        // so callers never hash or parse a partial object.
+        retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
