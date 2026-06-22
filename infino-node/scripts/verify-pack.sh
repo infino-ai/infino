@@ -45,8 +45,12 @@ case "$PLATFORM" in
         TRIPLE="linux-${ARCH}-musl"
       else
         # process.report unavailable — fall back to an authoritative libc probe.
-        # (Capture ldd's output first: musl's `ldd --version` exits non-zero, which
-        # `set -o pipefail` would otherwise treat as "no match".)
+        if ! command -v ldd >/dev/null 2>&1; then
+          echo "verify-pack: could not determine libc for linux-${ARCH}: ldd is unavailable" >&2
+          exit 1
+        fi
+        # Capture ldd's output first: musl's `ldd --version` exits non-zero, which
+        # `set -o pipefail` would otherwise treat as "no match".
         ldd_out="$(ldd --version 2>&1 || true)"
         if printf '%s' "$ldd_out" | grep -qi musl; then
           TRIPLE="linux-${ARCH}-musl"
