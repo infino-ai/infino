@@ -29,11 +29,10 @@
 **Python**
 
 ```sh
-# Install from TestPyPI.
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+pip install infino
 
 # Or with uv (https://docs.astral.sh/uv/):
-uv pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+uv pip install infino
 ```
 
 **Node.js**

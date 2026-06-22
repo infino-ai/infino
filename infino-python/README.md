@@ -199,15 +199,15 @@ matches must equal the number of rows you supply, otherwise it raises.
 Both methods return a `MutationStats` with `matched`, `n_tombstoned`, and
 `n_not_found`.
 
-## Compaction
+## Optimization
 
-Many small appends produce many small files. `compact` merges small or
+Many small appends produce many small files. `optimize` merges small or
 underfilled files into larger ones, which keeps reads efficient.
 
 ```python
-docs.compact()                                              # engine defaults
-docs.compact(infino.CompactOptions(target_superfile_size_mb=256,
-                                   min_fill_percent=50))
+docs.optimize()                                             # engine defaults
+docs.optimize(infino.OptimizeOptions(target_superfile_size_mb=256,
+                                     min_fill_percent=50))
 ```
 
 ## Storage backends
@@ -281,10 +281,10 @@ db = infino.connect(
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
   - `delete(predicate) -> MutationStats`
   - `update(predicate, new_rows) -> MutationStats`
-  - `compact(settings=None)`
+  - `optimize(settings=None)`
   - `schema() -> pyarrow.Schema`
 - `IndexSpec().fts(column).vector(column, dim, n_cent, metric)`
-- `CompactOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
+- `OptimizeOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
 - `MutationStats` — returned by `delete` / `update`; read-only attributes `matched`, `n_tombstoned`, `n_not_found`
 
 ## Building from source
