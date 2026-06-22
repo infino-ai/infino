@@ -124,9 +124,12 @@ python-wheel:
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
-# Build the bindings from source, install the examples' deps, and run every
-# notebook with nbconvert (a failing cell fails the target). Scratch tables are
-# cleaned afterwards; the venv is a reused throwaway (gitignored).
+# Concurrent example notebooks; lower it on smaller runners.
+CONCURRENT_EXAMPLE_TESTS ?= 4
+
+# Build the bindings from source and execute every example notebook (a failing
+# cell fails the target). Notebooks run in parallel — each uses a distinct
+# scratch dir. The venv is a reused throwaway (gitignored).
 python-examples-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
@@ -135,13 +138,15 @@ python-examples-test:
 	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
-	@status=0; \
-	for nb in infino-python/examples/[0-9]*.ipynb; do \
-		echo "executing $$nb"; \
-		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
-			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
-	done; \
-	rm -rf infino-python/examples/*_data infino-python/examples/_shared/__pycache__; \
+	# Warm the shared embedding model so parallel workers don't race the download.
+	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
+		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
+	@ls infino-python/examples/*/[0-9]*.ipynb | \
+	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
+		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \
+	status=$$?; \
+	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
 	exit $$status
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded

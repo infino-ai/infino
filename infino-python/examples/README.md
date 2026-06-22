@@ -1,16 +1,21 @@
-# Infino RAG examples
+# Infino examples
 
-End-to-end Retrieval-Augmented Generation examples built on
-[Infino](https://pypi.org/project/infino/) — one engine that runs **SQL,
-full-text (BM25), and vector search** over a single copy of your data, stored as
-Apache Parquet on local disk or object storage. No separate vector database to
-run or keep in sync.
+Runnable examples built on [Infino](https://pypi.org/project/infino/) — one
+engine that runs **SQL, full-text (BM25), and vector search** over a single copy
+of your data, stored as Apache Parquet on local disk or object storage. No
+separate vector database to run or keep in sync.
 
 Each example uses a **real public dataset** (pulled from the HuggingFace Hub)
-and runs **locally and key-free** — embeddings are computed on-device with
-`sentence-transformers` and the index lives on local disk. Generating an answer
-with an LLM is optional (see [below](#optional-llm-answers)); without one, the
-examples print the retrieved context.
+and runs **locally and key-free**.
+
+## Categories
+
+| Folder | What it covers |
+| ------ | -------------- |
+| [`rag/`](rag/) | Retrieval-Augmented Generation — chunk, embed, retrieve (vector / hybrid / filtered / conversational) and ground an answer |
+| [`code_search/`](code_search/) | Code search — exact symbol lookup, natural-language (vector), keyword (BM25), and hybrid search over one table |
+| [`analytics/`](analytics/) | SQL analytics + full-text — `GROUP BY` time-series, top-N, and leaderboards alongside BM25 search, no vector index |
+| [`inventory/`](inventory/) | Mutable data — keep a live inventory current with `update` / `delete` / `optimize`, durable across reconnect |
 
 ## Setup
 
@@ -36,42 +41,19 @@ To generate answers (not just retrieve context), configure either backend —
 
 Keep credentials in an untracked env file — never commit keys.
 
-## Examples
-
-Run them in order — each builds on the last.
-
-| # | Example | What it shows | Dataset |
-| - | ------- | ------------- | ------- |
-| 1 | [`01_rag_pdf.ipynb`](01_rag_pdf.ipynb) | The canonical RAG pipeline — chunk, embed, vector-retrieve, ground an answer | arXiv papers |
-| 2 | [`02_hybrid_rag.ipynb`](02_hybrid_rag.ipynb) | **Hybrid search** — BM25 + vector fused in one SQL call, scored against ground-truth labels | MS MARCO |
-| 3 | [`03_filtered_rag.ipynb`](03_filtered_rag.ipynb) | **Filtered & multi-tenant** retrieval — vector search + `WHERE` filters and a keyword pushdown | Amazon product catalog |
-| 4 | [`04_chat_rag.ipynb`](04_chat_rag.ipynb) | **Conversational RAG** — multi-turn chat with memory, per-turn hybrid retrieval, cited sources | Wikipedia |
-
-## Why one engine
-
-The same Infino table is simultaneously full-text searchable, vector searchable,
-and SQL-queryable — over the same rows, one consistency model. So hybrid
-retrieval and metadata filters run in **one SQL statement** against one copy of
-the data, instead of being stitched together across a database, a search
-cluster, and a vector store that you keep in sync.
-
-## Scaling
-
-The examples use small samples (100–1,200 rows) so they finish in seconds. To go
-bigger, raise the `n` argument in the `load_*` calls. Embedding is the main cost
-on a laptop (a few minutes per ~100k chunks on CPU) — batch it or switch to a
-hosted embedder for large corpora. Infino itself indexes and queries millions of
-rows; the data lives on disk (or object storage), not in RAM.
-
 ## Shared helpers
 
-`_shared/` holds the small pieces every example reuses:
+`_shared/` holds the small pieces every example reuses (it lives at the
+`examples/` root and is shared across all categories):
 
 - `embedding.py` — local `all-MiniLM-L6-v2` embeddings (384-dim, cosine)
 - `chunking.py` — fixed-size, overlapping text chunker
 - `loaders.py` — loaders for the real corpora above (HuggingFace Hub)
 - `sql.py` — tiny SQL helpers (literal quoting, empty-safe query)
 - `llm.py` — optional answer generation (Azure AI Foundry or OpenAI)
+
+Notebooks live one level down (e.g. `rag/`) and add the `examples/` root to
+`sys.path` in their first code cell so `from _shared.… import …` resolves.
 
 To use a hosted embedder instead of the local model, update the `embed` /
 `embed_query` bodies in `embedding.py` and set `DIM` / `METRIC` to match the new
