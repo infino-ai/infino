@@ -94,7 +94,10 @@ use uuid::Uuid;
 use crate::{
     superfile::{
         LazyByteSource,
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{
+            reader::BoolMode,
+            tokenize::{Tokenizer, unique_tokens},
+        },
     },
     supertable::{
         SuperfileEntry,
@@ -1196,12 +1199,10 @@ fn collect_in_list_leaves(
             if fts_cols.contains(c.name.as_str())
                 && let Some(tok) = tokenizer
             {
-                let terms: Vec<String> = values
-                    .iter()
-                    .filter_map(scalar_as_str)
-                    .flat_map(|s| tok.tokenize(s))
-                    .collect();
-
+                // One deduped term set across all values — a word shared
+                // by several values (e.g. 'Orange Juice', 'Apple Juice'
+                // → one `juice`) is probed once.
+                let terms = unique_tokens(tok, values.iter().filter_map(scalar_as_str));
                 if !terms.is_empty() {
                     // one bloom leaf holding all the values' tokens
                     out.push(PruneLeaf::TermPresence {
@@ -1547,8 +1548,9 @@ mod tests {
         let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
         let fts = HashSet::from(["title"]);
         let tok = AsciiLowerTokenizer;
-        // 'Foo Bar' → [foo, bar]; 'baz' → [baz].
-        let expr = col("title").in_list(vec![lit("Foo Bar"), lit("baz")], false);
+        // 'Foo Bar' → [foo, bar]; 'Bar Baz' → [bar, baz]. The shared `bar`
+        // is deduped, and the terms come out sorted-unique.
+        let expr = col("title").in_list(vec![lit("Foo Bar"), lit("Bar Baz")], false);
         let leaves = exprs_to_in_list_leaves(&[expr], &s, &fts, Some(&tok));
 
         assert!(
@@ -1572,7 +1574,8 @@ mod tests {
         assert_eq!(mode, BoolMode::Or);
         assert_eq!(
             terms,
-            &vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
+            &vec!["bar".to_string(), "baz".to_string(), "foo".to_string()],
+            "tokens are deduped (shared `bar`) and sorted"
         );
     }
 

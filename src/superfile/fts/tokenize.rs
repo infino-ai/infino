@@ -22,6 +22,7 @@
 use std::{
     any::Any,
     borrow::Cow,
+    collections::BTreeSet,
     str::{from_utf8, from_utf8_unchecked},
 };
 
@@ -109,6 +110,21 @@ pub trait Tokenizer: Send + Sync + 'static {
         }
         parsed
     }
+}
+
+/// Tokenize several `texts` into one sorted, de-duplicated term list.
+/// For building a single term set from many values (e.g. an `IN` list)
+/// where a word shared across values must be probed only once.
+pub(crate) fn unique_tokens<'a>(
+    tok: &dyn Tokenizer,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    texts
+        .into_iter()
+        .flat_map(|t| tok.tokenize(t))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// ASCII whitespace + punctuation split, ASCII lowercase, no stemming,
@@ -458,6 +474,14 @@ mod tests {
     #[test]
     fn single_token_lowercased() {
         assert_eq!(tokens("Hello"), vec!["hello"]);
+    }
+
+    #[test]
+    fn unique_tokens_dedups_and_sorts_across_values() {
+        let tok = AsciiLowerTokenizer;
+        // values share 'juice'; result is one sorted set, no repeat
+        let got = unique_tokens(&tok, ["Orange Juice", "Apple Juice"]);
+        assert_eq!(got, vec!["apple", "juice", "orange"]);
     }
 
     #[test]
