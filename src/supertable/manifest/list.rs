@@ -123,6 +123,9 @@ pub enum PartitionStrategy {
         column: String,
         boundaries: Vec<Vec<u8>>,
     },
+    IngestionTime {
+        granularity_secs: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -779,6 +782,9 @@ enum PartitionStrategyDto {
         column: String,
         boundaries: Vec<String>, // base64 per boundary
     },
+    IngestionTime {
+        granularity_secs: i64,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1086,6 +1092,11 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
             }
         }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            PartitionStrategyDto::IngestionTime {
+                granularity_secs: *granularity_secs,
+            }
+        }
     }
 }
 
@@ -1110,6 +1121,9 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
                 column,
                 boundaries: bs,
             }
+        }
+        PartitionStrategyDto::IngestionTime { granularity_secs } => {
+            PartitionStrategy::IngestionTime { granularity_secs }
         }
     })
 }

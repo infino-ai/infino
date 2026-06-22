@@ -134,9 +134,6 @@ const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
-/// Default hash-partition bucket count — a single bucket, which is
-/// observationally "no partitioning".
-const DEFAULT_PARTITION_N_BUCKETS: u32 = 1;
 
 /// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
@@ -573,9 +570,8 @@ impl SupertableOptions {
     pub fn effective_partition_strategy(&self) -> PartitionStrategy {
         self.partition_strategy
             .clone()
-            .unwrap_or_else(|| PartitionStrategy::Hash {
-                column: self.id_column.clone(),
-                n_buckets: DEFAULT_PARTITION_N_BUCKETS,
+            .unwrap_or(PartitionStrategy::IngestionTime {
+                granularity_secs: 86_400,
             })
     }
 
@@ -1427,14 +1423,13 @@ supertable:
     }
 
     #[test]
-    fn effective_partition_strategy_defaults_to_single_bucket_hash() {
+    fn effective_partition_strategy_defaults_to_ingestion_time() {
         let opts = plain_opts();
         match opts.effective_partition_strategy() {
-            PartitionStrategy::Hash { column, n_buckets } => {
-                assert_eq!(column, "_id");
-                assert_eq!(n_buckets, DEFAULT_PARTITION_N_BUCKETS);
+            PartitionStrategy::IngestionTime { granularity_secs } => {
+                assert_eq!(granularity_secs, 86_400);
             }
-            other => panic!("expected single-bucket Hash, got {other:?}"),
+            other => panic!("expected IngestionTime with 1-day granularity, got {other:?}"),
         }
     }
 
