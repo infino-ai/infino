@@ -127,3 +127,7 @@ references in [`docs/architecture/`](docs/architecture/) —
 and single-file reader/builder) and
 [`supertable.md`](docs/architecture/supertable.md) (the in-memory
 cross-superfile query and manifest layer).
+
+For how the Rust crate, Node, and Python package versions relate (the
+`major.minor` lockstep, independent patches, pre-1.0 policy), see
+[`docs/versioning.md`](docs/versioning.md).

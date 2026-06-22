@@ -36,6 +36,13 @@
   ],
   "main": "infino/index.js",
   "types": "infino/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./infino/index.d.ts",
+      "default": "./infino/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "napi": {
     "name": "infino",
     "triples": {
