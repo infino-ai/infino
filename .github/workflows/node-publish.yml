@@ -4,12 +4,16 @@ name: Node publish
 # thin `infino` package plus its per-platform binary packages (`infino-<triple>`)
 # to npm.
 #
-# Triggered manually. The default run is a dry run: it packs and validates the
-# main package and every platform package without uploading anything. Re-run
-# with dry_run unchecked to publish for real. A real run needs the NPM_TOKEN
+# Triggered two ways: (1) a `v<version>` tag pushes a real publish as part of a
+# coordinated release (crate + Node + Python) — the version comes from
+# package.json and a guard asserts it matches the tag; (2) a manual run
+# (workflow_dispatch) defaults to a dry run — pack + validate, upload nothing —
+# re-run with dry_run unchecked to publish. A real run needs the NPM_TOKEN
 # secret, with publish rights to the packages under the infino-ai org.
 
 on:
+  push:
+    tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -124,6 +128,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # On a tag push the published version comes from package.json — assert it
+      # matches the tag so a coordinated release can't ship a mismatched version.
+      - name: Check package.json version matches tag
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(jq -r .version infino-node/package.json)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match infino-node/package.json version $pkg"
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -151,7 +166,7 @@ jobs:
       - name: Stage binaries into platform packages
         run: cd infino-node && npm run artifacts
       - name: Validate (dry run)
-        if: ${{ inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release --dry-run
@@ -162,7 +177,7 @@ jobs:
       # includes a higher version, so npm won't move the latest tag onto
       # 0.1.0 implicitly. Passing it explicitly sets latest to the engine.
       - name: Publish to npm
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release
