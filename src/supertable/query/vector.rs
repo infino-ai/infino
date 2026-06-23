@@ -92,7 +92,10 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        manifest::{
+            Manifest, SuperfileEntry, SuperfileUri,
+            list::{CellRoutingParams, PartitionStrategy},
+        },
         tombstones::SidecarCache,
     },
 };
@@ -113,6 +116,26 @@ pub struct VectorFilter<'a> {
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
+}
+
+/// Apply query-time diagnostic overrides to the persisted cell-routing params.
+/// `INFINO_CELL_NPROBE_MAX` caps (or sets) the adaptive probe ceiling without
+/// rebuilding the index — set it equal to the nprobe floor to disable adaptive
+/// expansion ("use the hint"), or sweep it to trade fan-out against recall.
+/// Read once and cached.
+fn routing_with_env_overrides(mut routing: CellRoutingParams) -> CellRoutingParams {
+    use std::sync::OnceLock;
+    static NPROBE_MAX: OnceLock<Option<usize>> = OnceLock::new();
+    let override_max = *NPROBE_MAX.get_or_init(|| {
+        std::env::var("INFINO_CELL_NPROBE_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    });
+    if let Some(n) = override_max {
+        routing.nprobe_max = n.max(routing.nprobe_min);
+    }
+    routing
 }
 
 fn filter_superfiles_by_cells(
@@ -936,7 +959,7 @@ impl SupertableReader {
                             vit_metric,
                             query,
                             options.resolve(false).0,
-                            routing,
+                            routing_with_env_overrides(routing),
                         );
                         // Always scan the "incoming" append region in addition
                         // to the nprobe-routed cells: those rows have not been

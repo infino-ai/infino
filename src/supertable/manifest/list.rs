@@ -52,7 +52,12 @@ pub const FORMAT_VERSION: &str = "1.0";
 /// recall floor before the radius-aware threshold widens the probe set.
 const DEFAULT_CELL_NPROBE_MIN: usize = 4;
 /// Default hard cap on cells probed per query (bounds the object-store GET fan).
-const DEFAULT_CELL_NPROBE_MAX: usize = 64;
+/// Held at the nprobe floor so adaptive expansion is off by default: with the
+/// current (poorly-separated, large-radius) cells the radius-aware threshold
+/// otherwise widens to ~all cells, fanning every query out across the whole
+/// index. Raise it (or `INFINO_CELL_NPROBE_MAX`) once cells separate well
+/// enough that a few probes recall the neighbors.
+const DEFAULT_CELL_NPROBE_MAX: usize = 8;
 /// Default margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
 const DEFAULT_CELL_SLACK: f32 = 1.0;
 
