@@ -1,5 +1,4 @@
 {
-  "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "Infino",
   "description": "Embedded retrieval engine — SQL, full-text (BM25), and vector search over one copy of your data on object storage, running in-process with no server.",
   "url": "https://context7.com/infino-ai/infino",
