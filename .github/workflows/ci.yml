@@ -292,19 +292,19 @@ jobs:
   # Informational benchmark — superfile + supertable tiers, one in-region
   # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
   # On merge to main: publish the run as that baseline + a per-commit history
-  # point. Same-repo only (fork PRs can't use the Azure OIDC secrets).
+  # point. Fork PRs are gated on maintainer approval (see `is_fork_pr`).
   bench:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false # one member failing must not cancel the other
       matrix:
-        # `suffix` makes each leg's Azure resources unique — both legs
-        # share one run_id, so without it they'd collide / cross-delete.
+        # One supertable modality per leg, each on its own VM with its own
+        # baseline and PR comment. `suffix` keeps every leg's Azure resources,
+        # VM name, and comment marker unique (all legs share one run_id).
         include:
-          - { bench: superfile, docs: "1000000", suffix: sf }
-          - { bench: supertable, docs: "1000000", suffix: st }
+          - { bench: superfile,         docs: "1000000", suffix: sf }
+          - { bench: supertable_fts,    docs: "1000000", suffix: st-fts }
+          - { bench: supertable_vector, docs: "1000000", suffix: st-vec }
+          - { bench: supertable_sql,    docs: "1000000", suffix: st-sql }
     # PR: a new push cancels the in-flight run. main: serialize per bench so
     # concurrent merges don't race the baseline blob (never cancel).
     concurrency:
@@ -324,4 +324,6 @@ jobs:
       name_suffix: -${{ matrix.suffix }}
       update_baseline: ${{ github.event_name == 'push' }}
       pr_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      # Fork PR ⇒ gate on maintainer approval before secrets are exposed.
+      is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     secrets: inherit

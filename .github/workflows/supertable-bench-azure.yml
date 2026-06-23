@@ -14,7 +14,7 @@ on:
         required: false
         default: supertable_all
         type: choice
-        options: [superfile, supertable, supertable_all, fts, vector, combined, sql, all]
+        options: [superfile, supertable, supertable_all, supertable_fts, supertable_vector, supertable_sql, all]
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
@@ -88,6 +88,8 @@ on:
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs main to flag in the PR comment; smaller is noise.
       noise_threshold_pct: { type: string, required: false, default: "10" }
+      # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
+      is_fork_pr:      { type: boolean, required: false, default: false }
 
 permissions:
   id-token: write       # Azure OIDC federated login
@@ -111,10 +113,11 @@ env:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    # Run under the `ci` environment so the OIDC subject is
-    # repo:…:environment:ci — branch-independent, so one federated
-    # credential authorizes runs from any branch.
-    environment: ci
+    # `ci`: same-repo, no gate. `bench`: required reviewers, so a maintainer
+    # approves before secrets reach fork code. The env name is the OIDC
+    # subject (repo:…:environment:<name>) — each needs its own Azure
+    # federated credential.
+    environment: ${{ inputs.is_fork_pr && 'bench' || 'ci' }}
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
@@ -130,20 +133,18 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # All benches live in the single `bench` cargo target; cells are
-          # selected with positional tokens (`<tier> <modality> [phase]`).
-          # Map the legacy `bench` input vocabulary to (a) the binary's
-          # args and (b) the report JSONs (target/infino-bench/<name>.json)
-          # used for baseline restore / publish.
+          # Map the `bench` input to (a) the cargo bench target's positional
+          # cell selectors and (b) the report JSONs it emits
+          # (target/infino-bench/<name>.json) for baseline restore / publish.
+          # The supertable_* tokens select one cell each: CI fans them out
+          # one-per-VM so a modality's numbers stay isolated.
           case "${{ inputs.bench }}" in
-            superfile)      args="superfile";             reports="superfile_fts superfile_vector sql" ;;
-            supertable)     args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
-            supertable_all) args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
-            fts)            args="supertable fts";        reports="supertable supertable_fts" ;;
-            vector)         args="supertable vector";     reports="supertable supertable_vector" ;;
-            combined)       args="supertable fts vector"; reports="supertable supertable_fts supertable_vector" ;;
-            sql)            args="superfile sql";         reports="sql" ;;
-            all)            args="all";                   reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
+            superfile)                 args="superfile";         reports="superfile_fts superfile_vector sql" ;;
+            supertable|supertable_all) args="supertable";        reports="supertable supertable_fts supertable_vector supertable_sql" ;;
+            supertable_fts)            args="supertable fts";    reports="supertable_fts" ;;
+            supertable_vector)         args="supertable vector"; reports="supertable_vector" ;;
+            supertable_sql)            args="supertable sql";    reports="supertable_sql" ;;
+            all)                       args="all";               reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
             *) echo "::error::unknown bench ${{ inputs.bench }}"; exit 1 ;;
           esac
           echo "args=$args"       >> "$GITHUB_OUTPUT"
@@ -361,8 +362,9 @@ jobs:
           REMOTE
 
       # Publish the metrics as the latest-main pointer (overwritten, what PRs
-      # diff against) and an immutable per-commit history blob (the trend).
-      # Runs only on a successful bench, so a broken run never poisons it.
+      # diff against) plus an immutable per-commit history blob retained for
+      # archival. Runs only on a successful bench, so a broken run never
+      # poisons it.
       - name: Publish baseline + history
         # success() is implicit, but explicit here: never publish from a
         # failed/partial bench run.
@@ -408,102 +410,6 @@ jobs:
             fi
             echo "published: $j ($SHA)"
           done
-
-      # Render latency / memory / throughput trends over the last (≤10) main
-      # commits as Mermaid charts in the run summary. Best-effort: a fetch
-      # hiccup drops a point but never fails the step.
-      - name: Render trend charts
-        if: ${{ inputs.update_baseline && success() }}
-        env:
-          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
-          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
-          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
-          VM_SIZE: ${{ inputs.vm_size }}
-          DOCS: ${{ inputs.docs }}
-          # Reports this run produced — also the history-blob basenames each
-          # series reads from. A series renders only if its report is here.
-          REPORTS: ${{ steps.resolve.outputs.reports }}
-        run: |
-          set -uo pipefail
-          SUMMARY="$GITHUB_STEP_SUMMARY"
-
-          # One row per chart, tab-separated:
-          #   section <TAB> report <TAB> metric-key <TAB> divisor <TAB> unit <TAB> title
-          # The divisor maps the stored raw value into the chart unit:
-          #   latency ns → ms (1000000), bytes → MiB (1048576), docs/s raw (1).
-          # Keys come from the per-modality reports the bench emits today; the
-          # retired consolidated `supertable` report is not used. Cost
-          # (queries/$) keys are excluded — they embed volatile text (heap
-          # size, probe params), so the key changes per commit and can't trend.
-          # The leading indent on each row is a YAML block-scalar artifact and
-          # is stripped once, below.
-          series=$'Latency — warm search (ms)\tsupertable_vector\tbench/vector/supertable/search||default|warm\t1000000\tms\tSupertable vector warm search
-          Latency — warm search (ms)\tsupertable_sql\tbench/sql/supertable/warm|Search table functions (bm25 / vector / hybrid / token / exact)|bm25_search|p50\t1000000\tms\tSupertable SQL bm25_search p50
-          Latency — warm search (ms)\tsupertable_sql\tbench/sql/supertable/warm|Search table functions (bm25 / vector / hybrid / token / exact)|vector_search|p50\t1000000\tms\tSupertable SQL vector_search p50
-          Latency — warm search (ms)\tsupertable_sql\tbench/sql/supertable/warm|Search table functions (bm25 / vector / hybrid / token / exact)|hybrid_search|p50\t1000000\tms\tSupertable SQL hybrid_search p50
-          Latency — warm search (ms)\tsuperfile_vector\tbench/vector/superfile/search||default|warm\t1000000\tms\tSuperfile vector warm search
-          Memory — P90 RSS (MiB)\tsupertable_fts\tbench/fts/supertable/ingest||FTS-only|P90 RSS\t1048576\tMiB\tSupertable FTS ingest
-          Memory — P90 RSS (MiB)\tsupertable_vector\tbench/vector/supertable/ingest||vector-only|P90 RSS\t1048576\tMiB\tSupertable vector ingest
-          Memory — P90 RSS (MiB)\tsql\tbench/sql/build||1 writer|P90 RSS\t1048576\tMiB\tSQL 1-writer build
-          Memory — P90 RSS (MiB)\tsql\tbench/sql/query|Search table functions (bm25 / vector / hybrid / token / exact)|bm25_search|P90 RSS\t1048576\tMiB\tSQL bm25_search
-          Throughput — ingest (docs/s)\tsupertable_fts\tbench/fts/supertable/ingest||FTS-only|Throughput\t1\tdocs/s\tSupertable FTS ingest
-          Throughput — ingest (docs/s)\tsupertable_vector\tbench/vector/supertable/ingest||vector-only|Throughput\t1\tdocs/s\tSupertable vector ingest'
-          series="$(printf '%s\n' "$series" | sed 's/^[[:space:]]*//')"
-
-          printf '## Trends (last 10 main commits)\n' >> "$SUMMARY"
-
-          # Guard against series/report drift: if no row matches REPORTS the
-          # section would be silently empty (the bug that hid the broken gate).
-          matched=0
-          last_section=""
-
-          # FDs 3/4 keep the loop input clear of the az calls' own stdin reads.
-          while IFS=$'\t' read -r -u 3 section report key divisor unit title; do
-            case " $REPORTS " in *" $report "*) ;; *) continue ;; esac
-            matched=$((matched + 1))
-            if [ "$section" != "$last_section" ]; then
-              printf '### %s\n' "$section" >> "$SUMMARY"
-              last_section="$section"
-            fi
-
-            # Last ≤10 history points for this metric, ordered oldest→newest
-            # by commit time; keep only the name and short sha of each.
-            blobs="$(az storage blob list -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
-                       --prefix "bench/${report}/history/${VM_SIZE}-${DOCS}-" --include m \
-                       --query "[].{name:name, ts:metadata.ts, sha:metadata.sha}" -o tsv 2>/dev/null \
-                     | sort -k2 -n | tail -10)"
-
-            labels=(); values=(); points=0
-            while IFS=$'\t' read -r -u 4 name _ sha; do
-              [ -n "$name" ] || continue
-              az storage blob download -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
-                -n "$name" -f /tmp/point.json -o none 2>/dev/null || continue
-              value="$(jq -r --arg k "$key" '.[$k] // empty' /tmp/point.json)"
-              [ -n "$value" ] || continue
-              labels+=("${sha:0:7}")
-              values+=("$(awk -v v="$value" -v d="$divisor" 'BEGIN{printf "%g", v / d}')")
-              points=$((points + 1))
-            done 4<<< "$blobs"
-
-            if [ "$points" -lt 2 ]; then
-              printf '_%s: %d data point(s) — need ≥2 to chart._\n' "$title" "$points" >> "$SUMMARY"
-              continue
-            fi
-            {
-              echo '```mermaid'
-              echo 'xychart-beta'
-              echo "    title \"${title} (${unit})\""
-              printf '    x-axis [%s]\n' "$(IFS=,; echo "${labels[*]}")"
-              echo "    y-axis \"${unit}\""
-              printf '    line [%s]\n' "$(IFS=,; echo "${values[*]}")"
-              echo '```'
-            } >> "$SUMMARY"
-          done 3<<< "$series"
-
-          if [ "$matched" -eq 0 ]; then
-            echo "::warning::no trend series matched reports [$REPORTS] — check the series table"
-            echo "_No trend series matched reports: \`$REPORTS\`._" >> "$SUMMARY"
-          fi
 
       - name: Summarize results
         if: ${{ !cancelled() }}
@@ -611,50 +517,15 @@ jobs:
               || echo "no metrics for $j — skipping"
           done
 
-      # Last ≤10 main-history points per report, so the summary can say whether
-      # a flagged metric is a one-off or part of a sustained drift on main.
-      # Best-effort: a missing series just drops the trend annotation.
-      - name: Collect main history
-        if: ${{ !cancelled() && inputs.pr_number != '' }}
-        env:
-          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
-          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
-          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
-          VM_SIZE: ${{ inputs.vm_size }}
-          DOCS: ${{ inputs.docs }}
-          REPORTS: ${{ steps.resolve.outputs.reports }}
-        run: |
-          set -uo pipefail
-          mkdir -p history
-          for j in $REPORTS; do
-            mkdir -p "history/$j"
-            # Oldest→newest by commit time; keep the last 10.
-            blobs="$(az storage blob list -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
-                       --prefix "bench/${j}/history/${VM_SIZE}-${DOCS}-" --include m \
-                       --query '[].{name:name, ts:metadata.ts, sha:metadata.sha}' -o tsv 2>/dev/null \
-                     | sort -k2 -n | tail -10)"
-            i=0
-            while IFS=$'\t' read -r name _ts sha; do
-              [ -n "$name" ] || continue
-              # Index prefix preserves chronological order under lexical sort.
-              idx="$(printf '%02d' "$i")"
-              az storage blob download -c "$CONTAINER" --account-name "$ACC" --account-key "$KEY" \
-                -n "$name" -f "history/${j}/${idx}-${sha:0:7}.json" -o none 2>/dev/null \
-                || echo "::warning::history download failed for $j ($sha)"
-              i=$((i + 1))
-            done <<< "$blobs"
-          done
-
-      # Diff vs main, keep only changes past the threshold, and have Foundry
-      # narrate them. Falls back to the deterministic delta table on any model
-      # failure or missing creds — the comment is always correct.
+      # Diff vs latest main, keep only changes past the threshold, and have
+      # Foundry narrate them. Falls back to the deterministic delta table on any
+      # model failure or missing creds — the comment is always correct.
       - name: AI summary
         if: ${{ !cancelled() && inputs.pr_number != '' }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
           BASELINE_DIR: baseline
           CURRENT_DIR: current
-          HISTORY_DIR: history
           OUT_FILE: /tmp/ai-summary.md
           BENCH_LABEL: ${{ inputs.bench }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

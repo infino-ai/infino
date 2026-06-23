@@ -92,7 +92,13 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{
-    superfile::{LazyByteSource, fts::reader::BoolMode},
+    superfile::{
+        LazyByteSource,
+        fts::{
+            reader::BoolMode,
+            tokenize::{Tokenizer, unique_tokens},
+        },
+    },
     supertable::{
         SuperfileEntry,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch},
@@ -295,20 +301,33 @@ impl SupertableProvider {
         leaves
     }
 
-    /// Lower `filters` to prune leaves and return the superfiles that
-    /// survive the two-tier prune — exactly the inputs the scan hands to
-    /// DataFusion.
+    // Lower `filters` to prune leaves and select the superfiles that
+    // survive the two-tier prune — per-part aggregates (ManifestPartEntry)
+    // first, then per-superfile stats (SuperfileEntry).
+    //
+    // Pure manifest work: reads stats only, opens no superfile. Returns the
+    // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
-        let leaves = self.predicates_to_prune_leaves(predicates);
+        let mut leaves = self.predicates_to_prune_leaves(predicates);
+
+        leaves.extend(exprs_to_in_list_leaves(
+            filters,
+            &self.schema,
+            &self.fts_cols_set(),
+            self.manifest.options.tokenizer.as_deref(),
+        ));
+
         let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
         // Covered/residual residual scans read only their boundary
         // superfiles; everything else was answered from statistics.
         if let Some(allowed) = self.segment_filter.as_ref() {
             survivors.retain(|entry| allowed.contains(&entry.superfile_id));
         }
+
         Ok(survivors)
     }
 
@@ -1107,6 +1126,110 @@ pub(crate) fn exprs_to_scalar_predicates(
     out
 }
 
+/// Build prune leaves for the `column IN (...)` filters in `filters`. Each yields:
+///  i)  a `ScalarInList` (min/max) leaf — on every column;
+///  ii) plus, on an FTS-indexed column, a `TermPresence{Or}` leaf over the
+///      values' tokens, which prunes on which superfiles hold the term.
+///
+/// A `NOT IN`, a non-literal item, a function-wrapped or unknown column
+/// yields no leaf — that filter just isn't pruned (the scan stays correct).
+///
+/// Handles any `Expr::InList`, whatever its length. In practice SQL
+/// planning rewrites a short `IN` first — a 1-value to `=`, a 2–3 value
+/// to `OR` — so only 4+ value lists usually reach here, but that's the
+/// optimizer's behavior, not a precondition this helper relies on.
+pub(crate) fn exprs_to_in_list_leaves(
+    filters: &[Expr],
+    schema: &SchemaRef,
+    fts_cols: &HashSet<&str>,
+    tokenizer: Option<&dyn Tokenizer>,
+) -> Vec<PruneLeaf> {
+    let mut out = Vec::new();
+
+    for filter in filters {
+        collect_in_list_leaves(filter, schema, fts_cols, tokenizer, &mut out);
+    }
+
+    out
+}
+
+/// e.g. `product IN ('Orange Juice', 'Pineapple')` on an FTS column →
+/// `[ TermPresence{Or, [orange, juice, pineapple]},
+///    ScalarInList{product, ['Orange Juice', 'Pineapple']} ]`
+/// — bloom leaf holds the lowercased tokens, min/max leaf the raw values.
+///
+/// Note: the bloom flattens all tokens into one `Or`, so a superfile with
+/// only `orange` is kept though no value matches. A tighter prune would be
+/// per-value `(orange AND juice) OR pineapple`; FilterExec verifies either way.
+fn collect_in_list_leaves(
+    expr: &Expr,
+    schema: &SchemaRef,
+    fts_cols: &HashSet<&str>,
+    tokenizer: Option<&dyn Tokenizer>,
+    out: &mut Vec<PruneLeaf>,
+) {
+    match expr {
+        // Filters reach us alias-free (Filter::try_new runs unalias_nested),
+        // but an alias is a pure rename; descend it so pruning is unaffected
+        // if one ever survives (e.g. a metadata-carrying alias).
+        Expr::Alias(a) => collect_in_list_leaves(&a.expr, schema, fts_cols, tokenizer, out),
+        // Descend AND; an IN can sit on either side.
+        Expr::BinaryExpr(be) if be.op == Operator::And => {
+            collect_in_list_leaves(&be.left, schema, fts_cols, tokenizer, out);
+            collect_in_list_leaves(&be.right, schema, fts_cols, tokenizer, out);
+        }
+        Expr::InList(il) if !il.negated => {
+            // Only a bare column maps to a min/max or bloom; else skip.
+            let Expr::Column(c) = il.expr.as_ref() else {
+                return;
+            };
+
+            if schema.field_with_name(&c.name).is_err() {
+                return;
+            }
+
+            // Every item must be a literal to bound min/max; else skip.
+            let mut values = Vec::with_capacity(il.list.len());
+            for item in &il.list {
+                let Expr::Literal(v, _) = item else {
+                    return;
+                };
+                values.push(v.clone());
+            }
+
+            // Empty IN list, nothing to bound.
+            if values.is_empty() {
+                return;
+            }
+
+            // Only for FTS indexed columns
+            if fts_cols.contains(c.name.as_str())
+                && let Some(tok) = tokenizer
+            {
+                // One deduped term set across all values — a word shared
+                // by several values (e.g. 'Orange Juice', 'Apple Juice'
+                // → one `juice`) is probed once.
+                let terms = unique_tokens(tok, values.iter().filter_map(scalar_as_str));
+                if !terms.is_empty() {
+                    // one bloom leaf holding all the values' tokens
+                    out.push(PruneLeaf::TermPresence {
+                        column: c.name.clone(),
+                        terms,
+                        mode: BoolMode::Or,
+                    });
+                }
+            }
+
+            // The min/max leaf — on every column.
+            out.push(PruneLeaf::ScalarInList {
+                column: c.name.clone(),
+                values,
+            });
+        }
+        _ => {}
+    }
+}
+
 /// Recurse through `AND` nodes, pushing any recognized
 /// `column <op> literal` leaf into `out`.
 fn collect_conjuncts(expr: &Expr, schema: &SchemaRef, out: &mut Vec<ScalarPredicate>) {
@@ -1373,6 +1496,117 @@ mod tests {
         let s = schema_xy();
         let preds = exprs_to_scalar_predicates(&[col("x").gt(col("y"))], &s);
         assert!(preds.is_empty());
+    }
+
+    /// The `(column, value-count)` of each `ScalarInList` leaf, for asserting
+    /// extraction without matching on the full enum.
+    fn in_list_leaves(filters: &[Expr], schema: &SchemaRef) -> Vec<(String, usize)> {
+        // No FTS columns / tokenizer → only the scalar min/max leaf.
+        exprs_to_in_list_leaves(filters, schema, &HashSet::new(), None)
+            .into_iter()
+            .map(|l| match l {
+                PruneLeaf::ScalarInList { column, values } => (column, values.len()),
+                _ => panic!("expected a ScalarInList leaf"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_list_lowers_to_one_leaf_with_all_values() {
+        let s = schema_xy();
+        let expr = col("x").in_list(vec![lit(1_i64), lit(2_i64), lit(3_i64)], false);
+        assert_eq!(in_list_leaves(&[expr], &s), vec![("x".to_string(), 3)]);
+    }
+
+    #[test]
+    fn in_list_under_and_is_found() {
+        let s = schema_xy();
+        let expr = col("x")
+            .gt(lit(0_i64))
+            .and(col("y").in_list(vec![lit(7_i64)], false));
+        assert_eq!(in_list_leaves(&[expr], &s), vec![("y".to_string(), 1)]);
+    }
+
+    #[test]
+    fn in_list_under_alias_is_found() {
+        // Filters reach us unaliased, but the descent must still find an
+        // IN wrapped in an alias if one ever survives (a pure rename
+        // doesn't change the column the leaf prunes on).
+        let s = schema_xy();
+        let expr = col("x")
+            .in_list(vec![lit(1_i64), lit(2_i64)], false)
+            .alias("k");
+        assert_eq!(in_list_leaves(&[expr], &s), vec![("x".to_string(), 2)]);
+    }
+
+    #[test]
+    fn negated_in_list_emits_no_leaf() {
+        let s = schema_xy();
+        let expr = col("x").in_list(vec![lit(1_i64)], true);
+        assert!(exprs_to_in_list_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn in_list_with_non_literal_item_emits_no_leaf() {
+        let s = schema_xy();
+        // `x IN (1, y)` — `y` is a column, not a literal; can't bound min/max.
+        let expr = col("x").in_list(vec![lit(1_i64), col("y")], false);
+        assert!(exprs_to_in_list_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn in_list_on_unknown_column_emits_no_leaf() {
+        let s = schema_xy();
+        let expr = col("z").in_list(vec![lit(1_i64)], false);
+        assert!(exprs_to_in_list_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn in_list_on_fts_column_also_emits_term_presence_bloom() {
+        use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+        let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
+        let fts = HashSet::from(["title"]);
+        let tok = AsciiLowerTokenizer;
+        // 'Foo Bar' → [foo, bar]; 'Bar Baz' → [bar, baz]. The shared `bar`
+        // is deduped, and the terms come out sorted-unique.
+        let expr = col("title").in_list(vec![lit("Foo Bar"), lit("Bar Baz")], false);
+        let leaves = exprs_to_in_list_leaves(&[expr], &s, &fts, Some(&tok));
+
+        assert!(
+            leaves
+                .iter()
+                .any(|l| matches!(l, PruneLeaf::ScalarInList { .. })),
+            "scalar min/max leaf still emitted"
+        );
+        let (col_name, terms, mode) = leaves
+            .iter()
+            .find_map(|l| match l {
+                PruneLeaf::TermPresence {
+                    column,
+                    terms,
+                    mode,
+                } => Some((column.as_str(), terms, *mode)),
+                _ => None,
+            })
+            .expect("FTS column also emits a TermPresence bloom leaf");
+        assert_eq!(col_name, "title");
+        assert_eq!(mode, BoolMode::Or);
+        assert_eq!(
+            terms,
+            &vec!["bar".to_string(), "baz".to_string(), "foo".to_string()],
+            "tokens are deduped (shared `bar`) and sorted"
+        );
+    }
+
+    #[test]
+    fn in_list_on_non_fts_column_emits_only_scalar_leaf() {
+        let s = schema_xy();
+        let fts = HashSet::from(["title"]); // "x" not in the set
+        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+        let expr = col("x").in_list(vec![lit(1_i64), lit(2_i64), lit(3_i64), lit(4_i64)], false);
+        let leaves = exprs_to_in_list_leaves(&[expr], &s, &fts, Some(&tok));
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(leaves[0], PruneLeaf::ScalarInList { .. }));
     }
 
     #[test]

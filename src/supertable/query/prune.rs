@@ -31,7 +31,8 @@ use std::sync::Arc;
 use datafusion::scalar::ScalarValue;
 
 use super::skip::{
-    ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
+    ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_in_list_skip, scalar_skip,
+    scalar_value_may_match,
 };
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -39,7 +40,7 @@ use crate::{
         error::QueryError,
         manifest::{
             ManifestSnapshot, SuperfileEntry,
-            list::Manifest,
+            list::{Manifest, ManifestPartEntry},
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
         },
@@ -64,11 +65,17 @@ pub(crate) enum PruneLeaf {
     Prefix { column: String, prefix: Vec<u8> },
     /// Scalar comparison on a scalar column → per-column min/max.
     Scalar(ScalarPredicate),
+    /// `column IN (values)` → keep if the min/max could hold any value.
+    ScalarInList {
+        column: String,
+        values: Vec<ScalarValue>,
+    },
 }
 
 impl PruneLeaf {
-    /// Part-tier keep set for this leaf, or `None` when the leaf has no
-    /// part-level pruner (it imposes no part constraint → keep all).
+    /// Identified Which manifest parts this leaf keeps, from the part-level
+    /// aggregates (`ManifestPartEntry`). `None` = no part constraint →
+    /// keep all parts. The per-superfile tier runs separately.
     pub(crate) fn keep_parts(&self, list: &Manifest) -> Option<Vec<PartId>> {
         match self {
             PruneLeaf::TermPresence {
@@ -83,40 +90,63 @@ impl PruneLeaf {
                 Some(prune_parts_for_fts_prefix(list, column, prefix))
             }
             PruneLeaf::Scalar(pred) => Some(scalar_keep_parts(list, pred)),
+            PruneLeaf::ScalarInList { column, values } => {
+                Some(scalar_in_list_keep_parts(list, column, values))
+            }
         }
     }
 }
 
-/// Part-tier scalar prune: keep each part whose aggregate min/max for
-/// the predicate's column could satisfy it. A missing aggregate or
-/// undecodable bounds → keep (conservative — never a false prune).
-///
-/// The aggregate min/max are held as length-1 [`ArrayRef`]s
-/// (`ScalarStatsAgg.{min,max}`), already decoded when the manifest list
-/// was loaded — so this hot path reads the [`ScalarValue`] straight from
-/// the array with no per-query Arrow-IPC decode, then reuses the same
-/// comparison core the superfile tier uses ([`scalar_value_may_match`]).
-fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
+/// Keep each part whose aggregate min/max for `column` satisfies
+/// `may_match`. A missing aggregate or undecodable bounds keeps the part
+/// (conservative — never a false prune). The bounds are length-1
+/// [`ArrayRef`]s decoded when the list loaded, so reading the
+/// [`ScalarValue`] here is free of per-query Arrow decode.
+fn keep_parts_where(
+    list: &Manifest,
+    column: &str,
+    may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
+) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
-            let keep = match entry.scalar_stats_agg.get(&pred.column) {
+            let keep = match part_minmax(entry, column) {
+                Some((min, max)) => may_match(&min, &max),
                 None => true,
-                Some(agg) => {
-                    match (
-                        ScalarValue::try_from_array(agg.min.as_ref(), 0).ok(),
-                        ScalarValue::try_from_array(agg.max.as_ref(), 0).ok(),
-                    ) {
-                        (Some(min), Some(max)) => {
-                            scalar_value_may_match(&min, &max, pred.op, &pred.value)
-                        }
-                        _ => true,
-                    }
-                }
             };
             keep.then_some(entry.part_id)
         })
         .collect()
+}
+
+// The manifest part's aggregate min/max for `column`, or `None` when the column
+// has no aggregate or the bounds don't decode (caller keeps).
+fn part_minmax(entry: &ManifestPartEntry, column: &str) -> Option<(ScalarValue, ScalarValue)> {
+    let agg = entry.scalar_stats_agg.get(column)?;
+    match (
+        ScalarValue::try_from_array(agg.min.as_ref(), 0),
+        ScalarValue::try_from_array(agg.max.as_ref(), 0),
+    ) {
+        (Ok(min), Ok(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
+// Part-tier scalar prune: keep parts whose min/max could satisfy `pred`.
+fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
+    keep_parts_where(list, &pred.column, |min, max| {
+        scalar_value_may_match(min, max, pred.op, &pred.value)
+    })
+}
+
+// Part-tier `IN` prune: keep parts whose min/max could hold *any* listed
+// value (an `IN` is a disjunction of equalities).
+fn scalar_in_list_keep_parts(list: &Manifest, column: &str, values: &[ScalarValue]) -> Vec<PartId> {
+    keep_parts_where(list, column, |min, max| {
+        values
+            .iter()
+            .any(|v| scalar_value_may_match(min, max, ScalarOp::Eq, v))
+    })
 }
 
 /// Select the superfiles a predicate could match, newest-first in
@@ -172,6 +202,9 @@ pub(crate) async fn select_superfiles(
             }
             PruneLeaf::Prefix { column, prefix } => {
                 and_into(&mut mask, &fts_prefix_skip(&superfiles, column, prefix));
+            }
+            PruneLeaf::ScalarInList { column, values } => {
+                and_into(&mut mask, &scalar_in_list_skip(&superfiles, column, values));
             }
             // Scalar leaves handled above as one conjunction.
             PruneLeaf::Scalar(_) => {}
@@ -306,6 +339,28 @@ mod tests {
         assert_eq!(
             scalar_keep_parts(&list, &pred("x", ScalarOp::Gt, 50)),
             vec![p1.part_id]
+        );
+    }
+
+    #[test]
+    fn scalar_in_list_keep_parts_keeps_every_part_holding_a_listed_value() {
+        let p0 = part_from(&[seg_int("x", 0, 10)], 0);
+        let p1 = part_from(&[seg_int("x", 100, 110)], 1);
+        let p2 = part_from(&[seg_int("x", 200, 210)], 2);
+        let list = list_with(vec![p0.clone(), p1.clone(), p2.clone()]);
+        let i = |n| ScalarValue::Int64(Some(n));
+
+        // IN (5, 205) → p0 ([0,10]) and p2 ([200,210]); not p1.
+        assert_eq!(
+            scalar_in_list_keep_parts(&list, "x", &[i(5), i(205)]),
+            vec![p0.part_id, p2.part_id]
+        );
+        // IN (50) → in no part's range.
+        assert!(scalar_in_list_keep_parts(&list, "x", &[i(50)]).is_empty());
+        // Unknown column → conservative keep-all.
+        assert_eq!(
+            scalar_in_list_keep_parts(&list, "missing", &[i(5)]),
+            vec![p0.part_id, p1.part_id, p2.part_id]
         );
     }
 
