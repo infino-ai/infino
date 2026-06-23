@@ -75,22 +75,23 @@ pub(crate) struct CentroidTree {
 
 impl CentroidTree {
     /// Build a routing tree over the cell centroids `clusters` (Sq8+residual, as
-    /// stored in the manifest); leaf `i` routes to `cell_ids[i]`. Everything
+    /// stored in the manifest); leaf `i` routes to `leaf_refs[i]` (a cluster
+    /// within an object-resident superfile). Everything
     /// stays in the **encoded domain** — grouping is `encoded_ivf_kmeans` over
     /// the stored bytes, internal-node centroids are **medoids** (existing cell
     /// centroids, picked by `medoid_index_by`), and the tree's centroid block is
     /// *sliced* from `clusters` under the same shared quantizer (`select_rows`).
     /// No fp32 vector is ever reconstructed and no centroid is re-quantized.
-    /// Returns `None` for empty input, `dim == 0`, or a `cell_ids` length
+    /// Returns `None` for empty input, `dim == 0`, or a `leaf_refs` length
     /// mismatch.
     pub(crate) fn build(
         metric: Metric,
         clusters: &ClusterCentroids,
-        cell_ids: &[u128],
+        leaf_refs: &[LeafRef],
     ) -> Option<Self> {
         let n = clusters.n_cent as usize;
         let dim = clusters.dim as usize;
-        if n == 0 || dim == 0 || cell_ids.len() != n {
+        if n == 0 || dim == 0 || leaf_refs.len() != n {
             return None;
         }
         let rows = clusters.to_encoded_rows();
@@ -109,7 +110,7 @@ impl CentroidTree {
             dim,
             &rows,
             &cell_radii,
-            cell_ids,
+            leaf_refs,
             &indices,
             &mut nodes,
             &mut sources,
@@ -307,20 +308,20 @@ fn build_subtree(
     dim: usize,
     rows: &[EncodedCellRow],
     cell_radii: &[f32],
-    cell_ids: &[u128],
+    leaf_refs: &[LeafRef],
     indices: &[usize],
     nodes: &mut Vec<NodeMeta>,
     sources: &mut Vec<u32>,
 ) -> u32 {
     // Single cell → leaf.
     if indices.len() == 1 {
-        return push_leaf(indices[0], cell_radii, cell_ids, nodes, sources);
+        return push_leaf(indices[0], cell_radii, leaf_refs, nodes, sources);
     }
     // Small group → one internal node directly over leaf children.
     if indices.len() <= DEFAULT_FANOUT {
         let children: Vec<u32> = indices
             .iter()
-            .map(|&i| push_leaf(i, cell_radii, cell_ids, nodes, sources))
+            .map(|&i| push_leaf(i, cell_radii, leaf_refs, nodes, sources))
             .collect();
         return push_internal(metric, dim, rows, indices, children, nodes, sources);
     }
@@ -340,23 +341,24 @@ fn build_subtree(
     if non_empty.len() <= 1 || non_empty.iter().any(|g| g.len() == indices.len()) {
         let children: Vec<u32> = indices
             .iter()
-            .map(|&i| push_leaf(i, cell_radii, cell_ids, nodes, sources))
+            .map(|&i| push_leaf(i, cell_radii, leaf_refs, nodes, sources))
             .collect();
         return push_internal(metric, dim, rows, indices, children, nodes, sources);
     }
     let children: Vec<u32> = non_empty
         .into_iter()
-        .map(|g| build_subtree(metric, dim, rows, cell_radii, cell_ids, &g, nodes, sources))
+        .map(|g| build_subtree(metric, dim, rows, cell_radii, leaf_refs, &g, nodes, sources))
         .collect();
     push_internal(metric, dim, rows, indices, children, nodes, sources)
 }
 
 /// Append a leaf node for cell `i`; its centroid is cell `i`'s own (source index
-/// `i`). Returns its node id.
+/// `i`) and its target is `leaf_refs[i]` (the cluster within a superfile, or a
+/// whole-superfile leaf for the hidden cell shape). Returns its node id.
 fn push_leaf(
     i: usize,
     cell_radii: &[f32],
-    cell_ids: &[u128],
+    leaf_refs: &[LeafRef],
     nodes: &mut Vec<NodeMeta>,
     sources: &mut Vec<u32>,
 ) -> u32 {
@@ -364,15 +366,7 @@ fn push_leaf(
     sources.push(i as u32);
     nodes.push(NodeMeta {
         radius: cell_radii[i],
-        // Structural milestone: the leaf carries the degenerate whole-superfile
-        // range (`doc_off = 0`, `count = 0` → the query fetches the whole
-        // superfile, behavior unchanged). The per-cluster offsets are filled in
-        // by the later semantic step that splits a superfile into cluster leaves.
-        kind: NodeKind::Leaf(LeafRef {
-            superfile_id: cell_ids[i],
-            doc_off: 0,
-            count: 0,
-        }),
+        kind: NodeKind::Leaf(leaf_refs[i]),
     });
     id
 }

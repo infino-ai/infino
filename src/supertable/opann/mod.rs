@@ -28,6 +28,7 @@ pub(crate) mod test_util {
 
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::manifest::ClusterCentroids;
+    use crate::supertable::opann::page::LeafRef;
     use crate::supertable::opann::tree::CentroidTree;
 
     /// Deterministic synthetic cells: `n` centroids in `dim` dims with distinct
@@ -70,6 +71,16 @@ pub(crate) mod test_util {
         cells: &[(Vec<f32>, f32, u128)],
     ) -> Option<CentroidTree> {
         let (clusters, ids) = clusters_from_cells(metric, dim, cells);
-        CentroidTree::build(metric, &clusters, &ids)
+        // Synthetic cells are whole-superfile leaves (the hidden cell shape):
+        // `doc_off = 0`, `count = 0`.
+        let leaf_refs: Vec<LeafRef> = ids
+            .iter()
+            .map(|&id| LeafRef {
+                superfile_id: id,
+                doc_off: 0,
+                count: 0,
+            })
+            .collect();
+        CentroidTree::build(metric, &clusters, &leaf_refs)
     }
 }

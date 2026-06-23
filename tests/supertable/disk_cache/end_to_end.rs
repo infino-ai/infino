@@ -108,10 +108,12 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     let consumer = Supertable::open(consumer_opts).expect("open");
     assert_eq!(consumer.manifest_id(), 1);
 
-    // Cache starts cold: zero cold-fetches.
+    // No superfile has been read yet → zero superfile cold-fetches. Open does
+    // route the manifest part through the cache as a content-addressed blob, so
+    // `n_entries` may already be nonzero; that's the manifest-artifact cache
+    // path, not the superfile read path this test exercises.
     let pre_stats = cache.stats();
     assert_eq!(pre_stats.n_cold_fetches, 0);
-    assert_eq!(pre_stats.n_entries, 0);
 
     // First query against the consumer routes through the
     // disk cache → cold-fetch from storage.

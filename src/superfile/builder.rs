@@ -100,7 +100,7 @@ use crate::superfile::{
     },
     stats::SuperfileStats,
     vector::{
-        builder::VectorBuilder,
+        builder::{ClusterRouting, VectorBuilder},
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
         ivf_merge::{MergedIvfSubsection, merge_sq8_ivf_subsections},
@@ -828,9 +828,19 @@ impl SuperfileBuilder {
     /// If no `add_batch` calls have landed any rows, returns an
     /// empty `Vec<u8>` — there's no Parquet body to write and no
     /// FTS/vector blobs to embed.
-    pub fn finish(mut self) -> Result<Vec<u8>, BuildError> {
+    pub fn finish(self) -> Result<Vec<u8>, BuildError> {
+        self.finish_with_routing().map(|(bytes, _)| bytes)
+    }
+
+    /// As [`Self::finish`], but also returns the per-cluster routing the vector
+    /// builder captured (`(column_id, routing)`), for the supertable's OPANN
+    /// routing tree. Empty when there is no vector index or no rows. The bytes
+    /// are byte-for-byte identical to [`Self::finish`].
+    pub(crate) fn finish_with_routing(
+        mut self,
+    ) -> Result<(Vec<u8>, Vec<(u32, ClusterRouting)>), BuildError> {
         if self.next_local_doc_id == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let n_docs = self.next_local_doc_id as u64;
 
@@ -892,22 +902,22 @@ impl SuperfileBuilder {
                 &id_page_limit,
             )
         };
-        let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
-            let (fts_blob, vec_blob) =
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
+        let (body, fts_blob, vec_blob, routing) = if vec_builder.is_some() {
+            let (fts_blob, vec_blob, routing) =
+                finish_index_blobs_with_routing(fts_builder, vec_builder, cell_posting_builder)?;
             let body = encode_body()?;
-            (body, fts_blob, vec_blob)
+            (body, fts_blob, vec_blob, routing)
         } else {
             let (body_res, blobs_res) = rayon::join(encode_body, || {
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)
+                finish_index_blobs_with_routing(fts_builder, vec_builder, cell_posting_builder)
             });
             let body = body_res?;
-            let (fts_blob, vec_blob) = blobs_res?;
-            (body, fts_blob, vec_blob)
+            let (fts_blob, vec_blob, routing) = blobs_res?;
+            (body, fts_blob, vec_blob, routing)
         };
 
         let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
-        Ok(parts.bytes)
+        Ok((parts.bytes, routing))
     }
 }
 
@@ -915,21 +925,25 @@ impl SuperfileBuilder {
 /// routed scalar text and vectors into their builders, FTS and vector
 /// finalization do not share mutable state, so build them as sibling
 /// rayon jobs when both indexes are present.
-fn finish_index_blobs(
+fn finish_index_blobs_with_routing(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
-) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<(u32, ClusterRouting)>), BuildError> {
     match (fts_builder, vec_builder, cell_posting_builder) {
         (Some(fb), Some(vb), None) => {
-            let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
-            Ok((fts?, vec?))
+            let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish_with_routing());
+            let (vec_blob, routing) = vec?;
+            Ok((fts?, vec_blob, routing))
         }
-        (Some(fb), None, Some(cb)) => Ok((fb.finish()?, cb.finish()?)),
-        (Some(fb), None, None) => Ok((fb.finish()?, Vec::new())),
-        (None, Some(vb), None) => Ok((Vec::new(), vb.finish()?)),
-        (None, None, Some(cb)) => Ok((Vec::new(), cb.finish()?)),
-        (None, None, None) => Ok((Vec::new(), Vec::new())),
+        (Some(fb), None, Some(cb)) => Ok((fb.finish()?, cb.finish()?, Vec::new())),
+        (Some(fb), None, None) => Ok((fb.finish()?, Vec::new(), Vec::new())),
+        (None, Some(vb), None) => {
+            let (vec_blob, routing) = vb.finish_with_routing()?;
+            Ok((Vec::new(), vec_blob, routing))
+        }
+        (None, None, Some(cb)) => Ok((Vec::new(), cb.finish()?, Vec::new())),
+        (None, None, None) => Ok((Vec::new(), Vec::new(), Vec::new())),
         _ => Err(BuildError::VectorSchemaMismatch(
             "mixed ivf and cell_posting builders".into(),
         )),

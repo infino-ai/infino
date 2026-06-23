@@ -420,6 +420,7 @@ impl VectorBuilder {
             summary_offset_in_sub: subsection.summary_offset_in_sub,
             codec_meta_offset_in_sub: subsection.codec_meta_offset_in_sub,
             codec_meta_size: subsection.codec_meta_size,
+            routing: None,
         });
         Ok(())
     }
@@ -539,6 +540,18 @@ impl VectorBuilder {
         Ok(buf)
     }
 
+    /// As [`Self::finish`], but also returns the per-cluster routing for each
+    /// column that captured it (`(column_id, routing)`). The bytes are
+    /// byte-for-byte identical to [`Self::finish`].
+    pub(crate) fn finish_with_routing(
+        self,
+    ) -> Result<(Vec<u8>, Vec<(u32, ClusterRouting)>), BuildError> {
+        let header_dir_hint = OUTER_HEADER_SIZE + (self.columns.len() * DIR_ENTRY_SIZE) + 8;
+        let mut buf: Vec<u8> = Vec::with_capacity(header_dir_hint);
+        let routing = self.finish_to_with_routing(&mut buf)?;
+        Ok((buf, routing))
+    }
+
     /// Streaming variant: write the final blob progressively to
     /// `w` without materialising it as a contiguous `Vec<u8>`.
     ///
@@ -562,7 +575,19 @@ impl VectorBuilder {
     /// Object-storage callers can pass a multipart upload
     /// writer here so superfile build never owns the full blob in
     /// RAM.
-    pub fn finish_to<W: Write>(self, mut w: W) -> Result<(), BuildError> {
+    pub fn finish_to<W: Write>(self, w: W) -> Result<(), BuildError> {
+        self.finish_to_with_routing(w).map(|_| ())
+    }
+
+    /// As [`Self::finish_to`], but also returns the per-cluster routing for each
+    /// column that captured it (the streaming ingest path). The returned vec is
+    /// `(column_id, routing)`; columns with no captured routing (the
+    /// encoded/materialized merge path) are omitted. The output bytes are
+    /// byte-for-byte identical to [`Self::finish_to`].
+    pub(crate) fn finish_to_with_routing<W: Write>(
+        self,
+        mut w: W,
+    ) -> Result<Vec<(u32, ClusterRouting)>, BuildError> {
         let VectorBuilder {
             columns,
             mut scratch_dir,
@@ -684,7 +709,14 @@ impl VectorBuilder {
         // instant we've finished writing + CRC-ing it. At 10M ×
         // 384 a subsection is ~15 GiB, so retaining all of them
         // until the last byte is written would double the peak.
-        for sub in subsections.drain(..) {
+        // The drain index is the column_id (subsections are in column order,
+        // matching the directory loop above); take the routing out before the
+        // bytes drop so it costs no extra clone.
+        let mut routing_out: Vec<(u32, ClusterRouting)> = Vec::new();
+        for (i, mut sub) in subsections.drain(..).enumerate() {
+            if let Some(routing) = sub.routing.take() {
+                routing_out.push((i as u32, routing));
+            }
             w.write_all(&sub.bytes).map_err(BuildError::Io)?;
             outer_crc_acc = crc32c_append(outer_crc_acc, &sub.bytes);
         }
@@ -699,7 +731,7 @@ impl VectorBuilder {
         // had a live file path for the duration of its scan.
         drop(scratch_dir);
 
-        Ok(())
+        Ok(routing_out)
     }
 }
 
@@ -718,6 +750,41 @@ struct SubsectionBytes {
     /// start. Both are zero when the subsection has no codec_meta.
     codec_meta_offset_in_sub: usize,
     codec_meta_size: usize,
+    /// Per-cluster routing surfaced for the supertable's OPANN tree, or `None`
+    /// when this subsection was produced by a path that doesn't capture it
+    /// (the encoded/materialized merge path). The streaming ingest path always
+    /// fills it.
+    routing: Option<ClusterRouting>,
+}
+
+/// One routing entry for one non-empty IVF cluster, surfaced from a streaming
+/// subsection build so the supertable can hang a routing-tree leaf off it
+/// without ever decoding a stored Sq8 centroid.
+///
+/// `doc_off`/`count` are copied verbatim from the same [`ClusterBlock`] the
+/// `cluster_idx` slot is written from, so a leaf addresses exactly this
+/// cluster's bytes via [`crate::superfile::vector::reader`]'s
+/// `cluster_block_range`.
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterRoute {
+    /// The cluster's **ingestion-surface fp32** k-means center (Pass 1),
+    /// captured before quantization into the stored Sq8 block. Length `dim`.
+    pub(crate) centroid_fp32: Vec<f32>,
+    /// First-row offset of the cluster within the subsection (`cluster_idx`
+    /// `doc_off`).
+    pub(crate) doc_off: u32,
+    /// Row count in the cluster (`cluster_idx` `count`; always `> 0` here).
+    pub(crate) count: u32,
+    /// Covering radius: `sqrt(max row L2² to this cluster's centroid)`, in the
+    /// same fp32 distance units as the hidden index's leaf radius.
+    pub(crate) radius: f32,
+}
+
+/// Per-cluster routing for one column's IVF subsection — the non-empty clusters
+/// in storage order.
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterRouting {
+    pub(crate) routes: Vec<ClusterRoute>,
 }
 
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
@@ -970,6 +1037,9 @@ fn build_subsection_from_materialized(
             layout.codec_meta_off
         },
         codec_meta_size,
+        // The encoded/materialized merge path doesn't capture fp32 routing; the
+        // supertable handles routing for merged superfiles separately.
+        routing: None,
     })
 }
 
@@ -1066,6 +1136,10 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
+    // Per-cluster covering radius (squared, pre-sqrt): max over the cluster's
+    // rows of L2² distance to its own centroid. Folded in pass 2 alongside the
+    // summary radius; surfaced as each routing leaf's radius.
+    let mut cluster_radius_sq_max = vec![0.0f32; n_cent];
     let codec = cfg.rerank_codec;
     // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
@@ -1119,6 +1193,7 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
+            &mut cluster_radius_sq_max,
             codec,
             sq8_acc,
         )?;
@@ -1260,6 +1335,10 @@ fn build_subsection_streaming(
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
+    // One routing entry per non-empty cluster, captured from the same `blk` the
+    // `cluster_idx` slot is written from — so the leaf offset can never drift
+    // from the stored layout.
+    let mut routes: Vec<ClusterRoute> = Vec::with_capacity(n_cent);
 
     write_ivf_cluster_blocks(
         &mut bytes,
@@ -1316,6 +1395,15 @@ fn build_subsection_streaming(
                     );
                 }
             }
+            // `blk.first_row`/`blk.count` ARE the values written into this
+            // cluster's `cluster_idx` slot; the centroid is the Pass-1 fp32
+            // center (ingestion surface), never a decode of the stored Sq8.
+            routes.push(ClusterRoute {
+                centroid_fp32: centroids[centroid_id * dim..(centroid_id + 1) * dim].to_vec(),
+                doc_off: blk.first_row as u32,
+                count: blk.count as u32,
+                radius: cluster_radius_sq_max[centroid_id].sqrt(),
+            });
             Ok(())
         },
     )?;
@@ -1335,6 +1423,7 @@ fn build_subsection_streaming(
             layout.codec_meta_off
         },
         codec_meta_size,
+        routing: Some(ClusterRouting { routes }),
     })
 }
 
@@ -1648,6 +1737,7 @@ fn run_pass2(
     bucket_writers: &mut [BufWriter<File>],
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
+    cluster_radius_sq_max: &mut [f32],
     codec: RerankCodec,
     mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
@@ -1729,8 +1819,16 @@ fn run_pass2(
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
             }
+            // Fold this row into its cluster's covering radius (un-rotated input
+            // space, same convention as the summary radius). One extra distance
+            // per row against the assigned centroid only — negligible next to
+            // the `n_cent` comparisons `assign_to_centroids` already did.
+            let row = &chunk[r * dim..(r + 1) * dim];
+            let d = l2_sq(row, &centroids[cid * dim..(cid + 1) * dim]);
+            if d > cluster_radius_sq_max[cid] {
+                cluster_radius_sq_max[cid] = d;
+            }
             if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
-                let row = &chunk[r * dim..(r + 1) * dim];
                 let off = cid * dim;
                 update_min_max(row, &mut mn[off..off + dim], &mut mx[off..off + dim]);
             }
@@ -1847,6 +1945,57 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&blob[16..24]);
         assert_eq!(u64::from_le_bytes(buf), 0);
+    }
+
+    #[test]
+    fn finish_to_with_routing_emits_per_cluster_routing() {
+        let dim = 16;
+        let n_docs = 200usize;
+        let mut b = VectorBuilder::new();
+        b.register_column(cfg("v", dim)).expect("register column");
+        // Spread rows across four loose modes so k-means yields several
+        // non-empty clusters rather than one giant bucket.
+        for i in 0..n_docs {
+            let base = (i % 4) as f32 * 100.0;
+            let v: Vec<f32> = (0..dim).map(|j| base + (i + j) as f32 * 0.01).collect();
+            b.add(0, &v).expect("add");
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let routing = b
+            .finish_to_with_routing(&mut buf)
+            .expect("finish_to_with_routing");
+
+        assert_eq!(routing.len(), 1, "the one column emits routing");
+        let (col_id, r) = &routing[0];
+        assert_eq!(*col_id, 0);
+        assert!(!r.routes.is_empty(), "at least one non-empty cluster");
+        // The helper cfg uses n_cent = 4.
+        assert!(r.routes.len() <= 4, "no more routes than n_cent");
+
+        let mut total: u64 = 0;
+        for route in &r.routes {
+            assert_eq!(route.centroid_fp32.len(), dim, "centroid is dim-wide fp32");
+            assert!(route.count > 0, "only non-empty clusters are routed");
+            assert!(
+                route.radius.is_finite() && route.radius >= 0.0,
+                "radius is a non-negative finite distance"
+            );
+            total += route.count as u64;
+        }
+        assert_eq!(total, n_docs as u64, "routes cover every row exactly once");
+
+        // doc_off/count partition [0, n_docs) contiguously in storage order:
+        // each leaf addresses exactly its cluster's bytes, with no gaps or
+        // overlaps. This is the `cluster_idx` prefix-sum — the same values the
+        // reader's `cluster_block_range` consumes.
+        let mut by_off: Vec<(u32, u32)> = r.routes.iter().map(|x| (x.doc_off, x.count)).collect();
+        by_off.sort_by_key(|&(off, _)| off);
+        let mut cursor = 0u32;
+        for (off, cnt) in by_off {
+            assert_eq!(off, cursor, "cluster offsets are contiguous");
+            cursor += cnt;
+        }
+        assert_eq!(cursor as usize, n_docs, "offsets span all rows");
     }
 
     #[test]

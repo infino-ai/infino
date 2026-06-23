@@ -46,12 +46,16 @@ use super::tree::CentroidTree;
 /// uses, so an appended row is `dim * ROW_BYTES_PER_DIM` long.
 const ROW_BYTES_PER_DIM: usize = 2;
 
-/// One new partition leaf to splice into the routing tree: the leaf's cell id
-/// (`superfile_id.as_u128()`), its fp32 centroid (the k-means partition center
+/// One new cluster leaf to splice into the routing tree: the cluster's owning
+/// superfile id, its `(doc_off, count)` range within that superfile's IVF (so a
+/// probe range-GETs exactly the cluster), its fp32 centroid (the k-means center
 /// captured at the ingestion surface — never a decode of a stored centroid),
-/// and its covering radius.
+/// and its covering radius. A whole-superfile leaf (the hidden cell shape) uses
+/// `doc_off = 0`, `count = 0`.
 pub(crate) struct LeafInsert {
-    pub(crate) cell_id: u128,
+    pub(crate) superfile_id: u128,
+    pub(crate) doc_off: u32,
+    pub(crate) count: u32,
     pub(crate) centroid_fp32: Vec<f32>,
     pub(crate) radius: f32,
 }
@@ -138,13 +142,20 @@ fn build_genesis(
         .flat_map(|l| l.centroid_fp32.iter().copied())
         .collect();
     let radii: Vec<f32> = leaves.iter().map(|l| l.radius).collect();
-    let cell_ids: Vec<u128> = leaves.iter().map(|l| l.cell_id).collect();
+    let leaf_refs: Vec<LeafRef> = leaves
+        .iter()
+        .map(|l| LeafRef {
+            superfile_id: l.superfile_id,
+            doc_off: l.doc_off,
+            count: l.count,
+        })
+        .collect();
     let clusters =
         ClusterCentroids::from_fp32(metric, n, dim as u32, &flat, vec![1u32; n as usize])
             .with_radii(radii);
     // `build` only returns `None` for empty/zero-dim/mismatched input, none of
-    // which can happen here (non-empty leaves, fixed dim, aligned cell_ids).
-    let tree = CentroidTree::build(metric, &clusters, &cell_ids)
+    // which can happen here (non-empty leaves, fixed dim, aligned leaf refs).
+    let tree = CentroidTree::build(metric, &clusters, &leaf_refs)
         .expect("genesis tree from non-empty equal-dim leaves");
     tree.to_pages(page_budget)
 }
@@ -404,9 +415,9 @@ fn append_leaf_into_page(page: &Page, metric: Metric, dim: usize, leaf: &LeafIns
 
     let mut topo = page.topo().to_vec();
     topo.push(NodeTopo::Leaf(LeafRef {
-        superfile_id: leaf.cell_id,
-        doc_off: 0,
-        count: 0,
+        superfile_id: leaf.superfile_id,
+        doc_off: leaf.doc_off,
+        count: leaf.count,
     }));
     let root_local = page.root_local();
     let new_root = match topo[root_local as usize].clone() {
@@ -537,7 +548,9 @@ mod tests {
         cells
             .iter()
             .map(|(c, r, id)| LeafInsert {
-                cell_id: *id,
+                superfile_id: *id,
+                doc_off: 0,
+                count: 0,
                 centroid_fp32: c.clone(),
                 radius: *r,
             })
@@ -586,7 +599,9 @@ mod tests {
                 metric,
                 dim,
                 &[LeafInsert {
-                    cell_id: NEW_ID,
+                    superfile_id: NEW_ID,
+                    doc_off: 0,
+                    count: 0,
                     centroid_fp32: new_centroid.clone(),
                     radius: 0.05,
                 }],
