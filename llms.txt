@@ -26,6 +26,8 @@ as Python and Node.js bindings.
 - [Retrieval for agents](docs/concepts/retrieval-for-agents.md): the read path
   an agent calls hundreds of times per task — why speed-per-dollar compounds and
   what to reach for.
+- [Embedded retrieval](docs/concepts/embedded-retrieval.md): the in-process,
+  no-server model — add it as a library and query, the way you'd use SQLite.
 
 ## Architecture
 

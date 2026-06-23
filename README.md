@@ -9,7 +9,7 @@
 
 **Why infino**
 
-- **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds.
+- **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds. On a 1-million-document index, warm BM25 queries return in the microsecond range — see [benchmarks](benches/README.md).
 - **Multi-modal queries** — keyword (BM25), vector, and SQL queries over the same rows, offering flexible query paths for agents.
 - **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits. 
 - **Open format, no lock in** — text and numeric data is stored as spec-compliant Parquet, so anything that reads Parquet can read your data.
