@@ -447,6 +447,44 @@ fn sql_multi_value_in_returns_exact_rows_across_parts() {
 }
 
 #[test]
+fn sql_between_returns_exact_rows_across_parts() {
+    // `title BETWEEN 'C' AND 'G'` — a range predicate, sibling of IN.
+    //  - DataFusion expands BETWEEN to `title >= 'C' AND title <= 'G'`,
+    //    two comparisons the scalar conjunct path lowers to range leaves.
+    //  - so this never enters the IN path, and min/max still prunes:
+    //    part 2's titles all sort above 'G', so its range can't match.
+    //  - pins both the rows and the prune so the IN work can't regress it.
+    let dir = TempDir::new().expect("tempdir");
+    build_3_parts_two_superfiles_each(
+        dir.path(),
+        &[
+            ["Apple", "Cherry"], // part 0: matches Cherry, Date
+            ["Banana", "Date"],
+            ["Egg", "Fig"], // part 1: matches Egg, Fig
+            ["Grape", "Berry"],
+            ["Mango", "Orange"], // part 2: all > 'G', no match
+            ["Tango", "Plum"],
+        ],
+    );
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+
+    let batches = consumer
+        .reader()
+        .query_sql("SELECT _id FROM supertable WHERE title BETWEEN 'C' AND 'G'")
+        .expect("query");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 4, "Cherry, Date (part 0) + Egg, Fig (part 1)");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3, "6 commits / 2-per-part = 3 parts");
+    assert_eq!(
+        loaded, 2,
+        "min/max range prune skips part 2 (all titles > 'G'); got {loaded}/3"
+    );
+}
+
+#[test]
 fn fts_in_bloom_prunes_parts_min_max_cannot() {
     // Bloom prunes where min/max can't. `title IN (...)`, 4 values:
     //  - every part holds anchors "aaa"+"zzz" → min/max is [aaa,zzz] for

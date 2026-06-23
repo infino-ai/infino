@@ -305,7 +305,9 @@ impl SupertableProvider {
     // survive the two-tier prune — per-part aggregates (ManifestPartEntry)
     // first, then per-superfile stats (SuperfileEntry).
     //
-    // These superfiles are then opened and scanned by DataFusion.
+    // The survivors are returned to `scan`, which opens each through the
+    // superfile reader for its byte source + footer, then lets
+    // DataFusion's Parquet engine decode the rows over that byte source.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let mut leaves = self.predicates_to_prune_leaves(predicates);
@@ -1133,8 +1135,10 @@ pub(crate) fn exprs_to_scalar_predicates(
 /// A `NOT IN`, a non-literal item, a function-wrapped or unknown column
 /// yields no leaf — that filter just isn't pruned (the scan stays correct).
 ///
-/// Only sees `Expr::InList` (4+ values): DataFusion rewrites a 1-value
-/// `IN` to `=` and a 2–3 value `IN` to `OR` before the provider.
+/// Handles any `Expr::InList`, whatever its length. In practice SQL
+/// planning rewrites a short `IN` first — a 1-value to `=`, a 2–3 value
+/// to `OR` — so only 4+ value lists usually reach here, but that's the
+/// optimizer's behavior, not a precondition this helper relies on.
 pub(crate) fn exprs_to_in_list_leaves(
     filters: &[Expr],
     schema: &SchemaRef,
@@ -1166,6 +1170,10 @@ fn collect_in_list_leaves(
     out: &mut Vec<PruneLeaf>,
 ) {
     match expr {
+        // Filters reach us alias-free (Filter::try_new runs unalias_nested),
+        // but an alias is a pure rename; descend it so pruning is unaffected
+        // if one ever survives (e.g. a metadata-carrying alias).
+        Expr::Alias(a) => collect_in_list_leaves(&a.expr, schema, fts_cols, tokenizer, out),
         // Descend AND; an IN can sit on either side.
         Expr::BinaryExpr(be) if be.op == Operator::And => {
             collect_in_list_leaves(&be.left, schema, fts_cols, tokenizer, out);
@@ -1518,6 +1526,18 @@ mod tests {
             .gt(lit(0_i64))
             .and(col("y").in_list(vec![lit(7_i64)], false));
         assert_eq!(in_list_leaves(&[expr], &s), vec![("y".to_string(), 1)]);
+    }
+
+    #[test]
+    fn in_list_under_alias_is_found() {
+        // Filters reach us unaliased, but the descent must still find an
+        // IN wrapped in an alias if one ever survives (a pure rename
+        // doesn't change the column the leaf prunes on).
+        let s = schema_xy();
+        let expr = col("x")
+            .in_list(vec![lit(1_i64), lit(2_i64)], false)
+            .alias("k");
+        assert_eq!(in_list_leaves(&[expr], &s), vec![("x".to_string(), 2)]);
     }
 
     #[test]
