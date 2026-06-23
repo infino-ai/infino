@@ -1746,6 +1746,48 @@ impl VectorReader {
             .await
     }
 
+    /// Probe one OPANN routing leaf: fetch the cluster bytes named by
+    /// `(doc_off, count)` and score them. Skips centroid scoring — the tree
+    /// already selected this cell. `(doc_off, count) = (0, 0)` is the
+    /// whole-superfile hidden-cell shape: every non-empty IVF cluster is
+    /// probed without re-ranking centroids.
+    pub(crate) async fn probe_leaf_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        leaf_doc_off: u32,
+        leaf_count: u32,
+        rerank_mult: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated {
+            return Ok(Vec::new());
+        }
+        if leaf_doc_off == 0 && leaf_count == 0 {
+            let clusters: Vec<u32> = (0..col.n_cent).collect();
+            return self
+                .search_clusters_async(column, query, k, &clusters, rerank_mult, allow)
+                .await;
+        }
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            allow,
+        };
+        let meta = vec![(0usize, leaf_doc_off, leaf_count)];
+        self.probe_cluster_meta_async(col, query, &ctx, &meta)
+            .await
+    }
+
     /// Shared async tail of the IVF probe: given a chosen set of cluster
     /// ids plus the already-fetched cluster index, fetch each non-empty
     /// cluster's block, build the 1-bit shortlist, and rerank to top-k.
@@ -1760,9 +1802,7 @@ impl VectorReader {
         cluster_idx: &[u8],
         chosen: &[usize],
     ) -> Result<Vec<(u32, f32)>, VectorError> {
-        let cb = col.quant.code_bytes();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
-        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(chosen.len());
         for &c in chosen {
             if c >= col.n_cent as usize {
                 continue;
@@ -1771,12 +1811,39 @@ impl VectorReader {
             if cnt == 0 {
                 continue;
             }
-            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
             cluster_meta.push((c, off, cnt));
         }
         if cluster_meta.is_empty() {
             return Ok(Vec::new());
         }
+        self.probe_cluster_meta_async(col, query, ctx, &cluster_meta)
+            .await
+    }
+
+    /// Fetch + score cluster blocks when `(doc_off, count)` are already known
+    /// (OPANN leaf probe — no cluster index or centroid scoring).
+    async fn probe_cluster_meta_async(
+        &self,
+        col: &ColumnReader,
+        query: &[f32],
+        ctx: &ProbeCtx<'_>,
+        cluster_meta: &[(usize, u32, u32)],
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let cb = col.quant.code_bytes();
+        let mut filtered_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(cluster_meta.len());
+        let mut cluster_prefix_ranges: Vec<Range<usize>> =
+            Vec::with_capacity(cluster_meta.len());
+        for &(c, off, cnt) in cluster_meta {
+            if cnt == 0 {
+                continue;
+            }
+            filtered_meta.push((c, off, cnt));
+            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
+        }
+        if filtered_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
         // Warm fast path: every prefix already resident → sync zero-copy.
         let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
@@ -1808,7 +1875,7 @@ impl VectorReader {
             .await
             .map_err(|e| VectorError::LazySource(e.to_string()))?
         };
-        debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+        debug_assert_eq!(cluster_blocks.len(), filtered_meta.len());
 
         // Shared pure-CPU shortlist + candidate-build stage (see
         // [`build_shortlist`]); only the survivor-row fetch below
@@ -1816,7 +1883,7 @@ impl VectorReader {
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
             cb,
-            &cluster_meta,
+            &filtered_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
             ctx,

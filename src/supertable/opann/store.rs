@@ -26,6 +26,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::try_join_all;
 
+use crate::get_meter::{GetPhaseGuard, GET_PHASE_OPANN};
 use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::manifest::part::ContentHash;
 use crate::supertable::reader_cache::DiskCacheStore;
@@ -93,6 +94,7 @@ pub(crate) async fn load_resident(
         // Fetch every distinct page of this level concurrently. With a disk
         // cache attached each page rides `blob_bytes` (mmap-backed, evictable);
         // otherwise it falls back to a direct storage GET (heap bytes).
+        let _phase = GetPhaseGuard::new(GET_PHASE_OPANN);
         let fetched = try_join_all(to_fetch.iter().map(|h| {
             let h = *h;
             async move { Ok::<_, OpannStoreError>((h, fetch_page(cache, storage, h).await?)) }

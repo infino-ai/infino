@@ -937,10 +937,17 @@ pub mod vector {
         let _hits = consumer.topk_global(supertable::VEC_COLUMN, query, TOP_K, nprobe, rerank);
         let wall = t0.elapsed();
         let snap = meter.snapshot();
+        let waves = meter.range_wave_summary();
         eprintln!(
-            "[supertable_vector] metered cold vector search: GETs={} HEADs={} PUTs={} wall={wall:.1?}",
-            snap.get_count, snap.head_count, snap.put_count,
+            "[supertable_vector] metered cold vector search: GETs={} HEADs={} PUTs={} waves={} wall={wall:.1?}",
+            snap.get_count, snap.head_count, snap.put_count, waves.wave_batches,
         );
+        for (phase, gets, phase_waves) in waves.by_phase {
+            eprintln!(
+                "  {}: GETs={gets} waves={phase_waves}",
+                infino::get_meter::phase_label(phase),
+            );
+        }
         drop(consumer);
         drop(cache_dir);
         Some(snap)

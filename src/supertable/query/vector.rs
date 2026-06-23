@@ -169,7 +169,7 @@ fn adaptive_probe_cells(
 
 /// Superfiles in manifest commit order — loads parts when the flat
 /// `manifest.superfiles` view is empty (lazy open after `Supertable::open`).
-async fn ordered_manifest_superfiles(
+pub(super) async fn ordered_manifest_superfiles(
     manifest: &Manifest,
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
     if !manifest.is_in_process_only() {
@@ -559,7 +559,10 @@ impl SupertableReader {
             dispatch::fanout(self, units, kernel).await?
         };
 
-        Ok(top_k_ascending(per_superfile, k))
+        Ok(top_k_ascending(
+            per_superfile.into_iter().flatten().collect(),
+            k,
+        ))
     }
 
     /// Filtered single-column vector kNN: the k-nearest rows **among
@@ -623,6 +626,30 @@ impl SupertableReader {
             .collect();
         if surviving.is_empty() {
             return Ok(Vec::new());
+        }
+        let manifest = self.manifest();
+        if let Some(leaves) = super::vector_probe::select_opann_probe_leaves(
+            self,
+            manifest,
+            column,
+            query,
+            &options,
+            |sid| surviving.contains(&sid),
+        )
+        .await?
+        {
+            let entries: Vec<Arc<SuperfileEntry>> =
+                leaves.iter().map(|(_, _, e)| Arc::clone(e)).collect();
+            let allow = self
+                .candidate_bitmaps(&entries, filter.column, &tokens, filter.mode)
+                .await?;
+            if allow.is_empty() {
+                return Ok(Vec::new());
+            }
+            return super::vector_probe::fanout_opann_leaf_probes(
+                self, leaves, column, query, k, options, Some(allow),
+            )
+            .await;
         }
         let superfiles = self
             .candidate_superfiles_for_vector(column, query, &options, |sid| {
@@ -973,7 +1000,24 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        // Unfiltered: every leaf is admissible (no predicate survival gate).
+        let manifest = self.manifest();
+        if let Some(leaves) = super::vector_probe::select_opann_probe_leaves(
+            self,
+            manifest,
+            column,
+            query,
+            &options,
+            |_| true,
+        )
+        .await?
+        {
+            return super::vector_probe::fanout_opann_leaf_probes(
+                self, leaves, column, query, k, options, None,
+            )
+            .await;
+        }
+        // Legacy: no OPANN tree or missing probe layout — open superfiles and
+        // run per-superfile IVF search.
         let superfiles = self
             .candidate_superfiles_for_vector(column, query, &options, |_| true)
             .await?;
@@ -1122,7 +1166,7 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
-fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
+pub(super) fn top_k_ascending(hits: Vec<SuperfileHit>, k: usize) -> Vec<SuperfileHit> {
     #[derive(PartialEq)]
     struct MaxByScore(SuperfileHit);
     impl Eq for MaxByScore {}
@@ -1141,7 +1185,7 @@ fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Super
     }
 
     let mut heap = BinaryHeap::with_capacity(k + 1);
-    for hit in per_superfile.into_iter().flatten() {
+    for hit in hits {
         if heap.len() < k {
             heap.push(MaxByScore(hit));
         } else if let Some(worst) = heap.peek()

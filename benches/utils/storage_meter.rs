@@ -8,16 +8,21 @@
 //! write-dominated drain / optimize maintenance passes.
 
 use std::{
+    collections::HashMap,
     ops::Range,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use infino::storage::{ObjectMeta, StorageError, StorageProvider};
+use infino::{
+    get_meter,
+    storage::{ObjectMeta, StorageError, StorageProvider},
+};
 use object_store::{MultipartUpload, PutPayload, PutResult, UploadPart};
 
 /// One bench window's object-store footprint (read + write requests + bytes).
@@ -32,6 +37,15 @@ pub struct ObjectStoreMeter {
     /// Total bytes written, summed over single PUTs and multipart part uploads.
     pub put_bytes: u64,
     pub delete_count: u64,
+}
+
+/// Per-phase GET wave summary for one bench window.
+#[derive(Debug, Clone, Default)]
+pub struct RangeWaveSummary {
+    /// Parallel GET batches (overlapping request intervals count as one wave).
+    pub wave_batches: usize,
+    /// GET count attributed to each tagged phase (`get_meter` phase ids).
+    pub by_phase: Vec<(u8, u64, usize)>,
 }
 
 impl ObjectStoreMeter {
@@ -49,6 +63,14 @@ impl ObjectStoreMeter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RangeGetEvent {
+    bytes: u64,
+    start_us: u128,
+    end_us: u128,
+    phase: u8,
+}
+
 #[derive(Default)]
 struct MeterCounters {
     head_count: AtomicU64,
@@ -57,6 +79,7 @@ struct MeterCounters {
     put_count: AtomicU64,
     put_bytes: AtomicU64,
     delete_count: AtomicU64,
+    range_log: Mutex<Vec<RangeGetEvent>>,
 }
 
 impl MeterCounters {
@@ -71,9 +94,33 @@ impl MeterCounters {
         }
     }
 
-    fn record_get(&self, bytes: u64) {
+    fn record_get(&self, origin: Instant, start: Instant, end: Instant, bytes: u64, phase: u8) {
         self.get_count.fetch_add(1, Ordering::Relaxed);
         self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.range_log.lock().unwrap().push(RangeGetEvent {
+            bytes,
+            start_us: start.duration_since(origin).as_micros(),
+            end_us: end.duration_since(origin).as_micros(),
+            phase,
+        });
+    }
+
+    fn range_wave_summary(&self) -> RangeWaveSummary {
+        let log = self.range_log.lock().unwrap();
+        if log.is_empty() {
+            return RangeWaveSummary::default();
+        }
+        let wave_batches = count_get_waves(&log);
+        let mut by_phase: Vec<(u8, u64, usize)> = Vec::new();
+        for events in events_by_phase(&log) {
+            let phase = events[0].phase;
+            by_phase.push((phase, events.len() as u64, count_get_waves(&events)));
+        }
+        by_phase.sort_by_key(|(phase, _, _)| *phase);
+        RangeWaveSummary {
+            wave_batches,
+            by_phase,
+        }
     }
 
     /// Record a single-PUT write (one request + its byte payload).
@@ -81,6 +128,39 @@ impl MeterCounters {
         self.put_count.fetch_add(1, Ordering::Relaxed);
         self.put_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
+}
+
+/// Count parallel GET **waves**: requests whose intervals overlap belong to
+/// the same wave (same definition as `unified_object_store` cold-path diag).
+fn count_get_waves(events: &[RangeGetEvent]) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<&RangeGetEvent> = events.iter().collect();
+    sorted.sort_unstable_by_key(|e| (e.start_us, e.end_us));
+    let mut batches = 1usize;
+    let mut batch_end = sorted[0].end_us;
+    for event in sorted.iter().skip(1) {
+        if event.start_us <= batch_end {
+            batch_end = batch_end.max(event.end_us);
+        } else {
+            batches += 1;
+            batch_end = event.end_us;
+        }
+    }
+    batches
+}
+
+fn events_by_phase(log: &[RangeGetEvent]) -> Vec<Vec<RangeGetEvent>> {
+    let mut out: HashMap<u8, Vec<RangeGetEvent>> = HashMap::new();
+    for event in log {
+        out.entry(event.phase).or_default().push(event.clone());
+    }
+    let mut keys: Vec<u8> = out.keys().copied().collect();
+    keys.sort_unstable();
+    keys.into_iter()
+        .filter_map(|k| out.remove(&k))
+        .collect()
 }
 
 /// Storage provider wrapper that meters read- and write-path requests.
@@ -92,11 +172,20 @@ pub struct MeteredStorage {
 struct CountingStorage {
     inner: Arc<dyn StorageProvider>,
     counters: Arc<MeterCounters>,
+    origin: Instant,
 }
 
 impl CountingStorage {
-    fn new(inner: Arc<dyn StorageProvider>, counters: Arc<MeterCounters>) -> Self {
-        Self { inner, counters }
+    fn new(
+        inner: Arc<dyn StorageProvider>,
+        counters: Arc<MeterCounters>,
+        origin: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            counters,
+            origin,
+        }
     }
 }
 
@@ -108,8 +197,12 @@ impl std::fmt::Debug for CountingStorage {
 
 pub fn wrap(storage: Arc<dyn StorageProvider>) -> MeteredStorage {
     let counters = Arc::new(MeterCounters::default());
-    let provider: Arc<dyn StorageProvider> =
-        Arc::new(CountingStorage::new(storage, Arc::clone(&counters)));
+    let origin = Instant::now();
+    let provider: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
+        storage,
+        Arc::clone(&counters),
+        origin,
+    ));
     MeteredStorage { provider, counters }
 }
 
@@ -121,6 +214,11 @@ impl MeteredStorage {
     pub fn snapshot(&self) -> ObjectStoreMeter {
         self.counters.snapshot()
     }
+
+    /// GET wave batches and per-phase breakdown for the current window.
+    pub fn range_wave_summary(&self) -> RangeWaveSummary {
+        self.counters.range_wave_summary()
+    }
 }
 
 #[async_trait]
@@ -131,18 +229,47 @@ impl StorageProvider for CountingStorage {
     }
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        self.inner.get(uri).await
+        let start = Instant::now();
+        let phase = get_meter::get_phase();
+        let out = self.inner.get(uri).await?;
+        let end = Instant::now();
+        self.counters.record_get(
+            self.origin,
+            start,
+            end,
+            out.0.len() as u64,
+            phase,
+        );
+        Ok(out)
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+        let start = Instant::now();
+        let phase = get_meter::get_phase();
         let bytes = self.inner.get_range(uri, range).await?;
-        self.counters.record_get(bytes.len() as u64);
+        let end = Instant::now();
+        self.counters.record_get(
+            self.origin,
+            start,
+            end,
+            bytes.len() as u64,
+            phase,
+        );
         Ok(bytes)
     }
 
     async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+        let start = Instant::now();
+        let phase = get_meter::get_phase();
         let (bytes, size) = self.inner.tail(uri, len).await?;
-        self.counters.record_get(bytes.len() as u64);
+        let end = Instant::now();
+        self.counters.record_get(
+            self.origin,
+            start,
+            end,
+            bytes.len() as u64,
+            phase,
+        );
         Ok((bytes, size))
     }
 

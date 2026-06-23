@@ -124,6 +124,10 @@ pub use roaring;
 // public items are re-exported at the crate root below.
 mod catalog;
 mod error;
+#[cfg(feature = "test-helpers")]
+pub mod get_meter;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod get_meter;
 mod runtime_bridge;
 
 // ---- Curated public surface ----

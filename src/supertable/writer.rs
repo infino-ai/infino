@@ -2299,6 +2299,56 @@ fn routing_copies_for_superfile(
         .unwrap_or_default()
 }
 
+/// One whole-superfile OPANN leaf for the hidden index: degenerate `(0, 0)`
+/// range so queries probe the entire cell. Centroid is a doc-count-weighted
+/// mean of column-0 IVF cluster centroids from the shared build; radius comes
+/// from the superfile vector summary (same as k-means hidden incoming).
+fn hidden_cell_routing_copies_for_superfile(
+    superfile_id: u128,
+    entry: &SuperfileEntry,
+    column: &str,
+    routing: Vec<(u32, ClusterRouting)>,
+) -> Vec<PartitionRoutingCopy> {
+    let Some(vs) = entry.vector_summary.get(column) else {
+        return Vec::new();
+    };
+    let routes = match routing.into_iter().find(|(col_id, _)| *col_id == 0) {
+        Some((_, cr)) => cr.routes,
+        None => return Vec::new(),
+    };
+    if routes.is_empty() {
+        return Vec::new();
+    }
+    let dim = routes[0].centroid_fp32.len();
+    let mut acc = vec![0f32; dim];
+    let mut total = 0u64;
+    for rt in &routes {
+        let w = rt.count as u64;
+        if w == 0 {
+            continue;
+        }
+        for (a, &c) in acc.iter_mut().zip(rt.centroid_fp32.iter()) {
+            *a += c * w as f32;
+        }
+        total += w;
+    }
+    let centroid_fp32 = if total > 0 {
+        for a in &mut acc {
+            *a /= total as f32;
+        }
+        acc
+    } else {
+        routes[0].centroid_fp32.clone()
+    };
+    vec![PartitionRoutingCopy {
+        superfile_id,
+        doc_off: 0,
+        count: 0,
+        centroid_fp32,
+        radius: vs.radius,
+    }]
+}
+
 /// Derive manifest entries, storage writes, and OPANN routing copies from
 /// already-built superfile bytes. Safe to run twice on the same shards with
 /// different `inner` handles (user vs hidden shadow table) — build-once,
@@ -2345,6 +2395,59 @@ fn prepare_superfile_publish_in_scope(
     Ok((batch, new_routing))
 }
 
+/// Same as [`prepare_superfile_publish_in_scope`], but stamps one whole-cell
+/// `(0, 0)` OPANN leaf per hidden superfile instead of per-cluster leaves.
+fn prepare_hidden_superfile_publish_in_scope(
+    inner: &SupertableInner,
+    outputs: Vec<ShardOutput>,
+    hints: Vec<Option<u32>>,
+) -> Result<(SuperfilePublishBatch, Vec<PartitionRoutingCopy>), BuildError> {
+    let Some(column) = inner
+        .options
+        .vector_columns
+        .first()
+        .map(|c| c.column.clone())
+    else {
+        return prepare_superfile_publish_in_scope(inner, outputs, hints);
+    };
+    let prepared: Vec<(PreparedSuperfile, Vec<PartitionRoutingCopy>)> = outputs
+        .into_par_iter()
+        .zip(hints.into_par_iter())
+        .filter_map(|(mut shard, hint)| {
+            let routing = mem::take(&mut shard.routing);
+            match prepare_superfile(inner, shard) {
+                Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(|entry| {
+                    let copies = hidden_cell_routing_copies_for_superfile(
+                        entry.superfile_id.as_u128(),
+                        &entry,
+                        &column,
+                        routing,
+                    );
+                    (
+                        PreparedSuperfile {
+                            entry,
+                            bytes_for_store: p.bytes_for_store,
+                            bytes_for_storage: p.bytes_for_storage,
+                            bytes_for_cache: p.bytes_for_cache,
+                        },
+                        copies,
+                    )
+                })),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut prepared_superfiles = Vec::with_capacity(prepared.len());
+    let mut new_routing = Vec::new();
+    for (p, copies) in prepared {
+        prepared_superfiles.push(p);
+        new_routing.extend(copies);
+    }
+    let batch = collect_prepared_superfiles(inner, prepared_superfiles)?;
+    Ok((batch, new_routing))
+}
+
 fn prepare_user_superfile_batch_in_scope(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
@@ -2364,7 +2467,7 @@ fn prepare_hidden_incoming_from_shared_build(
     hints: Vec<Option<u32>>,
 ) -> Result<HiddenIncomingPrepare, BuildError> {
     let (batch, new_routing) =
-        prepare_superfile_publish_in_scope(hidden_inner, outputs, hints)?;
+        prepare_hidden_superfile_publish_in_scope(hidden_inner, outputs, hints)?;
     Ok(HiddenIncomingPrepare { batch, new_routing })
 }
 
@@ -4257,5 +4360,65 @@ supertable:
             matches!(commit, OpannRoutingCommit::Inherit),
             "unchanged root with no new pages must not rewrite the manifest pointer"
         );
+    }
+
+    #[test]
+    fn hidden_cell_routing_stamps_whole_cell_leaf() {
+        use std::collections::HashMap;
+
+        use uuid::Uuid;
+
+        use crate::superfile::vector::builder::{ClusterRoute, ClusterRouting};
+        use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
+
+        let superfile_id = 99u128;
+        let mut entry = SuperfileEntry {
+            superfile_id: Uuid::from_u128(superfile_id),
+            uri: SuperfileUri::new_v4(),
+            n_docs: 100,
+            id_min: 0,
+            id_max: 99,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        };
+        entry.vector_summary.insert(
+            "emb".into(),
+            VectorSummary {
+                centroid: ClusterCentroids::empty(),
+                radius: 2.0,
+                clusters: ClusterCentroids::empty(),
+            },
+        );
+        let routing = vec![(
+            0u32,
+            ClusterRouting {
+                routes: vec![
+                    ClusterRoute {
+                        centroid_fp32: vec![1.0, 0.0],
+                        doc_off: 10,
+                        count: 40,
+                        radius: 0.5,
+                    },
+                    ClusterRoute {
+                        centroid_fp32: vec![3.0, 0.0],
+                        doc_off: 50,
+                        count: 60,
+                        radius: 0.5,
+                    },
+                ],
+            },
+        )];
+        let copies =
+            hidden_cell_routing_copies_for_superfile(superfile_id, &entry, "emb", routing);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].doc_off, 0);
+        assert_eq!(copies[0].count, 0);
+        assert_eq!(copies[0].radius, 2.0);
+        assert!((copies[0].centroid_fp32[0] - 2.2).abs() < 1e-5);
     }
 }
