@@ -305,9 +305,8 @@ impl SupertableProvider {
     // survive the two-tier prune — per-part aggregates (ManifestPartEntry)
     // first, then per-superfile stats (SuperfileEntry).
     //
-    // The survivors are returned to `scan`, which opens each through the
-    // superfile reader for its byte source + footer, then lets
-    // DataFusion's Parquet engine decode the rows over that byte source.
+    // Pure manifest work: reads stats only, opens no superfile. Returns the
+    // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let mut leaves = self.predicates_to_prune_leaves(predicates);
