@@ -125,10 +125,35 @@ impl<S: PageSource> PagedTree<S> {
     /// at most once and cached for this descent; scoring runs off each page's
     /// Sq8+residual bytes (no fp32 reconstruction). Errors if a page on the
     /// descent path is missing or fails its content-hash check.
+    ///
+    /// Equivalent to [`Self::select_probes_where`] with an always-true survival
+    /// predicate (every leaf admitted) — the unfiltered descent. Production
+    /// always goes through `select_probes_where` (even the unfiltered path,
+    /// with an always-true predicate); this wrapper is the descent oracle the
+    /// round-trip + survival tests compare against.
+    #[cfg(test)]
     pub(crate) fn select_probes(
         &self,
         query: &[f32],
         n_probe: usize,
+    ) -> Result<Vec<(LeafRef, f32)>, PageError> {
+        self.select_probes_where(query, n_probe, |_| true)
+    }
+
+    /// As [`Self::select_probes`], but a leaf counts toward `n_probe` only when
+    /// `survives(leaf.superfile_id)` — the §5a survival-aware admission for
+    /// filtered search. A leaf whose superfile failed the predicate is **skipped
+    /// without consuming budget**, and descent keeps going (adaptive expansion),
+    /// so the `n_probe` returned cells are the vector-nearest *among the
+    /// predicate-surviving* superfiles. Routing nodes are never gated — only
+    /// leaves — so a survivor reachable through a node that mixes survivors and
+    /// non-survivors is still found. With an always-true predicate this is
+    /// exactly the unfiltered descent.
+    pub(crate) fn select_probes_where(
+        &self,
+        query: &[f32],
+        n_probe: usize,
+        survives: impl Fn(u128) -> bool,
     ) -> Result<Vec<(LeafRef, f32)>, PageError> {
         if n_probe == 0 {
             return Ok(Vec::new());
@@ -155,7 +180,11 @@ impl<S: PageSource> PagedTree<S> {
             // before we mutate the cache to resolve child pages.
             let topo = cache.get(&h.page)?.topo_at(h.local).clone();
             match topo {
-                NodeTopo::Leaf(cell) => Some(cell),
+                // A leaf is a probe only if its superfile survived the
+                // predicate; otherwise skip it (no children pushed) so descent
+                // continues without spending budget on it.
+                NodeTopo::Leaf(cell) if survives(cell.superfile_id) => Some(cell),
+                NodeTopo::Leaf(_) => None,
                 // Walk children in their original order — identical to the
                 // in-memory and single-page paths — so the heap pops the same
                 // sequence even when distances tie.
@@ -270,6 +299,53 @@ mod tests {
                             "{metric:?} budget {budget} target {target} k {k}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn survival_aware_descent_admits_only_surviving_superfiles() {
+        // §5a: a survival-aware descent must yield exactly the unfiltered
+        // descent's leaves, filtered to surviving superfiles, first `k` — i.e.
+        // the k vector-nearest *among survivors*, in the same best-first order.
+        // Skipping a non-surviving leaf must not perturb the relative order of
+        // the survivors (it only frees budget for the next survivor).
+        let (dim, n) = (24usize, 200usize);
+        let cells = synth_cells(n, dim);
+        // Survivors: every third cell's superfile id.
+        let surviving: std::collections::HashSet<u128> = cells
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 == 0)
+            .map(|(_, c)| c.2)
+            .collect();
+        let survives = |sid: u128| surviving.contains(&sid);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let tree = build_tree(metric, dim, &cells).expect("tree");
+            let split = tree.to_pages(16);
+            let paged = PagedTree::new(
+                ResidentPageSource::from_pages(split.pages.clone()),
+                split.root,
+            );
+            for &target in &[0usize, 1, 57, 150, 199] {
+                let q = &cells[target].0;
+                let full = paged.select_probes(q, n).expect("full descent");
+                for &k in &[1usize, 8, 32, n] {
+                    let expected: Vec<(LeafRef, f32)> = full
+                        .iter()
+                        .copied()
+                        .filter(|(leaf, _)| survives(leaf.superfile_id))
+                        .take(k)
+                        .collect();
+                    let got = paged
+                        .select_probes_where(q, k, survives)
+                        .expect("survival descent");
+                    assert_eq!(got, expected, "{metric:?} target {target} k {k}");
+                    assert!(
+                        got.iter().all(|(leaf, _)| survives(leaf.superfile_id)),
+                        "every admitted leaf survives"
+                    );
                 }
             }
         }

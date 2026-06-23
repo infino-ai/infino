@@ -84,6 +84,7 @@ use super::{
     dispatch,
     exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
     hierarchical_iter,
+    prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
@@ -557,19 +558,10 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        // Prune the superfile set through the routing tree (when present), then
-        // restrict to predicate-matching rows below — instead of scanning every
-        // superfile. The fall-back (no tree) still enumerates the full set.
-        let superfiles = self
-            .candidate_superfiles_for_vector(column, query, &options)
-            .await?;
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Tokenize the predicate once with the index tokenizer (the same
-        // tokenizer used at build time, so the terms match the postings).
-        // No tokens (e.g. empty / punctuation-only) ⇒ nothing matches.
+        // tokenizer used at build time, so the terms match the postings AND the
+        // manifest term blooms). No tokens (empty / punctuation-only) ⇒ nothing
+        // matches.
         let Some(tokenizer) = manifest.options.tokenizer.as_ref() else {
             return Ok(Vec::new());
         };
@@ -578,13 +570,39 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Build the per-superfile allow-set: one `token_match` per
-        // candidate superfile (postings only — the same retrieval
-        // `CandidatePlan::TermsAll` uses), grouped to a
-        // `superfile → RoaringBitmap` map. Empty bitmaps are dropped so
-        // their superfile never fans out. Reuses the shared `fanout`
-        // orchestrator (concurrent reader opens) but keeps each unit's
-        // result keyed to its superfile URI.
+        // §5a level-1 (leaf-survival): the cheap, manifest-only predicate prune
+        // (part-tier term bloom / range, then per-superfile summaries — no
+        // superfile reads) gives the superfiles that *could* match. The routing
+        // tree descent below is gated to exactly these: a leaf whose superfile
+        // failed the predicate is skipped without spending probe budget, so the
+        // budget lands on vector-near *matching* cells. Without this, a selective
+        // predicate craters recall (the budget goes to vector-near non-matching
+        // cells, and matching cells slightly farther by vector never get probed).
+        let prune_leaves = [PruneLeaf::TermPresence {
+            column: filter.column.to_owned(),
+            terms: tokens.clone(),
+            mode: filter.mode,
+        }];
+        let surviving: HashSet<u128> = select_superfiles(&manifest, &prune_leaves)
+            .await?
+            .iter()
+            .map(|e| e.superfile_id.as_u128())
+            .collect();
+        if surviving.is_empty() {
+            return Ok(Vec::new());
+        }
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options, |sid| {
+                surviving.contains(&sid)
+            })
+            .await?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // §5a level-2 (row mask): resolve the exact per-superfile allow-set
+        // (`token_match` postings) over the probed survivors; superfiles whose
+        // predicate matched no row are dropped so they never fan out.
         let allow = self
             .candidate_bitmaps(&superfiles, filter.column, &tokens, filter.mode)
             .await?;
@@ -658,10 +676,17 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        // Prune the superfile set through the routing tree (when present) before
-        // resolving the plan's allow-set over the survivors.
+        // Prune the superfile set through the routing tree, then resolve the
+        // plan's allow-set over the survivors.
+        // TODO(§5a): pass a real survival gate here — derive the surviving
+        // superfile set from the plan's prune leaves (a `CandidatePlan` →
+        // `PruneLeaf` extraction that doesn't exist yet) and feed it as
+        // `survives`, mirroring the text path below. Until then the SQL-pushdown
+        // path admits every leaf (vector-first), which under-probes selective
+        // predicates — the recall bench runs through `vector_hits_global_allow_async`,
+        // which IS survival-gated, so this gap doesn't mask the gate.
         let superfiles = self
-            .candidate_superfiles_for_vector(column, query, &options)
+            .candidate_superfiles_for_vector(column, query, &options, |_| true)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -693,18 +718,12 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        // Prune the search set through the routing tree (same selector as the
-        // production filtered paths), so the bench's filtered recall measures
-        // the tree-routed path. The allow-bitmap offsets below still walk the
-        // full superfile list.
-        let superfiles = self
-            .candidate_superfiles_for_vector(column, query, &options)
-            .await?;
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-
+        // Translate the global allow-bitmap into per-superfile local bitmaps,
+        // recording which superfiles hold any allowed row — that set is the §5a
+        // survival gate, computed before the descent so the bench's filtered
+        // recall measures the same survival-gated tree path production uses.
         let mut allow_by_uri: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
+        let mut surviving: HashSet<u128> = HashSet::new();
         let mut allowed = allow_global.iter().peekable();
         let mut base = 0u64;
         for entry in manifest.superfiles.iter() {
@@ -722,12 +741,22 @@ impl SupertableReader {
                 allowed.next();
             }
             if !local.is_empty() {
+                surviving.insert(entry.superfile_id.as_u128());
                 allow_by_uri.insert(entry.uri, local);
             }
             base = end;
         }
-
         if allow_by_uri.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Survival-gated descent: only superfiles holding allowed rows.
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options, |sid| {
+                surviving.contains(&sid)
+            })
+            .await?;
+        if superfiles.is_empty() {
             return Ok(Vec::new());
         }
         let allow = allow_by_uri
@@ -815,6 +844,7 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         options: &VectorSearchOptions,
+        survives: impl Fn(u128) -> bool,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         let manifest = self.manifest();
         // The resident OPANN routing tree swaps with the manifest — loaded once
@@ -832,9 +862,12 @@ impl SupertableReader {
             // probe set by radius-aware adaptive admission (§7.3) rather than a
             // fixed top-N: a far-centroid but large-radius partition can still
             // hold a true neighbor, and pure centroid-distance ranking drops it.
+            // `survives` is the §5a leaf-survival gate: a leaf whose superfile
+            // failed the predicate is skipped in the descent without consuming
+            // probe budget (the unfiltered path passes an always-true `survives`).
             (Some(source), Some((root, routing))) => {
                 let candidates: Vec<(u128, f32)> = PagedTree::new(source, root)
-                    .select_probes(query, usize::MAX)
+                    .select_probes_where(query, usize::MAX, &survives)
                     .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?
                     .into_iter()
                     // Collapse each cluster leaf to its superfile id; the probed
@@ -885,11 +918,16 @@ impl SupertableReader {
                 Vec::new()
             }
             // No tree (storage-less / `memory://` user table): there is no
-            // routing layer to prune through, so enumerate the full set.
+            // routing layer to prune through, so enumerate the full set —
+            // still honoring survival so a filtered query restricts to the
+            // predicate-surviving superfiles.
             _ => manifest
                 .get_pruned_superfiles_for_vector(column, query)
                 .await
-                .map_err(QueryError::ManifestLoad)?,
+                .map_err(QueryError::ManifestLoad)?
+                .into_iter()
+                .filter(|sf| survives(sf.superfile_id.as_u128()))
+                .collect(),
         };
         Ok(superfiles)
     }
@@ -904,8 +942,9 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // Unfiltered: every leaf is admissible (no predicate survival gate).
         let superfiles = self
-            .candidate_superfiles_for_vector(column, query, &options)
+            .candidate_superfiles_for_vector(column, query, &options, |_| true)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
