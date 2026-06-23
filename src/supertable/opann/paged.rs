@@ -293,8 +293,10 @@ mod tests {
                     let p = Page::parse(bytes).expect("parse subpage");
                     assert!(p.topo().len() <= budget, "{metric:?} budget {budget}");
                 }
-                let paged =
-                    PagedTree::new(ResidentPageSource::from_pages(split.pages.clone()), split.root);
+                let paged = PagedTree::new(
+                    ResidentPageSource::from_pages(split.pages.clone()),
+                    split.root,
+                );
                 for &target in &[0usize, 1, 57, 199] {
                     let q = &cells[target].0;
                     for &k in &[1usize, 8, 32, n] {
