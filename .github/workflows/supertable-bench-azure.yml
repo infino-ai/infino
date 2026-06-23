@@ -88,6 +88,8 @@ on:
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs main to flag in the PR comment; smaller is noise.
       noise_threshold_pct: { type: string, required: false, default: "10" }
+      # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
+      is_fork_pr:      { type: boolean, required: false, default: false }
 
 permissions:
   id-token: write       # Azure OIDC federated login
@@ -111,10 +113,11 @@ env:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    # Run under the `ci` environment so the OIDC subject is
-    # repo:…:environment:ci — branch-independent, so one federated
-    # credential authorizes runs from any branch.
-    environment: ci
+    # `ci`: same-repo, no gate. `bench`: required reviewers, so a maintainer
+    # approves before secrets reach fork code. The env name is the OIDC
+    # subject (repo:…:environment:<name>) — each needs its own Azure
+    # federated credential.
+    environment: ${{ inputs.is_fork_pr && 'bench' || 'ci' }}
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
