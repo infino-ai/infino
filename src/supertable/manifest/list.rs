@@ -690,7 +690,11 @@ impl VectorSummaryAgg {
         // merged ball still encloses both inputs after Sq8+ε quantization.
         let center = {
             let d = decode_centroid_envelope(&self.centroid_envelope);
-            if d.len() == new_center.len() { d } else { new_center }
+            if d.len() == new_center.len() {
+                d
+            } else {
+                new_center
+            }
         };
         let self_reach = l2_distance(&self_center, &center) + self.envelope_radius;
         let other_reach = l2_distance(&other_center, &center) + other.envelope_radius;
@@ -2300,7 +2304,11 @@ mod tests {
         );
         let got = decode(&bytes).expect("decode");
         assert!(got.opann_routing.is_none());
-        assert_eq!(encode(&got).expect("re-encode"), bytes, "re-encode must be byte-identical");
+        assert_eq!(
+            encode(&got).expect("re-encode"),
+            bytes,
+            "re-encode must be byte-identical"
+        );
     }
 
     #[test]

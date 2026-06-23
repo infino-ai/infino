@@ -32,6 +32,8 @@
 //! [`ManifestList`]: super::list::ManifestList
 //! [`ManifestListEntry`]: super::list::ManifestListEntry
 
+#[cfg(test)]
+use crate::supertable::manifest::encoding::decode_centroid_envelope;
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::manifest::{
@@ -39,8 +41,6 @@ use crate::{
         part::PartId,
     },
 };
-#[cfg(test)]
-use crate::supertable::manifest::encoding::decode_centroid_envelope;
 
 /// Filter the list's parts to those whose
 /// `fts_summary_agg[column].term_range` overlaps the prefix

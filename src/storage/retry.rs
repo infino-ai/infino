@@ -56,10 +56,9 @@ fn backoff(attempt: u32) -> Duration {
 /// Permanent error: the object returned fewer bytes than requested and
 /// made no progress. Stable, so callers don't retry.
 fn short_read(uri: &str, start: u64, requested: u64, got: u64) -> StorageError {
-    let source: Box<dyn Error + Send + Sync> = format!(
-        "short read: object returned {got} of {requested} bytes from offset {start}"
-    )
-    .into();
+    let source: Box<dyn Error + Send + Sync> =
+        format!("short read: object returned {got} of {requested} bytes from offset {start}")
+            .into();
     StorageError::Permanent {
         uri: uri.into(),
         source,
@@ -444,10 +443,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn complete_get_propagates_non_retryable() {
-        let r = complete_get("u", || async {
-            Err::<(Bytes, ObjectMeta), _>(not_found())
-        })
-        .await;
+        let r = complete_get("u", || async { Err::<(Bytes, ObjectMeta), _>(not_found()) }).await;
         assert!(matches!(r, Err(StorageError::NotFound { .. })));
     }
 }

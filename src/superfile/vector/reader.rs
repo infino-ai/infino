@@ -1143,8 +1143,12 @@ impl VectorReader {
         let sub = self
             .source
             .try_get_range_sync(col.subsection_range.clone())?;
-        let block =
-            CentroidBlock::new(&sub[col.summary_off..], col.metric, col.dim, col.n_cent as usize);
+        let block = CentroidBlock::new(
+            &sub[col.summary_off..],
+            col.metric,
+            col.dim,
+            col.n_cent as usize,
+        );
         Some((
             col.dim as u32,
             block.scale(),
@@ -6586,8 +6590,7 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         assert!(r.summary("missing").is_none());
         // Sanity on the present column too.
-        let (dim, _scale, _offset, _row, _norm, radius) =
-            r.summary("embedding").expect("present");
+        let (dim, _scale, _offset, _row, _norm, radius) = r.summary("embedding").expect("present");
         assert_eq!(dim, 16);
         assert!(radius >= 0.0);
     }

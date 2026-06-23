@@ -46,8 +46,8 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            OpannRoutingCommit, PartitionRoutingCopy, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, opann_routing_update, prepare_superfile,
+            OpannRoutingCommit, PartitionRoutingCopy, PreparedSuperfile, ShardOutput,
+            backoff_delay, finalize_compaction_commit, opann_routing_update, prepare_superfile,
             rebuild_sq8_superfile_from_readers, recluster_cells, try_commit_attempt,
         },
     },
@@ -410,9 +410,8 @@ impl Supertable {
                 // whose bytes only go sync-available after a racing background
                 // promotion. `open_compaction_input` forces mmap promotion
                 // (NVMe-backed, paged, budget-bounded — not a heap load).
-                let r =
-                    open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
-                        .await;
+                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+                    .await;
                 (entry.superfile_id, r)
             };
             superfile_readers_fut.push(open_fut);
@@ -572,24 +571,24 @@ impl Supertable {
                 .await
                 .map(|seg| (vec![seg], Vec::new()))
         };
-        let (prepared, new_routing): (Vec<PreparedSuperfile>, Vec<PartitionRoutingCopy>) = match build
-        {
-            Ok(p) => p,
-            Err(e) => {
-                for entry in &inputs {
-                    if let Err(unseal_err) =
-                        tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
-                            .await
-                    {
-                        tracing::warn!(
-                            superfile_id = %entry.superfile_id,
-                            "compaction failed; unseal also failed: {unseal_err}"
-                        );
+        let (prepared, new_routing): (Vec<PreparedSuperfile>, Vec<PartitionRoutingCopy>) =
+            match build {
+                Ok(p) => p,
+                Err(e) => {
+                    for entry in &inputs {
+                        if let Err(unseal_err) =
+                            tombstones_admin::unseal(&wal_store, entry.superfile_id, compaction_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                superfile_id = %entry.superfile_id,
+                                "compaction failed; unseal also failed: {unseal_err}"
+                            );
+                        }
                     }
+                    return Err(CompactionError::Build(e.to_string()));
                 }
-                return Err(CompactionError::Build(e.to_string()));
-            }
-        };
+            };
 
         let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
         let mut pending_storage_writes = Vec::with_capacity(prepared.len());
@@ -650,8 +649,8 @@ impl Supertable {
             let routing_commit = if is_hidden {
                 let removed: Vec<u128> = job.inputs.iter().map(|id| id.as_u128()).collect();
                 opann_routing_update(inner, current.as_ref(), &removed, &new_routing)
-                .await
-                .map_err(|e| CompactionError::Build(e.to_string()))?
+                    .await
+                    .map_err(|e| CompactionError::Build(e.to_string()))?
             } else {
                 OpannRoutingCommit::Inherit
             };

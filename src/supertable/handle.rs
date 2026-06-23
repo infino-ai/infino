@@ -1648,8 +1648,7 @@ mod tests {
                 row[(i + round as usize) % dim] += 0.5;
             }
             let flat = Float32Array::from(vals);
-            let fsl =
-                FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
             let batch = arrow_array::RecordBatch::try_new(
                 schema.clone(),
                 vec![

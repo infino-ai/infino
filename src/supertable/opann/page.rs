@@ -44,9 +44,9 @@ use crate::supertable::manifest::encoding::{
 };
 use crate::supertable::manifest::part::{BLAKE3_DIGEST_BYTES, ContentHash};
 
-use super::paged::SplitPages;
 #[cfg(test)]
 use super::descent::best_first;
+use super::paged::SplitPages;
 
 /// Magic at the start of every OPANN routing-tree page.
 const PAGE_MAGIC: [u8; 4] = *b"OPNP";
@@ -493,8 +493,13 @@ impl Page {
                                 if cp == page {
                                     links.push(ChildLink::Local(local_of[cl]));
                                 } else {
-                                    let hash =
-                                        self.build_subpage(cp, page_of, pages_nodes, page_root, out);
+                                    let hash = self.build_subpage(
+                                        cp,
+                                        page_of,
+                                        pages_nodes,
+                                        page_root,
+                                        out,
+                                    );
                                     links.push(ChildLink::Page(hash));
                                 }
                             }

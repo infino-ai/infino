@@ -16,8 +16,8 @@
 mod descent;
 pub(crate) mod insert;
 pub(crate) mod maintenance;
-pub(crate) mod paged;
 pub(crate) mod page;
+pub(crate) mod paged;
 pub(crate) mod store;
 pub(crate) mod tree;
 
@@ -54,7 +54,10 @@ pub(crate) mod test_util {
         cells: &[(Vec<f32>, f32, u128)],
     ) -> (ClusterCentroids, Vec<u128>) {
         let n = cells.len() as u32;
-        let flat: Vec<f32> = cells.iter().flat_map(|(c, _, _)| c.iter().copied()).collect();
+        let flat: Vec<f32> = cells
+            .iter()
+            .flat_map(|(c, _, _)| c.iter().copied())
+            .collect();
         let radii: Vec<f32> = cells.iter().map(|(_, r, _)| *r).collect();
         let ids: Vec<u128> = cells.iter().map(|(_, _, id)| *id).collect();
         let clusters =
