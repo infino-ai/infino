@@ -100,8 +100,7 @@ pub(crate) enum ChildLink {
 /// A routing-tree leaf's target: a specific cluster inside an object-resident
 /// superfile. `superfile_id` names the superfile; `doc_off`/`count` are that
 /// cluster's row range within the superfile's IVF, so a probe is one range-GET
-/// of the cluster's bytes. A hidden cell is the degenerate case — one cluster
-/// spanning the whole (small) superfile: `doc_off == 0`, `count == n_docs`.
+/// of the cluster's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeafRef {
     pub(crate) superfile_id: u128,
@@ -147,6 +146,12 @@ pub(crate) enum PageError {
     MissingPage(String),
     #[error("page content-hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch { expected: String, actual: String },
+    #[error("resident bundle encode overflow")]
+    BundleEncodeOverflow,
+    #[error("resident bundle decode overflow")]
+    BundleDecodeOverflow,
+    #[error("resident bundle decode: {0}")]
+    BundleDecode(String),
 }
 
 /// Serialize a contiguous group of routing-tree nodes into one immutable,

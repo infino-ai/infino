@@ -562,7 +562,9 @@ impl Supertable {
                 let mut routing = Vec::with_capacity(parts.len());
                 for p in parts {
                     prepared.push(p.prepared);
-                    routing.push(p.routing);
+                    if let Some(copy) = p.routing {
+                        routing.push(copy);
+                    }
                 }
                 (prepared, routing)
             })

@@ -568,6 +568,75 @@ mod tests {
     }
 
     #[test]
+    fn descent_selects_all_replicated_cells_for_one_hot_query() {
+        // Reproduces the hidden-index cell geometry of the multi-shard
+        // time-mirror (16 commits × 16 writer shards ⇒ 256 whole-cell leaves)
+        // *purely in memory* — zero storage, zero bench. Each commit fans its
+        // 64 one-hot docs across 16 shards; shard `s` owns the same 4 directions
+        // every commit, so its cell centroid is `0.25` on slots `{4s..4s+3}`.
+        // That yields 16 distinct centroids, each replicated once per commit ⇒
+        // 16 copies, 256 cells total.
+        //
+        // For a one-hot query `e_j` the 16 copies of group `s* = j/4` sit at
+        // centroid distance 0.75; every other cell is at 1.25 — a clean margin.
+        // A correct centroid descent must therefore return ALL 16 relevant
+        // copies well inside an nprobe=64 budget. This isolates the failing
+        // end-to-end recall: if this FAILS the bug is in the tree/descent (cell
+        // selection); if it PASSES the bug is downstream of descent (leaf probe,
+        // hidden→user remap, or the dual-write mirror), not the router.
+        const GROUPS: usize = 16;
+        const COPIES: usize = 16;
+        const SLOTS_PER_GROUP: usize = 4;
+        const DIM: usize = GROUPS * SLOTS_PER_GROUP;
+        const N_PROBE: usize = 64;
+        const CELL_VALUE: f32 = 1.0 / SLOTS_PER_GROUP as f32;
+
+        let radius = ((1.0 - CELL_VALUE).powi(2)
+            + (SLOTS_PER_GROUP as f32 - 1.0) * CELL_VALUE.powi(2))
+        .sqrt();
+        let metric = Metric::L2Sq;
+        let mut cells: Vec<(Vec<f32>, f32, u128)> = Vec::new();
+        let mut id = 1u128;
+        for s in 0..GROUPS {
+            let mut centroid = vec![0.0f32; DIM];
+            for slot in 0..SLOTS_PER_GROUP {
+                centroid[s * SLOTS_PER_GROUP + slot] = CELL_VALUE;
+            }
+            for _copy in 0..COPIES {
+                cells.push((centroid.clone(), radius, id));
+                id += 1;
+            }
+        }
+        assert_eq!(cells.len(), GROUPS * COPIES);
+        let tree = build_tree(metric, DIM, &cells).expect("tree");
+
+        let mut total_recall = 0.0f64;
+        let mut n_queries = 0usize;
+        for s_star in 0..GROUPS {
+            let mut q = vec![0.0f32; DIM];
+            q[s_star * SLOTS_PER_GROUP] = 1.0;
+            let truth: HashSet<u128> = (0..COPIES)
+                .map(|c| (s_star * COPIES + c) as u128 + 1)
+                .collect();
+            let got: HashSet<u128> = tree
+                .select_probes(&q, N_PROBE)
+                .into_iter()
+                .map(|(leaf, _)| leaf.superfile_id)
+                .collect();
+            total_recall += got.intersection(&truth).count() as f64 / COPIES as f64;
+            n_queries += 1;
+        }
+        let recall = total_recall / n_queries as f64;
+        assert!(
+            recall >= 0.99,
+            "in-memory OPANN descent returned only {recall:.3} of the replicated \
+             relevant cells at nprobe={N_PROBE} (margin 0.75 vs 1.25; a correct \
+             centroid descent must return all {COPIES} copies). If this fails the \
+             recall miss is in the router; if it passes it is downstream of descent."
+        );
+    }
+
+    #[test]
     fn page_round_trip_matches_in_memory_descent() {
         // Serializing to a single page and descending off the bytes must
         // reproduce the in-memory descent *exactly* — same cells, same order,

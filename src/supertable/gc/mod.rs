@@ -76,7 +76,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
     // the orphans are reclaimed on a later pass. With no routing tree the page
     // dir is absent/empty, so sweeping it is a harmless no-op.
     let sweep_pages = match manifest.opann_routing() {
-        Some(routing) => match reachable_page_uris(storage.as_ref(), routing.root_page).await {
+        Some(routing) => match reachable_page_uris(storage.as_ref(), routing).await {
             Ok(uris) => {
                 live.extend(uris);
                 true

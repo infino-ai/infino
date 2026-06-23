@@ -24,9 +24,9 @@
 //!   1. Encode the new manifest list (JSON).
 //!   2. Encode each new manifest part (Avro+zstd) →
 //!      content-addressed URI.
-//!   3. **In parallel** (`futures::future::join_all`): write
-//!      the list, write each new part. None depend on each
-//!      other — the list references parts by URI = blake3
+//!   3. **In parallel** (bounded fanout + shared I/O semaphore): write
+//!      the list, write each new part, write each new OPANN page. None
+//!      depend on each other — the list references parts by URI = blake3
 //!      hash of bytes, computable before any I/O.
 //!   4. Await all of the above (visibility barrier #1).
 //!   5. Write the pointer file conditionally:
@@ -41,9 +41,11 @@
 //! URI predictable before any PUT); a serial implementation
 //! is correctness-equivalent but pessimistic on object stores.
 
-use std::{str::from_utf8, sync::Arc};
+use std::{str::from_utf8, sync::{Arc, OnceLock}};
 
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use zstd::zstd_safe::get_frame_content_size;
 
 use crate::{
@@ -80,15 +82,23 @@ pub fn list_uri(manifest_id: u64) -> String {
     format!("{MANIFEST_LISTS_DIR}/list-{manifest_id:06}.json")
 }
 
+/// Build the URI for a content-addressed immutable blob. Shared by manifest
+/// parts, OPANN pages, and OPANN resident snapshots.
+pub(crate) fn content_addressed_uri(
+    dir: &str,
+    stem: &str,
+    content_hash: &ContentHash,
+    ext: &str,
+) -> String {
+    format!("{dir}/{stem}-{}.{}", content_hash.to_hex(), ext)
+}
+
 /// Build the URI for a manifest part at a given content hash.
 /// Content-addressed URI so two writers producing identical
 /// bytes resolve to the same URI — the load-bearing property
 /// for cross-version part reuse.
 pub fn part_uri(content_hash: &ContentHash) -> String {
-    format!(
-        "{MANIFEST_PARTS_DIR}/part-{}.avro.zst",
-        content_hash.to_hex()
-    )
+    content_addressed_uri(MANIFEST_PARTS_DIR, "part", content_hash, "avro.zst")
 }
 
 /// In-memory pointer file. Lives at [`POINTER_PATH`]; its
@@ -261,6 +271,66 @@ pub async fn write_manifest_part(
     })
 }
 
+/// Commit-time object-store write fanout width: half the machine's CPU
+/// parallelism, floored at 1. Every commit PUT (superfiles, manifest parts,
+/// OPANN routing pages, manifest lists) acquires one permit from the shared
+/// [`commit_io_semaphore`], so a user-table commit and its hidden-index dual
+/// write, plus any overlapping background maintenance compaction, share one
+/// global in-flight budget instead of each opening a full-width wave.
+pub(crate) fn commit_write_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
+
+static COMMIT_IO_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn commit_io_semaphore() -> &'static Semaphore {
+    COMMIT_IO_SEMAPHORE.get_or_init(|| {
+        Semaphore::const_new(commit_write_concurrency())
+    })
+}
+
+/// One permit from the commit I/O budget. Held for the duration of a single
+/// object-store PUT in the commit's pre-pointer wave.
+pub(crate) async fn commit_io_permit() -> SemaphorePermit<'static> {
+    commit_io_semaphore()
+        .acquire()
+        .await
+        .expect("commit I/O semaphore closed")
+}
+
+/// Write touched manifest parts and OPANN routing pages with bounded fanout.
+/// Parts and pages share one permit pool with superfile PUTs and the manifest
+/// list write.
+pub(crate) async fn write_pre_pointer_wave(
+    storage: &dyn StorageProvider,
+    parts_to_write: &[&[u8]],
+    page_blobs: &[(String, Bytes)],
+) -> Result<(), CommitError> {
+    let write_concurrency = commit_write_concurrency();
+    let n_parts = parts_to_write.len();
+    let futs = (0..n_parts + page_blobs.len()).map(|i| async move {
+        if i < n_parts {
+            write_part_bytes(storage, parts_to_write[i]).await
+        } else {
+            let (uri, bytes) = &page_blobs[i - n_parts];
+            put_immutable_blob(storage, uri, bytes.clone())
+                .await
+                .map_err(CommitError::from)
+        }
+    });
+    for result in stream::iter(futs)
+        .buffer_unordered(write_concurrency)
+        .collect::<Vec<_>>()
+        .await
+    {
+        result.map_err(translate_contention)?;
+    }
+    Ok(())
+}
+
 /// Read the decompressed size from the zstd frame header in O(1), no
 /// actual decompression.
 pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
@@ -280,9 +350,40 @@ pub(crate) async fn put_immutable_blob(
     uri: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
+    let _permit = commit_io_permit().await;
     match storage.put_atomic(uri, bytes).await {
         Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Fetch a content-addressed blob through the disk cache (or a direct GET),
+/// verifying blake3. Shared by [`ManifestPartLoader::load`] and OPANN resident
+/// tree open — one code path for every manifest-stamped immutable blob.
+pub(crate) async fn load_verified_blob(
+    expected_hash: ContentHash,
+    uri: &str,
+    storage: &dyn StorageProvider,
+    disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+) -> Result<Bytes, ManifestLoadError> {
+    match disk_cache {
+        Some(cache) => {
+            cache
+                .blob_bytes(expected_hash, uri.to_string(), storage)
+                .await
+                .map_err(ManifestLoadError::from)
+        }
+        None => {
+            let (bytes, _) = storage.get(uri).await.map_err(ManifestLoadError::Storage)?;
+            let actual_hash = ContentHash::of(&bytes);
+            if actual_hash != expected_hash {
+                return Err(ManifestLoadError::ContentHashMismatch {
+                    expected: expected_hash.to_hex(),
+                    actual: actual_hash.to_hex(),
+                });
+            }
+            Ok(bytes)
+        }
     }
 }
 
@@ -309,6 +410,7 @@ pub async fn write_manifest_list(
     let content_hash = ContentHash::of(&json);
     let uri = list_uri(list.manifest_id);
     let size = json.len() as u64;
+    let _permit = commit_io_permit().await;
     storage.put_atomic(&uri, Bytes::from(json)).await?;
     Ok(ListWriteResult {
         uri,

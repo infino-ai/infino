@@ -50,8 +50,8 @@ const ROW_BYTES_PER_DIM: usize = 2;
 /// superfile id, its `(doc_off, count)` range within that superfile's IVF (so a
 /// probe range-GETs exactly the cluster), its fp32 centroid (the k-means center
 /// captured at the ingestion surface — never a decode of a stored centroid),
-/// and its covering radius. A whole-superfile leaf (the hidden cell shape) uses
-/// `doc_off = 0`, `count = 0`.
+/// and its covering radius. Pre-fix manifests may still carry `(0, 0)` leaves;
+/// [`VectorReader::probe_leaf_async`] treats those as a legacy IVF rescan.
 pub(crate) struct LeafInsert {
     pub(crate) superfile_id: u128,
     pub(crate) doc_off: u32,

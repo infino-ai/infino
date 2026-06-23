@@ -87,7 +87,7 @@ use super::{
     },
     opann::{
         insert::{LeafInsert, update_tree},
-        paged::{ResidentPageSource, SplitPages},
+        paged::{OverlayPageSource, ResidentPageSource, SplitPages},
         store,
     },
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
@@ -123,7 +123,7 @@ use crate::{
         reader::vector_layout_from_kv,
         stats::SuperfileStats,
         vector::{
-            builder::ClusterRouting,
+            builder::{ClusterRoute, ClusterRouting},
             cell_posting::{EncodedCellRow, MaterializedIvfRow, encoded_ivf_kmeans},
             distance::Metric,
             kmeans::kmeans_with_assignments,
@@ -136,7 +136,7 @@ use crate::{
         error::ManifestError,
         manifest::{
             ClusterCentroids, Manifest,
-            commit::get_current_manifest_etag,
+            commit::{commit_io_permit, commit_write_concurrency, get_current_manifest_etag},
             list::{CellRoutingParams, OpannRouting, PartitionStrategy},
             part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
@@ -343,8 +343,8 @@ pub(in crate::supertable) fn materialized_ivf_rows_in_doc_order(
 }
 
 /// Target byte size for one immutable hidden vector-index cell. A commit's
-/// hidden vectors are split into this many bytes per cell so a probe reads a
-/// bounded amount in one whole-cell GET.
+/// hidden vectors are split into this many bytes per cell so each OPANN leaf's
+/// `(doc_off, count)` range stays within one cluster range GET.
 const HIDDEN_CELL_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// Rough per-row byte estimate for sizing hidden cells before they are built:
@@ -372,15 +372,13 @@ fn hidden_cell_count(total_rows: usize, sum_dim: usize) -> usize {
 /// vector-local partitions — each one superfile and one OPANN routing-tree leaf.
 struct HiddenIncomingPlan {
     buffer: Vec<BufferedBatch>,
-    column: String,
 }
 
-/// A routing copy captured for one routing-tree leaf: the leaf's owning
-/// superfile id, its `(doc_off, count)` range within that superfile's IVF (a
-/// whole-superfile leaf — the hidden cell shape — uses `0, 0`), its **fp32**
-/// centroid (the k-means center, captured at the ingestion surface — never
-/// decoded from a stored Sq8 centroid), and its covering radius. The OPANN tree
-/// is (re)built over these.
+/// One OPANN routing-tree leaf: a single object-resident hidden partition
+/// (cell). `(doc_off, count) = (0, 0)` means probe the whole partition at query
+/// time (one object-resident fetch, then scan inside). The fp32 centroid is the
+/// partition's routing copy (k-means cell center at ingest, or a count-weighted
+/// mean of internal IVF centroids when no cell centroid is supplied).
 pub(in crate::supertable) struct PartitionRoutingCopy {
     pub(in crate::supertable) superfile_id: u128,
     pub(in crate::supertable) doc_off: u32,
@@ -390,13 +388,13 @@ pub(in crate::supertable) struct PartitionRoutingCopy {
 }
 
 /// Cluster a buffered batch into vector-local partitions and build one IVF
-/// superfile per partition. Used for direct hidden-table commits only; the
-/// user-table path shares one encode via [`prepare_hidden_incoming_from_shared_build`].
+/// superfile per partition. Used for hidden-table commits (user-table commits
+/// route hidden vectors through this path after cloning the same buffer).
 fn execute_hidden_incoming_plan_in_scope(
     inner: &SupertableInner,
     plan: HiddenIncomingPlan,
 ) -> Result<HiddenIncomingPrepare, BuildError> {
-    let HiddenIncomingPlan { buffer, column } = plan;
+    let HiddenIncomingPlan { buffer } = plan;
     let empty_batch = SuperfilePublishBatch {
         new_entries: Vec::new(),
         to_remove: Vec::new(),
@@ -431,28 +429,31 @@ fn execute_hidden_incoming_plan_in_scope(
         if shard.is_empty() {
             continue;
         }
-        let built = build_one_shard_with_layout(&shard, &inner.options, VectorLayout::Ivf)?;
+        let mut built = build_one_shard_with_layout(&shard, &inner.options, VectorLayout::Ivf)?;
+        let routing = mem::take(&mut built.routing);
         let prepared = prepare_superfile(inner, built)?.ok_or_else(|| {
             BuildError::Store("hidden incoming superfile unexpectedly empty".into())
         })?;
-        // A hidden partition is one whole-superfile leaf (no `partition_hint`):
-        // the leaf id IS this superfile's id, with the degenerate `(0, 0)` range
-        // so the query fetches the whole cell. The radius is the builder's own
-        // summary radius for the column — both decode-free.
         let superfile_id = prepared.entry.superfile_id.as_u128();
-        let radius = prepared
-            .entry
-            .vector_summary
-            .get(&column)
-            .map(|vs| vs.radius)
-            .unwrap_or(0.0);
-        new_routing.push(PartitionRoutingCopy {
+        let partition_radius = inner
+            .options
+            .vector_columns
+            .first()
+            .and_then(|vc| {
+                prepared
+                    .entry
+                    .vector_summary
+                    .get(&vc.column)
+                    .map(|vs| vs.radius)
+            });
+        if let Some(copy) = routing_copy_for_opann_partition(
             superfile_id,
-            doc_off: 0,
-            count: 0,
-            centroid_fp32,
-            radius,
-        });
+            Some(centroid_fp32),
+            routing,
+            partition_radius,
+        ) {
+            new_routing.push(copy);
+        }
         let entry = finish_superfile_entry(inner, prepared.entry, None)?;
         prepared_cells.push(PreparedSuperfile {
             entry,
@@ -1354,7 +1355,6 @@ impl SupertableWriter {
     fn plan_hidden_incoming_shard(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
         let empty = HiddenIncomingPlan {
             buffer: Vec::new(),
-            column: String::new(),
         };
         if self.buffer.is_empty() {
             return Ok(empty);
@@ -1369,20 +1369,12 @@ impl SupertableWriter {
         if vec_dim == 0 {
             return Ok(empty);
         }
-        let column = self
-            .inner
-            .options
-            .vector_columns
-            .first()
-            .map(|vc| vc.column.clone())
-            .unwrap_or_default();
-
         // Direct hidden-table commits (maintenance / tests) still k-means the
         // buffered batch into vector-local partitions. The user-table commit
         // path shares one encode and registers bytes into both tables instead.
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
-        Ok(HiddenIncomingPlan { buffer, column })
+        Ok(HiddenIncomingPlan { buffer })
     }
 
     fn prepare_hidden_incoming_build(&mut self) -> Result<HiddenIncomingPrepare, BuildError> {
@@ -1432,11 +1424,6 @@ impl SupertableWriter {
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Build-once, write-twice: one Sq8+ε encode per commit; the same
-        // superfile bytes land in the user table and the hidden shadow table
-        // (separate storage prefixes, separate OPANN trees). No second k-means
-        // or rebuild on the hidden side — hot-region maintenance reshapes the
-        // shadow tree later; the user table stays time-organized.
         let hidden_inner = self
             .inner
             .vector_index_table
@@ -1499,8 +1486,9 @@ impl SupertableWriter {
                 (shards, hints)
             };
 
-        // One encode, then parallel prepare into user + hidden manifests
-        // (rayon::join inside one writer-pool install). Parallel publish via
+        // Build-once, write-twice: one Sq8+ε encode per commit; the same
+        // superfile bytes land in the user table and the hidden shadow table
+        // (separate storage prefixes, separate OPANN trees). Publish via
         // tokio::join.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
@@ -1540,10 +1528,7 @@ impl SupertableWriter {
                             )
                         },
                     );
-                    Ok((
-                        user_batch?,
-                        Some((hidden_inner, hidden_prep?)),
-                    ))
+                    Ok((user_batch?, Some((hidden_inner, hidden_prep?))))
                 },
             )?
         } else {
@@ -2228,9 +2213,7 @@ struct SuperfilePublishBatch {
 /// Hidden incoming build artifacts produced before manifest swap.
 struct HiddenIncomingPrepare {
     batch: SuperfilePublishBatch,
-    /// One routing copy per newly-built partition superfile (leaf id, fp32
-    /// centroid, radius) — folded into the manifest routing record and used to
-    /// rebuild the OPANN tree over the full current hidden-superfile set.
+    /// One OPANN routing leaf per newly-built hidden partition (cell).
     new_routing: Vec<PartitionRoutingCopy>,
 }
 
@@ -2273,80 +2256,81 @@ struct UserCommitPrepare {
     new_routing: Vec<PartitionRoutingCopy>,
 }
 
-/// Map a built superfile's per-cluster routing into routing copies tagged with
-/// its assigned id. Only column 0 — the first vector column, the one the OPANN
-/// tree indexes (matching [`opann_routing_update`]'s `vector_columns.first()`) —
-/// contributes leaves.
-fn routing_copies_for_superfile(
-    superfile_id: u128,
-    routing: Vec<(u32, ClusterRouting)>,
-) -> Vec<PartitionRoutingCopy> {
+/// Extract column-0 IVF routing from a built superfile shard, if present.
+fn cluster_routing_column0(routing: Vec<(u32, ClusterRouting)>) -> Option<ClusterRouting> {
     routing
         .into_iter()
         .find(|(col_id, _)| *col_id == 0)
-        .map(|(_, cr)| {
-            cr.routes
-                .into_iter()
-                .map(|rt| PartitionRoutingCopy {
-                    superfile_id,
-                    doc_off: rt.doc_off,
-                    count: rt.count,
-                    centroid_fp32: rt.centroid_fp32,
-                    radius: rt.radius,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(|(_, cr)| cr)
 }
 
-/// One whole-superfile OPANN leaf for the hidden index: degenerate `(0, 0)`
-/// range so queries probe the entire cell. Centroid is a doc-count-weighted
-/// mean of column-0 IVF cluster centroids from the shared build; radius comes
-/// from the superfile vector summary (same as k-means hidden incoming).
-fn hidden_cell_routing_copies_for_superfile(
+/// IVF cluster routes must partition row ids `[0, n_docs)` contiguously in
+/// storage order — the same invariant the vector reader's `cluster_idx` uses.
+fn ivf_routes_cover_rows_contiguously(routes: &[ClusterRoute]) -> bool {
+    let mut cursor = 0u32;
+    for route in routes {
+        if route.doc_off != cursor {
+            return false;
+        }
+        cursor = cursor.saturating_add(route.count);
+    }
+    !routes.is_empty()
+}
+
+/// Covering radius for one OPANN partition leaf: max internal cluster radius.
+fn partition_radius_from_ivf(cr: &ClusterRouting) -> f32 {
+    cr.routes
+        .iter()
+        .map(|route| route.radius)
+        .fold(0.0f32, f32::max)
+}
+
+/// Count-weighted mean of per-cluster fp32 centroids inside one built partition.
+fn weighted_centroid_from_ivf_routes(routes: &[ClusterRoute]) -> Vec<f32> {
+    let Some(first) = routes.first() else {
+        return Vec::new();
+    };
+    let dim = first.centroid_fp32.len();
+    let total: u64 = routes.iter().map(|route| u64::from(route.count)).sum();
+    if total == 0 {
+        return first.centroid_fp32.clone();
+    }
+    let mut acc = vec![0.0f32; dim];
+    for route in routes {
+        let weight = route.count as f32 / total as f32;
+        for (slot, &coord) in acc.iter_mut().zip(route.centroid_fp32.iter()) {
+            *slot += weight * coord;
+        }
+    }
+    acc
+}
+
+/// One OPANN routing leaf for an object-resident partition (hidden cell or user
+/// superfile when a table carries its own tree). Internal IVF cluster offsets
+/// are not separate tree leaves — `(0, 0)` selects the whole partition at probe
+/// time (one object-resident fetch, then scan inside).
+fn routing_copy_for_opann_partition(
     superfile_id: u128,
-    entry: &SuperfileEntry,
-    column: &str,
-    routing: Vec<(u32, ClusterRouting)>,
-) -> Vec<PartitionRoutingCopy> {
-    let Some(vs) = entry.vector_summary.get(column) else {
-        return Vec::new();
-    };
-    let routes = match routing.into_iter().find(|(col_id, _)| *col_id == 0) {
-        Some((_, cr)) => cr.routes,
-        None => return Vec::new(),
-    };
-    if routes.is_empty() {
-        return Vec::new();
+    partition_centroid: Option<Vec<f32>>,
+    ivf_routing: Vec<(u32, ClusterRouting)>,
+    partition_radius: Option<f32>,
+) -> Option<PartitionRoutingCopy> {
+    let cr = cluster_routing_column0(ivf_routing)?;
+    if cr.routes.is_empty() || !ivf_routes_cover_rows_contiguously(&cr.routes) {
+        return None;
     }
-    let dim = routes[0].centroid_fp32.len();
-    let mut acc = vec![0f32; dim];
-    let mut total = 0u64;
-    for rt in &routes {
-        let w = rt.count as u64;
-        if w == 0 {
-            continue;
-        }
-        for (a, &c) in acc.iter_mut().zip(rt.centroid_fp32.iter()) {
-            *a += c * w as f32;
-        }
-        total += w;
-    }
-    let centroid_fp32 = if total > 0 {
-        for a in &mut acc {
-            *a /= total as f32;
-        }
-        acc
-    } else {
-        routes[0].centroid_fp32.clone()
-    };
-    vec![PartitionRoutingCopy {
+    let centroid =
+        partition_centroid.unwrap_or_else(|| weighted_centroid_from_ivf_routes(&cr.routes));
+    let radius = partition_radius
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or_else(|| partition_radius_from_ivf(&cr));
+    Some(PartitionRoutingCopy {
         superfile_id,
         doc_off: 0,
         count: 0,
-        centroid_fp32,
-        radius: vs.radius,
-    }]
+        centroid_fp32: centroid,
+        radius,
+    })
 }
 
 /// Derive manifest entries, storage writes, and OPANN routing copies from
@@ -2358,7 +2342,12 @@ fn prepare_superfile_publish_in_scope(
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
 ) -> Result<(SuperfilePublishBatch, Vec<PartitionRoutingCopy>), BuildError> {
-    let prepared: Vec<(PreparedSuperfile, Vec<PartitionRoutingCopy>)> = outputs
+    let column = inner
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone());
+    let prepared: Vec<(PreparedSuperfile, Option<PartitionRoutingCopy>)> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
         .filter_map(|(mut shard, hint)| {
@@ -2368,8 +2357,15 @@ fn prepare_superfile_publish_in_scope(
             let routing = mem::take(&mut shard.routing);
             match prepare_superfile(inner, shard) {
                 Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(|entry| {
-                    let copies =
-                        routing_copies_for_superfile(entry.superfile_id.as_u128(), routing);
+                    let partition_radius = column.as_ref().and_then(|col| {
+                        entry.vector_summary.get(col).map(|vs| vs.radius)
+                    });
+                    let copy = routing_copy_for_opann_partition(
+                        entry.superfile_id.as_u128(),
+                        None,
+                        routing,
+                        partition_radius,
+                    );
                     (
                         PreparedSuperfile {
                             entry,
@@ -2377,7 +2373,7 @@ fn prepare_superfile_publish_in_scope(
                             bytes_for_storage: p.bytes_for_storage,
                             bytes_for_cache: p.bytes_for_cache,
                         },
-                        copies,
+                        copy,
                     )
                 })),
                 Ok(None) => None,
@@ -2387,65 +2383,36 @@ fn prepare_superfile_publish_in_scope(
         .collect::<Result<Vec<_>, _>>()?;
     let mut prepared_superfiles = Vec::with_capacity(prepared.len());
     let mut new_routing: Vec<PartitionRoutingCopy> = Vec::new();
-    for (p, copies) in prepared {
+    for (p, copy) in prepared {
         prepared_superfiles.push(p);
-        new_routing.extend(copies);
+        if let Some(copy) = copy {
+            new_routing.push(copy);
+        }
     }
     let batch = collect_prepared_superfiles(inner, prepared_superfiles)?;
     Ok((batch, new_routing))
 }
 
-/// Same as [`prepare_superfile_publish_in_scope`], but stamps one whole-cell
-/// `(0, 0)` OPANN leaf per hidden superfile instead of per-cluster leaves.
+/// Same as [`prepare_superfile_publish_in_scope`], for the hidden shadow table
+/// under its storage prefix (one whole-cell OPANN leaf per mirrored superfile).
 fn prepare_hidden_superfile_publish_in_scope(
-    inner: &SupertableInner,
+    hidden_inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
 ) -> Result<(SuperfilePublishBatch, Vec<PartitionRoutingCopy>), BuildError> {
-    let Some(column) = inner
-        .options
-        .vector_columns
-        .first()
-        .map(|c| c.column.clone())
-    else {
-        return prepare_superfile_publish_in_scope(inner, outputs, hints);
-    };
-    let prepared: Vec<(PreparedSuperfile, Vec<PartitionRoutingCopy>)> = outputs
-        .into_par_iter()
-        .zip(hints.into_par_iter())
-        .filter_map(|(mut shard, hint)| {
-            let routing = mem::take(&mut shard.routing);
-            match prepare_superfile(inner, shard) {
-                Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(|entry| {
-                    let copies = hidden_cell_routing_copies_for_superfile(
-                        entry.superfile_id.as_u128(),
-                        &entry,
-                        &column,
-                        routing,
-                    );
-                    (
-                        PreparedSuperfile {
-                            entry,
-                            bytes_for_store: p.bytes_for_store,
-                            bytes_for_storage: p.bytes_for_storage,
-                            bytes_for_cache: p.bytes_for_cache,
-                        },
-                        copies,
-                    )
-                })),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut prepared_superfiles = Vec::with_capacity(prepared.len());
-    let mut new_routing = Vec::new();
-    for (p, copies) in prepared {
-        prepared_superfiles.push(p);
-        new_routing.extend(copies);
-    }
-    let batch = collect_prepared_superfiles(inner, prepared_superfiles)?;
-    Ok((batch, new_routing))
+    prepare_superfile_publish_in_scope(hidden_inner, outputs, hints)
+}
+
+/// Register the same built superfile bytes into the hidden shadow supertable.
+/// Routing copies come from the shared IVF build — no second k-means pass.
+fn prepare_hidden_incoming_from_shared_build(
+    hidden_inner: &SupertableInner,
+    outputs: Vec<ShardOutput>,
+    hints: Vec<Option<u32>>,
+) -> Result<HiddenIncomingPrepare, BuildError> {
+    let (batch, new_routing) =
+        prepare_hidden_superfile_publish_in_scope(hidden_inner, outputs, hints)?;
+    Ok(HiddenIncomingPrepare { batch, new_routing })
 }
 
 fn prepare_user_superfile_batch_in_scope(
@@ -2455,20 +2422,6 @@ fn prepare_user_superfile_batch_in_scope(
 ) -> Result<UserCommitPrepare, BuildError> {
     let (batch, new_routing) = prepare_superfile_publish_in_scope(inner, outputs, hints)?;
     Ok(UserCommitPrepare { batch, new_routing })
-}
-
-/// Register the same built superfile bytes into the hidden shadow supertable
-/// under its storage prefix. Routing copies come from the shared IVF build —
-/// no second k-means pass. Hot-region rebalancing reshapes the hidden tree
-/// later; the user table's time-ordered layout is unchanged.
-fn prepare_hidden_incoming_from_shared_build(
-    hidden_inner: &SupertableInner,
-    outputs: Vec<ShardOutput>,
-    hints: Vec<Option<u32>>,
-) -> Result<HiddenIncomingPrepare, BuildError> {
-    let (batch, new_routing) =
-        prepare_hidden_superfile_publish_in_scope(hidden_inner, outputs, hints)?;
-    Ok(HiddenIncomingPrepare { batch, new_routing })
 }
 
 fn prepare_user_superfile_batch(
@@ -2593,22 +2546,35 @@ async fn load_materialized_rows_from_ivf_superfile(
 fn build_prepared_ivf_from_materialized(
     inner: &SupertableInner,
     rows: Vec<MaterializedIvfRow>,
-) -> Result<PreparedSuperfile, BuildError> {
+    partition_centroid: Option<Vec<f32>>,
+) -> Result<(PreparedSuperfile, Option<PartitionRoutingCopy>), BuildError> {
     if rows.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
-    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
+    let mut shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
+    let routing = mem::take(&mut shard.routing);
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-    // OPANN: no `partition_hint` — the routing-tree leaf id is the superfile's
-    // own id, set in `prepare_superfile`. The partition key stays the hidden
-    // table's default single bucket.
     let entry = finish_superfile_entry(inner, prepared.entry, None)?;
-    Ok(PreparedSuperfile {
-        entry,
-        bytes_for_store: prepared.bytes_for_store,
-        bytes_for_storage: prepared.bytes_for_storage,
-        bytes_for_cache: prepared.bytes_for_cache,
-    })
+    let partition_radius = inner
+        .options
+        .vector_columns
+        .first()
+        .and_then(|vc| entry.vector_summary.get(&vc.column).map(|vs| vs.radius));
+    let routing_copy = routing_copy_for_opann_partition(
+        entry.superfile_id.as_u128(),
+        partition_centroid,
+        routing,
+        partition_radius,
+    );
+    Ok((
+        PreparedSuperfile {
+            entry,
+            bytes_for_store: prepared.bytes_for_store,
+            bytes_for_storage: prepared.bytes_for_storage,
+            bytes_for_cache: prepared.bytes_for_cache,
+        },
+        routing_copy,
+    ))
 }
 
 /// Rebuild ONE merged superfile from a set of user-table Sq8 IVF inputs:
@@ -2722,7 +2688,6 @@ pub(in crate::supertable) async fn recluster_cells(
         .ok_or_else(|| BuildError::Store("re-cluster requires a vector column".into()))?;
     let column = vec_col.column.clone();
     let metric = vec_col.metric;
-    let dim = vec_col.dim;
     let sum_dim: usize = inner.options.vector_columns.iter().map(|c| c.dim).sum();
 
     // Stream the region's rows in through the mmap reader. Bounded by the job's
@@ -2739,21 +2704,22 @@ pub(in crate::supertable) async fn recluster_cells(
     let k = hidden_cell_count(rows.len(), sum_dim);
 
     let inner = Arc::clone(inner);
-    let column = column.clone();
     maint_pool().install(move || -> Result<Vec<ReclusteredPartition>, BuildError> {
         let encoded: Vec<EncodedCellRow> = rows.iter().map(|r| r.encoded.clone()).collect();
-        // `encoded_ivf_kmeans` returns each partition's fp32 centroid (the
-        // medoid decoded once — the sanctioned single-centroid decode for
-        // `from_fp32`, never a full-corpus decode). Captured here as the new
-        // partition superfile's OPANN routing copy.
         let (centroids, assign) = encoded_ivf_kmeans(&encoded, metric, k, RECLUSTER_KMEANS_ITERS);
         let k_actual = assign.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        let vec_dim = inner
+            .options
+            .vector_columns
+            .first()
+            .map(|c| c.dim)
+            .unwrap_or(0);
         let mut shards: Vec<Vec<MaterializedIvfRow>> = vec![Vec::new(); k_actual];
         for (row, &a) in rows.into_iter().zip(assign.iter()) {
             shards[a].push(row);
         }
         let mut out = Vec::with_capacity(shards.len());
-        for (cell, mut shard) in shards.into_iter().enumerate() {
+        for (cell_id, mut shard) in shards.into_iter().enumerate() {
             if shard.is_empty() {
                 continue;
             }
@@ -2761,40 +2727,26 @@ pub(in crate::supertable) async fn recluster_cells(
             for (local, row) in shard.iter_mut().enumerate() {
                 row.local_doc_id = local as u32;
             }
-            let prepared = build_prepared_ivf_from_materialized(&inner, shard)?;
-            let superfile_id = prepared.entry.superfile_id.as_u128();
-            let centroid_fp32 = centroids
-                .get(cell * dim..(cell + 1) * dim)
-                .map(|s| s.to_vec())
-                .unwrap_or_else(|| vec![0.0; dim]);
-            let radius = prepared
-                .entry
-                .vector_summary
-                .get(&column)
-                .map(|vs| vs.radius)
-                .unwrap_or(0.0);
+            let partition_centroid = if vec_dim > 0 && (cell_id + 1) * vec_dim <= centroids.len() {
+                Some(centroids[cell_id * vec_dim..(cell_id + 1) * vec_dim].to_vec())
+            } else {
+                None
+            };
+            let (prepared, routing_copy) =
+                build_prepared_ivf_from_materialized(&inner, shard, partition_centroid)?;
             out.push(ReclusteredPartition {
                 prepared,
-                // A re-clustered hidden partition is one whole-superfile leaf:
-                // degenerate `(0, 0)` range, fetched whole at query time.
-                routing: PartitionRoutingCopy {
-                    superfile_id,
-                    doc_off: 0,
-                    count: 0,
-                    centroid_fp32,
-                    radius,
-                },
+                routing: routing_copy,
             });
         }
         Ok(out)
     })
 }
 
-/// One re-clustered hidden partition: the built superfile plus its OPANN routing
-/// copy (leaf id, fp32 centroid captured at recluster, radius).
+/// One re-clustered hidden partition: the built superfile plus one OPANN leaf.
 pub(in crate::supertable) struct ReclusteredPartition {
     pub(in crate::supertable) prepared: PreparedSuperfile,
-    pub(in crate::supertable) routing: PartitionRoutingCopy,
+    pub(in crate::supertable) routing: Option<PartitionRoutingCopy>,
 }
 
 /// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
@@ -2825,7 +2777,8 @@ fn build_one_shard_from_materialized(
     let id_max = rows.iter().map(|r| r.stable_id).max().unwrap_or(0);
     let n_docs = rows.len() as u64;
     let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
-    let bytes = Bytes::from(builder.finish()?);
+    let (bytes, routing) = builder.finish_with_routing()?;
+    let bytes = Bytes::from(bytes);
 
     Ok(ShardOutput {
         bytes,
@@ -2833,9 +2786,7 @@ fn build_one_shard_from_materialized(
         id_min,
         id_max,
         scalar_stats,
-        // The materialized (Sq8+ε merge) path doesn't capture fp32 routing; the
-        // supertable refreshes routing for merged superfiles separately.
-        routing: Vec::new(),
+        routing,
     })
 }
 
@@ -2864,19 +2815,34 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
     split: Option<SplitPages>,
     prior_root: Option<ContentHash>,
     params: CellRoutingParams,
+    bundle: Option<(ContentHash, Vec<u8>)>,
 ) -> OpannRoutingCommit {
+    let attach_bundle = |routing: &mut OpannRouting,
+                         pages: &mut Vec<(String, Bytes)>,
+                         bundle: Option<(ContentHash, Vec<u8>)>| {
+        if let Some((hash, bytes)) = bundle {
+            let uri = store::resident_uri(&hash);
+            pages.push((uri.clone(), Bytes::from(bytes)));
+            routing.resident_uri = Some(uri);
+            routing.resident_content_hash = Some(hash);
+        }
+    };
     match split {
         Some(split) if !split.pages.is_empty() => {
-            let pages: Vec<(String, Bytes)> = split
+            let mut pages: Vec<(String, Bytes)> = split
                 .pages
                 .into_iter()
                 .map(|(hash, bytes)| (store::page_uri(&hash), Bytes::from(bytes)))
                 .collect();
+            let mut routing = OpannRouting {
+                root_page: split.root,
+                routing: params,
+                resident_uri: None,
+                resident_content_hash: None,
+            };
+            attach_bundle(&mut routing, &mut pages, bundle);
             OpannRoutingCommit::Replace {
-                routing: Some(OpannRouting {
-                    root_page: split.root,
-                    routing: params,
-                }),
+                routing: Some(routing),
                 pages,
             }
         }
@@ -2884,13 +2850,20 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
         // (content-addressed dedup at a prior commit). Still stamp the new root
         // into the manifest list — otherwise the pointer keeps a stale root and
         // vector search descends a tree that doesn't cover newly committed cells.
-        Some(split) if Some(split.root) != prior_root => OpannRoutingCommit::Replace {
-            routing: Some(OpannRouting {
+        Some(split) if Some(split.root) != prior_root => {
+            let mut pages = Vec::new();
+            let mut routing = OpannRouting {
                 root_page: split.root,
                 routing: params,
-            }),
-            pages: Vec::new(),
-        },
+                resident_uri: None,
+                resident_content_hash: None,
+            };
+            attach_bundle(&mut routing, &mut pages, bundle);
+            OpannRoutingCommit::Replace {
+                routing: Some(routing),
+                pages,
+            }
+        }
         Some(_) => OpannRoutingCommit::Inherit,
         None => OpannRoutingCommit::Replace {
             routing: None,
@@ -2950,7 +2923,21 @@ pub(in crate::supertable) async fn opann_routing_update(
         OPANN_PAGE_MAX_NODES,
     )
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    Ok(opann_routing_commit_from_split(split, prior_root, params))
+    let bundle = split.as_ref().and_then(|s| {
+        if Some(s.root) == prior_root && s.pages.is_empty() {
+            return None;
+        }
+        let overlay = OverlayPageSource::new(source.as_ref(), &s.pages);
+        store::pack_resident_bundle(&overlay, s.root)
+            .ok()
+            .map(|bytes| (ContentHash::of(bytes.as_ref()), bytes))
+    });
+    Ok(opann_routing_commit_from_split(
+        split,
+        prior_root,
+        params,
+        bundle,
+    ))
 }
 
 async fn publish_hidden_incoming_async(
@@ -3191,6 +3178,7 @@ async fn put_superfile_replace(
     path: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
+    let _permit = commit_io_permit().await;
     match storage.head(path).await {
         Ok(meta) => storage
             .put_if_match(path, bytes, meta.etag.as_deref())
@@ -3201,32 +3189,15 @@ async fn put_superfile_replace(
     }
 }
 
-/// Commit-time object-store write fanout width: half the machine's CPU
-/// parallelism, floored at 1. A single commit and a concurrent background
-/// maintenance compaction each fan out their PUTs at this width, so keeping
-/// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
-/// core count rather than a multiple of it.
-fn commit_write_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(1)
-        .max(1)
-}
-
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
-    // Bound object-store fanout to half the machine's CPU parallelism. A vector
-    // commit can stage one hidden delta per touched cell plus user shards;
-    // driving all PUTs at once opens dozens of sockets and can stall the commit
-    // path. Crucially, bulk ingest commits overlap background hidden-index
-    // OPANN hot-region maintenance (its own compaction PUT/GET waves), so a full-width
-    // fanout from each stacks and starves the connection pool until requests
-    // hit the per-request timeout. Capping each operation at ~50% of cores
-    // leaves headroom for a concurrent maintenance pass without saturation.
+    // Each PUT acquires a permit from the shared commit I/O semaphore (see
+    // `commit::commit_io_semaphore`). User + hidden dual-writes and overlapping
+    // maintenance compactions share one global in-flight budget.
     let write_concurrency = commit_write_concurrency();
 
     let replace_futs = pending_storage_replaces
@@ -3273,6 +3244,7 @@ pub async fn write_superfile_list(
             let uri = *uri;
             let bytes = bytes.clone();
             async move {
+                let _permit = commit_io_permit().await;
                 let path = superfile_storage_path(&uri);
                 let result = if (bytes.len() as u64) >= multipart_threshold {
                     put_superfile_multipart(storage.as_ref(), &path, bytes.clone()).await
@@ -4336,7 +4308,7 @@ supertable:
             pages: HashMap::new(),
             root: next,
         };
-        let commit = opann_routing_commit_from_split(Some(split), Some(prior), params);
+        let commit = opann_routing_commit_from_split(Some(split), Some(prior), params, None);
         match commit {
             OpannRoutingCommit::Replace {
                 routing: Some(routing),
@@ -4355,7 +4327,12 @@ supertable:
             pages: HashMap::new(),
             root,
         };
-        let commit = opann_routing_commit_from_split(Some(split), Some(root), CellRoutingParams::default());
+        let commit = opann_routing_commit_from_split(
+            Some(split),
+            Some(root),
+            CellRoutingParams::default(),
+            None,
+        );
         assert!(
             matches!(commit, OpannRoutingCommit::Inherit),
             "unchanged root with no new pages must not rewrite the manifest pointer"
@@ -4363,37 +4340,12 @@ supertable:
     }
 
     #[test]
-    fn hidden_cell_routing_stamps_whole_cell_leaf() {
-        use std::collections::HashMap;
-
+    fn routing_copy_for_opann_partition_emits_one_whole_cell_leaf() {
         use uuid::Uuid;
 
         use crate::superfile::vector::builder::{ClusterRoute, ClusterRouting};
-        use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
 
         let superfile_id = 99u128;
-        let mut entry = SuperfileEntry {
-            superfile_id: Uuid::from_u128(superfile_id),
-            uri: SuperfileUri::new_v4(),
-            n_docs: 100,
-            id_min: 0,
-            id_max: 99,
-            scalar_stats: HashMap::new(),
-            fts_summary: HashMap::new(),
-            vector_summary: HashMap::new(),
-            partition_key: Vec::new(),
-            partition_hint: None,
-            vector_layout: VectorLayout::Ivf,
-            subsection_offsets: None,
-        };
-        entry.vector_summary.insert(
-            "emb".into(),
-            VectorSummary {
-                centroid: ClusterCentroids::empty(),
-                radius: 2.0,
-                clusters: ClusterCentroids::empty(),
-            },
-        );
         let routing = vec![(
             0u32,
             ClusterRouting {
@@ -4408,17 +4360,51 @@ supertable:
                         centroid_fp32: vec![3.0, 0.0],
                         doc_off: 50,
                         count: 60,
-                        radius: 0.5,
+                        radius: 0.7,
                     },
                 ],
             },
         )];
-        let copies =
-            hidden_cell_routing_copies_for_superfile(superfile_id, &entry, "emb", routing);
-        assert_eq!(copies.len(), 1);
-        assert_eq!(copies[0].doc_off, 0);
-        assert_eq!(copies[0].count, 0);
-        assert_eq!(copies[0].radius, 2.0);
-        assert!((copies[0].centroid_fp32[0] - 2.2).abs() < 1e-5);
+        let copy = routing_copy_for_opann_partition(superfile_id, None, routing, None)
+            .expect("one leaf per partition");
+        assert_eq!(copy.superfile_id, superfile_id);
+        assert_eq!(copy.doc_off, 0);
+        assert_eq!(copy.count, 0);
+        assert_eq!(copy.radius, 0.7, "falls back to max internal cluster radius");
+        assert!(
+            copy.centroid_fp32[0] > 0.0,
+            "centroid is count-weighted across internal clusters"
+        );
+        let _ = Uuid::from_u128(superfile_id);
+    }
+
+    #[test]
+    fn routing_copy_prefers_partition_summary_radius_over_ivf_cluster_max() {
+        use crate::superfile::vector::builder::{ClusterRoute, ClusterRouting};
+
+        const PARTITION_RADIUS: f32 = 4.25;
+        let routing = vec![(
+            0u32,
+            ClusterRouting {
+                routes: vec![ClusterRoute {
+                    centroid_fp32: vec![1.0, 0.0],
+                    doc_off: 0,
+                    count: 100,
+                    radius: 0.5,
+                }],
+            },
+        )];
+        let copy = routing_copy_for_opann_partition(
+            7,
+            None,
+            routing,
+            Some(PARTITION_RADIUS),
+        )
+        .expect("whole-cell leaf");
+        assert_eq!(
+            copy.radius, PARTITION_RADIUS,
+            "OPANN leaf radius must be the partition vector_summary.radius \
+             (covering sphere for the whole cell), not max internal IVF cluster radius"
+        );
     }
 }

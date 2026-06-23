@@ -65,7 +65,6 @@ impl ObjectStoreMeter {
 
 #[derive(Debug, Clone)]
 struct RangeGetEvent {
-    bytes: u64,
     start_us: u128,
     end_us: u128,
     phase: u8,
@@ -98,7 +97,6 @@ impl MeterCounters {
         self.get_count.fetch_add(1, Ordering::Relaxed);
         self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.range_log.lock().unwrap().push(RangeGetEvent {
-            bytes,
             start_us: start.duration_since(origin).as_micros(),
             end_us: end.duration_since(origin).as_micros(),
             phase,

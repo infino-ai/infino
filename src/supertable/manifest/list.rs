@@ -165,6 +165,11 @@ pub struct OpannRouting {
     pub root_page: ContentHash,
     /// Probe tuning — reuses the cell-routing knobs.
     pub routing: CellRoutingParams,
+    /// Content-addressed snapshot of every page reachable from [`root_page`].
+    /// When set, open pulls this blob through the same verified-blob path as
+    /// manifest parts. Legacy manifests omit it and fall back to a per-page walk.
+    pub resident_uri: Option<String>,
+    pub resident_content_hash: Option<ContentHash>,
 }
 
 /// How superfiles are routed into manifest parts. Stamped into
@@ -889,6 +894,11 @@ struct OpannRoutingDto {
     root_page: String, // "blake3:<64hex>"
     #[serde(default)]
     routing: CellRoutingParamsDto,
+    /// Content-addressed resident snapshot; omitted on legacy manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resident_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resident_content_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1280,6 +1290,8 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
         opann_routing: l.opann_routing.as_ref().map(|r| OpannRoutingDto {
             root_page: encode_hash(&r.root_page),
             routing: r.routing.into(),
+            resident_uri: r.resident_uri.clone(),
+            resident_content_hash: r.resident_content_hash.as_ref().map(encode_hash),
         }),
         parts,
     })
@@ -1318,6 +1330,12 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
                 Ok(OpannRouting {
                     root_page: decode_hash(&r.root_page)?,
                     routing: r.routing.into(),
+                    resident_uri: r.resident_uri,
+                    resident_content_hash: r
+                        .resident_content_hash
+                        .as_deref()
+                        .map(decode_hash)
+                        .transpose()?,
                 })
             })
             .transpose()?,
@@ -2284,6 +2302,8 @@ mod tests {
                 nprobe_max: 32,
                 slack: 1.5,
             },
+            resident_uri: Some("opann-pages/resident-6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d.opann".into()),
+            resident_content_hash: Some(ContentHash([0x6d; 32])),
         });
         let got = decode(&encode(&list).expect("encode")).expect("decode");
         assert_eq!(got.opann_routing, list.opann_routing);

@@ -377,11 +377,14 @@ impl StorageProvider for S3StorageProvider {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
-            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
-            .await
-            .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+        retry::with_reissue(|| async {
+            self.store
+                .put_opts(&path, PutPayload::from_bytes(bytes.clone()), opts.clone())
+                .await
+                .map(|r| r.e_tag)
+                .map_err(|e| translate(uri, e))
+        })
+        .await
     }
 
     async fn put_if_match(
@@ -413,11 +416,14 @@ impl StorageProvider for S3StorageProvider {
                 ..Default::default()
             },
         };
-        self.store
-            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
-            .await
-            .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+        retry::with_reissue(|| async {
+            self.store
+                .put_opts(&path, PutPayload::from_bytes(bytes.clone()), opts.clone())
+                .await
+                .map(|r| r.e_tag)
+                .map_err(|e| translate(uri, e))
+        })
+        .await
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {

@@ -24,7 +24,7 @@ use super::descent::best_first;
 use super::page::{ChildLink, LeafRef, NodeTopo, Page, PageError};
 
 /// Where a [`PagedTree`] fetches page bytes by content hash. A warm
-/// implementation answers from a resident cache / mmap (no object I/O); a cold
+/// implementation answers from a disk-cache mmap (no object I/O); a cold
 /// one issues one object GET. The returned bytes are hash-verified by the
 /// caller before use.
 pub(crate) trait PageSource {
@@ -39,10 +39,32 @@ pub(crate) struct SplitPages {
     pub(crate) root: ContentHash,
 }
 
-/// A [`PageSource`] backed by a resident in-memory page map — the warm routing
-/// layer. The whole tree is loaded once (e.g. by `store::load_resident`) and
-/// descent then runs entirely against this map with zero object I/O, which is
-/// the OPANN routing model: routing lives on compute, warm descent does no GETs.
+/// A [`PageSource`] that overlays a write-side page map on a resident base.
+/// Copy-on-write commits fetch unchanged pages from the prior tree and only
+/// replace hashes present in `overlay`.
+pub(crate) struct OverlayPageSource<'a, B: PageSource + ?Sized> {
+    base: &'a B,
+    overlay: &'a HashMap<ContentHash, Vec<u8>>,
+}
+
+impl<'a, B: PageSource + ?Sized> OverlayPageSource<'a, B> {
+    pub(crate) fn new(base: &'a B, overlay: &'a HashMap<ContentHash, Vec<u8>>) -> Self {
+        Self { base, overlay }
+    }
+}
+
+impl<B: PageSource + ?Sized> PageSource for OverlayPageSource<'_, B> {
+    fn fetch(&self, hash: &ContentHash) -> Result<Bytes, PageError> {
+        if let Some(bytes) = self.overlay.get(hash) {
+            return Ok(Bytes::copy_from_slice(bytes));
+        }
+        self.base.fetch(hash)
+    }
+}
+
+/// A [`PageSource`] backed by a resident page map — the warm routing layer.
+/// Pages are mmap-backed slices (from the disk cache or a packed bundle); descent
+/// runs against this map with zero object I/O per query.
 pub(crate) struct ResidentPageSource {
     pages: HashMap<ContentHash, Bytes>,
 }

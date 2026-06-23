@@ -1748,9 +1748,9 @@ impl VectorReader {
 
     /// Probe one OPANN routing leaf: fetch the cluster bytes named by
     /// `(doc_off, count)` and score them. Skips centroid scoring — the tree
-    /// already selected this cell. `(doc_off, count) = (0, 0)` is the
-    /// whole-superfile hidden-cell shape: every non-empty IVF cluster is
-    /// probed without re-ranking centroids.
+    /// already selected this cell. Legacy manifests may still carry
+    /// `(doc_off, count) = (0, 0)` — those re-enter [`Self::search_clusters_async`]
+    /// (cluster index + one GET per non-empty cluster) until re-ingested.
     pub(crate) async fn probe_leaf_async(
         &self,
         column: &str,

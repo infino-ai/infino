@@ -69,9 +69,8 @@ use crate::{
         error::ManifestError,
         manifest::{
             commit::{
-                EncodedPart, PointerFile, frame_content_size, part_uri, put_immutable_blob,
-                read_pointer, translate_contention, write_manifest_list, write_part_bytes,
-                write_pointer,
+                EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
+                translate_contention, write_manifest_list, write_pointer,
             },
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
@@ -362,16 +361,16 @@ impl Manifest {
         let Some(storage) = self.options.storage.as_ref() else {
             return Ok(None);
         };
-        let root = routing.root_page;
         let storage = Arc::clone(storage);
         // Route page loads through the shared disk cache when one is attached,
         // so the routing tree is mmap-backed + evictable like superfile blobs
         // (and old-version pages reclaim once this manifest's source drops).
         let cache = self.options.disk_cache.clone();
+        let routing = routing.clone();
         let source = self
             .opann_tree
             .get_or_try_init(|| async move {
-                load_resident(cache.as_ref(), storage.as_ref(), root)
+                load_resident(cache.as_ref(), storage.as_ref(), &routing)
                     .await
                     .map(Arc::new)
             })
@@ -585,10 +584,10 @@ impl Manifest {
         };
 
         let manifest = Arc::new(new_manifest);
-        // Pull the OPANN routing tree onto compute as part of opening the
-        // manifest (one load per manifest version, reused by every query).
-        // Best-effort: a load failure here just leaves it lazy for the first
-        // query to retry.
+        // Prefetch the OPANN routing tree through the disk cache as part of
+        // opening the manifest (one load per manifest version, reused by every
+        // query). Best-effort: a load failure here just leaves it lazy for the
+        // first query to retry.
         let _ = manifest.opann_resident_tree().await;
         Ok(manifest)
     }
@@ -600,8 +599,8 @@ impl Manifest {
     /// 1. **In parallel** — write each new manifest part + write
     ///    the new manifest list. Independent of each other; the
     ///    list references parts by URI (= blake3 of bytes,
-    ///    computed before any I/O). Issued via
-    ///    [`futures::future::join_all`].
+    ///    computed before any I/O). Parts and pages share one
+    ///    bounded pre-pointer wave; the list PUT runs alongside it.
     /// 2. Await all of the above (visibility barrier #1: parts
     ///    and list must be durable before the pointer publishes).
     /// 3. Build the new pointer file (manifest_id, list_uri,
@@ -630,31 +629,19 @@ impl Manifest {
         // All are independent — the list's references to each part's URI (and
         // the OPANN root's reference to its page hashes) are content-addressable
         // from the in-memory bytes before any I/O, so there's no happens-before
-        // edge between them. The pages ride the same wave as the parts because
-        // they are the same kind of object: blake3-named immutable blobs that
-        // must exist before the pointer makes the new manifest visible.
+        // edge between them. Parts and pages share one bounded fanout wave via
+        // [`commit::write_pre_pointer_wave`]; each PUT acquires a permit from
+        // the global commit I/O semaphore (same pool as superfile PUTs).
         let list_fut = write_manifest_list(storage, list_to_write);
-        let part_futs = parts_to_write
-            .iter()
-            .map(|encoded| write_part_bytes(storage, encoded));
-        let part_join = future::join_all(part_futs);
-        let page_futs = page_blobs
-            .iter()
-            .map(|(uri, bytes)| put_immutable_blob(storage, uri, bytes.clone()));
-        let page_join = future::join_all(page_futs);
+        let pre_pointer = commit::write_pre_pointer_wave(storage, parts_to_write, page_blobs);
 
-        let (list_res, part_results, page_results) = tokio::join!(list_fut, part_join, page_join);
+        let (list_res, pre_res) = tokio::join!(list_fut, pre_pointer);
         // Translate `Storage(PreconditionFailed)` from sub-writes
         // into `WriteContentionExhausted` so callers (and the
         // writer's OCC retry loop) can match on one variant
         // regardless of which CAS lost the race — list or pointer.
         let list_res = list_res.map_err(translate_contention)?;
-        for part_result in part_results {
-            part_result.map_err(translate_contention)?;
-        }
-        for page_result in page_results {
-            page_result.map_err(|e| translate_contention(e.into()))?;
-        }
+        pre_res?;
 
         // Step 3: build pointer.
         let pointer = PointerFile {
@@ -1224,30 +1211,13 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let bytes = match self.disk_cache.as_ref() {
-            // `blob_bytes` content-verifies + caches the part (mmap-backed,
-            // evictable, reused across versions when the hash is unchanged).
-            Some(cache) => {
-                cache
-                    .blob_bytes(*expected_hash, uri.clone(), self.storage.as_ref())
-                    .await?
-            }
-            None => {
-                let (bytes, _) = self
-                    .storage
-                    .get(uri)
-                    .await
-                    .map_err(ManifestLoadError::Storage)?;
-                let actual_hash = ContentHash::of(&bytes);
-                if actual_hash != *expected_hash {
-                    return Err(ManifestLoadError::ContentHashMismatch {
-                        expected: expected_hash.to_hex(),
-                        actual: actual_hash.to_hex(),
-                    });
-                }
-                bytes
-            }
-        };
+        let bytes = commit::load_verified_blob(
+            *expected_hash,
+            uri,
+            self.storage.as_ref(),
+            self.disk_cache.as_ref(),
+        )
+        .await?;
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
     }
