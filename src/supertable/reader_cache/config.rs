@@ -17,7 +17,10 @@ use crate::supertable::manifest::SuperfileUri;
 /// How `DiskCacheStore` services a cache miss.
 ///
 /// Set via `DiskCacheConfig::cold_fetch_mode`. Default:
-/// [`ColdFetchMode::HybridWithPrefetch`].
+/// [`ColdFetchMode::LazyForegroundWithBackgroundFill`] — object-storage-native
+/// deployments make cold-query p50 the primary objective, and the foreground
+/// then pays only the per-query range budget while the full-superfile cache
+/// fill happens off the latency-critical path (warm stays resident).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColdFetchMode {
     /// Parallel range-GETs fan out over the superfile; each
@@ -30,7 +33,6 @@ pub enum ColdFetchMode {
     /// **1× bandwidth per cold miss** — same range responses
     /// serve both consumers; no re-fetching between foreground
     /// query and cache fill.
-    #[default]
     HybridWithPrefetch,
     /// Foreground query goes straight through `get_range` via
     /// [`StorageRangeSource`] — no disk-cache fill.
@@ -64,6 +66,7 @@ pub enum ColdFetchMode {
     ///
     /// [`SuperfileReader::open_lazy`]: crate::superfile::reader::SuperfileReader::open_lazy
     /// [`StorageRangeSource`]: crate::supertable::StorageRangeSource
+    #[default]
     LazyForegroundWithBackgroundFill,
 }
 

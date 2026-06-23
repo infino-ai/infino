@@ -652,6 +652,9 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        // Mark a foreground query in flight so background cache-fills yield
+        // S3 bandwidth to it; released when this query returns.
+        let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = match filter {
                 None => self.vector_search_async(column, query, k, options).await?,
@@ -684,6 +687,9 @@ impl SupertableReader {
         options: VectorSearchOptions,
         filter: Option<VectorFilter<'_>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // Mark a foreground query in flight so background cache-fills yield
+        // S3 bandwidth to it; released when this query returns.
+        let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         match filter {
             None => self.block_on(self.vector_search_async(column, query, k, options)),
             Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
