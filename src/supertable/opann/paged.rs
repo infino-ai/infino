@@ -272,6 +272,44 @@ mod tests {
     use crate::supertable::opann::test_util::{build_tree, synth_cells};
 
     #[test]
+    fn resplit_preserves_descent() {
+        // `Page::resplit` must re-page a page into a bounded subtree that
+        // descends *identically* to the original — same cells, same order, same
+        // distances. (The bounded-split test only checked reachability; this is
+        // the routing-correctness gate.) Build the whole tree into one page,
+        // then resplit at increasingly tight budgets and compare every descent
+        // against the in-memory oracle.
+        let (dim, n) = (24usize, 200usize);
+        let cells = synth_cells(n, dim);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let tree = build_tree(metric, dim, &cells).expect("tree");
+            // One page holding the entire tree (budget >> node count).
+            let whole = tree.to_pages(10 * n);
+            let page = Page::parse(&whole.pages[&whole.root]).expect("parse whole page");
+            for &budget in &[1usize, 4, 16, 64] {
+                let split = page.resplit(budget);
+                // Every produced page is within budget.
+                for bytes in split.pages.values() {
+                    let p = Page::parse(bytes).expect("parse subpage");
+                    assert!(p.topo().len() <= budget, "{metric:?} budget {budget}");
+                }
+                let paged =
+                    PagedTree::new(ResidentPageSource::from_pages(split.pages.clone()), split.root);
+                for &target in &[0usize, 1, 57, 199] {
+                    let q = &cells[target].0;
+                    for &k in &[1usize, 8, 32, n] {
+                        assert_eq!(
+                            tree.select_probes(q, k),
+                            paged.select_probes(q, k).expect("descend resplit"),
+                            "{metric:?} budget {budget} target {target} k {k}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn paged_descent_matches_in_memory_across_budgets() {
         // Splitting into pages and descending across them must reproduce the
         // in-memory descent *exactly* — same cells, same order, same distances —
