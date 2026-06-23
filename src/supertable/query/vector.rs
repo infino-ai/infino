@@ -557,10 +557,12 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
+        // Prune the superfile set through the routing tree (when present), then
+        // restrict to predicate-matching rows below — instead of scanning every
+        // superfile. The fall-back (no tree) still enumerates the full set.
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options)
+            .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -656,11 +658,11 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
+        // Prune the superfile set through the routing tree (when present) before
+        // resolving the plan's allow-set over the survivors.
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options)
+            .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -691,10 +693,13 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
+        // Prune the search set through the routing tree (same selector as the
+        // production filtered paths), so the bench's filtered recall measures
+        // the tree-routed path. The allow-bitmap offsets below still walk the
+        // full superfile list.
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options)
+            .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -799,46 +804,41 @@ impl SupertableReader {
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect())
     }
-    pub(crate) async fn vector_search_user_table_async(
+    /// Candidate superfiles for a vector query: descend the resident OPANN
+    /// routing tree (radius-aware adaptive admission) when this table carries
+    /// one, else enumerate the full set. Shared by the unfiltered user/hidden
+    /// path and the filtered paths, so filtered search **actually prunes**
+    /// through the tree instead of scanning every superfile — the predicate
+    /// allow-set then drops the rest within the probed set.
+    async fn candidate_superfiles_for_vector(
         &self,
         column: &str,
         query: &[f32],
-        k: usize,
-        options: VectorSearchOptions,
-    ) -> Result<Vec<SuperfileHit>, QueryError> {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
+        options: &VectorSearchOptions,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         let manifest = self.manifest();
         // The resident OPANN routing tree swaps with the manifest — loaded once
-        // at open and reused by every query (not a per-query / inner-cache
-        // load). Copy the routing root + probe budget out of the same routing
-        // record so neither borrows `manifest` across the awaits below.
+        // at open and reused by every query. Copy the routing root + probe
+        // budget out of the same record so neither borrows `manifest` across
+        // the awaits below.
         let tree = manifest
             .opann_resident_tree()
             .await
             .map_err(|e| QueryError::Store(format!("opann tree load: {e}")))?;
         let opann = manifest.opann_routing().map(|r| (r.root_page, r.routing));
         let superfiles = match (tree, opann) {
-            // OPANN: descend the compute-resident Sq8 routing tree to the nearest
-            // partition leaves, then keep ONLY the hidden superfiles those leaves
-            // name (`cell_id == superfile_id.as_u128()`). One leaf per superfile;
-            // the descent's `cell_set` is authoritative — no `partition_hint`
-            // match, no always-scan, no keep-all fallback.
+            // OPANN: descend the compute-resident Sq8 routing tree for ALL
+            // candidate leaves (cell id + centroid distance), then choose the
+            // probe set by radius-aware adaptive admission (§7.3) rather than a
+            // fixed top-N: a far-centroid but large-radius partition can still
+            // hold a true neighbor, and pure centroid-distance ranking drops it.
             (Some(source), Some((root, routing))) => {
-                // Descend the resident tree for ALL candidate partition leaves
-                // (cell id + centroid distance), then choose the probe set by
-                // radius-aware adaptive admission (§7.3) rather than a fixed
-                // top-N: a far-centroid but large-radius partition can still hold
-                // a true neighbor, and pure centroid-distance ranking drops it.
                 let candidates: Vec<(u128, f32)> = PagedTree::new(source, root)
                     .select_probes(query, usize::MAX)
                     .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?
                     .into_iter()
-                    // Collapse each cluster leaf to its superfile id — the
-                    // whole-superfile fetch path is unchanged (the per-cluster
-                    // offsets in the leaf are wired into the fetch in the later
-                    // semantic step that splits superfiles into cluster leaves).
+                    // Collapse each cluster leaf to its superfile id; the probed
+                    // superfile is then searched with its own internal IVF.
                     .map(|(leaf, d)| (leaf.superfile_id, d))
                     .collect();
                 let part_ids: Vec<PartId> = manifest
@@ -876,23 +876,37 @@ impl SupertableReader {
                     .filter(|sf| cell_set.contains(&sf.superfile_id.as_u128()))
                     .collect()
             }
-            // No tree. For the hidden vector index this means routing isn't
-            // published yet: only the in-process (pre-first-durable-commit) shape
-            // has data without a tree, and it has no manifest list to flatten —
-            // fall through to the flat path, which reads its in-memory
-            // superfiles. A durable hidden table always carries a tree, so a
-            // durable hidden table reaching here with a published list returns
-            // empty rather than brute-force scanning the whole index.
+            // Durable hidden index with no published tree yet: only the
+            // in-process (pre-first-durable-commit) shape has data without a
+            // tree, and it has no manifest list to flatten. A durable hidden
+            // table always carries a tree, so reaching here with a published
+            // list returns empty rather than brute-force scanning the index.
             _ if manifest.options.is_hidden_vector_index && !manifest.is_in_process_only() => {
-                return Ok(Vec::new());
+                Vec::new()
             }
-            // Genuine user table (no hidden index — e.g. a storage-less
-            // `memory://` table): the existing flat per-superfile cluster prune.
+            // No tree (storage-less / `memory://` user table): there is no
+            // routing layer to prune through, so enumerate the full set.
             _ => manifest
                 .get_pruned_superfiles_for_vector(column, query)
                 .await
                 .map_err(QueryError::ManifestLoad)?,
         };
+        Ok(superfiles)
+    }
+
+    pub(crate) async fn vector_search_user_table_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let superfiles = self
+            .candidate_superfiles_for_vector(column, query, &options)
+            .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
