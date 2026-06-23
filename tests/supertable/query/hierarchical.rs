@@ -401,10 +401,10 @@ fn sql_single_value_in_prunes_parts_via_equality_rewrite() {
 #[test]
 fn sql_multi_value_in_returns_exact_rows_across_parts() {
     // `title IN ('Straw Berry', 'Orange Juice')`, matches in parts 1 and 2.
-    //  - DataFusion rewrites a multi-value IN to `title = a OR title = b`.
-    //  - the manifest prune doesn't descend `OR`, so all 3 parts load.
-    //  - correctness comes from `FilterExec`, not pruning.
-    // This test pins the rows; pruning the `OR` form is future work.
+    //  - DataFusion rewrites a 2-value IN to `title = a OR title = b`.
+    //  - the same-column OR lowers to the IN leaves, so part 0 (neither
+    //    value in its min/max, neither token in its bloom) is pruned.
+    //  - the surviving 2 parts return the exact rows.
     let dir = TempDir::new().expect("tempdir");
     build_3_parts_two_superfiles_each(
         dir.path(),
@@ -427,10 +427,11 @@ fn sql_multi_value_in_returns_exact_rows_across_parts() {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "'Orange Juice' (part 1) + 'Straw Berry' (part 2)");
 
-    // Multi-value IN lowers to OR-of-equalities → no manifest prune today,
-    // so all parts load. Correctness still holds via FilterExec.
-    let (_loaded, total) = parts_loaded(&consumer);
+    // The OR-of-equalities now prunes: part 0 holds neither value, so only
+    // the 2 matching parts load.
+    let (loaded, total) = parts_loaded(&consumer);
     assert_eq!(total, 3, "6 commits / 2-per-part = 3 parts");
+    assert_eq!(loaded, 2, "part 0 pruned; got {loaded}/3");
 
     // Token-superset that isn't a full match → FilterExec drops it.
     // 'Straw' shares the `straw` token with 'Straw Berry' but isn't an
@@ -521,6 +522,44 @@ fn fts_in_bloom_prunes_parts_min_max_cannot() {
     assert_eq!(
         loaded, 1,
         "min/max keeps all 3 (range [aaa,zzz]); the bloom must narrow to part 1; got {loaded}/3"
+    );
+}
+
+#[test]
+fn sql_or_on_fts_column_bloom_prunes_parts_min_max_cannot() {
+    // Same-column OR (a 2-value IN's rewritten form) on an FTS column,
+    // min/max-blind by the anchor trick:
+    //  - every part holds "aaa"+"zzz" → min/max [aaa,zzz] keeps all 3.
+    //  - 'bravo' lives only in part 1 → the OR's TermPresence{Or} bloom
+    //    narrows to part 1, the other value exists nowhere.
+    let dir = TempDir::new().expect("tempdir");
+    build_3_parts_two_superfiles_each(
+        dir.path(),
+        &[
+            ["aaa", "alpha"], // part 0
+            ["zzz", "filler0"],
+            ["aaa", "bravo"], // part 1: holds 'bravo'
+            ["zzz", "filler1"],
+            ["aaa", "charlie"], // part 2
+            ["zzz", "filler2"],
+        ],
+    );
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_lazy_consumer(dir.path(), cache_dir.path());
+
+    // 2 values → arrives as `title = 'bravo' OR title = 'qx'`.
+    let batches = consumer
+        .reader()
+        .query_sql("SELECT _id FROM supertable WHERE title = 'bravo' OR title = 'qx'")
+        .expect("query");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1, "only the 'bravo' title matches");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(
+        loaded, 1,
+        "min/max keeps all 3 (range [aaa,zzz]); the OR bloom must narrow to part 1; got {loaded}/3"
     );
 }
 

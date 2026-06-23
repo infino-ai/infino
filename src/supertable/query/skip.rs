@@ -261,7 +261,7 @@ pub fn scalar_skip(
 /// Keep each superfile whose `column` min/max could hold *any* of
 /// `values` (an `IN` list is a disjunction). Empty `values` keeps all.
 /// The SQL-side sibling of [`scalar_skip`] for the `IN` shape.
-pub fn scalar_in_list_skip(
+pub fn scalar_value_set_skip(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
     values: &[ScalarValue],
@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_in_list_skip_keeps_superfiles_holding_any_listed_value() {
+    fn scalar_value_set_skip_keeps_superfiles_holding_any_listed_value() {
         let segs = vec![
             seg_with_int_stats("x", 0, 10),
             seg_with_int_stats("x", 100, 110),
@@ -680,18 +680,21 @@ mod tests {
         let i = |n| ScalarValue::Int64(Some(n));
         // IN (5, 205) → A's [0,10] and C's [200,210], not B.
         assert_eq!(
-            scalar_in_list_skip(&segs, "x", &[i(5), i(205)]),
+            scalar_value_set_skip(&segs, "x", &[i(5), i(205)]),
             vec![true, false, true]
         );
         // IN (50) → matches no range.
         assert_eq!(
-            scalar_in_list_skip(&segs, "x", &[i(50)]),
+            scalar_value_set_skip(&segs, "x", &[i(50)]),
             vec![false, false, false]
         );
         // Empty list and unknown column both keep all (conservative).
-        assert_eq!(scalar_in_list_skip(&segs, "x", &[]), vec![true, true, true]);
         assert_eq!(
-            scalar_in_list_skip(&segs, "missing", &[i(5)]),
+            scalar_value_set_skip(&segs, "x", &[]),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            scalar_value_set_skip(&segs, "missing", &[i(5)]),
             vec![true, true, true]
         );
     }

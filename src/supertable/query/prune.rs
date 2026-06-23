@@ -31,8 +31,8 @@ use std::sync::Arc;
 use datafusion::scalar::ScalarValue;
 
 use super::skip::{
-    ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_in_list_skip, scalar_skip,
-    scalar_value_may_match,
+    ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip,
+    scalar_value_may_match, scalar_value_set_skip,
 };
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -66,7 +66,7 @@ pub(crate) enum PruneLeaf {
     /// Scalar comparison on a scalar column → per-column min/max.
     Scalar(ScalarPredicate),
     /// `column IN (values)` → keep if the min/max could hold any value.
-    ScalarInList {
+    ScalarValueSet {
         column: String,
         values: Vec<ScalarValue>,
     },
@@ -90,8 +90,8 @@ impl PruneLeaf {
                 Some(prune_parts_for_fts_prefix(list, column, prefix))
             }
             PruneLeaf::Scalar(pred) => Some(scalar_keep_parts(list, pred)),
-            PruneLeaf::ScalarInList { column, values } => {
-                Some(scalar_in_list_keep_parts(list, column, values))
+            PruneLeaf::ScalarValueSet { column, values } => {
+                Some(scalar_value_set_keep_parts(list, column, values))
             }
         }
     }
@@ -141,7 +141,11 @@ fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
 
 // Part-tier `IN` prune: keep parts whose min/max could hold *any* listed
 // value (an `IN` is a disjunction of equalities).
-fn scalar_in_list_keep_parts(list: &Manifest, column: &str, values: &[ScalarValue]) -> Vec<PartId> {
+fn scalar_value_set_keep_parts(
+    list: &Manifest,
+    column: &str,
+    values: &[ScalarValue],
+) -> Vec<PartId> {
     keep_parts_where(list, column, |min, max| {
         values
             .iter()
@@ -203,8 +207,11 @@ pub(crate) async fn select_superfiles(
             PruneLeaf::Prefix { column, prefix } => {
                 and_into(&mut mask, &fts_prefix_skip(&superfiles, column, prefix));
             }
-            PruneLeaf::ScalarInList { column, values } => {
-                and_into(&mut mask, &scalar_in_list_skip(&superfiles, column, values));
+            PruneLeaf::ScalarValueSet { column, values } => {
+                and_into(
+                    &mut mask,
+                    &scalar_value_set_skip(&superfiles, column, values),
+                );
             }
             // Scalar leaves handled above as one conjunction.
             PruneLeaf::Scalar(_) => {}
@@ -229,10 +236,14 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, slice::from_ref};
+    use std::{
+        collections::{HashMap, HashSet},
+        slice::from_ref,
+    };
 
     use arrow_array::{Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use uuid::Uuid;
 
     use super::*;
@@ -247,7 +258,7 @@ mod tests {
                 list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
                 part::{ContentHash, PartId},
             },
-            query::skip::ScalarOp,
+            query::{provider::exprs_to_value_set_leaves, skip::ScalarOp},
         },
         test_helpers::default_tokenizer,
     };
@@ -343,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_in_list_keep_parts_keeps_every_part_holding_a_listed_value() {
+    fn scalar_value_set_keep_parts_keeps_every_part_holding_a_listed_value() {
         let p0 = part_from(&[seg_int("x", 0, 10)], 0);
         let p1 = part_from(&[seg_int("x", 100, 110)], 1);
         let p2 = part_from(&[seg_int("x", 200, 210)], 2);
@@ -352,15 +363,49 @@ mod tests {
 
         // IN (5, 205) → p0 ([0,10]) and p2 ([200,210]); not p1.
         assert_eq!(
-            scalar_in_list_keep_parts(&list, "x", &[i(5), i(205)]),
+            scalar_value_set_keep_parts(&list, "x", &[i(5), i(205)]),
             vec![p0.part_id, p2.part_id]
         );
         // IN (50) → in no part's range.
-        assert!(scalar_in_list_keep_parts(&list, "x", &[i(50)]).is_empty());
+        assert!(scalar_value_set_keep_parts(&list, "x", &[i(50)]).is_empty());
         // Unknown column → conservative keep-all.
         assert_eq!(
-            scalar_in_list_keep_parts(&list, "missing", &[i(5)]),
+            scalar_value_set_keep_parts(&list, "missing", &[i(5)]),
             vec![p0.part_id, p1.part_id, p2.part_id]
+        );
+    }
+
+    #[test]
+    fn or_of_equalities_prunes_at_both_tiers() {
+        // `x = 5 OR x = 205` lowers to the same ScalarValueSet the IN path
+        // builds; measure the drop each tier makes for that leaf.
+        let s = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let expr = col("x").eq(lit(5_i64)).or(col("x").eq(lit(205_i64)));
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None);
+        let (column, values) = match leaves.as_slice() {
+            [PruneLeaf::ScalarValueSet { column, values }] => (column.as_str(), values.clone()),
+            _ => panic!("expected one ScalarValueSet leaf from the OR"),
+        };
+
+        // Tier A — part aggregates: 3 parts → 2; p1's [100,110] holds
+        // neither value, so the part-level prune drops it.
+        let p0 = part_from(&[seg_int("x", 0, 10)], 0);
+        let p1 = part_from(&[seg_int("x", 100, 110)], 1);
+        let p2 = part_from(&[seg_int("x", 200, 210)], 2);
+        let list = list_with(vec![p0.clone(), p1, p2.clone()]);
+        assert_eq!(
+            scalar_value_set_keep_parts(&list, column, &values),
+            vec![p0.part_id, p2.part_id],
+            "part tier prunes 1 of 3"
+        );
+
+        // Tier B — per-superfile stats: within a surviving part, 2
+        // superfiles → 1; [50,60] holds neither value, dropped here.
+        let segs = vec![seg_int("x", 0, 10), seg_int("x", 50, 60)];
+        assert_eq!(
+            scalar_value_set_skip(&segs, column, &values),
+            vec![true, false],
+            "superfile tier prunes 1 of 2"
         );
     }
 
