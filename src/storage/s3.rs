@@ -223,6 +223,11 @@ const S3_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// dominate the fan-out's p99; the retry layer covers genuine drops.
 const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whole-request timeout (incl. body). The object_store default is too
+/// tight for multi-MiB superfile PUTs on a modest uplink — it aborts
+/// mid-upload and surfaces as "error sending request".
+const S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Tuned HTTP client options for the object-store-native fan-out.
 ///
 /// The supertable vector/FTS query path fans out one cold-open +
@@ -256,6 +261,9 @@ fn tuned_client_options() -> ClientOptions {
         // Bound the connect phase so a single slow SYN/TLS doesn't
         // dominate the fan-out's p99; the retry layer covers drops.
         .with_connect_timeout(S3_CONNECT_TIMEOUT)
+        // Large superfile PUTs (multi-MiB) need a generous whole-request
+        // budget; without this the default ~30s aborts mid-body upload.
+        .with_timeout(S3_REQUEST_TIMEOUT)
 }
 
 /// Translate an `object_store::Error` to our `StorageError`.

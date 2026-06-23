@@ -518,8 +518,8 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
 
 /// Like [`open_consumer`] but routes the consumer (and its hidden-index
 /// `PrefixedStorageProvider`) through a [`storage_meter::MeteredStorage`], so
-/// the object-store traffic of write-path maintenance — SPFresh drain, optimize
-/// — can be attributed by snapshotting the returned meter before and after.
+/// object-store traffic from `optimize` (hot-region overlap consolidation)
+/// can be attributed by snapshotting the returned meter before and after.
 fn open_consumer_metered(
     modality: Modality,
     built: &supertable::IngestResult,
@@ -532,13 +532,18 @@ fn open_consumer_metered(
     (cache_dir, tiers::open_consumer(opts), meter)
 }
 
-/// One row of the maintenance-cost table: object-store traffic + wall for a
-/// single maintenance pass (drain / optimize). All columns are lower-is-better.
-fn maint_cost_row(op: &str, c: storage_meter::ObjectStoreMeter, wall: Duration) -> Vec<Cell> {
+/// One row of the maintenance / search-traffic table: object-store requests +
+/// wall for a single bench window. All columns are lower-is-better.
+fn store_traffic_row(op: &str, c: storage_meter::ObjectStoreMeter, wall: Duration) -> Vec<Cell> {
     let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
     let wall_ns = wall.as_secs_f64() * 1e9;
     vec![
         text(op),
+        metric(
+            c.head_count as f64,
+            fmt_count(c.head_count as usize),
+            Better::Lower,
+        ),
         metric(
             c.put_count as f64,
             fmt_count(c.put_count as usize),
@@ -873,6 +878,14 @@ pub mod vector {
         std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
     }
 
+    /// Opt-in A/B maintenance pass for benches only. When set, the vector bench
+    /// runs recall **before** and **after** an explicit [`Supertable::optimize`]
+    /// call and reports object-store cost. Production never auto-invokes
+    /// `optimize` — hot-region consolidation is manual-only (same API).
+    fn run_optimize_ab() -> bool {
+        std::env::var_os("INFINO_BENCH_RUN_OPTIMIZE").is_some()
+    }
+
     /// Fixed probe count for the `default` row, overridable with
     /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
     fn fixed_nprobe() -> usize {
@@ -897,6 +910,52 @@ pub mod vector {
             );
         }
     }
+
+    /// One metered cold vector search on a fresh disk cache + consumer — the
+    /// same shape as `fts::measure_cold_store`, but for kNN. Only runs when
+    /// the ingest landed on a real object-store backend (`built.cleanup`).
+    fn measure_cold_vector_search_store(
+        built: &supertable::IngestResult,
+        query: &[f32],
+        nprobe: usize,
+        rerank: usize,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        built.cleanup.as_ref()?;
+        let meter = storage_meter::wrap(Arc::clone(&built.storage));
+        let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+            meter.provider(),
+            Some(built.total_index_bytes),
+        );
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        crate::executors::open_all_superfiles(&consumer);
+        let t0 = Instant::now();
+        let _hits = consumer.topk_global(supertable::VEC_COLUMN, query, TOP_K, nprobe, rerank);
+        let wall = t0.elapsed();
+        let snap = meter.snapshot();
+        eprintln!(
+            "[supertable_vector] metered cold vector search: GETs={} HEADs={} PUTs={} wall={wall:.1?}",
+            snap.get_count, snap.head_count, snap.put_count,
+        );
+        drop(consumer);
+        drop(cache_dir);
+        Some(snap)
+    }
+
+    const MAINT_TRAFFIC_HEADERS: &[&str] = &[
+        "pass",
+        "HEADs",
+        "PUTs",
+        "written",
+        "GETs",
+        "read",
+        "deletes",
+        "wall",
+    ];
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
     /// at calibrated recall targets (and a default config), with a
@@ -925,18 +984,19 @@ pub mod vector {
             .is_none()
             .then(|| supertable::prepare_corpus(Modality::Vector));
 
-        let (built, ingest_metrics) = if let Some(fixture) = existing {
-            (supertable::open_existing(Modality::Vector, fixture), None)
+        let (built, ingest_metrics, fresh_ingest) = if let Some(fixture) = existing {
+            (supertable::open_existing(Modality::Vector, fixture), None, false)
         } else if crate::dataset::dataset_mode() && !phases.build {
-            (supertable::open_dataset(Modality::Vector), None)
+            (supertable::open_dataset(Modality::Vector), None, false)
         } else {
-            build_measured(
+            let (built, metrics) = build_measured(
                 Modality::Vector,
                 corpus
                     .as_ref()
                     .expect("non-existing path prepared a corpus"),
                 phases,
-            )
+            );
+            (built, metrics, true)
         };
         if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
@@ -1044,11 +1104,15 @@ pub mod vector {
             // only.
             drop(corpus);
 
-            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
+            const INGEST_NOTE: &str = "Post-ingest recall (no maintenance). Hidden OPANN tree reflects commit-time IVF leaves; overlapping cells are expected until an operator runs `optimize`. Set INFINO_BENCH_RUN_OPTIMIZE=1 for a pre/post A/B pass around explicit `optimize`.";
 
-            // Only fresh-ingest runs price the optimize maintenance pass below;
-            // dataset / existing-prefix tables are read-only fixtures.
-            let fresh_ingest = ingest_metrics.is_some();
+            const PRE_MAINT_NOTE: &str = "Pre-optimize recall (A/B leg A): hidden OPANN tree after ingest only. Report-only — does not fail the bench.";
+
+            const POST_MAINT_NOTE: &str = "Post-optimize recall (A/B leg B): after explicit `optimize` (hot-region overlap consolidation on hidden table + user size-merge). Full recall gate + calibration grid when enabled.";
+
+            // Only a bench run that just ingested (not existing-prefix / dataset
+            // open) can run the optional optimize A/B pass.
+            let run_optimize_ab = fresh_ingest && run_optimize_ab();
 
             let search_title = |phase: &str| {
                 format!(
@@ -1058,16 +1122,43 @@ pub mod vector {
                 )
             };
 
-            // Metered consumer so the optimize maintenance pass below can be
-            // priced (object-store PUT/GET/DELETE traffic + bytes).
             let (cache_dir, consumer, maint_meter) =
                 open_consumer_metered(Modality::Vector, &built);
 
-            let recall_rows = {
-                if phases.warm {
-                    log_hidden_stats(&consumer, "at warm open");
+            let pre_maint_config = exec_vec::VectorSearchRunConfig {
+                assert_recall_floor: false,
+                run_calibration_grid: false,
+            };
+            let post_maint_config = if skip_cal {
+                exec_vec::VectorSearchRunConfig {
+                    assert_recall_floor: false,
+                    run_calibration_grid: false,
                 }
-                exec_vec::run_search(
+            } else {
+                exec_vec::VectorSearchRunConfig::POST_MAINTENANCE
+            };
+
+            if run_optimize_ab {
+                if phases.warm || phases.cold {
+                    log_hidden_stats(&consumer, "pre-optimize open");
+                }
+
+                // Meter one cold kNN search before optimize (fresh cache each
+                // time) so GET/PUT shape is comparable to the post-optimize leg.
+                let meter_query = q_correct
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| vec![0.0f32; DIM]);
+                let pre_search_t0 = Instant::now();
+                let pre_search_cost = measure_cold_vector_search_store(
+                    &built,
+                    &meter_query,
+                    nprobe,
+                    rerank,
+                );
+                let pre_search_wall = pre_search_t0.elapsed();
+
+                let _pre_recall_rows = exec_vec::run_search(
                     &mut report,
                     &consumer,
                     || SupertableVecColdGuard::open(&built),
@@ -1080,28 +1171,22 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
-                    phases.warm,
-                    phases.cold,
+                    false,
+                    false,
                     COLD_ITERS,
                     skip_cal,
-                    "supertable_vector",
-                    "bench/vector/supertable/search",
-                    search_title(""),
-                    LEGACY_NOTE,
-                )
-            };
+                    pre_maint_config,
+                    "supertable_vector/pre-optimize",
+                    "bench/vector/supertable/search/pre-optimize",
+                    search_title("pre-optimize"),
+                    PRE_MAINT_NOTE,
+                );
 
-            // Fresh-ingest runs additionally price the new-design write-path
-            // maintenance: overlap consolidation via optimize (full compaction
-            // merges overlapping per-cell hidden IVF superfiles). There is no
-            // eager drain in the new design — each commit's hidden vectors are
-            // already immutable ~8 MB cells. Measured after the search so it
-            // does not perturb the latency numbers above; object-store traffic
-            // is attributed via the meter delta around the call. Dataset /
-            // existing-prefix tables are read-only fixtures and skip this.
-            if fresh_ingest {
                 let opt_before = maint_meter.snapshot();
                 let opt_t0 = Instant::now();
+                eprintln!(
+                    "[supertable_vector] INFINO_BENCH_RUN_OPTIMIZE=1: calling Supertable::optimize (manual in production)..."
+                );
                 consumer
                     .optimize(&OptimizeOptions::compact(CompactionSettings {
                         target_superfile_size_mb: 1,
@@ -1112,35 +1197,102 @@ pub mod vector {
                 let opt_wall = opt_t0.elapsed();
                 let opt_cost = maint_meter.snapshot().delta(opt_before);
 
+                let post_search_t0 = Instant::now();
+                let post_search_cost = measure_cold_vector_search_store(
+                    &built,
+                    &meter_query,
+                    nprobe,
+                    rerank,
+                );
+                let post_search_wall = post_search_t0.elapsed();
+
                 if phases.warm {
-                    log_hidden_stats(&consumer, "after optimize");
+                    log_hidden_stats(&consumer, "post-optimize");
+                }
+
+                let mut traffic_rows: Vec<Vec<Cell>> = Vec::new();
+                if let Some(c) = pre_search_cost {
+                    traffic_rows.push(store_traffic_row(
+                        "cold_search (pre-optimize)",
+                        c,
+                        pre_search_wall,
+                    ));
+                }
+                traffic_rows.push(store_traffic_row("optimize", opt_cost, opt_wall));
+                if let Some(c) = post_search_cost {
+                    traffic_rows.push(store_traffic_row(
+                        "cold_search (post-optimize)",
+                        c,
+                        post_search_wall,
+                    ));
                 }
                 report.emit(&Section {
                     anchor: "bench/vector/supertable/maintenance".into(),
                     title: format!(
-                        "Supertable vector — maintenance cost ({} docs)",
+                        "Supertable vector — object-store traffic ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    note: "Object-store cost of write-path maintenance: overlap \
-                           consolidation via optimize (full compaction merges \
-                           overlapping per-cell hidden IVF superfiles). PUT/GET/DELETE \
-                           requests + bytes + wall. Δ vs the previous run."
+                    note: "Bench-only explicit `optimize` (INFINO_BENCH_RUN_OPTIMIZE=1). \
+                           `cold_search` rows: one fresh-cache kNN at the default `(nprobe, rerank)` \
+                           before and after optimize (table open + hidden-index fan-out + probed \
+                           superfile GETs). `optimize`: user size-merge + hidden hot-region \
+                           recluster (COW OPANN page PUTs). Not auto-run in production. \
+                           Δ vs the previous run."
                         .into(),
                     blocks: vec![Block {
                         subtitle: String::new(),
-                        headers: vec![
-                            "pass".into(),
-                            "PUTs".into(),
-                            "written".into(),
-                            "GETs".into(),
-                            "read".into(),
-                            "deletes".into(),
-                            "wall".into(),
-                        ],
-                        rows: vec![maint_cost_row("optimize", opt_cost, opt_wall)],
+                        headers: MAINT_TRAFFIC_HEADERS
+                            .iter()
+                            .map(|h| (*h).into())
+                            .collect(),
+                        rows: traffic_rows,
                     }],
                 });
+            } else if fresh_ingest {
+                eprintln!(
+                    "[supertable_vector] skipping optimize (set INFINO_BENCH_RUN_OPTIMIZE=1 for pre/post A/B around explicit optimize)"
+                );
             }
+
+            let recall_rows = exec_vec::run_search(
+                &mut report,
+                &consumer,
+                || SupertableVecColdGuard::open(&built),
+                supertable::VEC_COLUMN,
+                n_docs,
+                TOP_K,
+                nprobe,
+                rerank,
+                &q_correct,
+                &gt_correct,
+                &q_cal,
+                &gt_cal,
+                phases.warm,
+                phases.cold,
+                COLD_ITERS,
+                skip_cal,
+                post_maint_config,
+                if run_optimize_ab {
+                    "supertable_vector/post-optimize"
+                } else {
+                    "supertable_vector"
+                },
+                if run_optimize_ab {
+                    "bench/vector/supertable/search/post-optimize"
+                } else {
+                    "bench/vector/supertable/search"
+                },
+                search_title(if run_optimize_ab {
+                    "post-optimize"
+                } else {
+                    ""
+                }),
+                if run_optimize_ab {
+                    POST_MAINT_NOTE
+                } else {
+                    INGEST_NOTE
+                },
+            );
             if phases.warm {
                 emit_cost_warm(
                     &mut report,
@@ -1235,7 +1387,8 @@ pub mod vector {
                             DIM
                         ),
                         note: format!(
-                            "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
+                            "Filtered kNN on the user table (~10% selectivity, every {}th row), \
+                             post-optimize state. recall@{TOP_K} = {mean_recall:.3}. Δ vs the previous run.",
                             FILTER_KEEP_EVERY
                         ),
                         blocks: vec![Block {

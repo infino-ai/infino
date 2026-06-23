@@ -167,6 +167,39 @@ fn adaptive_probe_cells(
     chosen
 }
 
+/// Superfiles in manifest commit order — loads parts when the flat
+/// `manifest.superfiles` view is empty (lazy open after `Supertable::open`).
+async fn ordered_manifest_superfiles(
+    manifest: &Manifest,
+) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+    if !manifest.is_in_process_only() {
+        let part_ids: Vec<PartId> = manifest
+            .get_all_list_entries()
+            .iter()
+            .map(|e| e.part_id)
+            .collect();
+        hierarchical_iter::load_and_flatten(manifest, &part_ids)
+            .await
+            .map_err(QueryError::ManifestLoad)
+    } else {
+        Ok(hierarchical_iter::fallback_to_flat_superfiles(manifest))
+    }
+}
+
+/// Global doc-id base per superfile URI in manifest order.
+async fn superfile_doc_base_offsets(
+    manifest: &Manifest,
+) -> Result<HashMap<SuperfileUri, u32>, QueryError> {
+    let entries = ordered_manifest_superfiles(manifest).await?;
+    let mut map = HashMap::with_capacity(entries.len());
+    let mut acc = 0u32;
+    for entry in entries {
+        map.insert(entry.uri, acc);
+        acc = acc.saturating_add(entry.n_docs as u32);
+    }
+    Ok(map)
+}
+
 /// Whether every hit already references a superfile in the user manifest.
 fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHit]) -> bool {
     let manifest = reader.manifest();
@@ -583,7 +616,7 @@ impl SupertableReader {
             terms: tokens.clone(),
             mode: filter.mode,
         }];
-        let surviving: HashSet<u128> = select_superfiles(&manifest, &prune_leaves)
+        let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves[..])
             .await?
             .iter()
             .map(|e| e.superfile_id.as_u128())
@@ -874,14 +907,7 @@ impl SupertableReader {
                     // superfile is then searched with its own internal IVF.
                     .map(|(leaf, d)| (leaf.superfile_id, d))
                     .collect();
-                let part_ids: Vec<PartId> = manifest
-                    .get_all_list_entries()
-                    .iter()
-                    .map(|e| e.part_id)
-                    .collect();
-                let entries = hierarchical_iter::load_and_flatten(manifest, &part_ids)
-                    .await
-                    .map_err(QueryError::ManifestLoad)?;
+                let entries = ordered_manifest_superfiles(manifest).await?;
                 // Each candidate cell's covering radius is its partition's
                 // vector-summary radius (the same value stamped as the leaf
                 // radius at write — never decoded from a stored centroid).
@@ -893,15 +919,20 @@ impl SupertableReader {
                             .map(|vs| (sf.superfile_id.as_u128(), vs.radius))
                     })
                     .collect();
-                // The search `nprobe` is the fetch budget (the cap); the floor
-                // and slack come from the routing record. With no search nprobe,
-                // fall back to the routing cap.
-                let cap = options.nprobe.unwrap_or(routing.nprobe_max);
+                // The search `nprobe` is the recall FLOOR — the minimum number of
+                // nearest cells to probe — not a cap. Radius-aware admission then
+                // expands beyond the floor up to the routing `nprobe_max` ceiling.
+                // Wiring `nprobe` as the cap would defeat adaptive probing: a fixed
+                // `nprobe=6` would hard-stop at 6 cells even when a query's true
+                // neighbourhood is fragmented across many time-local per-commit
+                // cells, dropping recall. With no search nprobe, the routing floor
+                // (`nprobe_min`) applies and the ceiling stays `nprobe_max`.
+                let floor = options.nprobe.unwrap_or(routing.nprobe_min);
                 let cell_set = adaptive_probe_cells(
                     candidates,
                     &radius_of,
-                    routing.nprobe_min,
-                    cap,
+                    floor,
+                    routing.nprobe_max,
                     routing.slack,
                 );
                 entries
@@ -1059,6 +1090,14 @@ impl SupertableReader {
             }),
             Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
         }
+    }
+
+    test_visible! {
+    /// Map each user superfile URI to its global doc-id base. Loads manifest
+    /// parts when the flat `manifest.superfiles` list is empty (lazy open).
+    fn superfile_doc_base_offsets(&self) -> Result<HashMap<SuperfileUri, u32>, QueryError> {
+        self.block_on(superfile_doc_base_offsets(self.manifest()))
+    }
     }
 }
 
@@ -1240,6 +1279,165 @@ mod tests {
             "two nearest are the floor"
         );
         assert_eq!(chosen.len(), 2, "nothing else clears τ");
+    }
+
+    /// Path B acceptance gate: storage-backed hidden OPANN routing with default
+    /// adaptive probing must reach recall@10 ≥ 0.99 after `Supertable::open`.
+    #[test]
+    fn storage_backed_opann_recall_at_acceptance_bar() {
+        use std::collections::HashSet;
+
+        use tempfile::TempDir;
+
+        use crate::{
+            storage::{LocalFsStorageProvider, StorageProvider},
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::rerank_codec::RerankCodec,
+            },
+        };
+
+        const N_COMMITS: usize = 16;
+        const DOCS_PER_COMMIT: usize = 40;
+        const TOTAL_DOCS: usize = N_COMMITS * DOCS_PER_COMMIT;
+        const DIM: usize = 64;
+        const TOP_K: usize = 10;
+        const N_QUERIES: usize = 20;
+        const RECALL_BAR: f32 = 0.99;
+
+        fn vector_for_global(g: usize, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| if d == g % dim { 1.0 } else { 0.0 })
+                .collect()
+        }
+
+        fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| {
+                    let z = x - y;
+                    z * z
+                })
+                .sum()
+        }
+
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                fixed_list_f32(DIM),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tmpdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let make_opts = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: DIM,
+                    n_cent: 8,
+                    rot_seed: 7,
+                    metric: Metric::L2Sq,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                }],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+        let st = Supertable::create(make_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for commit in 0..N_COMMITS {
+            let base = commit * DOCS_PER_COMMIT;
+            let titles = LargeStringArray::from(
+                (0..DOCS_PER_COMMIT)
+                    .map(|i| format!("doc {}", base + i))
+                    .collect::<Vec<_>>(),
+            );
+            let mut flat = Vec::with_capacity(DOCS_PER_COMMIT * DIM);
+            for i in 0..DOCS_PER_COMMIT {
+                flat.extend(vector_for_global(base + i, DIM));
+            }
+            let fsl = FixedSizeListArray::try_new(
+                item.clone(),
+                DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("fsl");
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+
+        let mut corpus = Vec::with_capacity(TOTAL_DOCS);
+        for g in 0..TOTAL_DOCS {
+            corpus.push(vector_for_global(g, DIM));
+        }
+
+        let reopened = Supertable::open(make_opts()).expect("reopen");
+        let reader = reopened.reader();
+        let offsets = reader.superfile_doc_base_offsets().expect("doc bases");
+        assert!(
+            !offsets.is_empty(),
+            "lazy-open manifest must expose superfile doc bases for recall grading"
+        );
+
+        let mut sum = 0.0f32;
+        for qi in 0..N_QUERIES {
+            let global_row = qi * (TOTAL_DOCS / N_QUERIES);
+            let query = vector_for_global(global_row, DIM);
+            let mut scored: Vec<(f32, u32)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (l2_sq(&query, v), i as u32))
+                .collect();
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));
+            let truth: HashSet<u32> = scored.into_iter().take(TOP_K).map(|(_, id)| id).collect();
+
+            let hits = reader
+                .vector_hits("emb", &query, TOP_K, VectorSearchOptions::default(), None)
+                .expect("vector_hits");
+            let found: HashSet<u32> = hits
+                .into_iter()
+                .map(|h| {
+                    let base = offsets
+                        .get(&h.superfile)
+                        .expect("hit superfile in user manifest");
+                    base + h.local_doc_id
+                })
+                .collect();
+            let hit = found.iter().filter(|id| truth.contains(id)).count();
+            sum += hit as f32 / TOP_K as f32;
+        }
+        let mean = sum / N_QUERIES as f32;
+        assert!(
+            mean >= RECALL_BAR,
+            "path B recall@{TOP_K} = {mean:.3} < acceptance bar {RECALL_BAR:.2} \
+             (default adaptive OPANN routing after Supertable::open)"
+        );
     }
 
     /// Drive an async future to completion on a throwaway current-thread

@@ -757,34 +757,19 @@ pub mod vector {
             let hits = reader
                 .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
                 .expect("supertable vector_hits");
-            let manifest = reader.manifest();
-            // Per-superfile doc offsets in manifest order. Unfiltered
-            // vector search may route through the hidden index, whose
-            // superfiles live in a sibling manifest — fall back there
-            // until source_ref maps hidden hits back to user rows.
-            let mut seg_uris: Vec<_> = manifest.superfiles.iter().map(|e| e.uri).collect();
-            let mut offsets: Vec<u32> = Vec::with_capacity(seg_uris.len());
-            let mut acc: u32 = 0;
-            for entry in manifest.superfiles.iter() {
-                offsets.push(acc);
-                acc = acc.saturating_add(entry.n_docs as u32);
-            }
-            if let Some(hidden) = self.vector_index_table() {
-                let hidden_reader = hidden.reader();
-                let hidden_manifest = hidden_reader.manifest();
-                for entry in hidden_manifest.superfiles.iter() {
-                    seg_uris.push(entry.uri);
-                    offsets.push(acc);
-                    acc = acc.saturating_add(entry.n_docs as u32);
-                }
-            }
+            let offsets = reader
+                .superfile_doc_base_offsets()
+                .expect("superfile doc bases");
             hits.into_iter()
                 .map(|h| {
-                    let seg_idx = seg_uris
-                        .iter()
-                        .position(|u| *u == h.superfile)
-                        .expect("hit superfile present in user or hidden manifest");
-                    (offsets[seg_idx] + h.local_doc_id, h.score)
+                    let base = offsets.get(&h.superfile).unwrap_or_else(|| {
+                        panic!(
+                            "vector hit references superfile {:?} absent from user manifest \
+                             (hidden remap bug?)",
+                            h.superfile
+                        )
+                    });
+                    (base + h.local_doc_id, h.score)
                 })
                 .collect()
         }
@@ -1183,6 +1168,46 @@ pub mod vector {
         });
     }
 
+    /// Controls which parts of [`run_search`] run and whether sub-threshold
+    /// recall fails the bench (pre-maintenance passes report only).
+    pub struct VectorSearchRunConfig {
+        pub assert_recall_floor: bool,
+        pub run_calibration_grid: bool,
+    }
+
+    impl VectorSearchRunConfig {
+        /// Post-ingest, pre-`optimize`: measure recall, never fail the run.
+        pub const PRE_MAINTENANCE: Self = Self {
+            assert_recall_floor: false,
+            run_calibration_grid: false,
+        };
+        /// After hot-region consolidation: full gate + calibration grid.
+        pub const POST_MAINTENANCE: Self = Self {
+            assert_recall_floor: true,
+            run_calibration_grid: true,
+        };
+    }
+
+    fn assert_recall_at_least(
+        log_prefix: &str,
+        label: &str,
+        k: usize,
+        recall: f32,
+        assert_floor: bool,
+    ) {
+        if assert_floor {
+            assert!(
+                recall >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} {label} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] {label} OK: recall@{k} = {recall:.3}");
+        } else {
+            eprintln!(
+                "[{log_prefix}] {label}: recall@{k} = {recall:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2}, report-only)",
+            );
+        }
+    }
+
     /// Shared search driver: correctness gate, per-target calibration,
     /// warm + cold rows, and table emission. `warm_reader` is the
     /// already-warm reader both correctness and warm timing run against;
@@ -1205,6 +1230,7 @@ pub mod vector {
         include_cold: bool,
         cold_iters: usize,
         skip_calibration: bool,
+        run_config: VectorSearchRunConfig,
         log_prefix: &str,
         anchor: &str,
         title: String,
@@ -1230,9 +1256,21 @@ pub mod vector {
                 default_nprobe,
                 default_rerank,
             );
-            eprintln!(
-                "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
-            );
+            if run_config.assert_recall_floor {
+                eprintln!(
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {CORRECTNESS_RECALL_FLOOR:.2})",
+                );
+            } else {
+                eprintln!(
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (report-only, floor {CORRECTNESS_RECALL_FLOOR:.2})",
+                );
+            }
+            if run_config.assert_recall_floor {
+                assert!(
+                    default >= CORRECTNESS_RECALL_FLOOR,
+                    "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                );
+            }
             default_recall = Some(default);
         } else {
             eprintln!(
@@ -1248,11 +1286,20 @@ pub mod vector {
                 CORRECTNESS_NPROBE,
                 CORRECTNESS_RERANK_MULT,
             );
-            assert!(
-                recall >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            assert_recall_at_least(
+                log_prefix,
+                "correctness",
+                k,
+                recall,
+                run_config.assert_recall_floor,
             );
-            eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+            rows.push(RecallRow {
+                target: "correctness".into(),
+                params: format!("p={CORRECTNESS_NPROBE}, r={CORRECTNESS_RERANK_MULT}"),
+                recall: format!("{recall:.3}"),
+                warm: None,
+                cold: None,
+            });
 
             eprintln!(
                 "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
@@ -1267,16 +1314,20 @@ pub mod vector {
                 default_nprobe,
                 default_rerank,
             );
-            assert!(
-                default >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            assert_recall_at_least(
+                log_prefix,
+                "default-config",
+                k,
+                default,
+                run_config.assert_recall_floor,
             );
-            eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
             default_recall = Some(default);
             // Small corpora afford the exhaustive grid; past the cap the
             // staircase walk gets the same answers from O(P + R)
             // evaluations (see `calibrate_staircase`).
-            let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
+            let cal: Vec<Option<Calibrated>> = if !run_config.run_calibration_grid {
+                Vec::new()
+            } else if n_docs <= FULL_CALIBRATION_MAX_DOCS {
                 RECALL_TARGETS
                     .iter()
                     .map(|&target| {
@@ -1296,7 +1347,7 @@ pub mod vector {
                 calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
             };
 
-            for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            for (i, &target) in RECALL_TARGETS.iter().enumerate().take(cal.len()) {
                 match cal[i] {
                     Some(c) => rows.push(RecallRow {
                         target: format!("{target:.2}"),

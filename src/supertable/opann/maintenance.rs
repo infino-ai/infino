@@ -3,14 +3,13 @@
 
 //! Maintenance bookkeeping for the hidden global vector cell index.
 //!
-//! The user table stays time-ordered and immutable; the hidden index is a
-//! derived, cell-ordered acceleration layer. Each commit appends immutable
-//! ~8 MB IVF cells (no eager drain). When a region's cells start to overlap,
-//! overlap-triggered consolidation re-clusters that region into tight, disjoint
-//! cells — that work lives in [`crate::supertable::compaction`]
-//! (`overlap_consolidation_jobs`) + [`crate::supertable::writer`]
-//! (`recluster_cells`). This module owns the overlap detection
-//! ([`hot_overlap_groups`]).
+//! The user table stays time-ordered; the hidden shadow table shares the same
+//! Sq8+ε bytes at ingest (build-once/write-twice) and gets a separate OPANN
+//! tree. When manifest `vector_summary` radii show cells overlapping in vector
+//! space, [`hot_overlap_groups`] selects hot regions; [`crate::supertable::compaction`]
+//! (`overlap_consolidation_jobs`) + [`crate::supertable::writer`] (`recluster_cells`)
+//! recluster those regions and COW-update the hidden routing tree. Trigger is
+//! geometry (mean overlap degree ≥ τ), not ingest age.
 
 use crate::superfile::vector::distance::{Metric, metric_distance_by};
 

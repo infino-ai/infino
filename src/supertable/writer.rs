@@ -87,7 +87,7 @@ use super::{
     },
     opann::{
         insert::{LeafInsert, update_tree},
-        paged::ResidentPageSource,
+        paged::{ResidentPageSource, SplitPages},
         store,
     },
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
@@ -137,8 +137,8 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::{OpannRouting, PartitionStrategy},
-            part::{self as part_mod, PartId},
+            list::{CellRoutingParams, OpannRouting, PartitionStrategy},
+            part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
         query::{dispatch::open_compaction_input, vector::stable_ids_by_local_for_routing},
@@ -389,14 +389,9 @@ pub(in crate::supertable) struct PartitionRoutingCopy {
     pub(in crate::supertable) radius: f32,
 }
 
-/// Cluster a commit's hidden batch into ~8 MB vector-local partitions and build
-/// one immutable IVF superfile per partition (each a routing-tree leaf). The
-/// commit's raw fp32 vectors are k-means'd into `k = hidden_cell_count(rows,
-/// sum_dim)` partitions; each partition's fp32 centroid is captured here (the
-/// ingestion surface) as the leaf's routing copy. No fixed grid, no
-/// `partition_hint` — the leaf id is the new superfile's id, so a query's tree
-/// descent (which yields cell ids = superfile ids) fetches exactly these
-/// partitions.
+/// Cluster a buffered batch into vector-local partitions and build one IVF
+/// superfile per partition. Used for direct hidden-table commits only; the
+/// user-table path shares one encode via [`prepare_hidden_incoming_from_shared_build`].
 fn execute_hidden_incoming_plan_in_scope(
     inner: &SupertableInner,
     plan: HiddenIncomingPlan,
@@ -859,50 +854,6 @@ impl SupertableWriter {
             self.commit_appends_internal()?;
         }
 
-        Ok(())
-    }
-
-    /// Dual-write helper for the hidden vector-index supertable: buffer one
-    /// shard batch using the user table's stable row ids instead of minting
-    /// new ones so global-index hits can map back to user superfiles.
-    pub(crate) fn append_dual_write_batch(
-        &mut self,
-        ids: &Decimal128Array,
-        vectors: &[Arc<Float32Array>],
-    ) -> Result<(), BuildError> {
-        let options = &self.inner.options;
-        let n_rows = ids.len();
-        if n_rows == 0 {
-            return Ok::<(), BuildError>(());
-        }
-        if vectors.len() != options.vector_columns.len() {
-            return Err(BuildError::BatchSchemaMismatch);
-        }
-        let id_array = ids
-            .clone()
-            .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
-            )
-            .expect(
-                "invariant: precision 38 + scale 0 always valid \
-                 for any i128 payload",
-            );
-        let scalar = RecordBatch::try_new(
-            options.scalar_schema(),
-            vec![Arc::new(id_array) as ArrayRef],
-        )
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
-        let bytes = scalar.get_array_memory_size()
-            + vectors
-                .iter()
-                .map(|v| v.len() * std::mem::size_of::<f32>())
-                .sum::<usize>();
-        self.buffer.push(BufferedBatch {
-            scalar,
-            vectors: vectors.to_vec(),
-        });
-        self.buffer_bytes += bytes;
         Ok(())
     }
 
@@ -1397,10 +1348,9 @@ impl SupertableWriter {
         })
     }
 
-    /// Drain the hidden writer's buffered vectors into a plan. No clustering or
-    /// centroid work happens here — `execute_hidden_incoming_plan_in_scope`
-    /// k-means the buffer into ~8 MB vector-local partitions at build time, one
-    /// superfile (and one OPANN routing-tree leaf) per partition.
+    /// Drain the hidden writer's buffered vectors into a plan. Only used when
+    /// committing directly against the hidden shadow table — not the normal
+    /// user-table path, which build-once/write-twice shares the user encode.
     fn plan_hidden_incoming_shard(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
         let empty = HiddenIncomingPlan {
             buffer: Vec::new(),
@@ -1427,11 +1377,9 @@ impl SupertableWriter {
             .map(|vc| vc.column.clone())
             .unwrap_or_default();
 
-        // OPANN: the hidden batch is clustered into ~8 MB vector-local partitions
-        // at build time (`execute_hidden_incoming_plan_in_scope`) — no fixed cell
-        // grid to bootstrap. The hidden table keeps the default single-bucket
-        // partition strategy; routing lives entirely in the OPANN tree, whose
-        // leaves are the per-partition superfiles.
+        // Direct hidden-table commits (maintenance / tests) still k-means the
+        // buffered batch into vector-local partitions. The user-table commit
+        // path shares one encode and registers bytes into both tables instead.
         let buffer = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
         Ok(HiddenIncomingPlan { buffer, column })
@@ -1484,36 +1432,16 @@ impl SupertableWriter {
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Dual-write vectors into the hidden index writer, then build/publish
-        // user and hidden superfiles in parallel (create via rayon::join,
-        // publish via tokio::join).
-        let mut hidden_writer = None;
-        if let Some(vit) = self.inner.vector_index_table.as_ref() {
-            // A vector table always has its hidden vector-index sibling; the
-            // dual-write is part of the commit, not best-effort. Any failure
-            // fails the whole commit — vector search must never silently drift
-            // from the user table.
-            let mut vw = vit.writer().map_err(|e| {
-                BuildError::Store(format!("hidden vector-index writer unavailable: {e}"))
-            })?;
-            for batch in &buffer {
-                let ids = batch
-                    .scalar
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| {
-                        BuildError::Store(
-                            "hidden vector-index dual-write missing _id column".into(),
-                        )
-                    })?;
-                vw.append_dual_write_batch(ids, &batch.vectors)
-                    .map_err(|e| {
-                        BuildError::Store(format!("hidden vector-index append failed: {e}"))
-                    })?;
-            }
-            hidden_writer = Some(vw);
-        }
+        // Build-once, write-twice: one Sq8+ε encode per commit; the same
+        // superfile bytes land in the user table and the hidden shadow table
+        // (separate storage prefixes, separate OPANN trees). No second k-means
+        // or rebuild on the hidden side — hot-region maintenance reshapes the
+        // shadow tree later; the user table stays time-organized.
+        let hidden_inner = self
+            .inner
+            .vector_index_table
+            .as_ref()
+            .map(|vit| Arc::clone(vit.inner()));
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
@@ -1571,20 +1499,13 @@ impl SupertableWriter {
                 (shards, hints)
             };
 
-        // Parallel create: user superfile build + hidden incoming build
-        // share one writer-pool install (rayon::join, no nested install).
-        // Parallel publish: user + hidden manifest/storage commits overlap.
+        // One encode, then parallel prepare into user + hidden manifests
+        // (rayon::join inside one writer-pool install). Parallel publish via
+        // tokio::join.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
-        let hidden_plan = if let Some(vw) = hidden_writer.as_mut() {
-            Some(vw.plan_hidden_incoming_shard()?)
-        } else {
-            None
-        };
-        let hidden_inner = hidden_writer.as_ref().map(|vw| Arc::clone(&vw.inner));
-        let (user_batch, hidden_side) =
-            if let (Some(plan), Some(hidden_inner)) = (hidden_plan, hidden_inner) {
-                writer_pool.install(
+        let (user_batch, hidden_side) = if let Some(hidden_inner) = hidden_inner {
+            writer_pool.install(
                 || -> Result<
                     (
                         UserCommitPrepare,
@@ -1593,16 +1514,31 @@ impl SupertableWriter {
                     BuildError,
                 > {
                     let shards_ref = &shards;
-                    let hints = cell_hints.clone();
+                    let user_hints = cell_hints.clone();
+                    let outputs = fanout_shards_in_pool_scope(shards_ref, |slice| {
+                        build_one_shard(slice.as_slice(), &user_options)
+                    })?;
+                    let n_shards = outputs.len();
+                    let hidden_outputs = outputs.clone();
+                    // Shadow table is distance-organized via OPANN, not the user's
+                    // VectorCell time partitions — never stamp user cell hints here.
+                    let hidden_hints = vec![None; n_shards];
                     let hidden_inner = Arc::clone(&hidden_inner);
                     let (user_batch, hidden_prep) = rayon::join(
-                        || -> Result<UserCommitPrepare, BuildError> {
-                            let outputs = fanout_shards_in_pool_scope(shards_ref, |slice| {
-                                build_one_shard(slice.as_slice(), &user_options)
-                            })?;
-                            prepare_user_superfile_batch_in_scope(&user_inner, outputs, hints)
+                        || {
+                            prepare_user_superfile_batch_in_scope(
+                                &user_inner,
+                                outputs,
+                                user_hints,
+                            )
                         },
-                        || execute_hidden_incoming_plan_in_scope(&hidden_inner, plan),
+                        || {
+                            prepare_hidden_incoming_from_shared_build(
+                                &hidden_inner,
+                                hidden_outputs,
+                                hidden_hints,
+                            )
+                        },
                     );
                     Ok((
                         user_batch?,
@@ -1610,13 +1546,13 @@ impl SupertableWriter {
                     ))
                 },
             )?
-            } else {
-                let outputs = fanout_shards(&writer_pool, &shards, |slice| {
-                    build_one_shard(slice.as_slice(), &self.inner.options)
-                })?;
-                let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-                (batch, None)
-            };
+        } else {
+            let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+                build_one_shard(slice.as_slice(), &self.inner.options)
+            })?;
+            let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+            (batch, None)
+        };
 
         let drive = async {
             match hidden_side {
@@ -1674,6 +1610,7 @@ impl Drop for SupertableWriter {
 /// dropped, since the post-store `SuperfileReader` only exposes
 /// parquet row groups — Arrow batch min/max would require a full
 /// re-decode through DataFusion or parquet-rs's stats reader.
+#[derive(Clone)]
 pub struct ShardOutput {
     bytes: Bytes,
     n_docs: u64,
@@ -2362,11 +2299,15 @@ fn routing_copies_for_superfile(
         .unwrap_or_default()
 }
 
-fn prepare_user_superfile_batch_in_scope(
+/// Derive manifest entries, storage writes, and OPANN routing copies from
+/// already-built superfile bytes. Safe to run twice on the same shards with
+/// different `inner` handles (user vs hidden shadow table) — build-once,
+/// write-twice.
+fn prepare_superfile_publish_in_scope(
     inner: &SupertableInner,
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
-) -> Result<UserCommitPrepare, BuildError> {
+) -> Result<(SuperfilePublishBatch, Vec<PartitionRoutingCopy>), BuildError> {
     let prepared: Vec<(PreparedSuperfile, Vec<PartitionRoutingCopy>)> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
@@ -2401,7 +2342,30 @@ fn prepare_user_superfile_batch_in_scope(
         new_routing.extend(copies);
     }
     let batch = collect_prepared_superfiles(inner, prepared_superfiles)?;
+    Ok((batch, new_routing))
+}
+
+fn prepare_user_superfile_batch_in_scope(
+    inner: &SupertableInner,
+    outputs: Vec<ShardOutput>,
+    hints: Vec<Option<u32>>,
+) -> Result<UserCommitPrepare, BuildError> {
+    let (batch, new_routing) = prepare_superfile_publish_in_scope(inner, outputs, hints)?;
     Ok(UserCommitPrepare { batch, new_routing })
+}
+
+/// Register the same built superfile bytes into the hidden shadow supertable
+/// under its storage prefix. Routing copies come from the shared IVF build —
+/// no second k-means pass. Hot-region rebalancing reshapes the hidden tree
+/// later; the user table's time-ordered layout is unchanged.
+fn prepare_hidden_incoming_from_shared_build(
+    hidden_inner: &SupertableInner,
+    outputs: Vec<ShardOutput>,
+    hints: Vec<Option<u32>>,
+) -> Result<HiddenIncomingPrepare, BuildError> {
+    let (batch, new_routing) =
+        prepare_superfile_publish_in_scope(hidden_inner, outputs, hints)?;
+    Ok(HiddenIncomingPrepare { batch, new_routing })
 }
 
 fn prepare_user_superfile_batch(
@@ -2788,6 +2752,50 @@ const OPANN_PAGE_MAX_NODES: usize = 256;
 /// immutable + content-addressed, so writing them before the manifest commit
 /// that references them is safe (unreferenced until the new root is stamped).
 ///
+/// Map a copy-on-write OPANN tree update to the manifest commit action.
+///
+/// Returns [`OpannRoutingCommit::Replace`] with the new root (`None` only when
+/// the tree is emptied), or [`OpannRoutingCommit::Inherit`] when the root is
+/// unchanged and no new pages need writing.
+pub(in crate::supertable) fn opann_routing_commit_from_split(
+    split: Option<SplitPages>,
+    prior_root: Option<ContentHash>,
+    params: CellRoutingParams,
+) -> OpannRoutingCommit {
+    match split {
+        Some(split) if !split.pages.is_empty() => {
+            let pages: Vec<(String, Bytes)> = split
+                .pages
+                .into_iter()
+                .map(|(hash, bytes)| (store::page_uri(&hash), Bytes::from(bytes)))
+                .collect();
+            OpannRoutingCommit::Replace {
+                routing: Some(OpannRouting {
+                    root_page: split.root,
+                    routing: params,
+                }),
+                pages,
+            }
+        }
+        // Root moved but every rewritten page was already on object storage
+        // (content-addressed dedup at a prior commit). Still stamp the new root
+        // into the manifest list — otherwise the pointer keeps a stale root and
+        // vector search descends a tree that doesn't cover newly committed cells.
+        Some(split) if Some(split.root) != prior_root => OpannRoutingCommit::Replace {
+            routing: Some(OpannRouting {
+                root_page: split.root,
+                routing: params,
+            }),
+            pages: Vec::new(),
+        },
+        Some(_) => OpannRoutingCommit::Inherit,
+        None => OpannRoutingCommit::Replace {
+            routing: None,
+            pages: Vec::new(),
+        },
+    }
+}
+
 /// Returns [`OpannRoutingCommit::Replace`] with the new root (`None` only when
 /// the tree is emptied), or [`OpannRoutingCommit::Inherit`] when there is no
 /// vector column or nothing changed.
@@ -2839,31 +2847,7 @@ pub(in crate::supertable) async fn opann_routing_update(
         OPANN_PAGE_MAX_NODES,
     )
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    match split {
-        // Pages changed → hand them to the commit to write in its parallel
-        // pre-pointer wave (alongside the manifest parts) and stamp the new root.
-        Some(split) if !split.pages.is_empty() => {
-            let pages: Vec<(String, Bytes)> = split
-                .pages
-                .into_iter()
-                .map(|(hash, bytes)| (store::page_uri(&hash), Bytes::from(bytes)))
-                .collect();
-            Ok(OpannRoutingCommit::Replace {
-                routing: Some(OpannRouting {
-                    root_page: split.root,
-                    routing: params,
-                }),
-                pages,
-            })
-        }
-        // No pages changed (e.g. removed ids absent, nothing added) → unchanged.
-        Some(_) => Ok(OpannRoutingCommit::Inherit),
-        // Every cell removed and nothing added → the tree no longer exists.
-        None => Ok(OpannRoutingCommit::Replace {
-            routing: None,
-            pages: Vec::new(),
-        }),
-    }
+    Ok(opann_routing_commit_from_split(split, prior_root, params))
 }
 
 async fn publish_hidden_incoming_async(
@@ -4233,5 +4217,45 @@ supertable:
         w.commit().expect("commit");
         assert_eq!(w.buffered_bytes(), 0, "buffer drained on commit");
         assert_eq!(w.buffered_batches(), 0);
+    }
+
+    /// Regression: content-addressed page dedup can leave `split.pages` empty
+    /// while the root hash still moves. Inherit in that case leaves a stale
+    /// manifest root and path-B vector search returns zero hits.
+    #[test]
+    fn opann_routing_commit_stamps_root_when_pages_deduped() {
+        use crate::supertable::manifest::list::CellRoutingParams;
+
+        let prior = ContentHash::of(b"prior-root");
+        let next = ContentHash::of(b"next-root");
+        let params = CellRoutingParams::default();
+        let split = SplitPages {
+            pages: HashMap::new(),
+            root: next,
+        };
+        let commit = opann_routing_commit_from_split(Some(split), Some(prior), params);
+        match commit {
+            OpannRoutingCommit::Replace {
+                routing: Some(routing),
+                pages,
+            } if routing.root_page == next && pages.is_empty() => {}
+            _ => panic!("expected Replace with deduped pages and new root"),
+        }
+    }
+
+    #[test]
+    fn opann_routing_commit_inherits_when_root_unchanged_and_no_pages() {
+        use crate::supertable::manifest::list::CellRoutingParams;
+
+        let root = ContentHash::of(b"stable-root");
+        let split = SplitPages {
+            pages: HashMap::new(),
+            root,
+        };
+        let commit = opann_routing_commit_from_split(Some(split), Some(root), CellRoutingParams::default());
+        assert!(
+            matches!(commit, OpannRoutingCommit::Inherit),
+            "unchanged root with no new pages must not rewrite the manifest pointer"
+        );
     }
 }

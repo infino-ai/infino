@@ -1671,6 +1671,182 @@ mod tests {
         );
     }
 
+    /// Path B regression: after many storage-backed commits and a fresh
+    /// `Supertable::open`, the hidden index's OPANN tree must still descend to
+    /// leaves whose `superfile_id`s exist in the loaded manifest, and vector
+    /// search must return hits (not the durable-hidden empty fallback).
+    /// Recall@10 ≥ 0.99 is gated by
+    /// `supertable::query::vector::tests::storage_backed_opann_recall_at_acceptance_bar`.
+    #[test]
+    fn hidden_opann_tree_covers_manifest_after_reopen() {
+        use std::collections::HashSet;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            runtime_bridge::bridge_sync_to_async,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                options::Consistency,
+                opann::paged::PagedTree,
+                query::hierarchical_iter,
+            },
+        };
+
+        const N_COMMITS: usize = 16;
+        const DOCS_PER_COMMIT: usize = 32;
+        const DIM: usize = 32;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let make_opts = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: DIM,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::L2Sq,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider")))
+            .with_writer_pool(Arc::clone(&pool))
+            .with_read_consistency(Consistency::Snapshot)
+        };
+        let st = Supertable::create(make_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for commit in 0..N_COMMITS {
+            let base = commit * DOCS_PER_COMMIT;
+            let titles = LargeStringArray::from(
+                (0..DOCS_PER_COMMIT)
+                    .map(|i| format!("doc {}", base + i))
+                    .collect::<Vec<_>>(),
+            );
+            let mut flat = vec![0.0f32; DOCS_PER_COMMIT * DIM];
+            for (i, row) in flat.chunks_mut(DIM).enumerate() {
+                row[i % DIM] = 1.0;
+            }
+            let fsl = FixedSizeListArray::try_new(
+                item_field.clone(),
+                DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("fsl");
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+
+        let reopened = Supertable::open(make_opts()).expect("reopen");
+        let hidden = reopened.vector_index_table().expect("hidden index");
+        let hidden_reader = hidden.reader();
+        let hidden_manifest = hidden_reader.manifest();
+        assert!(
+            hidden_manifest.opann_routing().is_some(),
+            "hidden OPANN routing must survive Supertable::open"
+        );
+        assert!(
+            hidden_manifest.get_num_parts() > 0,
+            "hidden manifest must be durable (manifest list with parts)"
+        );
+
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        bridge_sync_to_async(async {
+            let (root, _routing) = hidden_manifest
+                .opann_routing()
+                .map(|r| (r.root_page, r.routing))
+                .expect("routing");
+            let tree = hidden_manifest
+                .opann_resident_tree()
+                .await
+                .expect("tree load")
+                .expect("resident tree");
+            let candidates: HashSet<u128> = PagedTree::new(Arc::clone(&tree), root)
+                .select_probes_where(&query, usize::MAX, &|_| true)
+                .expect("descent")
+                .into_iter()
+                .map(|(leaf, _)| leaf.superfile_id)
+                .collect();
+            assert!(
+                !candidates.is_empty(),
+                "OPANN descent must return candidate leaves after reopen"
+            );
+            let part_ids: Vec<_> = hidden_manifest
+                .get_all_list_entries()
+                .iter()
+                .map(|e| e.part_id)
+                .collect();
+            let entries = hierarchical_iter::load_and_flatten(hidden_manifest, &part_ids)
+                .await
+                .expect("load parts");
+            let manifest_ids: HashSet<u128> = entries
+                .iter()
+                .map(|e| e.superfile_id.as_u128())
+                .collect();
+            for id in &candidates {
+                assert!(
+                    manifest_ids.contains(id),
+                    "OPANN leaf superfile_id {id} missing from hidden manifest entries"
+                );
+            }
+            Ok::<(), ()>(())
+        })
+        .expect("async check");
+
+        let hits = reopened
+            .reader()
+            .vector_hits("emb", &query, 5, VectorSearchOptions::new(), None)
+            .expect("vector_hits");
+        assert!(
+            !hits.is_empty(),
+            "path B must return hits after reopen (got 0 — check OPANN stamp/descent)"
+        );
+        let bases = reopened
+            .reader()
+            .superfile_doc_base_offsets()
+            .expect("lazy offset map");
+        assert!(
+            !bases.is_empty(),
+            "lazy-open user manifest must expose superfile doc bases for recall grading"
+        );
+    }
+
     /// The hidden IVF superfiles must be made *resident* in the
     /// disk cache by a vector query, and a warm re-query must serve from
     /// that resident mmap without re-fetching from storage.
