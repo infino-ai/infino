@@ -34,6 +34,8 @@
 //!               n_pages u16, pages[n_pages] [32]  (child page content hashes)
 //! ```
 
+use std::collections::HashMap;
+
 use crate::superfile::vector::centroid_block::metric_stores_norm;
 use crate::superfile::vector::distance::{Metric, metric_from_id, metric_to_id};
 use crate::supertable::manifest::ClusterCentroids;
@@ -42,6 +44,7 @@ use crate::supertable::manifest::encoding::{
 };
 use crate::supertable::manifest::part::{BLAKE3_DIGEST_BYTES, ContentHash};
 
+use super::paged::SplitPages;
 #[cfg(test)]
 use super::descent::best_first;
 
@@ -401,6 +404,166 @@ impl Page {
     #[cfg(test)]
     pub(crate) fn radii(&self) -> &[f32] {
         &self.centroids.radii
+    }
+
+    /// Re-page an over-budget page into a subtree of pages each ≤ `budget`
+    /// nodes, **preserving its existing cross-page links**, and return the new
+    /// pages + the root page's hash. The COW insert calls this when a page grows
+    /// past budget: the returned subtree replaces this page under its parent via
+    /// a single cross-page link, so the parent's node count is unchanged and no
+    /// split propagates upward.
+    ///
+    /// Mirrors [`super::tree::CentroidTree::to_pages`] (partition by local-
+    /// subtree size, then encode bottom-up), but operates on a parsed page: a
+    /// `ChildLink::Page` is an opaque external edge carried through untouched,
+    /// and each sub-page's centroids are sliced out of this page's block under
+    /// the same shared quantizer ([`ClusterCentroids::select_rows`]) — no
+    /// re-quantization and no fp32 decode.
+    pub(crate) fn resplit(&self, budget: usize) -> SplitPages {
+        let budget = budget.max(1);
+        let n = self.topo.len();
+        // Local-subtree node counts. Only in-page (`Local`) children add nodes
+        // to a page; a `Page` child is an external edge (contributes nothing).
+        // A node's `Local` children always have smaller indices than it (build
+        // order is preserved through parse), so an ascending pass is post-order
+        // — every child's size is final before its parent's.
+        let mut size = vec![1usize; n];
+        for i in 0..n {
+            if let NodeTopo::Internal(children) = &self.topo[i] {
+                for c in children {
+                    if let ChildLink::Local(cl) = c {
+                        size[i] += size[*cl as usize];
+                    }
+                }
+            }
+        }
+        // Phase A: assign every reachable node to a sub-page, cutting a `Local`
+        // edge whose child subtree would overflow the current page.
+        let mut page_of = vec![u32::MAX; n];
+        let mut pages_nodes: Vec<Vec<u32>> = vec![Vec::new()];
+        let mut page_root: Vec<u32> = vec![self.root_local];
+        assign_page_nodes(
+            &self.topo,
+            &size,
+            budget,
+            self.root_local,
+            0,
+            &mut page_of,
+            &mut pages_nodes,
+            &mut page_root,
+        );
+        // Phase B: encode bottom-up; the root page yields the subtree's hash.
+        let mut out: HashMap<ContentHash, Vec<u8>> = HashMap::new();
+        let root_page = page_of[self.root_local as usize] as usize;
+        let root = self.build_subpage(root_page, &page_of, &pages_nodes, &page_root, &mut out);
+        SplitPages { pages: out, root }
+    }
+
+    /// Encode sub-page `page` (and, recursively, the sub-pages it links to),
+    /// returning its content hash. Local node order is the page's global node
+    /// ids sorted ascending (stable local indices → stable bytes). A `Local`
+    /// child in another sub-page becomes a `Page` cross-link to that sub-page's
+    /// root; an original `Page` child is preserved verbatim. Centroids are
+    /// sliced from this page's block under the shared quantizer.
+    fn build_subpage(
+        &self,
+        page: usize,
+        page_of: &[u32],
+        pages_nodes: &[Vec<u32>],
+        page_root: &[u32],
+        out: &mut HashMap<ContentHash, Vec<u8>>,
+    ) -> ContentHash {
+        let mut ids = pages_nodes[page].clone();
+        ids.sort_unstable();
+        let local_of: HashMap<u32, u32> = ids
+            .iter()
+            .enumerate()
+            .map(|(li, &g)| (g, li as u32))
+            .collect();
+        let mut topo: Vec<NodeTopo> = Vec::with_capacity(ids.len());
+        for &g in &ids {
+            match &self.topo[g as usize] {
+                NodeTopo::Leaf(leaf) => topo.push(NodeTopo::Leaf(*leaf)),
+                NodeTopo::Internal(children) => {
+                    let mut links = Vec::with_capacity(children.len());
+                    for child in children {
+                        match child {
+                            ChildLink::Local(cl) => {
+                                let cp = page_of[*cl as usize] as usize;
+                                if cp == page {
+                                    links.push(ChildLink::Local(local_of[cl]));
+                                } else {
+                                    let hash =
+                                        self.build_subpage(cp, page_of, pages_nodes, page_root, out);
+                                    links.push(ChildLink::Page(hash));
+                                }
+                            }
+                            // External edge — carried through untouched.
+                            ChildLink::Page(h) => links.push(ChildLink::Page(*h)),
+                        }
+                    }
+                    topo.push(NodeTopo::Internal(links));
+                }
+            }
+        }
+        let centroids = self.centroids.select_rows(&ids);
+        let root_local = local_of[&page_root[page]];
+        let bytes = encode_page(self.metric, &centroids, &topo, root_local);
+        let hash = ContentHash::of(&bytes);
+        out.entry(hash).or_insert(bytes);
+        hash
+    }
+}
+
+/// Phase A of [`Page::resplit`]: assign `node` and its in-page subtree to
+/// `page`, recursing into a fresh page at any `Local` edge whose child subtree
+/// would overflow `budget`. `Page` children are external and never assigned.
+#[allow(clippy::too_many_arguments)]
+fn assign_page_nodes(
+    topo: &[NodeTopo],
+    size: &[usize],
+    budget: usize,
+    node: u32,
+    page: usize,
+    page_of: &mut [u32],
+    pages_nodes: &mut Vec<Vec<u32>>,
+    page_root: &mut Vec<u32>,
+) {
+    page_of[node as usize] = page as u32;
+    pages_nodes[page].push(node);
+    if let NodeTopo::Internal(children) = &topo[node as usize] {
+        for child in children {
+            if let ChildLink::Local(cl) = child {
+                if pages_nodes[page].len() + size[*cl as usize] <= budget {
+                    absorb_node(topo, *cl, page, page_of, pages_nodes);
+                } else {
+                    let np = pages_nodes.len();
+                    pages_nodes.push(Vec::new());
+                    page_root.push(*cl);
+                    assign_page_nodes(topo, size, budget, *cl, np, page_of, pages_nodes, page_root);
+                }
+            }
+        }
+    }
+}
+
+/// Place `node`'s entire in-page (`Local`) subtree into `page` without further
+/// splitting — the "this subtree fits" branch of [`assign_page_nodes`].
+fn absorb_node(
+    topo: &[NodeTopo],
+    node: u32,
+    page: usize,
+    page_of: &mut [u32],
+    pages_nodes: &mut Vec<Vec<u32>>,
+) {
+    page_of[node as usize] = page as u32;
+    pages_nodes[page].push(node);
+    if let NodeTopo::Internal(children) = &topo[node as usize] {
+        for child in children {
+            if let ChildLink::Local(cl) = child {
+                absorb_node(topo, *cl, page, page_of, pages_nodes);
+            }
+        }
     }
 }
 

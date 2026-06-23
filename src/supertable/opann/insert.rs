@@ -101,7 +101,7 @@ pub(crate) fn update_tree(
         Some(cur) => cur,
     };
     for leaf in added {
-        cur = insert_one_leaf(&mut overlay, source, cur, metric, dim, leaf)?;
+        cur = insert_one_leaf(&mut overlay, source, cur, metric, dim, leaf, page_budget)?;
     }
     // Keep only what's reachable from the final root — intermediate rewrites
     // superseded within this batch are dropped, so the commit PUTs exactly the
@@ -170,13 +170,29 @@ fn insert_one_leaf(
     metric: Metric,
     dim: usize,
     leaf: &LeafInsert,
+    page_budget: usize,
 ) -> Result<ContentHash, PageError> {
     let path = greedy_leaf_page_path(overlay, source, root, &leaf.centroid_fp32)?;
     let leaf_page_hash = *path.last().expect("path always contains at least the root");
     let leaf_page = Page::parse(&fetch_bytes(overlay, source, &leaf_page_hash)?)?;
-    let new_leaf_page = append_leaf_into_page(&leaf_page, metric, dim, leaf);
-    let mut new_child = ContentHash::of(&new_leaf_page);
-    overlay.insert(new_child, new_leaf_page);
+    let new_page_bytes = append_leaf_into_page(&leaf_page, metric, dim, leaf);
+    // If the appended page now exceeds the node budget, split it locally into a
+    // bounded subtree (`resplit`) and hand the parent that subtree's root. The
+    // page→subtree-root swap is a single cross-page link, so the parent's node
+    // count is unchanged — the split never propagates upward, and pages stay
+    // bounded instead of one growing without limit across commits.
+    let appended = Page::parse(&new_page_bytes)?;
+    let mut new_child = if appended.topo().len() > page_budget {
+        let split = appended.resplit(page_budget);
+        for (h, b) in split.pages {
+            overlay.insert(h, b);
+        }
+        split.root
+    } else {
+        let h = ContentHash::of(&new_page_bytes);
+        overlay.insert(h, new_page_bytes);
+        h
+    };
     let mut old_child = leaf_page_hash;
     // Walk the page path back up to the root, redirecting each ancestor's link
     // to the rewritten child and re-emitting it (centroid block verbatim — only
@@ -568,6 +584,86 @@ mod tests {
             m.insert(*h, b.clone());
         }
         m
+    }
+
+    /// Inserting far more leaves than fit in one page, in batches through the
+    /// COW path, must keep **every** reachable page within the node budget (the
+    /// insert splits an overflowing page locally via `resplit`) — and every
+    /// inserted leaf must stay reachable by descent. Without the split, one page
+    /// would grow without bound across batches (the ingest blowup).
+    #[test]
+    fn cow_insert_splits_overflowing_pages_and_stays_bounded() {
+        let (dim, n, budget) = (16usize, 150usize, 8usize);
+        let cells = synth_cells(n, dim);
+        let leaves = leaves_from(&cells);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let genesis = insert_leaves(
+                &ResidentPageSource::from_pages(HashMap::new()),
+                None,
+                metric,
+                dim,
+                &leaves[..10],
+                budget,
+            )
+            .expect("genesis ok")
+            .expect("genesis some");
+            let mut pages = genesis.pages;
+            let mut root = genesis.root;
+            for batch in leaves[10..].chunks(7) {
+                let src = ResidentPageSource::from_pages(pages.clone());
+                let split = insert_leaves(&src, Some(root), metric, dim, batch, budget)
+                    .expect("insert ok")
+                    .expect("insert some");
+                for (h, b) in split.pages {
+                    pages.insert(h, b);
+                }
+                root = split.root;
+            }
+            // Every page reachable from the root respects the node budget.
+            let mut seen: HashSet<ContentHash> = HashSet::new();
+            let mut stack = vec![root];
+            let mut reachable = 0usize;
+            while let Some(h) = stack.pop() {
+                if !seen.insert(h) {
+                    continue;
+                }
+                reachable += 1;
+                let page = Page::parse(&pages[&h]).expect("parse");
+                assert!(
+                    page.topo().len() <= budget,
+                    "{metric:?}: page has {} nodes > budget {budget}",
+                    page.topo().len()
+                );
+                for node in page.topo() {
+                    if let NodeTopo::Internal(children) = node {
+                        for c in children {
+                            if let ChildLink::Page(ph) = c {
+                                stack.push(*ph);
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                reachable > 1,
+                "{metric:?}: expected a multi-page tree after splits, got {reachable}"
+            );
+            // Every inserted leaf is still reachable by descent.
+            let paged = PagedTree::new(ResidentPageSource::from_pages(pages.clone()), root);
+            let found: HashSet<u128> = paged
+                .select_probes(&cells[0].0, n)
+                .expect("descend")
+                .into_iter()
+                .map(|(leaf, _)| leaf.superfile_id)
+                .collect();
+            for c in &cells {
+                assert!(
+                    found.contains(&c.2),
+                    "{metric:?}: leaf {} missing after splits",
+                    c.2
+                );
+            }
+        }
     }
 
     /// Build a genesis tree, COW-insert a brand-new leaf, and confirm a paged
