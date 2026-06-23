@@ -33,7 +33,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
-use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
+use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate, VictimKey};
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -42,7 +42,7 @@ use crate::{
     },
     supertable::{
         StorageRangeSource,
-        manifest::{SubsectionOffsets, SuperfileUri},
+        manifest::{SubsectionOffsets, SuperfileUri, part::ContentHash},
     },
 };
 
@@ -134,6 +134,20 @@ struct CachedEntry {
     last_access_us: AtomicU64,
 }
 
+/// A cached content-addressed blob — a manifest part or an OPANN routing
+/// page. Holds the mmap-backed bytes the caller parses (superfiles cache a
+/// parsed `SuperfileReader`; blobs hand back raw bytes), plus the same
+/// residency bookkeeping `CachedEntry` carries. `bytes` and `mmap` share one
+/// `Arc<Mmap>` (via `Bytes::from_owner(ArcMmapOwner)`), so a MADV sweep on
+/// `mmap` reclaims the pages backing `bytes`, and dropping the last reference
+/// unmaps the file — identical lifecycle to a cached superfile.
+struct CachedBlob {
+    bytes: Bytes,
+    mmap: Arc<Mmap>,
+    size_bytes: u64,
+    last_access_us: AtomicU64,
+}
+
 /// Coalescing cell — concurrent cold readers on the same URI
 /// share one `OnceCell` and observe the same fetch result.
 type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
@@ -165,6 +179,11 @@ pub struct DiskCacheStore {
     config: DiskCacheConfig,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
+    /// Content-addressed blob cache — manifest parts + OPANN routing pages,
+    /// keyed by blake3 content hash. Shares the byte budget, eviction policy,
+    /// and MADV sweep with `cached`; entries hold raw mmap-backed bytes (the
+    /// caller parses) instead of a parsed `SuperfileReader`.
+    blobs: DashMap<ContentHash, Arc<CachedBlob>>,
     /// Per-URI cold-fetch coalescing. Inserted by the first
     /// caller to touch a cold URI; subsequent callers find
     /// the same `OnceCell` and `await` it via
@@ -233,6 +252,7 @@ impl DiskCacheStore {
             config,
             started_at: Instant::now(),
             cached: DashMap::new(),
+            blobs: DashMap::new(),
             coordinators: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             n_cold_fetches: AtomicU64::new(0),
@@ -302,17 +322,22 @@ impl DiskCacheStore {
         let now_us = self.now_us();
         // Snapshot: clone the Arc<Mmap> + last-access into an
         // owned Vec, then drop the iterator.
-        let snapshot: Vec<(SuperfileUri, Arc<Mmap>, u64)> = self
+        let mut snapshot: Vec<(Arc<Mmap>, u64)> = self
             .cached
             .iter()
             .filter_map(|e| {
                 let mmap = e.value().mmap.clone()?;
-                let last = e.value().last_access_us.load(Ordering::Acquire);
-                Some((*e.key(), mmap, last))
+                Some((mmap, e.value().last_access_us.load(Ordering::Acquire)))
             })
             .collect();
+        snapshot.extend(self.blobs.iter().map(|e| {
+            (
+                Arc::clone(&e.value().mmap),
+                e.value().last_access_us.load(Ordering::Acquire),
+            )
+        }));
         let mut n_advised = 0u64;
-        for (_uri, mmap, last_access) in snapshot {
+        for (mmap, last_access) in snapshot {
             let idle = now_us.saturating_sub(last_access);
             if idle >= threshold_us {
                 // `MADV_DONTNEED` lives on `UncheckedAdvice` in
@@ -611,7 +636,7 @@ impl DiskCacheStore {
     /// a `DashMap::len` (which itself is `O(shards)`).
     pub fn stats(&self) -> CacheStats {
         CacheStats {
-            n_entries: self.cached.len() as u64,
+            n_entries: (self.cached.len() + self.blobs.len()) as u64,
             current_bytes: self.current_bytes.load(Ordering::Acquire),
             budget_bytes: self.config.disk_budget_bytes,
             n_cold_fetches: self.n_cold_fetches.load(Ordering::Acquire),
@@ -648,10 +673,14 @@ impl DiskCacheStore {
     /// report `mmap_resident_bytes` and to drive the
     /// budget-aware sweep in [`Self::sweep_for_budget`].
     pub fn current_mmap_size_bytes(&self) -> u64 {
-        self.cached
+        let superfiles: u64 = self
+            .cached
             .iter()
             .filter_map(|e| e.value().mmap.as_ref().map(|m| m.len() as u64))
-            .sum()
+            .sum();
+        // Blobs are always mmap-backed once resident (no lazy/in-memory tier).
+        let blobs: u64 = self.blobs.iter().map(|e| e.value().mmap.len() as u64).sum();
+        superfiles + blobs
     }
 
     /// drop mmap pages until the cache's working set
@@ -681,24 +710,30 @@ impl DiskCacheStore {
         // Snapshot candidates: (uri, mmap_arc, last_access,
         // size). Drop the iterator before madvise calls so
         // we don't hold shard guards across the syscall.
-        let mut candidates: Vec<(SuperfileUri, Arc<Mmap>, u64, u64)> = self
+        let mut candidates: Vec<(Arc<Mmap>, u64, u64)> = self
             .cached
             .iter()
             .filter_map(|e| {
                 let mmap = e.value().mmap.clone()?;
                 Some((
-                    *e.key(),
                     mmap,
                     e.value().last_access_us.load(Ordering::Acquire),
                     e.value().size_bytes,
                 ))
             })
             .collect();
+        candidates.extend(self.blobs.iter().map(|e| {
+            (
+                Arc::clone(&e.value().mmap),
+                e.value().last_access_us.load(Ordering::Acquire),
+                e.value().size_bytes,
+            )
+        }));
         // Oldest-first.
-        candidates.sort_by_key(|(_, _, last, _)| *last);
+        candidates.sort_by_key(|(_, last, _)| *last);
 
         let mut n_advised = 0u64;
-        for (_uri, mmap, _last, size) in candidates {
+        for (mmap, _last, size) in candidates {
             if total <= budget_bytes {
                 break;
             }
@@ -857,6 +892,90 @@ impl DiskCacheStore {
         Ok(())
     }
 
+    /// Fetch a content-addressed blob (manifest part or OPANN routing page)
+    /// as mmap-backed bytes, caching it exactly like a superfile: pulled
+    /// through `storage` on a miss, pwritten to a local cache file, mmap'd,
+    /// and counted against the shared disk budget (LRU-evicted, MADV-swept).
+    /// A hit returns the resident mmap-backed `Bytes` with zero I/O.
+    ///
+    /// `hash` is the blob's blake3 content hash — both the cache key and the
+    /// integrity check. `storage_uri` is where the blob lives in `storage`;
+    /// the caller owns the URI scheme (`part_uri` for manifest parts,
+    /// `page_uri` for OPANN pages). Fetched bytes are verified to hash to
+    /// `hash` before they are admitted.
+    pub async fn blob_bytes(
+        self: &Arc<Self>,
+        hash: ContentHash,
+        storage_uri: String,
+        storage: &dyn StorageProvider,
+    ) -> Result<Bytes, DiskCacheError> {
+        if let Some(entry) = self.blobs.get(&hash) {
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
+            return Ok(entry.bytes.clone());
+        }
+
+        // Cold: GET the whole blob, verify the content hash, then pwrite + mmap.
+        let (bytes, _meta) = storage.get(&storage_uri).await?;
+        let actual = ContentHash::of(bytes.as_ref());
+        if actual != hash {
+            return Err(DiskCacheError::SuperfileOpen(format!(
+                "blob {storage_uri} content-hash mismatch: expected {}, got {}",
+                hash.to_hex(),
+                actual.to_hex()
+            )));
+        }
+        let size = bytes.len() as u64;
+        self.reserve_manual(size).await?;
+
+        let result: Result<Arc<CachedBlob>, DiskCacheError> = async {
+            let tmp = self.blob_tmp_path(&hash);
+            let final_path = self.blob_cache_path(&hash);
+            {
+                let mut file = tokio::fs::File::create(&tmp).await?;
+                file.write_all(&bytes).await?;
+                file.flush().await?;
+                file.sync_all().await?;
+            }
+            tokio::fs::rename(&tmp, &final_path).await?;
+            let mmap = open_readonly_mmap(&final_path).map_err(DiskCacheError::Io)?;
+            let mmap_arc = Arc::new(mmap);
+            let mapped = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+            Ok(Arc::new(CachedBlob {
+                bytes: mapped,
+                mmap: mmap_arc,
+                size_bytes: size,
+                last_access_us: AtomicU64::new(self.now_us()),
+            }))
+        }
+        .await;
+
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                // Roll back the reservation; leave any tmp file for next-run
+                // cleanup. Mirrors `insert_warm`'s error path.
+                self.current_bytes.fetch_sub(size, Ordering::Release);
+                return Err(e);
+            }
+        };
+
+        // Install, deduping against a concurrent miss on the same hash.
+        match self.blobs.entry(hash) {
+            Entry::Vacant(v) => {
+                let bytes = entry.bytes.clone();
+                v.insert(entry);
+                Ok(bytes)
+            }
+            Entry::Occupied(occ) => {
+                // Lost the race: release our reservation + unlink our file,
+                // serve the winner's identical bytes.
+                self.current_bytes.fetch_sub(size, Ordering::Release);
+                let _ = fs::remove_file(self.blob_cache_path(&hash));
+                Ok(occ.get().bytes.clone())
+            }
+        }
+    }
+
     // ----- internals -----
 
     fn now_us(&self) -> u64 {
@@ -872,6 +991,22 @@ impl DiskCacheStore {
     /// during cold fetch; renamed to `cache_path` on success).
     fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_tmp_filename())
+    }
+
+    /// Local cache file for a content-addressed blob. Hash-derived, so it is
+    /// stable across manifest versions and collision-free regardless of which
+    /// artifact (manifest part vs OPANN page) the bytes came from.
+    fn blob_cache_path(&self, hash: &ContentHash) -> PathBuf {
+        self.config
+            .cache_root
+            .join(format!("blob-{}.cache", hash.to_hex()))
+    }
+
+    /// Tempfile for a blob fetch; renamed to [`Self::blob_cache_path`] on success.
+    fn blob_tmp_path(&self, hash: &ContentHash) -> PathBuf {
+        self.config
+            .cache_root
+            .join(format!("blob-{}.cache.tmp", hash.to_hex()))
     }
 
     /// The storage-side URI for a superfile, mirroring the
@@ -1392,15 +1527,20 @@ impl DiskCacheStore {
             Arc::clone(&g)
         };
         let pinned = pinned_fn();
-        let candidates: Vec<EvictionCandidate> = self
+        let mut candidates: Vec<EvictionCandidate> = self
             .cached
             .iter()
             .map(|e| EvictionCandidate {
-                uri: *e.key(),
+                key: VictimKey::Superfile(*e.key()),
                 size_bytes: e.value().size_bytes,
                 last_access_us: e.value().last_access_us.load(Ordering::Acquire),
             })
             .collect();
+        candidates.extend(self.blobs.iter().map(|e| EvictionCandidate {
+            key: VictimKey::Blob(*e.key()),
+            size_bytes: e.value().size_bytes,
+            last_access_us: e.value().last_access_us.load(Ordering::Acquire),
+        }));
         let victims = self
             .config
             .eviction
@@ -1408,18 +1548,29 @@ impl DiskCacheStore {
         if victims.is_empty() {
             return Err(DiskCacheError::BudgetExceeded);
         }
-        for uri in victims {
-            // Atomic gate against concurrent eviction: only
-            // the caller that wins `DashMap::remove` runs
-            // unlink + decrement. Without this gate, two
-            // reservations evicting the same victim could
-            // double-decrement current_bytes.
-            if let Some((_, entry)) = self.cached.remove(&uri) {
-                let path = self.cache_path(&uri);
-                let _ = fs::remove_file(&path);
-                self.current_bytes
-                    .fetch_sub(entry.size_bytes, Ordering::Release);
-                self.n_evictions.fetch_add(1, Ordering::AcqRel);
+        for victim in victims {
+            // Atomic gate against concurrent eviction: only the caller that
+            // wins the map `remove` runs unlink + decrement, so two
+            // reservations evicting the same victim can't double-decrement
+            // current_bytes. Superfiles and content-addressed blobs share the
+            // budget but live in separate maps, dispatched by the key variant.
+            match victim {
+                VictimKey::Superfile(uri) => {
+                    if let Some((_, entry)) = self.cached.remove(&uri) {
+                        let _ = fs::remove_file(self.cache_path(&uri));
+                        self.current_bytes
+                            .fetch_sub(entry.size_bytes, Ordering::Release);
+                        self.n_evictions.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                VictimKey::Blob(hash) => {
+                    if let Some((_, blob)) = self.blobs.remove(&hash) {
+                        let _ = fs::remove_file(self.blob_cache_path(&hash));
+                        self.current_bytes
+                            .fetch_sub(blob.size_bytes, Ordering::Release);
+                        self.n_evictions.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
             }
         }
         Ok(())
@@ -2612,5 +2763,81 @@ mod tests {
             assert!(!format!("{v}").is_empty());
             assert!(!format!("{v:?}").is_empty());
         }
+    }
+
+    /// A content-addressed blob cold-fetches once (verified + mmap'd + counted
+    /// against the shared budget), then serves warm hits with no extra
+    /// residency — the page/part path the blob cache exists for.
+    #[tokio::test]
+    async fn blob_bytes_round_trips_and_caches() {
+        let store_dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("localfs"));
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: cache_dir.path().to_path_buf(),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+
+        let payload = Bytes::from_static(b"opann routing page bytes \x00\x01\x02\xff");
+        let hash = ContentHash::of(payload.as_ref());
+        let uri = format!("opann-pages/page-{}.opann", hash.to_hex());
+        storage
+            .put_atomic(&uri, payload.clone())
+            .await
+            .expect("put blob");
+
+        // Cold miss → fetched, hash-verified, mmap'd, budget-counted.
+        let got = cache
+            .blob_bytes(hash, uri.clone(), storage.as_ref())
+            .await
+            .expect("blob");
+        assert_eq!(got.as_ref(), payload.as_ref());
+        assert_eq!(cache.stats().n_entries, 1);
+        assert_eq!(cache.stats().current_bytes, payload.len() as u64);
+
+        // Warm hit → identical bytes, no extra residency.
+        let got2 = cache
+            .blob_bytes(hash, uri, storage.as_ref())
+            .await
+            .expect("blob hit");
+        assert_eq!(got2.as_ref(), payload.as_ref());
+        assert_eq!(cache.stats().current_bytes, payload.len() as u64);
+    }
+
+    /// Bytes that don't hash to the requested content hash are rejected, not
+    /// admitted — the content-addressed integrity check.
+    #[tokio::test]
+    async fn blob_bytes_rejects_content_hash_mismatch() {
+        let store_dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("localfs"));
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: cache_dir.path().to_path_buf(),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+
+        let payload = Bytes::from_static(b"real bytes");
+        let wrong_hash = ContentHash::of(b"different bytes entirely");
+        let uri = format!("manifest-parts/part-{}.avro.zst", wrong_hash.to_hex());
+        storage.put_atomic(&uri, payload).await.expect("put");
+
+        let err = cache.blob_bytes(wrong_hash, uri, storage.as_ref()).await;
+        assert!(
+            matches!(err, Err(DiskCacheError::SuperfileOpen(_))),
+            "expected content-hash mismatch error, got {err:?}"
+        );
+        assert_eq!(cache.stats().current_bytes, 0, "rejected blob not admitted");
     }
 }

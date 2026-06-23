@@ -29,13 +29,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
+
 use crate::superfile::vector::cell_posting::materialize_sq8_residual_row_into_cluster_quant;
 use crate::superfile::vector::centroid_block::metric_stores_norm;
 use crate::superfile::vector::distance::Metric;
 use crate::supertable::manifest::ClusterCentroids;
 use crate::supertable::manifest::part::ContentHash;
 
-use super::page::{ChildLink, NodeTopo, Page, PageError, encode_page};
+use super::page::{ChildLink, LeafRef, NodeTopo, Page, PageError, encode_page};
 use super::paged::{PageSource, SplitPages};
 use super::tree::CentroidTree;
 
@@ -101,7 +103,10 @@ pub(crate) fn update_tree(
     // superseded within this batch are dropped, so the commit PUTs exactly the
     // new tree's pages.
     retain_reachable(&mut overlay, cur)?;
-    Ok(Some(SplitPages { pages: overlay, root: cur }))
+    Ok(Some(SplitPages {
+        pages: overlay,
+        root: cur,
+    }))
 }
 
 /// Insert-only convenience wrapper (no removals). Test-only — production goes
@@ -121,13 +126,22 @@ pub(crate) fn insert_leaves(
 /// Build the first tree from a commit's partitions (the genesis case). The
 /// fp32 centroids are the ingestion surface, quantized once into one
 /// [`ClusterCentroids`] for this commit's tree, then split into pages.
-fn build_genesis(metric: Metric, dim: usize, leaves: &[LeafInsert], page_budget: usize) -> SplitPages {
+fn build_genesis(
+    metric: Metric,
+    dim: usize,
+    leaves: &[LeafInsert],
+    page_budget: usize,
+) -> SplitPages {
     let n = leaves.len() as u32;
-    let flat: Vec<f32> = leaves.iter().flat_map(|l| l.centroid_fp32.iter().copied()).collect();
+    let flat: Vec<f32> = leaves
+        .iter()
+        .flat_map(|l| l.centroid_fp32.iter().copied())
+        .collect();
     let radii: Vec<f32> = leaves.iter().map(|l| l.radius).collect();
     let cell_ids: Vec<u128> = leaves.iter().map(|l| l.cell_id).collect();
-    let clusters = ClusterCentroids::from_fp32(metric, n, dim as u32, &flat, vec![1u32; n as usize])
-        .with_radii(radii);
+    let clusters =
+        ClusterCentroids::from_fp32(metric, n, dim as u32, &flat, vec![1u32; n as usize])
+            .with_radii(radii);
     // `build` only returns `None` for empty/zero-dim/mismatched input, none of
     // which can happen here (non-empty leaves, fixed dim, aligned cell_ids).
     let tree = CentroidTree::build(metric, &clusters, &cell_ids)
@@ -158,8 +172,14 @@ fn insert_one_leaf(
     // the child-page link and covering radius change).
     for &anc_hash in path[..path.len() - 1].iter().rev() {
         let anc = Page::parse(&fetch_bytes(overlay, source, &anc_hash)?)?;
-        let new_anc =
-            redirect_child_page(&anc, metric, old_child, new_child, &leaf.centroid_fp32, leaf.radius);
+        let new_anc = redirect_child_page(
+            &anc,
+            metric,
+            old_child,
+            new_child,
+            &leaf.centroid_fp32,
+            leaf.radius,
+        );
         let new_anc_hash = ContentHash::of(&new_anc);
         overlay.insert(new_anc_hash, new_anc);
         old_child = anc_hash;
@@ -205,8 +225,8 @@ fn delete_subtree(
     //    page).
     let mut alive = vec![true; n];
     for (i, node) in page.topo().iter().enumerate() {
-        if let NodeTopo::Leaf(cell) = node
-            && removed.contains(cell)
+        if let NodeTopo::Leaf(leaf) = node
+            && removed.contains(&leaf.superfile_id)
         {
             alive[i] = false;
         }
@@ -288,9 +308,11 @@ fn fetch_bytes(
     overlay: &HashMap<ContentHash, Vec<u8>>,
     base: &dyn PageSource,
     hash: &ContentHash,
-) -> Result<Vec<u8>, PageError> {
+) -> Result<Bytes, PageError> {
     match overlay.get(hash) {
-        Some(b) => Ok(b.clone()),
+        // Overlay pages are freshly `encode_page`'d Vec<u8>s; copy once into
+        // `Bytes` to match the base source's (mmap-backed) `Bytes`.
+        Some(b) => Ok(Bytes::from(b.clone())),
         None => base.fetch(hash),
     }
 }
@@ -371,10 +393,21 @@ fn append_leaf_into_page(page: &Page, metric: Metric, dim: usize, leaf: &LeafIns
         store_norm,
     );
     let new_leaf_local = cc.n_cent;
-    push_row(&mut cc, &row_bytes, leaf.radius, had_radii, store_norm, norm);
+    push_row(
+        &mut cc,
+        &row_bytes,
+        leaf.radius,
+        had_radii,
+        store_norm,
+        norm,
+    );
 
     let mut topo = page.topo().to_vec();
-    topo.push(NodeTopo::Leaf(leaf.cell_id));
+    topo.push(NodeTopo::Leaf(LeafRef {
+        superfile_id: leaf.cell_id,
+        doc_off: 0,
+        count: 0,
+    }));
     let root_local = page.root_local();
     let new_root = match topo[root_local as usize].clone() {
         NodeTopo::Internal(mut children) => {
@@ -392,7 +425,14 @@ fn append_leaf_into_page(page: &Page, metric: Metric, dim: usize, leaf: &LeafIns
             // the old leaf and the new one. The internal node reuses the new
             // leaf's centroid bytes as its medoid (no new encode).
             let new_internal = cc.n_cent;
-            push_row(&mut cc, &row_bytes, leaf.radius, had_radii, store_norm, norm);
+            push_row(
+                &mut cc,
+                &row_bytes,
+                leaf.radius,
+                had_radii,
+                store_norm,
+                norm,
+            );
             topo.push(NodeTopo::Internal(vec![
                 ChildLink::Local(root_local),
                 ChildLink::Local(new_leaf_local),
@@ -420,7 +460,9 @@ fn push_row(
         cc.radii.push(radius);
     }
     if store_norm {
-        cc.norms.get_or_insert_with(Vec::new).push(norm.unwrap_or(0.0));
+        cc.norms
+            .get_or_insert_with(Vec::new)
+            .push(norm.unwrap_or(0.0));
     }
 }
 
@@ -504,7 +546,10 @@ mod tests {
 
     /// Merge the changed pages over a base page set (overlay wins by hash) — the
     /// resident tree after a commit.
-    fn merge(base: &HashMap<ContentHash, Vec<u8>>, changed: &HashMap<ContentHash, Vec<u8>>) -> HashMap<ContentHash, Vec<u8>> {
+    fn merge(
+        base: &HashMap<ContentHash, Vec<u8>>,
+        changed: &HashMap<ContentHash, Vec<u8>>,
+    ) -> HashMap<ContentHash, Vec<u8>> {
         let mut m = base.clone();
         for (h, b) in changed {
             m.insert(*h, b.clone());
@@ -554,7 +599,7 @@ mod tests {
             let paged = PagedTree::new(ResidentPageSource::from_pages(merged), inserted.root);
             let probes = paged.select_probes(&new_centroid, n + 1).expect("descend");
             assert!(
-                probes.iter().any(|(cell, _)| *cell == NEW_ID),
+                probes.iter().any(|(leaf, _)| leaf.superfile_id == NEW_ID),
                 "{metric:?}: inserted leaf {NEW_ID} not reachable by descent"
             );
         }
@@ -588,10 +633,16 @@ mod tests {
             let paged = PagedTree::new(ResidentPageSource::from_pages(merged), updated.root);
             // Ask for every cell; the victim must be gone, the rest present.
             let probes = paged.select_probes(&cells[17].0, n).expect("descend");
-            let got: HashSet<u128> = probes.iter().map(|(c, _)| *c).collect();
-            assert!(!got.contains(&victim), "{metric:?}: deleted cell still reachable");
+            let got: HashSet<u128> = probes.iter().map(|(leaf, _)| leaf.superfile_id).collect();
             assert!(
-                cells.iter().filter(|(_, _, id)| *id != victim).all(|(_, _, id)| got.contains(id)),
+                !got.contains(&victim),
+                "{metric:?}: deleted cell still reachable"
+            );
+            assert!(
+                cells
+                    .iter()
+                    .filter(|(_, _, id)| *id != victim)
+                    .all(|(_, _, id)| got.contains(id)),
                 "{metric:?}: a surviving cell went missing after delete"
             );
         }

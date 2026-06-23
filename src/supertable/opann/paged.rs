@@ -16,17 +16,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::supertable::manifest::part::ContentHash;
 
 use super::descent::best_first;
-use super::page::{ChildLink, NodeTopo, Page, PageError};
+use super::page::{ChildLink, LeafRef, NodeTopo, Page, PageError};
 
 /// Where a [`PagedTree`] fetches page bytes by content hash. A warm
 /// implementation answers from a resident cache / mmap (no object I/O); a cold
 /// one issues one object GET. The returned bytes are hash-verified by the
 /// caller before use.
 pub(crate) trait PageSource {
-    fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, PageError>;
+    fn fetch(&self, hash: &ContentHash) -> Result<Bytes, PageError>;
 }
 
 /// A routing tree serialized as a set of distinct content-addressed pages plus
@@ -42,11 +44,24 @@ pub(crate) struct SplitPages {
 /// descent then runs entirely against this map with zero object I/O, which is
 /// the OPANN routing model: routing lives on compute, warm descent does no GETs.
 pub(crate) struct ResidentPageSource {
-    pages: HashMap<ContentHash, Vec<u8>>,
+    pages: HashMap<ContentHash, Bytes>,
 }
 
 impl ResidentPageSource {
+    /// Build from owned page byte vectors — the in-memory write side and
+    /// tests. Each page is copied once into a `Bytes`.
     pub(crate) fn from_pages(pages: HashMap<ContentHash, Vec<u8>>) -> Self {
+        Self::from_byte_pages(
+            pages
+                .into_iter()
+                .map(|(h, v)| (h, Bytes::from(v)))
+                .collect(),
+        )
+    }
+
+    /// Build from already-`Bytes` pages — the disk-cache warm-load path, where
+    /// each page is mmap-backed, so the source holds the mapping with no copy.
+    pub(crate) fn from_byte_pages(pages: HashMap<ContentHash, Bytes>) -> Self {
         Self { pages }
     }
 
@@ -65,7 +80,7 @@ impl ResidentPageSource {
 }
 
 impl PageSource for ResidentPageSource {
-    fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, PageError> {
+    fn fetch(&self, hash: &ContentHash) -> Result<Bytes, PageError> {
         self.pages
             .get(hash)
             .cloned()
@@ -78,7 +93,7 @@ impl PageSource for ResidentPageSource {
 /// handed to [`PagedTree::new`] (which takes its source by value) without
 /// cloning the whole resident page map per query.
 impl<T: PageSource + ?Sized> PageSource for Arc<T> {
-    fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, PageError> {
+    fn fetch(&self, hash: &ContentHash) -> Result<Bytes, PageError> {
         (**self).fetch(hash)
     }
 }
@@ -114,7 +129,7 @@ impl<S: PageSource> PagedTree<S> {
         &self,
         query: &[f32],
         n_probe: usize,
-    ) -> Result<Vec<(u128, f32)>, PageError> {
+    ) -> Result<Vec<(LeafRef, f32)>, PageError> {
         if n_probe == 0 {
             return Ok(Vec::new());
         }
@@ -149,7 +164,13 @@ impl<S: PageSource> PagedTree<S> {
                         match child {
                             ChildLink::Local(cl) => {
                                 let d = cache[&h.page].score_local(cl, query);
-                                kids.push((PageNode { page: h.page, local: cl }, d));
+                                kids.push((
+                                    PageNode {
+                                        page: h.page,
+                                        local: cl,
+                                    },
+                                    d,
+                                ));
                             }
                             ChildLink::Page(ph) => {
                                 if let Err(e) = ensure(&mut cache, &self.source, &ph) {
@@ -170,7 +191,13 @@ impl<S: PageSource> PagedTree<S> {
                                 }
                                 let croot = child_page.root_local();
                                 let d = child_page.score_local(croot, query);
-                                kids.push((PageNode { page: ph, local: croot }, d));
+                                kids.push((
+                                    PageNode {
+                                        page: ph,
+                                        local: croot,
+                                    },
+                                    d,
+                                ));
                             }
                         }
                     }
@@ -230,8 +257,10 @@ mod tests {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             for &budget in &[1usize, 4, 16, 64, n + 10] {
                 let split = tree.to_pages(budget);
-                let paged =
-                    PagedTree::new(ResidentPageSource::from_pages(split.pages.clone()), split.root);
+                let paged = PagedTree::new(
+                    ResidentPageSource::from_pages(split.pages.clone()),
+                    split.root,
+                );
                 for &target in &[0usize, 1, 57, 150, 199] {
                     let q = &cells[target].0;
                     for &k in &[1usize, 8, 32, n] {
@@ -272,7 +301,16 @@ mod tests {
         // reject it rather than index past the child's centroid rows. NegDot so
         // no norms are required.
         let child_cc = ClusterCentroids::from_fp32(Metric::NegDot, 1, 2, &[1.0, 0.0], vec![1]);
-        let child_bytes = encode_page(Metric::NegDot, &child_cc, &[NodeTopo::Leaf(7)], 0);
+        let child_bytes = encode_page(
+            Metric::NegDot,
+            &child_cc,
+            &[NodeTopo::Leaf(LeafRef {
+                superfile_id: 7,
+                doc_off: 0,
+                count: 0,
+            })],
+            0,
+        );
         let child_hash = ContentHash::of(&child_bytes);
 
         let root_cc =
@@ -287,6 +325,9 @@ mod tests {
         let paged = PagedTree::new(ResidentPageSource::from_pages(pages), root_hash);
 
         let res = paged.select_probes(&[1.0, 0.0, 0.0, 0.0], 4);
-        assert!(matches!(res, Err(PageError::DimMismatch { .. })), "got {res:?}");
+        assert!(
+            matches!(res, Err(PageError::DimMismatch { .. })),
+            "got {res:?}"
+        );
     }
 }

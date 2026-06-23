@@ -48,7 +48,9 @@ use super::descent::best_first;
 /// Magic at the start of every OPANN routing-tree page.
 const PAGE_MAGIC: [u8; 4] = *b"OPNP";
 /// Page wire-format version; bumped on any incompatible layout change.
-const PAGE_FORMAT_VERSION: u8 = 1;
+/// v2: leaf nodes carry `(superfile_id u128, doc_off u32, count u32)` —
+/// a cluster within a superfile — instead of a bare `cell_id u128`.
+const PAGE_FORMAT_VERSION: u8 = 2;
 /// Header bytes reserved after the metric tag (must be zero) — room for
 /// future per-page flags without a version bump.
 const PAGE_HEADER_RESERVED: usize = 2;
@@ -92,13 +94,25 @@ pub(crate) enum ChildLink {
     Page(ContentHash),
 }
 
+/// A routing-tree leaf's target: a specific cluster inside an object-resident
+/// superfile. `superfile_id` names the superfile; `doc_off`/`count` are that
+/// cluster's row range within the superfile's IVF, so a probe is one range-GET
+/// of the cluster's bytes. A hidden cell is the degenerate case — one cluster
+/// spanning the whole (small) superfile: `doc_off == 0`, `count == n_docs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeafRef {
+    pub(crate) superfile_id: u128,
+    pub(crate) doc_off: u32,
+    pub(crate) count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NodeTopo {
     /// Internal routing node: its children in original order (a mix of in-page
     /// and cross-page links). A single-page serialization has only `Local`.
     Internal(Vec<ChildLink>),
-    /// Leaf: the object-resident cell (superfile) id this node routes to.
-    Leaf(u128),
+    /// Leaf: the cluster (within an object-resident superfile) this routes to.
+    Leaf(LeafRef),
 }
 
 /// Failures decoding page bytes.
@@ -157,12 +171,17 @@ pub(crate) fn encode_page(
     out.extend_from_slice(&centroid_bytes);
     for node in topo {
         match node {
-            NodeTopo::Leaf(cell) => {
+            NodeTopo::Leaf(leaf) => {
                 out.push(NODE_KIND_LEAF);
-                out.extend_from_slice(&cell.to_le_bytes());
+                out.extend_from_slice(&leaf.superfile_id.to_le_bytes());
+                out.extend_from_slice(&leaf.doc_off.to_le_bytes());
+                out.extend_from_slice(&leaf.count.to_le_bytes());
             }
             NodeTopo::Internal(children) => {
-                debug_assert!(children.len() <= u16::MAX as usize, "child fanout exceeds u16");
+                debug_assert!(
+                    children.len() <= u16::MAX as usize,
+                    "child fanout exceeds u16"
+                );
                 out.push(NODE_KIND_INTERNAL);
                 out.extend_from_slice(&(children.len() as u16).to_le_bytes());
                 for child in children {
@@ -209,8 +228,7 @@ impl Page {
             return Err(PageError::UnsupportedVersion(version));
         }
         let metric_id = r.u8()?;
-        let metric =
-            metric_from_id(metric_id as u32).ok_or(PageError::UnknownMetric(metric_id))?;
+        let metric = metric_from_id(metric_id as u32).ok_or(PageError::UnknownMetric(metric_id))?;
         r.take(PAGE_HEADER_RESERVED)?;
         let n_nodes = r.u32()?;
         let root_local = r.u32()?;
@@ -237,7 +255,16 @@ impl Page {
         let mut topo = Vec::with_capacity(n_nodes as usize);
         for _ in 0..n_nodes {
             match r.u8()? {
-                NODE_KIND_LEAF => topo.push(NodeTopo::Leaf(r.u128()?)),
+                NODE_KIND_LEAF => {
+                    let superfile_id = r.u128()?;
+                    let doc_off = r.u32()?;
+                    let count = r.u32()?;
+                    topo.push(NodeTopo::Leaf(LeafRef {
+                        superfile_id,
+                        doc_off,
+                        count,
+                    }));
+                }
                 NODE_KIND_INTERNAL => {
                     let n_children = r.u16()? as usize;
                     let mut children = Vec::with_capacity(n_children);
@@ -284,7 +311,7 @@ impl Page {
     /// [`super::paged::PagedTree::select_probes`]; this single-page descent is a
     /// round-trip oracle.
     #[cfg(test)]
-    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(u128, f32)> {
+    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(LeafRef, f32)> {
         if n_probe == 0 || self.topo.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
         }
@@ -312,7 +339,6 @@ impl Page {
             },
         )
     }
-
 
     /// Centroid dimension.
     pub(crate) fn dim(&self) -> usize {
@@ -414,7 +440,9 @@ impl<'a> Reader<'a> {
 
     fn u128(&mut self) -> Result<u128, PageError> {
         let b = self.take(U128_BYTES)?;
-        Ok(u128::from_le_bytes(b.try_into().expect("take(16) yields 16 bytes")))
+        Ok(u128::from_le_bytes(
+            b.try_into().expect("take(16) yields 16 bytes"),
+        ))
     }
 }
 
@@ -436,8 +464,16 @@ mod tests {
             ClusterCentroids::from_fp32(Metric::L2Sq, 3, dim, &centroids_fp32, vec![1, 1, 1]);
         cc.radii = vec![0.1, 0.2, 0.3];
         let topo = vec![
-            NodeTopo::Leaf(100),
-            NodeTopo::Leaf(200),
+            NodeTopo::Leaf(LeafRef {
+                superfile_id: 100,
+                doc_off: 0,
+                count: 0,
+            }),
+            NodeTopo::Leaf(LeafRef {
+                superfile_id: 200,
+                doc_off: 0,
+                count: 0,
+            }),
             NodeTopo::Internal(vec![ChildLink::Local(0), ChildLink::Local(1)]),
         ];
         encode_page(Metric::L2Sq, &cc, &topo, 2)
@@ -454,8 +490,22 @@ mod tests {
         assert_eq!(page.centroids.dim, 4);
         // Radii survive the centroid-block round trip.
         assert_eq!(page.centroids.radii, vec![0.1, 0.2, 0.3]);
-        assert_eq!(page.topo[0], NodeTopo::Leaf(100));
-        assert_eq!(page.topo[1], NodeTopo::Leaf(200));
+        assert_eq!(
+            page.topo[0],
+            NodeTopo::Leaf(LeafRef {
+                superfile_id: 100,
+                doc_off: 0,
+                count: 0
+            })
+        );
+        assert_eq!(
+            page.topo[1],
+            NodeTopo::Leaf(LeafRef {
+                superfile_id: 200,
+                doc_off: 0,
+                count: 0
+            })
+        );
         assert_eq!(
             page.topo[2],
             NodeTopo::Internal(vec![ChildLink::Local(0), ChildLink::Local(1)])
@@ -469,14 +519,14 @@ mod tests {
         let probes: Vec<u128> = page
             .select_probes(&[1.0, 0.0, 0.0, 0.0], 2)
             .into_iter()
-            .map(|(c, _)| c)
+            .map(|(leaf, _)| leaf.superfile_id)
             .collect();
         assert_eq!(probes, vec![100, 200]);
         // Query at node 1's centroid → cell 200 leads.
         let probes: Vec<u128> = page
             .select_probes(&[0.0, 1.0, 0.0, 0.0], 2)
             .into_iter()
-            .map(|(c, _)| c)
+            .map(|(leaf, _)| leaf.superfile_id)
             .collect();
         assert_eq!(probes, vec![200, 100]);
         // Probe budget is respected.
@@ -545,7 +595,11 @@ mod tests {
             counts: vec![1],
             radii: Vec::new(),
         };
-        let topo = vec![NodeTopo::Leaf(1)];
+        let topo = vec![NodeTopo::Leaf(LeafRef {
+            superfile_id: 1,
+            doc_off: 0,
+            count: 0,
+        })];
         let l2 = encode_page(Metric::L2Sq, &norms_absent, &topo, 0);
         assert!(matches!(Page::parse(&l2), Err(PageError::MissingNorms)));
         // Same bytes under NegDot parse fine — that metric never reads a norm.

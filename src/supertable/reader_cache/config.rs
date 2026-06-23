@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::supertable::manifest::SuperfileUri;
+use crate::supertable::manifest::part::ContentHash;
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -173,11 +174,22 @@ impl Debug for DiskCacheConfig {
     }
 }
 
+/// Identifies an evictable cache entry: a superfile (keyed by its
+/// store URI) or a content-addressed manifest blob — a manifest part
+/// or an OPANN routing page (keyed by its blake3 content hash). The
+/// eviction policy treats both uniformly; the key only tells the
+/// store which map + on-disk file a chosen victim refers to.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum VictimKey {
+    Superfile(SuperfileUri),
+    Blob(ContentHash),
+}
+
 /// What an eviction policy needs to know about each cached
 /// entry to choose victims.
 #[derive(Debug, Clone)]
 pub struct EvictionCandidate {
-    pub uri: SuperfileUri,
+    pub key: VictimKey,
     pub size_bytes: u64,
     /// Microseconds-since-construction at which this entry
     /// was last accessed. Monotonic per `DiskCacheStore`
@@ -210,7 +222,7 @@ pub trait CacheEvictionPolicy: Send + Sync {
         candidates: &[EvictionCandidate],
         pinned: &HashSet<SuperfileUri>,
         bytes_needed: u64,
-    ) -> Vec<SuperfileUri>;
+    ) -> Vec<VictimKey>;
 }
 
 /// Least-recently-accessed eviction policy. The default — works
@@ -238,13 +250,16 @@ impl CacheEvictionPolicy for LruPolicy {
         candidates: &[EvictionCandidate],
         pinned: &HashSet<SuperfileUri>,
         bytes_needed: u64,
-    ) -> Vec<SuperfileUri> {
+    ) -> Vec<VictimKey> {
         // Filter pinned, sort by ascending last_access_us
         // (oldest first), take until cumulative size ≥
-        // bytes_needed.
+        // bytes_needed. Only superfiles can be pinned (an
+        // in-flight query holds the reader); content-addressed
+        // blobs are always safe to evict and re-fetch, so they
+        // are never in `pinned`.
         let mut eligible: Vec<&EvictionCandidate> = candidates
             .iter()
-            .filter(|c| !pinned.contains(&c.uri))
+            .filter(|c| !matches!(c.key, VictimKey::Superfile(u) if pinned.contains(&u)))
             .collect();
         eligible.sort_by_key(|c| c.last_access_us);
         let mut victims = Vec::new();
@@ -253,7 +268,7 @@ impl CacheEvictionPolicy for LruPolicy {
             if freed >= bytes_needed {
                 break;
             }
-            victims.push(c.uri);
+            victims.push(c.key);
             freed = freed.saturating_add(c.size_bytes);
         }
         if freed < bytes_needed {

@@ -85,6 +85,7 @@ use crate::{
             store::{OpannStoreError, load_resident},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
+        reader_cache::{DiskCacheStore, disk::DiskCacheError},
     },
 };
 
@@ -258,7 +259,10 @@ impl Manifest {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            let loader = Arc::new(
+                ManifestPartLoader::new(Arc::clone(&storage), &list)
+                    .with_disk_cache(superfile_list.options.disk_cache.clone()),
+            );
             Self {
                 superfile_list,
                 list: Some(list),
@@ -360,10 +364,16 @@ impl Manifest {
         };
         let root = routing.root_page;
         let storage = Arc::clone(storage);
+        // Route page loads through the shared disk cache when one is attached,
+        // so the routing tree is mmap-backed + evictable like superfile blobs
+        // (and old-version pages reclaim once this manifest's source drops).
+        let cache = self.options.disk_cache.clone();
         let source = self
             .opann_tree
             .get_or_try_init(|| async move {
-                load_resident(storage.as_ref(), root).await.map(Arc::new)
+                load_resident(cache.as_ref(), storage.as_ref(), root)
+                    .await
+                    .map(Arc::new)
             })
             .await?;
         Ok(Some(Arc::clone(source)))
@@ -469,7 +479,10 @@ impl Manifest {
         }
 
         // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let loader = Arc::new(
+            ManifestPartLoader::new(Arc::clone(&storage), &list)
+                .with_disk_cache(options.disk_cache.clone()),
+        );
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
         if let Some(current_manifest) = &current_manifest {
@@ -1077,10 +1090,12 @@ impl Manifest {
             superfiles: new_superfile_list,
             vector_index_storage_prefix: None,
         };
-        let loader = opts
-            .storage
-            .as_ref()
-            .map(|storage| Arc::new(ManifestPartLoader::new(storage.clone(), &new_list)));
+        let loader = opts.storage.as_ref().map(|storage| {
+            Arc::new(
+                ManifestPartLoader::new(storage.clone(), &new_list)
+                    .with_disk_cache(opts.disk_cache.clone()),
+            )
+        });
         // Inherit only the cached parts the new list still
         // references — entries for rewritten/removed parts are
         // dropped rather than carried forward, so the in-memory
@@ -1174,6 +1189,11 @@ pub struct ManifestPartLoader {
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`Manifest`.
     parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// Shared disk cache, when one is attached. Part bytes ride it
+    /// (mmap-backed, content-addressed, evictable) exactly like superfile and
+    /// OPANN-page blobs, so unchanged parts hit a warm mmap across manifest
+    /// versions instead of re-fetching. `None` falls back to a direct GET.
+    disk_cache: Option<Arc<DiskCacheStore>>,
 }
 
 impl ManifestPartLoader {
@@ -1185,7 +1205,16 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
+            disk_cache: None,
         }
+    }
+
+    /// Attach a disk cache so part bytes are pulled through
+    /// [`DiskCacheStore::blob_bytes`]. Builder form keeps the bare `new`
+    /// (used widely in tests) cache-free.
+    pub fn with_disk_cache(mut self, disk_cache: Option<Arc<DiskCacheStore>>) -> Self {
+        self.disk_cache = disk_cache;
+        self
     }
 
     /// Fetch + verify + decode one part. Returns the parsed
@@ -1195,18 +1224,30 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let (bytes, _) = self
-            .storage
-            .get(uri)
-            .await
-            .map_err(ManifestLoadError::Storage)?;
-        let actual_hash = ContentHash::of(&bytes);
-        if actual_hash != *expected_hash {
-            return Err(ManifestLoadError::ContentHashMismatch {
-                expected: expected_hash.to_hex(),
-                actual: actual_hash.to_hex(),
-            });
-        }
+        let bytes = match self.disk_cache.as_ref() {
+            // `blob_bytes` content-verifies + caches the part (mmap-backed,
+            // evictable, reused across versions when the hash is unchanged).
+            Some(cache) => {
+                cache
+                    .blob_bytes(*expected_hash, uri.clone(), self.storage.as_ref())
+                    .await?
+            }
+            None => {
+                let (bytes, _) = self
+                    .storage
+                    .get(uri)
+                    .await
+                    .map_err(ManifestLoadError::Storage)?;
+                let actual_hash = ContentHash::of(&bytes);
+                if actual_hash != *expected_hash {
+                    return Err(ManifestLoadError::ContentHashMismatch {
+                        expected: expected_hash.to_hex(),
+                        actual: actual_hash.to_hex(),
+                    });
+                }
+                bytes
+            }
+        };
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
     }
@@ -1243,6 +1284,9 @@ pub enum ManifestLoadError {
     /// Storage backend returned an error.
     #[error("storage error during part load: {0}")]
     Storage(#[source] StorageError),
+    /// Disk-cache error while pulling part bytes through the shared blob cache.
+    #[error("disk cache error during part load: {0}")]
+    Cache(#[from] DiskCacheError),
     /// Computed blake3 of the loaded bytes didn't match the
     /// manifest list's recorded `content_hash`. The bad bytes
     /// are **not** auto-refetched — a mismatch indicates
@@ -2016,7 +2060,6 @@ impl ClusterCentroids {
         let kernel = self.kernel(metric, query);
         self.cluster_distance(&kernel, c)
     }
-
 
     /// Score every populated cluster against `query` through the single
     /// Sq8+residual scorer ([`Sq8ResidualKernel`]) — the same kernel used for

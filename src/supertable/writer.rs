@@ -110,7 +110,6 @@ use crate::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder},
-        stats::SuperfileStats,
         format::{
             CRC_BYTES,
             footer::read_kv_metadata,
@@ -122,6 +121,7 @@ use crate::{
             },
         },
         reader::vector_layout_from_kv,
+        stats::SuperfileStats,
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow, encoded_ivf_kmeans},
             distance::Metric,
@@ -2127,8 +2127,15 @@ pub(super) fn prepare_superfile_with_uri(
         }
     }
 
+    // The flat per-superfile vector summary is consumed *only* by the hidden
+    // index's overlap-driven rebalance (`compaction::overlap_consolidation_jobs`,
+    // itself gated on `is_hidden_vector_index_table`). User-table superfiles
+    // never read it — their vector routing goes through the OPANN routing tree —
+    // so skip the replication there; it was dead weight in the user manifest.
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
-    if let Some(vec_reader) = reader.vec() {
+    if inner.options.is_hidden_vector_index
+        && let Some(vec_reader) = reader.vec()
+    {
         for vc in &inner.options.vector_columns {
             if let Some((c_dim, c_scale, c_offset, c_rows, c_norm, radius)) =
                 vec_reader.summary(&vc.column)
@@ -2512,8 +2519,12 @@ pub(in crate::supertable) async fn rebuild_sq8_superfile_from_readers(
         let vec_reader = reader
             .vec()
             .ok_or_else(|| BuildError::Store("sq8 rebuild input missing vector index".into()))?;
-        let mut rows =
-            materialized_ivf_rows_in_doc_order(vec_reader, &column, &stable_ids, bitmap.as_deref())?;
+        let mut rows = materialized_ivf_rows_in_doc_order(
+            vec_reader,
+            &column,
+            &stable_ids,
+            bitmap.as_deref(),
+        )?;
 
         // The j-th kept vector row corresponds to the j-th record-batch row
         // (both tombstone-filtered, in doc order), so re-assign the local doc id
@@ -3177,9 +3188,10 @@ pub(crate) async fn try_commit_attempt(
         .await?;
     let (new_manifest, page_blobs): (Manifest, &[(String, Bytes)]) = match opann_routing {
         OpannRoutingCommit::Inherit => (new_manifest, &[]),
-        OpannRoutingCommit::Replace { routing, pages } => {
-            (new_manifest.with_opann_routing(routing.clone()), pages.as_slice())
-        }
+        OpannRoutingCommit::Replace { routing, pages } => (
+            new_manifest.with_opann_routing(routing.clone()),
+            pages.as_slice(),
+        ),
     };
 
     // 3. Read the prior pointer's etag for the CAS. Fresh
@@ -3195,7 +3207,12 @@ pub(crate) async fn try_commit_attempt(
         .map(|ep| ep.encoded.as_slice())
         .collect();
     new_manifest
-        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs, page_blobs)
+        .write(
+            storage.as_ref(),
+            prev_etag.as_deref(),
+            &encoded_refs,
+            page_blobs,
+        )
         .await?;
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
@@ -3661,9 +3678,14 @@ mod tests {
     }
 
     #[test]
-    fn superfile_entry_carries_vector_summary() {
+    fn hidden_superfile_entry_carries_vector_summary() {
+        // The per-superfile vector summary is populated only for the hidden
+        // vector-index table now (user superfiles route via the OPANN tree, so
+        // their manifest no longer replicates centroids). Mark the options
+        // hidden to exercise the population path.
         let dim = 16;
-        let st = Supertable::create(options_with_vector(dim)).expect("create");
+        let st = Supertable::create(options_with_vector(dim).mark_hidden_vector_index())
+            .expect("create");
         let mut w = st.writer().expect("writer");
         // Need at least n_cent docs so kmeans has data to cluster.
         w.append(&build_vector_batch(0, 8, dim)).expect("append");
@@ -3705,7 +3727,9 @@ mod tests {
         // far larger than any structural open range (outer header, directory,
         // sub-header, cluster_idx), making the exclusion unambiguous.
         let dim = 64;
-        let st = Supertable::create(options_with_vector(dim)).expect("create");
+        // vector_summary (the n_cent source here) is hidden-only now.
+        let st = Supertable::create(options_with_vector(dim).mark_hidden_vector_index())
+            .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_vector_batch(0, 8, dim)).expect("append");
         w.commit().expect("commit");

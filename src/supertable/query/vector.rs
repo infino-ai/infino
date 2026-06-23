@@ -831,9 +831,16 @@ impl SupertableReader {
                 // radius-aware adaptive admission (§7.3) rather than a fixed
                 // top-N: a far-centroid but large-radius partition can still hold
                 // a true neighbor, and pure centroid-distance ranking drops it.
-                let candidates = PagedTree::new(source, root)
+                let candidates: Vec<(u128, f32)> = PagedTree::new(source, root)
                     .select_probes(query, usize::MAX)
-                    .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
+                    .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?
+                    .into_iter()
+                    // Collapse each cluster leaf to its superfile id — the
+                    // whole-superfile fetch path is unchanged (the per-cluster
+                    // offsets in the leaf are wired into the fetch in the later
+                    // semantic step that splits superfiles into cluster leaves).
+                    .map(|(leaf, d)| (leaf.superfile_id, d))
+                    .collect();
                 let part_ids: Vec<PartId> = manifest
                     .get_all_list_entries()
                     .iter()
@@ -1151,7 +1158,8 @@ mod tests {
     fn adaptive_probe_admits_far_centroid_large_radius() {
         // c_near: d=1, r=0; c_far_wide: d=10 but r=9.5 → lb=0.5; c_mid: d=3, r=0.
         let candidates = vec![(1u128, 1.0f32), (2, 10.0), (3, 3.0)];
-        let radius_of: HashMap<u128, f32> = [(1u128, 0.0f32), (2, 9.5), (3, 0.0)].into_iter().collect();
+        let radius_of: HashMap<u128, f32> =
+            [(1u128, 0.0f32), (2, 9.5), (3, 0.0)].into_iter().collect();
         // nprobe_min=1 (floor = c1), slack=1 → τ = d*·2 = 2.0; cap=2.
         let chosen = adaptive_probe_cells(candidates, &radius_of, 1, 2, 1.0);
         assert!(chosen.contains(&1), "nearest cell is the floor");
@@ -1159,7 +1167,10 @@ mod tests {
             chosen.contains(&2),
             "far-centroid large-radius cell (lb=0.5 ≤ τ=2.0) must be admitted over the closer small-radius one"
         );
-        assert!(!chosen.contains(&3), "cap=2 reached; c3 (lb=3.0 > τ) excluded");
+        assert!(
+            !chosen.contains(&3),
+            "cap=2 reached; c3 (lb=3.0 > τ) excluded"
+        );
         assert_eq!(chosen.len(), 2, "respects the nprobe_max cap");
     }
 
@@ -1167,10 +1178,14 @@ mod tests {
     #[test]
     fn adaptive_probe_honors_nprobe_min_floor() {
         let candidates = vec![(1u128, 1.0f32), (2, 100.0), (3, 200.0)];
-        let radius_of: HashMap<u128, f32> = [(1u128, 0.0f32), (2, 0.0), (3, 0.0)].into_iter().collect();
+        let radius_of: HashMap<u128, f32> =
+            [(1u128, 0.0f32), (2, 0.0), (3, 0.0)].into_iter().collect();
         // τ = 2.0; only c1 within τ, but nprobe_min=2 forces the 2 nearest.
         let chosen = adaptive_probe_cells(candidates, &radius_of, 2, 8, 1.0);
-        assert!(chosen.contains(&1) && chosen.contains(&2), "two nearest are the floor");
+        assert!(
+            chosen.contains(&1) && chosen.contains(&2),
+            "two nearest are the floor"
+        );
         assert_eq!(chosen.len(), 2, "nothing else clears τ");
     }
 

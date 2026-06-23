@@ -21,11 +21,15 @@
 //!   layer that descent then runs against with zero further object I/O.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::future::try_join_all;
 
 use crate::storage::{StorageError, StorageProvider};
 use crate::supertable::manifest::part::ContentHash;
+use crate::supertable::reader_cache::DiskCacheStore;
+use crate::supertable::reader_cache::disk::DiskCacheError;
 
 use super::page::{Page, PageError};
 use super::paged::ResidentPageSource;
@@ -49,6 +53,8 @@ pub(crate) enum OpannStoreError {
     Storage(#[from] StorageError),
     #[error("page error: {0}")]
     Page(#[from] PageError),
+    #[error("disk cache error: {0}")]
+    Cache(#[from] DiskCacheError),
 }
 
 /// Load the whole routing tree reachable from `root` into memory and return it
@@ -62,10 +68,11 @@ pub(crate) enum OpannStoreError {
 /// so each page is fetched and verified exactly once even when the graph is a
 /// DAG rather than a strict tree.
 pub(crate) async fn load_resident(
+    cache: Option<&Arc<DiskCacheStore>>,
     storage: &dyn StorageProvider,
     root: ContentHash,
 ) -> Result<ResidentPageSource, OpannStoreError> {
-    let mut pages: HashMap<ContentHash, Vec<u8>> = HashMap::new();
+    let mut pages: HashMap<ContentHash, Bytes> = HashMap::new();
     let mut frontier: Vec<ContentHash> = vec![root];
     while !frontier.is_empty() {
         // Dedup this level against what's already resident and against itself,
@@ -83,14 +90,19 @@ pub(crate) async fn load_resident(
         if to_fetch.is_empty() {
             break;
         }
-        // Fetch every distinct page of this level concurrently.
-        let fetched = try_join_all(to_fetch.iter().map(|h| async move {
-            let (bytes, _meta) = storage.get(&page_uri(h)).await?;
-            Ok::<_, OpannStoreError>((*h, bytes))
+        // Fetch every distinct page of this level concurrently. With a disk
+        // cache attached each page rides `blob_bytes` (mmap-backed, evictable);
+        // otherwise it falls back to a direct storage GET (heap bytes).
+        let fetched = try_join_all(to_fetch.iter().map(|h| {
+            let h = *h;
+            async move { Ok::<_, OpannStoreError>((h, fetch_page(cache, storage, h).await?)) }
         }))
         .await?;
         let mut next_frontier: Vec<ContentHash> = Vec::new();
         for (hash, bytes) in fetched {
+            // `blob_bytes` already content-verified on the cache path; the
+            // re-check here is a cheap blake3 over already-resident bytes that
+            // also covers the no-cache GET path.
             let actual = ContentHash::of(bytes.as_ref());
             if actual != hash {
                 return Err(PageError::ContentHashMismatch {
@@ -99,19 +111,38 @@ pub(crate) async fn load_resident(
                 }
                 .into());
             }
-            // Parse to discover the page's child pages, then keep the raw bytes
-            // (descent re-parses from them through the PageSource).
+            // Parse to discover the page's child pages, then keep the (possibly
+            // mmap-backed) bytes — descent re-parses from them through the
+            // PageSource.
             let page = Page::parse(bytes.as_ref())?;
             for child in page.referenced_pages() {
                 if !pages.contains_key(&child) {
                     next_frontier.push(child);
                 }
             }
-            pages.insert(hash, bytes.to_vec());
+            pages.insert(hash, bytes);
         }
         frontier = next_frontier;
     }
-    Ok(ResidentPageSource::from_pages(pages))
+    Ok(ResidentPageSource::from_byte_pages(pages))
+}
+
+/// Fetch one routing-tree page's bytes. With a disk cache, the page is pulled
+/// through [`DiskCacheStore::blob_bytes`] — mmap-backed, content-verified, and
+/// counted against the shared budget so old-version pages evict like superfile
+/// blobs. Without one (e.g. the GC reachability walk), it's a direct GET.
+async fn fetch_page(
+    cache: Option<&Arc<DiskCacheStore>>,
+    storage: &dyn StorageProvider,
+    hash: ContentHash,
+) -> Result<Bytes, OpannStoreError> {
+    match cache {
+        Some(c) => Ok(c.blob_bytes(hash, page_uri(&hash), storage).await?),
+        None => {
+            let (bytes, _meta) = storage.get(&page_uri(&hash)).await?;
+            Ok(bytes)
+        }
+    }
 }
 
 /// Storage URIs of every routing-tree page reachable from `root` — the live
@@ -123,19 +154,21 @@ pub(crate) async fn reachable_page_uris(
     storage: &dyn StorageProvider,
     root: ContentHash,
 ) -> Result<HashSet<String>, OpannStoreError> {
-    let resident = load_resident(storage, root).await?;
+    // GC only needs the reachable hash set, not a warm cache — pass no cache so
+    // a background reachability walk doesn't churn the query cache with pages.
+    let resident = load_resident(None, storage, root).await?;
     Ok(resident.page_hashes().map(|h| page_uri(&h)).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::storage::LocalFsStorageProvider;
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::manifest::commit::put_immutable_blob;
     use crate::supertable::opann::paged::{PagedTree, SplitPages};
     use crate::supertable::opann::test_util::{build_tree, synth_cells};
+    use bytes::Bytes;
 
     /// Write a tree's pages to `storage` through the shared content-addressed
     /// blob primitive (the production commit path), so the store round-trip
@@ -164,14 +197,18 @@ mod tests {
             let n_pages = split.pages.len();
 
             put_test_pages(&storage, &split).await;
-            let source = load_resident(&storage, root).await.expect("load pages");
+            let source = load_resident(None, &storage, root)
+                .await
+                .expect("load pages");
             assert_eq!(
                 source.len(),
                 n_pages,
                 "{metric:?}: load must reach every page from the root"
             );
             // The GC live-page set is exactly the reachable pages' URIs.
-            let live = reachable_page_uris(&storage, root).await.expect("live uris");
+            let live = reachable_page_uris(&storage, root)
+                .await
+                .expect("live uris");
             assert_eq!(
                 live.len(),
                 n_pages,
@@ -231,7 +268,7 @@ mod tests {
             latest = Some((split.root, split.pages.len()));
         }
         let (root, n_pages) = latest.expect("root");
-        let source = load_resident(&storage, root)
+        let source = load_resident(None, &storage, root)
             .await
             .expect("load latest root from accumulated multi-version store");
         assert_eq!(

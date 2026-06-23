@@ -35,8 +35,8 @@ use crate::supertable::manifest::part::ContentHash;
 
 #[cfg(test)]
 use super::descent::best_first;
+use super::page::{ChildLink, LeafRef, NodeTopo, encode_page};
 use super::paged::SplitPages;
-use super::page::{ChildLink, NodeTopo, encode_page};
 
 /// Tree fanout: a node has up to this many children. Descent cost is
 /// ~`fanout · depth`; depth is `log_fanout(n_cells)`.
@@ -50,8 +50,8 @@ const TREE_KMEANS_ITERS: usize = 8;
 enum NodeKind {
     /// Internal routing node: ids of its child nodes.
     Internal(Vec<u32>),
-    /// Leaf: the cell (superfile) id this node routes to.
-    Leaf(u128),
+    /// Leaf: the cluster (within an object-resident superfile) this routes to.
+    Leaf(LeafRef),
 }
 
 struct NodeMeta {
@@ -105,7 +105,14 @@ impl CentroidTree {
         let mut sources: Vec<u32> = Vec::new();
         let indices: Vec<usize> = (0..n).collect();
         let root = build_subtree(
-            metric, dim, &rows, &cell_radii, cell_ids, &indices, &mut nodes, &mut sources,
+            metric,
+            dim,
+            &rows,
+            &cell_radii,
+            cell_ids,
+            &indices,
+            &mut nodes,
+            &mut sources,
         );
         // Every node centroid IS an existing cell centroid (its source index),
         // sliced from `clusters` under the shared quantizer — no re-quantization.
@@ -133,7 +140,7 @@ impl CentroidTree {
     /// ([`super::paged::PagedTree::select_probes`]); this in-memory descent is
     /// the oracle the page round-trip tests compare against.
     #[cfg(test)]
-    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(u128, f32)> {
+    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(LeafRef, f32)> {
         if n_probe == 0 || self.nodes.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
         }
@@ -142,7 +149,7 @@ impl CentroidTree {
             self.score(self.root, query),
             n_probe,
             |node, kids| match &self.nodes[node as usize].kind {
-                NodeKind::Leaf(cell) => Some(*cell),
+                NodeKind::Leaf(leaf) => Some(*leaf),
                 NodeKind::Internal(children) => {
                     for &ch in children {
                         kids.push((ch, self.score(ch, query)));
@@ -170,7 +177,7 @@ impl CentroidTree {
             .nodes
             .iter()
             .map(|n| match &n.kind {
-                NodeKind::Leaf(cell) => NodeTopo::Leaf(*cell),
+                NodeKind::Leaf(leaf) => NodeTopo::Leaf(*leaf),
                 NodeKind::Internal(children) => {
                     NodeTopo::Internal(children.iter().map(|&c| ChildLink::Local(c)).collect())
                 }
@@ -245,7 +252,7 @@ impl CentroidTree {
         let mut topo: Vec<NodeTopo> = Vec::with_capacity(ids.len());
         for &g in &ids {
             match &self.nodes[g as usize].kind {
-                NodeKind::Leaf(cell) => topo.push(NodeTopo::Leaf(*cell)),
+                NodeKind::Leaf(leaf) => topo.push(NodeTopo::Leaf(*leaf)),
                 NodeKind::Internal(children) => {
                     // Preserve the node's original child order, tagging each as
                     // an in-page or cross-page link, so every descent path
@@ -256,8 +263,7 @@ impl CentroidTree {
                         if cp == page {
                             links.push(ChildLink::Local(local_of[&c]));
                         } else {
-                            let hash =
-                                self.build_page(cp, page_of, pages_nodes, page_root, out);
+                            let hash = self.build_page(cp, page_of, pages_nodes, page_root, out);
                             links.push(ChildLink::Page(hash));
                         }
                     }
@@ -321,7 +327,8 @@ fn build_subtree(
     // Large group → encoded k-medoids into up to DEFAULT_FANOUT child groups
     // (reusing `encoded_ivf_kmeans` over the stored bytes), recurse.
     let subset: Vec<EncodedCellRow> = indices.iter().map(|&i| rows[i].clone()).collect();
-    let (_centroids, assign) = encoded_ivf_kmeans(&subset, metric, DEFAULT_FANOUT, TREE_KMEANS_ITERS);
+    let (_centroids, assign) =
+        encoded_ivf_kmeans(&subset, metric, DEFAULT_FANOUT, TREE_KMEANS_ITERS);
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); DEFAULT_FANOUT];
     for (local, &i) in indices.iter().enumerate() {
         groups[assign[local]].push(i);
@@ -357,7 +364,15 @@ fn push_leaf(
     sources.push(i as u32);
     nodes.push(NodeMeta {
         radius: cell_radii[i],
-        kind: NodeKind::Leaf(cell_ids[i]),
+        // Structural milestone: the leaf carries the degenerate whole-superfile
+        // range (`doc_off = 0`, `count = 0` → the query fetches the whole
+        // superfile, behavior unchanged). The per-cluster offsets are filled in
+        // by the later semantic step that splits a superfile into cluster leaves.
+        kind: NodeKind::Leaf(LeafRef {
+            superfile_id: cell_ids[i],
+            doc_off: 0,
+            count: 0,
+        }),
     });
     id
 }
@@ -379,8 +394,9 @@ fn push_internal(
 ) -> u32 {
     // Medoid of this subtree's cells — an existing encoded centroid.
     let subset: Vec<EncodedCellRow> = indices.iter().map(|&i| rows[i].clone()).collect();
-    let medoid_local =
-        medoid_index_by(&subset, |a, b| distance_encoded_rows_symmetric(metric, dim, a, b));
+    let medoid_local = medoid_index_by(&subset, |a, b| {
+        distance_encoded_rows_symmetric(metric, dim, a, b)
+    });
     let medoid = indices[medoid_local];
     // Covering radius from the medoid: max over children of
     // dist(medoid, child_centroid) + child_radius.
@@ -465,13 +481,17 @@ mod tests {
         for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             // More nodes than cells (internal nodes added), but never fewer.
-            assert!(tree.n_nodes() >= n, "{metric:?}: nodes {} < cells {n}", tree.n_nodes());
+            assert!(
+                tree.n_nodes() >= n,
+                "{metric:?}: nodes {} < cells {n}",
+                tree.n_nodes()
+            );
             // Probing for "everything" returns exactly the cell-id set.
             let q = cells[0].0.clone();
             let all: HashSet<u128> = tree
                 .select_probes(&q, n)
                 .into_iter()
-                .map(|(c, _)| c)
+                .map(|(leaf, _)| leaf.superfile_id)
                 .collect();
             let want: HashSet<u128> = cells.iter().map(|(_, _, id)| *id).collect();
             assert_eq!(all, want, "{metric:?}: descent must reach every cell");
@@ -493,7 +513,10 @@ mod tests {
                 let probes = tree.select_probes(&q, n_probe);
                 assert!(probes.len() <= n_probe, "{metric:?}: over budget");
                 assert!(!probes.is_empty(), "{metric:?}: empty probe set");
-                if probes.iter().any(|(c, _)| *c == cells[target].2) {
+                if probes
+                    .iter()
+                    .any(|(leaf, _)| leaf.superfile_id == cells[target].2)
+                {
                     hits += 1;
                 }
             }
@@ -532,7 +555,7 @@ mod tests {
             let got: HashSet<u128> = tree
                 .select_probes(&q, n_probe)
                 .into_iter()
-                .map(|(c, _)| c)
+                .map(|(leaf, _)| leaf.superfile_id)
                 .collect();
             let mut flat: Vec<(u128, f32)> = cells
                 .iter()
@@ -604,10 +627,11 @@ mod tests {
                     "budget {budget}: page must carry a radius per node"
                 );
                 for local in 0..page.n_nodes() as u32 {
-                    if let NodeTopo::Leaf(cell) = page.topo_at(local) {
+                    if let NodeTopo::Leaf(leaf) = page.topo_at(local) {
                         assert!(
-                            leaves.insert(*cell),
-                            "budget {budget}: cell {cell} appears in two pages"
+                            leaves.insert(leaf.superfile_id),
+                            "budget {budget}: cell {} appears in two pages",
+                            leaf.superfile_id
                         );
                     }
                 }

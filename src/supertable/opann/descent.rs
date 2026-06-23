@@ -27,23 +27,23 @@ use std::collections::BinaryHeap;
 /// `expand` (co-located with the data they come from), so the descent itself
 /// needs no scoring access. Pure compute — the caller owns all scoring data
 /// and any I/O.
-pub(super) fn best_first<N: Copy>(
+pub(super) fn best_first<N: Copy, L: Copy>(
     root: N,
     root_dist: f32,
     n_probe: usize,
-    mut expand: impl FnMut(N, &mut Vec<(N, f32)>) -> Option<u128>,
-) -> Vec<(u128, f32)> {
+    mut expand: impl FnMut(N, &mut Vec<(N, f32)>) -> Option<L>,
+) -> Vec<(L, f32)> {
     let mut heap: BinaryHeap<Cand<N>> = BinaryHeap::new();
     heap.push(Cand {
         dist: root_dist,
         node: root,
     });
-    let mut out: Vec<(u128, f32)> = Vec::new();
+    let mut out: Vec<(L, f32)> = Vec::new();
     let mut kids: Vec<(N, f32)> = Vec::new();
     while let Some(Cand { dist, node }) = heap.pop() {
         kids.clear();
-        if let Some(cell) = expand(node, &mut kids) {
-            out.push((cell, dist));
+        if let Some(leaf) = expand(node, &mut kids) {
+            out.push((leaf, dist));
             if out.len() >= n_probe {
                 break;
             }
