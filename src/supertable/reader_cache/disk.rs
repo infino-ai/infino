@@ -77,6 +77,76 @@ const MMAP_PROMOTION_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// full-superfile fill starts.
 const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Max parallel range-GET streams a single **background** fill may use,
+/// below the foreground/hybrid `cold_fetch_streams`. Bounds each fill's
+/// in-flight bytes (`streams × cold_fetch_chunk_bytes`) so (a) the aggregate
+/// across `prefetch_concurrency` concurrent fills can't saturate / trigger S3
+/// throttling — `open_all_superfiles` spawns a fill per cell, so at the
+/// default `prefetch_concurrency=8 × cold_fetch_streams=8 × 8 MiB = 512 MiB`
+/// in flight, which 503s on S3 — and (b) a fill's in-flight wave stays small,
+/// so [`yield_to_foreground`] (checked between waves) pauses it promptly when
+/// a query arrives. Complements the gate; neither alone suffices.
+const BACKGROUND_FILL_MAX_STREAMS: usize = 2;
+
+/// Poll cadence while a background cache-fill yields to in-flight foreground
+/// queries (see [`foreground_query_active`]).
+const BACKGROUND_FILL_YIELD_POLL: Duration = Duration::from_millis(5);
+
+/// Upper bound on how long a background fill yields to foreground queries
+/// before proceeding anyway. Prevents a sustained query stream from starving
+/// the cache warm-up indefinitely; under bursty load the fill simply resumes
+/// in the gaps between queries well within this bound.
+const BACKGROUND_FILL_MAX_YIELD: Duration = Duration::from_secs(2);
+
+/// Process-global count of in-flight foreground queries. Background
+/// full-superfile fills run at full bandwidth when this is 0 and **pause**
+/// while it is > 0, so the fill never competes for S3 bandwidth with a
+/// latency-critical query. Per-reader release gating
+/// (`wait_for_lazy_foreground_release`) can't prevent the contention: a fill
+/// commonly targets *different* superfiles (e.g. user files opened by the
+/// id→row locate) than the foreground reads, so those readers release
+/// immediately and the fill starts mid-query. This global gate is keyed off
+/// the query, not the reader, so it covers that case. Measured: an 8-stream ×
+/// 8 MiB fill dragged foreground 2 MiB block reads down to ~18 MB/s.
+static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard marking a foreground query in flight for its lifetime (held
+/// across the query's awaits). Background fills pause while any guard is live.
+pub struct ForegroundQueryGuard(());
+
+impl ForegroundQueryGuard {
+    pub fn enter() -> Self {
+        FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        ForegroundQueryGuard(())
+    }
+}
+
+impl Drop for ForegroundQueryGuard {
+    fn drop(&mut self) {
+        FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn foreground_query_active() -> bool {
+    FOREGROUND_QUERIES.load(Ordering::Acquire) > 0
+}
+
+/// Pause the calling background fill while a foreground query is reading —
+/// unless someone is explicitly waiting for *this* fill's mmap promotion
+/// (then the fill is itself latency-critical and must rush), the store is
+/// abandoned, or the yield bound elapses.
+async fn yield_to_foreground(store: &Arc<DiskCacheStore>) {
+    let mut waited = Duration::ZERO;
+    while foreground_query_active()
+        && store.n_promotion_waiters.load(Ordering::Acquire) == 0
+        && !background_store_abandoned(store)
+        && waited < BACKGROUND_FILL_MAX_YIELD
+    {
+        tokio::time::sleep(BACKGROUND_FILL_YIELD_POLL).await;
+        waited += BACKGROUND_FILL_YIELD_POLL;
+    }
+}
+
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
@@ -364,7 +434,13 @@ impl DiskCacheStore {
     /// → coalesced cold-fetch coordinator. Dispatches by
     /// `config.cold_fetch_mode`:
     ///
-    /// - [`ColdFetchMode::HybridWithPrefetch`] (default):
+    /// - [`ColdFetchMode::LazyForegroundWithBackgroundFill`] (default):
+    ///   foreground returns a lazy reader over a `StorageRangeSource`
+    ///   that pays only the per-query range budget; a background task
+    ///   downloads the full superfile to NVMe and swaps in the mmap'd
+    ///   entry, so subsequent (warm) queries are resident. Minimizes
+    ///   cold-query p50 on object-storage-native deployments.
+    /// - [`ColdFetchMode::HybridWithPrefetch`]:
     ///   parallel range-GETs feed the foreground reader (built
     ///   from in-memory bytes) and a fire-and-forget cache fill
     ///   (mmap'd, registered on completion). Foreground returns
@@ -1688,7 +1764,14 @@ async fn cold_fetch_to_disk_cancelable(
     dest_path: &Path,
     size: u64,
 ) -> Result<bool, DiskCacheError> {
-    let n_streams = store.config.cold_fetch_streams.max(1);
+    // Background fill: cap streams below the foreground setting to bound
+    // in-flight bytes (avoids the S3-throttling fill storm at open + lets the
+    // foreground gate pause it promptly between waves).
+    let n_streams = store
+        .config
+        .cold_fetch_streams
+        .max(1)
+        .min(BACKGROUND_FILL_MAX_STREAMS);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
     let file = {
         let f = fs::OpenOptions::new()
@@ -1713,6 +1796,13 @@ async fn cold_fetch_to_disk_cancelable(
     // materializing them as one `Bytes` would reintroduce the RSS spike
     // this disk-cache path is meant to avoid.
     loop {
+        // Yield to any in-flight foreground query before dispatching the next
+        // wave of chunk GETs, so the fill never competes for S3 bandwidth with
+        // a latency-critical read. Checked here (not just at fill start) so a
+        // fill that began in a gap pauses when the next query arrives.
+        if in_flight.is_empty() {
+            yield_to_foreground(store).await;
+        }
         while next_chunk < n_chunks && in_flight.len() < n_streams {
             if background_store_abandoned(store) {
                 return Ok(false);
