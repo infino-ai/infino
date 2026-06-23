@@ -1255,8 +1255,13 @@ pub mod vector {
 
     impl SupertableVecColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
+            // Open-on-demand: do NOT force-open every superfile. A vector
+            // query routes to ~nprobe cells and opens only those (lazily, via
+            // the disk cache) — that's the realistic cold path. Force-opening
+            // all user+hidden superfiles spawned a background fill per cell
+            // (an S3-throttling storm) and an open cost unrelated to the
+            // query's working set.
             let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
