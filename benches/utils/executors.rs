@@ -24,6 +24,41 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
+/// Summary of a timed-sample set. `min` is the regression-gate metric:
+/// benchmark noise is one-sided (every perturbation only *adds* time), so
+/// the fastest sample is the cleanest estimate of intrinsic cost. `p50`
+/// and `p90` ride along to show the run's spread, not to gate on.
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    pub min: Duration,
+    pub p50: Duration,
+    pub p90: Duration,
+    /// Number of timed samples behind these figures.
+    pub n: usize,
+}
+
+/// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
+pub fn summarize(samples: &mut [Duration]) -> Stats {
+    let n = samples.len();
+    if n == 0 {
+        return Stats {
+            min: Duration::ZERO,
+            p50: Duration::ZERO,
+            p90: Duration::ZERO,
+            n: 0,
+        };
+    }
+    samples.sort_unstable();
+    // Nearest-rank p90: ceil(0.9·n), clamped into the valid index range.
+    let p90_rank = (9 * n).div_ceil(10).clamp(1, n);
+    Stats {
+        min: samples[0],
+        p50: samples[(n - 1) / 2],
+        p90: samples[p90_rank - 1],
+        n,
+    }
+}
+
 /// Cold timings for one query, split at the open/search boundary:
 /// `open` is the fresh-consumer open (consumer + manifest + every
 /// superfile reader), `search` is the first query over the opened but
@@ -384,20 +419,25 @@ pub mod fts {
         }
     }
 
-    /// Warm p50 (+ per-query RSS) for one query: `p50` is the query
-    /// phase (id + score), `p50_fetched` the fetch phase (+ the text
-    /// column for the top-k rows).
+    /// Warm timing (+ per-query RSS) for one query. `warm` is the query
+    /// phase (id + score), gated on its `min`; `fetched_min` is the
+    /// best-case fetch phase (+ the text column for the top-k rows), a
+    /// secondary signal tracked by best case only.
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
-        pub p50: Duration,
-        pub p50_fetched: Duration,
+        pub warm: Stats,
+        pub fetched_min: Duration,
         pub rss: RssStats,
     }
 
-    /// Measure the warm battery against an already-warm reader: one
-    /// untimed prewarm per query, then `iters` timed iterations for
-    /// the query phase and `iters` for the fetch phase.
+    /// Untimed iterations run before sampling, to reach steady state
+    /// (warm caches, settled CPU frequency) so `min` reflects real work.
+    const WARMUP_ITERS: usize = 5;
+
+    /// Measure the warm battery against an already-warm reader: a short
+    /// untimed warmup per query, then `iters` timed iterations each for
+    /// the query phase and the fetch phase.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -412,7 +452,9 @@ pub mod fts {
                 eprintln!("[{log_prefix}] warm: query {}...", q.name);
                 let query = q.terms.join(" ");
                 let mode = to_infino_mode(q.mode);
-                let _ = reader.bm25_rows(column, &query, k, mode);
+                for _ in 0..WARMUP_ITERS {
+                    std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
+                }
                 let sampler = PeakSampler::start_default();
                 let mut samples = Vec::with_capacity(iters);
                 for _ in 0..iters {
@@ -421,7 +463,9 @@ pub mod fts {
                     samples.push(t.elapsed());
                     std::hint::black_box(rows);
                 }
-                let _ = reader.bm25_rows_fetched(column, &query, k, mode);
+                for _ in 0..WARMUP_ITERS {
+                    std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
+                }
                 let mut fetched_samples = Vec::with_capacity(iters);
                 for _ in 0..iters {
                     let t = Instant::now();
@@ -430,10 +474,15 @@ pub mod fts {
                     std::hint::black_box(rows);
                 }
                 let rss = sampler.stop_stats();
+                let warm = summarize(&mut samples);
+                eprintln!(
+                    "[{log_prefix}] warm: {} — min {:?} / p50 {:?} / p90 {:?} (n={})",
+                    q.name, warm.min, warm.p50, warm.p90, warm.n,
+                );
                 FtsQueryStat {
                     name: q.name,
-                    p50: p50(&mut samples),
-                    p50_fetched: p50(&mut fetched_samples),
+                    warm,
+                    fetched_min: summarize(&mut fetched_samples).min,
                     rss,
                 }
             })
@@ -488,10 +537,14 @@ pub mod fts {
     fn warm_cells(stat: Option<&FtsQueryStat>) -> Vec<Cell> {
         match stat {
             Some(q) => {
-                let ns = q.p50.as_secs_f64() * NS_PER_SEC;
-                let fetched_ns = q.p50_fetched.as_secs_f64() * NS_PER_SEC;
+                let min_ns = q.warm.min.as_secs_f64() * NS_PER_SEC;
+                let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
+                let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
                 vec![
-                    metric(ns, fmt_time(ns), Better::Lower),
+                    metric(min_ns, fmt_time(min_ns), Better::Lower),
+                    metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                    metric(p90_ns, fmt_time(p90_ns), Better::Lower),
                     metric(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                     metric(
                         q.rss.peak_rss_bytes as f64,
@@ -510,7 +563,15 @@ pub mod fts {
                     ),
                 ]
             }
-            None => vec![text("—"), text("—"), text("—"), text("—"), text("—")],
+            None => vec![
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+                text("—"),
+            ],
         }
     }
 
@@ -560,9 +621,17 @@ pub mod fts {
         let mut header_cols = vec!["Query".to_string()];
         if warm_map.is_some() {
             header_cols.extend(
-                ["warm", "warm +fetch", "Peak RSS", "Median RSS", "P90 RSS"]
-                    .iter()
-                    .map(|s| s.to_string()),
+                [
+                    "warm min",
+                    "warm p50",
+                    "warm p90",
+                    "+fetch min",
+                    "Peak RSS",
+                    "Median RSS",
+                    "P90 RSS",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
             );
         }
         if cold.is_some() {

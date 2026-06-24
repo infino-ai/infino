@@ -611,11 +611,12 @@ pub fn cold_from_fts(
         .collect()
 }
 
-/// Flatten warm FTS stats into `(name, p50_seconds)` for the cost model.
+/// Flatten warm FTS stats into `(name, min_seconds)` for the cost model —
+/// the gate metric, the intrinsic per-query cost basis.
 pub fn warm_from_fts(stats: &[crate::executors::fts::FtsQueryStat]) -> Vec<(String, f64)> {
     stats
         .iter()
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.warm.min.as_secs_f64()))
         .collect()
 }
 
