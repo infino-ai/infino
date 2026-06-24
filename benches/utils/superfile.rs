@@ -1089,6 +1089,7 @@ pub mod vector {
                 TOP_K,
                 opts,
                 Some(Arc::clone(allow)),
+                None,
             ))
             .expect("filtered sweep query");
             sum += corpus::recall_at_k(&hits, gt);
@@ -1228,6 +1229,7 @@ pub mod vector {
                     TOP_K,
                     opts,
                     Some(Arc::clone(allow)),
+                    None,
                 ))
                 .expect("filtered latency query");
                 std::hint::black_box(hits);
@@ -1408,6 +1410,7 @@ pub mod vector {
                                 FILTERED_DEFAULT_RERANK_MULT,
                             ),
                             Some(Arc::clone(&allow)),
+                            None,
                         ))
                         .expect("filtered recall query");
                         recalls.push(corpus::recall_at_k(&hits, gt));
@@ -1495,6 +1498,7 @@ pub mod vector {
                                 TOP_K,
                                 exec_vec::search_opts(nominal_nprobe, nominal_rerank),
                                 set.clone(),
+                                None,
                             ))
                             .expect("filtered vector search");
                             samples.push(t0.elapsed());
