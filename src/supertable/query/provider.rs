@@ -318,6 +318,8 @@ impl SupertableProvider {
             self.manifest.options.tokenizer.as_deref(),
         ));
 
+        leaves.extend(exprs_to_null_leaves(filters, &self.schema));
+
         let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -1278,6 +1280,46 @@ fn collect_or_eq(
     }
 }
 
+/// Build prune leaves for the `column IS NULL` / `IS NOT NULL` filters in
+/// `filters`. Each lowers to a `NullCheck` leaf that skips a manifest part
+/// or superfile only when its null stats prove no row can match. A wrapped
+/// inner (`CAST(c) IS NULL`) or an unknown column yields no leaf.
+pub(crate) fn exprs_to_null_leaves(filters: &[Expr], schema: &SchemaRef) -> Vec<PruneLeaf> {
+    let mut out = Vec::new();
+    for filter in filters {
+        collect_null_leaves(filter, schema, &mut out);
+    }
+    out
+}
+
+/// Recurse one filter expression: the `IS NULL` / `IS NOT NULL` arms emit
+/// a leaf, `AND` and aliases descend, anything else yields nothing.
+fn collect_null_leaves(expr: &Expr, schema: &SchemaRef, out: &mut Vec<PruneLeaf>) {
+    match expr {
+        Expr::Alias(a) => collect_null_leaves(&a.expr, schema, out),
+        Expr::BinaryExpr(be) if be.op == Operator::And => {
+            collect_null_leaves(&be.left, schema, out);
+            collect_null_leaves(&be.right, schema, out);
+        }
+        Expr::IsNull(inner) => push_null_leaf(inner, true, schema, out),
+        Expr::IsNotNull(inner) => push_null_leaf(inner, false, schema, out),
+        _ => {}
+    }
+}
+
+/// Push a `NullCheck` leaf when `inner` is a bare column in the schema;
+/// anything wrapped (cast, arithmetic) declines.
+fn push_null_leaf(inner: &Expr, want_null: bool, schema: &SchemaRef, out: &mut Vec<PruneLeaf>) {
+    if let Expr::Column(c) = inner
+        && schema.field_with_name(&c.name).is_ok()
+    {
+        out.push(PruneLeaf::NullCheck {
+            column: c.name.clone(),
+            want_null,
+        });
+    }
+}
+
 /// Recurse through `AND` nodes, pushing any recognized
 /// `column <op> literal` leaf into `out`.
 fn collect_conjuncts(expr: &Expr, schema: &SchemaRef, out: &mut Vec<ScalarPredicate>) {
@@ -1690,6 +1732,50 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").in_list(vec![lit(1_i64)], true);
         assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+    }
+
+    /// The `(column, want_null)` of the first `NullCheck` leaf, if any.
+    fn null_leaf(filters: &[Expr], schema: &SchemaRef) -> Option<(String, bool)> {
+        exprs_to_null_leaves(filters, schema)
+            .into_iter()
+            .find_map(|l| match l {
+                PruneLeaf::NullCheck { column, want_null } => Some((column, want_null)),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn is_null_and_is_not_null_lower_to_null_check() {
+        let s = schema_xy();
+        assert_eq!(
+            null_leaf(&[col("x").is_null()], &s),
+            Some(("x".to_string(), true))
+        );
+        assert_eq!(
+            null_leaf(&[col("x").is_not_null()], &s),
+            Some(("x".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn null_check_on_wrapped_inner_emits_no_leaf() {
+        // `CAST(x) IS NULL` — inner isn't a bare column.
+        let s = schema_xy();
+        let expr = cast(col("x"), DataType::Int32).is_null();
+        assert!(exprs_to_null_leaves(&[expr], &s).is_empty());
+    }
+
+    #[test]
+    fn null_check_on_unknown_column_emits_no_leaf() {
+        let s = schema_xy();
+        assert!(exprs_to_null_leaves(&[col("z").is_null()], &s).is_empty());
+    }
+
+    #[test]
+    fn null_check_under_and_is_found() {
+        let s = schema_xy();
+        let expr = col("x").gt(lit(0_i64)).and(col("y").is_null());
+        assert_eq!(null_leaf(&[expr], &s), Some(("y".to_string(), true)));
     }
 
     #[test]

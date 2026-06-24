@@ -303,7 +303,11 @@ superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
 - **Term queries** use each superfile's term presence filter.
 - **Prefix queries** use each superfile's lexicographic term range.
-- **Predicate (SQL) queries** use the per-column scalar statistics.
+- **Predicate (SQL) queries** use the per-column scalar statistics
+  (min/max and null count). `=` / `IN` / same-column `OR` prune on
+  min/max; `IS NULL` / `IS NOT NULL` prune on the null count — an
+  all-null column records a null-valued min/max plus its null count so
+  the all-null case is detectable.
 - **Vector queries** use the per-column vector summary to order and
 route work.
 
@@ -355,4 +359,3 @@ manifest over different superfiles.
 - One writer is active per table at a time.
 - Full-text and vector search are distinct query paths; combined
 relevance scoring is left to the caller.
-

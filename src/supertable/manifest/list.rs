@@ -211,7 +211,9 @@ impl ScalarStatsAgg {
     ///
     /// Returns `None` for types without a well-defined ordering (anything
     /// other than integer / float / boolean / utf8 / decimal) — those carry
-    /// no min/max, so there's nothing to prune on. When present, every
+    /// no min/max, so there's nothing to prune on. An all-null column of a
+    /// supported type still returns an aggregate: null min/max plus the
+    /// null count, so `IS [NOT] NULL` can prune on it. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
     /// same pass; sum/hll stay `None` for types that don't support them.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {

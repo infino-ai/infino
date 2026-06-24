@@ -1262,24 +1262,30 @@ pub(crate) fn merge_min_max_arrays(
     existing_max: &ArrayRef,
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
+    // Merge two optional bounds into the surviving one — smaller for a min,
+    // larger for a max. A `None` (the column is all-null on that side)
+    // yields to a present value; both `None` stays `None`, so an all-null
+    // column stays all-null through the fold, while a manifest part with any
+    // populated superfile keeps its real bound.
+    #[inline]
+    fn merge_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, keep_min: bool) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if keep_min == (a <= b) { a } else { b }),
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+
     macro_rules! prim_merge {
         ($array_ty:ty) => {{
-            let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
-            let ot_min_arr = other_min.as_any().downcast_ref::<$array_ty>()?;
-            let ex_max_arr = existing_max.as_any().downcast_ref::<$array_ty>()?;
-            let ot_max_arr = other_max.as_any().downcast_ref::<$array_ty>()?;
-
-            let ex_min = ex_min_arr.value(0);
-            let ot_min = ot_min_arr.value(0);
-            let ex_max = ex_max_arr.value(0);
-            let ot_max = ot_max_arr.value(0);
-
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
-
+            let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
+            let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
-                Arc::new(<$array_ty>::from(vec![merged_min])) as ArrayRef,
-                Arc::new(<$array_ty>::from(vec![merged_max])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])) as ArrayRef,
             ))
         }};
     }
@@ -1295,93 +1301,64 @@ pub(crate) fn merge_min_max_arrays(
         DataType::Int64 => prim_merge!(Int64Array),
         DataType::Float32 => prim_merge!(Float32Array),
         DataType::Float64 => prim_merge!(Float64Array),
-        DataType::Boolean => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let merged_min = ex_min && ot_min;
-            let merged_max = ex_max || ot_max;
-            Some((
-                Arc::new(BooleanArray::from(vec![merged_min])),
-                Arc::new(BooleanArray::from(vec![merged_max])),
-            ))
-        }
+        // `false < true`, so min folds like AND and max like OR.
+        DataType::Boolean => prim_merge!(BooleanArray),
         DataType::Utf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<StringArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<StringArray>()?.value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<StringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<StringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<StringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<StringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(StringArray::from(vec![merged_min])),
-                Arc::new(StringArray::from(vec![merged_max])),
+                Arc::new(StringArray::from(vec![min])),
+                Arc::new(StringArray::from(vec![max])),
             ))
         }
         DataType::LargeUtf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(LargeStringArray::from(vec![merged_min])),
-                Arc::new(LargeStringArray::from(vec![merged_max])),
+                Arc::new(LargeStringArray::from(vec![min])),
+                Arc::new(LargeStringArray::from(vec![max])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let otn = other_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let exx = existing_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let otx = other_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let at = |a: &Decimal128Array| (!a.is_null(0)).then(|| a.value(0));
+            let min = merge_opt(at(exn), at(otn), true);
+            let max = merge_opt(at(exx), at(otx), false);
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![merged_min])
+                    Decimal128Array::from(vec![min])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![merged_max])
+                    Decimal128Array::from(vec![max])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -1393,7 +1370,9 @@ pub(crate) fn merge_min_max_arrays(
 
 /// Compute (min, max) for one Arrow array as length-1 `ArrayRef`s.
 ///
-/// Returns `None` for unsupported types or for all-null inputs.
+/// Returns `None` only for unsupported types. An all-null input of a
+/// supported type yields length-1 *null* min/max arrays (not `None`), so
+/// its null count is still recorded and `IS [NOT] NULL` can prune on it.
 /// Supported set: integer (signed + unsigned, all widths), float
 /// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
@@ -1520,13 +1499,14 @@ pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
 }
 
 pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
+    // An all-null column yields *null* min/max (not no-stat), so its null
+    // count is still recorded for `IS [NOT] NULL` pruning — hence the
+    // `Option` min/max are kept rather than `?`-unwrapped away.
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
-            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mx]));
+            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::min(a)]));
+            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::max(a)]));
             Some((mn_arr, mx_arr))
         }};
     }
@@ -1544,43 +1524,35 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         DataType::Float64 => prim!(Float64Array),
         DataType::Boolean => {
             let a = col.as_any().downcast_ref::<BooleanArray>()?;
-            let mn = agg::min_boolean(a)?;
-            let mx = agg::max_boolean(a)?;
             Some((
-                Arc::new(BooleanArray::from(vec![mn])),
-                Arc::new(BooleanArray::from(vec![mx])),
+                Arc::new(BooleanArray::from(vec![agg::min_boolean(a)])),
+                Arc::new(BooleanArray::from(vec![agg::max_boolean(a)])),
             ))
         }
         DataType::Utf8 => {
             let a = col.as_any().downcast_ref::<StringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(StringArray::from(vec![mn])),
-                Arc::new(StringArray::from(vec![mx])),
+                Arc::new(StringArray::from(vec![agg::min_string(a)])),
+                Arc::new(StringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::LargeUtf8 => {
             let a = col.as_any().downcast_ref::<LargeStringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(LargeStringArray::from(vec![mn])),
-                Arc::new(LargeStringArray::from(vec![mx])),
+                Arc::new(LargeStringArray::from(vec![agg::min_string(a)])),
+                Arc::new(LargeStringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
             let a = col.as_any().downcast_ref::<Decimal128Array>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![mn])
+                    Decimal128Array::from(vec![agg::min(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![mx])
+                    Decimal128Array::from(vec![agg::max(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -1784,9 +1756,10 @@ impl ClusterCentroids {
 mod tests {
     use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
 
-    use arrow_array::Array;
+    use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use dashmap::DashMap;
+    use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
 
@@ -1817,6 +1790,32 @@ mod tests {
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
         let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
         (cc, centroids)
+    }
+
+    #[test]
+    fn min_max_stats_record_and_fold_all_null_columns() {
+        let arr = |vals: Vec<Option<i64>>| Arc::new(Int64Array::from(vals)) as ArrayRef;
+        let scalar = |a: &ArrayRef| ScalarValue::try_from_array(a, 0).expect("decode");
+
+        // All-null column still yields a stat, with null min/max (so the
+        // null count is recorded and `IS [NOT] NULL` can prune on it).
+        let (mn, mx) = column_min_max(&arr(vec![None, None])).expect("all-null stat");
+        assert!(mn.is_null(0) && mx.is_null(0));
+
+        // Populated column → real min/max, nulls ignored.
+        let (mn, mx) = column_min_max(&arr(vec![Some(5), Some(2), None])).expect("stat");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(5)));
+
+        // Fold: a real bound wins over a null bound; both-null stays null.
+        let null1 = arr(vec![None]);
+        let (mn, mx) =
+            merge_min_max_arrays(&null1, &arr(vec![Some(2)]), &null1, &arr(vec![Some(9)]))
+                .expect("merge real over null");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
+        let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
+        assert!(mn.is_null(0) && mx.is_null(0));
     }
 
     /// Folded Sq8-domain scoring must equal dequantize-then-distance
