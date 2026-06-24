@@ -432,30 +432,43 @@ mod tests {
 
     #[test]
     fn reserve_range_across_ms_boundary_produces_multi_span() {
-        // Forces a ms boundary by sleeping mid-call. The
-        // straight-line `reserve_range` API doesn't let us
-        // inject the sleep, so we exercise the multi-span
-        // path differently: mint a few ids, sleep until the
-        // next ms, mint more, and verify reserve_range
-        // *would* produce multiple spans if the same id
-        // sequence had come from one call. The boundary-
-        // detection logic (numerically-non-adjacent ids start
-        // a new span) is identical either way.
+        // `reserve_range` starts a new span whenever two consecutive ids
+        // are not numerically adjacent, which happens exactly when the ms
+        // timestamp field advances mid-reservation. The straight-line API
+        // gives no sleep-injection hook, so we exercise that same
+        // predicate directly: mint ids until the clock ticks to a new ms
+        // and confirm the id landing in the new ms is NOT `prev + 1`.
+        //
+        // We poll until the clock advances rather than sleeping a fixed
+        // amount: the monotonic clock's ms counter is published by a
+        // background ticker thread that can lag a short fixed sleep under
+        // load (e.g. coverage instrumentation on a busy runner). A fixed
+        // sleep would then read the same stale ms for both ids and see
+        // them as adjacent — flaky. Sleeping a little between attempts
+        // also keeps us from starving the very ticker we're waiting on.
+        const TICK_TIMEOUT: time::Duration = time::Duration::from_secs(5);
+
         let g = IdGenerator::with_worker_id(0x20);
-        let a = g.next_id();
-        sleep(time::Duration::from_millis(2));
-        let b = g.next_id();
-        // `b` is at least 2ms after `a` in the timestamp
-        // field, so it's not `a + 1` even though both are
-        // monotonic. This is the exact predicate that
-        // `reserve_range`'s inner loop uses to start a new
-        // span.
-        assert!(b > a, "monotonic");
-        assert_ne!(
-            b,
-            a + 1,
-            "two ids straddling a ms boundary should NOT be numerically adjacent — {a} → {b}"
-        );
+        let mut prev = g.next_id();
+        let deadline = time::Instant::now() + TICK_TIMEOUT;
+        loop {
+            let id = g.next_id();
+            assert!(id > prev, "ids must be strictly monotonic — {prev} → {id}");
+            if id != prev + 1 {
+                // The ms field advanced: the discontinuity that
+                // `reserve_range` turns into a new span. Property
+                // confirmed.
+                break;
+            }
+            // Same ms — only the sequence advanced. Yield so the ticker
+            // can publish the next ms, then retry.
+            prev = id;
+            assert!(
+                time::Instant::now() < deadline,
+                "clock did not advance to a new ms within {TICK_TIMEOUT:?}"
+            );
+            sleep(time::Duration::from_millis(1));
+        }
     }
 
     // ---- cross-worker isolation ----------------------------------------
