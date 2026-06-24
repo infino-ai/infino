@@ -5,6 +5,13 @@ name: Benchmark (Azure)
 # not the public internet). The VM builds with an sccache compile cache
 # in Azure Blob — shared across branches — runs the bench, and is torn
 # down.
+#
+# PR runs are A/B: both the PR ref and the base `main` are built and run on
+# the *same* VM, and the PR is compared against that same-host main arm. This
+# cancels the cross-host / noisy-neighbour / frequency variance a stored
+# baseline carries — the deltas reflect the code change, not the machine.
+# Baseline (push-to-main) runs build and run a single arm and publish it as
+# the stored baseline + per-commit history for the main time series.
 
 on:
   workflow_dispatch:
@@ -43,7 +50,10 @@ on:
       timeout_minutes:
         description: "Hard auto-stop; VM is torn down when hit."
         required: false
-        default: "30"
+        # A/B PR runs build + run two arms (PR and base main) on one VM, so a
+        # PR leg takes roughly twice a single run; baseline (push) runs stay
+        # single-arm and finish well under this.
+        default: "60"
         type: string
       update_baseline:
         description: "Publish this run as the main baseline + history (main only)."
@@ -75,7 +85,7 @@ on:
       location:        { type: string, required: false, default: eastus }
       ref:             { type: string, required: false, default: main }
       keep_table:      { type: boolean, required: false, default: false }
-      timeout_minutes: { type: string, required: false, default: "30" }
+      timeout_minutes: { type: string, required: false, default: "60" }
       # Discriminator appended to resource names so parallel callers
       # (e.g. matrix legs sharing one run_id) don't collide / cross-delete.
       name_suffix:     { type: string, required: false, default: "" }
@@ -263,6 +273,8 @@ jobs:
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             REF='${{ inputs.ref }}' \
+             UPDATE_BASELINE='${{ inputs.update_baseline }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -279,54 +291,78 @@ jobs:
           export SCCACHE_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=${AZURE_STORAGE_ACCOUNT_NAME};AccountKey=${AZURE_STORAGE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
           sccache --start-server || true
 
-          # Build the single unified bench target and record its binary so
+          # Build the unified bench target at one ref and save its binary so
           # the run step execs it directly — no cargo at run time means no
           # re-fingerprint / rebuild.
-          cargo bench --no-run
-          BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'bench-*' \
-                   -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
-          test -n "$BIN" && test -x "$BIN" || { echo "::error::bench binary not found"; exit 1; }
-          printf '%s\n' "$BIN" > "$HOME/bench-bin"
-          echo "built bench: $BIN"
+          build_arm() { # $1 = git ref, $2 = output binary path
+            git checkout "$1" 2>/dev/null \
+              || { git fetch --depth 1 origin "$1" && git checkout FETCH_HEAD; }
+            echo "building $(git rev-parse --short HEAD) -> $2"
+            cargo bench --no-run
+            local bin
+            bin="$(find target/release/deps -maxdepth 1 -type f -executable -name 'bench-*' \
+                     -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+            test -n "$bin" && test -x "$bin" || { echo "::error::bench binary not found"; exit 1; }
+            cp "$bin" "$2"
+          }
+
+          # PR arm = the ref under test. The run step reads this path.
+          build_arm "$REF" "$HOME/bench-pr"
+          printf '%s\n' "$HOME/bench-pr" > "$HOME/bench-bin"
+
+          # A/B: also build the base (main) arm on this same VM, so the PR is
+          # compared against a baseline measured here-and-now (same host,
+          # neighbours, frequency) rather than a stored cross-host one. Skipped
+          # on baseline (push) runs, which only establish main's own numbers.
+          if [ "$UPDATE_BASELINE" != "true" ]; then
+            git fetch --depth 1 origin main
+            build_arm FETCH_HEAD "$HOME/bench-main"
+            git checkout "$REF" 2>/dev/null \
+              || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
+          fi
           sccache --show-stats || true
           REMOTE
 
-      # Seed the report's baseline with main's metrics so the run renders
-      # deltas (vs main) instead of "(new)". Skipped on baseline runs, which
-      # want a clean baseline. Best-effort: no blob = first run = "(new)".
-      - name: Restore main baseline
+      # A/B baseline: run the base (main) arm on this same VM and leave its
+      # metric JSONs in place as the report's baseline, so the PR run renders
+      # deltas (vs main) measured here-and-now — same host, neighbours, and
+      # CPU frequency, which cancels the cross-host noise a stored baseline
+      # carries. Skipped on baseline (push) runs, which want a clean baseline.
+      - name: Same-host baseline (A/B main arm)
         if: ${{ !inputs.update_baseline }}
         env:
-          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
-          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
-          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
-          VM_SIZE: ${{ inputs.vm_size }}
-          DOCS: ${{ inputs.docs }}
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          # Stage the main baseline JSONs on the runner too — the AI-summary
-          # step diffs them against this run's metrics (scp'd back later).
-          mkdir -p baseline
           ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
-            "mkdir -p infino-src/target/infino-bench"
+            "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
+             AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
+             INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
+             INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
+             SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log
+          set -euo pipefail
+          cd "$HOME/infino-src"
+          export INFINO_BENCH_STORE=azure
+          [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
+          ulimit -n "$(ulimit -Hn)"
+          # The main-arm run writes target/infino-bench/<report>.json; those
+          # become the PR arm's baseline (Report::load reads them as `prev`).
+          echo "===== BASELINE (main arm) ${BENCH_ARGS} START ====="
+          "$HOME/bench-main" $BENCH_ARGS 2>&1
+          echo "===== BASELINE (main arm) END ====="
+          REMOTE
+          # Stage the main-arm JSONs on the runner too — the AI-summary step
+          # diffs them against the PR arm's metrics (collected later).
+          mkdir -p baseline
           for j in $REPORTS; do
-            blob="bench/${j}/baseline/${VM_SIZE}-${DOCS}.json"
-            if az storage blob download --account-name "$ACC" --account-key "$KEY" \
-                 -c "$CONTAINER" -n "$blob" -f "${j}.json" 2>/dev/null; then
-              cp "${j}.json" "baseline/${j}.json"
-              # Best-effort: a transient scp flake must not fail the bench —
-              # the run just renders "(new)" without the baseline.
-              if scp -o StrictHostKeyChecking=no "${j}.json" \
-                   "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json"; then
-                echo "baseline restored: $j"
-              else
-                echo "::warning::scp failed for $j — running without baseline"
-              fi
-            else
-              echo "no baseline for $j — first run, all (new)"
-            fi
+            scp -o StrictHostKeyChecking=no \
+              "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "baseline/${j}.json" \
+              2>/dev/null && echo "baseline staged: $j" \
+              || echo "::warning::no main-arm metrics for $j — PR arm renders (new)"
           done
 
       - name: Run benchmark (on VM)
