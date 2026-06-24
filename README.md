@@ -1,5 +1,6 @@
 # infino
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/infino-ai/infino)
 [![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
 [![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
