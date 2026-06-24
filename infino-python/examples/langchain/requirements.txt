@@ -2,6 +2,8 @@ infino
 langchain-infino>=0.1.0
 langchain-core>=0.3
 langchain-openai>=0.2      # optional: LLM answers (Azure AI Foundry or OpenAI)
+langchain-classic>=1.0     # SelfQueryRetriever (research-assistant self-query)
+lark>=1.1                  # query parser used by SelfQueryRetriever
 langgraph>=0.2             # the support/ops agent example
 sentence-transformers>=3   # local embeddings, no API key needed
 datasets>=2                # pulls the real public corpora from HuggingFace
