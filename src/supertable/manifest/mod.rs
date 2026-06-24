@@ -876,6 +876,30 @@ impl Manifest {
         Ok(out)
     }
 
+    /// Resolve one superfile by storage URI. Checks the flat
+    /// [`SuperfileList::superfiles`] view first; when the entry is absent
+    /// there (lazy list/parts layout), walks manifest parts until a match
+    /// is found — the same source [`superfiles_for_routed_cells`] uses for
+    /// hidden-index search.
+    pub(crate) async fn lookup_superfile_entry(
+        &self,
+        uri: SuperfileUri,
+    ) -> Result<Option<Arc<SuperfileEntry>>, ManifestLoadError> {
+        if let Some(entry) = self.superfiles.iter().find(|e| e.uri == uri) {
+            return Ok(Some(Arc::clone(entry)));
+        }
+        let Some(list) = &self.list else {
+            return Ok(None);
+        };
+        for part_entry in &list.parts {
+            let part = self.get_part_by_id(part_entry.part_id).await?;
+            if let Some(entry) = part.superfiles.iter().find(|e| e.uri == uri) {
+                return Ok(Some(Arc::clone(entry)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
     /// operation may create new ManifestParts. The function also returns the new ManifestParts that
     /// the caller can decide to write to storage.
