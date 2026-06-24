@@ -87,7 +87,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
     InfinoError,
     superfile::{
-        SuperfileReader,
+        FtsError, SuperfileReader,
         fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
     supertable::{
@@ -439,14 +439,6 @@ impl SupertableReader {
         Ok(top_k_descending(per_unit, k))
     }
 
-    /// Unranked token match across the pinned snapshot. Returns
-    /// every row matching `query`'s tokens under `mode` (`Or` = any
-    /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
-    /// (`score` is left `0.0`; these results are unordered). Superfile
-    /// skip uses the same term-bloom prune as BM25.
-    ///
-    /// `pub(crate)` async kernel; the public surface is the sync
-    /// [`SupertableReader::token_match`].
     /// Parse `query` into positive and negated tokens, then select the
     /// superfiles to scan. Pruning keys on the **positives only** — a
     /// negated term must never drop a superfile: a superfile lacking it
@@ -455,11 +447,12 @@ impl SupertableReader {
     /// search path so the unranked `token_match` / `count` surfaces honor
     /// negation the same way scored search does.
     ///
-    /// Returns `(positives, negatives, kept)`. A query with no positive
-    /// token (negation-only, e.g. `-foo`) yields an empty `kept`: there
-    /// is no positive anchor to match, so the caller returns the empty
-    /// result — the same outcome the scored path produces when it rejects
-    /// a negation-only query.
+    /// Returns `(positives, negatives, kept)`. A query with no tokens at
+    /// all yields an empty `kept`, so the caller returns the empty result
+    /// (`[]` / count `0`). A negation-only query (negated terms but no
+    /// positive, e.g. `-foo`) is rejected with [`FtsError::NegationOnly`],
+    /// the same as the scored search path — there is no positive anchor to
+    /// match against.
     async fn parse_and_prune(
         &self,
         column: &str,
@@ -470,7 +463,14 @@ impl SupertableReader {
         let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
         if positives.is_empty() {
-            return Ok((positives, negatives, Vec::new()));
+            if negatives.is_empty() {
+                // No tokens at all (empty/whitespace query) — nothing to
+                // match, not an error.
+                return Ok((positives, negatives, Vec::new()));
+            }
+            // Negation-only (e.g. `-foo`): reject, matching the scored
+            // search path, which has no positive anchor to rank or match.
+            return Err(QueryError::Parquet(FtsError::NegationOnly.to_string()));
         }
         let prune_leaf = PruneLeaf::TermPresence {
             column: column.to_owned(),
@@ -482,6 +482,14 @@ impl SupertableReader {
         Ok((positives, negatives, kept))
     }
 
+    /// Unranked token match across the pinned snapshot. Returns
+    /// every row matching `query`'s tokens under `mode` (`Or` = any
+    /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
+    /// (`score` is left `0.0`; these results are unordered). Superfile
+    /// skip uses the same term-bloom prune as BM25.
+    ///
+    /// `pub(crate)` async kernel; the public surface is the sync
+    /// [`SupertableReader::token_match`].
     pub(crate) async fn token_match_async(
         &self,
         column: &str,
@@ -1221,6 +1229,39 @@ mod tests {
         let r = st.reader();
         let res = r.bm25_hits("title", "-alpha", 10, BoolMode::Or);
         assert!(res.is_err(), "negation-only must error; got {res:?}");
+    }
+
+    #[test]
+    fn count_and_token_match_negation_only_query_errors() {
+        // The unranked count / token_match surfaces reject a negation-only
+        // query (`-foo`) the same way the scored path does — there is no
+        // positive anchor to match against. A token-less query (empty /
+        // whitespace) is still 0 / empty, not an error.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta"])).expect("append");
+        w.commit().expect("commit");
+        let r = st.reader();
+
+        for mode in [BoolMode::Or, BoolMode::And] {
+            assert!(
+                r.count("title", "-alpha", mode).is_err(),
+                "negation-only count must error ({mode:?})"
+            );
+            assert!(
+                r.token_match("title", "-alpha", mode).is_err(),
+                "negation-only token_match must error ({mode:?})"
+            );
+        }
+        // No positive anchor across several negated terms either.
+        assert!(r.count("title", "-alpha -beta", BoolMode::Or).is_err());
+        // Token-less queries stay non-error, 0 / empty.
+        assert_eq!(r.count("title", "", BoolMode::Or).expect("empty"), 0);
+        assert!(
+            r.token_match("title", "   ", BoolMode::Or)
+                .expect("blank")
+                .is_empty()
+        );
     }
 
     #[test]
