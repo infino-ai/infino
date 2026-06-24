@@ -87,7 +87,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
     InfinoError,
     superfile::{
-        FtsError, SuperfileReader,
+        SuperfileReader,
         fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
     supertable::{
@@ -101,6 +101,11 @@ use crate::{
         },
     },
 };
+
+/// Rejection message for a query with negated terms but no positive
+/// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
+/// both reject the case identically.
+const NEGATION_ONLY_QUERY_MSG: &str = "only negated terms; at least one positive term is required";
 
 /// Cross-segment top-k score sharing for the BM25 fan-out.
 ///
@@ -225,6 +230,14 @@ impl SupertableReader {
         let parsed = AsciiLowerTokenizer.parse(query);
         let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
+
+        // Negation-only (e.g. `-foo`): no positive anchor to rank. Reject
+        // up front so the per-superfile excluding kernel never has to, and
+        // so the unranked count / token_match path surfaces the identical
+        // error (see `parse_and_prune`).
+        if positives.is_empty() && !negatives.is_empty() {
+            return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
+        }
 
         // Pick the superfiles to search, via the shared two-tier bloom
         // prune. Only positive terms prune — a negated term must never
@@ -450,7 +463,7 @@ impl SupertableReader {
     /// Returns `(positives, negatives, kept)`. A query with no tokens at
     /// all yields an empty `kept`, so the caller returns the empty result
     /// (`[]` / count `0`). A negation-only query (negated terms but no
-    /// positive, e.g. `-foo`) is rejected with [`FtsError::NegationOnly`],
+    /// positive, e.g. `-foo`) is rejected with [`QueryError::InvalidQuery`],
     /// the same as the scored search path — there is no positive anchor to
     /// match against.
     async fn parse_and_prune(
@@ -470,7 +483,7 @@ impl SupertableReader {
             }
             // Negation-only (e.g. `-foo`): reject, matching the scored
             // search path, which has no positive anchor to rank or match.
-            return Err(QueryError::Parquet(FtsError::NegationOnly.to_string()));
+            return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
         }
         let prune_leaf = PruneLeaf::TermPresence {
             column: column.to_owned(),
