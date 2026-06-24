@@ -84,6 +84,54 @@ pub enum OrAlgo {
     /// so BMM/BMW's skip checks rarely trigger and become pure
     /// overhead.
     Exhaustive,
+    /// Windowed union: accumulate each term's contribution into a
+    /// fixed doc-id window (presence bitset + score array), then drain
+    /// in doc order into the top-k heap. Removes the per-doc f-way
+    /// merge; wins when no term dominates and the union is large (the
+    /// MaxScore-can't-prune case).
+    Windowed,
+}
+
+/// Doc-id window for the windowed union scorer. Power of two so the
+/// window base is a cheap mask. At 4096 the per-window state — a
+/// `4096 × f32` score accumulator (16 KiB) plus a `4096`-bit presence
+/// bitset (512 B) — stays L1/L2-resident across the accumulate + drain
+/// passes (matching the horizon both reference designs converge on).
+const OR_WINDOW: u32 = 4096;
+/// Number of 64-bit words in the window presence bitset.
+const OR_WINDOW_WORDS: usize = OR_WINDOW as usize / 64;
+
+/// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
+/// on MaxScore, so the window's per-window bookkeeping isn't worth it
+/// below this many terms.
+const OR_WINDOW_MIN_TERMS: usize = 3;
+/// Route a multi-term OR to the windowed union scorer only when the top
+/// term's score upper bound is at most this multiple of the *average*
+/// term upper bound — i.e. no single term dominates. Uniform terms sit at
+/// ~1.0× the average (MaxScore can't prune them → windowed wins); a
+/// dominant rare term sits well above it (MaxScore prunes hard → it stays
+/// on MaxScore). Calibrated on the 1M tier.
+const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
+
+/// Choose the windowed union scorer over MaxScore+BMM for a multi-term
+/// OR: true when there are enough terms to amortize the window and **no
+/// single term dominates** the score upper bound (so MaxScore's essential
+/// set won't shrink and it degrades to scoring the whole union). Cheap —
+/// the per-term upper bounds are already on the cursors.
+fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
+    if cursors.len() < OR_WINDOW_MIN_TERMS {
+        return false;
+    }
+    let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
+    if total <= 0.0 {
+        return false;
+    }
+    let max = cursors
+        .iter()
+        .map(|c| c.term_max_bm25)
+        .fold(0.0f32, f32::max);
+    let avg = total / cursors.len() as f32;
+    max <= OR_WINDOW_DOMINANCE_MULT * avg
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
@@ -2197,6 +2245,133 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
+    /// Windowed union scorer for multi-term OR (the M1 path for
+    /// uniform-upper-bound / common-term ORs, where MaxScore can't prune
+    /// and degrades to scoring the whole union with per-doc f-way merge
+    /// overhead).
+    ///
+    /// Walks the doc-id space one `OR_WINDOW`-doc window at a time. Within
+    /// a window each cursor streams its postings **sequentially**,
+    /// accumulating its BM25 contribution into `scores[doc - base]` and
+    /// marking a presence bit — no per-doc min-scan across cursors, no
+    /// heap touch during accumulation. The window is then drained in
+    /// ascending doc order (bit-trick over the presence bitset) and each
+    /// distinct matching doc is offered to the top-k heap once. Empty
+    /// windows are skipped (the base jumps to the next live doc), so a
+    /// sparse union costs only its non-empty windows.
+    ///
+    /// **Exact top-k:** same result set/order as [`Self::run_max_score_bmm`]
+    /// — same heap-admission rule (`score > threshold`, floor-seeded), same
+    /// `(score desc, doc asc)` tie-break, docs offered in ascending order.
+    /// The one nuance is summation *order*: contributions are summed
+    /// term-major here vs. per-doc-major in MaxScore, and f32 add is
+    /// non-associative, so a score can differ by ≤1 ULP. Validated against
+    /// the brute-force BM25 oracle; if a boundary tie ever flips, the
+    /// accumulator would move to f64.
+    ///
+    /// Negation: the [`ExcludeFilter`] is applied at **drain** (globally
+    /// ascending → satisfies its monotonic-feed contract), never during the
+    /// term-major accumulation.
+    fn run_windowed_union(
+        &self,
+        column_id: u32,
+        mut cursors: Vec<TermCursor>,
+        k: usize,
+        mut filter: Option<&mut ExcludeFilter>,
+        floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+
+        if doc_id_start > 0 {
+            for c in &mut cursors {
+                c.skip_to(doc_id_start);
+            }
+        }
+
+        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        // Floor-seeded threshold, identical to the MaxScore path.
+        let mut threshold: f32 = floor_eff.max(0.0);
+
+        // Per-window state, allocated once and reused across windows.
+        // Cleared lazily during the drain (only touched slots), so reset
+        // cost is proportional to matches, not to OR_WINDOW.
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
+        let mut present = [0u64; OR_WINDOW_WORDS];
+
+        loop {
+            // Next non-empty window: smallest current doc among live
+            // cursors, aligned down to a window boundary. O(f) per window
+            // (not per doc) — this replaces MaxScore's per-doc min-scan.
+            let mut min_doc = u32::MAX;
+            for c in &cursors {
+                if !c.is_exhausted() {
+                    min_doc = min_doc.min(c.current_doc_id());
+                }
+            }
+            if min_doc == u32::MAX || min_doc >= doc_id_end {
+                break;
+            }
+            let base = min_doc & !(OR_WINDOW - 1);
+            let window_end = (base + OR_WINDOW).min(doc_id_end);
+
+            // Accumulate each cursor's contributions in [base, window_end).
+            // Sequential walk per cursor; `d - base` is in range because
+            // every live cursor sits at `>= min_doc >= base`.
+            for c in &mut cursors {
+                while !c.is_exhausted() {
+                    let d = c.current_doc_id();
+                    if d >= window_end {
+                        break;
+                    }
+                    let local = (d - base) as usize;
+                    scores[local] += bm25::score_with_dl_norm_k1(
+                        c.idf_x_k1p1,
+                        c.current_tf(),
+                        dl_norm_k1[d as usize],
+                    );
+                    present[local >> 6] |= 1u64 << (local & 63);
+                    c.next();
+                }
+            }
+
+            // Drain ascending; clear touched slots for reuse; apply
+            // negation; offer to the heap.
+            for (word_idx, word) in present.iter_mut().enumerate() {
+                let mut bits = *word;
+                *word = 0;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let local = (word_idx << 6) | b;
+                    let score = scores[local];
+                    scores[local] = 0.0;
+                    let doc = base + local as u32;
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(doc)
+                    {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, doc));
+                        if heap.len() == k {
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        }
+                    } else if score > threshold {
+                        heap.pop();
+                        heap.push(TopKEntry(score, doc));
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    }
+                }
+            }
+        }
+
+        Ok(drain_top_k_desc(heap))
+    }
+
     /// Exhaustive union walk for multi-term OR. No threshold-driven
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
@@ -2364,7 +2539,18 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
+        // Route on upper-bound *spread*, not term count: when no single
+        // term dominates, MaxScore's essential set never shrinks and it
+        // degrades to scoring the whole union with per-doc f-way merge
+        // overhead — the windowed union scorer is dramatically faster
+        // there. A dominant-term query stays on MaxScore, which prunes
+        // hard (its block-skip / f→1 fast path); windowing would lose by
+        // scoring every windowed doc.
+        if prefer_windowed_union(&cursors) {
+            self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
+        } else {
+            self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
+        }
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
@@ -2396,6 +2582,9 @@ impl FtsReader {
             OrAlgo::Bmm => self.run_max_score_bmm(column_id, cursors, k, None, f32::NEG_INFINITY),
             OrAlgo::WandBmw => self.run_wand_bmw(column_id, cursors, k),
             OrAlgo::Exhaustive => self.run_exhaustive_union(column_id, cursors, k),
+            OrAlgo::Windowed => {
+                self.run_windowed_union(column_id, cursors, k, None, f32::NEG_INFINITY, 0, u32::MAX)
+            }
         }
     }
 }
@@ -4183,6 +4372,65 @@ mod tests {
         for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
             assert_eq!(dw, db, "doc_id mismatch wand={dw} bmm={db}");
             assert!((sw - sb).abs() < 1e-4, "score mismatch {sw} vs {sb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_union_agrees_with_bmm() {
+        // The windowed union scorer (M1) must return the identical top-k as
+        // the production MaxScore+BMM path — across term counts, k values,
+        // and the uniform-UB (common-term) shape it targets. Multi-block
+        // lists (N_DOCS well over BLOCK_LEN=128) so the walk crosses both
+        // posting-block and OR_WINDOW boundaries.
+        const N_DOCS: u32 = 400;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha "); // ~every doc
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 7 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: &[&[&str]] = &[
+            &["alpha", "beta"],
+            &["alpha", "beta", "gamma"],
+            &["beta", "gamma", "delta"], // no single dominator
+            &["alpha", "beta", "gamma", "delta", "epsilon"],
+        ];
+        for terms in shapes {
+            for k in [1usize, 5, 50, 1000] {
+                let bmm = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Bmm)
+                    .await
+                    .expect("bmm");
+                let win = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Windowed)
+                    .await
+                    .expect("windowed");
+                assert_eq!(bmm.len(), win.len(), "len mismatch {terms:?} k={k}");
+                for ((db, sb), (dw, sw)) in bmm.iter().zip(win.iter()) {
+                    assert_eq!(db, dw, "doc_id mismatch {terms:?} k={k}: bmm={db} win={dw}");
+                    assert!(
+                        (sb - sw).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sb} vs {sw}"
+                    );
+                }
+            }
         }
     }
 
