@@ -163,27 +163,93 @@ fn filter_superfiles_by_cells(
         .collect()
 }
 
-/// Whether every hit already references a superfile in the user manifest
-/// (flat view or list parts — same source as query fan-out).
-async fn hits_reference_user_superfiles(
-    reader: &SupertableReader,
+/// Split hits into those already on the user table vs hidden-index hits
+/// that still need remap. Mixed fan-out (user-table fallback alongside
+/// hidden-index probes) is classified per hit instead of all-or-nothing.
+async fn partition_hits_by_table(
+    user_reader: &SupertableReader,
     hits: &[SuperfileHit],
-) -> Result<bool, QueryError> {
+) -> Result<(Vec<SuperfileHit>, Vec<SuperfileHit>), QueryError> {
     if hits.is_empty() {
-        return Ok(true);
+        return Ok((Vec::new(), Vec::new()));
     }
-    let manifest = reader.manifest();
+    let user_manifest = user_reader.manifest();
+    let hidden_manifest = user_reader
+        .vector_index_table()
+        .map(|vit| Arc::clone(vit.reader().manifest()));
+    let hidden_has_data = hidden_manifest.as_ref().is_some_and(|m| {
+        !m.superfiles.is_empty() || m.get_num_parts() > 0
+    });
+    let mut on_user = Vec::new();
+    let mut on_hidden = Vec::new();
     for hit in hits {
-        if manifest
+        if user_manifest
             .lookup_superfile_entry(hit.superfile)
             .await
             .map_err(QueryError::ManifestLoad)?
-            .is_none()
+            .is_some()
         {
-            return Ok(false);
+            on_user.push(*hit);
+            continue;
+        }
+        if hidden_has_data {
+            let hidden_manifest = hidden_manifest.as_ref().expect("checked above");
+            if hidden_manifest
+                .lookup_superfile_entry(hit.superfile)
+                .await
+                .map_err(QueryError::ManifestLoad)?
+                .is_some()
+            {
+                on_hidden.push(*hit);
+                continue;
+            }
+        }
+        return Err(QueryError::Execute(format!(
+            "hit superfile {:?} missing from user and hidden manifests",
+            hit.superfile
+        )));
+    }
+    Ok((on_user, on_hidden))
+}
+
+/// Resolve the user-table superfile that owns `user_row_id` (flat view
+/// first, then list parts — same source as query fan-out).
+async fn lookup_user_superfile_by_id(
+    manifest: &Manifest,
+    user_row_id: i128,
+) -> Result<Arc<SuperfileEntry>, QueryError> {
+    if let Some(entry) = manifest
+        .superfiles
+        .iter()
+        .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
+    {
+        return Ok(Arc::clone(entry));
+    }
+    let part_entries = manifest.get_all_list_entries();
+    if part_entries.is_empty() {
+        return Err(QueryError::Execute(format!(
+            "no user superfile owns id {user_row_id}"
+        )));
+    }
+    for part_entry in part_entries {
+        if user_row_id < part_entry.id_range.0 || user_row_id > part_entry.id_range.1 {
+            continue;
+        }
+        let part = manifest
+            .get_part_by_id(part_entry.part_id)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if let Some(entry) = part
+            .superfiles
+            .iter()
+            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
+        {
+            return Ok(Arc::clone(entry));
         }
     }
-    Ok(true)
+    Err(QueryError::Execute(format!(
+        "no user superfile owns id {user_row_id}"
+    )))
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
@@ -425,14 +491,9 @@ async fn remap_hidden_hits_to_user_hits(
     let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for (i, &user_row_id) in user_ids.iter().enumerate() {
-        let user_entry = user_manifest
-            .superfiles
-            .iter()
-            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
-            .ok_or_else(|| {
-                QueryError::Execute(format!("no user superfile owns id {user_row_id}"))
-            })?;
-        if row_id_from_manifest_entry(user_entry, 0).is_some() {
+        let user_entry =
+            lookup_user_superfile_by_id(user_manifest, user_row_id).await?;
+        if row_id_from_manifest_entry(&user_entry, 0).is_some() {
             // Contiguous span (single-append): invert `id_min + local`.
             let local = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
                 QueryError::Execute(format!("local_doc_id out of range for id {user_row_id}"))
@@ -1083,16 +1144,16 @@ impl SupertableReader {
                     let hits = self
                         .vector_search_global_index_async(column, query, k, options)
                         .await?;
-                    let on_user_table = hits.is_empty()
-                        || hits_reference_user_superfiles(self, &hits).await?;
-                    if projection.is_none() && !on_user_table {
-                        let batch = hidden_hits_id_score_batch(self, &hits).await?;
+                    let (on_user, on_hidden) = partition_hits_by_table(self, &hits).await?;
+                    if projection.is_none() && on_user.is_empty() && !on_hidden.is_empty() {
+                        let batch = hidden_hits_id_score_batch(self, &on_hidden).await?;
                         return Ok(vec![batch]);
                     }
-                    if on_user_table {
-                        hits
+                    if on_hidden.is_empty() {
+                        on_user
                     } else {
-                        remap_hidden_hits_to_user_hits(self, &hits).await?
+                        let remapped = remap_hidden_hits_to_user_hits(self, &on_hidden).await?;
+                        top_k_ascending(vec![on_user, remapped], k)
                     }
                 }
                 Some(f) => {
@@ -1123,10 +1184,12 @@ impl SupertableReader {
                 let hits = self
                     .vector_search_global_index_async(column, query, k, options)
                     .await?;
-                if hits_reference_user_superfiles(self, &hits).await? {
-                    Ok(hits)
+                let (on_user, on_hidden) = partition_hits_by_table(self, &hits).await?;
+                if on_hidden.is_empty() {
+                    Ok(on_user)
                 } else {
-                    remap_hidden_hits_to_user_hits(self, &hits).await
+                    let remapped = remap_hidden_hits_to_user_hits(self, &on_hidden).await?;
+                    Ok(top_k_ascending(vec![on_user, remapped], k))
                 }
             }),
             Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
