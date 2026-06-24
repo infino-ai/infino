@@ -258,6 +258,19 @@ async fn read_ids_for_locals(
     {
         return Ok(ids);
     }
+    // Cold path: the region is present but not resident (the search fetched
+    // centroids/cluster_idx + blocks, never the region). Fetch it async and
+    // index it — far cheaper than the scalar `_id` decode below, and the path
+    // the inline-`_id` region was built for. (Warm hits the sync branch above.)
+    if let Some(v) = reader.vec() {
+        if let Some(ids) = v
+            .inline_stable_ids_for_locals_async(local_ids)
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        {
+            return Ok(ids);
+        }
+    }
     if reader.parquet_bytes().is_some() {
         let batch = reader
             .take_by_local_doc_ids(local_ids, &[id_column])

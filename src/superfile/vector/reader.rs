@@ -1263,6 +1263,52 @@ impl VectorReader {
         Some(out)
     }
 
+    /// Async sibling of [`Self::inline_stable_ids_for_locals`] for the COLD
+    /// path: when the inline `_id` region is present but **not resident** (a
+    /// freshly-opened lazy reader — the search fetches centroids/cluster_idx
+    /// and the per-cluster blocks, but never the region that sits between
+    /// codec_meta and those blocks), the sync version returns `None` and the
+    /// caller falls back to a scalar `_id` parquet decode. This variant
+    /// `range_async`-fetches the region (one small contiguous read,
+    /// `i128 × n_docs`) and indexes it — far cheaper than decoding the scalar
+    /// `_id` pages, and the path the inline-`_id` region was built for.
+    /// Returns `Ok(None)` when the column has no region (caller then uses the
+    /// scalar column).
+    pub(crate) async fn inline_stable_ids_for_locals_async(
+        &self,
+        locals: &[u32],
+    ) -> Result<Option<Vec<i128>>, VectorError> {
+        let Some(col) = self.columns.iter().find(|c| c.has_inline_stable_ids()) else {
+            return Ok(None);
+        };
+        let Some(range) = col.stable_ids_region_range() else {
+            return Ok(None);
+        };
+        let region = self
+            .source
+            .range_async(range)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let mut out = Vec::with_capacity(locals.len());
+        for &local in locals {
+            let p = (local as usize) * format::vec::STABLE_ID_BYTES;
+            let end = p + format::vec::STABLE_ID_BYTES;
+            if end > region.len() {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "inline stable_id region: local {local} out of range ({} bytes)",
+                    region.len()
+                ))));
+            }
+            let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end]
+                .try_into()
+                .map_err(|_| VectorError::Read(ReadError::MalformedVersion(
+                    "inline stable_id region slice".into(),
+                )))?;
+            out.push(i128::from_le_bytes(arr));
+        }
+        Ok(Some(out))
+    }
+
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
     pub(crate) fn sq8_ivf_merge_input(
         &self,
