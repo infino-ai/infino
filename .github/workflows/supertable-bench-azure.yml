@@ -6,12 +6,12 @@ name: Benchmark (Azure)
 # in Azure Blob — shared across branches — runs the bench, and is torn
 # down.
 #
-# PR runs are A/B: both the PR ref and the base `main` are built and run on
+# Benchmarks are A/B: both the PR ref and the base `main` are built and run on
 # the *same* VM, and the PR is compared against that same-host main arm. This
 # cancels the cross-host / noisy-neighbour / frequency variance a stored
-# baseline carries — the deltas reflect the code change, not the machine.
-# Baseline (push-to-main) runs build and run a single arm and publish it as
-# the stored baseline + per-commit history for the main time series.
+# baseline would carry — the deltas reflect the code change, not the machine.
+# Both arms run here, so the comparison data is always produced locally; nothing
+# is read from or written to object storage except the sccache compile cache.
 
 on:
   workflow_dispatch:
@@ -55,11 +55,6 @@ on:
         # single-arm and finish well under this.
         default: "60"
         type: string
-      update_baseline:
-        description: "Publish this run as the main baseline + history (main only)."
-        required: false
-        default: false
-        type: boolean
       skip_calibration:
         description: "Vector only: skip recall calibration, report fixed-config cold latency (no recall gate)."
         required: false
@@ -89,9 +84,6 @@ on:
       # Discriminator appended to resource names so parallel callers
       # (e.g. matrix legs sharing one run_id) don't collide / cross-delete.
       name_suffix:     { type: string, required: false, default: "" }
-      # On main: publish the run as the baseline pointer + per-commit
-      # history. On a PR: false — restore main's baseline and diff against it.
-      update_baseline: { type: boolean, required: false, default: false }
       # Vector only: skip recall calibration, fixed-config cold latency only.
       skip_calibration: { type: boolean, required: false, default: false }
       # PR to post the sticky results comment on. Blank ⇒ summary only.
@@ -274,7 +266,6 @@ jobs:
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              REF='${{ inputs.ref }}' \
-             UPDATE_BASELINE='${{ inputs.update_baseline }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -312,14 +303,12 @@ jobs:
 
           # A/B: also build the base (main) arm on this same VM, so the PR is
           # compared against a baseline measured here-and-now (same host,
-          # neighbours, frequency) rather than a stored cross-host one. Skipped
-          # on baseline (push) runs, which only establish main's own numbers.
-          if [ "$UPDATE_BASELINE" != "true" ]; then
-            git fetch --depth 1 origin main
-            build_arm FETCH_HEAD "$HOME/bench-main"
-            git checkout "$REF" 2>/dev/null \
-              || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
-          fi
+          # neighbours, frequency) rather than a stored cross-host one. Restore
+          # the PR checkout afterwards so the run step's cwd matches the PR ref.
+          git fetch --depth 1 origin main
+          build_arm FETCH_HEAD "$HOME/bench-main"
+          git checkout "$REF" 2>/dev/null \
+            || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
           sccache --show-stats || true
           REMOTE
 
@@ -329,7 +318,6 @@ jobs:
       # CPU frequency, which cancels the cross-host noise a stored baseline
       # carries. Skipped on baseline (push) runs, which want a clean baseline.
       - name: Same-host baseline (A/B main arm)
-        if: ${{ !inputs.update_baseline }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
@@ -398,56 +386,6 @@ jobs:
           "$BIN" $BENCH_ARGS 2>&1
           echo "===== BENCH ${BENCH_ARGS} END ====="
           REMOTE
-
-      # Publish the metrics as the latest-main pointer (overwritten, what PRs
-      # diff against) plus an immutable per-commit history blob retained for
-      # archival. Runs only on a successful bench, so a broken run never
-      # poisons it.
-      - name: Publish baseline + history
-        # success() is implicit, but explicit here: never publish from a
-        # failed/partial bench run.
-        if: ${{ inputs.update_baseline && success() }}
-        env:
-          ACC: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
-          KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
-          CONTAINER: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
-          VM_SIZE: ${{ inputs.vm_size }}
-          DOCS: ${{ inputs.docs }}
-          REPORTS: ${{ steps.resolve.outputs.reports }}
-        run: |
-          set -euo pipefail
-          VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          # Commit identity from the VM checkout: sha keys the history blob,
-          # commit time (unix s) rides as metadata for chronological sorting.
-          meta="$(ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
-            'cd infino-src && git rev-parse --short HEAD && git show -s --format=%ct HEAD')"
-          SHA="$(echo "$meta" | sed -n 1p)"
-          TS="$(echo "$meta" | sed -n 2p)"
-          for j in $REPORTS; do
-            scp -o StrictHostKeyChecking=no \
-              "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "${j}.json" \
-              || { echo "::warning::no metrics for $j — skipping"; continue; }
-
-            # Informational: warn on a real az failure rather than failing the
-            # whole run (az already retries transient storage errors itself).
-            az storage blob upload --overwrite --account-name "$ACC" --account-key "$KEY" \
-              -c "$CONTAINER" -n "bench/${j}/baseline/${VM_SIZE}-${DOCS}.json" -f "${j}.json" \
-              || { echo "::warning::baseline upload failed for $j — skipping"; continue; }
-
-            # History is immutable per commit. Check existence explicitly so a
-            # genuine az error isn't silently mistaken for "already written".
-            hist="bench/${j}/history/${VM_SIZE}-${DOCS}-${SHA}.json"
-            if [ "$(az storage blob exists --account-name "$ACC" --account-key "$KEY" \
-                      -c "$CONTAINER" -n "$hist" --query exists -o tsv 2>/dev/null)" = "true" ]; then
-              echo "::notice::history for $j ($SHA) already exists — skipping"
-            else
-              az storage blob upload --account-name "$ACC" --account-key "$KEY" \
-                -c "$CONTAINER" -n "$hist" -f "${j}.json" \
-                --metadata "sha=${SHA}" "ts=${TS}" "ref=main" \
-                || echo "::warning::history upload failed for $j ($SHA)"
-            fi
-            echo "published: $j ($SHA)"
-          done
 
       - name: Summarize results
         if: ${{ !cancelled() }}
