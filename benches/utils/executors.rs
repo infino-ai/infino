@@ -1947,3 +1947,61 @@ pub mod sql {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    use super::{repeat_cleanest, sample_batched, summarize};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn summarize_picks_min_median_p90() {
+        let mut s = [ms(5), ms(1), ms(3), ms(2), ms(4)];
+        let out = summarize(&mut s);
+        assert_eq!(out.min, ms(1));
+        assert_eq!(out.p50, ms(3)); // lower-median of 5
+        assert_eq!(out.p90, ms(5)); // nearest-rank ceil(0.9*5)=5
+    }
+
+    #[test]
+    fn summarize_single_and_empty() {
+        assert_eq!(summarize(&mut [ms(7)]).p90, ms(7));
+        let z = summarize(&mut []);
+        assert_eq!((z.min, z.p50, z.p90), (ms(0), ms(0), ms(0)));
+    }
+
+    #[test]
+    fn repeat_cleanest_keeps_min_per_item_in_order() {
+        // per item, per round latency; cleanest round = the min.
+        let table = [
+            [ms(5), ms(1), ms(9)],
+            [ms(3), ms(3), ms(3)],
+            [ms(8), ms(2), ms(7)],
+        ];
+        let items = [0usize, 1, 2];
+        let calls = Cell::new(0);
+        let out = repeat_cleanest(
+            3,
+            &items,
+            |i| {
+                let k = calls.get();
+                calls.set(k + 1);
+                table[*i][k / items.len()] // round = call / n_items
+            },
+            |d| *d,
+        );
+        assert_eq!(out, vec![ms(1), ms(3), ms(2)]);
+        assert_eq!(calls.get(), 9); // 3 items × 3 rounds
+    }
+
+    #[test]
+    fn sample_batched_returns_requested_count() {
+        let s = sample_batched(8, || std::hint::black_box(1 + 1));
+        assert_eq!(s.len(), 8);
+    }
+}
