@@ -39,7 +39,10 @@ use crate::{
         shutdown_query_runtime_on_drop,
     },
     storage::PrefixedStorageProvider,
-    superfile::vector::kmeans::kmeans,
+    superfile::vector::{
+        distance::Metric,
+        kmeans::kmeans,
+    },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
@@ -948,6 +951,7 @@ pub(crate) fn train_global_centroids(
         GLOBAL_VECTOR_KMEANS_SEED,
     );
     Some(super::manifest::ClusterCentroids::from_fp32(
+        Metric::L2Sq,
         n as u32,
         dim as u32,
         &centroids,
@@ -1014,7 +1018,7 @@ fn build_vector_index_options(
         .vector_columns
         .iter()
         .map(|vc| crate::superfile::builder::VectorConfig {
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
             ..vc.clone()
         })
         .collect();

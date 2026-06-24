@@ -32,10 +32,11 @@
 //! [`ManifestList`]: super::list::ManifestList
 //! [`ManifestListEntry`]: super::list::ManifestListEntry
 
+#[cfg(test)]
+use crate::supertable::manifest::encoding::decode_centroid_envelope;
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::manifest::{
-        encoding::{decode_centroid_envelope, l2_distance},
         list::{ManifestList, ManifestPartEntry},
         part::PartId,
     },
@@ -190,47 +191,12 @@ pub fn prune_parts_for_id_range(
         .collect()
 }
 
-/// Filter parts whose `vector_summary_agg[column]` envelope
-/// can possibly contain a vector within `query_cutoff` of
-/// `query`. Conservative: a part survives iff
-/// `distance(query, envelope_center) ≤ envelope_radius +
-/// query_cutoff`. Parts with no vector summary for this
-/// column survive (no info).
-///
-/// Distance is L2; for cosine workloads, the query vector + centroids
-/// should be normalized at the caller layer (matching the convention the
-/// superfile-level vector skip already uses).
-pub fn prune_parts_for_vector(
-    list: &ManifestList,
-    column: &str,
-    query: &[f32],
-    query_cutoff: f32,
-) -> Vec<PartId> {
-    list.parts
-        .iter()
-        .filter_map(|entry| {
-            let Some(agg) = entry.vector_summary_agg.get(column) else {
-                return Some(entry.part_id);
-            };
-            if agg.centroid_envelope.is_empty() {
-                // Empty envelope — no info; keep.
-                return Some(entry.part_id);
-            }
-            let envelope = decode_centroid_envelope(&agg.centroid_envelope);
-            if envelope.len() != query.len() {
-                // Dim mismatch — keep (the per-superfile prune
-                // will reject correctly).
-                return Some(entry.part_id);
-            }
-            let dist = l2_distance(query, &envelope);
-            if dist <= agg.envelope_radius + query_cutoff {
-                Some(entry.part_id)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
+// The fp32 centroid-envelope part scan (`prune_parts_for_vector`) is gone:
+// OPANN routes vector queries through the resident routing tree
+// (`SupertableReader::vector_search_user_table_async`), so part selection by
+// vector distance is the tree's job, not a manifest-list envelope scan. The
+// remaining vector paths enumerate the full superfile set
+// (`Manifest::get_pruned_superfiles_for_vector`).
 
 #[cfg(test)]
 mod tests {
@@ -240,6 +206,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::superfile::vector::distance::Metric;
     use crate::supertable::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         manifest::{
@@ -300,7 +267,7 @@ mod tests {
             vec_summary.insert(
                 "emb".into(),
                 VectorSummary {
-                    centroid: c,
+                    centroid: ClusterCentroids::single(Metric::L2Sq, &c),
                     radius: vec_radius,
                     clusters: ClusterCentroids::empty(),
                 },
@@ -470,16 +437,14 @@ mod tests {
             "envelope radius must dominate each seg ball; got {}",
             v.envelope_radius
         );
-        let decoded: Vec<f32> = v
-            .centroid_envelope
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // The envelope center is stored Sq8+residual; decode it through the
+        // codec, and allow one quantization step of error vs the true mean.
+        let decoded = decode_centroid_envelope(&v.centroid_envelope);
         assert_eq!(decoded.len(), 3);
         for (i, x) in decoded.iter().enumerate() {
             assert!(
-                (x - mean[i]).abs() < 1e-5,
-                "envelope[{}]={} expected {}",
+                (x - mean[i]).abs() < 0.05,
+                "envelope[{}]={} expected ~{}",
                 i,
                 x,
                 mean[i]
@@ -602,30 +567,6 @@ mod tests {
         let list = list_with(vec![part.clone()]);
         let survivors = prune_parts_for_fts_prefix(&list, "missing", b"any");
         assert_eq!(survivors, vec![part.part_id]);
-    }
-
-    #[test]
-    fn prune_parts_for_vector_filters_far_parts() {
-        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)], 0);
-        let part_b =
-            entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)], 1);
-        let list = list_with(vec![part_a.clone(), part_b]);
-        let survivors = prune_parts_for_vector(&list, "emb", &[10.0, 0.0, 0.0], 1.0);
-        assert_eq!(survivors.len(), 1);
-        assert_eq!(survivors[0], part_a.part_id);
-    }
-
-    #[test]
-    fn prune_parts_for_vector_keeps_overlapping_envelope() {
-        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)], 0);
-        let part_b = entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)], 1);
-        let list = list_with(vec![part_a, part_b]);
-        let survivors = prune_parts_for_vector(&list, "emb", &[0.0, 0.0, 0.0], 1.0);
-        assert_eq!(
-            survivors.len(),
-            2,
-            "both envelopes contain origin within cutoff"
-        );
     }
 
     #[test]

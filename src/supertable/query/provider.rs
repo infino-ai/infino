@@ -17,8 +17,7 @@
 //!      [`scalar_skip`] against each superfile's persisted
 //!      `scalar_stats` min/max. Definitely-irrelevant superfiles
 //!      are dropped before any bytes are decoded. This is the same
-//!      manifest-level skip philosophy as `fts_bloom_skip` /
-//!      `vector_centroid_skip`.
+//!      manifest-level skip philosophy as `fts_bloom_skip`.
 //!   2. **Row-group / page skip (DataFusion).** The surviving
 //!      superfiles' Parquet bytes are exposed to a DataFusion
 //!      `ParquetSource` via an in-memory object store. The same

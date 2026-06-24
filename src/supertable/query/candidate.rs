@@ -48,9 +48,16 @@ use datafusion::{
 use futures::future::BoxFuture;
 use roaring::RoaringBitmap;
 
-use crate::superfile::{
-    ReadError, SuperfileReader,
-    fts::{reader::BoolMode, tokenize::Tokenizer},
+use crate::{
+    superfile::{
+        ReadError, SuperfileReader,
+        fts::{reader::BoolMode, tokenize::Tokenizer},
+    },
+    supertable::{
+        error::QueryError,
+        manifest::Manifest,
+        query::prune::{PruneLeaf, select_superfiles},
+    },
 };
 
 /// A superfile-independent boolean plan over FTS term retrievals, lowered
@@ -150,6 +157,88 @@ impl CandidatePlan {
 }
 
 impl CandidatePlan {
+    /// Manifest-only superfile survival gate for this plan: the superfile
+    /// ids that *could* match according to term blooms. `None` means no
+    /// gate — the plan is [`Unbounded`], contains an `OR`, or otherwise
+    /// cannot be expressed as a conjunction of bloom leaves.
+    pub(crate) async fn surviving_superfile_ids(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Option<HashSet<u128>>, QueryError> {
+        let mut groups = Vec::new();
+        if !self.collect_survival_or_groups(&mut groups) {
+            return Ok(None);
+        }
+        if groups.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let mut acc = HashSet::new();
+        for leaves in groups {
+            if leaves.is_empty() {
+                continue;
+            }
+            acc.extend(
+                select_superfiles(manifest, &leaves)
+                    .await?
+                    .iter()
+                    .map(|e| e.superfile_id.as_u128()),
+            );
+        }
+        Ok(Some(acc))
+    }
+
+    /// Flatten this plan into one bloom-conjunction group per `OR` branch.
+    fn collect_survival_or_groups(&self, groups: &mut Vec<Vec<PruneLeaf>>) -> bool {
+        match self {
+            CandidatePlan::Or(children) => children
+                .iter()
+                .all(|child| child.collect_survival_or_branch(groups)),
+            other => other.collect_survival_or_branch(groups),
+        }
+    }
+
+    /// Append one `OR` branch as a single conjunctive leaf group.
+    fn collect_survival_or_branch(&self, groups: &mut Vec<Vec<PruneLeaf>>) -> bool {
+        match self {
+            CandidatePlan::Unbounded => false,
+            CandidatePlan::Or(children) => children
+                .iter()
+                .all(|child| child.collect_survival_or_branch(groups)),
+            other => {
+                let mut leaves = Vec::new();
+                if !other.append_prune_leaves(&mut leaves) {
+                    return false;
+                }
+                groups.push(leaves);
+                true
+            }
+        }
+    }
+
+    /// Append conjunctive [`PruneLeaf`]s for this subtree. Returns `false`
+    /// when the subtree contains an `OR` (not expressible as one bloom
+    /// conjunction).
+    fn append_prune_leaves(&self, leaves: &mut Vec<PruneLeaf>) -> bool {
+        match self {
+            CandidatePlan::Unbounded => true,
+            CandidatePlan::TermsAll { column, tokens } => {
+                if tokens.is_empty() {
+                    return true;
+                }
+                leaves.push(PruneLeaf::TermPresence {
+                    column: column.clone(),
+                    terms: tokens.clone(),
+                    mode: BoolMode::And,
+                });
+                true
+            }
+            CandidatePlan::And(children) => children
+                .iter()
+                .all(|child| child.append_prune_leaves(leaves)),
+            CandidatePlan::Or(_) => false,
+        }
+    }
+
     /// Cheap upper-bound estimate of how many rows this plan would match
     /// in `reader`'s superfile, computed from per-term `df` only (no
     /// `token_match`, no posting decode). The bound follows the boolean

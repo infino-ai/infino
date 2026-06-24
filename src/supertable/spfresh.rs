@@ -26,7 +26,7 @@ use std::{cmp::Ordering, collections::HashMap, env, sync::OnceLock};
 use crate::{
     superfile::vector::{
         cell_posting::{EncodedCellRow, manifest_centroid_components_from_row, medoid_index_by},
-        distance::{Metric, distance_encoded_to_centroid},
+        distance::Metric,
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -97,29 +97,20 @@ fn score_row_against_cell(
     row: &EncodedCellRow,
 ) -> f32 {
     let dim = clusters.dim as usize;
-    distance_encoded_to_centroid(
-        metric,
-        dim,
-        &row.scale,
-        &row.offset,
-        &row.codes,
-        &row.residuals,
-        row.norm_sq,
-        clusters.mins[cell],
-        clusters.scales[cell],
-        &clusters.codes[cell * dim..(cell + 1) * dim],
-    )
+    let fp32 = manifest_centroid_components_from_row(row, dim);
+    clusters.score_one(metric, cell, &fp32)
 }
 
 /// Build a one-cluster [`ClusterCentroids`] prototype from a stored Sq8+ε row so
 /// row↔row distances reuse the same asymmetric kernel as query scoring.
 fn centroid_prototype_from_row(
     template: &ClusterCentroids,
+    metric: Metric,
     row: &EncodedCellRow,
 ) -> ClusterCentroids {
     let dim = template.dim as usize;
     let fp32 = manifest_centroid_components_from_row(row, dim);
-    ClusterCentroids::from_fp32(1, template.dim, &fp32, vec![1])
+    ClusterCentroids::from_fp32(metric, 1, template.dim, &fp32, vec![1])
 }
 
 fn distance_encoded_rows(
@@ -128,7 +119,7 @@ fn distance_encoded_rows(
     a: &EncodedCellRow,
     b: &EncodedCellRow,
 ) -> f32 {
-    let proto = centroid_prototype_from_row(template, b);
+    let proto = centroid_prototype_from_row(template, metric, b);
     score_row_against_cell(&proto, metric, 0, a)
 }
 
@@ -171,8 +162,8 @@ pub(crate) fn plan_sq8_split(
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    let mut cent0 = centroid_prototype_from_row(clusters, &rows[seed0]);
-    let mut cent1 = centroid_prototype_from_row(clusters, &rows[seed1]);
+    let mut cent0 = centroid_prototype_from_row(clusters, metric, &rows[seed0]);
+    let mut cent1 = centroid_prototype_from_row(clusters, metric, &rows[seed1]);
 
     let mut assign = vec![0u8; rows.len()];
     for _ in 0..CELL_SPLIT_KMEANS_ITERS {
@@ -195,8 +186,8 @@ pub(crate) fn plan_sq8_split(
         }
         let m0 = medoid_index(clusters, metric, &shard0);
         let m1 = medoid_index(clusters, metric, &shard1);
-        cent0 = centroid_prototype_from_row(clusters, &shard0[m0]);
-        cent1 = centroid_prototype_from_row(clusters, &shard1[m1]);
+        cent0 = centroid_prototype_from_row(clusters, metric, &shard0[m0]);
+        cent1 = centroid_prototype_from_row(clusters, metric, &shard1[m1]);
     }
 
     // Re-assign against the converged centroids: the loop's last `assign` pass
@@ -290,6 +281,7 @@ pub(crate) fn nearest_among_cells_encoded(
 /// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.
 pub(crate) fn insert_split_centroid(
     base: &ClusterCentroids,
+    metric: Metric,
     cell_id: u32,
     sub_centroids: &[f32],
 ) -> (ClusterCentroids, u32) {
@@ -314,8 +306,8 @@ pub(crate) fn insert_split_centroid(
     };
     radii.resize(new_n, 0.0);
 
-    let updated =
-        ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts).with_radii(radii);
+    let updated = ClusterCentroids::from_fp32(metric, new_n as u32, base.dim, &fp32, counts)
+        .with_radii(radii);
     (updated, new_cell_id)
 }
 
@@ -368,7 +360,7 @@ mod tests {
             }
         }
         let counts = vec![100; nc];
-        ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
+        ClusterCentroids::from_fp32(Metric::L2Sq, n_cent, dim, &fp32, counts)
     }
 
     fn synth_rows(dim: usize, n: usize, offset: f32) -> Vec<EncodedCellRow> {
@@ -391,7 +383,7 @@ mod tests {
         let sub = vec![
             0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8,
         ];
-        let (updated, new_id) = insert_split_centroid(&base, 2, &sub);
+        let (updated, new_id) = insert_split_centroid(&base, Metric::L2Sq, 2, &sub);
         assert_eq!(new_id, 4);
         assert_eq!(updated.n_cent, 5);
     }
