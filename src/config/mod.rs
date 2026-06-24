@@ -36,6 +36,7 @@
 use std::{
     env, fmt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use figment::{
@@ -163,6 +164,9 @@ impl Default for CompactionSettings {
         }
     }
 }
+
+/// Minimum age an unreferenced object must reach before [`crate::Supertable::optimize`] deletes it.
+pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
 /// Options for [`crate::Supertable::optimize`].
 ///

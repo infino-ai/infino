@@ -45,6 +45,8 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ColdFetchMode
 pub enum infino::GcError
 pub infino::GcError::NoStorage
 pub infino::GcError::Storage(infino::storage::StorageError)
+impl core::convert::From<infino::GcError> for infino::OptimizeError
+pub fn infino::OptimizeError::from(infino::GcError) -> Self
 impl core::error::Error for infino::GcError
 pub fn infino::GcError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for infino::GcError
@@ -103,6 +105,7 @@ pub infino::OptimizeError::AlreadyRunning
 pub infino::OptimizeError::Build(alloc::string::String)
 pub infino::OptimizeError::Commit(alloc::string::String)
 pub infino::OptimizeError::EmptyMergedSuperfile
+pub infino::OptimizeError::Gc(infino::GcError)
 pub infino::OptimizeError::NoStorage
 pub infino::OptimizeError::Refresh(alloc::string::String)
 pub infino::OptimizeError::Seal(alloc::string::String)
@@ -110,7 +113,10 @@ pub infino::OptimizeError::SidecarConflict
 pub infino::OptimizeError::SidecarConflict::existing_compaction_id: uuid::Uuid
 pub infino::OptimizeError::SidecarConflict::superfile_id: uuid::Uuid
 pub infino::OptimizeError::SuperfileNotFound(uuid::Uuid)
+impl core::convert::From<infino::GcError> for infino::OptimizeError
+pub fn infino::OptimizeError::from(infino::GcError) -> Self
 impl core::error::Error for infino::OptimizeError
+pub fn infino::OptimizeError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for infino::OptimizeError
 pub fn infino::OptimizeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for infino::OptimizeError
@@ -120,8 +126,8 @@ impl core::marker::Send for infino::OptimizeError
 impl core::marker::Sync for infino::OptimizeError
 impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
-impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
-impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
+impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
+impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
 pub struct infino::CompactionSettings
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
