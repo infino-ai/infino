@@ -161,7 +161,7 @@ pub mod fts {
     use crate::{
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, PeakSampler, RssStats},
     };
 
@@ -563,20 +563,20 @@ pub mod fts {
                 let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
                 vec![
                     metric(min_ns, fmt_time(min_ns), Better::Lower),
-                    metric(p50_ns, fmt_time(p50_ns), Better::Lower),
-                    metric(p90_ns, fmt_time(p90_ns), Better::Lower),
-                    metric(fetched_ns, fmt_time(fetched_ns), Better::Lower),
+                    context(p50_ns, fmt_time(p50_ns), Better::Lower),
+                    context(p90_ns, fmt_time(p90_ns), Better::Lower),
+                    context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                     metric(
                         q.rss.peak_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.peak_rss_bytes),
                         Better::Lower,
                     ),
-                    metric(
+                    context(
                         q.rss.median_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.median_rss_bytes),
                         Better::Lower,
                     ),
-                    metric(
+                    context(
                         q.rss.p90_rss_bytes as f64,
                         rss::fmt_bytes(q.rss.p90_rss_bytes),
                         Better::Lower,
@@ -609,7 +609,7 @@ pub mod fts {
                 Some(t) => {
                     let open_ns = t.open.as_secs_f64() * NS_PER_SEC;
                     let search_ns = t.search.as_secs_f64() * NS_PER_SEC;
-                    cells.push(metric(open_ns, fmt_time(open_ns), Better::Lower));
+                    cells.push(context(open_ns, fmt_time(open_ns), Better::Lower));
                     cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
                 }
                 None => {
@@ -687,8 +687,8 @@ pub mod fts {
                         let b = bmm.as_secs_f64() * NS_PER_SEC;
                         vec![
                             text(*shape),
-                            metric(w, fmt_time(w), Better::Lower),
-                            metric(b, fmt_time(b), Better::Lower),
+                            context(w, fmt_time(w), Better::Lower),
+                            context(b, fmt_time(b), Better::Lower),
                         ]
                     })
                     .collect(),
@@ -750,7 +750,7 @@ pub mod fts {
                 vec![
                     text(name),
                     text(fmt_count(c.n as usize)),
-                    metric(ns, fmt_time(ns), Better::Lower),
+                    context(ns, fmt_time(ns), Better::Lower),
                 ]
             }
             None => vec![text(name), text("—"), text("—")],
@@ -804,7 +804,7 @@ pub mod vector {
     use crate::{
         corpus::{self, Calibrated},
         markdown::fmt_time,
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, PeakSampler, RssStats},
     };
 
@@ -1205,6 +1205,8 @@ pub mod vector {
         pub cold: Option<ColdTiming>,
     }
 
+    /// Gate time cell (Δ-tracked). Use for the headline latency (warm min,
+    /// cold search).
     fn time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             metric(ns, fmt_time(ns), Better::Lower)
@@ -1213,6 +1215,18 @@ pub mod vector {
         }
     }
 
+    /// Context time cell (shown, not Δ-tracked). Use for spread (p50/p90)
+    /// and secondary latencies (cold open).
+    fn ctx_time_cell(ns: f64) -> Cell {
+        if ns.is_finite() {
+            context(ns, fmt_time(ns), Better::Lower)
+        } else {
+            text("—")
+        }
+    }
+
+    /// Peak RSS is the gate (a memory regression we'd act on); median / p90
+    /// ride along as context.
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
             metric(
@@ -1220,12 +1234,12 @@ pub mod vector {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,
@@ -1275,8 +1289,8 @@ pub mod vector {
                     match &r.warm {
                         Some(w) => {
                             cells.push(time_cell(w.warm.min.as_secs_f64() * NS_PER_SEC));
-                            cells.push(time_cell(w.warm.p50.as_secs_f64() * NS_PER_SEC));
-                            cells.push(time_cell(w.warm.p90.as_secs_f64() * NS_PER_SEC));
+                            cells.push(ctx_time_cell(w.warm.p50.as_secs_f64() * NS_PER_SEC));
+                            cells.push(ctx_time_cell(w.warm.p90.as_secs_f64() * NS_PER_SEC));
                             cells.extend(rss_cells(&w.rss));
                         }
                         None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
@@ -1285,7 +1299,7 @@ pub mod vector {
                 if include_cold {
                     match r.cold {
                         Some(t) => {
-                            cells.push(time_cell(t.open.as_secs_f64() * NS_PER_SEC));
+                            cells.push(ctx_time_cell(t.open.as_secs_f64() * NS_PER_SEC));
                             cells.push(time_cell(t.search.as_secs_f64() * NS_PER_SEC));
                         }
                         None => {
@@ -1488,7 +1502,7 @@ pub mod sql {
     use crate::{
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, PeakSampler, RssStats},
     };
 
@@ -1757,6 +1771,7 @@ pub mod sql {
         }
     }
 
+    /// Peak RSS is the gate; median / p90 ride along as context.
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
             metric(
@@ -1764,12 +1779,12 @@ pub mod sql {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,
@@ -1784,8 +1799,8 @@ pub mod sql {
         let mut cells = vec![
             text(stat.name),
             metric(min_ns, fmt_time(min_ns), Better::Lower),
-            metric(p50_ns, fmt_time(p50_ns), Better::Lower),
-            metric(p90_ns, fmt_time(p90_ns), Better::Lower),
+            context(p50_ns, fmt_time(p50_ns), Better::Lower),
+            context(p90_ns, fmt_time(p90_ns), Better::Lower),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));

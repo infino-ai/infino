@@ -146,7 +146,7 @@ pub mod fts {
         },
         harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index},
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, RssStats},
         supertable::Phases,
         tiers,
@@ -503,7 +503,7 @@ pub mod fts {
                             .iter()
                             .map(|(name, d)| {
                                 let ns = d.as_secs_f64() * 1e9;
-                                vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                                vec![text(*name), context(ns, fmt_time(ns), Better::Lower)]
                             })
                             .collect(),
                     }],
@@ -734,8 +734,8 @@ pub mod fts {
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
-            metric(thr, fmt_throughput(thr), Better::Higher),
-            metric(bw, fmt_bandwidth(bw), Better::Higher),
+            context(thr, fmt_throughput(thr), Better::Higher),
+            context(bw, fmt_bandwidth(bw), Better::Higher),
             corpus_cell,
             stored_cell,
             metric(
@@ -743,12 +743,12 @@ pub mod fts {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,
@@ -853,7 +853,7 @@ pub mod vector {
             VectorRunConfig, run_vector_with_index,
         },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-        report::{Better, Block, Cell, Report, Section, metric, text},
+        report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss,
         supertable::Phases,
         tiers,
@@ -976,8 +976,8 @@ pub mod vector {
         vec![
             text(label),
             metric(ns, fmt_time(ns), Better::Lower),
-            metric(thr, fmt_throughput(thr), Better::Higher),
-            metric(bw, fmt_bandwidth(bw), Better::Higher),
+            context(thr, fmt_throughput(thr), Better::Higher),
+            context(bw, fmt_bandwidth(bw), Better::Higher),
             corpus_cell,
             stored_cell,
             metric(
@@ -985,12 +985,12 @@ pub mod vector {
                 rss::fmt_bytes(stats.peak_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.median_rss_bytes as f64,
                 rss::fmt_bytes(stats.median_rss_bytes),
                 Better::Lower,
             ),
-            metric(
+            context(
                 stats.p90_rss_bytes as f64,
                 rss::fmt_bytes(stats.p90_rss_bytes),
                 Better::Lower,

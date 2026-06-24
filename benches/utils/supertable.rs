@@ -53,7 +53,7 @@ use crate::{
     cost,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-    report::{Better, Block, Cell, Report, Section, metric, text},
+    report::{Better, Block, Cell, Report, Section, context, metric, text},
     rss::{self, PeakSampler},
     storage_meter, tiers,
 };
@@ -301,8 +301,8 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
-        metric(thr, fmt_throughput(thr), Better::Higher),
-        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        context(thr, fmt_throughput(thr), Better::Higher),
+        context(bw, fmt_bandwidth(bw), Better::Higher),
         text(rss::fmt_bytes(m.corpus_bytes)),
         metric(
             m.index_bytes as f64,
@@ -315,12 +315,12 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
             rss::fmt_bytes(m.peak_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.median_rss_bytes as f64,
             rss::fmt_bytes(m.median_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.p90_rss_bytes as f64,
             rss::fmt_bytes(m.p90_rss_bytes),
             Better::Lower,
@@ -1180,7 +1180,7 @@ pub mod vector {
                                 text(format!("p={nprobe}, r={effective_rerank}")),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),
-                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                                context(p50_ns, fmt_time(p50_ns), Better::Lower),
                             ]],
                         }],
                     });

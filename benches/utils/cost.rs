@@ -22,7 +22,7 @@
 use std::sync::OnceLock;
 
 use crate::{
-    report::{Better, Block, Report, Section, metric, text},
+    report::{Better, Block, Report, Section, context, text},
     storage_meter::ObjectStoreMeter,
 };
 
@@ -359,13 +359,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             fmt_wall_seconds(c.ingest_wall_s),
         )),
         text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(compute))),
-        metric(compute, usd(compute), Better::Lower),
+        context(compute, usd(compute), Better::Lower),
     ];
     let put_row = vec![
         text(format!("Ingest PUT ({} requests)", c.put_count)),
         text("once at commit"),
         text(format!("@ $5/1M → {}", usd(requests))),
-        metric(requests, usd(requests), Better::Lower),
+        context(requests, usd(requests), Better::Lower),
     ];
     let storage_row = vec![
         text(format!(
@@ -376,7 +376,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             "{stored_gb:.2} GB × {retention_months:.0} mo = {gb_months:.2} GB·mo",
         )),
         text(format!("@ $0.023/GB·mo → {}/mo", usd(storage_month))),
-        metric(
+        context(
             storage_month,
             format!("{}/mo", usd(storage_month)),
             Better::Lower,
@@ -407,7 +407,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 inst.usd_per_hour,
                 usd(open_usd)
             )),
-            metric(open_usd, usd(open_usd), Better::Lower),
+            context(open_usd, usd(open_usd), Better::Lower),
         ]);
         meter_rows.push(vec![
             text(format!("Cold search CPU ({})", q.name)),
@@ -421,7 +421,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 inst.usd_per_hour,
                 usd(search_usd)
             )),
-            metric(search_usd, usd(search_usd), Better::Lower),
+            context(search_usd, usd(search_usd), Better::Lower),
         ]);
     }
 
@@ -436,7 +436,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             )),
             text("one cold open + search"),
             text(format!("@ $0.40/1M → {}", usd(head_usd))),
-            metric(head_usd, usd(head_usd), Better::Lower),
+            context(head_usd, usd(head_usd), Better::Lower),
         ]);
         meter_rows.push(vec![
             text(format!(
@@ -446,7 +446,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             )),
             text("one cold open + search"),
             text(format!("@ $0.40/1M → {}", usd(get_usd))),
-            metric(get_usd, usd(get_usd), Better::Lower),
+            context(get_usd, usd(get_usd), Better::Lower),
         ]);
         meter_rows.push(vec![
             text("Cold object-store requests (total)"),
@@ -455,7 +455,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 store.head_count, store.get_count
             )),
             text(usd(req_usd)),
-            metric(req_usd, usd(req_usd), Better::Lower),
+            context(req_usd, usd(req_usd), Better::Lower),
         ]);
     } else if c.cold.is_some() {
         meter_rows.push(vec![
@@ -482,7 +482,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 fmt_vcpu_seconds(vcpu_s),
             )),
             text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(q_usd))),
-            metric(q_usd, usd(q_usd), Better::Lower),
+            context(q_usd, usd(q_usd), Better::Lower),
         ]);
     }
 
@@ -512,12 +512,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     "Ingest compute ({}w × {:.1}s)",
                     c.writers, c.ingest_wall_s
                 )),
-                metric(compute, usd(compute), Better::Lower),
+                context(compute, usd(compute), Better::Lower),
                 text(format!("{}/1M docs", usd(per_million))),
             ],
             vec![
                 text(format!("Ingest requests (~{} PUT)", c.put_count)),
-                metric(requests, usd(requests), Better::Lower),
+                context(requests, usd(requests), Better::Lower),
                 text(String::new()),
             ],
             vec![
@@ -525,7 +525,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     "Stored capacity ({})",
                     crate::rss::fmt_bytes(c.stored_bytes)
                 )),
-                metric(
+                context(
                     storage_month,
                     format!("{}/mo", usd(storage_month)),
                     Better::Lower,
@@ -554,7 +554,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             vec![
                 text(name.clone()),
                 text(crate::markdown::fmt_time(p50_s * 1.0e9)),
-                metric(
+                context(
                     queries_per_usd,
                     format!("{:.0}", queries_per_usd),
                     Better::Higher,

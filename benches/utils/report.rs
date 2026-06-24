@@ -44,11 +44,17 @@ pub enum Cell {
     /// A row/label cell with no tracked metric.
     Text(String),
     /// A measured value: `raw` is the comparable quantity (ns, bytes,
-    /// items/s …) used for the delta; `shown` is its human form.
+    /// items/s …) used for the delta; `shown` is its human form. `gate`
+    /// marks a regression-gate metric — only these carry a run-over-run Δ
+    /// and are surfaced in the PR highlights. Non-gate ("context") metrics
+    /// are still measured and shown, but render as a plain value: the
+    /// spread (p50/p90), secondary, and derived numbers that would
+    /// otherwise drown the signal in noisy deltas.
     Metric {
         raw: f64,
         shown: String,
         better: Better,
+        gate: bool,
     },
 }
 
@@ -57,12 +63,27 @@ pub fn text(s: impl Into<String>) -> Cell {
     Cell::Text(s.into())
 }
 
-/// A tracked metric cell.
+/// A gate metric cell — carries a run-over-run Δ and is surfaced as a
+/// regression signal. Use for the headline numbers (min latency, build
+/// time, peak RSS, stored size).
 pub fn metric(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
     Cell::Metric {
         raw,
         shown: shown.into(),
         better,
+        gate: true,
+    }
+}
+
+/// A context metric cell — measured and shown for the full picture, but
+/// not Δ-tracked or surfaced. Use for spread (p50/p90), secondary, and
+/// derived numbers so the comparison stays focused on the gate metrics.
+pub fn context(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
+    Cell::Metric {
+        raw,
+        shown: shown.into(),
+        better,
+        gate: false,
     }
 }
 
@@ -212,11 +233,18 @@ impl Report {
                         delta: String::new(),
                         delta_color: "",
                     }),
-                    Cell::Metric { raw, shown, better } => {
+                    Cell::Metric {
+                        raw,
+                        shown,
+                        better,
+                        gate,
+                    } => {
                         let header = block.headers.get(ci).map(String::as_str).unwrap_or("");
                         let key =
                             format!("{}|{}|{}|{}", section.anchor, block.subtitle, label, header);
-                        let (delta, color) = if self.track_deltas {
+                        // Only gate metrics carry a Δ; context metrics render
+                        // as a plain value (still saved, for the full picture).
+                        let (delta, color) = if self.track_deltas && *gate {
                             compute_delta(self.prev.get(&key).copied(), *raw, *better)
                         } else {
                             (String::new(), "")
