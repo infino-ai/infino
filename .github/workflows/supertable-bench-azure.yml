@@ -6,12 +6,10 @@ name: Benchmark (Azure)
 # in Azure Blob — shared across branches — runs the bench, and is torn
 # down.
 #
-# Benchmarks are A/B: both the PR ref and the base `main` are built and run on
-# the *same* VM, and the PR is compared against that same-host main arm. This
-# cancels the cross-host / noisy-neighbour / frequency variance a stored
-# baseline would carry — the deltas reflect the code change, not the machine.
-# Both arms run here, so the comparison data is always produced locally; nothing
-# is read from or written to object storage except the sccache compile cache.
+# Benchmarks are A/B: the PR ref and base `main` are built and run on the
+# *same* VM and compared against each other, so the deltas reflect the code
+# change, not cross-host / neighbour / frequency variance. Both arms run here,
+# so no metric is read from or written to object storage (only sccache is).
 
 on:
   workflow_dispatch:
@@ -50,9 +48,7 @@ on:
       timeout_minutes:
         description: "Hard auto-stop; VM is torn down when hit."
         required: false
-        # A/B PR runs build + run two arms (PR and base main) on one VM, so a
-        # PR leg takes roughly twice a single run; baseline (push) runs stay
-        # single-arm and finish well under this.
+        # A/B runs build + run two arms on one VM, so ~twice a single run.
         default: "60"
         type: string
       skip_calibration:
@@ -301,10 +297,8 @@ jobs:
           build_arm "$REF" "$HOME/bench-pr"
           printf '%s\n' "$HOME/bench-pr" > "$HOME/bench-bin"
 
-          # A/B: also build the base (main) arm on this same VM, so the PR is
-          # compared against a baseline measured here-and-now (same host,
-          # neighbours, frequency) rather than a stored cross-host one. Restore
-          # the PR checkout afterwards so the run step's cwd matches the PR ref.
+          # Base (main) arm for the A/B comparison. Restore the PR checkout
+          # after, so the run step's cwd matches the PR ref.
           git fetch --depth 1 origin main
           build_arm FETCH_HEAD "$HOME/bench-main"
           git checkout "$REF" 2>/dev/null \
@@ -312,11 +306,8 @@ jobs:
           sccache --show-stats || true
           REMOTE
 
-      # A/B baseline: run the base (main) arm on this same VM and leave its
-      # metric JSONs in place as the report's baseline, so the PR run renders
-      # deltas (vs main) measured here-and-now — same host, neighbours, and
-      # CPU frequency, which cancels the cross-host noise a stored baseline
-      # carries. Skipped on baseline (push) runs, which want a clean baseline.
+      # Run the main arm; its metric JSONs stay in place as the PR arm's
+      # baseline (Report::load reads them as `prev`).
       - name: Same-host baseline (A/B main arm)
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
@@ -337,8 +328,6 @@ jobs:
           export INFINO_BENCH_STORE=azure
           [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           ulimit -n "$(ulimit -Hn)"
-          # The main-arm run writes target/infino-bench/<report>.json; those
-          # become the PR arm's baseline (Report::load reads them as `prev`).
           echo "===== BASELINE (main arm) ${BENCH_ARGS} START ====="
           "$HOME/bench-main" $BENCH_ARGS 2>&1
           echo "===== BASELINE (main arm) END ====="

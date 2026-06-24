@@ -611,8 +611,7 @@ pub fn cold_from_fts(
         .collect()
 }
 
-/// Flatten warm FTS stats into `(name, min_seconds)` for the cost model —
-/// the gate metric, the intrinsic per-query cost basis.
+/// Flatten warm FTS stats into `(name, min_seconds)` for the cost model.
 pub fn warm_from_fts(stats: &[crate::executors::fts::FtsQueryStat]) -> Vec<(String, f64)> {
     stats
         .iter()
@@ -620,8 +619,7 @@ pub fn warm_from_fts(stats: &[crate::executors::fts::FtsQueryStat]) -> Vec<(Stri
         .collect()
 }
 
-/// Flatten warm SQL query sets into `(name, min_seconds)` — the gate
-/// metric, the intrinsic per-query cost basis.
+/// Flatten warm SQL query sets into `(name, min_seconds)`.
 pub fn warm_from_sql(sets: &crate::executors::sql::QuerySets) -> Vec<(String, f64)> {
     sets.scalar
         .iter()
@@ -632,8 +630,7 @@ pub fn warm_from_sql(sets: &crate::executors::sql::QuerySets) -> Vec<(String, f6
         .collect()
 }
 
-/// Flatten warm vector recall rows into `(label, min_seconds)` — the gate
-/// metric, the intrinsic per-query cost basis.
+/// Flatten warm vector recall rows into `(label, min_seconds)`.
 pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(String, f64)> {
     rows.iter()
         .filter_map(|r| {

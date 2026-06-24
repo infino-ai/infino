@@ -45,11 +45,9 @@ pub enum Cell {
     Text(String),
     /// A measured value: `raw` is the comparable quantity (ns, bytes,
     /// items/s …) used for the delta; `shown` is its human form. `gate`
-    /// marks a regression-gate metric — only these carry a run-over-run Δ
-    /// and are surfaced in the PR highlights. Non-gate ("context") metrics
-    /// are still measured and shown, but render as a plain value: the
-    /// spread (p50/p90), secondary, and derived numbers that would
-    /// otherwise drown the signal in noisy deltas.
+    /// metrics carry a Δ and are surfaced; context metrics (`gate = false`)
+    /// are shown and saved but not Δ-tracked — spread/derived numbers that
+    /// would otherwise drown the signal.
     Metric {
         raw: f64,
         shown: String,
@@ -63,9 +61,8 @@ pub fn text(s: impl Into<String>) -> Cell {
     Cell::Text(s.into())
 }
 
-/// A gate metric cell — carries a run-over-run Δ and is surfaced as a
-/// regression signal. Use for the headline numbers (min latency, build
-/// time, peak RSS, stored size).
+/// A gate metric cell — Δ-tracked and surfaced (min latency, build time,
+/// peak RSS, stored size).
 pub fn metric(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
     Cell::Metric {
         raw,
@@ -75,9 +72,8 @@ pub fn metric(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
     }
 }
 
-/// A context metric cell — measured and shown for the full picture, but
-/// not Δ-tracked or surfaced. Use for spread (p50/p90), secondary, and
-/// derived numbers so the comparison stays focused on the gate metrics.
+/// A context metric cell — shown and saved, but not Δ-tracked (spread,
+/// secondary, derived numbers).
 pub fn context(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
     Cell::Metric {
         raw,

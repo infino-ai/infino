@@ -24,33 +24,25 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
-/// Summary of a timed-sample set. `min` is the regression-gate metric:
-/// benchmark noise is one-sided (every perturbation only *adds* time), so
-/// the fastest sample is the cleanest estimate of intrinsic cost. `p50`
-/// and `p90` ride along to show the run's spread, not to gate on.
+/// Min / p50 / p90 of a timed-sample set. `min` is the gate: bench noise is
+/// one-sided (only ever adds time), so the fastest sample is the cleanest
+/// estimate of intrinsic cost. p50/p90 show spread, not gated on.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
     pub min: Duration,
     pub p50: Duration,
     pub p90: Duration,
-    /// Number of timed samples behind these figures.
-    pub n: usize,
 }
 
-/// Target wall-clock span per timed sample. Sub-microsecond queries are
-/// batched up to this so the per-call `Instant::now` overhead (tens of ns)
-/// can't dominate — a 200 ns query timed one call at a time is mostly timer
-/// noise; timed 250-at-once it isn't.
+/// Batch sub-µs ops up to this span so per-call `Instant::now` overhead
+/// (tens of ns) can't dominate the sample.
 const MIN_SAMPLE_NS: u64 = 50_000;
-/// Upper bound on the auto-chosen batch size, so a near-instant op can't
-/// blow up the iteration count.
+/// Cap on the auto-chosen batch size.
 const MAX_BATCH: u64 = 100_000;
 
-/// Collect `iters` timed per-call samples of `op`, auto-batching calls so
-/// each timed window spans at least [`MIN_SAMPLE_NS`]. A heavy op probes
-/// above the target and runs one call per sample (batch 1, identical to a
-/// plain timed loop); a sub-µs op runs many calls per sample and divides
-/// out, so the returned durations are accurate per-call times either way.
+/// Collect `iters` per-call timings of `op`, batching calls so each timed
+/// window spans at least [`MIN_SAMPLE_NS`]. A heavy op runs one call per
+/// sample; a sub-µs op runs many and divides out — accurate either way.
 pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duration> {
     let probe = Instant::now();
     std::hint::black_box(op());
@@ -75,17 +67,14 @@ pub fn summarize(samples: &mut [Duration]) -> Stats {
             min: Duration::ZERO,
             p50: Duration::ZERO,
             p90: Duration::ZERO,
-            n: 0,
         };
     }
     samples.sort_unstable();
-    // Nearest-rank p90: ceil(0.9·n), clamped into the valid index range.
     let p90_rank = (9 * n).div_ceil(10).clamp(1, n);
     Stats {
         min: samples[0],
         p50: samples[(n - 1) / 2],
         p90: samples[p90_rank - 1],
-        n,
     }
 }
 
@@ -449,10 +438,8 @@ pub mod fts {
         }
     }
 
-    /// Warm timing (+ per-query RSS) for one query. `warm` is the query
-    /// phase (id + score), gated on its `min`; `fetched_min` is the
-    /// best-case fetch phase (+ the text column for the top-k rows), a
-    /// secondary signal tracked by best case only.
+    /// Warm timing (+ RSS) for one query: `warm` is the query phase (id +
+    /// score), `fetched_min` the best-case fetch phase (+ top-k text).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
@@ -461,13 +448,12 @@ pub mod fts {
         pub rss: RssStats,
     }
 
-    /// Untimed iterations run before sampling, to reach steady state
-    /// (warm caches, settled CPU frequency) so `min` reflects real work.
+    /// Untimed iterations before sampling, to reach steady state.
     const WARMUP_ITERS: usize = 5;
 
     /// Measure the warm battery against an already-warm reader: a short
-    /// untimed warmup per query, then `iters` timed iterations each for
-    /// the query phase and the fetch phase.
+    /// warmup per query, then `iters` timed samples each for the query and
+    /// fetch phases.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -494,14 +480,9 @@ pub mod fts {
                 let mut fetched_samples =
                     sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
                 let rss = sampler.stop_stats();
-                let warm = summarize(&mut samples);
-                eprintln!(
-                    "[{log_prefix}] warm: {} — min {:?} / p50 {:?} / p90 {:?} (n={})",
-                    q.name, warm.min, warm.p50, warm.p90, warm.n,
-                );
                 FtsQueryStat {
                     name: q.name,
-                    warm,
+                    warm: summarize(&mut samples),
                     fetched_min: summarize(&mut fetched_samples).min,
                     rss,
                 }
@@ -1139,9 +1120,6 @@ pub mod vector {
         pub rss: RssStats,
     }
 
-    /// Untimed warmup iterations, then timed samples, for warm vector
-    /// search — more than the recall-calibration probe count so `min` has
-    /// a real chance to catch an uninterrupted sample.
     const WARM_WARMUP_ITERS: usize = 5;
     const WARM_SAMPLE_ITERS: usize = 30;
 
@@ -1205,8 +1183,7 @@ pub mod vector {
         pub cold: Option<ColdTiming>,
     }
 
-    /// Gate time cell (Δ-tracked). Use for the headline latency (warm min,
-    /// cold search).
+    /// Gate latency cell (warm min, cold search).
     fn time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             metric(ns, fmt_time(ns), Better::Lower)
@@ -1215,8 +1192,7 @@ pub mod vector {
         }
     }
 
-    /// Context time cell (shown, not Δ-tracked). Use for spread (p50/p90)
-    /// and secondary latencies (cold open).
+    /// Context latency cell (p50/p90, cold open).
     fn ctx_time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             context(ns, fmt_time(ns), Better::Lower)
@@ -1225,8 +1201,7 @@ pub mod vector {
         }
     }
 
-    /// Peak RSS is the gate (a memory regression we'd act on); median / p90
-    /// ride along as context.
+    /// Peak RSS gates; median / p90 are context.
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
             metric(
@@ -1620,8 +1595,7 @@ pub mod sql {
         pub rss: RssStats,
     }
 
-    /// Untimed iterations before sampling, to reach steady state so `min`
-    /// reflects real work.
+    /// Untimed iterations before sampling, to reach steady state.
     const WARMUP_ITERS: usize = 5;
 
     /// The full set of measured warm SQL query shapes. Infino-only: the
@@ -1771,7 +1745,7 @@ pub mod sql {
         }
     }
 
-    /// Peak RSS is the gate; median / p90 ride along as context.
+    /// Peak RSS gates; median / p90 are context.
     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
         vec![
             metric(

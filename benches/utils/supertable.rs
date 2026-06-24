@@ -576,8 +576,8 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query \
-                 min / p50 / p90 over repeated bm25_search; the Δ gates on `min`). Cold = fresh disk \
+                "Warm = shared consumer + disk cache (prewarm + wait_until_warm, then per-query \
+                 min / p50 / p90 over repeated bm25_search; Δ gates on `min`). Cold = fresh disk \
                  cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs \
                  the previous run.",
                 warm.as_deref(),
@@ -1305,7 +1305,7 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; min / p50 / p90 over repeated `query_sql` calls (the Δ gates on `min`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; min / p50 / p90 over repeated `query_sql` calls (Δ gates on `min`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
             emit_cost_warm(

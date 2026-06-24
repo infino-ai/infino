@@ -161,8 +161,8 @@ pub mod fts {
 
     /// Top-k for every search.
     pub const K: usize = 10;
-    /// Timed warm-search repetitions per query (after a short warmup); the
-    /// reported min / p50 / p90 are computed over these, and the gate is min.
+    /// Timed warm-search samples per query (after a short warmup); min /
+    /// p50 / p90 are computed over these.
     pub const WARM_ITERS: usize = 50;
     /// Cold-tier repetitions per query — each pays a fresh cache + full S3
     /// cold open, so this is deliberately small.
@@ -475,11 +475,9 @@ pub mod fts {
                         "Superfile FTS — search, single-superfile / in-memory ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Warm = `SuperfileReader::open` in memory (per-query min / p50 / p90 over the timed \
-                     iterations; the run-over-run Δ gates on `min`, the noise-free estimate of intrinsic \
-                     cost, with p50/p90 showing the run's spread); cold = same `.parquet` on \
-                     object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). \
-                     Δ is vs the previous run.",
+                    "Warm = `SuperfileReader::open` in memory (per-query min / p50 / p90; Δ gates on \
+                     `min`); cold = same `.parquet` on object storage via `DiskCacheStore::reader` -> \
+                     `bm25_search` (production cold path). Δ is vs the previous run.",
                     warm.as_deref(),
                     None,
                     probes.as_deref(),
@@ -1764,7 +1762,7 @@ pub mod sql {
                     "Superfile SQL — query, single superfile / in-memory ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm min / p50 / p90 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here); the run-over-run Δ gates on `min`. Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
+                "Warm min / p50 / p90 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here); Δ gates on `min`. Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
                 &sets,
             );
             let b = result
