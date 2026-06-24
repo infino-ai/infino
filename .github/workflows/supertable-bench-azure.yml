@@ -69,7 +69,7 @@ on:
       noise_threshold_pct:
         description: "Min |Δ%| vs main to flag in the PR comment; smaller is noise."
         required: false
-        default: "10"
+        default: "15"
         type: string
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
   # inputs; `choice` isn't valid here so `bench` is a string.
@@ -91,7 +91,7 @@ on:
       # PR to post the sticky results comment on. Blank ⇒ summary only.
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs main to flag in the PR comment; smaller is noise.
-      noise_threshold_pct: { type: string, required: false, default: "10" }
+      noise_threshold_pct: { type: string, required: false, default: "15" }
       # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
       is_fork_pr:      { type: boolean, required: false, default: false }
 

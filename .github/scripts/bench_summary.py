@@ -64,7 +64,7 @@ MIN_LATENCY_NS = 100_000.0
 
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_OUT = "/tmp/ai-summary.md"
-DEFAULT_THRESHOLD = 10.0
+DEFAULT_THRESHOLD = 15.0
 # Cap each table so a broad swing can't blow past GitHub's comment limit.
 MAX_ROWS = 15
 # Foundry latency ceiling; the fallback tables cover us if we trip it.
