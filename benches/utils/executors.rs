@@ -59,6 +59,31 @@ pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duratio
     samples
 }
 
+/// Measure each item `rounds` times, round-major (whole battery per round),
+/// keeping the cleanest round (lowest `min_key`) per item. Round-major
+/// spaces an item's repeats in time, so a transient slow window hits at
+/// most one round and `min` drops it.
+pub fn repeat_cleanest<I, S>(
+    rounds: usize,
+    items: &[I],
+    mut measure: impl FnMut(&I) -> S,
+    min_key: impl Fn(&S) -> Duration,
+) -> Vec<S> {
+    let mut best: Vec<Option<S>> = Vec::with_capacity(items.len());
+    best.resize_with(items.len(), || None);
+    for _ in 0..rounds.max(1) {
+        for (i, item) in items.iter().enumerate() {
+            let s = measure(item);
+            if best[i].as_ref().is_none_or(|b| min_key(&s) < min_key(b)) {
+                best[i] = Some(s);
+            }
+        }
+    }
+    best.into_iter()
+        .map(|s| s.expect("each item measured at least once"))
+        .collect()
+}
+
 /// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
 pub fn summarize(samples: &mut [Duration]) -> Stats {
     let n = samples.len();
@@ -450,10 +475,42 @@ pub mod fts {
 
     /// Untimed iterations before sampling, to reach steady state.
     const WARMUP_ITERS: usize = 5;
+    /// Warm-battery passes; the cleanest pass per query is kept (see
+    /// [`repeat_cleanest`]) so a transient slow window can't fix a gate.
+    const WARM_ROUNDS: usize = 5;
 
-    /// Measure the warm battery against an already-warm reader: a short
-    /// warmup per query, then `iters` timed samples each for the query and
-    /// fetch phases.
+    /// One warm measurement of a query: query-phase `Stats` (gated on min)
+    /// + best-case fetch + RSS.
+    fn measure_warm_once<R: FtsRead>(
+        reader: &R,
+        q: &FtsQuery,
+        column: &str,
+        k: usize,
+        iters: usize,
+    ) -> FtsQueryStat {
+        let query = q.terms.join(" ");
+        let mode = to_infino_mode(q.mode);
+        for _ in 0..WARMUP_ITERS {
+            std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
+        }
+        let sampler = PeakSampler::start_default();
+        let mut samples = sample_batched(iters, || reader.bm25_rows(column, &query, k, mode));
+        for _ in 0..WARMUP_ITERS {
+            std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
+        }
+        let mut fetched_samples =
+            sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
+        let rss = sampler.stop_stats();
+        FtsQueryStat {
+            name: q.name,
+            warm: summarize(&mut samples),
+            fetched_min: summarize(&mut fetched_samples).min,
+            rss,
+        }
+    }
+
+    /// Measure the warm battery against an already-warm reader over
+    /// [`WARM_ROUNDS`] round-major passes, keeping each query's cleanest pass.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -462,32 +519,16 @@ pub mod fts {
         iters: usize,
         log_prefix: &str,
     ) -> Vec<FtsQueryStat> {
-        battery
-            .iter()
-            .map(|q| {
-                eprintln!("[{log_prefix}] warm: query {}...", q.name);
-                let query = q.terms.join(" ");
-                let mode = to_infino_mode(q.mode);
-                for _ in 0..WARMUP_ITERS {
-                    std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
-                }
-                let sampler = PeakSampler::start_default();
-                let mut samples =
-                    sample_batched(iters, || reader.bm25_rows(column, &query, k, mode));
-                for _ in 0..WARMUP_ITERS {
-                    std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
-                }
-                let mut fetched_samples =
-                    sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
-                let rss = sampler.stop_stats();
-                FtsQueryStat {
-                    name: q.name,
-                    warm: summarize(&mut samples),
-                    fetched_min: summarize(&mut fetched_samples).min,
-                    rss,
-                }
-            })
-            .collect()
+        eprintln!(
+            "[{log_prefix}] warm: {} queries × {WARM_ROUNDS} rounds...",
+            battery.len()
+        );
+        repeat_cleanest(
+            WARM_ROUNDS,
+            battery,
+            |q| measure_warm_once(reader, q, column, k, iters),
+            |s| s.warm.min,
+        )
     }
 
     /// Measure the cold battery: for each query, `iters` fresh-reader
