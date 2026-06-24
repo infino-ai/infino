@@ -1585,10 +1585,14 @@ pub mod sql {
     #[derive(Clone)]
     pub struct SqlQueryStat {
         pub name: &'static str,
-        pub p50: Duration,
+        pub warm: Stats,
         pub rows: usize,
         pub rss: RssStats,
     }
+
+    /// Untimed iterations before sampling, to reach steady state so `min`
+    /// reflects real work.
+    const WARMUP_ITERS: usize = 5;
 
     /// The full set of measured warm SQL query shapes. Infino-only: the
     /// DataFusion-only control arms (plain scan, full-scan aggregates) were
@@ -1601,8 +1605,11 @@ pub mod sql {
     }
 
     fn timed<R: SqlRead>(reader: &R, name: &'static str, sql: &str, iters: usize) -> SqlQueryStat {
+        let mut warm_rows = 0;
+        for _ in 0..WARMUP_ITERS {
+            warm_rows = reader.query_rows(sql);
+        }
         let sampler = PeakSampler::start_default();
-        let warm_rows = reader.query_rows(sql);
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
@@ -1613,7 +1620,7 @@ pub mod sql {
         let rss = sampler.stop_stats();
         SqlQueryStat {
             name,
-            p50: p50(&mut samples),
+            warm: summarize(&mut samples),
             rows: warm_rows,
             rss,
         }
@@ -1761,10 +1768,14 @@ pub mod sql {
     }
 
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
-        let ns = stat.p50.as_secs_f64() * 1e9;
+        let min_ns = stat.warm.min.as_secs_f64() * 1e9;
+        let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
+        let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
         let mut cells = vec![
             text(stat.name),
-            metric(ns, fmt_time(ns), Better::Lower),
+            metric(min_ns, fmt_time(min_ns), Better::Lower),
+            metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+            metric(p90_ns, fmt_time(p90_ns), Better::Lower),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));
@@ -1774,7 +1785,9 @@ pub mod sql {
     fn query_headers() -> Vec<String> {
         vec![
             "Query".into(),
-            "p50".into(),
+            "warm min".into(),
+            "warm p50".into(),
+            "warm p90".into(),
             "Rows".into(),
             "Peak RSS".into(),
             "Median RSS".into(),

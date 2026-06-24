@@ -620,14 +620,15 @@ pub fn warm_from_fts(stats: &[crate::executors::fts::FtsQueryStat]) -> Vec<(Stri
         .collect()
 }
 
-/// Flatten warm SQL query sets into `(name, p50_seconds)`.
+/// Flatten warm SQL query sets into `(name, min_seconds)` — the gate
+/// metric, the intrinsic per-query cost basis.
 pub fn warm_from_sql(sets: &crate::executors::sql::QuerySets) -> Vec<(String, f64)> {
     sets.scalar
         .iter()
         .chain(&sets.tvf)
         .chain(&sets.fts_pushdown)
         .chain(&sets.agg_idx)
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.warm.min.as_secs_f64()))
         .collect()
 }
 
