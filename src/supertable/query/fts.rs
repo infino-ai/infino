@@ -80,6 +80,7 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 pub use crate::superfile::fts::reader::BoolMode;
@@ -446,41 +447,84 @@ impl SupertableReader {
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::token_match`].
+    /// Parse `query` into positive and negated tokens, then select the
+    /// superfiles to scan. Pruning keys on the **positives only** — a
+    /// negated term must never drop a superfile: a superfile lacking it
+    /// excludes nothing, and under `And` keying on it would wrongly prune
+    /// every superfile that doesn't carry it. This mirrors the BM25
+    /// search path so the unranked `token_match` / `count` surfaces honor
+    /// negation the same way scored search does.
+    ///
+    /// Returns `(positives, negatives, kept)`. A query with no positive
+    /// token (negation-only, e.g. `-foo`) yields an empty `kept`: there
+    /// is no positive anchor to match, so the caller returns the empty
+    /// result — the same outcome the scored path produces when it rejects
+    /// a negation-only query.
+    async fn parse_and_prune(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Arc<SuperfileEntry>>), QueryError> {
+        let parsed = AsciiLowerTokenizer.parse(query);
+        let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
+        let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
+        if positives.is_empty() {
+            return Ok((positives, negatives, Vec::new()));
+        }
+        let prune_leaf = PruneLeaf::TermPresence {
+            column: column.to_owned(),
+            terms: positives.clone(),
+            mode,
+        };
+        let kept =
+            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
+        Ok((positives, negatives, kept))
+    }
+
     pub(crate) async fn token_match_async(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let manifest = self.manifest();
-        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
-        if term_strings.is_empty() {
-            return Ok(Vec::new());
-        }
-        let kept = select_superfiles(
-            manifest.as_ref(),
-            &[PruneLeaf::TermPresence {
-                column: column.to_owned(),
-                terms: term_strings.clone(),
-                mode,
-            }],
-        )
-        .await?;
+        let (positives, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
+        let has_negatives = !negatives.is_empty();
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
+            let neg_arc = Arc::clone(&neg_arc);
             async move {
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 let docs = r
                     .token_match(&column_arc, &refs, mode)
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // Drop any positive match that also carries a negated
+                // term (union of the negatives). The df / count fast
+                // paths can't express exclusion, so negation forces a
+                // materialized walk over both sets.
+                let docs = if has_negatives {
+                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                    let excluded: RoaringBitmap = r
+                        .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .into_iter()
+                        .collect();
+                    docs.into_iter()
+                        .filter(|d| !excluded.contains(*d))
+                        .collect::<Vec<_>>()
+                } else {
+                    docs
+                };
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
@@ -506,27 +550,16 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
-        let manifest = self.manifest();
-        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(query).collect();
-        if term_strings.is_empty() {
-            return Ok(0);
-        }
-        let kept = select_superfiles(
-            manifest.as_ref(),
-            &[PruneLeaf::TermPresence {
-                column: column.to_owned(),
-                terms: term_strings.clone(),
-                mode,
-            }],
-        )
-        .await?;
+        let (positives, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(0);
         }
 
-        let single_term = term_strings.len() == 1;
+        let single_term = positives.len() == 1;
+        let has_negatives = !negatives.is_empty();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
         // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
@@ -539,6 +572,7 @@ impl SupertableReader {
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
+                let neg_arc = Arc::clone(&neg_arc);
                 async move {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
@@ -551,22 +585,39 @@ impl SupertableReader {
                         None => None,
                     };
                     let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                    // Deletes present: materialize the matching ids and
-                    // subtract the tombstoned ones (a df read or a bare
-                    // match count would over-count the deleted rows).
-                    if let Some(b) = tomb {
+                    // Negated terms or deletes both force materialization:
+                    // the df read and the bare match count can't subtract
+                    // excluded or tombstoned docs. Materialize the positive
+                    // matches, then drop any doc carrying a negated term
+                    // (union of the negatives) or a tombstone.
+                    if has_negatives || tomb.is_some() {
                         let docs = r
                             .token_match(&column_arc, &refs, mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                        return Ok::<u64, QueryError>(
-                            docs.iter().filter(|d| !b.contains(**d)).count() as u64,
-                        );
+                        let excluded: RoaringBitmap = if has_negatives {
+                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                            r.token_match(&column_arc, &neg_refs, BoolMode::Or)
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?
+                                .into_iter()
+                                .collect()
+                        } else {
+                            RoaringBitmap::new()
+                        };
+                        let n = docs
+                            .iter()
+                            .filter(|d| {
+                                !excluded.contains(**d)
+                                    && tomb.as_ref().is_none_or(|b| !b.contains(**d))
+                            })
+                            .count() as u64;
+                        return Ok::<u64, QueryError>(n);
                     }
-                    // No deletes (the common case): count without
-                    // materializing ids — a single token resolves O(1)
-                    // from the stored df, multi-token tallies the match
-                    // walk through the counting sink.
+                    // No negatives and no deletes (the common case): count
+                    // without materializing ids — a single token resolves
+                    // O(1) from the stored df, multi-token tallies the
+                    // match walk through the counting sink.
                     let n = if single_term {
                         r.term_df(&column_arc, &term_arc[0])
                             .await
@@ -1791,6 +1842,102 @@ mod tests {
         // term_df still says 3; the count must subtract the tombstone → 2.
         assert_eq!(
             st.count("title", "alpha", BoolMode::Or)
+                .expect("count after delete"),
+            2
+        );
+    }
+
+    #[test]
+    fn count_excludes_negated_terms() {
+        // A count query with a negated term must drop the docs matching
+        // that term, the same way a scored search does. The earlier count
+        // path tokenized "alpha -beta" into ["alpha", "beta"] and counted
+        // "beta" as a positive, so it over-counted instead of excluding.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha beta", "alpha gamma"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(2, &["alpha delta"])).expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(3, &["beta gamma"])).expect("append");
+        w.commit().expect("commit");
+
+        // "alpha" matches three docs across the superfiles; "-beta" drops
+        // the one that also contains beta → 2. Mirrors the search-side
+        // `negation_excludes_across_superfiles`.
+        assert_eq!(
+            st.count("title", "alpha -beta", BoolMode::Or)
+                .expect("count"),
+            2
+        );
+        // Positive-only count is unchanged: all three alpha docs.
+        assert_eq!(st.count("title", "alpha", BoolMode::Or).expect("count"), 3);
+        // A negated term absent from the corpus excludes nothing.
+        assert_eq!(
+            st.count("title", "alpha -absent", BoolMode::Or)
+                .expect("count"),
+            3
+        );
+    }
+
+    #[test]
+    fn count_with_negation_agrees_with_token_match() {
+        // The count↔token_match invariant must hold for negated queries
+        // too, across OR / AND and single- vs multi-positive shapes.
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha beta", "alpha gamma", "beta delta", "gamma delta"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        let r = st.reader();
+        for (q, mode) in [
+            ("alpha -beta", BoolMode::Or),
+            ("alpha gamma -delta", BoolMode::Or),
+            ("alpha -gamma", BoolMode::And),
+            ("beta -alpha", BoolMode::Or),
+        ] {
+            let c = r.count("title", q, mode).expect("count");
+            let n = r.token_match("title", q, mode).expect("token_match").len() as u64;
+            assert_eq!(c, n, "count vs token_match for {q:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn count_excludes_negated_terms_and_tombstones() {
+        // Negation and deletes compose: the materialized count drops both
+        // negated-term docs and tombstoned docs in one pass.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha one", "alpha two", "alpha beta", "alpha three"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer slot so `delete` can acquire it
+
+        // 4 alpha docs minus the one also containing beta → 3.
+        assert_eq!(
+            st.count("title", "alpha -beta", BoolMode::Or)
+                .expect("count"),
+            3
+        );
+
+        // Delete one of the surviving alpha docs; the count drops it too.
+        let stats = st
+            .delete(col("title").eq(lit("alpha two")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+        assert_eq!(
+            st.count("title", "alpha -beta", BoolMode::Or)
                 .expect("count after delete"),
             2
         );
