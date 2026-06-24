@@ -34,6 +34,7 @@
 
 use std::{future::Future, sync::Arc, time::Instant};
 
+use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
 use uuid::Uuid;
 
@@ -138,6 +139,29 @@ pub(crate) fn apply_tombstone_filter(
     Ok(())
 }
 
+/// Resolve stable user `_id`s for tagged hits from bytes already resident
+/// on this superfile reader — inline IVF region first (materialized hidden
+/// cells), then the scalar `_id` column (INCOMING staging superfiles).
+/// `None` when the bytes are not yet mmap'd (cold lazy); the remap step
+/// falls back to a manifest-backed read.
+fn stable_ids_for_tagged_hits(reader: &SuperfileReader, locals: &[u32]) -> Option<Vec<i128>> {
+    if locals.is_empty() {
+        return Some(Vec::new());
+    }
+    if let Some(v) = reader.vec() {
+        if let Some(ids) = v.inline_stable_ids_for_locals(locals) {
+            return Some(ids);
+        }
+    }
+    if reader.parquet_bytes().is_none() {
+        return None;
+    }
+    let id_column = reader.id_column();
+    let batch = reader.take_by_local_doc_ids(locals, &[id_column]).ok()?;
+    let array = batch.column(0).as_any().downcast_ref::<Decimal128Array>()?;
+    Some(array.values().to_vec())
+}
+
 /// Fan a per-superfile async kernel out across `units`, returning each
 /// unit's tagged + tombstone-filtered hits in input order.
 ///
@@ -179,20 +203,15 @@ where
                 let mut tagged = tag_hits(&entry, hits);
                 apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
                 // Piggyback the hidden→user `_id` resolve onto the search.
-                // For a hidden vector cell, the inline `_id` region was
-                // prefetched in this unit's fan-out wave (cold) or is resident
-                // (warm), so this sync lookup does no I/O — and lets the remap
-                // step skip its trailing region GET. No-op for FTS / readers
-                // without an inline `_id` region (`vec()` is `None` or the
-                // region lookup returns `None`).
+                // Materialized hidden cells: inline `_id` region (prefetched
+                // on cold, resident on warm). INCOMING staging superfiles:
+                // scalar `_id` column via sync `take_by_local_doc_ids` on
+                // resident bytes — both skip the trailing remap GET.
                 if !tagged.is_empty() {
-                    if let Some(v) = reader_for_ids.vec() {
-                        let locals: Vec<u32> =
-                            tagged.iter().map(|h| h.local_doc_id).collect();
-                        if let Some(ids) = v.inline_stable_ids_for_locals(&locals) {
-                            for (h, id) in tagged.iter_mut().zip(ids) {
-                                h.stable_id = Some(id);
-                            }
+                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
+                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
+                        for (h, id) in tagged.iter_mut().zip(ids) {
+                            h.stable_id = Some(id);
                         }
                     }
                 }
