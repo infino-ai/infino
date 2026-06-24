@@ -191,11 +191,11 @@ pub fn prune_parts_for_id_range(
         .collect()
 }
 
-// The fp32 centroid-envelope part scan (`prune_parts_for_vector`) is gone:
-// OPANN routes vector queries through the resident routing tree
-// (`SupertableReader::vector_search_user_table_async`), so part selection by
-// vector distance is the tree's job, not a manifest-list envelope scan. The
-// remaining vector paths enumerate the full superfile set
+// The fp32 centroid-envelope part scan (`prune_parts_for_vector`) is gone.
+// Vector nprobe routing scores the query against the flat [`ClusterCentroids`]
+// list already stored in the manifest (`select_cells_adaptive`), then filters
+// superfiles by routed cell partition keys — not by scanning list-part
+// envelopes. The remaining vector paths enumerate the full superfile set
 // (`Manifest::get_pruned_superfiles_for_vector`).
 
 #[cfg(test)]

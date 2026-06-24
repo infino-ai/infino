@@ -34,6 +34,7 @@ use super::{
     options::SupertableOptions,
 };
 use crate::{
+    config::CompactionSettings,
     runtime_bridge::{
         bridge_on_runtime, bridge_sync_to_async, get_or_init_query_runtime,
         shutdown_query_runtime_on_drop,
@@ -507,22 +508,15 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    // Gated to the same cfg as `writer::await_incoming_routed_to_cells`, which
-    // this calls: `test_visible!` only flips visibility (`pub` under
-    // test-helpers, else `pub(crate)`) and does not gate compilation, so
-    // without the cfg this would be compiled in plain builds and reference a
-    // function that only exists under test/test-helpers.
-    #[cfg(any(test, feature = "test-helpers"))]
     test_visible! {
-    /// Block until every accumulated hidden incoming IVF superfile is
-    /// routed into per-cell IVF superfiles. Benches use this between
-    /// pre-drain and post-drain search phases; unit tests use it to
-    /// await background maintenance before compacting the hidden table.
-    fn await_incoming_routed_to_cells_sync(&self) -> Result<(), BuildError> {
-        bridge_on_runtime(
-            super::writer::await_incoming_routed_to_cells(Arc::clone(&self.inner)),
-            &self.query_runtime(),
-        )
+    /// Route every accumulated INCOMING IVF superfile into per-cell delta
+    /// superfiles. Not part of the public API — [`Supertable::optimize`]
+    /// calls this on the hidden index before compact; tests and benches may
+    /// invoke it directly on the hidden table handle.
+    fn drain(&self) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::drain_incoming_to_cells(Arc::clone(
+            &self.inner,
+        )))
     }
     }
 
@@ -843,8 +837,9 @@ pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 /// region. Each hidden commit writes one IVF superfile under this sentinel
 /// partition holding that whole batch (all cells mixed, unsorted). Queries
 /// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles; background SPFresh maintenance later routes incoming into the
-/// per-cell IVF superfiles and deletes it. `u32::MAX` is out of the
+/// superfiles. Call [`Supertable::optimize`] (or the internal [`Supertable::drain`]
+/// hook on the hidden table) to route INCOMING rows into per-cell IVF superfiles.
+/// `u32::MAX` is out of the
 /// valid cell range `0..n_cent`, so it never collides with a real cell.
 pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
 
@@ -862,19 +857,15 @@ const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 128;
 
 /// Hidden vector-index compaction: target packed per-cell superfile size. Smaller
 /// than the user table's default — cell superfiles are many and individually small.
-const HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB: u64 = 8;
+pub(crate) const HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB: u64 = 8;
 
 /// Hidden vector-index compaction: merge a superfile once it drops below this
 /// fraction (percent) of the target size.
-const HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT: u8 = 40;
+pub(crate) const HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT: u8 = 40;
 
 /// Hidden vector-index compaction: per-pass memory ceiling.
-const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
+pub(crate) const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
 
-/// Train global VectorCell centroids from the user manifest and queue them
-/// on the hidden index table for its next commit.
-/// Aggressive compaction profile for the hidden vector-index table: keep
-/// ~one compact superfile per cell instead of many shard-sized files.
 /// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
 pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
     !opts.vector_columns.is_empty()
@@ -883,14 +874,6 @@ pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
             opts.partition_strategy,
             Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
         )
-}
-
-pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
-    crate::config::CompactionSettings {
-        target_superfile_size_mb: HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
-        min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
-        max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
-    }
 }
 
 pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
@@ -1011,9 +994,7 @@ fn build_vector_index_options(
         )));
     }
     let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
-    // Hidden maintenance (incoming routing, cell split, compaction) reads Sq8+ε
-    // rerank rows without fp32 reconstruction. User-table rerank codec may be
-    // Fp32; the hidden index always stores Sq8+ε on disk.
+    // Hidden index reads Sq8+ε rerank rows without fp32 reconstruction.
     let hidden_vector_columns: Vec<crate::superfile::builder::VectorConfig> = user_opts
         .vector_columns
         .iter()
@@ -1032,7 +1013,12 @@ fn build_vector_index_options(
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
+        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD)
+        .with_compaction(CompactionSettings {
+            target_superfile_size_mb: HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
+            min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
+            max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
+        });
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
@@ -1810,9 +1796,7 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
             if let Some(hidden) = producer.reader().vector_index_table() {
-                hidden
-                    .await_incoming_routed_to_cells_sync()
-                    .expect("route hidden incoming into manifest cells");
+                hidden.drain().expect("route hidden incoming into manifest cells");
             }
         }
 
@@ -2050,6 +2034,7 @@ mod tests {
         let st = Supertable::create(options).expect("create");
 
         let rows_per_commit = 8usize;
+        let commits_per_drain = 5usize;
         for commit in 0..10 {
             let titles = LargeStringArray::from(
                 (0..rows_per_commit)
@@ -2070,6 +2055,13 @@ mod tests {
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
+            if (commit + 1) % commits_per_drain == 0 {
+                st.reader()
+                    .vector_index_table()
+                    .expect("hidden vector index")
+                    .drain()
+                    .expect("route accumulated INCOMING into cells");
+            }
         }
 
         let hidden = st
@@ -2087,9 +2079,6 @@ mod tests {
             }
             by_cell.values().copied().max().unwrap_or(0)
         };
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("route hidden incoming into manifest cells");
         let before = count_by_cell(hidden.reader().manifest());
         assert!(
             before >= 2,

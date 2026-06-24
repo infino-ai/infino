@@ -200,6 +200,36 @@ pub(crate) fn row_id_from_manifest_entry(
     Some(entry.id_min + i128::from(local_doc_id))
 }
 
+/// Sync stable-id resolution for incoming drain when superfile bytes are
+/// resident (in-memory store, disk-cache mmap, or whole-object open).
+pub(crate) fn stable_ids_for_incoming_drain_resident(
+    entry: &SuperfileEntry,
+    reader: &SuperfileReader,
+) -> Result<Vec<i128>, QueryError> {
+    if row_id_from_manifest_entry(entry, 0).is_some() {
+        return Ok((0..entry.n_docs as u32)
+            .map(|local| entry.id_min + i128::from(local))
+            .collect());
+    }
+    let locals: Vec<u32> = (0..reader.n_docs() as u32).collect();
+    if let Some(ids) = reader
+        .vec()
+        .and_then(|v| v.inline_stable_ids_for_locals(&locals))
+    {
+        return Ok(ids);
+    }
+    let id_column = reader.id_column();
+    if reader.parquet_bytes().is_some() {
+        let batch = reader
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?;
+        return id_values_from_batch(&batch);
+    }
+    Err(QueryError::Execute(
+        "incoming drain requires resident superfile bytes".into(),
+    ))
+}
+
 /// Stable `_id` for every row in `entry` (`local` → `id_min + local` when the
 /// manifest span is contiguous, else targeted column reads). Same tier order as
 /// [`hidden_hits_user_ids`]: span arithmetic → resident `take_by_local_doc_ids`

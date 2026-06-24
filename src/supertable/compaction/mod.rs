@@ -36,7 +36,7 @@ use crate::{
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
-        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        handle::is_hidden_vector_index_table,
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
@@ -192,11 +192,7 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        Self::compact_one_table(self, cfg).await?;
-        if let Some(hidden) = self.inner().vector_index_table.as_ref() {
-            Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
-        }
-        Ok(())
+        Self::compact_one_table(self, cfg).await
     }
 
     pub(crate) async fn compact_one_table(
@@ -565,6 +561,10 @@ mod tests {
         BoolMode, Supertable,
         supertable::{
             error::CompactionError,
+            handle::{
+                HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB, HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
+                HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
+            },
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
@@ -790,7 +790,11 @@ mod tests {
             s.partition_key = 3u32.to_le_bytes().to_vec();
             segs.push(s);
         }
-        let cfg = hidden_vector_index_compaction_settings();
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
+            min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
+            max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
+        };
         let jobs = select(&segs, &cfg);
         assert!(
             !jobs.is_empty(),

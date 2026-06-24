@@ -117,7 +117,7 @@ use crate::{
         },
         reader::vector_layout_from_kv,
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            cell_posting::{EncodedCellRow, MaterializedIvfRow, MaterializedRebuildMode},
             distance::Metric,
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -134,7 +134,12 @@ use crate::{
             part::{self as part_mod, PartId},
             partition::{assign_partition, encode_partition_key},
         },
-        query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
+        query::{
+            dispatch::{open_compaction_input, open_reader},
+            vector::{
+                stable_ids_by_local_for_routing, stable_ids_for_incoming_drain_resident,
+            },
+        },
         reader_cache::DiskCacheStore,
     },
 };
@@ -300,20 +305,11 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
 
 /// Sq8+ε IVF rows aligned to scalar `_id` row order. Optional tombstone bitmap
 /// skips deleted locals (cell maintenance); incoming routing passes `None`.
-async fn materialized_ivf_rows_in_doc_order(
-    vec_reader: &VectorReader,
-    column: &str,
+fn align_materialized_rows_in_doc_order(
+    mut rows: Vec<MaterializedIvfRow>,
     stable_ids_by_local: &[i128],
     tombstones: Option<&roaring::RoaringBitmap>,
-) -> Result<Vec<MaterializedIvfRow>, BuildError> {
-    let mut rows = vec_reader
-        .materialized_index_rows_async(column)
-        .await
-        .ok_or_else(|| {
-            BuildError::Store(format!(
-                "IVF maintenance: column '{column}' missing Sq8Residual index"
-            ))
-        })?;
+) -> Vec<MaterializedIvfRow> {
     let n_rows = stable_ids_by_local.len();
     let mut by_local = vec![None; n_rows];
     for row in &mut rows {
@@ -322,10 +318,6 @@ async fn materialized_ivf_rows_in_doc_order(
         }
         let slot = row.local_doc_id as usize;
         if slot < n_rows {
-            // Cell superfiles inline the stable `_id` in the IVF blob, so the
-            // read-back already carries it (nonzero). Region-less incoming
-            // superfiles return 0 here and fall back to the scalar `_id` column
-            // resolved into `stable_ids_by_local`.
             if row.stable_id == 0 {
                 row.stable_id = stable_ids_by_local[slot];
                 row.encoded.stable_id = row.stable_id;
@@ -333,7 +325,7 @@ async fn materialized_ivf_rows_in_doc_order(
             by_local[slot] = Some(row.clone());
         }
     }
-    Ok(by_local
+    by_local
         .into_iter()
         .enumerate()
         .filter_map(|(i, r)| {
@@ -342,12 +334,103 @@ async fn materialized_ivf_rows_in_doc_order(
                 row
             })
         })
-        .collect())
+        .collect()
+}
+
+async fn materialized_ivf_rows_in_doc_order(
+    vec_reader: &VectorReader,
+    column: &str,
+    stable_ids_by_local: &[i128],
+    tombstones: Option<&roaring::RoaringBitmap>,
+) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+    let rows = vec_reader
+        .materialized_index_rows_async(column)
+        .await
+        .ok_or_else(|| {
+            BuildError::Store(format!(
+                "IVF maintenance: column '{column}' missing Sq8Residual index"
+            ))
+        })?;
+    Ok(align_materialized_rows_in_doc_order(
+        rows,
+        stable_ids_by_local,
+        tombstones,
+    ))
+}
+
+fn materialized_ivf_rows_in_doc_order_sync(
+    vec_reader: &VectorReader,
+    column: &str,
+    stable_ids_by_local: &[i128],
+    tombstones: Option<&roaring::RoaringBitmap>,
+) -> Option<Vec<MaterializedIvfRow>> {
+    let rows = vec_reader.materialized_index_rows_sync(column)?;
+    Some(align_materialized_rows_in_doc_order(
+        rows,
+        stable_ids_by_local,
+        tombstones,
+    ))
+}
+
+async fn open_incoming_superfile_for_drain(
+    store: &Arc<dyn crate::supertable::reader_cache::SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    entry: &Arc<SuperfileEntry>,
+) -> Result<Arc<SuperfileReader>, BuildError> {
+    if let Ok(reader) = store.reader(&entry.uri) {
+        return Ok(reader);
+    }
+    if let Ok(reader) = open_compaction_input(store, disk_cache, storage, entry).await {
+        return Ok(reader);
+    }
+    let Some(storage) = storage else {
+        return Err(BuildError::Store(
+            "incoming superfile not resident in reader cache".into(),
+        ));
+    };
+    let path = entry.uri.storage_path();
+    let (bytes, _) = storage
+        .get(&path)
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    SuperfileReader::open(bytes)
+        .map(Arc::new)
+        .map_err(|e| BuildError::Store(e.to_string()))
+}
+
+async fn load_incoming_materialized_rows_for_drain(
+    store: &Arc<dyn crate::supertable::reader_cache::SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    manifest: &Arc<Manifest>,
+    entry: &Arc<SuperfileEntry>,
+    column: &str,
+) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+    let reader =
+        open_incoming_superfile_for_drain(store, disk_cache, storage, entry).await?;
+    if let Ok(stable_ids) = stable_ids_for_incoming_drain_resident(entry, &reader) {
+        if let Some(vec_reader) = reader.vec() {
+            if let Some(rows) =
+                materialized_ivf_rows_in_doc_order_sync(vec_reader, column, &stable_ids, None)
+            {
+                return Ok(rows);
+            }
+        }
+    }
+    let stable_ids = stable_ids_by_local_for_routing(manifest, entry, &reader)
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let vec_reader = reader
+        .vec()
+        .ok_or_else(|| BuildError::Store("incoming superfile missing vector index".into()))?;
+    materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, None).await
 }
 
 /// One commit's hidden-index batch, ready to build into a single
-/// "incoming" IVF superfile. No per-cell split happens here — that is deferred
-/// to background SPFresh maintenance.
+/// "incoming" IVF superfile. No per-cell split happens here — callers
+/// invoke [`Supertable::drain`] (via [`Supertable::optimize`]) to route
+/// INCOMING rows into per-cell superfiles.
 struct HiddenIncomingPlan {
     buffer: Vec<BufferedBatch>,
     clusters: ClusterCentroids,
@@ -357,8 +440,8 @@ struct HiddenIncomingPlan {
 /// Build ONE "incoming" IVF superfile from a commit's hidden batch,
 /// tagged with the reserved incoming partition. This reuses the standard IVF
 /// superfile writer (`build_one_shard`) verbatim — no per-cell work. Queries
-/// always scan incoming superfiles; background SPFresh maintenance later routes
-/// them into per-cell IVF superfiles and deletes them.
+/// always scan incoming superfiles until [`drain_incoming_to_cells`] routes
+/// them into per-cell IVF superfiles and removes them.
 fn execute_hidden_incoming_plan_in_scope(
     inner: &SupertableInner,
     plan: HiddenIncomingPlan,
@@ -1245,9 +1328,9 @@ impl SupertableWriter {
 
     /// Plan one incoming IVF superfile from the hidden writer's buffered vectors.
     /// Bootstraps the global cell centroids from the first batch if they don't
-    /// exist yet (routing and maintenance both need them), but does NOT split
-    /// by cell and does NOT touch per-cell counts — that is deferred to
-    /// background SPFresh routing, which is when the rows actually land in cells.
+    /// exist yet (routing and drain both need them), but does NOT split
+    /// by cell and does NOT touch per-cell counts — that happens in
+    /// [`drain_incoming_to_cells`], when rows land in cells.
     fn plan_hidden_incoming_shard(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
         let empty = HiddenIncomingPlan {
             buffer: Vec::new(),
@@ -1534,15 +1617,10 @@ impl SupertableWriter {
                         ),
                     );
                     user_res?;
-                    match hidden_res {
-                        Ok(()) => {
-                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                            );
-                        }
+                    if let Err(e) = hidden_res {
+                        tracing::warn!(
+                            "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
+                        );
                     }
                     Ok::<(), BuildError>(())
                 }
@@ -2285,16 +2363,10 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Minimum number of accumulated "incoming" IVF superfiles before background
-/// maintenance routes them into per-cell IVF superfiles. Amortizes the
-/// per-cell build so it isn't paid on every commit; until routing fires the
-/// incoming superfiles are simply scanned by queries (recall is unaffected).
-const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
-
 /// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
 /// `par_iter`/`join` to one thread instead of fanning out across every core, so
-/// routing can't starve foreground ingest CPU.
+/// drain can't starve foreground ingest CPU.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn maint_pool() -> &'static rayon::ThreadPool {
@@ -2307,76 +2379,22 @@ fn maint_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Background SPFresh maintenance: route the hidden index's "incoming" IVF
-/// superfiles into per-cell IVF superfiles and delete the incoming ones. Only
-/// runs once enough incoming superfiles accumulate so the per-cell build amortizes.
+/// Route every accumulated INCOMING IVF superfile into per-cell delta superfiles.
+/// Entry point for [`Supertable::drain`] and for split/reassign redrive (step 9).
 ///
-/// The routing future's async work (object-store + disk-cache I/O) MUST run on the same
-/// `query_runtime` as the foreground path: the disk cache's async coordination
-/// primitives (per-URI fetch coordinators, background-fill notifications) are
-/// bound to that runtime, and awaiting them from a *different* runtime loses
-/// wakeups and intermittently deadlocks the commit. A short-lived thread drives
-/// it via `block_on` (the routing future borrows through `write_superfile_list`,
-/// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
-/// not by a separate runtime. The `compaction_outstanding` single-flight guard
-/// makes concurrent invocations cheap no-ops, so threads don't pile up.
-fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
-    let runtime = inner.query_runtime();
-    std::thread::Builder::new()
-        .name("hidden-maint".into())
-        .spawn(move || {
-            if let Err(e) = runtime.block_on(route_incoming_to_manifest_cells(inner)) {
-                tracing::warn!(
-                    "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
-                );
-            }
-        })
-        .ok();
+/// Async I/O (object-store + disk-cache reads) must run on the table's
+/// `query_runtime` — the disk cache's coordination primitives are bound to
+/// that runtime.
+pub(in crate::supertable) async fn drain_incoming_to_cells(
+    inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    route_incoming_to_manifest_cells_if_ready(inner, 1, None).await
 }
 
 /// Read each accumulated incoming IVF superfile's Sq8+ε rows, assign every row
 /// to its nearest global cell, build one Sq8 IVF superfile per touched cell,
 /// then publish those cell superfiles and remove the routed incoming
 /// superfiles in one OCC commit.
-async fn route_incoming_to_manifest_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
-    route_incoming_to_manifest_cells_if_ready(inner, INCOMING_ROUTE_MIN_SUPERFILES, None).await
-}
-
-/// Route every accumulated incoming IVF superfile (threshold = 1). Used by
-/// tests and by [`await_incoming_routed_to_cells`] so maintenance can be awaited
-/// before compaction runs on the per-cell IVF superfiles.
-#[cfg(any(test, feature = "test-helpers"))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::supertable) async fn await_incoming_routed_to_cells(
-    inner: Arc<SupertableInner>,
-) -> Result<(), BuildError> {
-    const FLUSH_MAX_ROUNDS: usize = 64;
-    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
-        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
-            super::handle::INCOMING_VECTOR_CELL,
-        ),
-    );
-    for _ in 0..FLUSH_MAX_ROUNDS {
-        while inner.compaction_outstanding.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, None).await?;
-        let remaining = inner
-            .manifest
-            .load_full()
-            .get_all_superfiles()
-            .iter()
-            .filter(|e| e.partition_key == incoming_key)
-            .count();
-        if remaining == 0 {
-            return Ok(());
-        }
-    }
-    Err(BuildError::Store(
-        "hidden incoming routing flush exceeded round budget".into(),
-    ))
-}
-
 async fn route_incoming_to_manifest_cells_if_ready(
     inner: Arc<SupertableInner>,
     min_incoming: usize,
@@ -2437,16 +2455,11 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .clone()
         .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
-    // Read Sq8+ε IVF rows from each incoming superfile — same open path as
-    // query fan-out (`dispatch::open_reader` → disk cache / in-memory tier).
+    // Read Sq8+ε IVF rows from each incoming superfile. Prefer the in-memory
+    // store / mmap-backed compaction opener so drain avoids cold object-store
+    // GETs when INCOMING bytes are still resident from the recent commit.
     let manifest = inner.manifest.load_full();
     let column_name = column.clone();
-    // Bound the reader fan-out to the commit write-concurrency cap (rather than
-    // an unbounded `try_join_all`) so a routing pass over many accumulated
-    // incoming superfiles doesn't saturate the object-store connection pool
-    // while a concurrent ingest commit is in flight. `buffered` (not
-    // `buffer_unordered`) preserves input order so the concatenated rows stay
-    // deterministic.
     let row_sets = stream::iter(incoming.iter().map(|entry| {
         let entry = Arc::clone(entry);
         let store = Arc::clone(&store);
@@ -2455,16 +2468,15 @@ async fn route_incoming_to_manifest_cells_if_ready(
         let manifest = Arc::clone(&manifest);
         let column_name = column_name.clone();
         async move {
-            let reader = open_reader(&store, disk_cache.as_ref(), storage_opt.as_ref(), &entry)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            let vec_reader = reader.vec().ok_or_else(|| {
-                BuildError::Store("incoming superfile missing vector index".into())
-            })?;
-            materialized_ivf_rows_in_doc_order(vec_reader, &column_name, &stable_ids, None).await
+            load_incoming_materialized_rows_for_drain(
+                &store,
+                disk_cache.as_ref(),
+                storage_opt.as_ref(),
+                &manifest,
+                &entry,
+                &column_name,
+            )
+            .await
         }
     }))
     .buffered(commit_write_concurrency())
@@ -2510,7 +2522,12 @@ async fn route_incoming_to_manifest_cells_if_ready(
             if shard_radius > 0.0 {
                 radii_updates.insert(cell_id, shard_radius);
             }
-            let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
+            let p = build_prepared_ivf_from_materialized(
+                &inner,
+                cell_id,
+                rows,
+                MaterializedRebuildMode::IncomingDrain,
+            )?;
             let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
             cell_updates.insert(cell_id, base.saturating_add(added));
             prepared.push(p);
@@ -2592,11 +2609,12 @@ fn build_prepared_ivf_from_materialized(
     inner: &SupertableInner,
     partition_hint: u32,
     rows: Vec<MaterializedIvfRow>,
+    mode: MaterializedRebuildMode,
 ) -> Result<PreparedSuperfile, BuildError> {
     if rows.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
-    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
+    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf, mode)?;
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
     Ok(PreparedSuperfile {
@@ -2613,6 +2631,7 @@ fn build_one_shard_from_materialized(
     rows: &[MaterializedIvfRow],
     options: &SupertableOptions,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
+    mode: MaterializedRebuildMode,
 ) -> Result<ShardOutput, BuildError> {
     let id_array = Decimal128Array::from_iter_values(rows.iter().map(|r| r.stable_id))
         .with_precision_and_scale(
@@ -2629,7 +2648,7 @@ fn build_one_shard_from_materialized(
     let mut builder =
         SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
     builder.add_batch_ids_only(&scalar)?;
-    builder.load_materialized_ivf_rows(rows.to_vec())?;
+    builder.load_materialized_ivf_rows(rows.to_vec(), mode)?;
 
     let id_min = rows.iter().map(|r| r.stable_id).min().unwrap_or(0);
     let id_max = rows.iter().map(|r| r.stable_id).max().unwrap_or(0);
@@ -2735,7 +2754,12 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         for (local, row) in rows.iter_mut().enumerate() {
             row.local_doc_id = local as u32;
         }
-        build_prepared_ivf_from_materialized(&inner, super::handle::INCOMING_VECTOR_CELL, rows)
+        build_prepared_ivf_from_materialized(
+            &inner,
+            super::handle::INCOMING_VECTOR_CELL,
+            rows,
+            MaterializedRebuildMode::Maintenance,
+        )
     })?;
 
     let batch = collect_prepared_superfiles(&inner, vec![incoming_prepared])?;
@@ -2793,10 +2817,8 @@ async fn publish_hidden_incoming_async(
         manifest_before.with_partition_strategy(updated_strategy),
     ));
     // We already hold the incoming superfile's bytes here. Warm them onto local
-    // disk so the background SPFresh routing pass reads them via mmap instead of
-    // cold-fetching ~one superfile per accumulated commit back from object
-    // storage — those GETs otherwise contend with foreground ingest PUTs and
-    // stall the commit. Cheap clone (Bytes is Arc-backed).
+    // disk so a later [`drain_incoming_to_cells`] pass reads them via mmap
+    // instead of cold-fetching back from object storage.
     let incoming_writes: Vec<(SuperfileUri, Bytes)> = prep.batch.pending_storage_writes.clone();
     let new_manifest = persist_commit_async(
         &inner,
