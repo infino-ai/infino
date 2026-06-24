@@ -164,15 +164,27 @@ fn filter_superfiles_by_cells(
         .collect()
 }
 
-/// Whether every hit already references a superfile in the user manifest.
-fn hits_reference_user_superfiles(reader: &SupertableReader, hits: &[SuperfileHit]) -> bool {
+/// Whether every hit already references a superfile in the user manifest
+/// (flat view or list parts — same source as query fan-out).
+async fn hits_reference_user_superfiles(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+) -> Result<bool, QueryError> {
+    if hits.is_empty() {
+        return Ok(true);
+    }
     let manifest = reader.manifest();
-    hits.iter().all(|hit| {
-        manifest
-            .superfiles
-            .iter()
-            .any(|entry| entry.uri == hit.superfile)
-    })
+    for hit in hits {
+        if manifest
+            .lookup_superfile_entry(hit.superfile)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
@@ -371,14 +383,14 @@ async fn hidden_hits_user_ids(
     }
     for (uri, idxs) in by_superfile {
         let entry = hidden_manifest
-            .superfiles
-            .iter()
-            .find(|e| e.uri == uri)
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
                 QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
             })?;
         // Contiguous span → arithmetic, no read.
-        if row_id_from_manifest_entry(entry, 0).is_some() {
+        if row_id_from_manifest_entry(&entry, 0).is_some() {
             for &i in &idxs {
                 ids[i] = entry.id_min + i128::from(hidden_hits[i].local_doc_id);
             }
@@ -386,7 +398,7 @@ async fn hidden_hits_user_ids(
         }
         // Gapped span → one resident read of just the rows these hits touch.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals = read_ids_for_locals(hidden_manifest, entry, &locals, id_column).await?;
+        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column).await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -468,16 +480,17 @@ async fn remap_hidden_hits_to_user_hits(
     }
     for (uri, idxs) in gapped {
         let user_entry = user_manifest
-            .superfiles
-            .iter()
-            .find(|e| e.uri == uri)
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
                 QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
             })?;
         let n = user_entry.n_docs as usize;
         let all_locals: Vec<u32> = (0..n as u32).collect();
         // Column is monotonic (ids minted in row order) → binary-searchable.
-        let id_col = read_ids_for_locals(user_manifest, user_entry, &all_locals, id_column).await?;
+        let id_col =
+            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column).await?;
         for &i in &idxs {
             let user_row_id = user_ids[i];
             let pos = id_col.binary_search(&user_row_id).map_err(|_| {
@@ -1121,8 +1134,8 @@ impl SupertableReader {
                     let hits = self
                         .vector_search_global_index_async(column, query, k, options)
                         .await?;
-                    let on_user_table =
-                        hits.is_empty() || hits_reference_user_superfiles(self, &hits);
+                    let on_user_table = hits.is_empty()
+                        || hits_reference_user_superfiles(self, &hits).await?;
                     if projection.is_none() && !on_user_table {
                         let batch = hidden_hits_id_score_batch(self, &hits).await?;
                         return Ok(vec![batch]);
@@ -1161,7 +1174,7 @@ impl SupertableReader {
                 let hits = self
                     .vector_search_global_index_async(column, query, k, options)
                     .await?;
-                if hits_reference_user_superfiles(self, &hits) {
+                if hits_reference_user_superfiles(self, &hits).await? {
                     Ok(hits)
                 } else {
                     remap_hidden_hits_to_user_hits(self, &hits).await
