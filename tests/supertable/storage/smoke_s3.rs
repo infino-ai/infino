@@ -380,9 +380,8 @@ async fn supertable_smoke_via_s3_wire_protocol() {
 /// the EC2 `supertable_vector` ingest hang. Commits run on a `spawn_blocking`
 /// thread (no ambient runtime → `block_on_writer_future` takes the `Err` branch
 /// onto `query_runtime`, exactly as the EC2 ingest harness drives it), across
-/// enough commits to trigger the background SPFresh drain (the multi-commit
-/// path that hangs on EC2). A `timeout` converts a deadlock into a fast test
-/// failure instead of wedging the runner.
+/// enough commits to stress multi-commit OCC. A `timeout` converts a deadlock
+/// into a fast test failure instead of wedging the runner.
 ///
 /// Endpoint: in-process s3s-fs by default — but s3s-fs does NOT enforce
 /// conditional If-Match PUT, so the drain↔commit OCC race is masked and a hang

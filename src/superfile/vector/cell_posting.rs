@@ -629,12 +629,23 @@ pub struct EncodedCellRow {
     pub norm_sq: Option<f32>,
 }
 
+/// How [`super::builder::VectorBuilder`] re-encodes materialized IVF rows on finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterializedRebuildMode {
+    /// Full Lloyd k-means + reassignment (maintenance / split redrive).
+    Maintenance,
+    /// Incoming drain: preserve source IVF cluster assignment, medoid centroids only.
+    IncomingDrain,
+}
+
 /// One IVF row for Sq8-native maintenance rebuilds: preserved 1-bit RaBitQ estimate
 /// codes plus the Sq8+ε rerank payload. Re-fed into [`super::builder::VectorBuilder`].
 #[derive(Debug, Clone)]
 pub struct MaterializedIvfRow {
     pub local_doc_id: u32,
     pub stable_id: i128,
+    /// IVF cluster index in the source superfile (set when materialized from disk).
+    pub source_ivf_cluster: u32,
     pub rabitq_code: Vec<u8>,
     pub encoded: EncodedCellRow,
 }
@@ -662,6 +673,20 @@ pub(crate) fn cluster_quant_from_medoid(
     let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
     let mid = medoid_index_symmetric(metric, dim, &encoded);
     (encoded[mid].scale.clone(), encoded[mid].offset.clone())
+}
+
+/// Medoid Sq8+ε row in `bucket` folded to fp32 centroid components for IVF headers.
+pub(crate) fn ivf_centroid_components_from_materialized_bucket(
+    metric: Metric,
+    dim: usize,
+    bucket: &[&MaterializedIvfRow],
+) -> Vec<f32> {
+    debug_assert!(!bucket.is_empty());
+    let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
+    let mid = medoid_index_by(&encoded, |a, b| {
+        distance_encoded_rows_symmetric(metric, dim, a, b)
+    });
+    manifest_centroid_components_from_row(&encoded[mid], dim)
 }
 
 /// Copy or Sq8-transcode one row into `out` (`[codes | residuals]`, length `2·dim`).

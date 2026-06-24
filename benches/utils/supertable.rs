@@ -853,16 +853,13 @@ pub mod vector {
         }
     }
 
-    /// Drain hidden incoming IVF into per-cell superfiles via the existing
-    /// SPFresh maintenance hook (same call integration tests use).
+    /// Drain hidden INCOMING IVF into per-cell superfiles (same path as optimize).
     fn drain_hidden_incoming(consumer: &Supertable) {
         let hidden = consumer
             .vector_index_table()
             .expect("vector table keeps hidden index");
         eprintln!("[supertable_vector] draining hidden incoming IVF into cell superfiles...");
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("hidden incoming drain");
+        hidden.drain().expect("hidden incoming drain");
         log_hidden_stats(hidden, "after drain");
     }
 

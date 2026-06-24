@@ -1509,6 +1509,7 @@ impl VectorReader {
                 out.push(MaterializedIvfRow {
                     local_doc_id: local_id,
                     stable_id,
+                    source_ivf_cluster: c as u32,
                     rabitq_code: rabitq,
                     encoded: EncodedCellRow {
                         stable_id,
@@ -1565,6 +1566,51 @@ impl VectorReader {
             .range_async(col.subsection_range.clone())
             .await
             .ok()?;
+        Some(Self::parse_materialized_index_rows(
+            col,
+            sub.as_ref(),
+            &scale_buf,
+            &offset_buf,
+        ))
+    }
+
+    /// Sync read-back for incoming drain when the subsection and Sq8 meta are
+    /// resident (`try_get_range_sync`). Avoids cold object-store GETs on the
+    /// hot drain path after commit or disk-cache warm.
+    pub(crate) fn materialized_index_rows_sync(
+        &self,
+        index_name: &str,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        let cid = *self.column_id_by_name.get(index_name)?;
+        let col = &self.columns[cid as usize];
+        if col.rerank_codec != RerankCodec::Sq8Residual {
+            return None;
+        }
+        let dim = col.dim;
+        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+        let (scale_buf, offset_buf) = match &col.sq8_meta {
+            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
+            Some(Sq8ColumnMeta::Lazy {
+                scale_abs_off,
+                offset_abs_off,
+                ..
+            }) => {
+                let scale_bytes = self
+                    .source
+                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)?;
+                let offset_bytes = self
+                    .source
+                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)?;
+                (
+                    parse_f32_le_vec(scale_bytes.as_ref()),
+                    parse_f32_le_vec(offset_bytes.as_ref()),
+                )
+            }
+            _ => return None,
+        };
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
         Some(Self::parse_materialized_index_rows(
             col,
             sub.as_ref(),

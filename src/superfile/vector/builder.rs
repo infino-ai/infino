@@ -33,8 +33,9 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, cluster_quant_from_medoid, encode_sq8_residual_dim,
-            encoded_component_at, encoded_ivf_kmeans,
+            MaterializedIvfRow, MaterializedRebuildMode, cluster_quant_from_medoid,
+            encode_sq8_residual_dim, encoded_component_at, encoded_ivf_kmeans,
+            ivf_centroid_components_from_materialized_bucket,
             materialize_sq8_residual_row_into_cluster_quant,
         },
         centroid_block,
@@ -79,6 +80,13 @@ const RESERVOIR_SEED_XOR_MASK: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 /// is the standard turn-key default; returns diminish past it on
 /// typical embedding distributions.
 const KMEANS_ITERS: usize = 5;
+
+fn materialized_ivf_n_cent(cfg: &VectorConfig, n_docs: usize) -> usize {
+    cfg.n_cent
+        .max(1)
+        .min(n_cent_row_count_cap(n_docs))
+        .min(n_docs.max(1))
+}
 
 /// Target memory budget (~128 MiB) for one pass-2 rotated chunk
 /// (`chunk_rows × dim × 4` bytes); the chunk row count is derived
@@ -204,6 +212,8 @@ struct ColumnState {
     /// Sq8-native maintenance rows: when set, finish uses the materialized IVF
     /// rebuild path instead of the fp32 ingest pipeline.
     materialized_rows: Option<Vec<MaterializedIvfRow>>,
+    /// Re-encode strategy when `materialized_rows` is set.
+    materialized_rebuild_mode: MaterializedRebuildMode,
     /// Pre-built subsection bytes from byte-splice merge (compaction path).
     prebuilt_subsection: Option<SubsectionBytes>,
 }
@@ -366,6 +376,7 @@ impl VectorBuilder {
             spill: None,
             spill_threshold_bytes,
             materialized_rows: None,
+            materialized_rebuild_mode: MaterializedRebuildMode::Maintenance,
             prebuilt_subsection: None,
         });
         Ok(column_id)
@@ -377,6 +388,7 @@ impl VectorBuilder {
         &mut self,
         column_id: u32,
         rows: Vec<MaterializedIvfRow>,
+        mode: MaterializedRebuildMode,
     ) -> Result<(), BuildError> {
         let idx = column_id as usize;
         let col = self
@@ -394,6 +406,7 @@ impl VectorBuilder {
         }
         col.n_docs = rows.len() as u32;
         col.materialized_rows = Some(rows);
+        col.materialized_rebuild_mode = mode;
         Ok(())
     }
 
@@ -782,7 +795,24 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 /// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
 fn build_subsection_from_materialized(
     cfg: VectorConfig,
+    rows: Vec<MaterializedIvfRow>,
+    mode: MaterializedRebuildMode,
+) -> Result<SubsectionBytes, BuildError> {
+    let n_docs = rows.len();
+    if n_docs == 0 {
+        return Err(BuildError::VectorSchemaMismatch(
+            "materialized IVF rebuild requires at least one row".into(),
+        ));
+    }
+    let n_cent = materialized_ivf_n_cent(&cfg, n_docs);
+    build_subsection_from_materialized_impl(cfg, rows, n_cent, mode)
+}
+
+fn build_subsection_from_materialized_impl(
+    cfg: VectorConfig,
     mut rows: Vec<MaterializedIvfRow>,
+    n_cent: usize,
+    mode: MaterializedRebuildMode,
 ) -> Result<SubsectionBytes, BuildError> {
     rows.sort_by_key(|r| r.local_doc_id);
     let n_docs = rows.len();
@@ -792,13 +822,50 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
-    let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
-    let n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_cent_row_count_cap(n_docs))
-        .min(n_docs.max(1));
-    let (centroids, _assign) = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
+
+    let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
+    let centroids = match mode {
+        MaterializedRebuildMode::IncomingDrain => {
+            for row in &rows {
+                let c = (row.source_ivf_cluster as usize) % n_cent;
+                buckets[c].push(row);
+            }
+            let mut centroids = vec![0.0f32; n_cent * dim];
+            for (c, bucket) in buckets.iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let comps =
+                    ivf_centroid_components_from_materialized_bucket(cfg.metric, dim, bucket);
+                centroids[c * dim..(c + 1) * dim].copy_from_slice(&comps);
+            }
+            centroids
+        }
+        MaterializedRebuildMode::Maintenance => {
+            let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
+            let (centroids, _assign) =
+                encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
+            for row in &rows {
+                let mut best_c = 0usize;
+                let mut best_score = f32::INFINITY;
+                for c in 0..n_cent {
+                    let cv = &centroids[c * dim..(c + 1) * dim];
+                    let score = metric_distance_by(
+                        cfg.metric,
+                        dim,
+                        |d| encoded_component_at(&row.encoded, d),
+                        |d| cv[d],
+                    );
+                    if score < best_score {
+                        best_score = score;
+                        best_c = c;
+                    }
+                }
+                buckets[best_c].push(row);
+            }
+            centroids
+        }
+    };
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
@@ -819,26 +886,6 @@ fn build_subsection_from_materialized(
     let code_bytes = quant.code_bytes();
     let codec = cfg.rerank_codec;
     debug_assert!(matches!(codec, RerankCodec::Sq8Residual));
-
-    let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
-    for row in &rows {
-        let mut best_c = 0usize;
-        let mut best_score = f32::INFINITY;
-        for c in 0..n_cent {
-            let cv = &centroids[c * dim..(c + 1) * dim];
-            let score = metric_distance_by(
-                cfg.metric,
-                dim,
-                |d| encoded_component_at(&row.encoded, d),
-                |d| cv[d],
-            );
-            if score < best_score {
-                best_score = score;
-                best_c = c;
-            }
-        }
-        buckets[best_c].push(row);
-    }
 
     let mut bucket_counts = vec![0u32; n_cent];
     let mut summary_radius_sq_max = 0.0f32;
@@ -991,12 +1038,13 @@ fn build_subsection_streaming(
         spill,
         spill_threshold_bytes: _,
         materialized_rows,
+        materialized_rebuild_mode,
         prebuilt_subsection: _,
     } = col;
 
     if let Some(rows) = materialized_rows {
         drop(reservoir);
-        return build_subsection_from_materialized(cfg, rows);
+        return build_subsection_from_materialized(cfg, rows, materialized_rebuild_mode);
     }
 
     let dim = cfg.dim;

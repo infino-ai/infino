@@ -51,7 +51,7 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode},
+    config::{CompactionSettings, Config, StorageBackend, StorageColdFetchMode},
     storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
     superfile::{
         OpenOptions,
@@ -374,6 +374,11 @@ pub struct SupertableOptions {
     /// the application never refreshes by hand. Default:
     /// [`Consistency::BoundedStaleness`] with a 1s window.
     pub read_consistency: Consistency,
+    /// Compaction profile for [`Supertable::compact`] on this table.
+    /// User tables typically pass per-call settings via
+    /// [`OptimizeOptions`](crate::config::OptimizeOptions); the hidden
+    /// vector-index sibling is created with an aggressive cell-local default.
+    pub compaction: CompactionSettings,
 }
 
 impl SupertableOptions {
@@ -526,6 +531,7 @@ impl SupertableOptions {
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
+            compaction: CompactionSettings::default(),
         })
     }
 
@@ -732,6 +738,12 @@ impl SupertableOptions {
     /// Default `100 MiB`.
     pub fn with_put_multipart_threshold_bytes(mut self, n: u64) -> Self {
         self.put_multipart_threshold_bytes = n;
+        self
+    }
+
+    /// Override the compaction profile stamped on this table handle.
+    pub fn with_compaction(mut self, compaction: CompactionSettings) -> Self {
+        self.compaction = compaction;
         self
     }
 

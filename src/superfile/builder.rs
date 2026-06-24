@@ -101,7 +101,7 @@ use crate::superfile::{
     stats::SuperfileStats,
     vector::{
         builder::VectorBuilder,
-        cell_posting::{CellPostingBuilder, MaterializedIvfRow},
+        cell_posting::{CellPostingBuilder, MaterializedIvfRow, MaterializedRebuildMode},
         distance::Metric,
         ivf_merge::{MergedIvfSubsection, merge_sq8_ivf_subsections},
         layout::VectorLayout,
@@ -637,12 +637,13 @@ impl SuperfileBuilder {
     pub(crate) fn load_materialized_ivf_rows(
         &mut self,
         rows: Vec<MaterializedIvfRow>,
+        mode: MaterializedRebuildMode,
     ) -> Result<(), BuildError> {
         let vb = self
             .vec_builder
             .as_mut()
             .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
-        vb.load_materialized_rows(0, rows)?;
+        vb.load_materialized_rows(0, rows, mode)?;
         Ok(())
     }
 
