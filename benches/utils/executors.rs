@@ -14,8 +14,10 @@
 
 use std::time::{Duration, Instant};
 
-use crate::report::{Better, Cell, context, metric};
-use crate::rss::{self, RssStats};
+use crate::{
+    report::{Better, Cell, context, metric},
+    rss::{self, RssStats},
+};
 
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
@@ -1920,8 +1922,7 @@ pub mod sql {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::time::Duration;
+    use std::{cell::Cell, time::Duration};
 
     use super::{repeat_cleanest, sample_batched, summarize};
 
