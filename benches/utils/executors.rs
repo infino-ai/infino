@@ -14,6 +14,9 @@
 
 use std::time::{Duration, Instant};
 
+use crate::report::{Better, Cell, context, metric};
+use crate::rss::{self, RssStats};
+
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
 pub fn p50(samples: &mut [Duration]) -> Duration {
@@ -82,6 +85,27 @@ pub fn repeat_cleanest<I, S>(
     best.into_iter()
         .map(|s| s.expect("each item measured at least once"))
         .collect()
+}
+
+/// Peak / median / p90 RSS cells. Peak gates; median and p90 are context.
+fn rss_cells(stats: &RssStats) -> Vec<Cell> {
+    vec![
+        metric(
+            stats.peak_rss_bytes as f64,
+            rss::fmt_bytes(stats.peak_rss_bytes),
+            Better::Lower,
+        ),
+        context(
+            stats.median_rss_bytes as f64,
+            rss::fmt_bytes(stats.median_rss_bytes),
+            Better::Lower,
+        ),
+        context(
+            stats.p90_rss_bytes as f64,
+            rss::fmt_bytes(stats.p90_rss_bytes),
+            Better::Lower,
+        ),
+    ]
 }
 
 /// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
@@ -176,7 +200,7 @@ pub mod fts {
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, context, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Nanoseconds per second, for time-cell formatting.
@@ -583,27 +607,14 @@ pub mod fts {
                 let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
                 let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
                 let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
-                vec![
+                let mut cells = vec![
                     metric(min_ns, fmt_time(min_ns), Better::Lower),
                     context(p50_ns, fmt_time(p50_ns), Better::Lower),
                     context(p90_ns, fmt_time(p90_ns), Better::Lower),
                     context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
-                    metric(
-                        q.rss.peak_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.peak_rss_bytes),
-                        Better::Lower,
-                    ),
-                    context(
-                        q.rss.median_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.median_rss_bytes),
-                        Better::Lower,
-                    ),
-                    context(
-                        q.rss.p90_rss_bytes as f64,
-                        rss::fmt_bytes(q.rss.p90_rss_bytes),
-                        Better::Lower,
-                    ),
-                ]
+                ];
+                cells.extend(rss_cells(&q.rss));
+                cells
             }
             None => vec![
                 text("—"),
@@ -827,7 +838,7 @@ pub mod vector {
         corpus::{self, Calibrated},
         markdown::fmt_time,
         report::{Better, Block, Cell, Report, Section, context, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Recall correctness gate (shared by both tiers).
@@ -1161,7 +1172,8 @@ pub mod vector {
         pub rss: RssStats,
     }
 
-    const WARM_WARMUP_ITERS: usize = 5;
+    /// Untimed iterations before sampling, to reach steady state.
+    const WARMUP_ITERS: usize = 5;
     const WARM_SAMPLE_ITERS: usize = 30;
 
     pub fn measure_warm<R: VectorRead>(
@@ -1172,7 +1184,7 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> VecTiming {
-        for _ in 0..WARM_WARMUP_ITERS {
+        for _ in 0..WARMUP_ITERS {
             black_box(reader.topk_global(column, query, k, nprobe, rerank));
         }
         let sampler = PeakSampler::start_default();
@@ -1240,27 +1252,6 @@ pub mod vector {
         } else {
             text("—")
         }
-    }
-
-    /// Peak RSS gates; median / p90 are context.
-    fn rss_cells(stats: &RssStats) -> Vec<Cell> {
-        vec![
-            metric(
-                stats.peak_rss_bytes as f64,
-                rss::fmt_bytes(stats.peak_rss_bytes),
-                Better::Lower,
-            ),
-            context(
-                stats.median_rss_bytes as f64,
-                rss::fmt_bytes(stats.median_rss_bytes),
-                Better::Lower,
-            ),
-            context(
-                stats.p90_rss_bytes as f64,
-                rss::fmt_bytes(stats.p90_rss_bytes),
-                Better::Lower,
-            ),
-        ]
     }
 
     /// Render the recall/latency table (same columns for both tiers):
@@ -1519,7 +1510,7 @@ pub mod sql {
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, context, metric, text},
-        rss::{self, PeakSampler, RssStats},
+        rss::{PeakSampler, RssStats},
     };
 
     /// Timed query repetitions per query (after one warmup).
@@ -1784,27 +1775,6 @@ pub mod sql {
             fts_pushdown,
             agg_idx,
         }
-    }
-
-    /// Peak RSS gates; median / p90 are context.
-    fn rss_cells(stats: &RssStats) -> Vec<Cell> {
-        vec![
-            metric(
-                stats.peak_rss_bytes as f64,
-                rss::fmt_bytes(stats.peak_rss_bytes),
-                Better::Lower,
-            ),
-            context(
-                stats.median_rss_bytes as f64,
-                rss::fmt_bytes(stats.median_rss_bytes),
-                Better::Lower,
-            ),
-            context(
-                stats.p90_rss_bytes as f64,
-                rss::fmt_bytes(stats.p90_rss_bytes),
-                Better::Lower,
-            ),
-        ]
     }
 
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
