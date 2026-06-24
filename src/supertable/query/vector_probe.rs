@@ -98,8 +98,13 @@ pub(super) async fn select_opann_probe_leaves(
         return Ok(None);
     };
 
+    // Collect every surviving leaf (same as [`super::vector::SupertableReader::candidate_superfiles_for_vector`]):
+    // radius-aware τ admission runs over the full candidate pool and trims to
+    // `[floor, nprobe_max]`. Capping descent at `nprobe_max` first drops cells
+    // that τ would have admitted — spread-out queries need those far-but-large-
+    // radius partitions, not a smaller fixed centroid-depth budget.
     let candidates = PagedTree::new(source, root)
-        .select_probes_where(query, routing.nprobe_max, &survives)
+        .select_probes_where(query, usize::MAX, &survives)
         .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
 
     let entries = super::vector::ordered_manifest_superfiles(manifest).await?;

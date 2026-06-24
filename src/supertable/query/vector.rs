@@ -1145,6 +1145,76 @@ impl SupertableReader {
     }
 }
 
+/// Hidden-table hits before user remap — bench / integration diagnostics only.
+pub(crate) async fn opann_diag_hidden_hits(
+    user_reader: &SupertableReader,
+    column: &str,
+    query: &[f32],
+    k: usize,
+    options: VectorSearchOptions,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let vit = user_reader
+        .vector_index_table()
+        .ok_or_else(|| QueryError::Execute("hidden vector index missing".into()))?;
+    vit.reader()
+        .vector_search_user_table_async(column, query, k, options)
+        .await
+}
+
+/// Read one Int64 column for every row in `entry` (generation-index diagnostics).
+pub(crate) async fn opann_diag_read_i64_column_all_rows(
+    manifest: &Manifest,
+    entry: &SuperfileEntry,
+    column: &str,
+) -> Result<Vec<i64>, QueryError> {
+    if entry.n_docs == 0 {
+        return Ok(Vec::new());
+    }
+    let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+    let storage = manifest
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| QueryError::Execute("column read needs storage".into()))?;
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.as_ref();
+    let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
+    let batch = if reader.parquet_bytes().is_some() {
+        reader
+            .take_by_local_doc_ids(&locals, &[column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+    } else {
+        let (obj_store, path) = storage
+            .object_store_handle(&entry.uri.storage_path())
+            .ok_or_else(|| QueryError::Execute("no object_store handle".into()))?;
+        let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
+        take_rows_object_store(
+            obj_store,
+            path,
+            file_size,
+            reader.schema(),
+            entry.n_docs,
+            &locals,
+            &[column],
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?
+    };
+    let arr = batch
+        .column_by_name(column)
+        .ok_or_else(|| QueryError::Execute(format!("column {column:?} missing")))?
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .ok_or_else(|| QueryError::Execute(format!("column {column:?} is not Int64")))?;
+    Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+}
+
+#[cfg(feature = "test-helpers")]
+#[path = "opann_recall_diag.rs"]
+mod opann_recall_diag;
+#[cfg(feature = "test-helpers")]
+pub use opann_recall_diag::{OpannRecallQueryBreakdown, run_opann_recall_breakdown};
+
 fn subtract_tombstones(
     bm: &mut RoaringBitmap,
     entry: &SuperfileEntry,
@@ -1498,12 +1568,7 @@ mod tests {
     /// single-thread test above only ever builds ~16 leaves, so it cannot catch
     /// regressions that show up once the tree has hundreds of partitions.
     #[test]
-    #[ignore = "reproduces the open 256-shard hidden-OPANN recall miss (recall@10 ~0.60); \
-                descent and cell-open are verified correct, remap/mirror completeness still \
-                under investigation — un-ignore once recall is restored"]
     fn storage_backed_opann_recall_multi_shard_time_mirror() {
-        use std::collections::HashSet;
-
         use tempfile::TempDir;
 
         use crate::{
@@ -1522,8 +1587,13 @@ mod tests {
         const TOP_K: usize = 10;
         const N_QUERIES: usize = 20;
         const TEST_NPROBE: usize = 64;
-        /// Same tripwire as `benches/utils/executors.rs` `CORRECTNESS_RECALL_FLOOR`.
-        const RECALL_BAR: f32 = 0.80;
+        /// Acceptance bar. Graded by recomputed true distance of the documents
+        /// the user-facing `vector_search` returns, so the full 0.99 bar applies
+        /// — not the loose 0.80 bench tripwire.
+        const RECALL_BAR: f32 = 0.99;
+        /// Tolerance for fp rounding when comparing a returned document's
+        /// recomputed true distance to the brute-force k-th distance.
+        const DIST_EPSILON: f32 = 1e-3;
 
         fn vector_for_global(g: usize, dim: usize) -> Vec<f32> {
             (0..dim)
@@ -1621,7 +1691,15 @@ mod tests {
              want ≫ {N_COMMITS} from single-shard ingest)"
         );
 
-        let offsets = reader.superfile_doc_base_offsets().expect("doc bases");
+        // The 16-thread writer pool shards every commit's append across threads,
+        // so the user table is many superfiles — the topology the bench runs and
+        // the single-shard test cannot reach.
+        let n_user_superfiles = reader.superfile_doc_base_offsets().expect("doc bases").len();
+        assert!(
+            n_user_superfiles > N_COMMITS,
+            "expected sharded user ingest (got {n_user_superfiles} user superfiles, \
+             want > {N_COMMITS})"
+        );
         let mut corpus = Vec::with_capacity(TOTAL_DOCS);
         for g in 0..TOTAL_DOCS {
             corpus.push(vector_for_global(g, DIM));
@@ -1631,40 +1709,55 @@ mod tests {
         for qi in 0..N_QUERIES {
             let global_row = qi * (TOTAL_DOCS / N_QUERIES);
             let query = vector_for_global(global_row, DIM);
-            let mut scored: Vec<(f32, u32)> = corpus
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (l2_sq(&query, v), i as u32))
-                .collect();
-            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));
-            let truth: HashSet<u32> = scored.into_iter().take(TOP_K).map(|(_, id)| id).collect();
+            // Brute-force k-th nearest TRUE distance — the recall threshold.
+            let mut dists: Vec<f32> = corpus.iter().map(|v| l2_sq(&query, v)).collect();
+            dists.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let d_k = dists[TOP_K - 1];
 
-            let hits = reader
-                .vector_hits(
+            // User-facing path: `vector_search` returns the actual documents the
+            // user sees, projected to their unique `title` (a scalar column, so
+            // projectable — the vector column is not). Each returned document's
+            // TRUE distance is recomputed from the corpus by its title-encoded
+            // generation index; the engine's own score is never used to grade,
+            // and no storage-position (`base + local`) assumption is made.
+            let batches = reopened
+                .vector_search(
                     "emb",
                     &query,
                     TOP_K,
                     VectorSearchOptions::default().with_nprobe(TEST_NPROBE),
                     None,
+                    Some(&["title"]),
                 )
-                .expect("vector_hits");
-            let found: HashSet<u32> = hits
-                .into_iter()
-                .map(|h| {
-                    let base = offsets
-                        .get(&h.superfile)
-                        .expect("hit superfile in user manifest");
-                    base + h.local_doc_id
-                })
-                .collect();
-            let hit = found.iter().filter(|id| truth.contains(id)).count();
-            sum += hit as f32 / TOP_K as f32;
+                .expect("vector_search");
+            let mut correct = 0usize;
+            for batch in &batches {
+                let titles = batch
+                    .column_by_name("title")
+                    .expect("title projection present")
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title is LargeUtf8");
+                for r in 0..titles.len() {
+                    let g: usize = titles
+                        .value(r)
+                        .strip_prefix("doc ")
+                        .expect("title format `doc <n>`")
+                        .parse()
+                        .expect("doc index");
+                    if l2_sq(&query, &corpus[g]) <= d_k + DIST_EPSILON {
+                        correct += 1;
+                    }
+                }
+            }
+            sum += correct as f32 / TOP_K as f32;
         }
-        let mean = sum / N_QUERIES as f32;
+        let recall = sum / N_QUERIES as f32;
         assert!(
-            mean >= RECALL_BAR,
-            "multi-shard path B recall@{TOP_K} = {mean:.3} < floor {RECALL_BAR:.2} \
-             (256-leaf time-mirror hidden OPANN after Supertable::open)"
+            recall >= RECALL_BAR,
+            "multi-shard path B recall@{TOP_K} = {recall:.3} < bar {RECALL_BAR:.2} \
+             (256-leaf time-mirror hidden OPANN; user-facing vector_search graded by \
+             recomputed true distance of the returned documents)"
         );
     }
 

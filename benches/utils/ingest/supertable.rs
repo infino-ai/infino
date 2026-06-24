@@ -63,6 +63,11 @@ pub fn n_writers() -> usize {
 }
 pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
+/// Scalar identity column on vector/combined corpora: each doc's generation
+/// index. Lets the recall harness grade the documents `vector_search` returns
+/// by identity (independent of how the writer pool shards the append across
+/// superfiles), instead of a storage-position (`base + local`) assumption.
+pub const VEC_KEY_COLUMN: &str = "doc_key";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
@@ -151,6 +156,7 @@ fn schema_for(modality: Modality) -> Arc<Schema> {
         fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
     }
     if modality.has_vector() {
+        fields.push(Field::new(VEC_KEY_COLUMN, DataType::Int64, false));
         fields.push(Field::new(
             VEC_COLUMN,
             DataType::FixedSizeList(
@@ -613,6 +619,11 @@ fn chunk_batch(
         ));
     }
     if modality.has_vector() {
+        // Generation index per row — the stable identity the recall harness
+        // maps results back to (storage position is scrambled by sharding).
+        columns.push(Arc::new(Int64Array::from(
+            (start..end).map(|d| d as i64).collect::<Vec<_>>(),
+        )));
         let all = corpus
             .vectors
             .as_ref()

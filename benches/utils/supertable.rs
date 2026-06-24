@@ -1106,6 +1106,16 @@ pub mod vector {
                     None,
                 )
             };
+            // Optional OPANN recall breakdown needs corpus vectors for the
+            // probed-cell oracle; clone before the mmap is dropped.
+            let diag_vectors = if std::env::var("INFINO_DIAG_OPANN_RECALL").is_ok() {
+                corpus.as_ref().and_then(|c| {
+                    c.vectors()
+                        .map(|v| v.as_slice().to_vec())
+                })
+            } else {
+                None
+            };
             // Queries + ground truth extracted; free the corpus pages
             // + temp file so the warm/cold samplers measure the engine
             // only.
@@ -1131,6 +1141,26 @@ pub mod vector {
 
             let (cache_dir, consumer, maint_meter) =
                 open_consumer_metered(Modality::Vector, &built);
+
+            if let Some(ref vslice) = diag_vectors {
+                if !skip_cal && !gt_correct.is_empty() {
+                    eprintln!(
+                        "[supertable_vector] INFINO_DIAG_OPANN_RECALL=1: per-query OPANN recall breakdown ({} queries)...",
+                        q_correct.len().min(3),
+                    );
+                    infino::supertable::query::vector::run_opann_recall_breakdown(
+                        &consumer,
+                        supertable::VEC_COLUMN,
+                        crate::ingest::supertable::VEC_KEY_COLUMN,
+                        vslice,
+                        DIM,
+                        &q_correct,
+                        &gt_correct,
+                        TOP_K,
+                    )
+                    .expect("opann recall diag");
+                }
+            }
 
             let pre_maint_config = exec_vec::VectorSearchRunConfig {
                 assert_recall_floor: false,

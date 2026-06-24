@@ -667,6 +667,7 @@ pub mod fts {
 pub mod vector {
     use std::{collections::HashMap, hint::black_box};
 
+    use arrow_array::{Array, Int64Array};
     use infino::{
         superfile::{SuperfileReader, reader::VectorSearchOptions},
         supertable::Supertable,
@@ -750,28 +751,45 @@ pub mod vector {
             column: &str,
             query: &[f32],
             k: usize,
-            nprobe: usize,
+            _nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            let reader = self.reader();
-            let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
-                .expect("supertable vector_hits");
-            let offsets = reader
-                .superfile_doc_base_offsets()
-                .expect("superfile doc bases");
-            hits.into_iter()
-                .map(|h| {
-                    let base = offsets.get(&h.superfile).unwrap_or_else(|| {
-                        panic!(
-                            "vector hit references superfile {:?} absent from user manifest \
-                             (hidden remap bug?)",
-                            h.superfile
-                        )
-                    });
-                    (base + h.local_doc_id, h.score)
-                })
-                .collect()
+            // Grade what the USER sees: `vector_search` returns the actual
+            // documents, projected to their `doc_key` (= corpus generation
+            // index). Recall is then identity-based and independent of how the
+            // writer pool sharded the append across superfiles — storage
+            // position (`base + local_doc_id`) does NOT equal generation order
+            // once a commit fans into many superfiles, so a position-based
+            // mapping silently under-reports recall.
+            // OPANN cell selection uses manifest routing (`nprobe_min` floor +
+            // radius-aware τ up to `nprobe_max`). `VectorSearchOptions::nprobe`
+            // is that floor, not within-superfile IVF depth — passing the
+            // superfile-tier CORRECTNESS_NPROBE (64) as the floor pins it to
+            // the ceiling and disables τ expansion on sharded tables.
+            let opts = VectorSearchOptions::default().with_rerank_mult(rerank);
+            let batches = self
+                .vector_search(
+                    column,
+                    query,
+                    k,
+                    opts,
+                    None,
+                    Some(&[crate::ingest::supertable::VEC_KEY_COLUMN]),
+                )
+                .expect("supertable vector_search");
+            let mut out = Vec::with_capacity(k);
+            for batch in &batches {
+                let keys = batch
+                    .column_by_name(crate::ingest::supertable::VEC_KEY_COLUMN)
+                    .expect("doc_key projection present")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("doc_key is Int64");
+                for i in 0..keys.len() {
+                    out.push((keys.value(i) as u32, 0.0));
+                }
+            }
+            out
         }
     }
 
