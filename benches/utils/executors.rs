@@ -1111,12 +1111,19 @@ pub mod vector {
             .collect()
     }
 
-    /// Warm p50 (+ RSS) for one config on an already-warm reader.
+    /// Warm timing (+ RSS) for one config on an already-warm reader,
+    /// gated on `warm.min`.
     #[derive(Clone, Copy)]
     pub struct VecTiming {
-        pub p50_ns: f64,
+        pub warm: Stats,
         pub rss: RssStats,
     }
+
+    /// Untimed warmup iterations, then timed samples, for warm vector
+    /// search — more than the recall-calibration probe count so `min` has
+    /// a real chance to catch an uninterrupted sample.
+    const WARM_WARMUP_ITERS: usize = 5;
+    const WARM_SAMPLE_ITERS: usize = 30;
 
     pub fn measure_warm<R: VectorRead>(
         reader: &R,
@@ -1126,10 +1133,12 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> VecTiming {
+        for _ in 0..WARM_WARMUP_ITERS {
+            black_box(reader.topk_global(column, query, k, nprobe, rerank));
+        }
         let sampler = PeakSampler::start_default();
-        let _ = reader.topk_global(column, query, k, nprobe, rerank);
-        let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
-        for _ in 0..CALIBRATION_P50_ITERS {
+        let mut samples = Vec::with_capacity(WARM_SAMPLE_ITERS);
+        for _ in 0..WARM_SAMPLE_ITERS {
             let t0 = Instant::now();
             let hits = reader.topk_global(column, query, k, nprobe, rerank);
             samples.push(t0.elapsed());
@@ -1137,7 +1146,7 @@ pub mod vector {
         }
         let rss = sampler.stop_stats();
         VecTiming {
-            p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC,
+            warm: summarize(&mut samples),
             rss,
         }
     }
@@ -1226,9 +1235,16 @@ pub mod vector {
         ];
         if include_warm {
             headers.extend(
-                ["warm", "Peak RSS", "Median RSS", "P90 RSS"]
-                    .iter()
-                    .map(|s| s.to_string()),
+                [
+                    "warm min",
+                    "warm p50",
+                    "warm p90",
+                    "Peak RSS",
+                    "Median RSS",
+                    "P90 RSS",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
             );
         }
         if include_cold {
@@ -1242,10 +1258,12 @@ pub mod vector {
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
-                            cells.push(time_cell(w.p50_ns));
+                            cells.push(time_cell(w.warm.min.as_secs_f64() * NS_PER_SEC));
+                            cells.push(time_cell(w.warm.p50.as_secs_f64() * NS_PER_SEC));
+                            cells.push(time_cell(w.warm.p90.as_secs_f64() * NS_PER_SEC));
                             cells.extend(rss_cells(&w.rss));
                         }
-                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(4)),
+                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
                     }
                 }
                 if include_cold {

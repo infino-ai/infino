@@ -631,7 +631,8 @@ pub fn warm_from_sql(sets: &crate::executors::sql::QuerySets) -> Vec<(String, f6
         .collect()
 }
 
-/// Flatten warm vector recall rows into `(label, p50_seconds)`.
+/// Flatten warm vector recall rows into `(label, min_seconds)` — the gate
+/// metric, the intrinsic per-query cost basis.
 pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(String, f64)> {
     rows.iter()
         .filter_map(|r| {
@@ -641,7 +642,7 @@ pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(St
                 } else {
                     format!("{} ({})", r.target, r.params)
                 };
-                (label, w.p50_ns / 1e9)
+                (label, w.warm.min.as_secs_f64())
             })
         })
         .collect()
