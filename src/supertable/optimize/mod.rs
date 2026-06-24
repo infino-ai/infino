@@ -4,13 +4,16 @@
 use crate::{
     Supertable,
     config::{DEFAULT_GC_SAFETY_GAP, OptimizeOptions},
-    supertable::error::OptimizeError,
+    supertable::error::{GcError, OptimizeError},
 };
 
 impl Supertable {
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.compact(&opts.compaction)?;
-        self.gc(DEFAULT_GC_SAFETY_GAP)?;
+        match self.gc(DEFAULT_GC_SAFETY_GAP) {
+            Ok(_) | Err(GcError::NoStorage) => {}
+            Err(e) => return Err(OptimizeError::Gc(e)),
+        }
         Ok(())
     }
 }
