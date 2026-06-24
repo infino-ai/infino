@@ -37,6 +37,36 @@ pub struct Stats {
     pub n: usize,
 }
 
+/// Target wall-clock span per timed sample. Sub-microsecond queries are
+/// batched up to this so the per-call `Instant::now` overhead (tens of ns)
+/// can't dominate — a 200 ns query timed one call at a time is mostly timer
+/// noise; timed 250-at-once it isn't.
+const MIN_SAMPLE_NS: u64 = 50_000;
+/// Upper bound on the auto-chosen batch size, so a near-instant op can't
+/// blow up the iteration count.
+const MAX_BATCH: u64 = 100_000;
+
+/// Collect `iters` timed per-call samples of `op`, auto-batching calls so
+/// each timed window spans at least [`MIN_SAMPLE_NS`]. A heavy op probes
+/// above the target and runs one call per sample (batch 1, identical to a
+/// plain timed loop); a sub-µs op runs many calls per sample and divides
+/// out, so the returned durations are accurate per-call times either way.
+pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duration> {
+    let probe = Instant::now();
+    std::hint::black_box(op());
+    let per_call_ns = (probe.elapsed().as_nanos() as u64).max(1);
+    let batch = (MIN_SAMPLE_NS / per_call_ns).clamp(1, MAX_BATCH) as u32;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        for _ in 0..batch {
+            std::hint::black_box(op());
+        }
+        samples.push(t.elapsed() / batch);
+    }
+    samples
+}
+
 /// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
 pub fn summarize(samples: &mut [Duration]) -> Stats {
     let n = samples.len();
@@ -456,23 +486,13 @@ pub mod fts {
                     std::hint::black_box(reader.bm25_rows(column, &query, k, mode));
                 }
                 let sampler = PeakSampler::start_default();
-                let mut samples = Vec::with_capacity(iters);
-                for _ in 0..iters {
-                    let t = Instant::now();
-                    let rows = reader.bm25_rows(column, &query, k, mode);
-                    samples.push(t.elapsed());
-                    std::hint::black_box(rows);
-                }
+                let mut samples =
+                    sample_batched(iters, || reader.bm25_rows(column, &query, k, mode));
                 for _ in 0..WARMUP_ITERS {
                     std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
                 }
-                let mut fetched_samples = Vec::with_capacity(iters);
-                for _ in 0..iters {
-                    let t = Instant::now();
-                    let rows = reader.bm25_rows_fetched(column, &query, k, mode);
-                    fetched_samples.push(t.elapsed());
-                    std::hint::black_box(rows);
-                }
+                let mut fetched_samples =
+                    sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
                 let rss = sampler.stop_stats();
                 let warm = summarize(&mut samples);
                 eprintln!(
@@ -1137,13 +1157,9 @@ pub mod vector {
             black_box(reader.topk_global(column, query, k, nprobe, rerank));
         }
         let sampler = PeakSampler::start_default();
-        let mut samples = Vec::with_capacity(WARM_SAMPLE_ITERS);
-        for _ in 0..WARM_SAMPLE_ITERS {
-            let t0 = Instant::now();
-            let hits = reader.topk_global(column, query, k, nprobe, rerank);
-            samples.push(t0.elapsed());
-            black_box(hits);
-        }
+        let mut samples = sample_batched(WARM_SAMPLE_ITERS, || {
+            reader.topk_global(column, query, k, nprobe, rerank)
+        });
         let rss = sampler.stop_stats();
         VecTiming {
             warm: summarize(&mut samples),
@@ -1610,13 +1626,7 @@ pub mod sql {
             warm_rows = reader.query_rows(sql);
         }
         let sampler = PeakSampler::start_default();
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            let r = reader.query_rows(sql);
-            samples.push(t0.elapsed());
-            black_box(r);
-        }
+        let mut samples = sample_batched(iters, || reader.query_rows(sql));
         let rss = sampler.stop_stats();
         SqlQueryStat {
             name,
