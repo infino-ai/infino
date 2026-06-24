@@ -113,8 +113,8 @@ env:
   VM: bench-vm-${{ github.run_id }}${{ inputs.name_suffix }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
-  # Paused while bench numbers are flaky. Flip to "true" to resume PR comments.
-  POST_PR_COMMENT: "false"
+  # Set "false" to suppress PR comments (summary-only).
+  POST_PR_COMMENT: "true"
 
 jobs:
   benchmark:
