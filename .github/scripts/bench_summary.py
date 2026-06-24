@@ -38,12 +38,14 @@ TEXT_ONLY = ("Corpus", "Superfiles")
 # embed volatile text — they don't diff cleanly. Skip them (the comment says
 # so) rather than mis-unit them as latency.
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
-# Only gate metrics are surfaced as regressions — mirrors the renderer's
-# gate/context split. The headline numbers: best-case (min) warm + cold
-# latency, build time, peak memory, stored size. Everything else (p50/p90
-# spread, +fetch, median/p90 RSS, cold open, throughput/bandwidth, count) is
-# context — measured and in the full report, but too noisy to flag.
-GATE_HEADERS = ("warm min", "cold search", "Time", "Peak RSS", "Stored")
+
+# Primary metrics — controllable CPU / footprint, flagged at `threshold`.
+PRIMARY_HEADERS = ("warm min", "Time", "Stored")
+# Secondary metrics — cold (object-store network variance) and peak RSS
+# (run-order biased) are too noisy to gate tightly; surfaced only on a large
+# move, as directional side-notes.
+SECONDARY_HEADERS = ("cold search", "Peak RSS")
+SECONDARY_THRESHOLD_PCT = 30.0
 
 # Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
@@ -82,9 +84,13 @@ def is_cost(header):
     return any(t in h for t in COST_TOKENS)
 
 
-def is_gate(header):
-    """A regression-gate metric — the only kind surfaced as a change."""
-    return any(t in header for t in GATE_HEADERS)
+def tier(header):
+    """`primary`, `secondary`, or None (context — not surfaced)."""
+    if any(t in header for t in PRIMARY_HEADERS):
+        return "primary"
+    if any(t in header for t in SECONDARY_HEADERS):
+        return "secondary"
+    return None
 
 
 def is_latency(header):
@@ -143,10 +149,8 @@ def diff(reports, baseline_dir, current_dir, threshold):
             if is_cost(header):
                 cost_present = True
                 continue
-            # Surface only gate metrics; context (p50/p90 spread, +fetch,
-            # median/p90 RSS, cold open, throughput/bandwidth, count) stays in
-            # the full report but never flags a change.
-            if not is_gate(header):
+            t = tier(header)
+            if t is None:
                 continue
             old = base.get(key)
             if old is None or old == 0.0:
@@ -154,8 +158,9 @@ def diff(reports, baseline_dir, current_dir, threshold):
             had_baseline = True
             if is_latency(header) and max(abs(old), abs(new)) < MIN_LATENCY_NS:
                 continue
+            limit = threshold if t == "primary" else max(threshold, SECONDARY_THRESHOLD_PCT)
             pct = (new - old) / old * 100.0
-            if abs(pct) < threshold:
+            if abs(pct) < limit:
                 continue
             improved = pct > 0 if higher_is_better(header) else pct < 0
             entry = {
@@ -164,7 +169,7 @@ def diff(reports, baseline_dir, current_dir, threshold):
                 "metric": f"{label} / {header}".strip(" /"),
                 "change": f"{human(header, old)} → {human(header, new)}",
                 "pct": round(pct, 1),
-                "is_cold": "cold" in header.lower(),
+                "tier": t,
             }
             (improvements if improved else regressions).append(entry)
     regressions.sort(key=lambda e: -abs(e["pct"]))
@@ -191,12 +196,16 @@ def narrate(payload, endpoint, key, model):
     system = (
         "You are a performance engineer giving a PR reviewer the headline on a "
         "benchmark run. You are given JSON of metric changes ALREADY filtered "
-        "past the noise threshold, plus any run failures. Write 2-5 lines of "
-        "GitHub markdown:\n"
-        "- Line 1: a one-line verdict (net slower / net faster / mixed / no change).\n"
-        "- Then call out ONLY the biggest things that got worse and any failures. "
-        "Do NOT restate every row — tables below carry the detail.\n"
-        "- Cite ONLY numbers in the payload. Never invent or recompute a value.\n"
+        "past the noise threshold, plus any run failures. Each change has a "
+        "`tier`: `primary` (latency / build / size — the real signal) or "
+        "`secondary` (cold + peak RSS — noisy and run-order biased). Write 2-5 "
+        "lines of GitHub markdown:\n"
+        "- Line 1: a one-line verdict from PRIMARY changes only "
+        "(net slower / net faster / mixed / no change).\n"
+        "- Call out the biggest PRIMARY regressions and any failures. "
+        "Mention SECONDARY changes only if large, in one trailing note framed as "
+        "directional / likely noise — never let them drive the verdict.\n"
+        "- Do NOT restate every row; cite ONLY numbers in the payload.\n"
         "- If there are no changes and no failures, say "
         f"'No significant changes (within ±{payload['threshold']}%).'\n"
         "No preamble, no sign-off, no tables."
@@ -258,15 +267,21 @@ def main():
         os.environ.get("AZURE_AI_MODEL", DEFAULT_MODEL),
     )
 
-    if failures or (regressions and not improvements):
-        badge = "🔴"  # pure bad: failures, or things got worse with no offsetting wins
-    elif regressions:
-        badge = "🟡"  # mixed: some worse, some better
-    elif improvements:
+    # Badge, verdict, and counts come from the primary signal only; secondary
+    # (cold, peak RSS) is directional and never gates.
+    prim_regr = [e for e in regressions if e["tier"] == "primary"]
+    prim_impr = [e for e in improvements if e["tier"] == "primary"]
+    secondary = [e for e in regressions + improvements if e["tier"] == "secondary"]
+
+    if failures or (prim_regr and not prim_impr):
+        badge = "🔴"
+    elif prim_regr:
+        badge = "🟡"
+    elif prim_impr:
         badge = "🟢"
     else:
         badge = "⚪"
-    counts = f"{len(regressions)} worse · {len(improvements)} better"
+    counts = f"{len(prim_regr)} worse · {len(prim_impr)} better"
     parts = [f"## {badge} Benchmark `{label}` — {counts} (±{threshold:g}% vs main)", ""]
 
     if prose:
@@ -275,25 +290,26 @@ def main():
         parts += ["### 🛑 Failures", "```", "\n".join(failures[:20]), "```", ""]
     elif not had_baseline:
         parts += ["_No `main` baseline to diff against (first run or new config) — see the full report._", ""]
-    elif not regressions and not improvements:
+    elif not prim_regr and not prim_impr and not secondary:
         parts += [f"No significant changes (within ±{threshold:g}%).", ""]
 
-    # The things that got worse are what gate a merge — keep them visible; fold the wins.
-    if regressions:
-        parts += [f"### 🔴 Worse ({len(regressions)})", table(regressions), ""]
-    if improvements:
-        parts += [f"<details><summary>🟢 Better ({len(improvements)})</summary>",
-                  "", table(improvements), "", "</details>", ""]
+    if prim_regr:
+        parts += [f"### 🔴 Worse ({len(prim_regr)})", table(prim_regr), ""]
+    if prim_impr:
+        parts += [f"<details><summary>🟢 Better ({len(prim_impr)})</summary>",
+                  "", table(prim_impr), "", "</details>", ""]
+    if secondary:
+        parts += [f"<details><summary>Directional — cold / peak RSS, noisy ({len(secondary)})</summary>",
+                  "", table(secondary), "", "</details>", ""]
 
-    if regressions or improvements:
-        touched = {e["subsystem"]: e["area"] for e in regressions + improvements if e.get("area")}
+    if prim_regr or prim_impr:
+        touched = {e["subsystem"]: e["area"] for e in prim_regr + prim_impr if e.get("area")}
         if touched:
             parts.append("_Where to look: " + " · ".join(
                 f"{s} → `{a}`" for s, a in sorted(touched.items())) + "_")
-        if any(e["is_cold"] for e in regressions + improvements):
-            parts.append("_Cold metrics are single-run and noisy — treat large cold deltas as directional._")
-        if cost_present:
-            parts.append("_Cost metrics (bytes / requests / queries-per-$) are not delta-tracked — see the full report._")
+    if cost_present:
+        parts.append("_Cost metrics (bytes / requests / queries-per-$) are not delta-tracked — see the full report._")
+    if prim_regr or prim_impr or secondary:
         parts.append("")
 
     if run_url:
