@@ -26,7 +26,7 @@ use infino::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use crate::rustfs_server::{self, RUSTFS_BENCH_BUCKET, RustFsBucketLease};
+use crate::rustfs_server::{self, RustFsBucketLease};
 
 /// Bytes in one gibibyte, for GiB-denominated cache budgets.
 const GIB_BYTES: u64 = 1u64 << 30;
@@ -413,31 +413,23 @@ pub async fn supertable_storage_fixture() -> StorageFixture {
     }
 }
 
+/// Panic text when `dataset prepare` / `dataset bench` is run with the local
+/// RustFS bench session (ephemeral per-process data dir).
+const DATASET_REQUIRES_PRODUCTION_STORE: &str = "\
+Prepared datasets require a production object store. The default local RustFS \
+bench session uses an ephemeral per-process data directory and cannot retain \
+data across separate cargo bench invocations. Configure a production backend \
+via INFINO_BENCH_STORE (remote S3, Azure Blob, or a production RustFS \
+endpoint).";
+
 /// Storage for a prepared dataset at a fixed prefix — no unique suffix, no
 /// cleanup, so the data persists across runs. `subdir` namespaces the modality
-/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. RustFS, S3, or
-/// Azure only — same as [`supertable_storage_fixture`].
+/// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. Production object
+/// store only (not the local RustFS bench session).
 pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
     let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
-    if matches!(backend, Backend::RustFs) {
-        let base = crate::dataset::dataset_prefix()
-            .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
-        let prefix = format!("{}/{subdir}", base.trim_matches('/'));
-        let prefix_for_log = prefix.clone();
-        let lease = tokio::task::spawn_blocking(move || {
-            RustFsBucketLease::persistent(rustfs_server::session(), RUSTFS_BENCH_BUCKET, &prefix)
-                .unwrap_or_else(|e| panic!("rustfs dataset bucket: {e}"))
-        })
-        .await
-        .expect("rustfs spawn_blocking join");
-        eprintln!("[tiers] dataset rustfs prefix={prefix_for_log}");
-        return StorageFixture {
-            storage: Arc::clone(&lease.storage),
-            storage_label: "rustfs",
-            remote: false,
-            cleanup: None,
-            _keepalive: StorageKeepalive::RustFs { _bucket: lease },
-        };
+    if backend.uses_local_rustfs_bench_session() {
+        panic!("{DATASET_REQUIRES_PRODUCTION_STORE}");
     }
     let base = crate::dataset::dataset_prefix()
         .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
