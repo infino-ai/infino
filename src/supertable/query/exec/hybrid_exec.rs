@@ -465,6 +465,7 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
             superfile,
             local_doc_id,
             score,
+            stable_id: None,
         })
         .collect();
     fused.sort_by(|a, b| {
@@ -644,6 +645,7 @@ mod tests {
             superfile: seg,
             local_doc_id: doc,
             score,
+            stable_id: None,
         };
         // BM25 best-first: doc1, doc2, doc3. Vector best-first: doc2, doc4.
         let bm25 = vec![h(1, 9.0), h(2, 8.0), h(3, 7.0)];
@@ -668,6 +670,7 @@ mod tests {
             superfile: seg,
             local_doc_id: doc,
             score: 0.0,
+            stable_id: None,
         };
         let bm25 = vec![h(1), h(2), h(3)];
         let vector = vec![h(4), h(5)];
@@ -685,11 +688,13 @@ mod tests {
             superfile: seg_a,
             local_doc_id: 0,
             score: 1.0,
+            stable_id: None,
         }];
         let vector = vec![SuperfileHit {
             superfile: seg_b,
             local_doc_id: 0,
             score: 0.1,
+            stable_id: None,
         }];
         let fused = rrf_fuse(&bm25, &vector, 10);
         assert_eq!(fused.len(), 2, "distinct superfiles → distinct hits");

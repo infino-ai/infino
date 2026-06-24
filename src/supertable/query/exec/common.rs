@@ -833,11 +833,13 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: 0,
                 score: 1.5,
+                stable_id: None,
             },
             SuperfileHit {
                 superfile: entry.uri,
                 local_doc_id: (entry.n_docs - 1) as u32,
                 score: 0.5,
+                stable_id: None,
             },
         ]
     }
@@ -945,11 +947,13 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: 0,
                 score: 0.0,
+                stable_id: None,
             },
             SuperfileHit {
                 superfile: entry.uri,
                 local_doc_id: last,
                 score: 0.0,
+                stable_id: None,
             },
         ];
 
@@ -978,6 +982,7 @@ mod tests {
             superfile: SuperfileUri::new_v4(),
             local_doc_id: 0,
             score: 0.0,
+            stable_id: None,
         }];
         assert!(
             resolve_ids_arithmetic(&reader, &hits).is_none(),

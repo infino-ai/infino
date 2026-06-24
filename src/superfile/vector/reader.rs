@@ -313,6 +313,14 @@ pub struct VectorReader {
     n_docs: u64,
     columns: Vec<ColumnReader>,
     column_id_by_name: HashMap<String, u32>,
+    /// Cold-path stash of the inline stable-`_id` region bytes, prefetched
+    /// in the same fan-out wave as the cluster blocks (see
+    /// [`Self::probe_clusters_async`]). The remap step resolves hidden→user
+    /// `_id` from this — via the sync [`Self::inline_stable_ids_for_locals`]
+    /// at the fan-out tag site — instead of a trailing region GET. Empty on
+    /// warm (the region is already resident) and on any reader whose column
+    /// has no inline region.
+    cold_stable_id_region: std::sync::Mutex<Option<Bytes>>,
 }
 
 impl VectorReader {
@@ -1152,6 +1160,7 @@ impl VectorReader {
             n_docs,
             columns,
             column_id_by_name,
+            cold_stable_id_region: std::sync::Mutex::new(None),
         })
     }
 
@@ -1247,9 +1256,20 @@ impl VectorReader {
     /// hidden hit carries.
     pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
         let col = self.columns.iter().find(|c| c.has_inline_stable_ids())?;
-        let region = self
-            .source
-            .try_get_range_sync(col.stable_ids_region_range()?)?;
+        // Prefer the cold-path region stashed during the fan-out wave
+        // (`cold_stable_id_region`); otherwise serve a resident (warm) slice.
+        // Both are the full `i128 × n_docs` region, indexed identically below.
+        let region = match self
+            .cold_stable_id_region
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+        {
+            Some(bytes) => bytes,
+            None => self
+                .source
+                .try_get_range_sync(col.stable_ids_region_range()?)?,
+        };
         let mut out = Vec::with_capacity(locals.len());
         for &local in locals {
             let p = (local as usize) * format::vec::STABLE_ID_BYTES;
@@ -1952,13 +1972,32 @@ impl VectorReader {
                     .iter()
                     .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
                     .collect();
-                let (blocks, meta) = get_cluster_ranges_coalesced_with_extra_async(
+                // Piggyback the inline stable-`_id` region onto THIS wave:
+                // fetch it concurrently with the cluster-block GETs (same
+                // round-trip envelope) and stash it on the reader. The remap
+                // step then resolves hidden→user `_id` from the stash (sync,
+                // at the fan-out tag site) instead of issuing a trailing
+                // region GET — removing a serial cold wave. `None` when the
+                // column has no inline region (e.g. incoming superfiles).
+                let region_range = col.stable_ids_region_range();
+                let cluster_fut = get_cluster_ranges_coalesced_with_extra_async(
                     &self.source,
                     &cluster_full_ranges,
                     lazy_sq8_meta_range,
-                )
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                );
+                let region_fut = async {
+                    match &region_range {
+                        Some(r) => self.source.range_async(r.clone()).await.map(Some),
+                        None => Ok(None),
+                    }
+                };
+                let ((blocks, meta), region_bytes) = futures::try_join!(cluster_fut, region_fut)
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                if let Some(bytes) = region_bytes {
+                    if let Ok(mut slot) = self.cold_stable_id_region.lock() {
+                        *slot = Some(bytes);
+                    }
+                }
                 (blocks, meta, false)
             };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());

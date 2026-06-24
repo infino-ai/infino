@@ -80,6 +80,7 @@ pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<Sup
             superfile: entry.uri,
             local_doc_id,
             score,
+            stable_id: None,
         })
         .collect()
 }
@@ -142,9 +143,28 @@ where
         move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
             async move {
+                let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
                 apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                // Piggyback the hidden→user `_id` resolve onto the search.
+                // For a hidden vector cell, the inline `_id` region was
+                // prefetched in this unit's fan-out wave (cold) or is resident
+                // (warm), so this sync lookup does no I/O — and lets the remap
+                // step skip its trailing region GET. No-op for FTS / readers
+                // without an inline `_id` region (`vec()` is `None` or the
+                // region lookup returns `None`).
+                if !tagged.is_empty() {
+                    if let Some(v) = reader_for_ids.vec() {
+                        let locals: Vec<u32> =
+                            tagged.iter().map(|h| h.local_doc_id).collect();
+                        if let Some(ids) = v.inline_stable_ids_for_locals(&locals) {
+                            for (h, id) in tagged.iter_mut().zip(ids) {
+                                h.stable_id = Some(id);
+                            }
+                        }
+                    }
+                }
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },

@@ -327,6 +327,15 @@ async fn hidden_hits_user_ids(
     let mut ids = vec![0i128; hidden_hits.len()];
     let mut by_superfile: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for (i, hit) in hidden_hits.iter().enumerate() {
+        // Piggyback fast path: the search already resolved the user `_id`
+        // from the inline region (prefetched in the fan-out wave) and stamped
+        // it here — reuse it and skip this superfile's region/scalar read
+        // entirely. Hits without it (incoming superfiles have no inline
+        // region) fall through to the grouped read below.
+        if let Some(id) = hit.stable_id {
+            ids[i] = id;
+            continue;
+        }
         by_superfile.entry(hit.superfile).or_default().push(i);
     }
     for (uri, idxs) in by_superfile {
@@ -420,6 +429,7 @@ async fn remap_hidden_hits_to_user_hits(
                 superfile: user_entry.uri,
                 local_doc_id: local,
                 score: hidden_hits[i].score,
+                stable_id: None,
             });
         } else {
             gapped.entry(user_entry.uri).or_default().push(i);
@@ -446,6 +456,7 @@ async fn remap_hidden_hits_to_user_hits(
                 superfile: uri,
                 local_doc_id: pos as u32,
                 score: hidden_hits[i].score,
+                stable_id: None,
             });
         }
     }
@@ -1655,6 +1666,7 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: d,
                 score: d as f32,
+                stable_id: None,
             })
             .collect();
 
@@ -1678,6 +1690,7 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: d,
                 score: 0.0,
+                stable_id: None,
             })
             .collect();
         let original = hits.clone();
@@ -1708,6 +1721,7 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: d,
                 score: 0.0,
+                stable_id: None,
             })
             .collect();
         let original = hits.clone();
