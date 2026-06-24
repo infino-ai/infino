@@ -555,6 +555,46 @@ impl SuperfileBuilder {
             }
         }
 
+        // Route vectors. This block does NOT read `next_local_doc_id`, so
+        // routing it before the FTS + cursor-advance step (which `add_batch_fts_and_scalar`
+        // performs and which uses `next_local_doc_id` as its pre-advance base)
+        // preserves the original observable behavior of `add_batch`.
+        if let Some(vb) = self.vec_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    vb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
+        } else if let Some(cb) = self.cell_posting_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    cb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
+        }
+
+        self.add_batch_fts_and_scalar(batch)
+    }
+
+    /// `add_batch` minus the vector payload: validates the batch schema, routes
+    /// the FTS columns (`fb.add_doc(col_id, next_local_doc_id + row, text)`),
+    /// advances the local-doc cursor, and pushes the batch. Used by the Sq8
+    /// rebuild merge in compaction, where the vectors arrive separately via
+    /// [`Self::load_materialized_ivf_rows`] (rebuilt from each input's
+    /// `load_materialized_ivf_rows` rows) rather than as `&[&[f32]]` slices.
+    pub(crate) fn add_batch_fts_and_scalar(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<(), BuildError> {
+        if batch.schema().fields() != self.opts.schema.fields() {
+            return Err(BuildError::BatchSchemaMismatch);
+        }
+        let n_rows = batch.num_rows() as u32;
+
         // Route FTS columns. Pull each column's LargeStringArray once.
         if let Some(fb) = self.fts_builder.as_mut() {
             for (col_id, &schema_idx) in self.fts_col_idxs.iter().enumerate() {
@@ -573,25 +613,6 @@ impl SuperfileBuilder {
                         strs.value(row)
                     };
                     fb.add_doc(col_id as u32, local_doc_id, text)?;
-                }
-            }
-        }
-
-        // Route vectors.
-        if let Some(vb) = self.vec_builder.as_mut() {
-            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
-                let dim = vc.dim;
-                for row in 0..(n_rows as usize) {
-                    let start = row * dim;
-                    vb.add(i as u32, &vectors[i][start..start + dim])?;
-                }
-            }
-        } else if let Some(cb) = self.cell_posting_builder.as_mut() {
-            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
-                let dim = vc.dim;
-                for row in 0..(n_rows as usize) {
-                    let start = row * dim;
-                    cb.add(i as u32, &vectors[i][start..start + dim])?;
                 }
             }
         }
@@ -653,7 +674,7 @@ impl SuperfileBuilder {
             .vec()
             .and_then(|v| v.vector_columns_config().next())
             .ok_or_else(|| BuildError::VectorReadError)?;
-        if vec_col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+        if vec_col.rerank_codec != RerankCodec::Sq8Residual {
             return Err(BuildError::VectorReadError);
         }
         let column = vec_col.name.clone();
@@ -696,7 +717,7 @@ impl SuperfileBuilder {
     ///
     /// **Requirements:**
     /// - The reader's vector indexes must use the **Fp32 codec**. Other codecs
-    ///   (Sq8ResidualEpsilon, RabitqOnly) will fail with `BuildError::VectorReadError`.
+    ///   (Sq8Residual, RabitqOnly) will fail with `BuildError::VectorReadError`.
     /// - Vector column names and dimensions in the reader must match those in
     ///   `self.opts.vector_columns` in the exact same order. Mismatches will
     ///   return `BuildError::VectorDimMismatch` error.
@@ -845,22 +866,6 @@ impl SuperfileBuilder {
             }
         }
 
-        // A superfile has three independent build outputs: the scalar /
-        // relational Parquet body (the SQL-queryable columns), the FTS
-        // blob, and the vector blob. None reads another's bytes — blobs
-        // are appended after the last row group, and FTS/vector
-        // finalization share no state — so they can run concurrently.
-        //
-        // But how to overlap them depends on the vector index. The
-        // vector finalizer already saturates every core via its own
-        // rayon `par_iter` (rotation / encode / quantize), so overlapping
-        // the *serial* Parquet body encode with it just steals a core
-        // from the bottleneck — a measured regression on vector builds.
-        // So: when a vector index is present, finalize the index blobs
-        // (FTS ‖ vector) first and encode the body afterward. When it is
-        // absent, the FTS finalizer doesn't saturate the pool, so hide
-        // the body encode behind it (body ‖ FTS). The final splice (byte
-        // appends + footer rewrite) is cheap and stays serial.
         let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
         let encode_body = || {
             encode_parquet_body(
@@ -974,7 +979,9 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 /// `{"column":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
 /// The reader at open time parses this back into
 /// `VectorConfig` to drive distance kernels + IVF probing.
-fn vec_columns_json(cols: &[VectorConfig]) -> String {
+/// JSON form stored in `inf.vec.columns` — shared by the builder and the
+/// supertable OPANN leaf-probe path (opens `VectorReader` without Parquet).
+pub(crate) fn vec_columns_json(cols: &[VectorConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -1832,7 +1839,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
             }],
             None,
         );
@@ -1849,7 +1856,7 @@ mod tests {
             .expect("get vector reader")
             .get_vectors_fp32("emb");
 
-        assert!(result.is_err(), "should reject Sq8ResidualEpsilon codec");
+        assert!(result.is_err(), "should reject Sq8Residual codec");
     }
 
     #[tokio::test]

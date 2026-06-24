@@ -77,7 +77,7 @@ const GIB_BYTES: u64 = 1u64 << 30;
 /// Distance metric for the bench vector index.
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Rerank residual codec for the bench vector index.
-const BENCH_RERANK: RerankCodec = RerankCodec::Sq8ResidualEpsilon;
+const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget in GiB, capping resident RSS during ingest.

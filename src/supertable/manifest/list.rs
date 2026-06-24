@@ -1337,6 +1337,7 @@ mod tests {
         },
         *,
     };
+    use crate::superfile::vector::distance::Metric;
 
     /// Build a per-column aggregate from a plain `i64` array (no nulls).
     fn agg_i64(vals: Vec<i64>) -> ScalarStatsAgg {
@@ -1966,6 +1967,7 @@ mod tests {
         list.partition_strategy = PartitionStrategy::VectorCell {
             column: "emb".into(),
             clusters: ClusterCentroids::from_fp32(
+                Metric::L2Sq,
                 2,
                 4,
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],

@@ -599,12 +599,33 @@ fn build_vector_summary(
         return out;
     };
     for vc in &options.vector_columns {
-        if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
+        if let Some((c_dim, c_scale, c_offset, c_rows, c_norm, radius)) =
+            vec_reader.summary(&vc.column)
+        {
+            let centroid = ClusterCentroids {
+                n_cent: 1,
+                dim: c_dim,
+                scale: c_scale,
+                offset: c_offset,
+                rows: c_rows,
+                norms: c_norm.map(|n| vec![n]),
+                counts: vec![1],
+                radii: Vec::new(),
+            };
             let clusters = vec_reader
-                .cluster_centroids(&vc.column)
-                .map(|(n_cent, dim, fp32, counts)| {
-                    ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
-                })
+                .cluster_centroids_encoded(&vc.column)
+                .map(
+                    |(n_cent, dim, scale, offset, rows, norms, counts)| ClusterCentroids {
+                        n_cent,
+                        dim,
+                        scale,
+                        offset,
+                        rows,
+                        norms,
+                        counts,
+                        radii: Vec::new(),
+                    },
+                )
                 .unwrap_or_default();
             out.insert(
                 vc.column.clone(),

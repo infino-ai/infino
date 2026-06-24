@@ -11,10 +11,7 @@ use bytemuck::cast_slice;
 
 use crate::superfile::{
     BuildError,
-    format::{
-        checksum::crc32c,
-        vec::{DOC_ID_BYTES, STABLE_ID_BYTES},
-    },
+    format::{checksum::crc32c, vec::{DOC_ID_BYTES, STABLE_ID_BYTES}},
     vector::{
         builder::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
@@ -24,6 +21,7 @@ use crate::superfile::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
+        centroid_block::CentroidBlock,
         distance::Metric,
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry},
@@ -40,7 +38,8 @@ pub(crate) struct Sq8IvfMergeInput {
     pub metric: Metric,
     pub doc_id_offset: u32,
     pub cluster_idx_off: usize,
-    pub centroids_off: usize,
+    /// Byte offset (within `sub`) of the Sq8+ε centroid block's first byte.
+    pub centroid_block_off: usize,
     pub per_cluster_blocks_off: usize,
     pub code_bytes: usize,
     pub per_vec_bytes: usize,
@@ -48,10 +47,7 @@ pub(crate) struct Sq8IvfMergeInput {
     pub scale: Vec<f32>,
     pub offset: Vec<f32>,
     pub summary_radius_x100: u32,
-    /// Inline stable-`_id`s for this input, indexed by its local doc id, when
-    /// the source subsection carries the region (materialized/hidden cells).
-    /// `None` for region-less sources (streaming/incoming). The merge produces a
-    /// merged region only when every input has one.
+    /// Inline stable-`_id`s indexed by local doc id when the source has the region.
     pub stable_ids: Option<Vec<i128>>,
 }
 
@@ -100,30 +96,40 @@ pub(crate) fn merge_sq8_ivf_subsections(
     }
 
     let n_docs: u32 = parsed.iter().map(|p| p.n_docs).sum();
-    let codec = RerankCodec::Sq8ResidualEpsilon;
+    let codec = RerankCodec::Sq8Residual;
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);
     let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
 
+    // Per-input centroid block views. Centroids are Sq8+ε on disk; decode
+    // each cluster centroid to fp32 here (the merge boundary, not the query
+    // hot path) to count-weight-average across inputs, then re-quantize the
+    // result through the output centroid block below.
+    let centroid_blocks: Vec<CentroidBlock> = parsed
+        .iter()
+        .map(|inp| {
+            CentroidBlock::new(
+                &inp.sub[inp.centroid_block_off..],
+                inp.metric,
+                inp.dim,
+                inp.n_cent,
+            )
+        })
+        .collect();
+
     let mut out_centroids = vec![0.0f32; n_cent * dim];
     for c in 0..n_cent {
         let mut acc = vec![0.0f64; dim];
         let mut total = 0u64;
-        for inp in &parsed {
+        for (inp, block) in parsed.iter().zip(&centroid_blocks) {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count == 0 {
                 continue;
             }
             total += count as u64;
-            let co = inp.centroids_off + c * dim * 4;
-            for (d, acc_d) in acc.iter_mut().enumerate().take(dim) {
-                let v = f32::from_le_bytes([
-                    inp.sub[co + d * 4],
-                    inp.sub[co + d * 4 + 1],
-                    inp.sub[co + d * 4 + 2],
-                    inp.sub[co + d * 4 + 3],
-                ]);
+            let cv = block.cluster_components(c);
+            for (acc_d, &v) in acc.iter_mut().zip(&cv) {
                 *acc_d += v as f64 * count as f64;
             }
         }
@@ -173,12 +179,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
 
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, n_cent, metric);
     let cluster_stride = code_bytes + DOC_ID_BYTES + per_vec_bytes;
-    // Carry the inline stable-`_id` region through the splice when every input
-    // has one (materialized/hidden cells always do; streaming/incoming sources
-    // don't). All-or-nothing: a merged region must cover every merged local id,
-    // so a single region-less input means we emit none and the merged cell
-    // falls back to the scalar `_id` column (still correct). The region is
-    // rewritten in merged local-id order in the cluster-block loop below.
     let produce_region = parsed.iter().all(|p| p.stable_ids.is_some());
     let stable_ids_region_bytes = if produce_region {
         n_docs as usize * STABLE_ID_BYTES
@@ -192,12 +192,16 @@ pub(crate) fn merge_sq8_ivf_subsections(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
+        metric,
     );
 
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &out_centroids,
     );
@@ -232,9 +236,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
         .collect();
     let id_bytes = DOC_ID_BYTES;
     let mut row_buf = vec![0u8; dim * 2];
-    // Relative offset of the merged stable-`_id` region (start of the i128s),
-    // `Some` exactly when `produce_region`. Written per row below, indexed by
-    // the merged local doc id.
     let stable_ids_region_off = layout.stable_ids_off;
 
     write_ivf_cluster_blocks(
@@ -278,9 +279,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
                     let id_off = blk.ids_base + out_i * id_bytes;
                     bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
 
-                    // Carry the stable `_id` to the merged region at the same
-                    // (remapped) local id. `produce_region` guarantees every
-                    // input has `stable_ids`, so the index is in range.
                     if let Some(region_off) = stable_ids_region_off {
                         let sid = inp.stable_ids.as_ref().expect("produce_region")
                             [src_local as usize];
@@ -306,8 +304,8 @@ pub(crate) fn merge_sq8_ivf_subsections(
                         } else {
                             let encoded = EncodedCellRow {
                                 stable_id: 0,
-                                scale: std::sync::Arc::from(src_scale),
-                                offset: std::sync::Arc::from(src_offset),
+                                scale: src_scale.to_vec(),
+                                offset: src_offset.to_vec(),
                                 codes: inp.sub[rowb..rowb + dim].to_vec(),
                                 residuals: inp.sub[rowb + dim..rowb + dim + dim].to_vec(),
                                 norm_sq: None,

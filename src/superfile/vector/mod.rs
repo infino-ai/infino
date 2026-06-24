@@ -13,6 +13,7 @@
 
 pub mod builder;
 pub mod cell_posting;
+pub(crate) mod centroid_block;
 pub mod distance;
 pub mod ivf_merge;
 pub mod kmeans;

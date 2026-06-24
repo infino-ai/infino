@@ -484,7 +484,13 @@ mod tests {
     #[test]
     fn compute_options_hash_distinguishes_vector_cell() {
         let opts = fts_opts();
-        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let clusters = ClusterCentroids::from_fp32(
+            crate::superfile::vector::distance::Metric::L2Sq,
+            2,
+            4,
+            &[0.0; 8],
+            vec![1, 1],
+        );
         let h_vc = compute_options_hash(
             &opts,
             &PartitionStrategy::VectorCell {

@@ -246,7 +246,7 @@ fn build_superfile_bytes() -> Bytes {
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );
@@ -1892,7 +1892,7 @@ pub(crate) mod diag {
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
                 rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
             }],
             Some(default_tokenizer()),
         )

@@ -22,11 +22,10 @@
 //!      `[quokka, quokka_upper_bound)`). `bm25_search_prefix`
 //!      opens only the matching superfile.
 //!
-//! Vector centroid skip is not asserted here — the v1
-//! `vector_centroid_skip` returns all-keep (cutoff-driven skip
-//! is deferred), so the test would just confirm "every superfile
-//! is opened" which isn't a useful invariant. Scalar skip via
-//! SQL is similarly deferred: the SQL path uses a `MemTable`
+//! Vector centroid skip is not asserted here — vector search currently
+//! loads every superfile in the pruned manifest set, so the test would
+//! just confirm "every superfile is opened" which isn't a useful
+//! invariant. Scalar skip via SQL is similarly deferred: the SQL path uses a `MemTable`
 //! that opens every superfile at registration time; a future
 //! custom `TableProvider` will integrate `PruningPredicate`
 //! and revisit this.

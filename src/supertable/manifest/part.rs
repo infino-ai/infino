@@ -745,6 +745,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::superfile::vector::distance::Metric;
     use crate::supertable::{
         SuperfileEntry, SuperfileUri,
         manifest::{
@@ -790,7 +791,7 @@ mod tests {
     fn make_vector_summary(dim: usize, seed: f32) -> VectorSummary {
         let centroid: Vec<f32> = (0..dim).map(|i| seed + i as f32 * 0.001).collect();
         VectorSummary {
-            centroid,
+            centroid: ClusterCentroids::single(Metric::L2Sq, &centroid),
             radius: seed * 1.7,
             clusters: ClusterCentroids::empty(),
         }
@@ -928,14 +929,7 @@ mod tests {
                 bv.radius.to_bits(),
                 "vec {k} radius bits"
             );
-            assert_eq!(av.centroid.len(), bv.centroid.len(), "vec {k} dim");
-            for (i, (af, bf)) in av.centroid.iter().zip(bv.centroid.iter()).enumerate() {
-                assert_eq!(
-                    af.to_bits(),
-                    bf.to_bits(),
-                    "vec {k} centroid[{i}] bits ({af} vs {bf})"
-                );
-            }
+            assert_eq!(av.centroid, bv.centroid, "vec {k} centroid (Sq8+ε)");
         }
     }
 

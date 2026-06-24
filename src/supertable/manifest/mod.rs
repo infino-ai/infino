@@ -39,7 +39,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use arrow::compute::kernels::aggregate as agg;
@@ -60,7 +60,8 @@ use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::vector::{
-        distance::{COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, sq8_dot, u8_sum_sumsq},
+        cell_posting::{EncodedCellRow, encode_rows, encoded_component_at},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
         layout::VectorLayout,
     },
     supertable::{
@@ -636,16 +637,11 @@ impl Manifest {
 
     pub(crate) async fn get_pruned_superfiles_for_vector(
         &self,
-        column: &str,
-        query: &[f32],
+        _column: &str,
+        _query: &[f32],
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        match &self.list {
-            Some(list) => {
-                let kept = list_prune::prune_parts_for_vector(list, column, query, f32::INFINITY);
-                hierarchical_iter::load_and_flatten(self, &kept).await
-            }
-            None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
-        }
+        // Empty leaves → no part pruning → every part's superfiles, in order.
+        self.get_pruned_superfiles(&[]).await
     }
 
     pub fn get_all_list_entries(&self) -> &[ManifestPartEntry] {
@@ -1723,9 +1719,11 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 /// possible top-k hit.
 #[derive(Debug, Clone)]
 pub struct VectorSummary {
-    /// Cluster centroid; length matches the vector column's `dim`
-    /// declared in `SupertableOptions::vector_columns`.
-    pub centroid: Vec<f32>,
+    /// The superfile's summary centroid (bounding-sphere center), stored as a
+    /// single Sq8+residual centroid (`n_cent == 1`) — the one internal codec,
+    /// no fp32. Score it with [`ClusterCentroids::score_one`] / decode with
+    /// [`ClusterCentroids::dequantize_into`] at the coarse prune/order boundary.
+    pub centroid: ClusterCentroids,
     /// Maximum distance from any indexed vector in this superfile to
     /// `centroid`, in the same metric the column was built with.
     pub radius: f32,
@@ -1735,58 +1733,58 @@ pub struct VectorSummary {
     pub clusters: ClusterCentroids,
 }
 
-/// Maximum Sq8 code value. The manifest's per-cluster centroid
-/// summary quantizes each component to a single unsigned byte, so
-/// the per-cluster scale maps `[min, max]` onto `[0, SQ8_CODE_MAX]`.
-const SQ8_CODE_MAX: f32 = 255.0;
-
-/// Per-cluster IVF centroids for one vector column, Sq8-quantized with
-/// per-cluster calibration. Carried in the manifest so a query can rank
-/// every superfile's clusters globally — without opening the superfile —
-/// and probe only the globally-closest clusters. The 1-bit shortlist +
-/// rerank still run on the superfile's on-disk compressed vectors; these
-/// drive cluster *selection* only.
+/// Per-cluster IVF centroids for one vector column, stored as Sq8+residual
+/// under **one shared quantizer** — the same on-disk codec as cell payloads
+/// and the superfile centroid block ([`encode_rows`]). Carried in the manifest
+/// so a query can rank every superfile's clusters globally — without opening
+/// the superfile — and probe only the globally-closest clusters. The 1-bit
+/// shortlist + rerank still run on the superfile's on-disk compressed vectors;
+/// these drive cluster *selection* only.
 ///
-/// Quantization is value-only (no metric); the selector applies the
-/// column's metric when scoring a dequantized centroid against a query.
+/// There is no plain-Sq8 and no fp32 centroid representation: `scale`/`offset`
+/// are the shared per-dim quantizer (length `dim`), and each cluster row is
+/// `[codes(dim) u8 ‖ residuals(dim) i8]`. Scoring goes through
+/// [`Sq8ResidualKernel`] — the single Sq8+residual scorer — exactly as a cell
+/// row is scored.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterCentroids {
     pub n_cent: u32,
     pub dim: u32,
-    /// `n_cent * dim` Sq8 codes, cluster-major.
-    pub codes: Vec<u8>,
-    /// Per-cluster dequant base (min component); length `n_cent`.
-    pub mins: Vec<f32>,
-    /// Per-cluster dequant step `(max - min) / 255`; length `n_cent`.
-    pub scales: Vec<f32>,
+    /// Shared per-dim quantizer scale; length `dim`.
+    pub scale: Vec<f32>,
+    /// Shared per-dim quantizer offset; length `dim`.
+    pub offset: Vec<f32>,
+    /// `n_cent` rows of `[codes(dim) u8 ‖ residuals(dim) i8]`, cluster-major.
+    pub rows: Vec<u8>,
+    /// Per-cluster decoded norm (`‖centroid‖²`), length `n_cent`. `Some` for
+    /// L2Sq / Cosine (folded into the kernel distance); `None` for NegDot.
+    pub norms: Option<Vec<f32>>,
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
-    /// Per-cluster max member distance from the Sq8 centroid (same units
-    /// as [`Self::score_one`]). Empty on legacy manifests; adaptive
-    /// probing falls back to centroid distance when a cell has no radius.
+    /// Per-cluster max member distance from the centroid (same units as the
+    /// kernel distance). Empty when no radius is recorded; adaptive probing
+    /// falls back to centroid distance when a cell has no radius.
     pub radii: Vec<f32>,
-    /// Lazily-computed per-cluster `(Σcode, Σcode²)` — the
-    /// query-independent moments the folded L2 scoring needs to
-    /// reconstruct `‖centroid‖²` without dequantizing. Populated on
-    /// first L2 query (one pass over `codes`), 8 bytes per cluster;
-    /// never serialized (decode starts it empty).
-    pub code_moments: OnceLock<Vec<(f32, f32)>>,
 }
 
 impl PartialEq for ClusterCentroids {
     fn eq(&self, other: &Self) -> bool {
         self.n_cent == other.n_cent
             && self.dim == other.dim
-            && self.codes == other.codes
-            && self.mins == other.mins
-            && self.scales == other.scales
+            && self.scale == other.scale
+            && self.offset == other.offset
+            && self.rows == other.rows
+            && self.norms == other.norms
             && self.counts == other.counts
             && self.radii == other.radii
     }
 }
 
 impl Eq for ClusterCentroids {}
+
+/// Bytes per stored dim in a centroid row: one Sq8 code + one i8 residual.
+const CENTROID_ROW_BYTES_PER_DIM: usize = 2;
 
 impl ClusterCentroids {
     /// The "no cluster centroids" value — a superfile without a vector
@@ -1795,59 +1793,66 @@ impl ClusterCentroids {
         Self::default()
     }
 
+    /// A single Sq8+residual centroid (`n_cent == 1`) from one fp32 vector —
+    /// for per-superfile summary centroids and the part-level envelope center.
+    pub fn single(metric: Metric, centroid: &[f32]) -> Self {
+        Self::from_fp32(metric, 1, centroid.len() as u32, centroid, vec![1])
+    }
+
+    /// Decode the single centroid (`n_cent == 1`) back to `dim` fp32 components.
+    pub fn to_single_fp32(&self) -> Vec<f32> {
+        let mut out = vec![0f32; self.dim as usize];
+        if self.n_cent >= 1 {
+            self.dequantize_into(0, &mut out);
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.n_cent == 0
     }
 
-    /// Sq8-quantize fp32 cluster centroids (`centroids` is cluster-major,
-    /// `n_cent * dim` floats) with per-cluster calibration: each cluster
-    /// centroid spans the full 8-bit range against its own component
-    /// min/max. `counts` is the per-cluster indexed doc count.
-    pub fn from_fp32(n_cent: u32, dim: u32, centroids: &[f32], counts: Vec<u32>) -> Self {
+    /// Encode fp32 cluster centroids (`centroids` is cluster-major,
+    /// `n_cent * dim` floats) into the shared-quantizer Sq8+residual layout via
+    /// the canonical [`encode_rows`] codec — one `scale`/`offset` trained over
+    /// all centroids, then `[codes ‖ residuals]` per cluster. The fp32 input is
+    /// the ingest/staging-boundary form (k-means output, or decoded at the
+    /// reader boundary); nothing fp32 survives into the stored bytes. `metric`
+    /// selects whether per-cluster decoded norms are stored (L2Sq / Cosine);
+    /// `counts` is the per-cluster indexed doc count.
+    pub fn from_fp32(
+        metric: Metric,
+        n_cent: u32,
+        dim: u32,
+        centroids: &[f32],
+        counts: Vec<u32>,
+    ) -> Self {
         let nc = n_cent as usize;
         let d = dim as usize;
-        let mut codes = vec![0u8; nc * d];
-        let mut mins = vec![0f32; nc];
-        let mut scales = vec![0f32; nc];
-        for c in 0..nc {
-            let src = &centroids[c * d..(c + 1) * d];
-            let mut mn = f32::INFINITY;
-            let mut mx = f32::NEG_INFINITY;
-            for &v in src {
-                mn = mn.min(v);
-                mx = mx.max(v);
-            }
-            if !mn.is_finite() {
-                mn = 0.0;
-            }
-            if !mx.is_finite() {
-                mx = 0.0;
-            }
-            let scale = if mx > mn {
-                (mx - mn) / SQ8_CODE_MAX
-            } else {
-                0.0
+        if nc == 0 || d == 0 {
+            return Self {
+                n_cent,
+                dim,
+                scale: vec![1.0; d],
+                offset: vec![0.0; d],
+                rows: Vec::new(),
+                norms: None,
+                counts,
+                radii: Vec::new(),
             };
-            mins[c] = mn;
-            scales[c] = scale;
-            let dst = &mut codes[c * d..(c + 1) * d];
-            for (o, &v) in dst.iter_mut().zip(src) {
-                *o = if scale > 0.0 {
-                    ((v - mn) / scale).round().clamp(0.0, SQ8_CODE_MAX) as u8
-                } else {
-                    0
-                };
-            }
         }
+        let ids: Vec<u32> = (0..n_cent).collect();
+        let row_idx: Vec<usize> = (0..nc).collect();
+        let encoded = encode_rows(metric, centroids, &ids, d, &row_idx);
         Self {
             n_cent,
             dim,
-            codes,
-            mins,
-            scales,
+            scale: encoded.scale,
+            offset: encoded.offset,
+            rows: encoded.rows,
+            norms: encoded.per_doc_norms,
             counts,
             radii: Vec::new(),
-            code_moments: OnceLock::new(),
         }
     }
 
@@ -1859,64 +1864,124 @@ impl ClusterCentroids {
         self
     }
 
-    /// Sq8-domain score of one cluster `c` against `query` — the per-cluster
-    /// kernel shared by [`Self::score_one`] and [`Self::score_clusters_into`].
-    /// `moments` is the per-cluster `(Σcode, Σcode²)` table and must be `Some`
-    /// for [`Metric::L2Sq`]; it is unused for Cosine/NegDot.
-    fn score_cluster_at(
-        &self,
-        metric: Metric,
-        c: usize,
-        query: &[f32],
-        sum_q: f32,
-        norm_q_sq: f32,
-        moments: Option<&[(f32, f32)]>,
-    ) -> f32 {
+    /// A new block holding only clusters `ids` (in the given order) under the
+    /// **same shared quantizer** — `scale`/`offset` are kept verbatim and the
+    /// per-cluster rows / norms / counts / radii are *sliced*, never
+    /// re-quantized, so the carved block is bit-exact. Out-of-range ids are
+    /// skipped (a defensive no-op rather than a panic). Used to carve a routing
+    /// page's node centroids out of the whole-tree block.
+    pub fn select_rows(&self, ids: &[u32]) -> ClusterCentroids {
         let d = self.dim as usize;
-        let codes = &self.codes[c * d..(c + 1) * d];
-        let dot_qc = self.mins[c] * sum_q + self.scales[c] * sq8_dot(query, codes, d);
-        match metric {
-            Metric::Cosine => COSINE_DISTANCE_BASE - dot_qc,
-            Metric::NegDot => -dot_qc,
-            Metric::L2Sq => {
-                let (sum_c, sumsq_c) = moments.expect("L2 moments built by caller")[c];
-                let centroid_norm_sq = d as f32 * self.mins[c] * self.mins[c]
-                    + L2_CROSS_TERM_COEFF * self.mins[c] * self.scales[c] * sum_c
-                    + self.scales[c] * self.scales[c] * sumsq_c;
-                norm_q_sq - L2_CROSS_TERM_COEFF * dot_qc + centroid_norm_sq
+        let stride = d * CENTROID_ROW_BYTES_PER_DIM;
+        let n_cent = self.n_cent as usize;
+        let mut rows = Vec::with_capacity(ids.len() * stride);
+        let mut counts = Vec::with_capacity(ids.len());
+        let mut norms_out = self.norms.as_ref().map(|_| Vec::with_capacity(ids.len()));
+        let has_radii = self.radii.len() == n_cent;
+        let mut radii_out = Vec::with_capacity(if has_radii { ids.len() } else { 0 });
+        for &id in ids {
+            let i = id as usize;
+            if i >= n_cent {
+                continue;
             }
+            rows.extend_from_slice(&self.rows[i * stride..(i + 1) * stride]);
+            counts.push(self.counts.get(i).copied().unwrap_or(0));
+            if let (Some(out), Some(src)) = (norms_out.as_mut(), self.norms.as_ref()) {
+                out.push(src[i]);
+            }
+            if has_radii {
+                radii_out.push(self.radii[i]);
+            }
+        }
+        ClusterCentroids {
+            n_cent: counts.len() as u32,
+            dim: self.dim,
+            scale: self.scale.clone(),
+            offset: self.offset.clone(),
+            rows,
+            norms: norms_out,
+            counts,
+            radii: radii_out,
         }
     }
 
-    /// Build (once, memoized) the per-cluster `(Σcode, Σcode²)` moments table
-    /// L2 scoring needs, returning it as a slice for [`Self::score_cluster_at`].
-    fn l2_code_moments(&self) -> &[(f32, f32)] {
-        let d = self.dim as usize;
-        self.code_moments.get_or_init(|| {
-            (0..self.n_cent as usize)
-                .map(|c| u8_sum_sumsq(&self.codes[c * d..(c + 1) * d]))
-                .collect()
-        })
+    /// Codes (`dim` u8) for cluster `c`.
+    #[inline]
+    fn codes(&self, c: usize) -> &[u8] {
+        let base = c * self.dim as usize * CENTROID_ROW_BYTES_PER_DIM;
+        &self.rows[base..base + self.dim as usize]
     }
 
-    /// Score cluster `c` against `query` in the Sq8 domain (same kernel as
-    /// [`Self::score_clusters_into`]).
-    pub fn score_one(
+    /// Residuals (`dim` i8 LE bytes) for cluster `c`.
+    #[inline]
+    fn residuals(&self, c: usize) -> &[u8] {
+        let d = self.dim as usize;
+        let base = c * d * CENTROID_ROW_BYTES_PER_DIM + d;
+        &self.rows[base..base + d]
+    }
+
+    /// Stored decoded norm for cluster `c` (`None` for NegDot).
+    #[inline]
+    fn norm(&self, c: usize) -> Option<f32> {
+        self.norms.as_ref().map(|n| n[c])
+    }
+
+    /// Build a per-query Sq8+residual kernel bound to the shared
+    /// `scale`/`offset` — the single scorer used for every centroid distance,
+    /// matching how cell rows are scored. Build once per query, reuse across
+    /// clusters.
+    fn kernel(&self, metric: Metric, query: &[f32]) -> Sq8ResidualKernel {
+        Sq8ResidualKernel::new(
+            metric,
+            query,
+            &self.scale,
+            &self.offset,
+            SQ8_RESIDUAL_DIVISOR,
+        )
+    }
+
+    /// Distance from `query` to cluster `c` under a prebuilt `kernel`.
+    #[inline]
+    fn cluster_distance(&self, kernel: &Sq8ResidualKernel, c: usize) -> f32 {
+        kernel.distance_with_norm(self.codes(c), self.residuals(c), self.norm(c))
+    }
+
+    /// Score cluster `c` against `query` via the Sq8+residual kernel (same
+    /// scorer as [`Self::score_clusters_into`]). Builds a one-off kernel; for
+    /// scoring many clusters per query, use [`Self::score_clusters_into`].
+    pub fn score_one(&self, metric: Metric, c: usize, query: &[f32]) -> f32 {
+        debug_assert_eq!(query.len(), self.dim as usize);
+        let kernel = self.kernel(metric, query);
+        self.cluster_distance(&kernel, c)
+    }
+
+    /// Score every populated cluster against `query` through the single
+    /// Sq8+residual scorer ([`Sq8ResidualKernel`]) — the same kernel used for
+    /// cell rows. Builds the kernel once over the shared `scale`/`offset`, then
+    /// folds each cluster's `[codes ‖ residuals]` (and decoded norm) through
+    /// `distance_with_norm`. Calls `emit(cluster_id, score)` for each cluster
+    /// with a nonzero indexed count; smaller score = closer. Matches
+    /// `dequantize_into` + `distance` up to f32 association order (gated by
+    /// `score_clusters_into_matches_dequantized_distance`).
+    pub fn score_clusters_into(
         &self,
         metric: Metric,
-        c: usize,
         query: &[f32],
-        sum_q: f32,
-        norm_q_sq: f32,
-    ) -> f32 {
+        mut emit: impl FnMut(u32, f32),
+    ) {
         debug_assert_eq!(query.len(), self.dim as usize);
-        let moments = matches!(metric, Metric::L2Sq).then(|| self.l2_code_moments());
-        self.score_cluster_at(metric, c, query, sum_q, norm_q_sq, moments)
+        if self.n_cent == 0 {
+            return;
+        }
+        let kernel = self.kernel(metric, query);
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            emit(c as u32, self.cluster_distance(&kernel, c));
+        }
     }
 
-    /// Adaptive cell selection for hidden-index routing: score every populated
-    /// cell, apply the triangle-inequality lower bound (`d − r`), and return
-    /// the probe set (nearest-first by centroid distance).
     pub fn select_cells_adaptive(
         &self,
         metric: Metric,
@@ -1928,10 +1993,8 @@ impl ClusterCentroids {
         if self.n_cent == 0 || dim == 0 || query.len() != dim {
             return (0..self.n_cent).collect();
         }
-        let sum_q: f32 = query.iter().sum();
-        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         let mut scored: Vec<(u32, f32)> = Vec::with_capacity(self.n_cent as usize);
-        self.score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+        self.score_clusters_into(metric, query, |c, score| {
             scored.push((c, score));
         });
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
@@ -1974,57 +2037,12 @@ impl ClusterCentroids {
         order.into_iter().map(|i| scored[i].0).collect()
     }
 
-    /// Score every populated cluster against `query` directly in the
-    /// Sq8 code domain — no per-cluster dequantization, no scratch
-    /// buffer. The affine dequant (`v_j = min + scale·code_j`) folds
-    /// out of every metric:
-    ///
-    /// ```text
-    /// dot(q, centroid) = min·Σq + scale·(q · codes)
-    /// ‖centroid‖²      = d·min² + 2·min·scale·Σcode + scale²·Σcode²
-    /// L2²(q, centroid) = ‖q‖² − 2·dot(q, centroid) + ‖centroid‖²
-    /// ```
-    ///
-    /// so the only O(dim) work per cluster is one Sq8 dot product over
-    /// the already-contiguous `codes` row — the same AVX-512 / AVX2 /
-    /// `wide` kernel the rerank path uses. `sum_q` is `Σ query_j`;
-    /// `norm_q_sq` is `‖query‖²` (read only for L2). Calls
-    /// `emit(cluster_id, score)` for each cluster with a nonzero
-    /// indexed count. Scores equal `dequantize_into` + `distance` up
-    /// to f32 association order (gated by
-    /// `score_clusters_into_matches_dequantized_distance`).
-    pub fn score_clusters_into(
-        &self,
-        metric: Metric,
-        query: &[f32],
-        sum_q: f32,
-        norm_q_sq: f32,
-        mut emit: impl FnMut(u32, f32),
-    ) {
-        debug_assert_eq!(query.len(), self.dim as usize);
-        // L2 needs each cluster's query-independent code moments;
-        // computed once per `ClusterCentroids` (first L2 query) so the
-        // per-query, per-cluster O(dim) work stays a single Sq8 dot.
-        let moments = matches!(metric, Metric::L2Sq).then(|| self.l2_code_moments());
-        for c in 0..self.n_cent as usize {
-            if self.counts[c] == 0 {
-                continue;
-            }
-            emit(
-                c as u32,
-                self.score_cluster_at(metric, c, query, sum_q, norm_q_sq, moments),
-            );
-        }
-    }
-
-    /// Return the cell whose Sq8 centroid is closest to `query` under `metric`.
-    /// Uses [`Self::score_clusters_into`] — same SIMD path as IVF selection.
+    /// Return the cell whose centroid is closest to `query` under `metric`.
+    /// Uses [`Self::score_clusters_into`] — the single Sq8+residual scorer.
     pub fn nearest_cell(&self, metric: Metric, query: &[f32]) -> u32 {
-        let sum_q: f32 = query.iter().sum();
-        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         let mut best_cell = 0u32;
         let mut best_score = f32::INFINITY;
-        self.score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+        self.score_clusters_into(metric, query, |c, score| {
             if score < best_score {
                 best_score = score;
                 best_cell = c;
@@ -2058,14 +2076,21 @@ impl ClusterCentroids {
             });
     }
 
-    /// Dequantize cluster `c`'s centroid into `out` (length `dim`).
+    /// Decode cluster `c`'s centroid into `out` (length `dim`) — the inverse of
+    /// the Sq8+residual encode, via the canonical [`encoded_component_at`] codec.
+    /// Used only at the staging / oracle boundary, never in the query path
+    /// (which scores straight off the bytes via [`Sq8ResidualKernel`]).
     pub fn dequantize_into(&self, c: usize, out: &mut [f32]) {
-        let d = self.dim as usize;
-        let codes = &self.codes[c * d..(c + 1) * d];
-        let mn = self.mins[c];
-        let scale = self.scales[c];
-        for (o, &code) in out.iter_mut().zip(codes) {
-            *o = mn + code as f32 * scale;
+        let row = EncodedCellRow {
+            stable_id: 0,
+            scale: self.scale.clone(),
+            offset: self.offset.clone(),
+            codes: self.codes(c).to_vec(),
+            residuals: self.residuals(c).to_vec(),
+            norm_sq: None,
+        };
+        for (d, o) in out.iter_mut().enumerate() {
+            *o = encoded_component_at(&row, d);
         }
     }
 }
@@ -2083,7 +2108,10 @@ mod tests {
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
-        superfile::{builder::FtsConfig, vector::distance::distance},
+        superfile::{
+            builder::FtsConfig,
+            vector::distance::{COSINE_DISTANCE_BASE, distance, dot},
+        },
         supertable::manifest::{
             commit::{PartWriteResult, write_manifest_part},
             list::PartitionStrategy,
@@ -2105,7 +2133,7 @@ mod tests {
             }
         }
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
-        let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
+        let cc = ClusterCentroids::from_fp32(Metric::L2Sq, n_cent, dim, &centroids, counts);
         (cc, centroids)
     }
 
@@ -2117,6 +2145,7 @@ mod tests {
         use crate::supertable::manifest::{encoding, list::CellRoutingParams};
 
         let clusters = ClusterCentroids::from_fp32(
+            Metric::L2Sq,
             4,
             4,
             &[
@@ -2148,16 +2177,19 @@ mod tests {
         let query: Vec<f32> = (0..dim)
             .map(|j| ((j as u64 * 40_503 + 11) % 997) as f32 / 500.0 - 1.0)
             .collect();
-        let sum_q: f32 = query.iter().sum();
-        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
+        let _sum_q: f32 = query.iter().sum();
+        let _norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
 
         for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
             let mut folded: Vec<(u32, f32)> = Vec::new();
-            cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |c, s| {
+            cc.score_clusters_into(metric, &query, |c, s| {
                 folded.push((c, s));
             });
 
-            // Reference: the old dequantize + distance loop.
+            // Reference: decode each centroid and score with the same metric
+            // convention the Sq8ResidualKernel uses. Cosine divides by the
+            // centroid norm (the kernel folds in the stored ‖x‖); L2Sq / NegDot
+            // match distance() directly.
             let mut deq = vec![0f32; dim as usize];
             let mut reference: Vec<(u32, f32)> = Vec::new();
             for c in 0..n_cent as usize {
@@ -2165,7 +2197,18 @@ mod tests {
                     continue;
                 }
                 cc.dequantize_into(c, &mut deq);
-                reference.push((c as u32, distance(metric, &query, &deq)));
+                let ref_dist = match metric {
+                    Metric::Cosine => {
+                        let norm = deq.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        if norm > 0.0 {
+                            COSINE_DISTANCE_BASE - dot(&query, &deq) / norm
+                        } else {
+                            COSINE_DISTANCE_BASE - dot(&query, &deq)
+                        }
+                    }
+                    _ => distance(metric, &query, &deq),
+                };
+                reference.push((c as u32, ref_dist));
             }
 
             assert_eq!(
@@ -2196,14 +2239,12 @@ mod tests {
         let iters = 50usize;
         let (cc, _) = synth_clusters(n_cent, dim, 99);
         let query: Vec<f32> = (0..dim).map(|j| (j as f32).sin()).collect();
-        let sum_q: f32 = query.iter().sum();
-        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
 
         for metric in [Metric::Cosine, Metric::L2Sq] {
             let t0 = Instant::now();
             for _ in 0..iters {
                 let mut acc = 0f32;
-                cc.score_clusters_into(metric, &query, sum_q, norm_q_sq, |_, s| acc += s);
+                cc.score_clusters_into(metric, &query, |_, s| acc += s);
                 black_box(acc);
             }
             let folded_us = t0.elapsed().as_micros() as f64 / iters as f64;
@@ -2832,7 +2873,7 @@ mod tests {
         assert!(cc.is_empty());
         assert_eq!(cc.n_cent, 0);
         // A populated one is not empty.
-        let cc = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let cc = ClusterCentroids::from_fp32(Metric::L2Sq, 2, 4, &[0.0; 8], vec![1, 1]);
         assert!(!cc.is_empty());
         assert_eq!(cc.n_cent, 2);
         assert_eq!(cc.dim, 4);
@@ -5032,11 +5073,10 @@ mod tests {
     #[test]
     fn from_fp32_handles_non_finite_components() {
         let centroids = [f32::INFINITY, f32::NEG_INFINITY, 0.0, 1.0];
-        let cc = ClusterCentroids::from_fp32(1, 4, &centroids, vec![1]);
-        // Degenerate (non-finite) min/max collapse to a zero scale, so
-        // every code in the cluster is 0 — no NaN/inf leaks through.
-        assert_eq!(cc.scales[0], 0.0);
-        assert!(cc.mins[0].is_finite());
-        assert!(cc.codes.iter().all(|&c| c == 0));
+        let cc = ClusterCentroids::from_fp32(Metric::L2Sq, 1, 4, &centroids, vec![1]);
+        // Non-finite fp32 input is sanitized at encode time; the stored row is finite.
+        assert!(cc.scale.iter().all(|s| s.is_finite()));
+        assert!(cc.offset.iter().all(|o| o.is_finite()));
+        assert!(!cc.rows.is_empty());
     }
 }

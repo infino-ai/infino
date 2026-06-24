@@ -952,8 +952,8 @@ async fn compare_fp32_and_sq8_on_1m_bench_workload() {
     drop(fp32_reader);
 
     for codec in [
-        RerankCodec::Sq8ResidualEpsilon,
-        RerankCodec::Sq8ResidualEpsilon,
+        RerankCodec::Sq8Residual,
+        RerankCodec::Sq8Residual,
     ] {
         eprintln!("\ndebug: building {codec:?} reader");
         let reader = build_reader(vectors, codec);
@@ -1082,7 +1082,7 @@ async fn inspect_sq8_miss_geometry_on_1m_bench_workload() {
     );
 
     eprintln!("miss-debug: building Sq8 reader");
-    let sq8 = build_reader(vectors, RerankCodec::Sq8ResidualEpsilon);
+    let sq8 = build_reader(vectors, RerankCodec::Sq8Residual);
 
     let mut total_hits = 0usize;
     let mut missed_queries = 0usize;
@@ -1211,7 +1211,7 @@ async fn sq8_oversampled_exact_rescore_recall_on_1m_bench_workload() {
     let truths = corpus::ground_truth(vectors, N_DOCS, &queries, TOP_K);
 
     eprintln!("rescore-debug: building Sq8 reader");
-    let sq8 = build_reader(vectors, RerankCodec::Sq8ResidualEpsilon);
+    let sq8 = build_reader(vectors, RerankCodec::Sq8Residual);
 
     for m in [10usize, 20, 50, 100, 200] {
         let mut sq8_hits = 0usize;
@@ -1426,7 +1426,7 @@ async fn sq8_top20_cheap_sidecar_rescore_on_1m_bench_workload() {
     eprintln!("sidecar-debug: computing exact fp32 brute-force ground truth");
     let truths = corpus::ground_truth(vectors, N_DOCS, &queries, TOP_K);
     eprintln!("sidecar-debug: building Sq8 reader");
-    let sq8 = build_reader(vectors, RerankCodec::Sq8ResidualEpsilon);
+    let sq8 = build_reader(vectors, RerankCodec::Sq8Residual);
 
     let top32_dims = top_variance_dims(vectors, 32);
     let top64_dims = top_variance_dims(vectors, 64);
@@ -1684,7 +1684,7 @@ async fn sq8_top20_residual_sidecar_rescore_on_1m_bench_workload() {
     let fp32_blob = build_blob(vectors, RerankCodec::Fp32);
     let layout = parse_ivf_layout_from_fp32_blob(&fp32_blob);
     eprintln!("residual-debug: building Sq8 reader + Sq8 sidecar model");
-    let sq8_reader = build_reader(vectors, RerankCodec::Sq8ResidualEpsilon);
+    let sq8_reader = build_reader(vectors, RerankCodec::Sq8Residual);
     let sq8_sidecar = build_sq8_sidecar_by_doc(vectors, &layout);
 
     let mut fp32_hits = 0usize;
