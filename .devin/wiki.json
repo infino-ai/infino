@@ -9,39 +9,5 @@
     {
       "content": "Architecture: a 'superfile' is a single, valid Apache Parquet file with BM25 and vector index regions embedded alongside the columnar data. The 'supertable' layer composes many superfiles into one table with snapshot-isolated reads, append-only writes, and an atomic-commit manifest; the manifest carries term filters, value ranges, and vector centroids used to prune superfiles before any bytes are fetched. The public API is the small surface re-exported at the crate root (connect / connect_with, Connection, Supertable, IndexSpec, Metric, BoolMode, VectorSearchOptions, VectorFilter, InfinoError); the storage / superfile / supertable layers are internal (pub(crate)). Canonical design docs live in docs/architecture/ (overview, superfile, supertable); concept pages in docs/concepts/; operational answers in docs/faq.md; the honest limits in docs/tradeoffs.md. Infino's own performance numbers live in benches/README.md."
     }
-  ],
-  "pages": [
-    {
-      "title": "Overview",
-      "purpose": "What Infino is — an embedded, object-storage-native retrieval engine for SQL, full-text, and vector search over one copy of the data — who it is for (agent/RAG and in-app retrieval over data in object storage), and the mental model. Summarize the four properties: speed-per-dollar, multi-modal queries, object-storage-native, and open Parquet format."
-    },
-    {
-      "title": "Installation and quickstart",
-      "purpose": "How to install in each language (pip install infino, npm install @infino-ai/infino, cargo add infino) and the smallest end-to-end example: open a connection, create a table with an IndexSpec, append rows, and run keyword, vector, and SQL retrieval. Emphasize that it runs in-process with no server."
-    },
-    {
-      "title": "Object-storage-native retrieval",
-      "purpose": "Explain the core model: search that runs directly on data in object storage rather than in a database or cluster that owns its own copy, and why that matters for cost and for agent workloads. Base this on docs/concepts/object-storage-native-retrieval.md."
-    },
-    {
-      "title": "Architecture: superfiles and supertables",
-      "purpose": "Describe the two layers — the superfile (a valid Parquet file with embedded BM25 + vector indexes) and the supertable (many superfiles with manifest snapshots, atomic commits, and skip-pruning). Base this on docs/architecture/superfile.md and supertable.md."
-    },
-    {
-      "title": "Search and SQL: keyword, vector, hybrid, filtered",
-      "purpose": "Document the retrieval surface: BM25 keyword search, vector kNN (including the optional pushdown text filter via VectorFilter), hybrid search (keyword + vector fused with reciprocal-rank fusion), and SQL — including that the search functions are SQL table functions that compose into queries. Base this on docs/concepts/hybrid-search.md and the architecture queries section."
-    },
-    {
-      "title": "Public API and stability",
-      "purpose": "Document the stable public surface re-exported at the crate root (connect/Connection/Supertable/IndexSpec/Metric/BoolMode/VectorSearchOptions/VectorFilter/InfinoError) and the stability policy (semver, the cargo-public-api snapshot, Arrow/DataFusion as part of the contract). Base this on the README Stability section and docs/versioning.md."
-    },
-    {
-      "title": "Retrieval for agents and RAG",
-      "purpose": "Explain why Infino fits agent and RAG workloads — hundreds of retrievals per task where latency and cost compound, multi-modal retrieval over one corpus, and an embeddable, no-server engine that runs on data already in object storage. Base this on docs/concepts/retrieval-for-agents.md and embedded-retrieval.md."
-    },
-    {
-      "title": "Tradeoffs and limits",
-      "purpose": "The honest envelope: what Infino is good at (warm-query speed, multi-modal retrieval over one copy, flat storage cost) and what it is not built for (cold first-touch latency, write-dominated and transactional workloads). Base this on docs/tradeoffs.md."
-    }
   ]
 }
