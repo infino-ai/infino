@@ -284,6 +284,8 @@ pub enum OptimizeError {
     Refresh(String),
     #[error("optimize already in progress on this handle")]
     AlreadyRunning,
+    #[error("gc failed during optimize: {0}")]
+    Gc(#[from] GcError),
 }
 
 impl From<CompactionError> for OptimizeError {
