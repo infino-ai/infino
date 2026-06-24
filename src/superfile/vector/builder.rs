@@ -33,10 +33,14 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, encoded_component_at,
+            MaterializedIvfRow, cluster_quant_from_medoid, encode_sq8_residual_dim,
+            encoded_component_at, encoded_ivf_kmeans,
             materialize_sq8_residual_row_into_cluster_quant,
         },
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
+        centroid_block,
+        distance::{
+            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by, metric_to_id,
+        },
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
@@ -107,16 +111,6 @@ const N_CENT_SMALL: usize = 64;
 /// back by the reader as `value / 100.0`.
 const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 
-/// Maximum Sq8 code value: each component quantizes to one unsigned
-/// byte, so the per-dim scale maps a cluster's value span onto
-/// `[0, SQ8_CODE_MAX]`.
-const SQ8_CODE_MAX: f32 = 255.0;
-
-/// Symmetric clamp bound for the Sq8ResidualEpsilon i8 leg. The residual is
-/// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
-/// quantized magnitude stays symmetric about zero.
-const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
-
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
         N_CENT_LARGE
@@ -124,16 +118,6 @@ fn n_cent_row_count_cap(n_docs: usize) -> usize {
         N_CENT_MEDIUM
     } else {
         N_CENT_SMALL
-    }
-}
-
-/// Metric ID encoding for the directory entry. Spec: 0 = L2Sq, 1 = Cosine,
-/// 2 = NegDot.
-fn metric_id(m: Metric) -> u32 {
-    match m {
-        Metric::L2Sq => format::vec::METRIC_ID_L2SQ,
-        Metric::Cosine => format::vec::METRIC_ID_COSINE,
-        Metric::NegDot => format::vec::METRIC_ID_NEGDOT,
     }
 }
 
@@ -402,7 +386,7 @@ impl VectorBuilder {
                 column: format!("(unregistered vector column_id {column_id})"),
                 actual: "n/a".to_string(),
             })?;
-        if !matches!(col.config.rerank_codec, RerankCodec::Sq8ResidualEpsilon) {
+        if !matches!(col.config.rerank_codec, RerankCodec::Sq8Residual) {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.config.column.clone(),
                 codec: col.config.rerank_codec.name(),
@@ -544,11 +528,6 @@ impl VectorBuilder {
     /// expected `-> Vec<u8>` need to `?` the result; the
     /// `SuperfileBuilder` shim does so already.
     pub fn finish(self) -> Result<Vec<u8>, BuildError> {
-        // Capacity hint: the largest known-cheap pre-allocation is
-        // `OUTER_HEADER_SIZE + (n_columns × DIR_ENTRY_SIZE) + 8`
-        // (header + directory + dir_crc + outer_crc). Subsection
-        // bytes are unknown until built; the inner `Write` impl on
-        // `Vec` will grow as needed.
         let header_dir_hint = OUTER_HEADER_SIZE + (self.columns.len() * DIR_ENTRY_SIZE) + 8;
         let mut buf: Vec<u8> = Vec::with_capacity(header_dir_hint);
         self.finish_to(&mut buf)?;
@@ -639,7 +618,7 @@ impl VectorBuilder {
             directory.extend_from_slice(&(i as u32).to_le_bytes()); // column_id
             directory.extend_from_slice(&(cfg.dim as u32).to_le_bytes()); // dim
             directory.extend_from_slice(&(sub.n_cent as u32).to_le_bytes()); // physical n_cent
-            directory.extend_from_slice(&metric_id(cfg.metric).to_le_bytes()); // metric_id
+            directory.extend_from_slice(&metric_to_id(cfg.metric).to_le_bytes()); // metric_id
             directory.extend_from_slice(&cfg.rot_seed.to_le_bytes()); // rot_seed (8)
             directory.extend_from_slice(&subsection_start_off.to_le_bytes()); // subsection_offset (8)
             directory.extend_from_slice(&(sub.bytes.len() as u64).to_le_bytes()); // subsection_length (8)
@@ -768,8 +747,12 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///
 /// ```text
 ///   [Sub-header — 56 bytes]
-///   [Summary centroid + radius]   — dim f32s
-///   [IVF centroids]               — n_cent × dim × f32
+///   [Centroid block]              — Sq8+ε, one shared quantizer over the
+///                                   summary centroid (row 0) + n_cent IVF
+///                                   centroids (rows 1..=n_cent):
+///                                     scale[dim] f32, offset[dim] f32,
+///                                     rows[(n_cent+1) × dim × 2] (codes ‖ eps),
+///                                     norms[(n_cent+1)] f32 (L2Sq/Cosine only)
 ///   [Cluster index]               — n_cent × (u32 doc_off, u32 doc_count)
 ///   [1-bit codes]                 — n_docs × ceil(dim/8) (cluster-contiguous)
 ///   [Full-precision vectors]      — n_docs × dim × f32 (cluster-contiguous)
@@ -809,31 +792,13 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
+    let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
     let n_cent = cfg
         .n_cent
         .max(1)
         .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1));
-    // Train centroids the same way the user-superfile build does: on a bounded
-    // sample (NOT every row), via the shared `kmeans` (random init + parallel).
-    // The previous bespoke `encoded_ivf_kmeans` trained over every row with
-    // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
-    // on large cells. Only the sampled rows are decoded to fp32, so there is no
-    // full-corpus fp32 buffer.
-    let sample_size = default_kmeans_sample_size(n_cent).min(n_docs);
-    let mut sample = vec![0f32; sample_size * dim];
-    for s in 0..sample_size {
-        let idx = if sample_size == n_docs {
-            s
-        } else {
-            s * n_docs / sample_size
-        };
-        let enc = &rows[idx].encoded;
-        for (d, slot) in sample[s * dim..(s + 1) * dim].iter_mut().enumerate() {
-            *slot = encoded_component_at(enc, d);
-        }
-    }
-    let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+    let (centroids, _assign) = encoded_ivf_kmeans(&encoded_only, cfg.metric, n_cent, KMEANS_ITERS);
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
@@ -853,7 +818,7 @@ fn build_subsection_from_materialized(
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let codec = cfg.rerank_codec;
-    debug_assert!(matches!(codec, RerankCodec::Sq8ResidualEpsilon));
+    debug_assert!(matches!(codec, RerankCodec::Sq8Residual));
 
     let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
     for row in &rows {
@@ -893,27 +858,14 @@ fn build_subsection_from_materialized(
         }
     }
 
-    // Per-cluster Sq8 quantizer: calibrate from the cluster's per-dim min/max,
-    // exactly as the user/streaming build does (`derive_sq8_quantizer_from_min_max`
-    // over `update_min_max`). This is O(rows · dim); the previous medoid-based
-    // derivation was O(rows² · dim) (summed pairwise distances per cluster) and
-    // single-threaded — it spun for minutes on a large post-routing cluster.
     let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = buckets
         .iter()
         .map(|bucket| {
             if bucket.is_empty() {
-                return (vec![1.0f32; dim], vec![0.0f32; dim]);
+                (vec![1.0f32; dim], vec![0.0f32; dim])
+            } else {
+                cluster_quant_from_medoid(cfg.metric, dim, bucket)
             }
-            let mut min = vec![f32::INFINITY; dim];
-            let mut max = vec![f32::NEG_INFINITY; dim];
-            let mut row_fp = vec![0.0f32; dim];
-            for row in bucket.iter() {
-                for (d, slot) in row_fp.iter_mut().enumerate() {
-                    *slot = encoded_component_at(&row.encoded, d);
-                }
-                update_min_max(&row_fp, &mut min, &mut max);
-            }
-            derive_sq8_quantizer_from_min_max(&min, &max)
         })
         .collect();
 
@@ -925,9 +877,6 @@ fn build_subsection_from_materialized(
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    // The materialized build is the hidden-cell path: inline the stable `_id`
-    // as a trailing i128-per-doc region so id+score queries and the drain read
-    // it straight from the blob (no scalar `_id` column resolution).
     let stable_ids_region_bytes = n_docs * format::vec::STABLE_ID_BYTES;
     let layout = IvfSubsectionLayout::compute(
         dim,
@@ -936,6 +885,7 @@ fn build_subsection_from_materialized(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
+        cfg.metric,
     );
     let total_size_before_crc = layout.total_size_before_crc;
 
@@ -943,6 +893,9 @@ fn build_subsection_from_materialized(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        cfg.metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &centroids,
     );
@@ -999,12 +952,6 @@ fn build_subsection_from_materialized(
         },
     )?;
 
-    // Inline stable-`_id` region: one i128 per doc, indexed by `local_doc_id`
-    // (the same index a hidden hit's positional doc-id resolves through), so an
-    // id+score query and the drain read the stable `_id` straight from the blob
-    // instead of resolving it through a scalar `_id` column. It sits between
-    // codec_meta and the per-cluster blocks (see `IvfSubsectionLayout`); the
-    // whole subsection is CRC'd below, so the region is covered.
     if let Some(stable_ids_off) = layout.stable_ids_off {
         for row in &rows {
             let off = stable_ids_off + (row.local_doc_id as usize) * format::vec::STABLE_ID_BYTES;
@@ -1124,10 +1071,14 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
+    // Per-cluster covering radius (squared, pre-sqrt): max over the cluster's
+    // rows of L2² distance to its own centroid. Folded in pass 2 alongside the
+    // summary radius; surfaced as each routing leaf's radius.
+    let mut cluster_radius_sq_max = vec![0.0f32; n_cent];
     let codec = cfg.rerank_codec;
-    // `Sq8ResidualEpsilon` uses per-cluster scale/offset codec_meta plus
+    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
-    let sq8_family = matches!(codec, RerankCodec::Sq8ResidualEpsilon);
+    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
     let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
         (
             vec![f32::INFINITY; n_cent * dim],
@@ -1177,6 +1128,7 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
+            &mut cluster_radius_sq_max,
             codec,
             sq8_acc,
         )?;
@@ -1274,15 +1226,24 @@ fn build_subsection_streaming(
     // `nprobe + 1 fat-range` GETs (which over-fetched the whole
     // rerank region) to `nprobe` GETs of ~cluster-sized blocks.
     let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    // Streaming (user-superfile) build: no inline stable-`_id` region.
-    let layout =
-        IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size, 0);
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs,
+        cluster_stride,
+        codec_meta_size,
+        0,
+        cfg.metric,
+    );
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
         summary_radius_x100,
+        cfg.metric,
+        dim,
+        n_cent,
         &summary_centroid,
         &centroids,
     );
@@ -1347,7 +1308,7 @@ fn build_subsection_streaming(
                     bytes[blk.rerank_base..blk.rerank_base + blk.count * dim * 4]
                         .copy_from_slice(&full_block);
                 }
-                RerankCodec::Sq8ResidualEpsilon => {
+                RerankCodec::Sq8Residual => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                     let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                     let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
@@ -1388,7 +1349,7 @@ fn build_subsection_streaming(
     })
 }
 
-/// `Sq8ResidualEpsilon` per-cluster encode. Writes a row-interleaved
+/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
 /// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
 /// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
 /// `sq8_encode_row` quantization; the residual code captures the
@@ -1413,6 +1374,7 @@ fn encode_sq8_residual_cluster_simd(
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
     let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let row_bytes = dim * 2;
+    let store_norm = sq8_norms_block_off.is_some();
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
@@ -1428,17 +1390,10 @@ fn encode_sq8_residual_cluster_simd(
             let qc = bytes[code_off + d];
             let base = (qc as f32) * scale_c[d] + offset_c[d];
             let step = scale_c[d] / residual_divisor;
-            let rq = if step > 0.0 {
-                ((src[d] - base) / step)
-                    .round()
-                    .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
-            } else {
-                0
-            };
-            bytes[res_off + d] = rq.to_le_bytes()[0];
-            if sq8_norms_block_off.is_some() {
-                let x = base + (rq as f32) * step;
-                acc += (x as f64) * (x as f64);
+            let (res_byte, norm_contrib) = encode_sq8_residual_dim(src[d], base, step, store_norm);
+            bytes[res_off + d] = res_byte;
+            if let Some(c) = norm_contrib {
+                acc += c;
             }
         }
         if let Some(norms_off) = sq8_norms_block_off {
@@ -1520,20 +1475,23 @@ fn order_centroids_recursive(order: &mut [usize], centroids: &[f32], dim: usize)
 /// materialized rebuild, and the byte-splice merge — so the layout math lives
 /// in exactly one place.
 pub(crate) struct IvfSubsectionLayout {
+    /// Start of the Sq8+ε centroid block (the block's `scale` sub-region). The
+    /// summary centroid and IVF centroids share one quantizer and live here as
+    /// one block — see [`centroid_block`]. Recorded in the sub-header's
+    /// `summary_off` slot for backward-compatible field reuse.
     pub summary_off: usize,
+    /// Start of the centroid block's `rows` sub-region (codes ‖ residuals; row 0
+    /// = summary, rows `1..=n_cent` = IVF centroids). Recorded in the
+    /// sub-header's `centroids_off` slot.
     pub centroids_off: usize,
     pub cluster_idx_off: usize,
     /// Start of the codec-meta region; for the Sq8 family this is also the
     /// per-cluster Sq8 `scale` block offset.
     pub codec_meta_off: usize,
     pub per_cluster_blocks_off: usize,
-    /// Offset of the inline stable-`_id` region (one i128 per doc, indexed by
-    /// `local_doc_id`), present only for the materialized (hidden-cell) build.
-    /// `None` when no region was requested. The region sits *between* the
-    /// codec-meta region and the per-cluster blocks, so the per-cluster blocks
-    /// stay the last data region before the CRC — the reader still derives
-    /// `n_docs` from that trailing region's length, and infers this region's
-    /// presence/size from the offset gap (no header flag).
+    /// Inline stable-`_id` region (one i128 per doc, indexed by `local_doc_id`).
+    /// Present only for materialized hidden-cell builds; inferred from the gap
+    /// between codec meta and per-cluster blocks.
     pub stable_ids_off: Option<usize>,
     pub total_size_before_crc: usize,
 }
@@ -1542,8 +1500,7 @@ impl IvfSubsectionLayout {
     /// Compute the region offsets. `per_cluster_stride` is
     /// `code_bytes + DOC_ID_BYTES + per_vec_bytes`; `codec_meta_size` is the
     /// codec's metadata region size (0 when it has none). `stable_ids_region_bytes`
-    /// is `n_docs * STABLE_ID_BYTES` for the materialized (hidden-cell) build that
-    /// inlines the stable `_id`, and 0 for the streaming/merge builds.
+    /// is `n_docs * STABLE_ID_BYTES` for materialized hidden-cell builds, 0 otherwise.
     pub(crate) fn compute(
         dim: usize,
         n_cent: usize,
@@ -1551,13 +1508,13 @@ impl IvfSubsectionLayout {
         per_cluster_stride: usize,
         codec_meta_size: usize,
         stable_ids_region_bytes: usize,
+        metric: Metric,
     ) -> Self {
         let summary_off = SUB_HEADER_SIZE;
-        let centroids_off = summary_off + dim * 4;
-        let cluster_idx_off = centroids_off + n_cent * dim * 4;
+        let centroids_off = summary_off + centroid_block::rows_rel_off(dim);
+        let cluster_idx_off =
+            summary_off + centroid_block::centroid_block_bytes(dim, n_cent, metric);
         let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
-        // The stable-`_id` region (if any) goes between codec_meta and the
-        // per-cluster blocks, so the blocks remain the trailing data region.
         let codec_meta_end = codec_meta_off + codec_meta_size;
         let stable_ids_off = (stable_ids_region_bytes > 0).then_some(codec_meta_end);
         let per_cluster_blocks_off = codec_meta_end + stable_ids_region_bytes;
@@ -1576,12 +1533,20 @@ impl IvfSubsectionLayout {
 
 /// Allocate the subsection buffer (sized to `total_size_before_crc`, CRC not yet
 /// appended) and write the fixed prefix every IVF subsection shares: the 56-byte
-/// sub-header, the summary centroid, and the per-cluster centroids. The caller
+/// sub-header and the Sq8+ε centroid block (summary centroid + per-cluster
+/// centroids under one shared quantizer — see [`centroid_block`]). The caller
 /// fills the cluster index, codec-meta/per-cluster blocks, then appends the CRC.
+///
+/// `summary_centroid` (`dim`) and `centroids` (`n_cent × dim`) are fp32 at the
+/// ingest boundary only; they are quantized to Sq8+ε before being written, so no
+/// fp32 centroid bytes survive into the subsection.
 pub(crate) fn alloc_ivf_subsection_with_header(
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
     summary_radius_x100: u32,
+    metric: Metric,
+    dim: usize,
+    n_cent: usize,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) -> Vec<u8> {
@@ -1601,10 +1566,15 @@ pub(crate) fn alloc_ivf_subsection_with_header(
         .copy_from_slice(&(layout.cluster_idx_off as u64).to_le_bytes());
     bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
         .copy_from_slice(&(layout.per_cluster_blocks_off as u64).to_le_bytes());
-    bytes[layout.summary_off..layout.summary_off + summary_centroid.len() * 4]
-        .copy_from_slice(bytemuck::cast_slice(summary_centroid));
-    bytes[layout.centroids_off..layout.centroids_off + centroids.len() * 4]
-        .copy_from_slice(bytemuck::cast_slice(centroids));
+    centroid_block::write_centroid_block(
+        &mut bytes,
+        layout.summary_off,
+        metric,
+        dim,
+        n_cent,
+        summary_centroid,
+        centroids,
+    );
     bytes
 }
 
@@ -1697,6 +1667,7 @@ fn run_pass2(
     bucket_writers: &mut [BufWriter<File>],
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
+    cluster_radius_sq_max: &mut [f32],
     codec: RerankCodec,
     mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
@@ -1778,8 +1749,16 @@ fn run_pass2(
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
             }
+            // Fold this row into its cluster's covering radius (un-rotated input
+            // space, same convention as the summary radius). One extra distance
+            // per row against the assigned centroid only — negligible next to
+            // the `n_cent` comparisons `assign_to_centroids` already did.
+            let row = &chunk[r * dim..(r + 1) * dim];
+            let d = l2_sq(row, &centroids[cid * dim..(cid + 1) * dim]);
+            if d > cluster_radius_sq_max[cid] {
+                cluster_radius_sq_max[cid] = d;
+            }
             if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
-                let row = &chunk[r * dim..(r + 1) * dim];
                 let off = cid * dim;
                 update_min_max(row, &mut mn[off..off + dim], &mut mx[off..off + dim]);
             }
@@ -1795,17 +1774,6 @@ mod tests {
     use std::fs::{read, write};
 
     use super::*;
-
-    /// Drive an async reader call to completion. The materialized read-back is
-    /// async (the drain fetches-on-miss); these tests use in-memory readers, so
-    /// every fetch resolves without yielding and a current-thread runtime is
-    /// enough.
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build current-thread runtime")
-            .block_on(f)
-    }
 
     fn cfg(name: &str, dim: usize) -> VectorConfig {
         VectorConfig {
@@ -1909,175 +1877,6 @@ mod tests {
         assert_eq!(u64::from_le_bytes(buf), 0);
     }
 
-    /// The materialized (hidden-cell) build inlines the stable `_id` as a
-    /// trailing i128-per-doc region; a streaming build emits none. Round-trip
-    /// both through `materialized_index_rows`: the materialized rebuild must
-    /// carry each row's stable `_id` straight from the blob (no scalar column),
-    /// while the streaming blob reports `0` (region absent).
-    #[test]
-    fn materialized_build_round_trips_inline_stable_ids() {
-        use bytes::Bytes;
-
-        use crate::superfile::vector::reader::VectorReader;
-
-        let dim = 16;
-        let n = 24usize;
-        let json = format!(
-            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
-        );
-        let cfg = || VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent: 4,
-            rot_seed: 7,
-            metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
-        };
-
-        // Streaming build: distinct vectors at local_doc_ids 0..n.
-        let mut b = VectorBuilder::new();
-        b.register_column(cfg()).expect("register");
-        for i in 0..n {
-            let mut v = vec![0.0f32; dim];
-            v[i % dim] = 1.0 + (i as f32);
-            v[(i * 7) % dim] += 0.5;
-            // arg 0 is the column id; local_doc_ids auto-assign as 0..n.
-            b.add(0, &v).expect("add");
-        }
-        let stream_blob = b.finish().expect("finish streaming");
-        let stream_reader =
-            VectorReader::open(Bytes::from(stream_blob), &json).expect("open streaming");
-        let mut stream_rows = block_on(stream_reader.materialized_index_rows_async("v"))
-            .expect("streaming rows");
-        // Streaming subsection has no inline region.
-        assert!(
-            stream_rows.iter().all(|r| r.stable_id == 0),
-            "streaming build must not carry inline stable_ids"
-        );
-
-        // Assign a distinct, nonzero stable `_id` per row (keyed by local id),
-        // then rebuild through the materialized path so the region is written.
-        let want = |local: u32| -> i128 { 1_700_000_000_000i128 + local as i128 };
-        for r in &mut stream_rows {
-            r.stable_id = want(r.local_doc_id);
-            r.encoded.stable_id = r.stable_id;
-        }
-
-        let mut mb = VectorBuilder::new();
-        mb.register_column(cfg()).expect("register mat");
-        mb.load_materialized_rows(0, stream_rows)
-            .expect("load materialized");
-        let mat_blob = mb.finish().expect("finish materialized");
-        let mat_reader =
-            VectorReader::open(Bytes::from(mat_blob), &json).expect("open materialized");
-        assert_eq!(mat_reader.n_docs(), n as u64);
-
-        let mat_rows = block_on(mat_reader.materialized_index_rows_async("v"))
-            .expect("materialized rows");
-        assert_eq!(mat_rows.len(), n);
-        for r in &mat_rows {
-            assert_eq!(
-                r.stable_id,
-                want(r.local_doc_id),
-                "inline stable_id must round-trip for local {}",
-                r.local_doc_id
-            );
-            assert_eq!(
-                r.encoded.stable_id, r.stable_id,
-                "EncodedCellRow.stable_id must match"
-            );
-        }
-    }
-
-    /// A byte-splice compaction merge of two materialized (hidden-cell)
-    /// subsections must carry the inline stable-`_id` region forward, rewritten
-    /// in merged local-id order (each input's ids shifted by its `doc_id_offset`).
-    /// Without carry-through a compacted cell would silently lose its inline ids.
-    #[test]
-    fn sq8_merge_carries_inline_stable_ids_through_compaction() {
-        use bytes::Bytes;
-
-        use crate::superfile::vector::{
-            ivf_merge::merge_sq8_ivf_subsections, reader::VectorReader,
-        };
-
-        let dim = 16;
-        let json = format!(
-            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
-        );
-        let cfg = || VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent: 4,
-            rot_seed: 7,
-            metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
-        };
-
-        // Build one materialized cell blob of `n` rows whose stable `_id`s are
-        // `id_base + local`, by streaming then rebuilding through the
-        // materialized path (which writes the inline region).
-        let build_cell = |n: usize, id_base: i128| -> Bytes {
-            let mut b = VectorBuilder::new();
-            b.register_column(cfg()).expect("register");
-            for i in 0..n {
-                let mut v = vec![0.0f32; dim];
-                v[i % dim] = 1.0 + (i as f32);
-                v[(i * 5) % dim] += 0.25;
-                b.add(0, &v).expect("add");
-            }
-            let stream = b.finish().expect("finish streaming");
-            let r = VectorReader::open(Bytes::from(stream), &json).expect("open streaming");
-            let mut rows = block_on(r.materialized_index_rows_async("v")).expect("rows");
-            for row in &mut rows {
-                row.stable_id = id_base + row.local_doc_id as i128;
-                row.encoded.stable_id = row.stable_id;
-            }
-            let mut mb = VectorBuilder::new();
-            mb.register_column(cfg()).expect("register mat");
-            mb.load_materialized_rows(0, rows).expect("load materialized");
-            Bytes::from(mb.finish().expect("finish materialized"))
-        };
-
-        let (na, nb) = (10usize, 8usize);
-        let blob_a = build_cell(na, 5_000);
-        let blob_b = build_cell(nb, 9_000);
-        let reader_a = VectorReader::open(blob_a, &json).expect("open A");
-        let reader_b = VectorReader::open(blob_b, &json).expect("open B");
-
-        // Merge: B's local ids shift by `na` (its doc_id_offset).
-        let merged = merge_sq8_ivf_subsections(&[
-            (&reader_a, "v", 0),
-            (&reader_b, "v", na as u32),
-        ])
-        .expect("merge");
-        assert_eq!(merged.n_docs as usize, na + nb);
-
-        let mut wb = VectorBuilder::new();
-        wb.register_column(cfg()).expect("register merged");
-        wb.set_prebuilt_subsection(0, merged)
-            .expect("set prebuilt");
-        let merged_blob = wb.finish().expect("finish merged");
-        let reader_m = VectorReader::open(Bytes::from(merged_blob), &json).expect("open merged");
-
-        let rows = block_on(reader_m.materialized_index_rows_async("v")).expect("merged rows");
-        assert_eq!(rows.len(), na + nb);
-        for r in &rows {
-            // A occupies merged locals 0..na (id 5000+local); B occupies
-            // na..na+nb (id 9000+(local-na)).
-            let want = if (r.local_doc_id as usize) < na {
-                5_000 + r.local_doc_id as i128
-            } else {
-                9_000 + (r.local_doc_id as i128 - na as i128)
-            };
-            assert_eq!(
-                r.stable_id, want,
-                "merged inline stable_id wrong for local {}",
-                r.local_doc_id
-            );
-        }
-    }
-
     #[test]
     fn sq8_tiny_shard_writes_physical_n_cent_to_directory() {
         use bytes::Bytes;
@@ -2093,7 +1892,7 @@ mod tests {
             n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");

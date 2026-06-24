@@ -311,7 +311,7 @@ async fn materialized_ivf_rows_in_doc_order(
         .await
         .ok_or_else(|| {
             BuildError::Store(format!(
-                "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
+                "IVF maintenance: column '{column}' missing Sq8Residual index"
             ))
         })?;
     let n_rows = stable_ids_by_local.len();
@@ -628,7 +628,7 @@ fn bootstrap_centroids_from_batch(
     for &a in &assignments {
         counts[a as usize] += 1;
     }
-    let clusters = ClusterCentroids::from_fp32(k as u32, vec_dim as u32, &centroids, counts);
+    let clusters = ClusterCentroids::from_fp32(metric, k as u32, vec_dim as u32, &centroids, counts);
     Some(clusters.clone().with_radii(per_cell_radii(
         &clusters,
         &vectors,
@@ -653,9 +653,7 @@ fn per_cell_radii(
             continue;
         }
         let member = &vectors[doc_idx * vec_dim..(doc_idx + 1) * vec_dim];
-        let sum_m: f32 = member.iter().sum();
-        let norm_m_sq: f32 = member.iter().map(|v| v * v).sum();
-        let dist = clusters.score_one(metric, c, member, sum_m, norm_m_sq);
+        let dist = clusters.score_one(metric, c, member);
         if dist > radii[c] {
             radii[c] = dist;
         }
@@ -2042,15 +2040,33 @@ pub(super) fn prepare_superfile_with_uri(
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-                // Stage the per-cluster centroids (Sq8) into the
-                // manifest so a query can rank this superfile's clusters
-                // globally without opening the superfile.
+            if let Some((c_dim, c_scale, c_offset, c_rows, c_norm, radius)) =
+                vec_reader.summary(&vc.column)
+            {
+                let centroid = ClusterCentroids {
+                    n_cent: 1,
+                    dim: c_dim,
+                    scale: c_scale,
+                    offset: c_offset,
+                    rows: c_rows,
+                    norms: c_norm.map(|n| vec![n]),
+                    counts: vec![1],
+                    radii: Vec::new(),
+                };
                 let clusters = vec_reader
-                    .cluster_centroids(&vc.column)
-                    .map(|(n_cent, dim, fp32, counts)| {
-                        ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
-                    })
+                    .cluster_centroids_encoded(&vc.column)
+                    .map(
+                        |(n_cent, dim, scale, offset, rows, norms, counts)| ClusterCentroids {
+                            n_cent,
+                            dim,
+                            scale,
+                            offset,
+                            rows,
+                            norms,
+                            counts,
+                            radii: Vec::new(),
+                        },
+                    )
                     .unwrap_or_default();
                 vector_summary.insert(
                     vc.column.clone(),
@@ -2687,7 +2703,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
 
     let old_n_cent = clusters.n_cent;
     let (mut updated_clusters, new_cell_id) =
-        spfresh::insert_split_centroid(&clusters, split_cell, &sub_centroids);
+        spfresh::insert_split_centroid(&clusters, metric, split_cell, &sub_centroids);
     let neighborhood = spfresh::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
 
     let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -3621,7 +3637,7 @@ mod tests {
             .vector_summary
             .get("emb")
             .expect("emb vector summary present");
-        assert_eq!(vs.centroid.len(), dim);
+        assert_eq!(vs.centroid.dim as usize, dim);
         assert!(vs.radius >= 0.0);
         // Per-cluster centroids are staged into the manifest for
         // cross-superfile global cluster selection.
@@ -3632,9 +3648,9 @@ mod tests {
         assert_eq!(vs.clusters.dim as usize, dim);
         assert!(vs.clusters.n_cent >= 1);
         assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.mins.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.scales.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.codes.len(), vs.clusters.n_cent as usize * dim);
+        assert_eq!(vs.clusters.scale.len(), dim);
+        assert_eq!(vs.clusters.offset.len(), dim);
+        assert!(!vs.clusters.rows.is_empty());
         // Every indexed doc lands in exactly one cluster, so the
         // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();

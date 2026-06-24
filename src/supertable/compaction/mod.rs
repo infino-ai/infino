@@ -37,7 +37,7 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        query::dispatch::open_reader,
+        query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
@@ -299,7 +299,8 @@ impl Supertable {
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
             let open_fut = async {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
+                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+                    .await;
                 (entry.superfile_id, r)
             };
             superfile_readers_fut.push(open_fut);
@@ -333,7 +334,7 @@ impl Supertable {
                 reader.vec().and_then(|v| {
                     v.vector_columns_config()
                         .next()
-                        .map(|c| c.rerank_codec == RerankCodec::Sq8ResidualEpsilon)
+                        .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
                 })
             });
             if sq8_merge == Some(true) {

@@ -13,20 +13,19 @@ use roaring::RoaringBitmap;
 use crate::superfile::{
     BuildError,
     builder::VectorConfig,
-    format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel},
+        distance::{
+            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, SQ8_RESIDUAL_I8_CLAMP, Sq8ResidualKernel,
+            metric_distance_by, metric_from_id, metric_to_id,
+        },
+        sq8_simd::Sq8EncodeConsts,
     },
 };
 
 const MAGIC: &[u8] = b"infino.cell_posting.v1\n";
 const SEGMENTED_MAGIC: &[u8] = b"infino.cell_posting.segments.v1\n";
-const SQ8_CODE_MAX: f32 = 255.0;
-const EPSILON_I8_CLAMP: f32 = 127.0;
-/// Symmetric clamp bound for the Sq8+ε i8 residual leg (matches IVF builder).
-const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
-const ROW_BYTES_PER_DIM: usize = 2;
+pub(crate) const ROW_BYTES_PER_DIM: usize = 2;
 
 fn u32_le(body: &[u8]) -> Result<u32, String> {
     let arr: [u8; 4] = body.try_into().map_err(|_| "truncated u32".to_string())?;
@@ -142,7 +141,7 @@ pub fn encode_blob(
     let posting = encode_rows(metric, vectors, ids, dim, &rows);
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.push(metric_id(metric));
+    out.push(metric_id_byte(metric));
     out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for v in &posting.scale {
         out.extend_from_slice(&v.to_le_bytes());
@@ -186,7 +185,7 @@ fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
         return Err("segmented cell posting header truncated".into());
     }
     let dim = u32_le(&body[0..4])? as usize;
-    let metric = metric_from_id(body[4])?;
+    let metric = metric_from_id_byte(body[4])?;
     let n_segments = u32_le(&body[5..9])? as usize;
     let mut off = 9;
     let mut segments = Vec::with_capacity(n_segments);
@@ -202,7 +201,7 @@ fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
         }
         let seg_body = [
             &(dim as u32).to_le_bytes()[..],
-            &[metric_id(metric)][..],
+            &[metric_id_byte(metric)][..],
             &(n_docs as u32).to_le_bytes()[..],
             &body[off..off + segment_len],
         ]
@@ -226,7 +225,7 @@ fn parse_segment_body(
         return Err("cell posting header truncated".into());
     }
     let dim = u32_le(&body[0..4])? as usize;
-    let metric = metric_from_id(body[4])?;
+    let metric = metric_from_id_byte(body[4])?;
     let n_docs = u32_le(&body[5..9])? as usize;
     let header = 9 + dim * 8;
     let rows_len = n_docs * dim * ROW_BYTES_PER_DIM;
@@ -298,13 +297,12 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
                     .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
             ),
         };
-        let kernel = Sq8ResidualEpsilonKernel::new(
+        let kernel = Sq8ResidualKernel::new(
             posting.metric,
             query,
             &posting.scale,
             &posting.offset,
             SQ8_RESIDUAL_DIVISOR,
-            norms_for_kernel,
         );
         let dim = posting.dim;
         for row in 0..posting.ids.len() {
@@ -415,7 +413,7 @@ fn encode_segmented_blob(
 ) -> Result<Vec<u8>, String> {
     let mut out = SEGMENTED_MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.push(metric_id(metric));
+    out.push(metric_id_byte(metric));
     out.extend_from_slice(&(segments.len() as u32).to_le_bytes());
     for segment in segments {
         if segment.dim != dim || segment.metric != metric {
@@ -474,15 +472,19 @@ fn decode_ids(bytes: &[u8]) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-struct EncodedRows {
-    ids: Vec<u32>,
-    scale: Vec<f32>,
-    offset: Vec<f32>,
-    rows: Vec<u8>,
-    per_doc_norms: Option<Vec<f32>>,
+/// Sq8+ε encoding of a set of fp32 vectors under one shared quantizer: per-dim
+/// `scale`/`offset` from the set's min/max, then `rows` = `[codes(dim) ‖
+/// residuals(dim)]` per vector. This is the canonical shared encoder for both
+/// cell payloads and any centroid-routing layer built on top of them.
+pub(crate) struct EncodedRows {
+    pub(crate) ids: Vec<u32>,
+    pub(crate) scale: Vec<f32>,
+    pub(crate) offset: Vec<f32>,
+    pub(crate) rows: Vec<u8>,
+    pub(crate) per_doc_norms: Option<Vec<f32>>,
 }
 
-fn encode_rows(
+pub(crate) fn encode_rows(
     metric: Metric,
     vectors: &[f32],
     ids: &[u32],
@@ -529,18 +531,11 @@ fn encode_rows(
             };
             let base = offset[d] + q as f32 * scale[d];
             let step = scale[d] / SQ8_RESIDUAL_DIVISOR;
-            let eps = if step > 0.0 {
-                ((src[d] - base) / step)
-                    .round()
-                    .clamp(-EPSILON_I8_CLAMP, EPSILON_I8_CLAMP) as i8
-            } else {
-                0
-            };
+            let (eps_byte, norm_contrib) = encode_sq8_residual_dim(src[d], base, step, store_norms);
             encoded[code_start + d] = q;
-            encoded[eps_start + d] = eps.to_le_bytes()[0];
-            if store_norms {
-                let x = base + (eps as f32) * step;
-                acc += (x as f64) * (x as f64);
+            encoded[eps_start + d] = eps_byte;
+            if let Some(c) = norm_contrib {
+                acc += c;
             }
         }
         if let Some(norms) = per_doc_norms.as_mut() {
@@ -575,36 +570,60 @@ fn cmp_f32(a: f32, b: f32) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
-fn metric_id(m: Metric) -> u8 {
-    // Same metric↔id mapping as the IVF directory entry (format::vec).
-    match m {
-        Metric::L2Sq => METRIC_ID_L2SQ as u8,
-        Metric::Cosine => METRIC_ID_COSINE as u8,
-        Metric::NegDot => METRIC_ID_NEGDOT as u8,
-    }
+/// Cell-posting metric id is the single on-disk byte form of the
+/// shared metric↔id mapping (`distance::metric_to_id`). The cell
+/// posting header carries it in one byte, so we narrow the shared
+/// `u32` discriminator here.
+fn metric_id_byte(m: Metric) -> u8 {
+    metric_to_id(m) as u8
 }
 
-fn metric_from_id(id: u8) -> Result<Metric, String> {
-    match id as u32 {
-        METRIC_ID_L2SQ => Ok(Metric::L2Sq),
-        METRIC_ID_COSINE => Ok(Metric::Cosine),
-        METRIC_ID_NEGDOT => Ok(Metric::NegDot),
-        _ => Err(format!("unknown cell posting metric id {id}")),
-    }
+/// Inverse of [`metric_id_byte`]: decode the one-byte on-disk metric
+/// id, mapping an unknown id to this layer's `Result<_, String>`
+/// boundary.
+fn metric_from_id_byte(id: u8) -> Result<Metric, String> {
+    metric_from_id(id as u32).ok_or_else(|| format!("unknown cell posting metric id {id}"))
 }
 
-/// One Sq8+ε row carried through SPFresh maintenance without fp32 reconstruction.
+/// Encode the Sq8+ε residual leg for one dimension.
 ///
-/// `scale`/`offset` are the per-cluster dequant params (length `dim`), identical
-/// for every row in a cluster, so they are stored as a shared `Arc<[f32]>`: all
-/// rows decoded from one cluster point at a single backing buffer instead of each
-/// carrying its own `dim`-length copy. At dim=1024 that is ~8 KiB/row of
-/// duplication removed — material when a drain materializes millions of rows.
+/// Given the dequantized Sq8 `base` for this dim and the per-dim
+/// residual `step` (`scale[d] / SQ8_RESIDUAL_DIVISOR`), quantize the
+/// residual `v - base` to a symmetric i8 (`±SQ8_RESIDUAL_I8_CLAMP`)
+/// and return its little-endian byte. When `store_norm` is set, also
+/// return the residual-corrected `x²` contribution to `‖x‖²`, where
+/// `x = base + eps·step` is the value the residual reconstructs.
+///
+/// This is the one definition of the residual arithmetic shared by the
+/// IVF builder and both cell-posting encode paths; the differing *code*
+/// legs (SIMD / scalar / transcode) stay at the call sites.
+#[inline]
+pub(crate) fn encode_sq8_residual_dim(
+    v: f32,
+    base: f32,
+    step: f32,
+    store_norm: bool,
+) -> (u8, Option<f64>) {
+    let eps = if step > 0.0 {
+        ((v - base) / step)
+            .round()
+            .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
+    } else {
+        0
+    };
+    let norm_contrib = store_norm.then(|| {
+        let x = base + eps as f32 * step;
+        (x as f64) * (x as f64)
+    });
+    (eps.to_le_bytes()[0], norm_contrib)
+}
+
+/// One Sq8+ε row carried through hidden-index maintenance without fp32 reconstruction.
 #[derive(Debug, Clone)]
 pub struct EncodedCellRow {
     pub stable_id: i128,
-    pub scale: std::sync::Arc<[f32]>,
-    pub offset: std::sync::Arc<[f32]>,
+    pub scale: Vec<f32>,
+    pub offset: Vec<f32>,
     pub codes: Vec<u8>,
     pub residuals: Vec<u8>,
     pub norm_sq: Option<f32>,
@@ -631,6 +650,18 @@ pub(crate) fn sq8_quant_params_equal(
         && offset_a.len() == offset_b.len()
         && scale_a == scale_b
         && offset_a == offset_b
+}
+
+/// Per-cluster (scale, offset) taken from the medoid Sq8 row in `bucket`.
+pub(crate) fn cluster_quant_from_medoid(
+    metric: Metric,
+    dim: usize,
+    bucket: &[&MaterializedIvfRow],
+) -> (Vec<f32>, Vec<f32>) {
+    debug_assert!(!bucket.is_empty());
+    let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
+    let mid = medoid_index_symmetric(metric, dim, &encoded);
+    (encoded[mid].scale.clone(), encoded[mid].offset.clone())
 }
 
 /// Copy or Sq8-transcode one row into `out` (`[codes | residuals]`, length `2·dim`).
@@ -661,31 +692,21 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         });
     }
 
-    let inv_scale: Vec<f32> = dst_scale.iter().map(|s| 1.0 / s).collect();
-    let c2: Vec<f32> = dst_scale
-        .iter()
-        .zip(dst_offset.iter())
-        .map(|(s, o)| (-o).mul_add(1.0 / s, 0.5))
-        .collect();
+    let ec = Sq8EncodeConsts::from_scale_offset(dst_scale, dst_offset);
     let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let mut acc = 0.0f64;
     for d in 0..dim {
         let v = encoded_component_at(row, d);
-        let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
+        let q = v
+            .mul_add(ec.inv_scale[d], ec.c2[d])
+            .clamp(0.0, SQ8_CODE_MAX);
         out[code_off + d] = q as u8;
         let base = q.mul_add(dst_scale[d], dst_offset[d]);
         let step = dst_scale[d] / residual_divisor;
-        let rq = if step > 0.0 {
-            ((v - base) / step)
-                .round()
-                .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
-        } else {
-            0
-        };
-        out[res_off + d] = rq.to_le_bytes()[0];
-        if store_norm {
-            let x = base + (rq as f32) * step;
-            acc += (x as f64) * (x as f64);
+        let (res_byte, norm_contrib) = encode_sq8_residual_dim(v, base, step, store_norm);
+        out[res_off + d] = res_byte;
+        if let Some(c) = norm_contrib {
+            acc += c;
         }
     }
     store_norm.then_some(acc as f32)
@@ -719,41 +740,43 @@ pub(crate) fn encoded_component_at(row: &EncodedCellRow, d: usize) -> f32 {
             * (row.codes[d] as f32 + (i8::from_le_bytes([row.residuals[d]]) as f32) * inv_div)
 }
 
-/// Cap on the medoid all-pairs search. A medoid here is only a centroid *seed*
-/// (the split's discrete k-means update), so a representative sample suffices —
-/// and the exact O(n²) loop would otherwise spin for minutes on a split-cap
-/// shard (~50k rows). Same bounded-sample rationale as the k-means training.
-const MEDOID_SAMPLE_CAP: usize = 512;
+pub(crate) fn distance_encoded_rows_symmetric(
+    metric: Metric,
+    dim: usize,
+    a: &EncodedCellRow,
+    b: &EncodedCellRow,
+) -> f32 {
+    metric_distance_by(
+        metric,
+        dim,
+        |d| encoded_component_at(a, d),
+        |d| encoded_component_at(b, d),
+    )
+}
 
 /// Index of the medoid row — the one minimizing the summed pairwise distance to
-/// all others — under an arbitrary row↔row distance `dist`. Used as a centroid
-/// seed by the split's discrete k-means in `supertable::spfresh`.
-///
-/// Bounded to O(cap²): on a shard larger than [`MEDOID_SAMPLE_CAP`] it evaluates
-/// a strided sample of candidate rows against a strided sample of reference rows
-/// (the same strided-sample shape the materialized k-means uses), and returns an
-/// index into the *original* shard. For `len <= cap` it is the exact all-pairs
-/// medoid (`step == 1`), so small shards are unchanged.
+/// all others — under an arbitrary row↔row distance `dist`. Shared by the
+/// symmetric kernel here and the asymmetric variant in hidden-index maintenance.
 pub(crate) fn medoid_index_by<F>(shard: &[EncodedCellRow], dist: F) -> usize
 where
     F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,
 {
-    let n = shard.len();
-    let step = n.div_ceil(MEDOID_SAMPLE_CAP).max(1);
-    let refs: Vec<&EncodedCellRow> = shard.iter().step_by(step).collect();
     let mut best_idx = 0usize;
     let mut best_sum = f32::INFINITY;
-    let mut i = 0usize;
-    while i < n {
-        let row_i = &shard[i];
-        let sum: f32 = refs.iter().map(|row_j| dist(row_i, row_j)).sum();
+    for (i, row_i) in shard.iter().enumerate() {
+        let sum: f32 = shard.iter().map(|row_j| dist(row_i, row_j)).sum();
         if sum < best_sum {
             best_sum = sum;
             best_idx = i;
         }
-        i += step;
     }
     best_idx
+}
+
+fn medoid_index_symmetric(metric: Metric, dim: usize, shard: &[EncodedCellRow]) -> usize {
+    medoid_index_by(shard, |a, b| {
+        distance_encoded_rows_symmetric(metric, dim, a, b)
+    })
 }
 
 /// Sq8+ε row → `dim` fp32 components for manifest [`ClusterCentroids::from_fp32`]
@@ -762,6 +785,93 @@ pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: u
     (0..dim).map(|d| encoded_component_at(row, d)).collect()
 }
 
+/// Lloyd k-means on Sq8+ε rows for internal IVF centroid training during maintenance.
+pub(crate) fn encoded_ivf_kmeans(
+    rows: &[EncodedCellRow],
+    metric: Metric,
+    k: usize,
+    iters: usize,
+) -> (Vec<f32>, Vec<usize>) {
+    if rows.is_empty() || k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let dim = rows[0].codes.len();
+    let k = k.min(rows.len());
+
+    let mut medoid_indices: Vec<usize> = Vec::with_capacity(k);
+    medoid_indices.push(0);
+    while medoid_indices.len() < k {
+        let mut best_idx = 0usize;
+        let mut best_min = f32::NEG_INFINITY;
+        for (i, row) in rows.iter().enumerate() {
+            if medoid_indices.contains(&i) {
+                continue;
+            }
+            let min_d = medoid_indices
+                .iter()
+                .map(|&s| distance_encoded_rows_symmetric(metric, dim, row, &rows[s]))
+                .fold(f32::INFINITY, f32::min);
+            if min_d > best_min {
+                best_min = min_d;
+                best_idx = i;
+            }
+        }
+        medoid_indices.push(best_idx);
+    }
+
+    let mut assign = vec![0usize; rows.len()];
+    for _ in 0..iters {
+        for (i, row) in rows.iter().enumerate() {
+            let mut best_c = 0usize;
+            let mut best_score = f32::INFINITY;
+            for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
+                let score = distance_encoded_rows_symmetric(metric, dim, row, &rows[mid]);
+                if score < best_score {
+                    best_score = score;
+                    best_c = c;
+                }
+            }
+            assign[i] = best_c;
+        }
+        for (c, slot) in medoid_indices.iter_mut().enumerate().take(k) {
+            let shard: Vec<usize> = assign
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a == c)
+                .map(|(i, _)| i)
+                .collect();
+            if shard.is_empty() {
+                continue;
+            }
+            let shard_rows: Vec<EncodedCellRow> = shard.iter().map(|&i| rows[i].clone()).collect();
+            let local_m = medoid_index_symmetric(metric, dim, &shard_rows);
+            *slot = shard[local_m];
+        }
+    }
+
+    // Final assignment against the converged medoids: the loop's last `assign`
+    // pass ran before the final medoid update, so re-assign once more so the
+    // returned shards match the returned centroids.
+    for (i, row) in rows.iter().enumerate() {
+        let mut best_c = 0usize;
+        let mut best_score = f32::INFINITY;
+        for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
+            let score = distance_encoded_rows_symmetric(metric, dim, row, &rows[mid]);
+            if score < best_score {
+                best_score = score;
+                best_c = c;
+            }
+        }
+        assign[i] = best_c;
+    }
+
+    let mut out = vec![0f32; k * dim];
+    for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
+        let fp32 = manifest_centroid_components_from_row(&rows[mid], dim);
+        out[c * dim..(c + 1) * dim].copy_from_slice(&fp32);
+    }
+    (out, assign)
+}
 
 /// Load live Sq8+ε rows from a cell-posting blob aligned with scalar `_id` order.
 pub fn load_encoded_rows_from_blob(
@@ -773,10 +883,6 @@ pub fn load_encoded_rows_from_blob(
     let mut row_idx = 0usize;
     let mut out = Vec::new();
     for posting in &postings {
-        // One shared backing per segment — every row in this segment clones the
-        // Arc (a refcount bump), not the dim-length scale/offset buffers.
-        let scale_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(posting.scale.as_slice());
-        let offset_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(posting.offset.as_slice());
         for local_row in 0..posting.ids.len() {
             if deleted.is_some_and(|bm| bm.contains(posting.ids[local_row])) {
                 row_idx += 1;
@@ -792,8 +898,8 @@ pub fn load_encoded_rows_from_blob(
             let norm_sq = posting.per_doc_norms.as_ref().map(|norms| norms[local_row]);
             out.push(EncodedCellRow {
                 stable_id: stable_ids[row_idx],
-                scale: scale_arc.clone(),
-                offset: offset_arc.clone(),
+                scale: posting.scale.clone(),
+                offset: posting.offset.clone(),
                 codes,
                 residuals,
                 norm_sq,
@@ -832,46 +938,6 @@ mod tests {
         let hits = search_blob(&blob, &q, 5).expect("search");
         assert_eq!(hits.len(), 5);
         assert_eq!(hits[0].0, 31);
-    }
-
-    #[test]
-    fn loaded_rows_share_one_scale_offset_backing_per_segment() {
-        // The drain materializes millions of EncodedCellRows; scale/offset are
-        // per-cluster (length `dim`), so rows of one segment must share a single
-        // Arc<[f32]> backing rather than each carrying its own copy. Per-row
-        // copies would give one distinct pointer per row.
-        let dim = 8usize;
-        let n = 16u32;
-        let mut ids = Vec::new();
-        let mut vecs = Vec::new();
-        for i in 0..n {
-            ids.push(i);
-            for d in 0..dim {
-                vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
-            }
-        }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
-        let stable_ids: Vec<i128> = (0..n as i128).collect();
-        let rows = load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load");
-        assert_eq!(rows.len(), n as usize);
-        assert_eq!(rows[0].scale.len(), dim, "scale is per-dim, not per-row sized");
-
-        let distinct_scale: std::collections::HashSet<*const f32> =
-            rows.iter().map(|r| r.scale.as_ptr()).collect();
-        let distinct_offset: std::collections::HashSet<*const f32> =
-            rows.iter().map(|r| r.offset.as_ptr()).collect();
-        assert!(
-            distinct_scale.len() < rows.len(),
-            "scale backing not shared: {} distinct buffers for {} rows",
-            distinct_scale.len(),
-            rows.len()
-        );
-        assert!(
-            distinct_offset.len() < rows.len(),
-            "offset backing not shared: {} distinct buffers for {} rows",
-            distinct_offset.len(),
-            rows.len()
-        );
     }
 
     #[test]

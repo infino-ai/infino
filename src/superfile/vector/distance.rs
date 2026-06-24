@@ -14,20 +14,31 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-use std::sync::Arc;
 
 use wide::f32x8;
 
+use crate::superfile::format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT};
 use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
-use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
+use crate::superfile::vector::simd_dispatch::avx512_enabled;
 
-/// Residual quantization step divisor for [`RerankCodec::Sq8ResidualEpsilon`].
+/// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
 /// The signed 8-bit residual code at dim `d` carries
 /// `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized steps around the Sq8
 /// dequant base. `16` hit the recall target with the best
 /// byte/CPU trade-off on the 1M × 384 cosine calibration sweep.
 pub(crate) const SQ8_RESIDUAL_DIVISOR: f32 = 16.0;
+
+/// Sq8 u8-code ceiling. Sq8 quantizes each component to a single
+/// unsigned byte, so the per-cluster scale maps a cluster's value span
+/// onto `[0, SQ8_CODE_MAX]` and the encoder clamps to that range before
+/// the truncating cast to `u8`.
+pub(crate) const SQ8_CODE_MAX: f32 = 255.0;
+
+/// Symmetric i8 clamp for the Sq8+ε residual leg. The residual code is
+/// stored as a signed byte but clamped to ±127 (not `i8::MIN`) so the
+/// quantized magnitude stays symmetric about zero.
+pub(crate) const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
 /// Lane count of the portable `wide::f32x8` SIMD register (256-bit /
 /// 32-bit). The universal kernel processes this many f32s per
@@ -67,6 +78,31 @@ pub enum Metric {
     /// Negated dot product, `-dot(a, b)`. For maximum-inner-product
     /// search where vector magnitudes carry signal.
     NegDot,
+}
+
+/// Map a [`Metric`] to its on-disk `metric_id` discriminator
+/// (`format::vec::METRIC_ID_*`). Single source of truth for the
+/// metric↔id encoding shared by the IVF directory entry, the
+/// cell-posting header, and the manifest summary.
+#[inline]
+pub(crate) fn metric_to_id(m: Metric) -> u32 {
+    match m {
+        Metric::L2Sq => METRIC_ID_L2SQ,
+        Metric::Cosine => METRIC_ID_COSINE,
+        Metric::NegDot => METRIC_ID_NEGDOT,
+    }
+}
+
+/// Inverse of [`metric_to_id`]: decode an on-disk `metric_id`
+/// discriminator back to its [`Metric`], or `None` for an unknown id.
+#[inline]
+pub(crate) fn metric_from_id(id: u32) -> Option<Metric> {
+    match id {
+        METRIC_ID_L2SQ => Some(Metric::L2Sq),
+        METRIC_ID_COSINE => Some(Metric::Cosine),
+        METRIC_ID_NEGDOT => Some(Metric::NegDot),
+        _ => None,
+    }
 }
 
 /// Generic distance dispatch. Smaller value = closer match for every metric.
@@ -389,11 +425,11 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 /// Centroid scoring NEVER comes through here — centroids are always
 /// stored as fp32 regardless of the column's rerank codec.
 ///
-/// `Sq8` doesn't have a "flat" entry point because the decode needs
-/// the per-column scale/offset (and per-doc norm for L2Sq). Sq8
-/// callers go through [`Sq8Kernel`] which captures those once per
-/// query. `None` panics here — its column carries no `full[]` bytes
-/// to feed in.
+/// `Sq8Residual` has no "flat" entry point because the decode needs
+/// the per-cluster scale/offset (and per-doc norm for L2Sq/Cosine);
+/// callers go through [`Sq8ResidualKernel`], which captures those once
+/// per query. `RabitqOnly` panics here — its column carries no
+/// `full[]` bytes to feed in.
 #[inline]
 pub(crate) fn distance_bytes_codec(
     metric: Metric,
@@ -403,9 +439,9 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8ResidualEpsilon => {
+        RerankCodec::Sq8Residual => {
             unreachable!(
-                "distance_bytes_codec called with Sq8ResidualEpsilon — Sq8ResidualEpsilon rerank goes \
+                "distance_bytes_codec called with Sq8Residual — Sq8Residual rerank goes \
                  through dedicated kernels (need per-column scale/offset + per-doc \
                  norm context)"
             )
@@ -419,151 +455,15 @@ pub(crate) fn distance_bytes_codec(
     }
 }
 
-/// Sq8 rerank context. Captures the per-column quantizer
-/// (`scale[dim]` + `offset[dim]`), optional per-doc cached
-/// decoded-norms (`Σ_d x_decoded²`, only populated for L2Sq),
-/// and the per-query precomputes that fold scale/offset into
-/// the query side so the per-doc inner loop is a plain u8→f32
-/// widen + SIMD dot.
+/// `Sq8Residual` rerank context. Captures the per-cluster quantizer
+/// (`scale[dim]`, `offset[dim]`) plus the query-side precomputes for
+/// both the Sq8 code leg and the i8 residual leg, so the per-candidate
+/// inner loop is two u8/i8 → f32 widens + SIMD dot.
 ///
-/// One kernel per query, reused across every rerank candidate.
-/// The per-query precompute is two dim-passes (`q · scale`,
-/// `q · offset`, plus `q · q` for L2Sq), amortized over
-/// `k × rerank_mult` candidates so it costs ≪ 1 % of search time
-/// at typical `rerank_mult = 256`.
-pub(crate) struct Sq8Kernel {
-    metric: Metric,
-    dim: usize,
-    /// `q_prime[d] = query[d] * scale[d]`. The per-doc inner
-    /// step is `Σ_d q_prime[d] * code[d] as f32`.
-    q_prime: Vec<f32>,
-    /// `Σ_d query[d] * offset[d]`. Per-query constant — added
-    /// once per candidate at the end of the inner reduction to
-    /// recover `dot(query, x_decoded)`.
-    q_dot_offset: f32,
-    /// `Σ_d query[d]²`. L2Sq only — used in
-    /// `dist = q_norm_sq − 2·dot + x_norm_sq[pos]`.
-    q_norm_sq: f32,
-    /// Optional per-doc `Σ_d x_decoded²` table, indexed by the
-    /// rerank shortlist's `pos` field. `Some` for L2Sq columns,
-    /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
-    /// Cosine (stores `‖x‖²`; rerank divides by `√norm`). Shared by
-    /// refcount (`Arc`) so the kernel is `'static` and can run on a
-    /// rayon worker — no per-query copy.
-    per_doc_norms: Option<Arc<[f32]>>,
-}
-
-impl Sq8Kernel {
-    /// Build the per-query kernel. `scale` + `offset` are the
-    /// per-dim quantizer arrays from the column's `codec_meta`.
-    /// `per_doc_norms` is `Some` for L2Sq and Cosine columns.
-    pub fn new(
-        metric: Metric,
-        query: &[f32],
-        scale: &[f32],
-        offset: &[f32],
-        per_doc_norms: Option<Arc<[f32]>>,
-    ) -> Self {
-        let dim = query.len();
-        debug_assert_eq!(scale.len(), dim);
-        debug_assert_eq!(offset.len(), dim);
-        // Build q_prime + q_dot_offset in one SIMD pass per
-        // dim — both fold over the same query.
-        let mut q_prime = vec![0.0f32; dim];
-        let mut q_dot_offset_acc = f32x8::ZERO;
-        let mut i = 0;
-        while i + F32X8_LANES <= dim {
-            let qc = f32x8::from(
-                <[f32; F32X8_LANES]>::try_from(&query[i..i + F32X8_LANES]).expect("len-8 slice"),
-            );
-            let sc = f32x8::from(
-                <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES]).expect("len-8 slice"),
-            );
-            let oc = f32x8::from(
-                <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES]).expect("len-8 slice"),
-            );
-            let qp = qc * sc;
-            // Write q_prime out as 8 f32s. `wide::f32x8::to_array`
-            // is the safe accessor; the per-lane copy compiles to
-            // a single 32-byte mov on AVX2.
-            q_prime[i..i + F32X8_LANES].copy_from_slice(&qp.to_array());
-            q_dot_offset_acc += qc * oc;
-            i += F32X8_LANES;
-        }
-        let mut q_dot_offset: f32 = q_dot_offset_acc.reduce_add();
-        while i < dim {
-            q_prime[i] = query[i] * scale[i];
-            q_dot_offset += query[i] * offset[i];
-            i += 1;
-        }
-        // q_norm_sq is only needed for L2Sq, but it's cheap to
-        // always compute — one extra `dim/8` SIMD reduce.
-        let q_norm_sq = match metric {
-            Metric::L2Sq => dot(query, query),
-            Metric::Cosine | Metric::NegDot => 0.0,
-        };
-        Self {
-            metric,
-            dim,
-            q_prime,
-            q_dot_offset,
-            q_norm_sq,
-            per_doc_norms,
-        }
-    }
-
-    /// Distance for one rerank candidate at position `pos`, with
-    /// `dim` u8 codes at `code_bytes`. Smaller = closer for every
-    /// metric (matches the [`distance`] dispatch convention).
-    #[inline]
-    pub fn distance_at(&self, pos: u32, code_bytes: &[u8]) -> f32 {
-        let norm = self.per_doc_norms.as_ref().map(|norms| norms[pos as usize]);
-        self.distance_with_norm(code_bytes, norm)
-    }
-
-    #[inline]
-    pub fn distance_with_norm(&self, code_bytes: &[u8], norm: Option<f32>) -> f32 {
-        debug_assert_eq!(code_bytes.len(), self.dim);
-        // Per-doc inner reduction: Σ_d q_prime[d] * code[d] as f32.
-        // Dispatches to AVX-512 (16-lane FMA with VPMOVZXBD widen)
-        // when the runtime gate passes; otherwise the f32x8 widen-
-        // and-FMA scalar-tier kernel.
-        let qp_code_dot = sq8_dot(&self.q_prime, code_bytes, self.dim);
-        // `dot(query, x_decoded) = qp_code_dot + q_dot_offset` because
-        // x_decoded[d] = code[d] * scale[d] + offset[d], so
-        // Σ_d q[d] * x_decoded[d] = Σ_d q_prime[d] * code[d]
-        //                         + Σ_d q[d] * offset[d].
-        let dot = qp_code_dot + self.q_dot_offset;
-        match self.metric {
-            Metric::Cosine => {
-                let x_norm = norm
-                    .expect("Sq8Kernel + Cosine requires per_doc_norms")
-                    .sqrt();
-                if x_norm > 0.0 {
-                    COSINE_DISTANCE_BASE - dot / x_norm
-                } else {
-                    COSINE_DISTANCE_BASE - dot
-                }
-            }
-            Metric::NegDot => -dot,
-            Metric::L2Sq => {
-                let x_norm_sq = norm.expect("Sq8Kernel + L2Sq requires per_doc_norms");
-                self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
-            }
-        }
-    }
-}
-
-/// `Sq8ResidualEpsilon` rerank context — the residual-corrected sibling of
-/// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
-/// `offset[dim]`) plus the query-side precomputes for both the Sq8
-/// code leg and the i8 residual leg, so the per-candidate inner loop
-/// is two u8/i8 → f32 widens + SIMD dot.
-///
-/// Applied only to the small final-refine set the Sq8 score selects,
-/// so it never runs over the full shortlist. One kernel per query +
-/// cluster, reused across that cluster's refine candidates.
-pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
+/// One kernel per query + cluster, reused across that cluster's rerank
+/// candidates. Every rerank candidate is scored with the full residual
+/// distance — there is no Sq8-only coarse pass.
+pub(crate) struct Sq8ResidualKernel {
     metric: Metric,
     dim: usize,
     /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
@@ -576,23 +476,19 @@ pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
     q_dot_offset: f32,
     /// `Σ_d query[d]²`. L2Sq only.
     q_norm_sq: f32,
-    /// Per-doc `Σ_d x_corrected²` table (residual-corrected norms),
-    /// indexed by the shortlist's `pos`. `Some` for L2Sq + Cosine.
-    per_doc_norms: Option<&'a [f32]>,
 }
 
-impl<'a> Sq8ResidualEpsilonKernel<'a> {
+impl Sq8ResidualKernel {
     /// Build the per-query residual kernel. `scale` + `offset` are
     /// the per-cluster quantizer arrays; `residual_divisor` is
-    /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
-    /// and Cosine columns.
+    /// [`SQ8_RESIDUAL_DIVISOR`]. The per-doc decoded norm is supplied
+    /// per candidate to [`Self::distance_with_norm`].
     pub fn new(
         metric: Metric,
         query: &[f32],
         scale: &[f32],
         offset: &[f32],
         residual_divisor: f32,
-        per_doc_norms: Option<&'a [f32]>,
     ) -> Self {
         let dim = query.len();
         debug_assert_eq!(scale.len(), dim);
@@ -639,22 +535,13 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
             q_residual,
             q_dot_offset,
             q_norm_sq,
-            per_doc_norms,
         }
     }
 
-    /// Distance for one refine candidate at position `pos`, with
-    /// `dim` u8 Sq8 codes at `code_bytes` and `dim` i8 residual
-    /// codes at `residual_bytes`. Smaller = closer for every metric.
-    #[inline]
-    pub fn distance_at(&self, pos: u32, code_bytes: &[u8], residual_bytes: &[u8]) -> f32 {
-        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
-        self.distance_with_norm(code_bytes, residual_bytes, norm)
-    }
-
-    /// Like [`Self::distance_at`] but takes the per-doc decoded-norm
-    /// explicitly — for lazy object-store paths that fetch norms into
-    /// a sparse `pos → norm` map rather than a contiguous slice.
+    /// Distance for one refine candidate: `dim` u8 Sq8 codes at
+    /// `code_bytes`, `dim` i8 residual codes at `residual_bytes`, and
+    /// the per-doc decoded norm supplied explicitly (`Some` for L2Sq +
+    /// Cosine). Smaller = closer for every metric.
     #[inline]
     pub fn distance_with_norm(
         &self,
@@ -693,7 +580,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
         match self.metric {
             Metric::Cosine => {
                 let x_norm = norm
-                    .expect("Sq8ResidualEpsilonKernel + Cosine requires per_doc_norms")
+                    .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
                     COSINE_DISTANCE_BASE - dot / x_norm
@@ -703,261 +590,10 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                let x_norm_sq =
-                    norm.expect("Sq8ResidualEpsilonKernel + L2Sq requires per_doc_norms");
+                let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
-    }
-}
-
-/// Asymmetric distance from one stored Sq8+ε row to a manifest Sq8 centroid.
-/// Folds per-row scale/offset and per-centroid min/scale without materializing
-/// fp32 vector buffers — for SPFresh maintenance assignment only (not query).
-pub(crate) fn distance_encoded_to_centroid(
-    metric: Metric,
-    dim: usize,
-    row_scale: &[f32],
-    row_offset: &[f32],
-    row_codes: &[u8],
-    row_residuals: &[u8],
-    row_norm_sq: Option<f32>,
-    cent_min: f32,
-    cent_scale: f32,
-    cent_codes: &[u8],
-) -> f32 {
-    debug_assert_eq!(row_scale.len(), dim);
-    debug_assert_eq!(row_offset.len(), dim);
-    debug_assert_eq!(row_codes.len(), dim);
-    debug_assert_eq!(row_residuals.len(), dim);
-    debug_assert_eq!(cent_codes.len(), dim);
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
-    let mut dot = 0.0f32;
-    let mut row_norm_sq_acc = 0.0f32;
-    let mut cent_norm_sq = 0.0f32;
-    for d in 0..dim {
-        let doc_d = row_offset[d]
-            + row_scale[d]
-                * (row_codes[d] as f32 + (i8::from_le_bytes([row_residuals[d]]) as f32) * inv_div);
-        let cent_d = cent_min + cent_scale * cent_codes[d] as f32;
-        dot += doc_d * cent_d;
-        row_norm_sq_acc += doc_d * doc_d;
-        cent_norm_sq += cent_d * cent_d;
-    }
-    let row_norm_sq = row_norm_sq.unwrap_or(row_norm_sq_acc);
-    match metric {
-        Metric::NegDot => -dot,
-        Metric::Cosine => {
-            let row_norm = row_norm_sq.sqrt();
-            let cent_norm = cent_norm_sq.sqrt();
-            if row_norm > 0.0 && cent_norm > 0.0 {
-                COSINE_DISTANCE_BASE - dot / (row_norm * cent_norm)
-            } else {
-                COSINE_DISTANCE_BASE - dot
-            }
-        }
-        Metric::L2Sq => row_norm_sq - L2_CROSS_TERM_COEFF * dot + cent_norm_sq,
-    }
-}
-
-/// Dot-product reduction for `Sq8Kernel::distance_at`:
-/// `Σ_d q_prime[d] * (code_bytes[d] as f32)` over the first `dim`
-/// dimensions. This is the `q_prime · code` half of the Sq8 distance
-/// expansion — the `Σ q[d] * offset[d]` half is folded into
-/// `Sq8Kernel::q_dot_offset` once at query-prep time.
-///
-/// Three-tier dispatch:
-///
-/// 1. AVX-512 (16-lane FMA + `vpmovzxbd` u8 → i32 widen)
-/// 2. AVX2 (8-lane FMA + `vpmovzxbd` u8 → i32 widen — same widen
-///    instruction in a half-width register, no scalar per-lane
-///    casts in the hot loop)
-/// 3. Portable `wide::f32x8` with per-lane scalar `as f32` widen
-///    (aarch64 / SSE-only / `INFINO_DISABLE_AVX2=1`)
-///
-/// All three paths compute exactly the same reduction in
-/// `bit-identical` lane order up to f32 add-tree associativity (the
-/// reduce tree's shape differs between 8-lane and 16-lane
-/// accumulators, but the per-pair multiplies are identical and the
-/// resulting sum differs only by an FMA-vs-multiply rounding ε per
-/// reduction step — well below Sq8's per-lane quantization error).
-///
-/// Inputs are pre-validated by `Sq8Kernel::distance_at`'s
-/// `debug_assert_eq!(code_bytes.len(), self.dim)`. `q_prime.len()`
-/// is guaranteed `== dim` by `Sq8Kernel::new`.
-#[inline]
-pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx512_enabled() {
-            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
-            return unsafe { sq8_dot_avx512(q_prime, code_bytes, dim) };
-        }
-        if avx2_enabled() {
-            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe { sq8_dot_avx2(q_prime, code_bytes, dim) };
-        }
-    }
-    sq8_dot_wide(q_prime, code_bytes, dim)
-}
-
-/// Upper chunk length for [`u8_sum_sumsq`]'s u32 accumulators:
-/// `U8_SUMSQ_CHUNK · 255² < u32::MAX`, so a per-chunk Σcode² cannot
-/// overflow before it spills into the u64 total.
-const U8_SUMSQ_CHUNK: usize = 16_384;
-
-/// Σcode and Σcode² over one Sq8 code row, both as f32.
-///
-/// Exact integer accumulation: u32 lane math inside bounded chunks
-/// (u8-widening adds + `pmaddwd`-shaped squares that LLVM
-/// auto-vectorizes at the `x86-64-v3` baseline — 64-bit accumulators
-/// would defeat vectorization), spilled into u64 totals between
-/// chunks so no input length can overflow. Used by the manifest's
-/// folded Sq8 centroid scoring to reconstruct `‖centroid‖²` without
-/// dequantizing.
-pub(crate) fn u8_sum_sumsq(codes: &[u8]) -> (f32, f32) {
-    let mut sum: u64 = 0;
-    let mut sumsq: u64 = 0;
-    for chunk in codes.chunks(U8_SUMSQ_CHUNK) {
-        let mut s: u32 = 0;
-        let mut sq: u32 = 0;
-        for &b in chunk {
-            let v = b as u32;
-            s += v;
-            sq += v * v;
-        }
-        sum += u64::from(s);
-        sumsq += u64::from(sq);
-    }
-    (sum as f32, sumsq as f32)
-}
-
-/// Portable `wide::f32x8` (256-bit) Sq8 dot product. Same per-
-/// element math as the AVX-512 path, processed 8 lanes at a time
-/// with a per-lane scalar `u8 as f32` widen. Universal fallback
-/// for aarch64, SSE-only x86_64 hosts, and
-/// `INFINO_DISABLE_AVX2=1` / `INFINO_DISABLE_AVX512=1` A/B runs.
-#[inline]
-fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    let mut acc = f32x8::ZERO;
-    let mut i = 0;
-    while i + F32X8_LANES <= dim {
-        let qc: [f32; F32X8_LANES] = q_prime[i..i + F32X8_LANES]
-            .try_into()
-            .expect("q_prime[i..i+8] len 8");
-        let mut bc = [0f32; F32X8_LANES];
-        for (j, slot) in bc.iter_mut().enumerate() {
-            *slot = code_bytes[i + j] as f32;
-        }
-        let qv = f32x8::from(qc);
-        let bv = f32x8::from(bc);
-        acc += qv * bv;
-        i += F32X8_LANES;
-    }
-    let mut dot = acc.reduce_add();
-    while i < dim {
-        dot += q_prime[i] * (code_bytes[i] as f32);
-        i += 1;
-    }
-    dot
-}
-
-/// AVX2 Sq8 dot product. Same shape as the AVX-512 path but
-/// 8 lanes per iteration via 256-bit registers. The win vs the
-/// portable wide kernel is the u8 → f32 widen: a single
-/// `vpmovzxbd` (zero-extend 8 u8 to 8 i32) + `vcvtdq2ps` (convert
-/// 8 i32 to 8 f32) pair, instead of 8 scalar `as f32` casts the
-/// compiler can't always hoist out of the SIMD loop. Lifts every
-/// AVX2 host (g5, Graviton-on-x86, Skylake, Zen 2 / 3, ...) that
-/// lacks AVX-512.
-///
-/// # Safety
-///
-/// Callers must ensure the target supports `avx2`. `avx2_enabled()`
-/// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    debug_assert_eq!(q_prime.len(), dim);
-    debug_assert_eq!(code_bytes.len(), dim);
-
-    // SAFETY: each iteration reads 8 f32s from `q_prime` and 8
-    // bytes from `code_bytes`. The `i + 8 <= dim` predicate
-    // guarantees both windows are in bounds. `_mm_loadl_epi64`
-    // reads exactly 64 bits = 8 bytes; `_mm256_loadu_ps` reads
-    // 32 bytes (8 f32s). Both are unaligned loads.
-    unsafe {
-        let mut acc = _mm256_setzero_ps();
-        let mut i = 0;
-        while i + F32X8_LANES <= dim {
-            // Load 8 u8 doc codes into the low 64 bits of an xmm
-            // register; the high 64 bits are zero.
-            let codes_u8 = _mm_loadl_epi64(code_bytes.as_ptr().add(i) as *const __m128i);
-            // `_mm256_cvtepu8_epi32` (VPMOVZXBD): zero-extend the
-            // low 8 bytes to 8 × i32 in a 256-bit register.
-            let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
-            // `_mm256_cvtepi32_ps` (VCVTDQ2PS): 8 i32 → 8 f32.
-            let codes_f32 = _mm256_cvtepi32_ps(codes_i32);
-            let q = _mm256_loadu_ps(q_prime.as_ptr().add(i));
-            acc = _mm256_fmadd_ps(q, codes_f32, acc);
-            i += F32X8_LANES;
-        }
-        // Horizontal add 8 fp32 lanes. Standard hadd-tree.
-        let lo = _mm256_castps256_ps128(acc);
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let sums2 = _mm_add_ss(sums, shuf2);
-        let mut dot = _mm_cvtss_f32(sums2);
-        while i < dim {
-            dot += q_prime[i] * (code_bytes[i] as f32);
-            i += 1;
-        }
-        dot
-    }
-}
-
-/// AVX-512 Sq8 dot product. The win vs the `wide` kernel is two
-/// stacked sources of speedup: the f32 FMA is 16-wide instead of
-/// 8, **and** the u8 → f32 widen is a single `vpmovzxbd` +
-/// `vcvtdq2ps` pair instead of 8 scalar `as f32` casts.
-///
-/// # Safety
-///
-/// Callers must ensure the target supports `avx512f`. `avx512_enabled()`
-/// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-    debug_assert_eq!(q_prime.len(), dim);
-    debug_assert_eq!(code_bytes.len(), dim);
-
-    // SAFETY: each iteration reads 16 f32s from `q_prime` and 16
-    // bytes from `code_bytes`. The `i + 16 <= dim` predicate
-    // guarantees both windows are in bounds. `_mm_loadu_si128`
-    // and `_mm512_loadu_ps` are unaligned loads so no alignment
-    // assumption is needed.
-    unsafe {
-        let mut acc = _mm512_setzero_ps();
-        let mut i = 0;
-        while i + AVX512_F32_LANES <= dim {
-            // Load 16 u8 doc codes (one 128-bit lane) and widen
-            // to 16 × i32 then convert to 16 × f32.
-            let codes = _mm_loadu_si128(code_bytes.as_ptr().add(i) as *const __m128i);
-            let codes_i32 = _mm512_cvtepu8_epi32(codes);
-            let codes_f32 = _mm512_cvtepi32_ps(codes_i32);
-            let q = _mm512_loadu_ps(q_prime.as_ptr().add(i));
-            acc = _mm512_fmadd_ps(q, codes_f32, acc);
-            i += AVX512_F32_LANES;
-        }
-        let mut dot = _mm512_reduce_add_ps(acc);
-        while i < dim {
-            dot += q_prime[i] * (code_bytes[i] as f32);
-            i += 1;
-        }
-        dot
     }
 }
 
@@ -1156,32 +792,9 @@ mod tests {
         }
     }
 
-    // --- sq8 kernel -----------------------------------------------------
+    // --- sq8 residual kernel --------------------------------------------
 
-    /// Encode `values` to u8 codes using the same per-dim
-    /// `scale`/`offset` the kernel will decode under.
-    fn encode_sq8(values: &[f32], dim: usize, scale: &[f32], offset: &[f32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(values.len());
-        for row in values.chunks_exact(dim) {
-            for d in 0..dim {
-                let q = ((row[d] - offset[d]) / scale[d]).round().clamp(0.0, 255.0) as u8;
-                out.push(q);
-            }
-        }
-        out
-    }
-
-    /// Decode the same u8 codes back to fp32 — the reference the
-    /// kernel must agree with.
-    fn decode_sq8(codes: &[u8], dim: usize, scale: &[f32], offset: &[f32]) -> Vec<f32> {
-        codes
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (c as f32) * scale[i % dim] + offset[i % dim])
-            .collect()
-    }
-
-    /// Decode `Sq8ResidualEpsilon` codes (`code * scale + offset + residual
+    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
     /// * scale / divisor`) — the reference the residual kernel must
     /// agree with.
     fn decode_sq8_residual(
@@ -1225,15 +838,8 @@ mod tests {
                 Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
                 Metric::NegDot => None,
             };
-            let kernel = Sq8ResidualEpsilonKernel::new(
-                metric,
-                &query,
-                &scale,
-                &offset,
-                residual_divisor,
-                norms_arg,
-            );
-            let got = kernel.distance_at(0, &codes, &residuals);
+            let kernel = Sq8ResidualKernel::new(metric, &query, &scale, &offset, residual_divisor);
+            let got = kernel.distance_with_norm(&codes, &residuals, norms_arg.map(|n| n[0]));
             let want = match metric {
                 Metric::Cosine => 1.0 - dot(&query, &corrected) / corrected_norm.sqrt(),
                 _ => distance(metric, &query, &corrected),
@@ -1258,223 +864,14 @@ mod tests {
             .collect();
         let corrected =
             decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
-        let kernel = Sq8ResidualEpsilonKernel::new(
-            Metric::NegDot,
-            &query,
-            &scale,
-            &offset,
-            residual_divisor,
-            None,
-        );
-        let got = kernel.distance_at(0, &codes, &residuals);
+        let kernel =
+            Sq8ResidualKernel::new(Metric::NegDot, &query, &scale, &offset, residual_divisor);
+        let got = kernel.distance_with_norm(&codes, &residuals, None);
         let want = distance(Metric::NegDot, &query, &corrected);
         assert!(
             (want - got).abs() <= 1e-4,
             "tail-dim residual kernel: got {got} vs corrected ref {want}"
         );
-    }
-
-    #[test]
-    fn sq8_kernel_dot_matches_decoded_reference() {
-        let dim = 16usize;
-        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.05 - 0.3).collect();
-        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i as f32) * 0.002).collect();
-        let offset: Vec<f32> = (0..dim).map(|i| -1.0 + (i as f32) * 0.1).collect();
-        let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-        let decoded = decode_sq8(&codes, dim, &scale, &offset);
-
-        for m in [Metric::Cosine, Metric::NegDot] {
-            let norms = if m == Metric::Cosine {
-                Some(vec![decoded.iter().map(|x| x * x).sum::<f32>()])
-            } else {
-                None
-            };
-            let want = match m {
-                Metric::Cosine => {
-                    let x_norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if x_norm > 0.0 {
-                        1.0 - dot(&query, &decoded) / x_norm
-                    } else {
-                        1.0 - dot(&query, &decoded)
-                    }
-                }
-                Metric::NegDot => distance(m, &query, &decoded),
-                Metric::L2Sq => unreachable!(),
-            };
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms.clone().map(Arc::from));
-            let got = kernel.distance_at(0, &codes);
-            let err = (want - got).abs();
-            assert!(
-                err <= 1e-4,
-                "metric {m:?}: kernel {got} vs decoded ref {want} (err {err})"
-            );
-        }
-    }
-
-    #[test]
-    fn sq8_kernel_l2sq_matches_decoded_reference() {
-        let dim = 24usize;
-        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.07 - 0.1).collect();
-        let scale: Vec<f32> = (0..dim).map(|i| 0.02 + (i as f32) * 0.003).collect();
-        let offset: Vec<f32> = (0..dim).map(|i| 0.5 - (i as f32) * 0.05).collect();
-        // Two docs with very different codes — exercise both
-        // pos=0 and pos=1 into the norms table.
-        let codes_doc0: Vec<u8> = (0..dim).map(|i| ((i * 7) % 256) as u8).collect();
-        let codes_doc1: Vec<u8> = (0..dim).map(|i| ((i * 31 + 12) % 256) as u8).collect();
-        let decoded0 = decode_sq8(&codes_doc0, dim, &scale, &offset);
-        let decoded1 = decode_sq8(&codes_doc1, dim, &scale, &offset);
-        let norm0: f32 = decoded0.iter().map(|x| x * x).sum();
-        let norm1: f32 = decoded1.iter().map(|x| x * x).sum();
-        let per_doc_norms = vec![norm0, norm1];
-
-        let kernel = Sq8Kernel::new(
-            Metric::L2Sq,
-            &query,
-            &scale,
-            &offset,
-            Some(Arc::from(per_doc_norms.clone())),
-        );
-
-        let got0 = kernel.distance_at(0, &codes_doc0);
-        let want0 = distance(Metric::L2Sq, &query, &decoded0);
-        assert!(
-            (want0 - got0).abs() <= 1e-3,
-            "doc0: kernel {got0} vs decoded ref {want0}"
-        );
-
-        let got1 = kernel.distance_at(1, &codes_doc1);
-        let want1 = distance(Metric::L2Sq, &query, &decoded1);
-        assert!(
-            (want1 - got1).abs() <= 1e-3,
-            "doc1: kernel {got1} vs decoded ref {want1}"
-        );
-    }
-
-    #[test]
-    fn sq8_kernel_handles_tail_dim_not_multiple_of_8() {
-        // Dim 13: one SIMD chunk + 5-lane tail. The kernel's
-        // per-query loop must merge the tail into q_prime /
-        // q_dot_offset; the per-doc loop must merge the tail
-        // into `cross`.
-        let dim = 13usize;
-        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.03 + 0.1).collect();
-        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i as f32) * 0.001).collect();
-        let offset: Vec<f32> = (0..dim).map(|i| -0.1 + (i as f32) * 0.02).collect();
-        let codes: Vec<u8> = (0..dim).map(|i| ((i * 11 + 5) % 256) as u8).collect();
-        let decoded = decode_sq8(&codes, dim, &scale, &offset);
-
-        let kernel = Sq8Kernel::new(Metric::NegDot, &query, &scale, &offset, None);
-        let got = kernel.distance_at(0, &codes);
-        let want = distance(Metric::NegDot, &query, &decoded);
-        assert!(
-            (want - got).abs() <= 1e-4,
-            "tail-dim Sq8 kernel: got {got} vs decoded ref {want}"
-        );
-    }
-
-    #[test]
-    fn sq8_full_round_trip_within_recall_tolerance_of_fp32() {
-        // Multi-doc corpus so per-dim min < max (a single-doc
-        // corpus collapses to scale=1.0/offset=x per dim — the
-        // degenerate-dim guard, not the real quantizer).
-        //
-        // Worst-case per-dim quantization error is `scale/2 ≈
-        // (max-min)/510`. For this corpus, per-dim span ≈ 32 →
-        // error ≈ 0.063 per dim. |q-x|² over 16 dims is bounded
-        // by ≈ Σ_d (2·|q_d-x_d|·0.063 + 0.063²) ≈ a few units.
-        // The test pins generous tolerances per metric to stay
-        // robust against rounding on different platforms.
-        let dim = 16usize;
-        let n_docs = 32usize;
-        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5).collect();
-        let corpus: Vec<f32> = (0..n_docs)
-            .flat_map(|i| (0..dim).map(move |j| ((i * 7 + j * 3) as f32 % 32.0) - 8.0))
-            .collect();
-
-        let mut min_v = vec![f32::INFINITY; dim];
-        let mut max_v = vec![f32::NEG_INFINITY; dim];
-        for row in corpus.chunks_exact(dim) {
-            for (d, &x) in row.iter().enumerate() {
-                min_v[d] = min_v[d].min(x);
-                max_v[d] = max_v[d].max(x);
-            }
-        }
-        // Sanity check: per-dim span is non-zero, so we're
-        // exercising real quantization rather than the
-        // degenerate-dim guard. Catches a future test edit that
-        // accidentally re-shrinks the corpus.
-        for d in 0..dim {
-            assert!(
-                max_v[d] - min_v[d] > 0.0,
-                "test corpus must span each dim: dim {d} has min == max"
-            );
-        }
-
-        let mut scale = vec![0.0f32; dim];
-        let mut offset = vec![0.0f32; dim];
-        for d in 0..dim {
-            offset[d] = min_v[d];
-            scale[d] = (max_v[d] - min_v[d]) / 255.0;
-        }
-        let codes_all = encode_sq8(&corpus, dim, &scale, &offset);
-        let decoded_all = decode_sq8(&codes_all, dim, &scale, &offset);
-
-        // Per-doc norms for the L2Sq branch — indexed by pos
-        // matching the builder's contract.
-        let per_doc_norms: Vec<f32> = decoded_all
-            .chunks_exact(dim)
-            .map(|row| row.iter().map(|x| x * x).sum::<f32>())
-            .collect();
-
-        for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
-            let norms_arg: Option<Arc<[f32]>> = match m {
-                Metric::L2Sq | Metric::Cosine => Some(Arc::from(per_doc_norms.clone())),
-                Metric::NegDot => None,
-            };
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);
-            // Probe a handful of doc positions — exercises both
-            // norms-table indexing and the per-doc inner loop on
-            // independent codes.
-            for pos in [0u32, 1, 5, 17, 31] {
-                let codes_doc = &codes_all[(pos as usize) * dim..(pos as usize + 1) * dim];
-                let decoded_doc = &decoded_all[(pos as usize) * dim..(pos as usize + 1) * dim];
-                let got = kernel.distance_at(pos, codes_doc);
-                let want_fp32 = distance(
-                    m,
-                    &query,
-                    &corpus[(pos as usize) * dim..(pos as usize + 1) * dim],
-                );
-                let want_decoded = match m {
-                    Metric::Cosine => {
-                        let x_norm = per_doc_norms[pos as usize].sqrt();
-                        if x_norm > 0.0 {
-                            1.0 - dot(&query, decoded_doc) / x_norm
-                        } else {
-                            1.0 - dot(&query, decoded_doc)
-                        }
-                    }
-                    _ => distance(m, &query, decoded_doc),
-                };
-                // Kernel must match the decoded reference very
-                // tightly — it's doing the same math, just fused
-                // through the per-query precompute. Difference
-                // from fp32 is the quantization error itself.
-                assert!(
-                    (got - want_decoded).abs() <= 1e-3,
-                    "metric {m:?} pos {pos}: kernel {got} vs decoded ref {want_decoded}"
-                );
-                // Cosine Sq8 normalizes the decoded vector at rerank;
-                // [`distance`] assumes unit-norm fp32 inputs, so the
-                // fp32 reference is only meaningful for L2Sq / NegDot.
-                if m != Metric::Cosine {
-                    let rel = (got - want_fp32).abs() / want_fp32.abs().max(1e-2);
-                    assert!(
-                        rel <= 0.1 || (got - want_fp32).abs() <= 1.0,
-                        "metric {m:?} pos {pos}: Sq8 {got} vs fp32 {want_fp32} (rel {rel})"
-                    );
-                }
-            }
-        }
     }
 
     // --- AVX-512 parity (fp32) ------------------------------------------
@@ -1613,65 +1010,6 @@ mod tests {
         assert!(!parse("yes")); // pinned: we only accept 1 / true
     }
 
-    // --- AVX-512 parity -------------------------------------------------
-
-    /// AVX-512 `sq8_dot` agrees with the `wide` baseline
-    /// across a length sweep. The dot product is `Σ q_prime[d] *
-    /// (code[d] as f32)` so values are integer-magnitude on the
-    /// doc side — exact widen, reduction-order is the only divergence.
-    /// Tolerance is correspondingly tight.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn sq8_dot_avx512_matches_wide_across_lengths() {
-        if !avx512_enabled() {
-            eprintln!("sq8_dot_avx512_matches_wide_across_lengths: skipped, no AVX-512");
-            return;
-        }
-        for dim in [1usize, 7, 15, 16, 17, 31, 32, 33, 64, 96, 128, 384, 768] {
-            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let want = sq8_dot_wide(&q_prime, &codes, dim);
-            // SAFETY: gated on avx512_enabled() above.
-            let got = unsafe { sq8_dot_avx512(&q_prime, &codes, dim) };
-            let tol = 1e-5 * want.abs().max(1.0);
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: sq8 avx512 {got} vs sq8 wide {want} (tol {tol})"
-            );
-        }
-    }
-
-    // --- AVX2 parity ----------------------------------------------------
-
-    /// AVX2 `sq8_dot_avx2` agrees with the portable wide
-    /// kernel across a length sweep. Inner math is identical (FMA
-    /// of q_prime against the u8-widened doc codes); the only
-    /// difference is how the widen happens. Tolerance is one
-    /// add-tree ULP per accumulator slot times √(dim/8); the
-    /// constant `1e-5 * |result|` more than covers that.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn sq8_dot_avx2_matches_wide_across_lengths() {
-        if !avx2_enabled() {
-            eprintln!("sq8_dot_avx2_matches_wide_across_lengths: skipped, no AVX2");
-            return;
-        }
-        for dim in [
-            1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 384, 768,
-        ] {
-            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let want = sq8_dot_wide(&q_prime, &codes, dim);
-            // SAFETY: gated on avx2_enabled() above.
-            let got = unsafe { sq8_dot_avx2(&q_prime, &codes, dim) };
-            let tol = 1e-5 * want.abs().max(1.0);
-            assert!(
-                (want - got).abs() <= tol,
-                "dim {dim}: sq8 avx2 {got} vs wide {want} (tol {tol})"
-            );
-        }
-    }
-
     // --- AVX-512 microbench (run by hand) ------------------------------
     //
     // Direct head-to-head per-kernel timings between the AVX-512 fast
@@ -1759,298 +1097,6 @@ mod tests {
                 wide_ns,
                 avx_ns,
                 wide_ns / avx_ns,
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    #[cfg(target_arch = "x86_64")]
-    fn avx512_microbench_sq8_kernel() {
-        if !avx512_enabled() {
-            eprintln!("avx512_microbench: skipped, no AVX-512 on this host");
-            return;
-        }
-        eprintln!();
-        eprintln!(
-            "### Sq8 cross-product kernel — AVX-512 (vpmovzxbd widen) vs wide (ns per call)\n"
-        );
-        eprintln!("| kernel | dim | wide ns | avx512 ns | speedup |");
-        eprintln!("|--------|----:|--------:|----------:|--------:|");
-
-        use std::hint::black_box;
-        for &dim in realistic_dims() {
-            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
-
-            let wide_ns = time_ns(iters, || {
-                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            // SAFETY: gated on avx512_enabled() above.
-            let avx_ns = time_ns(iters, || unsafe {
-                sq8_dot_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            eprintln!(
-                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_ns,
-                avx_ns,
-                wide_ns / avx_ns,
-            );
-        }
-    }
-
-    // --- AVX2 microbench (run by hand) ---------------------------------
-    //
-    // Measures the AVX2 widen-FMA paths against the portable
-    // scalar-widen kernels they replace on AVX2 hosts. Run with:
-    //
-    // ```text
-    // cargo test --release --lib superfile::vector::distance::tests::\
-    //   avx2_microbench -- --ignored --nocapture
-    // ```
-    //
-    // On hosts with AVX-512, the AVX2 widen path is not the runtime
-    // default (the dispatch chain picks AVX-512 first), but the
-    // parity tests + this microbench still exercise it via direct
-    // call to keep the AVX2 baseline a first-class measurable tier.
-
-    // --- Unified 4-tier per-kernel microbench --------------------------
-    //
-    // One run, every kernel × every SIMD tier × every realistic dim,
-    // emitted as a single markdown table. Replaces ad-hoc per-tier
-    // microbenches that only ever showed two columns side-by-side
-    // (wide vs avx512, or wide vs avx2). Run with:
-    //
-    // ```text
-    // cargo test --release --lib simd_microbench_all_tiers \
-    //   -- --ignored --nocapture
-    // ```
-    //
-    // Columns mean exactly what they say: ns/call for that kernel
-    // routed through that specific implementation, irrespective of
-    // what the runtime dispatch chain would have picked. Columns
-    // without a dedicated path (e.g. `dot` fp32 has no separate
-    // AVX2 kernel — the wide path *is* the AVX2 path via `wide`)
-    // are printed as `—` so the table doesn't lie about coverage.
-
-    /// Scalar fp32 dot. No SIMD types — the absolute baseline.
-    /// Compiler will autovectorize this on most x86_64 targets but
-    /// the scalar source is what we measure, so the result is
-    /// representative of "what you get with no hand-tuned SIMD".
-    #[cfg(target_arch = "x86_64")]
-    fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-        let mut s = 0.0f32;
-        for i in 0..a.len() {
-            s += a[i] * b[i];
-        }
-        s
-    }
-
-    /// Scalar fp32 L2².
-    #[cfg(target_arch = "x86_64")]
-    fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
-        let mut s = 0.0f32;
-        for i in 0..a.len() {
-            let d = a[i] - b[i];
-            s += d * d;
-        }
-        s
-    }
-
-    /// Scalar Sq8 dot-product kernel core: `Σ q'[d] * code[d]`
-    /// after per-lane u8→f32 widening. Used inside `Sq8Kernel::
-    /// distance_at`; this is the part the SIMD paths accelerate.
-    #[cfg(target_arch = "x86_64")]
-    fn sq8_dot_scalar(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
-        let mut s = 0.0f32;
-        for d in 0..dim {
-            s += q_prime[d] * (code_bytes[d] as f32);
-        }
-        s
-    }
-
-    /// Single-pane microbench: every kernel × scalar/wide/AVX2/AVX-512
-    /// at every realistic dim, one markdown table.
-    ///
-    /// When a kernel has no dedicated AVX2 implementation (e.g. fp32
-    /// `dot`/`l2_sq` — the `wide::f32x8` path already lowers to
-    /// `__m256` + `vfmadd*ps` under the `x86-64-v3` target this crate
-    /// pins via `.cargo/config.toml`, so a hand-written AVX2 kernel
-    /// would emit the same instructions), the AVX2 column shows
-    /// `wide(=AVX2)` followed by the wide ns to make it clear that
-    /// the dispatch chain on an AVX2-only host actually runs at the
-    /// wide column's number. Kernels that *do* have a separate AVX2
-    /// path (the Sq8 widen kernel — wide had per-lane scalar widen,
-    /// AVX2 has VPMOVZXBD + shift) shows the dedicated AVX2 timing.
-    #[test]
-    #[ignore = "perf microbench, not a correctness gate"]
-    #[cfg(target_arch = "x86_64")]
-    fn simd_microbench_all_tiers() {
-        use std::hint::black_box;
-        let avx2 = avx2_enabled();
-        let avx512 = avx512_enabled();
-        eprintln!();
-        eprintln!(
-            "### vector distance kernels — per-tier ns / call on this host (single thread, release)\n"
-        );
-        eprintln!("host caps: avx2={avx2}, avx512f={avx512}");
-        eprintln!(
-            "build:     `target-cpu=x86-64-v3` (Haswell+AVX2+FMA baseline) from .cargo/config.toml\n"
-        );
-        eprintln!("| kernel | dim | scalar ns | wide ns | avx2 ns | avx512 ns |");
-        eprintln!("|--------|----:|----------:|--------:|--------:|----------:|");
-
-        /// Format an AVX2 cell: `Some(ns)` for a dedicated AVX2
-        /// kernel, `None` for a kernel whose AVX2 dispatch falls
-        /// through to wide (the wide ns is passed so the cell
-        /// shows the actual runtime cost on an AVX2-only host).
-        fn avx2_cell(v: Option<f64>, wide_ns: f64) -> String {
-            match v {
-                Some(x) => format!("{:>7.1}", x),
-                None => format!("wide(={:>5.1})", wide_ns),
-            }
-        }
-
-        /// Format an AVX-512 cell: `Some(ns)` for a dedicated kernel,
-        /// `None` when AVX-512 isn't enabled on this host.
-        fn avx512_cell(v: Option<f64>) -> String {
-            match v {
-                Some(x) => format!("{:>7.1}", x),
-                None => "      —".to_string(),
-            }
-        }
-
-        for &dim in realistic_dims() {
-            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001 - 0.5).collect();
-            let b: Vec<f32> = (0..dim).map(|i| ((i + 7) as f32) * 0.0017 - 0.3).collect();
-            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
-
-            // --- distance::dot (fp32) ---
-            let s = time_ns(iters, || dot_scalar(black_box(&a), black_box(&b)));
-            let w = time_ns(iters, || dot_wide(black_box(&a), black_box(&b)));
-            // No dedicated AVX2 path — `wide::f32x8` on x86-64-v3
-            // lowers straight to `__m256` + `vfmadd*ps`, so the wide
-            // path *is* the AVX2 path for this kernel. AVX2 column
-            // prints `wide(=<wide ns>)` to make that explicit.
-            let a2 = None::<f64>;
-            let a5 = if avx512 {
-                Some(time_ns(iters, || unsafe {
-                    dot_avx512(black_box(&a), black_box(&b))
-                }))
-            } else {
-                None
-            };
-            eprintln!(
-                "| `distance::dot` (fp32) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
-                s,
-                w,
-                avx2_cell(a2, w),
-                avx512_cell(a5),
-            );
-
-            // --- distance::l2_sq (fp32) ---
-            let s = time_ns(iters, || l2_sq_scalar(black_box(&a), black_box(&b)));
-            let w = time_ns(iters, || l2_sq_wide(black_box(&a), black_box(&b)));
-            let a2 = None::<f64>;
-            let a5 = if avx512 {
-                Some(time_ns(iters, || unsafe {
-                    l2_sq_avx512(black_box(&a), black_box(&b))
-                }))
-            } else {
-                None
-            };
-            eprintln!(
-                "| `distance::l2_sq` (fp32) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
-                s,
-                w,
-                avx2_cell(a2, w),
-                avx512_cell(a5),
-            );
-
-            // --- sq8_dot (the Sq8Kernel hot loop core) ---
-            let s = time_ns(iters, || {
-                sq8_dot_scalar(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            let w = time_ns(iters, || {
-                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            let a2 = if avx2 {
-                Some(time_ns(iters, || unsafe {
-                    sq8_dot_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
-                }))
-            } else {
-                None
-            };
-            let a5 = if avx512 {
-                Some(time_ns(iters, || unsafe {
-                    sq8_dot_avx512(black_box(&q_prime), black_box(&codes), black_box(dim))
-                }))
-            } else {
-                None
-            };
-            eprintln!(
-                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>9.1} | {:>7.1} | {} | {} |",
-                s,
-                w,
-                avx2_cell(a2, w),
-                avx512_cell(a5),
-            );
-        }
-
-        eprintln!();
-        eprintln!(
-            "Notes: `wide(=N.N)` in the AVX2 column means there is no \
-             dedicated AVX2 kernel — the dispatch on an AVX2-only host \
-             actually runs the wide kernel at that timing. This applies to \
-             the fp32 `dot` / `l2_sq` kernels because `wide::f32x8` on \
-             `target-cpu=x86-64-v3` lowers to `__m256` + `vfmadd*ps`, \
-             which is what a hand-written AVX2 kernel would emit. The \
-             Sq8 widen kernel has a dedicated AVX2 path (visible \
-             above) because the wide path previously did per-lane scalar \
-             widening; the dedicated AVX2 path replaces that with \
-             VPMOVZXBD / VPMOVZXWD + shift."
-        );
-    }
-
-    /// AVX2 fp32-equivalent Sq8 widen path vs the portable
-    /// scalar-widen `_wide` kernel. Captures the "lift the AVX2
-    /// fallback path" win; the complementary Sq8Kernel rerank cache
-    /// is a data-structure change exercised by the IVF rerank benches
-    /// end-to-end.
-    #[test]
-    #[ignore]
-    #[cfg(target_arch = "x86_64")]
-    fn avx2_microbench_widen_kernels() {
-        if !avx2_enabled() {
-            eprintln!("avx2_microbench: skipped, no AVX2 on this host");
-            return;
-        }
-        eprintln!();
-        eprintln!("### AVX2 widen + FMA vs portable scalar-widen wide path (ns per call)\n");
-        eprintln!("| kernel | dim | wide ns | avx2 ns | speedup |");
-        eprintln!("|--------|----:|--------:|--------:|--------:|");
-
-        use std::hint::black_box;
-        for &dim in realistic_dims() {
-            let q_prime: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.013 - 0.4).collect();
-            let codes: Vec<u8> = (0..dim).map(|i| ((i * 17 + 3) % 256) as u8).collect();
-            let iters: u32 = (10_000_000u64 / (dim as u64).max(1)).max(50_000) as u32;
-
-            let wide_sq8_ns = time_ns(iters, || {
-                sq8_dot_wide(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            // SAFETY: gated on avx2_enabled() above.
-            let avx2_sq8_ns = time_ns(iters, || unsafe {
-                sq8_dot_avx2(black_box(&q_prime), black_box(&codes), black_box(dim))
-            });
-            eprintln!(
-                "| `Sq8Kernel::distance_at` (dot) | {dim} | {:>7.1} | {:>7.1} | {:>5.2}× |",
-                wide_sq8_ns,
-                avx2_sq8_ns,
-                wide_sq8_ns / avx2_sq8_ns,
             );
         }
     }

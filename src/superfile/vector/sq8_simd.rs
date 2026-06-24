@@ -36,10 +36,7 @@ use std::ptr::write_unaligned;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
-/// Maximum Sq8 code value. Sq8 quantizes each component to a single
-/// unsigned byte, so the encoder clamps the FMA result to
-/// `[0, SQ8_CODE_MAX]` before the truncating cast to `u8`.
-const SQ8_CODE_MAX: f32 = 255.0;
+use crate::superfile::vector::distance::SQ8_CODE_MAX;
 
 /// Round-half-up bias folded into the per-cluster `c2` encode
 /// constant. Adding `0.5` before a truncating cast turns truncation
@@ -522,7 +519,7 @@ mod tests {
         for d in 0..dim {
             offset[d] = -2.0 + 4.0 * next();
             let span = 0.1 + 4.0 * next();
-            scale[d] = span / 255.0;
+            scale[d] = span / SQ8_CODE_MAX;
             // Mix of in-range, low-tail, and high-tail samples to
             // exercise clamp + rounding boundaries.
             let pick = next();
@@ -547,7 +544,7 @@ mod tests {
         debug_assert_eq!(row.len(), dst.len());
         for d in 0..row.len() {
             let q = row[d].mul_add(inv_scale[d], c2[d]);
-            let q_clamped = q.max(0.0).min(255.0);
+            let q_clamped = q.max(0.0).min(SQ8_CODE_MAX);
             dst[d] = q_clamped as u8;
         }
     }

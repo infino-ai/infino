@@ -36,17 +36,15 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
+use crate::superfile::vector::cell_posting::ROW_BYTES_PER_DIM;
+use crate::superfile::vector::distance::Metric;
 use crate::supertable::manifest::{
     ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
 };
@@ -459,24 +457,38 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 //   f32 radius
 // ---------------------------------------------------------
 
-/// Sq8 cluster-centroid block (same layout as the tail of
-/// [`encode_vector_summary`], without the bounding-sphere header).
+/// Sq8+residual cluster-centroid block. Layout (all LE):
+///   u32 n_cent, u32 dim
+///   [counts: n_cent × u32]
+///   [scale: dim × f32][offset: dim × f32]   (shared quantizer)
+///   [rows: n_cent × dim × ROW_BYTES_PER_DIM] (codes(dim) u8 ‖ residuals(dim) i8)
+///   u8 has_norms, [norms: n_cent × f32] when set (L2Sq / Cosine)
+///   [radii: n_cent × f32]                    (optional tail)
 pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
-    let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(8 + nc * (4 + 4 + 4) + nc * cd);
+    let d = cl.dim as usize;
+    let mut out = Vec::with_capacity(8 + nc * 4 + 2 * d * 4 + cl.rows.len() + 1 + 2 * nc * 4);
     out.extend_from_slice(&cl.n_cent.to_le_bytes());
     out.extend_from_slice(&cl.dim.to_le_bytes());
     for &c in &cl.counts {
         out.extend_from_slice(&c.to_le_bytes());
     }
-    for &m in &cl.mins {
-        out.extend_from_slice(&m.to_le_bytes());
+    for &s in &cl.scale {
+        out.extend_from_slice(&s.to_le_bytes());
     }
-    for &sc in &cl.scales {
-        out.extend_from_slice(&sc.to_le_bytes());
+    for &o in &cl.offset {
+        out.extend_from_slice(&o.to_le_bytes());
     }
-    out.extend_from_slice(&cl.codes);
+    out.extend_from_slice(&cl.rows);
+    match &cl.norms {
+        Some(norms) => {
+            out.push(1);
+            for &n in norms {
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+        None => out.push(0),
+    }
     if cl.radii.len() == nc {
         for &r in &cl.radii {
             out.extend_from_slice(&r.to_le_bytes());
@@ -490,6 +502,19 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
     let cdim = read_u32(&mut c, "cluster_dim")? as usize;
 
+    let read_f32s =
+        |c: &mut Cursor<&[u8]>, n: usize, what: &'static str| -> Result<Vec<f32>, DecodeError> {
+            let b = read_n(c, n * 4, what)?;
+            if b.len() != n * 4 {
+                return Err(DecodeError::InvalidVectorSummary(format!(
+                    "truncated {what}"
+                )));
+            }
+            Ok(b.chunks_exact(4)
+                .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                .collect())
+        };
+
     let counts_b = read_n(&mut c, n_cent * 4, "cluster_counts")?;
     if counts_b.len() != n_cent * 4 {
         return Err(DecodeError::InvalidVectorSummary(
@@ -501,28 +526,32 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let ms_b = read_n(&mut c, n_cent * 8, "cluster_min_scale")?;
-    if ms_b.len() != n_cent * 8 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster min/scale".into(),
-        ));
-    }
-    let floats: Vec<f32> = ms_b
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    let mins = floats[0..n_cent].to_vec();
-    let scales = floats[n_cent..2 * n_cent].to_vec();
+    let scale = read_f32s(&mut c, cdim, "cluster_scale")?;
+    let offset = read_f32s(&mut c, cdim, "cluster_offset")?;
 
-    let codes_b = read_n(&mut c, n_cent * cdim, "cluster_codes")?;
-    if codes_b.len() != n_cent * cdim {
+    let rows_len = n_cent * cdim * ROW_BYTES_PER_DIM;
+    let rows_b = read_n(&mut c, rows_len, "cluster_rows")?;
+    if rows_b.len() != rows_len {
         return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster codes".into(),
+            "truncated cluster rows".into(),
         ));
     }
+    let rows = rows_b.to_vec();
+
+    let flag = read_n(&mut c, 1, "cluster_has_norms")?;
+    if flag.is_empty() {
+        return Err(DecodeError::InvalidVectorSummary(
+            "missing cluster norms flag".into(),
+        ));
+    }
+    let norms = if flag[0] != 0 {
+        Some(read_f32s(&mut c, n_cent, "cluster_norms")?)
+    } else {
+        None
+    };
 
     let tail = c.position() as usize;
-    let radii = if tail + n_cent * 4 <= bytes.len() {
+    let radii = if n_cent > 0 && tail + n_cent * 4 <= bytes.len() {
         bytes[tail..tail + n_cent * 4]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -534,50 +563,43 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     Ok(ClusterCentroids {
         n_cent: n_cent as u32,
         dim: cdim as u32,
-        codes: codes_b.to_vec(),
-        mins,
-        scales,
+        scale,
+        offset,
+        rows,
+        norms,
         counts,
         radii,
-        code_moments: OnceLock::new(),
     })
 }
 
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
-    let dim = s.centroid.len();
-    let cl = &s.clusters;
-    let nc = cl.n_cent as usize;
-    let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(4 + dim * 4 + 4 + 8 + nc * (4 + 4 + 4) + nc * cd);
-    out.extend_from_slice(&(dim as u32).to_le_bytes());
-    for &v in &s.centroid {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
+    // radius ‖ u32 len(centroid block) ‖ centroid block (Sq8+ε, n_cent=1) ‖
+    // clusters block (Sq8+ε). The length prefix delimits the two
+    // self-describing ClusterCentroids blocks.
+    let centroid_enc = encode_cluster_centroids(&s.centroid);
+    let mut out = Vec::with_capacity(8 + centroid_enc.len());
     out.extend_from_slice(&s.radius.to_le_bytes());
-    out.extend_from_slice(&encode_cluster_centroids(cl));
+    out.extend_from_slice(&(centroid_enc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&centroid_enc);
+    out.extend_from_slice(&encode_cluster_centroids(&s.clusters));
     out
 }
 
 pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError> {
     let mut c = Cursor::new(bytes);
-    let dim = read_u32(&mut c, "dim")? as usize;
-    let mut centroid = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let b = read_n(&mut c, 4, "centroid_float")?;
-        if b.len() != 4 {
-            return Err(DecodeError::InvalidVectorSummary(format!(
-                "truncated centroid at index {i}"
-            )));
-        }
-        let arr = [b[0], b[1], b[2], b[3]];
-        centroid.push(f32::from_le_bytes(arr));
-    }
     let rb = read_n(&mut c, 4, "radius")?;
     if rb.len() != 4 {
         return Err(DecodeError::InvalidVectorSummary("truncated radius".into()));
     }
     let radius = f32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
-
+    let clen = read_u32(&mut c, "centroid_len")? as usize;
+    let cb = read_n(&mut c, clen, "centroid_block")?;
+    if cb.len() != clen {
+        return Err(DecodeError::InvalidVectorSummary(
+            "truncated centroid block".into(),
+        ));
+    }
+    let centroid = decode_cluster_centroids(&cb)?;
     let tail = &bytes[c.position() as usize..];
     let clusters = decode_cluster_centroids(tail)?;
     Ok(VectorSummary {
@@ -597,17 +619,31 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
 // reduce to L2).
 // ---------------------------------------------------------
 
-/// Pack floats into the packed little-endian f32 centroid-envelope blob.
+/// Encode the envelope center (the mean centroid) as a single Sq8+residual
+/// centroid (`n_cent = 1`) — the one internal codec, no fp32 stored. Empty in →
+/// empty out (the "no info" sentinel the list-level pruner treats as always-keep).
 pub(crate) fn encode_centroid_envelope(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let cc = ClusterCentroids::from_fp32(Metric::L2Sq, 1, v.len() as u32, v, vec![1]);
+    encode_cluster_centroids(&cc)
 }
 
-/// Decode a packed little-endian f32 centroid-envelope blob back to floats.
+/// Decode the Sq8+residual envelope center back to fp32 for the L2 bounding-ball
+/// math. Empty / malformed → empty (treated as "no info" / always-keep).
 pub(crate) fn decode_centroid_envelope(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    match decode_cluster_centroids(bytes) {
+        Ok(cc) if cc.n_cent >= 1 && cc.dim > 0 => {
+            let mut out = vec![0f32; cc.dim as usize];
+            cc.dequantize_into(0, &mut out);
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Euclidean (L2) distance between two equal-length centroid vectors.
@@ -1144,6 +1180,7 @@ mod decode_error_tests {
 #[cfg(test)]
 mod vector_summary_tests {
     use super::{decode_vector_summary, encode_vector_summary};
+    use crate::superfile::vector::distance::Metric;
     use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
 
     #[test]
@@ -1158,9 +1195,10 @@ mod vector_summary_tests {
             10.0, 10.5, 11.0, 11.5, // cluster 2
         ];
         let counts = vec![100u32, 0, 42];
-        let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
+        let clusters =
+            ClusterCentroids::from_fp32(Metric::L2Sq, n_cent, dim, &centroids, counts.clone());
         let s = VectorSummary {
-            centroid: vec![1.0, 2.0, 3.0, 4.0],
+            centroid: ClusterCentroids::single(Metric::L2Sq, &[1.0, 2.0, 3.0, 4.0]),
             radius: 9.0,
             clusters,
         };
@@ -1171,20 +1209,19 @@ mod vector_summary_tests {
         assert_eq!(got.clusters.n_cent, n_cent);
         assert_eq!(got.clusters.dim, dim);
         assert_eq!(got.clusters.counts, counts);
-        assert_eq!(got.clusters.codes, s.clusters.codes);
-        assert_eq!(got.clusters.mins, s.clusters.mins);
-        assert_eq!(got.clusters.scales, s.clusters.scales);
+        // Exact round-trip of the Sq8+residual cluster block.
+        assert_eq!(got.clusters, s.clusters);
 
-        // Dequantized centroids are within one Sq8 step of the source.
+        // Decoded centroids are close to the source (Sq8+residual is tight).
+        let max_step = got.clusters.scale.iter().copied().fold(0.0f32, f32::max);
         for c in 0..n_cent as usize {
             let mut out = vec![0f32; dim as usize];
             got.clusters.dequantize_into(c, &mut out);
             let src = &centroids[c * dim as usize..(c + 1) * dim as usize];
-            let step = got.clusters.scales[c];
             for (o, e) in out.iter().zip(src) {
                 assert!(
-                    (o - e).abs() <= step + 1e-6,
-                    "cluster {c}: dequant {o} vs {e} (step {step})"
+                    (o - e).abs() <= max_step + 1e-4,
+                    "cluster {c}: dequant {o} vs {e} (max_step {max_step})"
                 );
             }
         }
@@ -1193,7 +1230,7 @@ mod vector_summary_tests {
     #[test]
     fn round_trips_with_empty_clusters() {
         let s = VectorSummary {
-            centroid: vec![0.5, -0.5],
+            centroid: ClusterCentroids::single(Metric::L2Sq, &[0.5, -0.5]),
             radius: 1.0,
             clusters: ClusterCentroids::empty(),
         };

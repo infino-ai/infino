@@ -143,7 +143,7 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             n_cent: n_cent_for(n_rows),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     )

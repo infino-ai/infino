@@ -72,6 +72,37 @@ pub(crate) async fn open_reader(
     .map_err(|e| QueryError::Store(e.to_string()))
 }
 
+/// Open one superfile for **compaction**, with its bytes locally available for
+/// *synchronous* reads.
+///
+/// Compaction's Sq8 IVF merge reads each input's centroid/code subsection via
+/// `VectorReader::try_get_range_sync` and its id column via
+/// `SuperfileReader::get_record_batch` — both resolve straight off
+/// locally-present bytes, never async I/O. The lazy query reader returned by
+/// [`open_reader`] only exposes its bytes synchronously after a *background*
+/// mmap promotion, so a compaction that races that promotion sees a reader
+/// with no resident bytes (`get_record_batch` → `LazyReaderUnsupported`, and
+/// `try_get_range_sync` → `None`) and fails. Force the disk cache to
+/// mmap-promote the input first via [`DiskCacheStore::reader_synchronous_with_storage`]:
+/// the bytes are NVMe-backed and OS-paged — bounded by the cache budget and the
+/// `MADV_DONTNEED` sweep — so this does **not** pull whole superfiles into the
+/// heap (the whole point of the streamed/mmap design). Falls back to the query
+/// opener when no disk cache is configured.
+pub(crate) async fn open_compaction_input(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    entry: &SuperfileEntry,
+) -> Result<Arc<SuperfileReader>, QueryError> {
+    if let (Some(cache), Some(storage)) = (disk_cache, storage) {
+        return cache
+            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+            .await
+            .map_err(|e| QueryError::Store(e.to_string()));
+    }
+    open_reader(store, disk_cache, storage, entry).await
+}
+
 /// Tag a kernel's `(local_doc_id, score)` results with their source
 /// superfile URI.
 pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
