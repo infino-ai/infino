@@ -82,7 +82,8 @@ impl Drop for RustFsHandle {
     }
 }
 
-/// Force-stop a spawned RustFS child, then wait briefly before a final kill attempt.
+/// Send `kill` to a spawned RustFS child, poll until exit or grace elapses, then
+/// `kill` again and `wait` (no `SIGTERM` — RustFS teardown is best-effort).
 pub fn terminate_child(child: &mut Child) {
     terminate_child_impl(child);
 }
@@ -529,12 +530,49 @@ fn percent_encode_path_segment(s: &str) -> String {
     out
 }
 
+/// Decode XML character references in S3 `ListObjectsV2` text nodes.
 fn unescape_xml_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        if let Some((decoded, consumed)) = decode_xml_entity(rest) {
+            out.push(decoded);
+            rest = &rest[consumed..];
+        } else {
+            out.push('&');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_xml_entity(s: &str) -> Option<(char, usize)> {
+    if !s.starts_with('&') {
+        return None;
+    }
+    let end = s.find(';')?;
+    let entity = &s[1..end];
+    let consumed = end + 1;
+    if let Some(hex) = entity.strip_prefix("#x") {
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(code).map(|ch| (ch, consumed));
+    }
+    if let Some(decimal) = entity.strip_prefix('#') {
+        let code = decimal.parse::<u32>().ok()?;
+        return char::from_u32(code).map(|ch| (ch, consumed));
+    }
+    let ch = match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        _ => return None,
+    };
+    Some((ch, consumed))
 }
 
 fn parse_list_objects_v2_page(xml: &str) -> Result<(Vec<String>, Option<String>, bool), String> {
@@ -1007,6 +1045,13 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unescape_xml_entities_decodes_numeric_references() {
+        assert_eq!(unescape_xml_entities("a&#38;b"), "a&b");
+        assert_eq!(unescape_xml_entities("a&#x26;b"), "a&b");
+        assert_eq!(unescape_xml_entities("&#65;"), "A");
+    }
 
     #[test]
     fn parse_list_objects_v2_page_unescapes_xml_entities() {
