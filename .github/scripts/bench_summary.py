@@ -38,6 +38,12 @@ TEXT_ONLY = ("Corpus", "Superfiles")
 # embed volatile text — they don't diff cleanly. Skip them (the comment says
 # so) rather than mis-unit them as latency.
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
+# Only gate metrics are surfaced as regressions — mirrors the renderer's
+# gate/context split. The headline numbers: best-case (min) warm + cold
+# latency, build time, peak memory, stored size. Everything else (p50/p90
+# spread, +fetch, median/p90 RSS, cold open, throughput/bandwidth, count) is
+# context — measured and in the full report, but too noisy to flag.
+GATE_HEADERS = ("warm min", "cold search", "Time", "Peak RSS", "Stored")
 
 # Map a report basename to (subsystem label, source area).
 SUBSYSTEM = {
@@ -74,6 +80,11 @@ def higher_is_better(header):
 def is_cost(header):
     h = header.lower()
     return any(t in h for t in COST_TOKENS)
+
+
+def is_gate(header):
+    """A regression-gate metric — the only kind surfaced as a change."""
+    return any(t in header for t in GATE_HEADERS)
 
 
 def is_latency(header):
@@ -131,6 +142,11 @@ def diff(reports, baseline_dir, current_dir, threshold):
                 continue
             if is_cost(header):
                 cost_present = True
+                continue
+            # Surface only gate metrics; context (p50/p90 spread, +fetch,
+            # median/p90 RSS, cold open, throughput/bandwidth, count) stays in
+            # the full report but never flags a change.
+            if not is_gate(header):
                 continue
             old = base.get(key)
             if old is None or old == 0.0:
