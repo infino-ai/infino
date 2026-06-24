@@ -36,7 +36,12 @@ on:
         default: "eastus"
         type: string
       ref:
-        description: "Git ref / SHA to benchmark."
+        description: "Git ref / SHA to benchmark (the PR arm)."
+        required: false
+        default: "main"
+        type: string
+      base_ref:
+        description: "A/B base arm ref (default main; set = ref for same-host noise)."
         required: false
         default: "main"
         type: string
@@ -75,6 +80,7 @@ on:
       vm_size:         { type: string, required: false, default: "Standard_D8s_v7" }
       location:        { type: string, required: false, default: eastus }
       ref:             { type: string, required: false, default: main }
+      base_ref:        { type: string, required: false, default: main }
       keep_table:      { type: boolean, required: false, default: false }
       timeout_minutes: { type: string, required: false, default: "60" }
       # Discriminator appended to resource names so parallel callers
@@ -262,6 +268,7 @@ jobs:
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              REF='${{ inputs.ref }}' \
+             BASE_REF='${{ inputs.base_ref }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build.log
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -297,9 +304,8 @@ jobs:
           build_arm "$REF" "$HOME/bench-pr"
           printf '%s\n' "$HOME/bench-pr" > "$HOME/bench-bin"
 
-          # Base (main) arm for the A/B comparison. Restore the PR checkout
-          # after, so the run step's cwd matches the PR ref.
-          git fetch --depth 1 origin main
+          # Base arm. Restore the PR checkout after so the run step's cwd is `ref`.
+          git fetch --depth 1 origin "$BASE_REF"
           build_arm FETCH_HEAD "$HOME/bench-main"
           git checkout "$REF" 2>/dev/null \
             || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
