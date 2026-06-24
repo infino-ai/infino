@@ -529,6 +529,14 @@ fn percent_encode_path_segment(s: &str) -> String {
     out
 }
 
+fn unescape_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 fn parse_list_objects_v2_page(xml: &str) -> Result<(Vec<String>, Option<String>, bool), String> {
     let mut keys = Vec::new();
     let mut rest = xml;
@@ -537,7 +545,7 @@ fn parse_list_objects_v2_page(xml: &str) -> Result<(Vec<String>, Option<String>,
         let end = rest
             .find("</Key>")
             .ok_or("ListObjectsV2 response missing </Key>")?;
-        keys.push(rest[..end].to_string());
+        keys.push(unescape_xml_entities(&rest[..end]));
         rest = &rest[end..];
     }
     let truncated = xml.contains("<IsTruncated>true</IsTruncated>");
@@ -545,7 +553,7 @@ fn parse_list_objects_v2_page(xml: &str) -> Result<(Vec<String>, Option<String>,
         .split("<NextContinuationToken>")
         .nth(1)
         .and_then(|tail| tail.split("</NextContinuationToken>").next())
-        .map(str::to_string);
+        .map(unescape_xml_entities);
     Ok((keys, continuation, truncated))
 }
 
@@ -999,6 +1007,19 @@ fn sign_s3_request(params: &S3SignParams<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_list_objects_v2_page_unescapes_xml_entities() {
+        let xml = "\
+<ListBucketResult>
+<Contents><Key>a&amp;b</Key></Contents>
+<NextContinuationToken>tok&amp;1</NextContinuationToken>
+</ListBucketResult>";
+        let (keys, next, truncated) = parse_list_objects_v2_page(xml).expect("parse");
+        assert_eq!(keys, vec!["a&b".to_string()]);
+        assert_eq!(next.as_deref(), Some("tok&1"));
+        assert!(!truncated);
+    }
 
     #[test]
     fn parse_list_objects_v2_page_extracts_keys_and_continuation() {
