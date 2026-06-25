@@ -1,0 +1,50 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Infino",
+  "colors": {
+    "primary": "#5E6AD2"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": ["docs/index"]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "docs/concepts/object-storage-native-retrieval",
+          "docs/concepts/hybrid-search",
+          "docs/concepts/retrieval-for-agents",
+          "docs/concepts/embedded-retrieval"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "docs/architecture/overview",
+          "docs/architecture/superfile",
+          "docs/architecture/supertable"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": ["docs/faq", "docs/tradeoffs", "docs/versioning"]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/infino-ai/infino"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/infino-ai/infino"
+    }
+  }
+}
