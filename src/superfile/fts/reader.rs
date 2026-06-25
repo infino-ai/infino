@@ -2316,7 +2316,11 @@ impl FtsReader {
                 break;
             }
             let base = min_doc & !(OR_WINDOW - 1);
-            let window_end = (base + OR_WINDOW).min(doc_id_end);
+            // saturating: a doc id within OR_WINDOW of u32::MAX would
+            // overflow `base + OR_WINDOW` (panic in debug; wrap in release,
+            // which makes window_end < base → the accumulate loop stalls and
+            // the outer loop spins). Saturate, then clamp to doc_id_end.
+            let window_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
 
             // Accumulate each cursor's contributions in [base, window_end).
             // Sequential walk per cursor; `d - base` is in range because
