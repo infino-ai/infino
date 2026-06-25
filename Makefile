@@ -120,7 +120,7 @@ doc:
 python-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip
-	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas
+	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas duckdb
 	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
 	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
 

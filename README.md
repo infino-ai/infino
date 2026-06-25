@@ -12,7 +12,7 @@
 
 - **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds. On a 1-million-document index, warm BM25 queries return in the microsecond range — see [benchmarks](benches/README.md).
 - **Multi-modal queries** — keyword (BM25), vector, and SQL queries over the same rows, offering flexible query paths for agents.
-- **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits. 
+- **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits.
 - **Open format, no lock in** — text and numeric data is stored as spec-compliant Parquet, so anything that reads Parquet can read your data.
 
 ## Contents
@@ -210,6 +210,59 @@ Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
 The Node API is synchronous — objects in, plain records out, with `_id`
 returned as a JavaScript `bigint`.
 
+### Open format: read it as Parquet
+
+A superfile *is* a spec-compliant Parquet file. The embedded BM25 and
+vector index regions are spliced in ahead of a standard Parquet footer
+and pointed at by `inf.*` key/value metadata keys, which any conformant
+Parquet reader ignores. So the columnar body opens in DuckDB, pandas,
+pyarrow, or DataFusion with **no infino in the read path** and no export
+step:
+
+```python
+import infino, pyarrow as pa, glob, duckdb
+
+db = infino.connect("./data")          # persist to disk (not "memory://")
+docs = db.create_table(
+    "docs",
+    pa.schema([
+        pa.field("source", pa.large_utf8(), nullable=False),
+        pa.field("body", pa.large_utf8(), nullable=False),
+    ]),
+    infino.IndexSpec().fts("body"),
+)
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing."},
+    {"source": "help-center", "body": "Refunds return to the original payment method."},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance."},
+])
+
+# The superfiles are ordinary files on disk (one write can shard into
+# several, so read them as a set):
+files = glob.glob("data/**/*.sf.parquet", recursive=True)
+print(files[0])   # e.g. data/docs-18bc4051eb6a9468-0/data/seg-....sf.parquet
+
+# Read them with a third-party engine, no infino in this line:
+duckdb.sql("SELECT source, count(*) FROM read_parquet('data/**/*.sf.parquet') GROUP BY source").show()
+# ┌─────────────┬──────────────┐
+# │   source    │ count_star() │
+# ├─────────────┼──────────────┤
+# │ help-center │            2 │
+# │ blog        │            1 │
+# └─────────────┴──────────────┘
+```
+
+**Read-only openness.** Standard tools *read* a superfile's columns with
+no export step. Rewriting it through a generic Parquet writer (e.g.
+`pyarrow.parquet.write_table`) produces valid Parquet that has silently
+dropped the embedded BM25/vector indexes, so it's no longer a superfile.
+The compatibility is one-directional.
+
+The shortest end-to-end demo (write a corpus, run BM25 + vector +
+SQL/hybrid retrieval against it, then read the very same file back with
+DuckDB *and* pyarrow) is
+[`infino-python/examples/parquet_interop.py`](infino-python/examples/parquet_interop.py).
+
 ## Architecture
 
 Three docs cover the design, from the high-level tour down to the
@@ -367,7 +420,7 @@ shared layer.
 
 Retrieval composes the same way. The ranked `bm25_search` /
 `vector_search` / `hybrid_search` and the unranked `token_match` /
-`exact_match` are table functions so a candidate set is the 
+`exact_match` are table functions so a candidate set is the
 *first stage of a plan* rather than its result:
 
 ```sql
