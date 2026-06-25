@@ -1,0 +1,6 @@
+infino
+crewai-infino>=0.1.0
+crewai>=0.80               # the agent framework (Agent / Task / Crew / LLM)
+sentence-transformers>=3   # local embeddings, no API key needed
+datasets>=2                # pulls the real public corpora from HuggingFace
+pyarrow>=14

@@ -53,7 +53,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::distance::{Metric, distance},
     },
-    supertable::manifest::{ManifestSnapshot, SuperfileEntry},
+    supertable::manifest::{ManifestSnapshot, ScalarStatsAgg, SuperfileEntry},
 };
 
 /// Bloom-skip mask for an exact-term BM25 search.
@@ -279,6 +279,43 @@ pub fn scalar_value_set_skip(
                 .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
         })
         .collect()
+}
+
+/// Keep each superfile whose `column` stats could still satisfy
+/// `IS [NOT] NULL`. A missing stat keeps the superfile.
+pub fn null_check_skip(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    want_null: bool,
+) -> Vec<bool> {
+    superfiles
+        .iter()
+        .map(|entry| {
+            entry
+                .scalar_stats
+                .get(column)
+                .is_none_or(|agg| null_check_may_match(agg, want_null))
+        })
+        .collect()
+}
+
+/// Whether a column's stats could still match `IS [NOT] NULL`, shared by
+/// both prune tiers:
+///  - `IS NULL` (`want_null`): keep unless the stats prove zero nulls.
+///  - `IS NOT NULL`: keep unless the column is entirely null.
+pub(crate) fn null_check_may_match(agg: &ScalarStatsAgg, want_null: bool) -> bool {
+    if want_null {
+        agg.null_count != Some(0)
+    } else {
+        !agg_all_null(agg)
+    }
+}
+
+/// All values are null iff the min stat is null — no non-null value fed it.
+fn agg_all_null(agg: &ScalarStatsAgg) -> bool {
+    ScalarValue::try_from_array(agg.min.as_ref(), 0)
+        .map(|v| v.is_null())
+        .unwrap_or(false)
 }
 
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
@@ -697,6 +734,46 @@ mod tests {
             scalar_value_set_skip(&segs, "missing", &[i(5)]),
             vec![true, true, true]
         );
+    }
+
+    #[test]
+    fn null_check_may_match_covers_both_predicates() {
+        let arr = |v: Option<i64>| Arc::new(Int64Array::from(vec![v])) as ArrayRef;
+        let agg = |min: Option<i64>, null_count: Option<u64>| ScalarStatsAgg {
+            min: arr(min),
+            max: arr(min),
+            null_count,
+            sum: None,
+            hll: None,
+        };
+
+        // No nulls: IS NULL drops, IS NOT NULL keeps.
+        let no_null = agg(Some(5), Some(0));
+        assert!(!null_check_may_match(&no_null, true));
+        assert!(null_check_may_match(&no_null, false));
+
+        // All null (min is null): IS NULL keeps, IS NOT NULL drops.
+        let all_null = agg(None, Some(10));
+        assert!(null_check_may_match(&all_null, true));
+        assert!(!null_check_may_match(&all_null, false));
+
+        // Some nulls (min present): both keep.
+        let mixed = agg(Some(5), Some(2));
+        assert!(null_check_may_match(&mixed, true));
+        assert!(null_check_may_match(&mixed, false));
+
+        // Unknown null count (None): can't prove zero nulls, both keep.
+        let unknown = agg(Some(5), None);
+        assert!(null_check_may_match(&unknown, true));
+        assert!(null_check_may_match(&unknown, false));
+    }
+
+    #[test]
+    fn null_check_skip_keeps_on_missing_stat() {
+        let segs = vec![seg_with_int_stats("x", 0, 10)];
+        // Column not in stats → conservative keep for either predicate.
+        assert_eq!(null_check_skip(&segs, "missing", true), vec![true]);
+        assert_eq!(null_check_skip(&segs, "missing", false), vec![true]);
     }
 
     #[test]

@@ -30,19 +30,19 @@ use std::sync::Arc;
 
 use datafusion::scalar::ScalarValue;
 
-use super::skip::{
-    ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip,
-    scalar_value_may_match, scalar_value_set_skip,
-};
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
         manifest::{
-            ManifestSnapshot, SuperfileEntry,
-            list::{Manifest, ManifestPartEntry},
+            ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
+            list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
+        },
+        query::skip::{
+            ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
+            null_check_skip, scalar_skip, scalar_value_may_match, scalar_value_set_skip,
         },
     },
 };
@@ -70,6 +70,9 @@ pub(crate) enum PruneLeaf {
         column: String,
         values: Vec<ScalarValue>,
     },
+    /// `column IS NULL` (`want_null`) / `IS NOT NULL` → keep via the
+    /// per-column null count and all-null check.
+    NullCheck { column: String, want_null: bool },
 }
 
 impl PruneLeaf {
@@ -93,36 +96,45 @@ impl PruneLeaf {
             PruneLeaf::ScalarValueSet { column, values } => {
                 Some(scalar_value_set_keep_parts(list, column, values))
             }
+            PruneLeaf::NullCheck { column, want_null } => {
+                Some(null_check_keep_parts(list, column, *want_null))
+            }
         }
     }
 }
 
-/// Keep each part whose aggregate min/max for `column` satisfies
-/// `may_match`. A missing aggregate or undecodable bounds keeps the part
-/// (conservative — never a false prune). The bounds are length-1
-/// [`ArrayRef`]s decoded when the list loaded, so reading the
-/// [`ScalarValue`] here is free of per-query Arrow decode.
+/// Keep each part whose `column` aggregate satisfies `keep`. A missing
+/// aggregate keeps the part (conservative — never a false prune). The
+/// stats are length-1 [`ArrayRef`]s decoded when the list loaded, so
+/// reading them here is free of per-query Arrow decode.
+fn keep_parts_where_agg(
+    list: &Manifest,
+    column: &str,
+    keep: impl Fn(&ScalarStatsAgg) -> bool,
+) -> Vec<PartId> {
+    list.parts
+        .iter()
+        .filter_map(|entry| {
+            let k = entry.scalar_stats_agg.get(column).is_none_or(&keep);
+            k.then_some(entry.part_id)
+        })
+        .collect()
+}
+
+// Keep each part whose aggregate min/max for `column` satisfies `may_match`;
+// undecodable bounds keep the part.
 fn keep_parts_where(
     list: &Manifest,
     column: &str,
     may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
 ) -> Vec<PartId> {
-    list.parts
-        .iter()
-        .filter_map(|entry| {
-            let keep = match part_minmax(entry, column) {
-                Some((min, max)) => may_match(&min, &max),
-                None => true,
-            };
-            keep.then_some(entry.part_id)
-        })
-        .collect()
+    keep_parts_where_agg(list, column, |agg| {
+        agg_minmax(agg).is_none_or(|(min, max)| may_match(&min, &max))
+    })
 }
 
-// The manifest part's aggregate min/max for `column`, or `None` when the column
-// has no aggregate or the bounds don't decode (caller keeps).
-fn part_minmax(entry: &ManifestPartEntry, column: &str) -> Option<(ScalarValue, ScalarValue)> {
-    let agg = entry.scalar_stats_agg.get(column)?;
+// An aggregate's decoded min/max, or `None` when the bounds don't decode.
+fn agg_minmax(agg: &ScalarStatsAgg) -> Option<(ScalarValue, ScalarValue)> {
     match (
         ScalarValue::try_from_array(agg.min.as_ref(), 0),
         ScalarValue::try_from_array(agg.max.as_ref(), 0),
@@ -130,6 +142,11 @@ fn part_minmax(entry: &ManifestPartEntry, column: &str) -> Option<(ScalarValue, 
         (Ok(min), Ok(max)) => Some((min, max)),
         _ => None,
     }
+}
+
+// Part-tier `IS [NOT] NULL` prune; the superfile-tier sibling lives in `skip`.
+fn null_check_keep_parts(list: &Manifest, column: &str, want_null: bool) -> Vec<PartId> {
+    keep_parts_where_agg(list, column, |agg| null_check_may_match(agg, want_null))
 }
 
 // Part-tier scalar prune: keep parts whose min/max could satisfy `pred`.
@@ -212,6 +229,9 @@ pub(crate) async fn select_superfiles(
                     &mut mask,
                     &scalar_value_set_skip(&superfiles, column, values),
                 );
+            }
+            PruneLeaf::NullCheck { column, want_null } => {
+                and_into(&mut mask, &null_check_skip(&superfiles, column, *want_null));
             }
             // Scalar leaves handled above as one conjunction.
             PruneLeaf::Scalar(_) => {}

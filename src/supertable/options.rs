@@ -159,6 +159,11 @@ pub enum Consistency {
     /// other processes' new data requires a fresh `open`. For pure
     /// read replicas / time-bounded scans that never want surprise
     /// pointer reads.
+    ///
+    /// Do not hold a `Snapshot` handle open longer than the GC safety
+    /// gap (default 24 hours). GC removes old manifests once they age
+    /// past that threshold; a handle whose pinned manifest has been
+    /// collected will fail on the next query.
     Snapshot,
 }
 

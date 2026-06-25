@@ -388,6 +388,9 @@ pub enum QueryError {
     #[error("error reading parquet bytes during scan: {0}")]
     Parquet(String),
 
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
     #[error("DataFusion failed to plan the query: {0}")]
     Plan(String),
 

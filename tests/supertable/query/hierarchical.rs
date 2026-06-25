@@ -33,15 +33,18 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    superfile::fts::reader::BoolMode,
+    superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
-        Supertable,
+        Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
 };
+use rayon::ThreadPoolBuilder;
 
 /// Disk-cache byte budget (1 GiB) for the hierarchical-manifest tests.
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
@@ -561,6 +564,134 @@ fn sql_or_on_fts_column_bloom_prunes_parts_min_max_cannot() {
         loaded, 1,
         "min/max keeps all 3 (range [aaa,zzz]); the OR bloom must narrow to part 1; got {loaded}/3"
     );
+}
+
+// Schema for the null-prune fixture: FTS `title` plus a nullable `tag`.
+fn tag_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("tag", DataType::LargeUtf8, true),
+    ]))
+}
+
+fn tag_options() -> SupertableOptions {
+    // Single-thread writer pool mirrors `default_supertable_options`, so
+    // part rollup is deterministic (2 superfiles per part).
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool"),
+    );
+    SupertableOptions::new(
+        tag_schema(),
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    )
+    .expect("tag options")
+    .with_writer_pool(pool)
+}
+
+fn tag_batch(titles: &[&str], tags: &[Option<&str>]) -> RecordBatch {
+    RecordBatch::try_new(
+        tag_schema(),
+        vec![
+            Arc::new(LargeStringArray::from(titles.to_vec())),
+            Arc::new(LargeStringArray::from(tags.to_vec())),
+        ],
+    )
+    .expect("tag batch")
+}
+
+// Three parts (2 superfiles each): part 0 has an all-null `tag`, parts 1
+// and 2 have no nulls. Returns the storage dir so each query opens a
+// fresh cold consumer.
+fn build_tag_parts(storage_dir: &std::path::Path) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let producer = Supertable::create(
+        tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_target_superfiles_per_part(2),
+    )
+    .expect("create");
+    let commits: &[(&[&str], &[Option<&str>])] = &[
+        (&["a0", "a1"], &[None, None]), // part 0: tag all null
+        (&["b0", "b1"], &[None, None]),
+        (&["c0", "c1"], &[Some("x"), Some("y")]), // part 1: no nulls
+        (&["d0", "d1"], &[Some("x"), Some("y")]),
+        (&["e0", "e1"], &[Some("x"), Some("y")]), // part 2: no nulls
+        (&["f0", "f1"], &[Some("x"), Some("y")]),
+    ];
+    for (titles, tags) in commits {
+        let mut w = producer.writer().expect("writer");
+        w.append(&tag_batch(titles, tags)).expect("append");
+        w.commit().expect("commit");
+    }
+}
+
+fn open_tag_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
+    let cache = make_cache(Arc::clone(&storage), cache_dir);
+    Supertable::open(
+        tag_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY)
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("open")
+}
+
+#[test]
+fn sql_is_null_prunes_no_null_parts() {
+    // `tag IS NULL`:
+    //  - parts 1 and 2 have null_count == 0, so they're dropped.
+    //  - only part 0 (all-null tag) loads; its 4 rows match.
+    let dir = TempDir::new().expect("tempdir");
+    build_tag_parts(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_tag_consumer(dir.path(), cache_dir.path());
+
+    let rows: usize = consumer
+        .reader()
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NULL")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 4, "part 0's 4 rows have a null tag");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(loaded, 1, "no-null parts pruned; got {loaded}/3");
+}
+
+#[test]
+fn sql_is_not_null_prunes_all_null_parts() {
+    // `tag IS NOT NULL`:
+    //  - part 0 is entirely null (min stat is null), so it's dropped.
+    //  - parts 1 and 2 load; their 8 rows match.
+    let dir = TempDir::new().expect("tempdir");
+    build_tag_parts(dir.path());
+    let cache_dir = TempDir::new().expect("cache");
+    let consumer = open_tag_consumer(dir.path(), cache_dir.path());
+
+    let rows: usize = consumer
+        .reader()
+        .query_sql("SELECT _id FROM supertable WHERE tag IS NOT NULL")
+        .expect("query")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 8, "parts 1 and 2 have 8 non-null tags");
+
+    let (loaded, total) = parts_loaded(&consumer);
+    assert_eq!(total, 3);
+    assert_eq!(loaded, 2, "all-null part 0 pruned; got {loaded}/3");
 }
 
 #[test]

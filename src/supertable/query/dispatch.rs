@@ -35,6 +35,7 @@
 use std::{future::Future, sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::SuperfileHit;
@@ -84,9 +85,25 @@ pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<Sup
         .collect()
 }
 
-/// Drop tombstoned `local_doc_id`s from one superfile's hits. After the
-/// orchestrator's batched [`SidecarCache::prefetch`] every lookup here
-/// is an in-memory cache hit, so this is a cheap retain pass.
+/// Resolve a superfile's tombstones to a non-empty deny bitmap, or `None`
+/// when it has none. After the orchestrator's batched
+/// [`SidecarCache::prefetch`] this is an in-memory cache hit. The single
+/// source of the "look up the bitmap, treat empty as absent" step shared
+/// by the post-rank filter here, the allow-set subtraction, and the
+/// unfiltered deny-set pushdown.
+pub(crate) fn tombstone_deny_set(
+    cache: &SidecarCache,
+    superfile_id: Uuid,
+    now: Instant,
+) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+    let bitmap = cache
+        .bitmap_for(superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    Ok((!bitmap.is_empty()).then_some(bitmap))
+}
+
+/// Drop tombstoned `local_doc_id`s from one superfile's hits — the
+/// post-rank filter for query paths that rank without a deny set (FTS).
 pub(crate) fn apply_tombstone_filter(
     cache: Option<&Arc<SidecarCache>>,
     entry: &SuperfileEntry,
@@ -96,12 +113,9 @@ pub(crate) fn apply_tombstone_filter(
     let Some(cache) = cache else {
         return Ok(());
     };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
+    let Some(bitmap) = tombstone_deny_set(cache, entry.superfile_id, now)? else {
         return Ok(());
-    }
+    };
     hits.retain(|h| !bitmap.contains(h.local_doc_id));
     Ok(())
 }
