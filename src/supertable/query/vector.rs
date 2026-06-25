@@ -92,11 +92,8 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
-        manifest::{
-            Manifest, SuperfileEntry, SuperfileUri,
-            list::{CellRoutingParams, PartitionStrategy},
-        },
+        handle::{Supertable, SupertableReader},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri},
         tombstones::SidecarCache,
     },
 };
@@ -119,49 +116,26 @@ enum Probe {
     Nprobe,
 }
 
-/// Apply query-time diagnostic overrides to the persisted cell-routing params.
-/// `INFINO_CELL_NPROBE_MAX` caps (or sets) the adaptive probe ceiling without
-/// rebuilding the index — set it equal to the nprobe floor to disable adaptive
-/// expansion ("use the hint"), or sweep it to trade fan-out against recall.
-/// Read once and cached.
-fn routing_with_env_overrides(mut routing: CellRoutingParams) -> CellRoutingParams {
-    use std::sync::OnceLock;
-    static NPROBE_MAX: OnceLock<Option<usize>> = OnceLock::new();
-    let override_max = *NPROBE_MAX.get_or_init(|| {
-        std::env::var("INFINO_CELL_NPROBE_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    });
-    if let Some(n) = override_max {
-        routing.nprobe_max = n.max(routing.nprobe_min);
+/// All superfile entries of `manifest` in manifest order, flattening the lazy
+/// list parts when the manifest is object-store-backed (the hidden vector-index
+/// table) or returning the resident flat list for an in-process manifest. Used
+/// by the OPANN leaf-probe path to map a descended `LeafRef.superfile_id` back
+/// to its entry (uri + radius) — loaded once per query, part GETs disk-cached.
+pub(super) async fn ordered_manifest_superfiles(
+    manifest: &Manifest,
+) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+    if !manifest.is_in_process_only() {
+        let part_ids: Vec<_> = manifest
+            .get_all_list_entries()
+            .iter()
+            .map(|e| e.part_id)
+            .collect();
+        hierarchical_iter::load_and_flatten(manifest, &part_ids)
+            .await
+            .map_err(QueryError::ManifestLoad)
+    } else {
+        Ok(hierarchical_iter::fallback_to_flat_superfiles(manifest))
     }
-    routing
-}
-
-fn filter_superfiles_by_cells(
-    superfiles: &[Arc<SuperfileEntry>],
-    routed_cells: &[u32],
-) -> Vec<Arc<SuperfileEntry>> {
-    if routed_cells.is_empty() {
-        return superfiles.to_vec();
-    }
-    let routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
-    superfiles
-        .iter()
-        .filter(|sf| {
-            if sf.partition_key.len() == 4 {
-                let mut key = [0u8; 4];
-                key.copy_from_slice(&sf.partition_key);
-                routed_keys.contains(&key)
-            } else if let Some(cell) = sf.partition_hint {
-                routed_keys.contains(&cell.to_le_bytes())
-            } else {
-                false
-            }
-        })
-        .cloned()
-        .collect()
 }
 
 /// Split hits into those already on the user table vs hidden-index hits
@@ -1043,6 +1017,26 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
+        // OPANN path-B: descend the resident tree to admitted leaves and fetch
+        // each as a direct parallel range-GET on its superfile object — no
+        // manifest-part lookup, no Parquet-footer decode, one wave of ~nprobe
+        // GETs. Falls through to the legacy per-superfile IVF scan when no tree
+        // is published or the entries lack the vector-probe subsection layout.
+        if let Some(leaves) = super::vector_probe::select_opann_probe_leaves(
+            self,
+            manifest,
+            column,
+            query,
+            &options,
+            |_| true,
+        )
+        .await?
+        {
+            return super::vector_probe::fanout_opann_leaf_probes(
+                self, leaves, column, query, k, options, None,
+            )
+            .await;
+        }
         let superfiles = manifest
             .get_pruned_superfiles_for_vector(column, query)
             .await
@@ -1054,9 +1048,11 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-index vector kNN: hidden manifest + cell filter + fan-out at
-    /// the hidden storage prefix. Falls back to the user table when the
-    /// hidden index is absent or empty.
+    /// Global-index vector kNN. The hidden vector-index table is dual-written
+    /// with every vector, so when it holds data it is authoritative: we
+    /// delegate to its own user-table path (OPANN leaf probe over the resident
+    /// tree). Falls back to the user table only when the hidden index is absent
+    /// or empty.
     pub(crate) async fn vector_search_global_index_async(
         &self,
         column: &str,
@@ -1072,59 +1068,9 @@ impl SupertableReader {
             let vit_manifest = vit_reader.manifest();
             let has_data = !vit_manifest.superfiles.is_empty() || vit_manifest.get_num_parts() > 0;
             if has_data {
-                let vit_metric = vit_manifest
-                    .options
-                    .vector_columns
-                    .iter()
-                    .find(|vc| vc.column == column)
-                    .map(|vc| vc.metric)
-                    .unwrap_or(Metric::L2Sq);
-                let selected = match vit_manifest.get_partition_strategy() {
-                    PartitionStrategy::VectorCell {
-                        clusters, routing, ..
-                    } => {
-                        let mut routed = clusters.select_cells_adaptive(
-                            vit_metric,
-                            query,
-                            options.resolve(false).0,
-                            routing_with_env_overrides(routing),
-                        );
-                        // Always scan the "incoming" append region in addition
-                        // to the nprobe-routed cells: those rows have not been
-                        // distributed into cells by maintenance yet, so routing
-                        // by centroid can't see them.
-                        routed.push(INCOMING_VECTOR_CELL);
-                        if vit_manifest.superfiles.is_empty() {
-                            vit_manifest
-                                .superfiles_for_routed_cells(&routed)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
-                        }
-                    }
-                    _ => {
-                        if vit_manifest.superfiles.is_empty() {
-                            let part_ids: Vec<_> = vit_manifest
-                                .get_all_list_entries()
-                                .iter()
-                                .map(|e| e.part_id)
-                                .collect();
-                            hierarchical_iter::load_and_flatten(vit_manifest, &part_ids)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            vit_manifest.superfiles.to_vec()
-                        }
-                    }
-                };
-                if !selected.is_empty() {
-                    // Already top-k ascending (same as the user-table path
-                    // below) — no second `top_k_ascending` pass needed.
-                    return vit_reader
-                        .fanout_vector_clusters(&selected, column, query, k, options)
-                        .await;
-                }
+                return vit_reader
+                    .vector_search_user_table_async(column, query, k, options)
+                    .await;
             }
         }
         self.vector_search_user_table_async(column, query, k, options)
@@ -1238,7 +1184,7 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
-fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
+pub(super) fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     #[derive(PartialEq)]
     struct MaxByScore(SuperfileHit);
     impl Eq for MaxByScore {}

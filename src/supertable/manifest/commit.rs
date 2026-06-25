@@ -58,6 +58,7 @@ use crate::{
                 PartId,
             },
         },
+        reader_cache::DiskCacheStore,
     },
 };
 
@@ -89,6 +90,65 @@ pub fn part_uri(content_hash: &ContentHash) -> String {
         "{MANIFEST_PARTS_DIR}/part-{}.avro.zst",
         content_hash.to_hex()
     )
+}
+
+/// Build the URI for a content-addressed immutable blob. Shared by manifest
+/// parts, OPANN pages, and OPANN resident snapshots: `<dir>/<stem>-<hash>.<ext>`.
+pub(crate) fn content_addressed_uri(
+    dir: &str,
+    stem: &str,
+    content_hash: &ContentHash,
+    ext: &str,
+) -> String {
+    format!("{dir}/{stem}-{}.{}", content_hash.to_hex(), ext)
+}
+
+/// Conditional-create PUT of an immutable, content-addressed blob. A blob whose
+/// object already exists (identical content from a racing or retried writer) is
+/// a benign collision and treated as success. The one write primitive shared by
+/// manifest parts and OPANN routing pages — both blake3-named immutable objects.
+// Wired into the commit page-persistence path in Stage 2 (commit-build); until
+// then only the store round-trip tests exercise it.
+#[allow(dead_code)]
+pub(crate) async fn put_immutable_blob(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    match storage.put_atomic(uri, bytes).await {
+        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Fetch a content-addressed blob and verify its blake3 against `expected_hash`.
+/// Shared by OPANN resident-tree open and the page walk. Direct GET + verify;
+/// disk-cache warm loading is a separate optimization (the resident bundle is
+/// re-fetched per open until then).
+pub(crate) async fn load_verified_blob(
+    expected_hash: ContentHash,
+    uri: &str,
+    storage: &dyn StorageProvider,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+) -> Result<Bytes, ManifestLoadError> {
+    // Route through the disk cache when attached: the blob is mmap-backed +
+    // evictable, so a warm load is zero object I/O (the OPANN resident tree /
+    // pages stay resident across queries). Falls back to a direct GET + verify.
+    if let Some(cache) = disk_cache {
+        return cache
+            .blob_bytes(expected_hash, uri.to_string(), storage)
+            .await
+            .map_err(|e| ManifestLoadError::DiskCache(e.to_string()));
+    }
+    let (bytes, _) = storage.get(uri).await.map_err(ManifestLoadError::Storage)?;
+    let actual_hash = ContentHash::of(&bytes);
+    if actual_hash != expected_hash {
+        return Err(ManifestLoadError::ContentHashMismatch {
+            expected: expected_hash.to_hex(),
+            actual: actual_hash.to_hex(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// In-memory pointer file. Lives at [`POINTER_PATH`]; its
@@ -667,6 +727,7 @@ mod tests {
         // columns, an empty schema. Encoding only requires the
         // format header + the empty collections.
         let list = ManifestList {
+            opann_routing: None,
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),

@@ -98,6 +98,11 @@ pub struct ManifestList {
     /// [`crate::supertable::options::SupertableOptions::effective_partition_strategy`]
     /// for how the field is resolved.
     pub partition_strategy: PartitionStrategy,
+    /// OPANN routing-tree root (the paged hierarchical cell router) and its
+    /// probe tuning. `None` on tables without an OPANN tree — readers then use
+    /// flat cell selection. Optional + defaulted in the wire form, so manifests
+    /// written before OPANN still decode.
+    pub opann_routing: Option<OpannRouting>,
     /// Object-storage prefix for the hidden vector-index sibling
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
@@ -144,6 +149,29 @@ impl Default for CellRoutingParams {
             slack: DEFAULT_CELL_SLACK,
         }
     }
+}
+
+/// OPANN routing-tree reference stamped into the manifest: the content hash of
+/// the root page (entry into the paged hierarchical cell router, stored under
+/// the hidden vector-index prefix) plus the probe tuning. `opann_routing == None`
+/// means the table has no OPANN tree.
+///
+/// The tree itself — every leaf's cell id (`= superfile_id.as_u128()`),
+/// Sq8+residual centroid, and covering radius — lives entirely in the
+/// content-addressed pages reachable from `root_page`. Nothing fp32 is persisted
+/// here; a commit/compaction updates the tree by copy-on-write insert/delete
+/// against the page graph, rewriting only the affected leaf→root path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpannRouting {
+    /// Content hash of the root routing page.
+    pub root_page: ContentHash,
+    /// Probe tuning — reuses the cell-routing knobs.
+    pub routing: CellRoutingParams,
+    /// Content-addressed snapshot of every page reachable from [`root_page`].
+    /// When set, open pulls this blob through the same verified-blob path as
+    /// manifest parts. Legacy manifests omit it and fall back to a per-page walk.
+    pub resident_uri: Option<String>,
+    pub resident_content_hash: Option<ContentHash>,
 }
 
 /// How superfiles are routed into manifest parts. Stamped into
@@ -757,6 +785,8 @@ struct ManifestListDto {
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     partition_strategy: PartitionStrategyDto,
+    #[serde(default)]
+    opann_routing: Option<OpannRoutingDto>,
     parts: Vec<ManifestPartEntryDto>,
 }
 
@@ -849,6 +879,17 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpannRoutingDto {
+    root_page: String, // "blake3:<64hex>"
+    #[serde(default)]
+    routing: Option<CellRoutingParamsDto>,
+    #[serde(default)]
+    resident_uri: Option<String>,
+    #[serde(default)]
+    resident_content_hash: Option<String>, // "blake3:<64hex>"
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1237,6 +1278,12 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        opann_routing: l.opann_routing.as_ref().map(|r| OpannRoutingDto {
+            root_page: encode_hash(&r.root_page),
+            routing: Some(r.routing.into()),
+            resident_uri: r.resident_uri.clone(),
+            resident_content_hash: r.resident_content_hash.as_ref().map(encode_hash),
+        }),
         parts,
     })
 }
@@ -1268,6 +1315,21 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             })
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
+        opann_routing: d
+            .opann_routing
+            .map(|r| -> Result<OpannRouting, ListParseError> {
+                Ok(OpannRouting {
+                    root_page: decode_hash(&r.root_page)?,
+                    routing: r.routing.map(CellRoutingParams::from).unwrap_or_default(),
+                    resident_uri: r.resident_uri,
+                    resident_content_hash: r
+                        .resident_content_hash
+                        .as_deref()
+                        .map(decode_hash)
+                        .transpose()?,
+                })
+            })
+            .transpose()?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         parts,
     })
@@ -1743,6 +1805,7 @@ mod tests {
 
     fn empty_list() -> ManifestList {
         ManifestList {
+            opann_routing: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),

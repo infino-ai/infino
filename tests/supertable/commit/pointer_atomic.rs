@@ -166,6 +166,7 @@ fn fresh_part(seed: u8) -> ManifestPart {
 fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
     ManifestList {
         format_version: LIST_FORMAT_VERSION.into(),
+        opann_routing: None,
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
         schema: Vec::new(),

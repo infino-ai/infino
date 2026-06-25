@@ -79,7 +79,12 @@ use crate::{
             part::{ContentHash, ManifestPart, PartId},
             partition::{PartitionKey, assign_partition, encode_partition_key},
         },
+        opann::{
+            paged::ResidentPageSource,
+            store::{OpannStoreError, load_resident},
+        },
         query::{hierarchical_iter, prune::PruneLeaf},
+        reader_cache::DiskCacheStore,
     },
 };
 
@@ -207,6 +212,10 @@ pub struct Manifest {
     /// Stamped partition strategy before the first list lands, or
     /// when updating strategy without rebuilding options.
     stamped_partition_strategy: Option<PartitionStrategy>,
+    /// Resident OPANN routing tree for this manifest version — loaded once
+    /// (lazily, on first access / open pre-warm) and reused by every query,
+    /// swapping with the manifest. Empty for tables without an OPANN root.
+    opann_tree: OnceCell<Arc<ResidentPageSource>>,
 }
 
 impl fmt::Debug for Manifest {
@@ -249,8 +258,12 @@ impl Manifest {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            let loader = Arc::new(
+                ManifestPartLoader::new(Arc::clone(&storage), &list)
+                    .with_disk_cache(superfile_list.options.disk_cache.clone()),
+            );
             Self {
+                opann_tree: OnceCell::new(),
                 superfile_list,
                 list: Some(list),
                 parts: DashMap::new(),
@@ -259,6 +272,7 @@ impl Manifest {
             }
         } else {
             Self {
+                opann_tree: OnceCell::new(),
                 superfile_list,
                 list: None,
                 parts: DashMap::new(),
@@ -280,6 +294,7 @@ impl Manifest {
     /// `Supertable::create` when no storage is attached.
     pub fn empty(options: Arc<SupertableOptions>) -> Self {
         Self {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList::empty(options),
             list: None,
             parts: DashMap::new(),
@@ -293,6 +308,7 @@ impl Manifest {
         vector_index_storage_prefix: Option<String>,
     ) -> Self {
         Self {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList::empty_with_vector_index_prefix(
                 options,
                 vector_index_storage_prefix,
@@ -426,7 +442,10 @@ impl Manifest {
         }
 
         // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let loader = Arc::new(
+            ManifestPartLoader::new(Arc::clone(&storage), &list)
+                .with_disk_cache(options.disk_cache.clone()),
+        );
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
         if let Some(current_manifest) = &current_manifest {
@@ -520,6 +539,7 @@ impl Manifest {
         new_superfile_list.manifest_id = pointer.manifest_id;
         new_superfile_list.superfiles = all_superfiles;
         let new_manifest = Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(list),
             parts,
@@ -527,7 +547,11 @@ impl Manifest {
             stamped_partition_strategy: None,
         };
 
-        Ok(Arc::new(new_manifest))
+        let manifest = Arc::new(new_manifest);
+        // Prefetch the OPANN routing tree through the disk cache at open — one
+        // load per manifest version, reused (mmap-backed) by every query.
+        let _ = manifest.opann_resident_tree().await;
+        Ok(manifest)
     }
 
     /// Commit a new manifest version.
@@ -659,6 +683,7 @@ impl Manifest {
     /// addressed `Arc::clone` lives in `Supertable::refresh`.
     pub fn with_appended(&self, new_entries: Vec<Arc<SuperfileEntry>>) -> Self {
         Self {
+            opann_tree: OnceCell::new(),
             superfile_list: self.superfile_list.with_appended(new_entries),
             list: self.list.clone(),
             parts: DashMap::new(),
@@ -680,6 +705,7 @@ impl Manifest {
             None => None,
         };
         Self {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: self.manifest_id,
                 options: Arc::clone(&self.options),
@@ -691,6 +717,65 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: Some(strategy),
         }
+    }
+
+    /// The OPANN routing-tree reference for this manifest, if a tree is
+    /// published (`None` ⇒ readers fall back to flat cell selection).
+    pub(crate) fn opann_routing(&self) -> Option<&list::OpannRouting> {
+        self.list.as_ref().and_then(|l| l.opann_routing.as_ref())
+    }
+
+    /// Return a manifest with `opann_routing` set on its list — the drain stamps
+    /// the freshly-built routing-tree root here before publishing. Mirrors
+    /// [`Self::with_partition_strategy`]; leaves the partition strategy untouched.
+    pub(crate) fn with_opann_routing(&self, opann_routing: Option<list::OpannRouting>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.opann_routing = opann_routing;
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            opann_tree: OnceCell::new(),
+        }
+    }
+
+    /// The resident OPANN routing tree for this manifest, loaded once (through
+    /// `load_resident` against this manifest's storage) and reused for every
+    /// query — it swaps with the manifest. `Ok(None)` if there is no OPANN
+    /// routing root or no storage backend.
+    pub(crate) async fn opann_resident_tree(
+        &self,
+    ) -> Result<Option<Arc<ResidentPageSource>>, OpannStoreError> {
+        let Some(routing) = self.opann_routing() else {
+            return Ok(None);
+        };
+        let Some(storage) = self.options.storage.as_ref() else {
+            return Ok(None);
+        };
+        let storage = Arc::clone(storage);
+        // Route page loads through the shared disk cache when attached, so the
+        // routing tree is mmap-backed + evictable like superfile blobs.
+        let cache = self.options.disk_cache.clone();
+        let routing = routing.clone();
+        let source = self
+            .opann_tree
+            .get_or_try_init(|| async move {
+                load_resident(cache.as_ref(), storage.as_ref(), &routing)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Some(Arc::clone(source)))
     }
 
     /// Lazy-load entry point for manifest parts.
@@ -1024,6 +1109,10 @@ impl Manifest {
                 })
                 .collect(),
             partition_strategy: strategy,
+            // Carry the OPANN routing root forward across commits; the drain
+            // stamps a fresh root (via `with_opann_routing`) before this rebuild,
+            // and other commits inherit the prior tree unchanged.
+            opann_routing: self.list.as_ref().and_then(|l| l.opann_routing.clone()),
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
             parts: out_list_entries_after_removal,
         };
@@ -1046,10 +1135,12 @@ impl Manifest {
             superfiles: new_superfile_list,
             vector_index_storage_prefix: None,
         };
-        let loader = opts
-            .storage
-            .as_ref()
-            .map(|storage| Arc::new(ManifestPartLoader::new(storage.clone(), &new_list)));
+        let loader = opts.storage.as_ref().map(|storage| {
+            Arc::new(
+                ManifestPartLoader::new(storage.clone(), &new_list)
+                    .with_disk_cache(opts.disk_cache.clone()),
+            )
+        });
         // Inherit only the cached parts the new list still
         // references — entries for rewritten/removed parts are
         // dropped rather than carried forward, so the in-memory
@@ -1072,6 +1163,7 @@ impl Manifest {
         }
 
         let new_manifest = Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(new_list),
             parts,
@@ -1142,6 +1234,11 @@ pub struct ManifestPartLoader {
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`Manifest`.
     parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// Shared disk cache, when one is attached. Part bytes ride it
+    /// (mmap-backed, content-addressed, evictable) exactly like superfile and
+    /// OPANN-page blobs, so unchanged parts hit a warm mmap across manifest
+    /// versions instead of re-fetching. `None` falls back to a direct GET.
+    disk_cache: Option<Arc<DiskCacheStore>>,
 }
 
 impl ManifestPartLoader {
@@ -1153,7 +1250,16 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
+            disk_cache: None,
         }
+    }
+
+    /// Attach a disk cache so part bytes are pulled through
+    /// [`DiskCacheStore::blob_bytes`]. Builder form keeps the bare `new`
+    /// (used widely in tests) cache-free.
+    pub fn with_disk_cache(mut self, disk_cache: Option<Arc<DiskCacheStore>>) -> Self {
+        self.disk_cache = disk_cache;
+        self
     }
 
     /// Fetch + verify + decode one part. Returns the parsed
@@ -1163,18 +1269,13 @@ impl ManifestPartLoader {
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
-        let (bytes, _) = self
-            .storage
-            .get(uri)
-            .await
-            .map_err(ManifestLoadError::Storage)?;
-        let actual_hash = ContentHash::of(&bytes);
-        if actual_hash != *expected_hash {
-            return Err(ManifestLoadError::ContentHashMismatch {
-                expected: expected_hash.to_hex(),
-                actual: actual_hash.to_hex(),
-            });
-        }
+        let bytes = commit::load_verified_blob(
+            *expected_hash,
+            uri,
+            self.storage.as_ref(),
+            self.disk_cache.as_ref(),
+        )
+        .await?;
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
     }
@@ -1221,6 +1322,10 @@ pub enum ManifestLoadError {
     /// Avro / zstd / version-incompat parse failure.
     #[error("part parse failed")]
     Parse(#[from] part::PartParseError),
+    /// Disk-cache failure loading a content-addressed blob (OPANN routing tree
+    /// page / resident bundle) through [`crate::supertable::reader_cache`].
+    #[error("disk cache blob load: {0}")]
+    DiskCache(String),
 }
 
 /// One superfile's metadata + skip-pruning summaries. The bytes that
@@ -1915,6 +2020,27 @@ impl ClusterCentroids {
             counts,
             radii: radii_out,
         }
+    }
+
+    /// One [`EncodedCellRow`] per cluster, each sharing this block's quantizer —
+    /// the form the encoded-domain centroid kernels (`medoid_index_by`,
+    /// `encoded_ivf_kmeans`, `distance_encoded_rows_symmetric`) consume.
+    /// `stable_id` is the cluster index. Codes/residuals are copied as-is; no
+    /// fp32 vector is reconstructed.
+    pub(crate) fn to_encoded_rows(&self) -> Vec<EncodedCellRow> {
+        (0..self.n_cent as usize)
+            .map(|c| EncodedCellRow {
+                stable_id: c as i128,
+                // EncodedCellRow shares its quantizer as `Arc<[f32]>`; the block
+                // holds one quantizer for all clusters, so every row's `Arc`
+                // wraps a copy of the same shared scale/offset.
+                scale: self.scale.clone().into(),
+                offset: self.offset.clone().into(),
+                codes: self.codes(c).to_vec(),
+                residuals: self.residuals(c).to_vec(),
+                norm_sq: self.norm(c),
+            })
+            .collect()
     }
 
     /// Codes (`dim` u8) for cluster `c`.
@@ -2612,6 +2738,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
             ManifestList {
+                opann_routing: None,
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2643,6 +2770,7 @@ mod tests {
         ) -> Manifest {
             let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
             Manifest {
+                opann_tree: OnceCell::new(),
                 superfile_list: SuperfileList::empty(options_for_test()),
                 list: Some(list),
                 parts: DashMap::new(),
@@ -2841,6 +2969,7 @@ mod tests {
         use list::{ManifestList, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2868,6 +2997,7 @@ mod tests {
             }],
         };
         let m = Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),
@@ -2988,8 +3118,10 @@ mod tests {
 
     fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<Manifest> {
         Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
+                opann_routing: None,
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -3085,6 +3217,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3119,6 +3252,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3232,6 +3366,7 @@ mod tests {
         // entry for partition A (the rewrite candidate); A_old is the
         // frozen older entry; B is an untouched partition.
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3260,6 +3395,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3441,6 +3577,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3475,6 +3612,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3536,6 +3674,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3570,6 +3709,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3669,6 +3809,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3718,6 +3859,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3798,6 +3940,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3850,6 +3993,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3929,6 +4073,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3981,6 +4126,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4081,6 +4227,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4159,6 +4306,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4237,6 +4385,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4270,6 +4419,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4328,6 +4478,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4361,6 +4512,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4435,6 +4587,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4487,6 +4640,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4573,6 +4727,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4625,6 +4780,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4701,6 +4857,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4734,6 +4891,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4783,6 +4941,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4816,6 +4975,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4886,6 +5046,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4938,6 +5099,7 @@ mod tests {
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
         let old_manifest = Arc::new(Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5010,6 +5172,7 @@ mod tests {
             })
             .collect();
         ManifestList {
+            opann_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -5028,6 +5191,7 @@ mod tests {
 
     fn manifest_with_list(list: list::ManifestList) -> Manifest {
         Manifest {
+            opann_tree: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),

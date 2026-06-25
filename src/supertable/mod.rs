@@ -31,6 +31,7 @@ pub mod handle;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;
+pub(crate) mod opann;
 pub(crate) mod optimize;
 pub mod options;
 pub mod query;

@@ -43,8 +43,9 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, split_overflow_cell_after_compaction, try_commit_attempt,
+            OpannRoutingCommit, PreparedSuperfile, ShardOutput, backoff_delay,
+            finalize_compaction_commit, prepare_superfile, split_overflow_cell_after_compaction,
+            try_commit_attempt,
         },
     },
 };
@@ -500,6 +501,7 @@ impl Supertable {
                 &entries_to_remove,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
+                &OpannRoutingCommit::Inherit,
             )
             .await
             {

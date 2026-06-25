@@ -117,7 +117,9 @@ use crate::{
         },
         reader::vector_layout_from_kv,
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            cell_posting::{
+                EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row,
+            },
             distance::Metric,
             ivf_merge::{RoutedCellSubsection, encode_encoded_rows},
             kmeans::kmeans_with_assignments,
@@ -130,10 +132,17 @@ use crate::{
         error::ManifestError,
         manifest::{
             ClusterCentroids, Manifest,
-            commit::get_current_manifest_etag,
-            list::PartitionStrategy,
-            part::{self as part_mod, PartId},
+            commit::{get_current_manifest_etag, put_immutable_blob},
+            list::{CellRoutingParams, OpannRouting, PartitionStrategy},
+            part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
+        },
+        opann::{
+            insert::{LeafInsert, update_tree},
+            page::LeafRef,
+            paged::{OverlayPageSource, ResidentPageSource, SplitPages},
+            store,
+            tree::CentroidTree,
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
@@ -2311,6 +2320,7 @@ async fn persist_superfile_publish_batch_async(
             &batch.to_remove,
             batch.pending_storage_writes,
             Vec::new(),
+            OpannRoutingCommit::Inherit,
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -2350,6 +2360,163 @@ fn maint_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("hidden maintenance rayon pool")
     })
+}
+
+/// Page-node budget per OPANN routing page (a connected subtree of ≤ this many
+/// nodes; descent crosses a page boundary at the cut edges).
+const OPANN_PAGE_MAX_NODES: usize = 4096;
+
+/// One new partition's routing copy for the OPANN tree: the cluster's owning
+/// superfile id, its `(doc_off, count)` range within that superfile's IVF
+/// (`(0, 0)` = the whole partition — one object fetch then scan inside), its
+/// fp32 centroid (the ingestion-surface k-means center / a transient decode of
+/// the cell's stored centroid — never persisted), and its covering radius.
+pub(in crate::supertable) struct PartitionRoutingCopy {
+    pub(in crate::supertable) superfile_id: u128,
+    pub(in crate::supertable) doc_off: u32,
+    pub(in crate::supertable) count: u32,
+    pub(in crate::supertable) centroid_fp32: Vec<f32>,
+    pub(in crate::supertable) radius: f32,
+}
+
+/// How a commit treats the manifest's OPANN routing root.
+pub(crate) enum OpannRoutingCommit {
+    /// Carry the prior routing forward unchanged (no tree change).
+    Inherit,
+    /// Stamp this routing into the committed manifest. `routing` is `Some` for a
+    /// commit that copy-on-write-updated the tree, `None` to clear routing when
+    /// the tree is emptied. `pages` are the changed routing-tree pages
+    /// `(uri, bytes)` — content-addressed immutable blobs written in the commit's
+    /// parallel pre-pointer wave, exactly like manifest parts.
+    Replace {
+        routing: Option<OpannRouting>,
+        pages: Vec<(String, Bytes)>,
+    },
+}
+
+/// Returns [`OpannRoutingCommit::Replace`] with the new root (`None` only when
+/// the tree is emptied), or [`OpannRoutingCommit::Inherit`] when the root is
+/// unchanged and no new pages need writing.
+pub(in crate::supertable) fn opann_routing_commit_from_split(
+    split: Option<SplitPages>,
+    prior_root: Option<ContentHash>,
+    params: CellRoutingParams,
+    bundle: Option<(ContentHash, Vec<u8>)>,
+) -> OpannRoutingCommit {
+    let attach_bundle = |routing: &mut OpannRouting,
+                         pages: &mut Vec<(String, Bytes)>,
+                         bundle: Option<(ContentHash, Vec<u8>)>| {
+        if let Some((hash, bytes)) = bundle {
+            let uri = store::resident_uri(&hash);
+            pages.push((uri.clone(), Bytes::from(bytes)));
+            routing.resident_uri = Some(uri);
+            routing.resident_content_hash = Some(hash);
+        }
+    };
+    match split {
+        Some(split) if !split.pages.is_empty() => {
+            let mut pages: Vec<(String, Bytes)> = split
+                .pages
+                .into_iter()
+                .map(|(hash, bytes)| (store::page_uri(&hash), Bytes::from(bytes)))
+                .collect();
+            let mut routing = OpannRouting {
+                root_page: split.root,
+                routing: params,
+                resident_uri: None,
+                resident_content_hash: None,
+            };
+            attach_bundle(&mut routing, &mut pages, bundle);
+            OpannRoutingCommit::Replace {
+                routing: Some(routing),
+                pages,
+            }
+        }
+        // Root moved but every rewritten page was already on object storage
+        // (content-addressed dedup at a prior commit). Still stamp the new root.
+        Some(split) if Some(split.root) != prior_root => {
+            let mut pages = Vec::new();
+            let mut routing = OpannRouting {
+                root_page: split.root,
+                routing: params,
+                resident_uri: None,
+                resident_content_hash: None,
+            };
+            attach_bundle(&mut routing, &mut pages, bundle);
+            OpannRoutingCommit::Replace {
+                routing: Some(routing),
+                pages,
+            }
+        }
+        Some(_) => OpannRoutingCommit::Inherit,
+        None => OpannRoutingCommit::Replace {
+            routing: None,
+            pages: Vec::new(),
+        },
+    }
+}
+
+/// Copy-on-write-update the OPANN routing tree: drop every leaf whose cell id is
+/// in `removed`, splice in `added`, and return the resulting [`OpannRoutingCommit`]
+/// (the changed pages + new root, or `Inherit` when nothing changed). `root ==
+/// None` (genesis) builds the first tree from `added`.
+pub(in crate::supertable) async fn opann_routing_update(
+    inner: &SupertableInner,
+    current: &Manifest,
+    removed: &[u128],
+    added: &[PartitionRoutingCopy],
+) -> Result<OpannRoutingCommit, BuildError> {
+    let Some(vec_col) = inner.options.vector_columns.first() else {
+        return Ok(OpannRoutingCommit::Inherit);
+    };
+    if removed.is_empty() && added.is_empty() {
+        return Ok(OpannRoutingCommit::Inherit);
+    }
+    let prior = current.opann_routing();
+    let prior_root = prior.map(|r| r.root_page);
+    let params = prior.map(|r| r.routing).unwrap_or_default();
+    let leaves: Vec<LeafInsert> = added
+        .iter()
+        .map(|c| LeafInsert {
+            superfile_id: c.superfile_id,
+            doc_off: c.doc_off,
+            count: c.count,
+            centroid_fp32: c.centroid_fp32.clone(),
+            radius: c.radius,
+        })
+        .collect();
+    // Descend the current tree's resident pages (warm); empty source covers the
+    // genesis case (no prior root).
+    let source = match prior_root {
+        Some(_) => current
+            .opann_resident_tree()
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?
+            .unwrap_or_else(|| Arc::new(ResidentPageSource::from_pages(HashMap::new()))),
+        None => Arc::new(ResidentPageSource::from_pages(HashMap::new())),
+    };
+    let split = update_tree(
+        source.as_ref(),
+        prior_root,
+        vec_col.metric,
+        vec_col.dim,
+        removed,
+        &leaves,
+        OPANN_PAGE_MAX_NODES,
+    )
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    let bundle = split.as_ref().and_then(|s| {
+        if Some(s.root) == prior_root && s.pages.is_empty() {
+            return None;
+        }
+        let overlay = OverlayPageSource::new(source.as_ref(), &s.pages);
+        store::pack_resident_bundle(&overlay, s.root)
+            .ok()
+            .map(|bytes| (ContentHash::of(bytes.as_ref()), bytes))
+    });
+    Ok(opann_routing_commit_from_split(
+        split, prior_root, params, bundle,
+    ))
 }
 
 /// Route every accumulated INCOMING IVF superfile into per-cell delta superfiles.
@@ -2529,6 +2696,32 @@ async fn route_incoming_to_manifest_cells_if_ready(
 
     // Bump per-cell counts so routing sees the now-populated cells.
     let updated_clusters = spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
+    // Each new cell superfile becomes a whole-partition leaf in the OPANN routing
+    // tree: `(doc_off, count) = (0, 0)` (fetch the whole partition, scan inside),
+    // and the leaf centroid is a transient decode of the cell's stored Sq8
+    // centroid — no fp32 persisted.
+    let dim = updated_clusters.dim as usize;
+    let cell_rows = updated_clusters.to_encoded_rows();
+    let added: Vec<PartitionRoutingCopy> = batch
+        .new_entries
+        .iter()
+        .filter_map(|e| {
+            let cell = e.partition_hint? as usize;
+            // Leaf key is the committed superfile UUID (matching opann): the
+            // OPANN leaf-probe path resolves `LeafRef.superfile_id` → its entry
+            // (uri) and issues one direct range-GET per leaf. Each cell
+            // superfile is its own leaf carrying the cell's Sq8 centroid (the
+            // geometric model co-locates same-cell superfiles at the same
+            // centroid); a stale cell index can't address a real object.
+            cell_rows.get(cell).map(|row| PartitionRoutingCopy {
+                superfile_id: e.superfile_id.as_u128(),
+                doc_off: 0,
+                count: 0,
+                centroid_fp32: manifest_centroid_components_from_row(row, dim),
+                radius: updated_clusters.radii.get(cell).copied().unwrap_or(0.0),
+            })
+        })
+        .collect();
     inner
         .manifest
         .store(Arc::new(inner.manifest.load().with_partition_strategy(
@@ -2539,7 +2732,14 @@ async fn route_incoming_to_manifest_cells_if_ready(
             },
         )));
 
-    // Publish: add the cell superfiles, remove the routed incoming superfiles.
+    // Copy-on-write-update the OPANN routing tree with the new cell leaves (or
+    // build the genesis tree when there is no prior root). The changed pages +
+    // new root ride the commit's blob wave + pointer flip below.
+    let current = inner.manifest.load_full();
+    let opann_commit = opann_routing_update(&inner, &current, &[], &added).await?;
+
+    // Publish: add the cell superfiles, remove the routed incoming superfiles,
+    // and stamp the new routing root.
     let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
@@ -2547,6 +2747,7 @@ async fn route_incoming_to_manifest_cells_if_ready(
         &incoming,
         batch.pending_storage_writes,
         Vec::new(),
+        opann_commit,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -2835,6 +3036,19 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
             },
         )));
 
+    // Drop the stale neighborhood leaves from the OPANN routing tree: their
+    // superfiles are removed by this commit (rows staged to INCOMING), and the
+    // new per-cell superfiles are minted — and re-added as leaves keyed by
+    // their committed superfile UUID — by the step-9 redrive below. This is the
+    // grow-on-split path: each overflow split CoW-edits the tree (N→N+1 cells)
+    // instead of inheriting a stale root, so a table can start at a few coarse
+    // cells and let `optimize` grow the tree as cells overflow.
+    let removed: Vec<u128> = to_remove.iter().map(|e| e.superfile_id.as_u128()).collect();
+    let current = inner.manifest.load_full();
+    let opann_commit = opann_routing_update(&inner, &current, &removed, &[])
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+
     let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
@@ -2842,6 +3056,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         &to_remove,
         batch.pending_storage_writes,
         Vec::new(),
+        opann_commit,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -2888,6 +3103,7 @@ async fn publish_hidden_incoming_async(
         &prep.batch.to_remove,
         prep.batch.pending_storage_writes,
         Vec::new(),
+        OpannRoutingCommit::Inherit,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -2987,6 +3203,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
+    opann_routing: OpannRoutingCommit,
 ) -> Result<Manifest, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -3005,6 +3222,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 entries_to_remove,
                 pending_writes,
                 pending_replaces,
+                &opann_routing,
             )
             .await
             {
@@ -3044,6 +3262,7 @@ pub(in crate::supertable) fn persist_commit(
         entries_to_remove,
         pending_storage_writes,
         pending_storage_replaces,
+        OpannRoutingCommit::Inherit,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(Arc::new(new_manifest));
@@ -3223,6 +3442,7 @@ pub(crate) async fn try_commit_attempt(
     entries_to_remove: &[Arc<SuperfileEntry>],
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+    opann_routing: &OpannRoutingCommit,
 ) -> Result<Manifest, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -3238,10 +3458,28 @@ pub(crate) async fn try_commit_attempt(
         .update(new_entries, entries_to_remove)
         .await?;
 
+    // 2a. Apply the OPANN routing update: stamp the new routing root into the
+    //     committed manifest and collect the changed routing-tree pages, written
+    //     below as content-addressed immutable blobs before the pointer flip.
+    let (new_manifest, page_blobs): (Manifest, &[(String, Bytes)]) = match opann_routing {
+        OpannRoutingCommit::Inherit => (new_manifest, &[]),
+        OpannRoutingCommit::Replace { routing, pages } => {
+            (new_manifest.with_opann_routing(routing.clone()), pages.as_slice())
+        }
+    };
+
     // 3. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial
     //    commit).
     let prev_etag = get_current_manifest_etag(&storage, current_manifest).await?;
+
+    // 3a. Write the changed routing-tree pages — durable before the pointer that
+    //     references the new root. Content-addressed; benign collision on retry.
+    for (uri, bytes) in page_blobs {
+        put_immutable_blob(storage.as_ref(), uri, bytes.clone())
+            .await
+            .map_err(SupertableCommitError::Storage)?;
+    }
 
     // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).

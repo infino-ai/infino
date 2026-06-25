@@ -830,8 +830,11 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Default number of global vector-index cells for routed search.
-pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+/// Default number of global vector-index cells for routed search. Sized so each
+/// cell is a tight geometric region (≈ one natural cluster at 1M docs) — fine
+/// cells concentrate a query's neighbors so a few probes hit ≈full recall. The
+/// OPANN routing tree keeps cell selection sublinear as this grows toward 1T.
+pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 1024;
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
 /// region. Each hidden commit writes one IVF superfile under this sentinel
