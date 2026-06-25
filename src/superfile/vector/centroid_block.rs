@@ -22,6 +22,8 @@
 //! cluster-major order. The query is scored against any centroid with
 //! [`Sq8ResidualKernel`] — never an fp32 decode — exactly as cell rows are.
 
+use std::sync::Arc;
+
 use crate::superfile::vector::{
     cell_posting::{EncodedCellRow, ROW_BYTES_PER_DIM, encode_rows, encoded_component_at},
     distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
@@ -243,12 +245,10 @@ impl<'a> CentroidBlock<'a> {
     /// Decode storage row `r` to fp32 via the shared scale/offset and the row's
     /// codes/residuals — the inverse of [`encode_rows`].
     fn row_components(&self, r: usize) -> Vec<f32> {
-        let scale = self.scale();
-        let offset = self.offset();
         let row = EncodedCellRow {
             stable_id: 0,
-            scale,
-            offset,
+            scale: Arc::from(self.scale()),
+            offset: Arc::from(self.offset()),
             codes: self.codes(r).to_vec(),
             residuals: self.residuals(r).to_vec(),
             norm_sq: None,

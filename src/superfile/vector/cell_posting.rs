@@ -6,7 +6,7 @@
 //! One superfile carries one cell's postings. Cold read = one range GET on
 //! `inf.vec.offset..+length`, then scan/rerank in memory.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 
 use roaring::RoaringBitmap;
 
@@ -622,20 +622,12 @@ pub(crate) fn encode_sq8_residual_dim(
 #[derive(Debug, Clone)]
 pub struct EncodedCellRow {
     pub stable_id: i128,
-    pub scale: Vec<f32>,
-    pub offset: Vec<f32>,
+    /// Shared per-IVF-cluster quantizer; [`Arc`] avoids cloning `dim` fp32s per row on drain.
+    pub scale: Arc<[f32]>,
+    pub offset: Arc<[f32]>,
     pub codes: Vec<u8>,
     pub residuals: Vec<u8>,
     pub norm_sq: Option<f32>,
-}
-
-/// How [`super::builder::VectorBuilder`] re-encodes materialized IVF rows on finish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MaterializedRebuildMode {
-    /// Full Lloyd k-means + reassignment (maintenance / split redrive).
-    Maintenance,
-    /// Incoming drain: preserve source IVF cluster assignment, medoid centroids only.
-    IncomingDrain,
 }
 
 /// One IVF row for Sq8-native maintenance rebuilds: preserved 1-bit RaBitQ estimate
@@ -668,11 +660,14 @@ pub(crate) fn cluster_quant_from_medoid(
     metric: Metric,
     dim: usize,
     bucket: &[&MaterializedIvfRow],
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Arc<[f32]>, Arc<[f32]>) {
     debug_assert!(!bucket.is_empty());
     let encoded: Vec<EncodedCellRow> = bucket.iter().map(|r| r.encoded.clone()).collect();
     let mid = medoid_index_symmetric(metric, dim, &encoded);
-    (encoded[mid].scale.clone(), encoded[mid].offset.clone())
+    (
+        Arc::clone(&encoded[mid].scale),
+        Arc::clone(&encoded[mid].offset),
+    )
 }
 
 /// Medoid Sq8+ε row in `bucket` folded to fp32 centroid components for IVF headers.
@@ -810,94 +805,6 @@ pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: u
     (0..dim).map(|d| encoded_component_at(row, d)).collect()
 }
 
-/// Lloyd k-means on Sq8+ε rows for internal IVF centroid training during maintenance.
-pub(crate) fn encoded_ivf_kmeans(
-    rows: &[EncodedCellRow],
-    metric: Metric,
-    k: usize,
-    iters: usize,
-) -> (Vec<f32>, Vec<usize>) {
-    if rows.is_empty() || k == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let dim = rows[0].codes.len();
-    let k = k.min(rows.len());
-
-    let mut medoid_indices: Vec<usize> = Vec::with_capacity(k);
-    medoid_indices.push(0);
-    while medoid_indices.len() < k {
-        let mut best_idx = 0usize;
-        let mut best_min = f32::NEG_INFINITY;
-        for (i, row) in rows.iter().enumerate() {
-            if medoid_indices.contains(&i) {
-                continue;
-            }
-            let min_d = medoid_indices
-                .iter()
-                .map(|&s| distance_encoded_rows_symmetric(metric, dim, row, &rows[s]))
-                .fold(f32::INFINITY, f32::min);
-            if min_d > best_min {
-                best_min = min_d;
-                best_idx = i;
-            }
-        }
-        medoid_indices.push(best_idx);
-    }
-
-    let mut assign = vec![0usize; rows.len()];
-    for _ in 0..iters {
-        for (i, row) in rows.iter().enumerate() {
-            let mut best_c = 0usize;
-            let mut best_score = f32::INFINITY;
-            for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
-                let score = distance_encoded_rows_symmetric(metric, dim, row, &rows[mid]);
-                if score < best_score {
-                    best_score = score;
-                    best_c = c;
-                }
-            }
-            assign[i] = best_c;
-        }
-        for (c, slot) in medoid_indices.iter_mut().enumerate().take(k) {
-            let shard: Vec<usize> = assign
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| **a == c)
-                .map(|(i, _)| i)
-                .collect();
-            if shard.is_empty() {
-                continue;
-            }
-            let shard_rows: Vec<EncodedCellRow> = shard.iter().map(|&i| rows[i].clone()).collect();
-            let local_m = medoid_index_symmetric(metric, dim, &shard_rows);
-            *slot = shard[local_m];
-        }
-    }
-
-    // Final assignment against the converged medoids: the loop's last `assign`
-    // pass ran before the final medoid update, so re-assign once more so the
-    // returned shards match the returned centroids.
-    for (i, row) in rows.iter().enumerate() {
-        let mut best_c = 0usize;
-        let mut best_score = f32::INFINITY;
-        for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
-            let score = distance_encoded_rows_symmetric(metric, dim, row, &rows[mid]);
-            if score < best_score {
-                best_score = score;
-                best_c = c;
-            }
-        }
-        assign[i] = best_c;
-    }
-
-    let mut out = vec![0f32; k * dim];
-    for (c, &mid) in medoid_indices.iter().enumerate().take(k) {
-        let fp32 = manifest_centroid_components_from_row(&rows[mid], dim);
-        out[c * dim..(c + 1) * dim].copy_from_slice(&fp32);
-    }
-    (out, assign)
-}
-
 /// Load live Sq8+ε rows from a cell-posting blob aligned with scalar `_id` order.
 pub fn load_encoded_rows_from_blob(
     bytes: &[u8],
@@ -923,8 +830,8 @@ pub fn load_encoded_rows_from_blob(
             let norm_sq = posting.per_doc_norms.as_ref().map(|norms| norms[local_row]);
             out.push(EncodedCellRow {
                 stable_id: stable_ids[row_idx],
-                scale: posting.scale.clone(),
-                offset: posting.offset.clone(),
+                scale: Arc::from(posting.scale.clone()),
+                offset: Arc::from(posting.offset.clone()),
                 codes,
                 residuals,
                 norm_sq,

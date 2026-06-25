@@ -2095,8 +2095,8 @@ impl ClusterCentroids {
     pub fn dequantize_into(&self, c: usize, out: &mut [f32]) {
         let row = EncodedCellRow {
             stable_id: 0,
-            scale: self.scale.clone(),
-            offset: self.offset.clone(),
+            scale: Arc::from(self.scale.clone()),
+            offset: Arc::from(self.offset.clone()),
             codes: self.codes(c).to_vec(),
             residuals: self.residuals(c).to_vec(),
             norm_sq: None,

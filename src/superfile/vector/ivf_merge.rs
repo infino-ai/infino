@@ -8,6 +8,7 @@
 //! differs from the destination — no fp32 corpus buffer and no re-kmeans.
 
 use bytemuck::cast_slice;
+use std::sync::Arc;
 
 use crate::superfile::{
     BuildError,
@@ -304,8 +305,8 @@ pub(crate) fn merge_sq8_ivf_subsections(
                         } else {
                             let encoded = EncodedCellRow {
                                 stable_id: 0,
-                                scale: src_scale.to_vec(),
-                                offset: src_offset.to_vec(),
+                                scale: Arc::from(src_scale.to_vec()),
+                                offset: Arc::from(src_offset.to_vec()),
                                 codes: inp.sub[rowb..rowb + dim].to_vec(),
                                 residuals: inp.sub[rowb + dim..rowb + dim + dim].to_vec(),
                                 norm_sq: None,

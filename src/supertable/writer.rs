@@ -117,7 +117,7 @@ use crate::{
         },
         reader::vector_layout_from_kv,
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow, MaterializedRebuildMode},
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::Metric,
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -310,19 +310,34 @@ fn align_materialized_rows_in_doc_order(
     stable_ids_by_local: &[i128],
     tombstones: Option<&roaring::RoaringBitmap>,
 ) -> Vec<MaterializedIvfRow> {
+    if let Some(bm) = tombstones {
+        rows.retain(|r| !bm.contains(r.local_doc_id));
+    }
     let n_rows = stable_ids_by_local.len();
-    let mut by_local = vec![None; n_rows];
-    for row in &mut rows {
-        if tombstones.is_some_and(|bm| bm.contains(row.local_doc_id)) {
-            continue;
-        }
-        let slot = row.local_doc_id as usize;
-        if slot < n_rows {
+    // Dense local ids: sort into doc order without per-slot clones.
+    if rows.len() == n_rows {
+        rows.sort_by_key(|r| r.local_doc_id);
+        for (local, row) in rows.iter_mut().enumerate() {
             if row.stable_id == 0 {
+                row.stable_id = stable_ids_by_local[local];
+                row.encoded.stable_id = row.stable_id;
+            }
+            row.local_doc_id = local as u32;
+        }
+        return rows;
+    }
+    let mut by_local: Vec<Option<MaterializedIvfRow>> = vec![None; n_rows];
+    for mut row in rows {
+        if row.stable_id == 0 {
+            let slot = row.local_doc_id as usize;
+            if slot < n_rows {
                 row.stable_id = stable_ids_by_local[slot];
                 row.encoded.stable_id = row.stable_id;
             }
-            by_local[slot] = Some(row.clone());
+        }
+        let slot = row.local_doc_id as usize;
+        if slot < n_rows {
+            by_local[slot] = Some(row);
         }
     }
     by_local
@@ -2455,6 +2470,29 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .clone()
         .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
+    // Open every INCOMING superfile first so bytes are mmap-resident before
+    // materialize (sync fast path); avoids cold subsection GETs on drain.
+    stream::iter(incoming.iter().map(|entry| {
+        let entry = Arc::clone(entry);
+        let store = Arc::clone(&store);
+        let disk_cache = disk_cache.clone();
+        let storage_opt = storage_opt.clone();
+        async move {
+            open_incoming_superfile_for_drain(
+                &store,
+                disk_cache.as_ref(),
+                storage_opt.as_ref(),
+                &entry,
+            )
+            .await
+        }
+    }))
+    .buffered(commit_write_concurrency())
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, BuildError>>()?;
+
     // Read Sq8+ε IVF rows from each incoming superfile. Prefer the in-memory
     // store / mmap-backed compaction opener so drain avoids cold object-store
     // GETs when INCOMING bytes are still resident from the recent commit.
@@ -2484,52 +2522,53 @@ async fn route_incoming_to_manifest_cells_if_ready(
     .await
     .into_iter()
     .collect::<Result<Vec<_>, BuildError>>()?;
-    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for mut rows in row_sets {
-        all_materialized.append(&mut rows);
-    }
 
-    // Assign rows to cells and build one IVF superfile per touched cell.
+    // Assign rows to cells and build one LIRE delta superfile per touched cell.
+    let inner = Arc::clone(&inner);
     let (prepared, cell_updates, radii_updates): (
         Vec<PreparedSuperfile>,
         HashMap<u32, u32>,
         HashMap<u32, f32>,
-    ) = maint_pool().install(|| -> Result<_, BuildError> {
+    ) = inner.options.writer_pool.install(|| -> Result<_, BuildError> {
         let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-        for row in all_materialized {
-            let cell = if let Some(cands) = assign_among {
-                spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
-            } else {
-                spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
-            };
-            by_cell.entry(cell).or_default().push(row);
+        for rows in row_sets {
+            for row in rows {
+                let cell = if let Some(cands) = assign_among {
+                    spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
+                } else {
+                    spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
+                };
+                by_cell.entry(cell).or_default().push(row);
+            }
         }
-        let mut prepared: Vec<PreparedSuperfile> = Vec::new();
-        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-        let mut radii_updates: HashMap<u32, f32> = HashMap::new();
-        for (cell_id, mut rows) in by_cell {
-            if rows.is_empty() {
-                continue;
-            }
-            rows.sort_by_key(|r| r.stable_id);
-            for (local, row) in rows.iter_mut().enumerate() {
-                row.local_doc_id = local as u32;
-            }
-            let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
-            let added = rows.len() as u32;
-            let shard_radius =
-                spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
+        let built: Result<Vec<(PreparedSuperfile, u32, u32, f32)>, BuildError> = by_cell
+            .into_par_iter()
+            .map(|(cell_id, mut rows)| {
+                if rows.is_empty() {
+                    return Err(BuildError::NoDocsToBuild);
+                }
+                rows.sort_by_key(|r| r.stable_id);
+                for (local, row) in rows.iter_mut().enumerate() {
+                    row.local_doc_id = local as u32;
+                }
+                let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
+                let added = rows.len() as u32;
+                let shard_radius =
+                    spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
+                let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
+                let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
+                Ok((p, cell_id, base.saturating_add(added), shard_radius))
+            })
+            .collect();
+        let built = built?;
+        let mut prepared = Vec::with_capacity(built.len());
+        let mut cell_updates = HashMap::new();
+        let mut radii_updates = HashMap::new();
+        for (p, cell_id, count, shard_radius) in built {
             if shard_radius > 0.0 {
                 radii_updates.insert(cell_id, shard_radius);
             }
-            let p = build_prepared_ivf_from_materialized(
-                &inner,
-                cell_id,
-                rows,
-                MaterializedRebuildMode::IncomingDrain,
-            )?;
-            let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
-            cell_updates.insert(cell_id, base.saturating_add(added));
+            cell_updates.insert(cell_id, count);
             prepared.push(p);
         }
         Ok((prepared, cell_updates, radii_updates))
@@ -2563,6 +2602,16 @@ async fn route_incoming_to_manifest_cells_if_ready(
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
     inner.manifest.store(Arc::new(new_manifest));
+
+    if let Some(cache) = inner.options.disk_cache.as_ref() {
+        warm_cache_inserts(cache, batch.pending_cache_inserts).await;
+    }
+    if let (Some(cache), Some(budget)) = (
+        inner.options.disk_cache.as_ref(),
+        inner.options.memory_budget_bytes,
+    ) {
+        cache.sweep_for_budget(budget);
+    }
 
     schedule_background_storage_reclaim(Arc::clone(&inner));
     Ok(())
@@ -2609,12 +2658,11 @@ fn build_prepared_ivf_from_materialized(
     inner: &SupertableInner,
     partition_hint: u32,
     rows: Vec<MaterializedIvfRow>,
-    mode: MaterializedRebuildMode,
 ) -> Result<PreparedSuperfile, BuildError> {
     if rows.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
-    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf, mode)?;
+    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
     Ok(PreparedSuperfile {
@@ -2631,7 +2679,6 @@ fn build_one_shard_from_materialized(
     rows: &[MaterializedIvfRow],
     options: &SupertableOptions,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
-    mode: MaterializedRebuildMode,
 ) -> Result<ShardOutput, BuildError> {
     let id_array = Decimal128Array::from_iter_values(rows.iter().map(|r| r.stable_id))
         .with_precision_and_scale(
@@ -2648,7 +2695,7 @@ fn build_one_shard_from_materialized(
     let mut builder =
         SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
     builder.add_batch_ids_only(&scalar)?;
-    builder.load_materialized_ivf_rows(rows.to_vec(), mode)?;
+    builder.load_materialized_ivf_rows(rows.to_vec())?;
 
     let id_min = rows.iter().map(|r| r.stable_id).min().unwrap_or(0);
     let id_max = rows.iter().map(|r| r.stable_id).max().unwrap_or(0);
@@ -2758,7 +2805,6 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
             &inner,
             super::handle::INCOMING_VECTOR_CELL,
             rows,
-            MaterializedRebuildMode::Maintenance,
         )
     })?;
 
