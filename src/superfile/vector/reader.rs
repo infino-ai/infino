@@ -1035,7 +1035,8 @@ impl VectorReader {
             }
             let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
             let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
-            if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
+            if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes
+            {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
                      bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
@@ -1361,11 +1362,12 @@ impl VectorReader {
                     region.len()
                 ))));
             }
-            let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end]
-                .try_into()
-                .map_err(|_| VectorError::Read(ReadError::MalformedVersion(
-                    "inline stable_id region slice".into(),
-                )))?;
+            let arr: [u8; format::vec::STABLE_ID_BYTES] =
+                region[p..end].try_into().map_err(|_| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "inline stable_id region slice".into(),
+                    ))
+                })?;
             out.push(i128::from_le_bytes(arr));
         }
         Ok(Some(out))
@@ -1566,51 +1568,6 @@ impl VectorReader {
             .range_async(col.subsection_range.clone())
             .await
             .ok()?;
-        Some(Self::parse_materialized_index_rows(
-            col,
-            sub.as_ref(),
-            &scale_buf,
-            &offset_buf,
-        ))
-    }
-
-    /// Sync read-back for incoming drain when the subsection and Sq8 meta are
-    /// resident (`try_get_range_sync`). Avoids cold object-store GETs on the
-    /// hot drain path after commit or disk-cache warm.
-    pub(crate) fn materialized_index_rows_sync(
-        &self,
-        index_name: &str,
-    ) -> Option<Vec<MaterializedIvfRow>> {
-        let cid = *self.column_id_by_name.get(index_name)?;
-        let col = &self.columns[cid as usize];
-        if col.rerank_codec != RerankCodec::Sq8Residual {
-            return None;
-        }
-        let dim = col.dim;
-        let so_block_bytes = (col.n_cent as usize) * dim * 4;
-        let (scale_buf, offset_buf) = match &col.sq8_meta {
-            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
-            Some(Sq8ColumnMeta::Lazy {
-                scale_abs_off,
-                offset_abs_off,
-                ..
-            }) => {
-                let scale_bytes = self
-                    .source
-                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)?;
-                let offset_bytes = self
-                    .source
-                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)?;
-                (
-                    parse_f32_le_vec(scale_bytes.as_ref()),
-                    parse_f32_le_vec(offset_bytes.as_ref()),
-                )
-            }
-            _ => return None,
-        };
-        let sub = self
-            .source
-            .try_get_range_sync(col.subsection_range.clone())?;
         Some(Self::parse_materialized_index_rows(
             col,
             sub.as_ref(),
@@ -2005,8 +1962,7 @@ impl VectorReader {
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
         let mut filtered_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(cluster_meta.len());
-        let mut cluster_prefix_ranges: Vec<Range<usize>> =
-            Vec::with_capacity(cluster_meta.len());
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(cluster_meta.len());
         for &(c, off, cnt) in cluster_meta {
             if cnt == 0 {
                 continue;

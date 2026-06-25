@@ -52,7 +52,7 @@ use std::{
     collections::HashMap,
     fmt, io,
     marker::PhantomData,
-    mem,
+    mem, slice,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -119,6 +119,7 @@ use crate::{
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::Metric,
+            ivf_merge::{RoutedCellSubsection, encode_encoded_rows},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
@@ -136,9 +137,7 @@ use crate::{
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::{
-                stable_ids_by_local_for_routing, stable_ids_for_incoming_drain_resident,
-            },
+            vector::stable_ids_by_local_for_routing,
         },
         reader_cache::DiskCacheStore,
     },
@@ -373,20 +372,6 @@ async fn materialized_ivf_rows_in_doc_order(
     ))
 }
 
-fn materialized_ivf_rows_in_doc_order_sync(
-    vec_reader: &VectorReader,
-    column: &str,
-    stable_ids_by_local: &[i128],
-    tombstones: Option<&roaring::RoaringBitmap>,
-) -> Option<Vec<MaterializedIvfRow>> {
-    let rows = vec_reader.materialized_index_rows_sync(column)?;
-    Some(align_materialized_rows_in_doc_order(
-        rows,
-        stable_ids_by_local,
-        tombstones,
-    ))
-}
-
 async fn open_incoming_superfile_for_drain(
     store: &Arc<dyn crate::supertable::reader_cache::SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -412,34 +397,6 @@ async fn open_incoming_superfile_for_drain(
     SuperfileReader::open(bytes)
         .map(Arc::new)
         .map_err(|e| BuildError::Store(e.to_string()))
-}
-
-async fn load_incoming_materialized_rows_for_drain(
-    store: &Arc<dyn crate::supertable::reader_cache::SuperfileReaderCache>,
-    disk_cache: Option<&Arc<DiskCacheStore>>,
-    storage: Option<&Arc<dyn StorageProvider>>,
-    manifest: &Arc<Manifest>,
-    entry: &Arc<SuperfileEntry>,
-    column: &str,
-) -> Result<Vec<MaterializedIvfRow>, BuildError> {
-    let reader =
-        open_incoming_superfile_for_drain(store, disk_cache, storage, entry).await?;
-    if let Ok(stable_ids) = stable_ids_for_incoming_drain_resident(entry, &reader) {
-        if let Some(vec_reader) = reader.vec() {
-            if let Some(rows) =
-                materialized_ivf_rows_in_doc_order_sync(vec_reader, column, &stable_ids, None)
-            {
-                return Ok(rows);
-            }
-        }
-    }
-    let stable_ids = stable_ids_by_local_for_routing(manifest, entry, &reader)
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-    let vec_reader = reader
-        .vec()
-        .ok_or_else(|| BuildError::Store("incoming superfile missing vector index".into()))?;
-    materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, None).await
 }
 
 /// One commit's hidden-index batch, ready to build into a single
@@ -726,7 +683,8 @@ fn bootstrap_centroids_from_batch(
     for &a in &assignments {
         counts[a as usize] += 1;
     }
-    let clusters = ClusterCentroids::from_fp32(metric, k as u32, vec_dim as u32, &centroids, counts);
+    let clusters =
+        ClusterCentroids::from_fp32(metric, k as u32, vec_dim as u32, &centroids, counts);
     Some(clusters.clone().with_radii(per_cell_radii(
         &clusters,
         &vectors,
@@ -2470,9 +2428,10 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .clone()
         .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
-    // Open every INCOMING superfile first so bytes are mmap-resident before
-    // materialize (sync fast path); avoids cold subsection GETs on drain.
-    stream::iter(incoming.iter().map(|entry| {
+    // Open every INCOMING superfile first so bytes are mmap-resident before the
+    // byte-splice drain (sync fast path); avoids cold subsection GETs on drain.
+    // Keep the readers alive: `encode_encoded_rows` borrows their `VectorReader`s.
+    let readers: Vec<Arc<SuperfileReader>> = stream::iter(incoming.iter().map(|entry| {
         let entry = Arc::clone(entry);
         let store = Arc::clone(&store);
         let disk_cache = disk_cache.clone();
@@ -2493,86 +2452,76 @@ async fn route_incoming_to_manifest_cells_if_ready(
     .into_iter()
     .collect::<Result<Vec<_>, BuildError>>()?;
 
-    // Read Sq8+ε IVF rows from each incoming superfile. Prefer the in-memory
-    // store / mmap-backed compaction opener so drain avoids cold object-store
-    // GETs when INCOMING bytes are still resident from the recent commit.
-    let manifest = inner.manifest.load_full();
-    let column_name = column.clone();
-    let row_sets = stream::iter(incoming.iter().map(|entry| {
-        let entry = Arc::clone(entry);
-        let store = Arc::clone(&store);
-        let disk_cache = disk_cache.clone();
-        let storage_opt = storage_opt.clone();
-        let manifest = Arc::clone(&manifest);
-        let column_name = column_name.clone();
-        async move {
-            load_incoming_materialized_rows_for_drain(
-                &store,
-                disk_cache.as_ref(),
-                storage_opt.as_ref(),
-                &manifest,
-                &entry,
-                &column_name,
-            )
+    // Incoming superfiles are streaming-built and carry NO inline `_id` region,
+    // so the byte-splice cannot read stable ids from the subsection bytes.
+    // Resolve each reader's per-local stable `_id` here (scalar `_id` column /
+    // span arithmetic — the same path the query remap uses), in the SAME order
+    // as `readers`, and hand them to the splice below. This await must happen
+    // before the sync `writer_pool.install` scope, which cannot await.
+    let mut stable_ids_per_input: Vec<Vec<i128>> = Vec::with_capacity(readers.len());
+    for (entry, reader) in incoming.iter().zip(readers.iter()) {
+        let ids = stable_ids_by_local_for_routing(&manifest, entry.as_ref(), reader.as_ref())
             .await
-        }
-    }))
-    .buffered(commit_write_concurrency())
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, BuildError>>()?;
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        stable_ids_per_input.push(ids);
+    }
 
-    // Assign rows to cells and build one LIRE delta superfile per touched cell.
+    // Assign rows to cells by byte-splicing each routed Sq8+ε row verbatim into
+    // its destination cell's subsection — no re-quantization, so recall is
+    // preserved exactly. The materialized rebuild path is bypassed entirely.
     let inner = Arc::clone(&inner);
+    let column_name = column.clone();
     let (prepared, cell_updates, radii_updates): (
         Vec<PreparedSuperfile>,
         HashMap<u32, u32>,
         HashMap<u32, f32>,
-    ) = inner.options.writer_pool.install(|| -> Result<_, BuildError> {
-        let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-        for rows in row_sets {
-            for row in rows {
+    ) = inner
+        .options
+        .writer_pool
+        .install(|| -> Result<_, BuildError> {
+            let mut merge_inputs: Vec<(&VectorReader, &str)> = Vec::with_capacity(readers.len());
+            for reader in &readers {
+                let v = reader.vec().ok_or_else(|| {
+                    BuildError::Store("incoming superfile missing vector index".into())
+                })?;
+                merge_inputs.push((v, column_name.as_str()));
+            }
+
+            // Route each row to its cell and report the member's distance to that
+            // cell's centroid. Pure (no shared state) so `encode_encoded_rows` can
+            // run the routing pass in parallel on the ambient pool (this whole block
+            // is under `writer_pool.install`, the half-cores pool); it reduces these
+            // distances into a per-cell max radius carried on each returned
+            // `RoutedCellSubsection`.
+            let route = |row: &EncodedCellRow| -> (u32, f32) {
                 let cell = if let Some(cands) = assign_among {
-                    spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
+                    spfresh::nearest_among_cells_encoded(&clusters, metric, cands, row)
                 } else {
-                    spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
+                    spfresh::nearest_cell_encoded(&clusters, metric, row)
                 };
-                by_cell.entry(cell).or_default().push(row);
-            }
-        }
-        let built: Result<Vec<(PreparedSuperfile, u32, u32, f32)>, BuildError> = by_cell
-            .into_par_iter()
-            .map(|(cell_id, mut rows)| {
-                if rows.is_empty() {
-                    return Err(BuildError::NoDocsToBuild);
-                }
-                rows.sort_by_key(|r| r.stable_id);
-                for (local, row) in rows.iter_mut().enumerate() {
-                    row.local_doc_id = local as u32;
-                }
-                let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
-                let added = rows.len() as u32;
-                let shard_radius =
-                    spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
-                let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
+                let dist =
+                    spfresh::encoded_shard_radius(&clusters, metric, cell, slice::from_ref(row));
+                (cell, dist)
+            };
+            let routed = encode_encoded_rows(&merge_inputs, &stable_ids_per_input, route)?;
+
+            let mut prepared = Vec::with_capacity(routed.len());
+            let mut cell_updates = HashMap::new();
+            let mut radii_updates = HashMap::new();
+            for (cell_id, routed_cell) in routed {
+                let added = routed_cell.subsection.n_docs;
+                // Read before the value is consumed by the splice-publish below.
+                let shard_radius = routed_cell.shard_radius;
+                let p = build_prepared_ivf_from_spliced(&inner, cell_id, routed_cell)?;
                 let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
-                Ok((p, cell_id, base.saturating_add(added), shard_radius))
-            })
-            .collect();
-        let built = built?;
-        let mut prepared = Vec::with_capacity(built.len());
-        let mut cell_updates = HashMap::new();
-        let mut radii_updates = HashMap::new();
-        for (p, cell_id, count, shard_radius) in built {
-            if shard_radius > 0.0 {
-                radii_updates.insert(cell_id, shard_radius);
+                if shard_radius > 0.0 {
+                    radii_updates.insert(cell_id, shard_radius);
+                }
+                cell_updates.insert(cell_id, base.saturating_add(added));
+                prepared.push(p);
             }
-            cell_updates.insert(cell_id, count);
-            prepared.push(p);
-        }
-        Ok((prepared, cell_updates, radii_updates))
-    })?;
+            Ok((prepared, cell_updates, radii_updates))
+        })?;
     if prepared.is_empty() {
         return Ok(());
     }
@@ -2663,6 +2612,76 @@ fn build_prepared_ivf_from_materialized(
         return Err(BuildError::NoDocsToBuild);
     }
     let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
+    let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+    let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
+    Ok(PreparedSuperfile {
+        entry,
+        bytes_for_store: prepared.bytes_for_store,
+        bytes_for_storage: prepared.bytes_for_storage,
+        bytes_for_cache: prepared.bytes_for_cache,
+    })
+}
+
+/// Build one cell's Sq8 IVF superfile from a byte-spliced subsection — no
+/// re-quantization. The IVF subsection (codes + rerank bytes) is injected
+/// verbatim via [`SuperfileBuilder::set_prebuilt_ivf_subsection`]; the scalar
+/// `_id` batch is written in the same `local_doc_id` order the subsection used,
+/// so the superfile's id pages line up with the IVF rows.
+fn build_one_shard_from_spliced(
+    routed: RoutedCellSubsection,
+    options: &SupertableOptions,
+) -> Result<ShardOutput, BuildError> {
+    let RoutedCellSubsection {
+        subsection,
+        stable_ids,
+        // The drain reads `shard_radius` off the value before this point; the
+        // per-shard build only needs the subsection bytes + id order.
+        shard_radius: _,
+    } = routed;
+    if stable_ids.is_empty() {
+        return Err(BuildError::NoDocsToBuild);
+    }
+    let id_array = Decimal128Array::from_iter_values(stable_ids.iter().copied())
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+    let scalar = RecordBatch::try_new(
+        options.scalar_schema(),
+        vec![Arc::new(id_array) as ArrayRef],
+    )
+    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+    let mut builder = SuperfileBuilder::new(
+        options
+            .builder_options()
+            .with_vector_layout(VectorLayout::Ivf),
+    )?;
+    builder.add_batch_ids_only(&scalar)?;
+    builder.set_prebuilt_ivf_subsection(0, subsection)?;
+
+    let id_min = stable_ids.iter().copied().min().unwrap_or(0);
+    let id_max = stable_ids.iter().copied().max().unwrap_or(0);
+    let n_docs = stable_ids.len() as u64;
+    let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
+    let bytes = Bytes::from(builder.finish()?);
+
+    Ok(ShardOutput {
+        bytes,
+        n_docs,
+        id_min,
+        id_max,
+        scalar_stats,
+    })
+}
+
+/// Build one cell's Sq8 IVF superfile from a byte-spliced subsection and finish
+/// its manifest entry (carrying the cell partition hint). Drain fast path:
+/// preserves rerank bytes verbatim, so recall is unchanged.
+fn build_prepared_ivf_from_spliced(
+    inner: &SupertableInner,
+    partition_hint: u32,
+    routed: RoutedCellSubsection,
+) -> Result<PreparedSuperfile, BuildError> {
+    let shard = build_one_shard_from_spliced(routed, &inner.options)?;
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
     Ok(PreparedSuperfile {
@@ -2801,11 +2820,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         for (local, row) in rows.iter_mut().enumerate() {
             row.local_doc_id = local as u32;
         }
-        build_prepared_ivf_from_materialized(
-            &inner,
-            super::handle::INCOMING_VECTOR_CELL,
-            rows,
-        )
+        build_prepared_ivf_from_materialized(&inner, super::handle::INCOMING_VECTOR_CELL, rows)
     })?;
 
     let batch = collect_prepared_superfiles(&inner, vec![incoming_prepared])?;
