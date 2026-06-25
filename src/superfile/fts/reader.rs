@@ -2282,6 +2282,12 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        // A top-0 request admits nothing. Guard here too (callers already
+        // short-circuit) so the heap-admission `else if` below can never
+        // run against an empty heap.
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
 
