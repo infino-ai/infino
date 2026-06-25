@@ -2245,10 +2245,10 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Windowed union scorer for multi-term OR (the M1 path for
+    /// Windowed union scorer for multi-term OR — the fast path for
     /// uniform-upper-bound / common-term ORs, where MaxScore can't prune
     /// and degrades to scoring the whole union with per-doc f-way merge
-    /// overhead).
+    /// overhead.
     ///
     /// Walks the doc-id space one `OR_WINDOW`-doc window at a time. Within
     /// a window each cursor streams its postings **sequentially**,
@@ -4387,7 +4387,7 @@ mod tests {
 
     #[tokio::test]
     async fn windowed_union_agrees_with_bmm() {
-        // The windowed union scorer (M1) must return the identical top-k as
+        // The windowed union scorer must return the identical top-k as
         // the production MaxScore+BMM path — across term counts, k values,
         // and the uniform-UB (common-term) shape it targets. Multi-block
         // lists (N_DOCS well over BLOCK_LEN=128) so the walk crosses both
