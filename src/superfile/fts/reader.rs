@@ -99,7 +99,7 @@ pub enum OrAlgo {
 /// passes (matching the horizon both reference designs converge on).
 const OR_WINDOW: u32 = 4096;
 /// Number of 64-bit words in the window presence bitset.
-const OR_WINDOW_WORDS: usize = OR_WINDOW as usize / 64;
+const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
