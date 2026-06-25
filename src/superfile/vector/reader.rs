@@ -1484,8 +1484,8 @@ impl VectorReader {
             let block = col.per_cluster_blocks_off + doc_off * stride;
             let doc_ids_at = block + count * code_bytes;
             let full_at = block + count * (code_bytes + id_bytes);
-            let sc = scale[c * dim..c * dim + dim].to_vec();
-            let of = offset[c * dim..c * dim + dim].to_vec();
+            let sc: Arc<[f32]> = Arc::from(scale[c * dim..c * dim + dim].to_vec());
+            let of: Arc<[f32]> = Arc::from(offset[c * dim..c * dim + dim].to_vec());
             for i in 0..count {
                 let idb = doc_ids_at + i * id_bytes;
                 let local_id =
@@ -1513,8 +1513,8 @@ impl VectorReader {
                     rabitq_code: rabitq,
                     encoded: EncodedCellRow {
                         stable_id,
-                        scale: sc.clone(),
-                        offset: of.clone(),
+                        scale: Arc::clone(&sc),
+                        offset: Arc::clone(&of),
                         codes,
                         residuals,
                         norm_sq,
