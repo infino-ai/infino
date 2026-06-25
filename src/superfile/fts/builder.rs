@@ -2504,9 +2504,12 @@ struct TermScratch {
     doc_ids: Vec<u32>,
     /// Per-block tf column, same lifecycle as `doc_ids`.
     tfs: Vec<u32>,
-    /// Per-term minimum doc-length per block, used to compute the
-    /// per-block BM25 upper bound for the skip table.
-    min_dl_per_block: Vec<u32>,
+    /// Per-block BM25 upper bound for the skip table — the **exact**
+    /// maximum per-doc contribution over the block's docs (not the looser
+    /// `score(max_tf, min_dl)`, whose best-case tf and best-case dl need
+    /// not co-occur in one doc). A tighter bound lets the reader's
+    /// block-skip fire more often.
+    block_ub_per_block: Vec<f32>,
     /// Per-term list of encoded blocks held across the meta + skip-
     /// table + block-bytes emit stages.
     encoded_blocks: Vec<EncodedBlock>,
@@ -2567,9 +2570,9 @@ fn encode_and_emit_term<W: Write>(
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
         let encoded_blocks = &mut scratch.encoded_blocks;
-        let min_dl_per_block = &mut scratch.min_dl_per_block;
+        let block_ub_per_block = &mut scratch.block_ub_per_block;
         encoded_blocks.clear();
-        min_dl_per_block.clear();
+        block_ub_per_block.clear();
         let block_build_start = profile.enabled.then(Instant::now);
         // Build each block by moving the reusable `doc_ids` / `tfs`
         // buffers into a `Block` (Vec move = pointer swap, no copy),
@@ -2592,12 +2595,18 @@ fn encode_and_emit_term<W: Write>(
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
             block_tfs.extend(chunk.iter().map(|&(_, t)| t));
-            let min_dl = block_doc_ids
+            // Exact per-block BM25 upper bound: the max actual per-doc
+            // contribution over the block. score() rises with tf and falls
+            // with dl, so the looser `score(max_tf, min_dl)` over-estimates
+            // when the highest-tf doc isn't also the shortest. Computing the
+            // real max here (build-time, off the query path) tightens the
+            // skip-table bound so the reader skips more blocks.
+            let block_ub = block_doc_ids
                 .iter()
-                .map(|d| col_doc_lengths[*d as usize])
-                .min()
-                .unwrap_or(0);
-            min_dl_per_block.push(min_dl);
+                .zip(block_tfs.iter())
+                .map(|(&d, &t)| bm25::score(idf_t, t, col_doc_lengths[d as usize], avgdl))
+                .fold(0.0f32, f32::max);
+            block_ub_per_block.push(block_ub);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
                 tfs: mem::take(&mut block_tfs),
@@ -2645,7 +2654,7 @@ fn encode_and_emit_term<W: Write>(
         let mut block_offset: u32 = (TERM_META_SIZE + skip_table_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
-            let max_bm25 = bm25::block_upper_bound(idf_t, blk.max_tf, min_dl_per_block[i], avgdl);
+            let max_bm25 = block_ub_per_block[i];
             // ceil(): the stored fixed-point value must stay a true
             // UPPER bound after quantization — truncation would round
             // it below the real block max and let BMW / floor skips

@@ -21,12 +21,6 @@
 //! `idf(N, df)` is monotonic in `df` (smaller `df` → larger `idf`); always
 //! non-negative because we use the +0.5 / +0.5 form ("BM25+1") which keeps
 //! the log argument ≥ 1.
-//!
-//! `block_upper_bound` is the per-block maximum BM25 contribution used by
-//! BlockMaxWAND for early termination — given a block's `max_tf` and
-//! `min_dl`, compute the largest possible score any single doc in that
-//! block can contribute. If this upper bound can't beat the current top-k
-//! worst score, the whole block is skipped.
 
 use wide::f32x4;
 
@@ -125,17 +119,6 @@ pub fn score_simd_x4(
     let num = idf_v * tf_v;
     let scores = num / denom;
     scores.reduce_add()
-}
-
-/// Per-block upper bound on BM25 contribution. Used by BlockMaxWAND:
-/// if this upper bound for the block can't beat the current top-k
-/// threshold, the entire block of postings can be skipped.
-///
-/// The bound is achieved at `tf = max_tf` (highest possible numerator)
-/// and `dl = min_dl` (smallest length-norm denominator).
-#[inline]
-pub fn block_upper_bound(idf_t: f32, max_tf: u32, min_dl: u32, avgdl: f32) -> f32 {
-    score(idf_t, max_tf, min_dl, avgdl)
 }
 
 #[cfg(test)]
@@ -309,45 +292,6 @@ mod tests {
         let s_zero_dl = score(i, 5, 0, 200.0);
         let s_one_dl = score(i, 5, 1, 200.0);
         assert!(s_zero_dl > s_one_dl);
-    }
-
-    // --- block_upper_bound ----------------------------------------------
-
-    #[test]
-    fn upper_bound_at_extreme_inputs_matches_score() {
-        // block_upper_bound(idf, max_tf, min_dl, avgdl) is just
-        // score(idf, max_tf, min_dl, avgdl). Verify identity.
-        let i = idf(1_000_000, 1_000);
-        for max_tf in [1, 5, 50] {
-            for min_dl in [1, 100, 1_000] {
-                for avgdl in [50.0, 500.0] {
-                    let ub = block_upper_bound(i, max_tf, min_dl, avgdl);
-                    let s = score(i, max_tf, min_dl, avgdl);
-                    assert!(approx(ub, s, 1e-6));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn upper_bound_is_real_upper_bound() {
-        // For any (tf, dl) in the block (tf ≤ max_tf, dl ≥ min_dl),
-        // the upper bound must dominate the actual score.
-        let i = idf(1_000_000, 1_000);
-        let max_tf = 10;
-        let min_dl = 50;
-        let avgdl = 200.0;
-        let ub = block_upper_bound(i, max_tf, min_dl, avgdl);
-
-        for tf in 1..=max_tf {
-            for dl in min_dl..=(min_dl * 5) {
-                let s = score(i, tf, dl, avgdl);
-                assert!(
-                    s <= ub + 1e-6,
-                    "score(tf={tf}, dl={dl}) = {s} should be ≤ ub {ub}"
-                );
-            }
-        }
     }
 
     // --- constant sanity ------------------------------------------------
