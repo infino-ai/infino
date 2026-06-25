@@ -96,7 +96,7 @@ pub enum OrAlgo {
 /// window base is a cheap mask. At 4096 the per-window state — a
 /// `4096 × f32` score accumulator (16 KiB) plus a `4096`-bit presence
 /// bitset (512 B) — stays L1/L2-resident across the accumulate + drain
-/// passes (matching the horizon both reference designs converge on).
+/// passes.
 const OR_WINDOW: u32 = 4096;
 /// Number of 64-bit words in the window presence bitset.
 const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
@@ -4389,10 +4389,13 @@ mod tests {
     async fn windowed_union_agrees_with_bmm() {
         // The windowed union scorer must return the identical top-k as
         // the production MaxScore+BMM path — across term counts, k values,
-        // and the uniform-UB (common-term) shape it targets. Multi-block
-        // lists (N_DOCS well over BLOCK_LEN=128) so the walk crosses both
-        // posting-block and OR_WINDOW boundaries.
-        const N_DOCS: u32 = 400;
+        // and the uniform-UB (common-term) shape it targets. N_DOCS spans
+        // multiple windows (and many BLOCK_LEN=128 posting blocks), so the
+        // walk exercises the multi-window path: base advancing to the next
+        // window, empty-window skipping, and cross-window monotonicity —
+        // not just a single window. Tied to OR_WINDOW so it keeps crossing
+        // the boundary if the window size changes.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into()).expect("register");
@@ -4442,6 +4445,121 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn windowed_union_negation_agrees_with_bmm() {
+        // The windowed scorer applies the ExcludeFilter (negation) at
+        // drain. Drive a negated query straight through run_windowed_union
+        // and check it matches MaxScore+BMM with the same exclusion — BMM's
+        // negation is the oracle-validated reference, so equality proves
+        // the windowed filter arm. (Calls the scorers directly so the
+        // windowed arm is exercised regardless of the production dispatch.)
+        const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i % 7 == 0 {
+                text.push_str("epsilon ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        // (positive terms, negated terms)
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["alpha", "beta", "gamma"], &["delta"]),
+            (&["beta", "gamma", "delta"], &["epsilon"]),
+            (&["alpha", "beta", "gamma", "delta"], &["epsilon", "gamma"]),
+        ];
+        for (pos, neg) in cases {
+            for k in [1usize, 5, 50] {
+                let mut wf =
+                    ExcludeFilter::new(r.build_term_cursors(col, neg).await.expect("neg cursors"));
+                let win = r
+                    .run_windowed_union(
+                        col,
+                        r.build_term_cursors(col, pos).await.expect("pos cursors"),
+                        k,
+                        Some(&mut wf),
+                        f32::NEG_INFINITY,
+                        0,
+                        u32::MAX,
+                    )
+                    .expect("windowed");
+                let mut bf =
+                    ExcludeFilter::new(r.build_term_cursors(col, neg).await.expect("neg cursors"));
+                let bmm = r
+                    .run_max_score_bmm(
+                        col,
+                        r.build_term_cursors(col, pos).await.expect("pos cursors"),
+                        k,
+                        Some(&mut bf),
+                        f32::NEG_INFINITY,
+                    )
+                    .expect("bmm");
+                assert_eq!(win.len(), bmm.len(), "len {pos:?} -{neg:?} k={k}");
+                for ((dw, sw), (db, sb)) in win.iter().zip(bmm.iter()) {
+                    assert_eq!(
+                        dw, db,
+                        "doc mismatch {pos:?} -{neg:?} k={k}: win={dw} bmm={db}"
+                    );
+                    assert!(
+                        (sw - sb).abs() < 1e-4,
+                        "score mismatch {pos:?} -{neg:?} k={k}: {sw} vs {sb}"
+                    );
+                }
+            }
+        }
+
+        // Sanity: the filter is actually active — at a high k the negated
+        // query must return strictly fewer docs than the positive-only one
+        // (the negated term excludes a non-empty set).
+        let pos: &[&str] = &["alpha", "beta", "gamma"];
+        let neg: &[&str] = &["delta"];
+        let unfiltered = r
+            .run_windowed_union(
+                col,
+                r.build_term_cursors(col, pos).await.expect("pos"),
+                N_DOCS as usize,
+                None,
+                f32::NEG_INFINITY,
+                0,
+                u32::MAX,
+            )
+            .expect("unfiltered");
+        let mut f = ExcludeFilter::new(r.build_term_cursors(col, neg).await.expect("neg"));
+        let filtered = r
+            .run_windowed_union(
+                col,
+                r.build_term_cursors(col, pos).await.expect("pos"),
+                N_DOCS as usize,
+                Some(&mut f),
+                f32::NEG_INFINITY,
+                0,
+                u32::MAX,
+            )
+            .expect("filtered");
+        assert!(
+            filtered.len() < unfiltered.len(),
+            "negation should drop docs: filtered={} unfiltered={}",
+            filtered.len(),
+            unfiltered.len()
+        );
     }
 
     #[tokio::test]
