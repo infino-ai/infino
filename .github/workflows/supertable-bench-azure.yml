@@ -179,6 +179,17 @@ jobs:
           echo "reports=$reports" >> "$GITHUB_OUTPUT"
           echo "args=[$args] reports=[$reports]"
 
+      - name: Validate bench gate metric
+        run: |
+          set -euo pipefail
+          case "${{ inputs.bench_gate_metric }}" in
+            min|p50|p90) ;;
+            *)
+              echo "::error::invalid bench_gate_metric='${{ inputs.bench_gate_metric }}' (allowed: min|p50|p90)"
+              exit 1
+              ;;
+          esac
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
