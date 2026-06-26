@@ -172,6 +172,15 @@ pub struct OpannRouting {
     /// manifest parts. Legacy manifests omit it and fall back to a per-page walk.
     pub resident_uri: Option<String>,
     pub resident_content_hash: Option<ContentHash>,
+    /// Content-addressed blob of the hidden index's consolidated deleted
+    /// user-`_id` set (the rows tombstoned in the user table but not yet
+    /// physically removed by a drain). Loaded resident at open in the same wave
+    /// as the routing bundle and consulted in memory by the vector read path,
+    /// so a cold search pays zero per-cell tombstone GETs. A sibling blob (not
+    /// folded into the page bundle) so a delete-only commit need not re-pack the
+    /// page graph. Absent on legacy manifests and when no deletes are pending.
+    pub deleted_ids_uri: Option<String>,
+    pub deleted_ids_content_hash: Option<ContentHash>,
 }
 
 /// How superfiles are routed into manifest parts. Stamped into
@@ -890,6 +899,10 @@ struct OpannRoutingDto {
     resident_uri: Option<String>,
     #[serde(default)]
     resident_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default)]
+    deleted_ids_uri: Option<String>,
+    #[serde(default)]
+    deleted_ids_content_hash: Option<String>, // "blake3:<64hex>"
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1283,6 +1296,8 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             routing: Some(r.routing.into()),
             resident_uri: r.resident_uri.clone(),
             resident_content_hash: r.resident_content_hash.as_ref().map(encode_hash),
+            deleted_ids_uri: r.deleted_ids_uri.clone(),
+            deleted_ids_content_hash: r.deleted_ids_content_hash.as_ref().map(encode_hash),
         }),
         parts,
     })
@@ -1324,6 +1339,12 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
                     resident_uri: r.resident_uri,
                     resident_content_hash: r
                         .resident_content_hash
+                        .as_deref()
+                        .map(decode_hash)
+                        .transpose()?,
+                    deleted_ids_uri: r.deleted_ids_uri,
+                    deleted_ids_content_hash: r
+                        .deleted_ids_content_hash
                         .as_deref()
                         .map(decode_hash)
                         .transpose()?,

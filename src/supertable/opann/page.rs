@@ -51,9 +51,16 @@ use super::paged::SplitPages;
 /// Magic at the start of every OPANN routing-tree page.
 const PAGE_MAGIC: [u8; 4] = *b"OPNP";
 /// Page wire-format version; bumped on any incompatible layout change.
-/// v2: leaf nodes carry `(superfile_id u128, doc_off u32, count u32)` —
-/// a cluster within a superfile — instead of a bare `cell_id u128`.
-const PAGE_FORMAT_VERSION: u8 = 2;
+/// v2: leaf nodes carry `(superfile_id u128, doc_off u32, count u32)`.
+/// v3: appends the internal IVF cluster ordinal `cluster_id u32` to each leaf,
+/// so the offset probe can index the correct per-cluster Sq8 scale/offset meta.
+/// v2 pages still parse (cluster_id defaults to 0 — v2 only ever emitted the
+/// whole-cell `(0,0)` legacy leaf, where cluster_id is unused).
+const PAGE_FORMAT_VERSION: u8 = 3;
+/// Oldest page version this build can still parse.
+const PAGE_FORMAT_VERSION_MIN: u8 = 2;
+/// First page version whose leaves carry the internal `cluster_id` ordinal.
+const LEAF_CLUSTER_ID_MIN_VERSION: u8 = 3;
 /// Header bytes reserved after the metric tag (must be zero) — room for
 /// future per-page flags without a version bump.
 const PAGE_HEADER_RESERVED: usize = 2;
@@ -100,12 +107,16 @@ pub(crate) enum ChildLink {
 /// A routing-tree leaf's target: a specific cluster inside an object-resident
 /// superfile. `superfile_id` names the superfile; `doc_off`/`count` are that
 /// cluster's row range within the superfile's IVF, so a probe is one range-GET
-/// of the cluster's bytes.
+/// of the cluster's bytes; `cluster_id` is that cluster's internal IVF ordinal,
+/// which the probe uses to select the cluster's Sq8 scale/offset for rerank
+/// decode. The legacy whole-cell leaf carries `(doc_off, count) = (0, 0)` and
+/// `cluster_id = 0` (unused — the whole-partition scan re-derives clusters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeafRef {
     pub(crate) superfile_id: u128,
     pub(crate) doc_off: u32,
     pub(crate) count: u32,
+    pub(crate) cluster_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +195,7 @@ pub(crate) fn encode_page(
                 out.extend_from_slice(&leaf.superfile_id.to_le_bytes());
                 out.extend_from_slice(&leaf.doc_off.to_le_bytes());
                 out.extend_from_slice(&leaf.count.to_le_bytes());
+                out.extend_from_slice(&leaf.cluster_id.to_le_bytes());
             }
             NodeTopo::Internal(children) => {
                 debug_assert!(
@@ -232,7 +244,7 @@ impl Page {
             return Err(PageError::BadMagic);
         }
         let version = r.u8()?;
-        if version != PAGE_FORMAT_VERSION {
+        if !(PAGE_FORMAT_VERSION_MIN..=PAGE_FORMAT_VERSION).contains(&version) {
             return Err(PageError::UnsupportedVersion(version));
         }
         let metric_id = r.u8()?;
@@ -267,10 +279,18 @@ impl Page {
                     let superfile_id = r.u128()?;
                     let doc_off = r.u32()?;
                     let count = r.u32()?;
+                    // v3+ appends the internal cluster ordinal; v2 leaves are
+                    // whole-cell `(0,0)` so cluster_id is unused — default 0.
+                    let cluster_id = if version >= LEAF_CLUSTER_ID_MIN_VERSION {
+                        r.u32()?
+                    } else {
+                        0
+                    };
                     topo.push(NodeTopo::Leaf(LeafRef {
                         superfile_id,
                         doc_off,
                         count,
+                        cluster_id,
                     }));
                 }
                 NODE_KIND_INTERNAL => {
@@ -641,11 +661,13 @@ mod tests {
                 superfile_id: 100,
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
             }),
             NodeTopo::Leaf(LeafRef {
                 superfile_id: 200,
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
             }),
             NodeTopo::Internal(vec![ChildLink::Local(0), ChildLink::Local(1)]),
         ];
@@ -668,7 +690,8 @@ mod tests {
             NodeTopo::Leaf(LeafRef {
                 superfile_id: 100,
                 doc_off: 0,
-                count: 0
+                count: 0,
+                cluster_id: 0
             })
         );
         assert_eq!(
@@ -676,7 +699,8 @@ mod tests {
             NodeTopo::Leaf(LeafRef {
                 superfile_id: 200,
                 doc_off: 0,
-                count: 0
+                count: 0,
+                cluster_id: 0
             })
         );
         assert_eq!(
@@ -772,6 +796,7 @@ mod tests {
             superfile_id: 1,
             doc_off: 0,
             count: 0,
+            cluster_id: 0,
         })];
         let l2 = encode_page(Metric::L2Sq, &norms_absent, &topo, 0);
         assert!(matches!(Page::parse(&l2), Err(PageError::MissingNorms)));

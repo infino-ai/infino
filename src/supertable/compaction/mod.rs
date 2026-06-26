@@ -43,9 +43,9 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            OpannRoutingCommit, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile, split_overflow_cell_after_compaction,
-            try_commit_attempt,
+            OpannRoutingCommit, PartitionRoutingCopy, PreparedSuperfile, ShardOutput,
+            backoff_delay, finalize_compaction_commit, opann_routing_update, prepare_superfile,
+            split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -491,6 +491,38 @@ impl Supertable {
                 return Ok(());
             }
 
+            // Hidden vector index: keep the OPANN routing tree consistent with
+            // the merge in the SAME commit — drop the merged-away inputs' leaves
+            // and splice in the merged superfile as one whole-cell `(0, 0)` leaf
+            // carrying its summary centroid (decoded to fp32). This is the same
+            // `opann_routing_update` op the drain/split use; recomputed per OCC
+            // attempt so a retry rebuilds against the winning base. User-table
+            // compaction has no routing tree, so it inherits.
+            let routing_commit = if is_hidden_vector_index_table(&inner.options) {
+                let removed: Vec<u128> = job.inputs.iter().map(|id| id.as_u128()).collect();
+                let added: Vec<PartitionRoutingCopy> = inner
+                    .options
+                    .vector_columns
+                    .first()
+                    .and_then(|vc| new_entries[0].vector_summary.get(&vc.column))
+                    .map(|summary| {
+                        vec![PartitionRoutingCopy {
+                            superfile_id: new_entries[0].superfile_id.as_u128(),
+                            doc_off: 0,
+                            count: 0,
+                            cluster_id: 0,
+                            centroid_fp32: summary.centroid.to_single_fp32(),
+                            radius: summary.radius,
+                        }]
+                    })
+                    .unwrap_or_default();
+                opann_routing_update(inner, current.as_ref(), &removed, &added)
+                    .await
+                    .map_err(|e| CompactionError::Build(e.to_string()))?
+            } else {
+                OpannRoutingCommit::Inherit
+            };
+
             let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
             match try_commit_attempt(
@@ -501,7 +533,7 @@ impl Supertable {
                 &entries_to_remove,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
-                &OpannRoutingCommit::Inherit,
+                &routing_commit,
             )
             .await
             {

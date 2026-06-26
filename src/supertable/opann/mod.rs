@@ -91,6 +91,7 @@ pub(crate) mod test_util {
                 superfile_id: id,
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
             })
             .collect();
         CentroidTree::build(metric, &clusters, &leaf_refs)

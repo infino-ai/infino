@@ -446,6 +446,7 @@ mod tests {
                 superfile_id: 7,
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
             })],
             0,
         );

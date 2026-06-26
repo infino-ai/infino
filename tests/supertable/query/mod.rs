@@ -11,6 +11,7 @@ mod id_resolve;
 pub mod match_search;
 mod query_errors;
 mod query_surface;
+pub mod routing_correctness;
 pub mod skip_pruning;
 mod stats_fold;
 pub mod tombstone_filter;

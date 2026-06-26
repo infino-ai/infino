@@ -1326,6 +1326,27 @@ impl VectorReader {
         Some((col.n_cent, dim as u32, scale, offset, rows, norms, counts))
     }
 
+    /// Per-cluster `doc_off` (row offset within the per-cluster blocks region),
+    /// in cluster-ordinal order — the `offset` half of each 8-byte
+    /// `(doc_off, count)` cluster-index entry (the `count` half is what
+    /// [`Self::cluster_centroids_encoded`] reads). Captured at write time so the
+    /// manifest can carry each cluster's byte range, letting a query range-GET an
+    /// individual cluster without re-reading the cluster index.
+    pub fn cluster_doc_offsets(&self, column: &str) -> Option<Vec<u32>> {
+        let cid = *self.column_id_by_name.get(column)?;
+        let col = &self.columns[cid as usize];
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let n_cent = col.n_cent as usize;
+        let mut offsets = Vec::with_capacity(n_cent);
+        for c in 0..n_cent {
+            let b = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
+            offsets.push(u32::from_le_bytes([sub[b], sub[b + 1], sub[b + 2], sub[b + 3]]));
+        }
+        Some(offsets)
+    }
+
     /// Async sibling of [`Self::inline_stable_ids_for_locals`] for the COLD
     /// path: when the inline `_id` region is present but **not resident** (a
     /// freshly-opened lazy reader — the search fetches centroids/cluster_idx
@@ -1958,6 +1979,46 @@ impl VectorReader {
             allow,
         };
         let meta = vec![(0usize, leaf_doc_off, leaf_count)];
+        self.probe_cluster_meta_async(col, query, &ctx, &meta)
+            .await
+    }
+
+    /// Probe a set of OPANN offset leaves that all live in THIS superfile, in
+    /// one wave: each `(cluster_id, doc_off, count)` names an internal IVF
+    /// cluster's row range, fetched as a contiguous range-GET — no cluster-index
+    /// read, no centroid scoring (the tree already routed). `cluster_id` selects
+    /// that cluster's Sq8 scale/offset for the rerank decode (so it must be the
+    /// real internal ordinal, not 0). Coalesces multiple admitted clusters of
+    /// one cell into a single fetch batch instead of opening the cell per leaf.
+    pub(crate) async fn probe_clusters_at_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[(u32, u32, u32)],
+        rerank_mult: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let (col, validated) = self.resolve_column(column, query, k)?;
+        if !validated || clusters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
+        if filter_mult == 0 {
+            return Ok(Vec::new());
+        }
+        let mut q_rot = vec![0f32; col.dim];
+        col.rot.apply(query, &mut q_rot);
+        let ctx = ProbeCtx {
+            q_rot: &q_rot,
+            k,
+            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            allow,
+        };
+        let meta: Vec<(usize, u32, u32)> = clusters
+            .iter()
+            .map(|&(cluster_id, doc_off, count)| (cluster_id as usize, doc_off, count))
+            .collect();
         self.probe_cluster_meta_async(col, query, &ctx, &meta)
             .await
     }

@@ -1459,6 +1459,23 @@ impl DiskCacheStore {
                 actual.to_hex()
             )));
         }
+        self.admit_blob(hash, bytes).await
+    }
+
+    /// Admit content-addressed bytes already in hand into the blob cache:
+    /// reserve budget, pwrite + fsync + mmap, then install (deduped against a
+    /// concurrent insert on the same hash). Shared by the cold `blob_bytes` GET
+    /// path and the write-time [`Self::seed_blob`] pre-warm. Idempotent — an
+    /// already-cached hash is a no-op returning the resident mmap bytes.
+    async fn admit_blob(
+        self: &Arc<Self>,
+        hash: ContentHash,
+        bytes: Bytes,
+    ) -> Result<Bytes, DiskCacheError> {
+        if let Some(entry) = self.blobs.get(&hash) {
+            entry.last_access_us.store(self.now_us(), Ordering::Release);
+            return Ok(entry.bytes.clone());
+        }
         let size = bytes.len() as u64;
         self.reserve_manual(size).await?;
         let result: Result<Arc<CachedBlob>, DiskCacheError> = async {
@@ -1503,6 +1520,21 @@ impl DiskCacheStore {
                 Ok(occ.get().bytes.clone())
             }
         }
+    }
+
+    /// Pre-warm the cache with a content-addressed blob just written to object
+    /// storage (an OPANN tree page or resident bundle), so the first read after
+    /// a commit serves the warm mmap instead of re-GETting it. Under heavy write
+    /// traffic every commit mints a new root/bundle hash; without this, each
+    /// post-commit query degenerates to an object-store GET on the cold path.
+    /// Best-effort + idempotent. `hash` MUST be `ContentHash::of(&bytes)` (the
+    /// content-addressed identity the read path verifies against).
+    pub async fn seed_blob(
+        self: &Arc<Self>,
+        hash: ContentHash,
+        bytes: Bytes,
+    ) -> Result<(), DiskCacheError> {
+        self.admit_blob(hash, bytes).await.map(|_| ())
     }
 
     /// Local cache file for a content-addressed blob — hash-derived, stable

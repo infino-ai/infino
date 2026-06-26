@@ -64,6 +64,86 @@ pub(crate) fn resident_uri(hash: &ContentHash) -> String {
     content_addressed_uri(OPANN_PAGES_DIR, "resident", hash, "opann")
 }
 
+/// Magic prefix on a packed deleted-user-`_id` blob.
+const DELETED_IDS_MAGIC: &[u8; 4] = b"OPDS";
+
+/// Wire-format version for [`DELETED_IDS_MAGIC`] blobs.
+const DELETED_IDS_VERSION: u8 = 1;
+
+/// Header: magic (4) + version (1) + count (4).
+const DELETED_IDS_HEADER_LEN: usize = 4 + 1 + 4;
+
+/// Bytes per serialized `_id` (a little-endian `i128`).
+const DELETED_ID_LEN: usize = 16;
+
+/// Storage URI for a packed deleted-`_id` blob with content hash `hash`.
+pub(crate) fn deleted_ids_uri(hash: &ContentHash) -> String {
+    content_addressed_uri(OPANN_PAGES_DIR, "deleted-ids", hash, "opann")
+}
+
+/// Serialize the consolidated deleted user-`_id` set. The caller passes a
+/// sorted, deduplicated slice so the on-disk order is canonical — the same set
+/// yields byte-identical blobs (content-addressed dedup) and the resident
+/// reader can `binary_search` it directly.
+pub(crate) fn encode_deleted_ids(sorted_ids: &[i128]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DELETED_IDS_HEADER_LEN + sorted_ids.len() * DELETED_ID_LEN);
+    out.extend_from_slice(DELETED_IDS_MAGIC);
+    out.push(DELETED_IDS_VERSION);
+    out.extend_from_slice(&(sorted_ids.len() as u32).to_le_bytes());
+    for id in sorted_ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a deleted-`_id` blob written by [`encode_deleted_ids`]. Returns the
+/// `_id`s in stored (ascending) order.
+pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, PageError> {
+    if bytes.len() < DELETED_IDS_HEADER_LEN {
+        return Err(PageError::Truncated);
+    }
+    if &bytes[0..4] != DELETED_IDS_MAGIC {
+        return Err(PageError::BadMagic);
+    }
+    let version = bytes[4];
+    if version != DELETED_IDS_VERSION {
+        return Err(PageError::UnsupportedVersion(version));
+    }
+    let count = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+    let body = &bytes[DELETED_IDS_HEADER_LEN..];
+    if body.len() != count * DELETED_ID_LEN {
+        return Err(PageError::Truncated);
+    }
+    let mut ids = Vec::with_capacity(count);
+    for chunk in body.chunks_exact(DELETED_ID_LEN) {
+        let mut buf = [0u8; DELETED_ID_LEN];
+        buf.copy_from_slice(chunk);
+        ids.push(i128::from_le_bytes(buf));
+    }
+    Ok(ids)
+}
+
+/// Load the hidden index's consolidated deleted user-`_id` set for `routing`,
+/// routed through the disk cache (mmap-backed, so a warm load is zero object
+/// I/O — the set stays resident across queries, exactly like the routing
+/// bundle). Returns an empty set when the manifest stamps no blob (legacy
+/// manifests, or no deletes pending since the last drain).
+pub(crate) async fn load_deleted_ids(
+    routing: &OpannRouting,
+    storage: &dyn StorageProvider,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+) -> Result<Vec<i128>, OpannStoreError> {
+    let (Some(uri), Some(hash)) = (
+        routing.deleted_ids_uri.as_deref(),
+        routing.deleted_ids_content_hash,
+    ) else {
+        return Ok(Vec::new());
+    };
+    let _guard = GetPhaseGuard::new(GET_PHASE_OPANN);
+    let bytes = load_verified_blob(hash, uri, storage, disk_cache).await?;
+    Ok(decode_deleted_ids(&bytes)?)
+}
+
 /// Failures writing or loading OPANN pages.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpannStoreError {
@@ -359,6 +439,8 @@ mod tests {
             routing: CellRoutingParams::default(),
             resident_uri: resident_hash.map(|h| resident_uri(&h)),
             resident_content_hash: resident_hash,
+            deleted_ids_uri: None,
+            deleted_ids_content_hash: None,
         }
     }
 
@@ -371,6 +453,42 @@ mod tests {
                 .await
                 .expect("put page");
         }
+    }
+
+    #[test]
+    fn deleted_ids_encode_decode_roundtrip() {
+        // Canonical (sorted, deduped) set, including negatives and extremes —
+        // `_id`s are signed 128-bit snowflakes.
+        let ids: Vec<i128> = vec![i128::MIN, -1, 0, 1, 42, 1 << 100, i128::MAX];
+        let bytes = encode_deleted_ids(&ids);
+        assert_eq!(decode_deleted_ids(&bytes).expect("decode"), ids);
+
+        // Empty set round-trips to an empty vec (header only).
+        let empty = encode_deleted_ids(&[]);
+        assert!(decode_deleted_ids(&empty).expect("decode empty").is_empty());
+
+        // Same set → byte-identical blob (content-addressed dedup relies on it).
+        assert_eq!(encode_deleted_ids(&ids), bytes);
+    }
+
+    #[test]
+    fn deleted_ids_decode_rejects_corruption() {
+        let good = encode_deleted_ids(&[1, 2, 3]);
+        // Bad magic.
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(matches!(
+            decode_deleted_ids(&bad_magic),
+            Err(PageError::BadMagic)
+        ));
+        // Truncated body (drop the last id's bytes).
+        let truncated = &good[..good.len() - DELETED_ID_LEN];
+        assert!(matches!(
+            decode_deleted_ids(truncated),
+            Err(PageError::Truncated)
+        ));
+        // Too-short for even the header.
+        assert!(matches!(decode_deleted_ids(&[0u8; 3]), Err(PageError::Truncated)));
     }
 
     #[test]

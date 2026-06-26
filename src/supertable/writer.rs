@@ -1279,6 +1279,16 @@ impl SupertableWriter {
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
+        // The hidden vector-index cells are not rewritten on a user delete, so
+        // the deleted rows stay physically present in them. Record the resolved
+        // user `_id`s into the hidden index's resident deleted-set so vector
+        // search drops them in memory (zero per-cell tombstone GETs).
+        let hidden_inner = self
+            .inner
+            .vector_index_table
+            .as_ref()
+            .map(|vit| Arc::clone(vit.inner()));
+        let deleted_ids: Vec<i128> = entry.target_ids.clone();
         let drive = async move {
             let etag = wal_store
                 .create(&wal_doc)
@@ -1297,6 +1307,19 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
+            // Best-effort, mirroring the dual-write append path: a failure here
+            // leaves the durable user-table delete intact; vector search may
+            // transiently surface a deleted row until the next successful
+            // record (or a tombstone-aware hidden compaction prunes it).
+            if let Some(hi) = hidden_inner {
+                if let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await {
+                    tracing::warn!(
+                        "supertable: hidden vector-index deleted-set record failed: {e} \
+                         (user-table delete is durable; vector search may transiently \
+                         return deleted rows until the next successful record)"
+                    );
+                }
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -2128,12 +2151,20 @@ pub(super) fn prepare_superfile_with_uri(
                         },
                     )
                     .unwrap_or_default();
+                // Per-cluster byte offsets, read from the cell's cluster index
+                // (the bytes the splice just wrote), aligned with `clusters` by
+                // cluster ordinal — so a query can range-GET an individual
+                // cluster without re-reading the index.
+                let cluster_offsets = vec_reader
+                    .cluster_doc_offsets(&vc.column)
+                    .unwrap_or_default();
                 vector_summary.insert(
                     vc.column.clone(),
                     VectorSummary {
                         centroid,
                         radius,
                         clusters,
+                        cluster_offsets,
                     },
                 );
             }
@@ -2375,6 +2406,9 @@ pub(in crate::supertable) struct PartitionRoutingCopy {
     pub(in crate::supertable) superfile_id: u128,
     pub(in crate::supertable) doc_off: u32,
     pub(in crate::supertable) count: u32,
+    /// Internal IVF cluster ordinal within `superfile_id` (selects the cluster's
+    /// Sq8 scale/offset at probe time). 0 for the whole-cell `(0,0)` leaf.
+    pub(in crate::supertable) cluster_id: u32,
     pub(in crate::supertable) centroid_fp32: Vec<f32>,
     pub(in crate::supertable) radius: f32,
 }
@@ -2402,10 +2436,18 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
     prior_root: Option<ContentHash>,
     params: CellRoutingParams,
     bundle: Option<(ContentHash, Vec<u8>)>,
+    prior_deleted: Option<(String, ContentHash)>,
 ) -> OpannRoutingCommit {
+    // Carry the prior deleted-set blob ref onto any freshly-built routing so a
+    // tree-changing commit (drain / split / compaction) does not wipe it — the
+    // deleted rows are still physically present in the (untouched) cells.
     let attach_bundle = |routing: &mut OpannRouting,
                          pages: &mut Vec<(String, Bytes)>,
                          bundle: Option<(ContentHash, Vec<u8>)>| {
+        if let Some((uri, hash)) = prior_deleted.as_ref() {
+            routing.deleted_ids_uri = Some(uri.clone());
+            routing.deleted_ids_content_hash = Some(hash.clone());
+        }
         if let Some((hash, bytes)) = bundle {
             let uri = store::resident_uri(&hash);
             pages.push((uri.clone(), Bytes::from(bytes)));
@@ -2425,6 +2467,8 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
                 routing: params,
                 resident_uri: None,
                 resident_content_hash: None,
+                deleted_ids_uri: None,
+                deleted_ids_content_hash: None,
             };
             attach_bundle(&mut routing, &mut pages, bundle);
             OpannRoutingCommit::Replace {
@@ -2441,6 +2485,8 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
                 routing: params,
                 resident_uri: None,
                 resident_content_hash: None,
+                deleted_ids_uri: None,
+                deleted_ids_content_hash: None,
             };
             attach_bundle(&mut routing, &mut pages, bundle);
             OpannRoutingCommit::Replace {
@@ -2481,6 +2527,7 @@ pub(in crate::supertable) async fn opann_routing_update(
             superfile_id: c.superfile_id,
             doc_off: c.doc_off,
             count: c.count,
+            cluster_id: c.cluster_id,
             centroid_fp32: c.centroid_fp32.clone(),
             radius: c.radius,
         })
@@ -2514,8 +2561,13 @@ pub(in crate::supertable) async fn opann_routing_update(
             .ok()
             .map(|bytes| (ContentHash::of(bytes.as_ref()), bytes))
     });
+    let prior_deleted = prior.and_then(|r| {
+        r.deleted_ids_uri
+            .clone()
+            .zip(r.deleted_ids_content_hash.clone())
+    });
     Ok(opann_routing_commit_from_split(
-        split, prior_root, params, bundle,
+        split, prior_root, params, bundle, prior_deleted,
     ))
 }
 
@@ -2696,10 +2748,10 @@ async fn route_incoming_to_manifest_cells_if_ready(
 
     // Bump per-cell counts so routing sees the now-populated cells.
     let updated_clusters = spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
-    // Each new cell superfile becomes a whole-partition leaf in the OPANN routing
-    // tree: `(doc_off, count) = (0, 0)` (fetch the whole partition, scan inside),
-    // and the leaf centroid is a transient decode of the cell's stored Sq8
-    // centroid — no fp32 persisted.
+    // Each new cell superfile becomes one whole-partition leaf in the OPANN
+    // routing tree: `(doc_off, count) = (0, 0)` (fetch the whole partition, scan
+    // inside), keyed to the committed superfile UUID, with the cell's Sq8
+    // centroid decoded transiently to fp32.
     let dim = updated_clusters.dim as usize;
     let cell_rows = updated_clusters.to_encoded_rows();
     let added: Vec<PartitionRoutingCopy> = batch
@@ -2707,16 +2759,11 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .iter()
         .filter_map(|e| {
             let cell = e.partition_hint? as usize;
-            // Leaf key is the committed superfile UUID (matching opann): the
-            // OPANN leaf-probe path resolves `LeafRef.superfile_id` → its entry
-            // (uri) and issues one direct range-GET per leaf. Each cell
-            // superfile is its own leaf carrying the cell's Sq8 centroid (the
-            // geometric model co-locates same-cell superfiles at the same
-            // centroid); a stale cell index can't address a real object.
             cell_rows.get(cell).map(|row| PartitionRoutingCopy {
                 superfile_id: e.superfile_id.as_u128(),
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
                 centroid_fp32: manifest_centroid_components_from_row(row, dim),
                 radius: updated_clusters.radii.get(cell).copied().unwrap_or(0.0),
             })
@@ -3269,6 +3316,74 @@ pub(in crate::supertable) fn persist_commit(
     Ok(())
 }
 
+/// Record `new_deleted` user `_id`s into the hidden index's resident deleted
+/// set and persist the change. Loads the prior set, unions `new_deleted` in,
+/// writes a new content-addressed blob, and swaps `OpannRouting` — inheriting
+/// the routing tree (root + resident bundle), changing only the deleted-set
+/// blob reference.
+///
+/// The hidden cells are NOT rewritten on a user delete (the drain byte-splices
+/// every incoming row, tombstoned or not — `encode_encoded_rows` is passed
+/// `None` for incoming routing), so deleted rows stay physically present in the
+/// cells. This resident set is what the vector read path consults — in memory,
+/// zero per-cell tombstone GETs — to drop them. It is monotonic until a
+/// tombstone-aware hidden compaction physically removes the rows and prunes
+/// their ids.
+///
+/// No-op pre-drain (no routing tree to attach the set to yet) and when no id is
+/// actually new. The hidden index is single-writer, so the load→union→swap is
+/// not racing another hidden commit; `persist_commit_async`'s OCC loop still
+/// guards the pointer CAS against other processes.
+async fn record_hidden_deleted_ids(
+    inner: &SupertableInner,
+    new_deleted: &[i128],
+) -> Result<(), BuildError> {
+    if new_deleted.is_empty() {
+        return Ok(());
+    }
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    let current = inner.manifest.load_full();
+    let Some(prior) = current.opann_routing() else {
+        return Ok(());
+    };
+    let mut ids = store::load_deleted_ids(
+        prior,
+        storage.as_ref(),
+        inner.options.disk_cache.as_ref(),
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    let before = ids.len();
+    ids.extend_from_slice(new_deleted);
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() == before {
+        // Every id was already recorded — nothing to persist.
+        return Ok(());
+    }
+    let bytes = store::encode_deleted_ids(&ids);
+    let hash = ContentHash::of(&bytes);
+    let uri = store::deleted_ids_uri(&hash);
+    let mut routing = prior.clone();
+    routing.deleted_ids_uri = Some(uri.clone());
+    routing.deleted_ids_content_hash = Some(hash);
+    // Replace carrying the unchanged tree fields + the new deleted-set blob;
+    // the blob travels as a content-addressed page write in the pre-pointer
+    // wave, exactly like a routing page.
+    let commit = OpannRoutingCommit::Replace {
+        routing: Some(routing),
+        pages: vec![(uri, Bytes::from(bytes))],
+    };
+    let new_manifest =
+        persist_commit_async(inner, storage, Vec::new(), &[], Vec::new(), Vec::new(), commit)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+    inner.manifest.store(Arc::new(new_manifest));
+    Ok(())
+}
+
 // Writes the superfile list to storage. Performs the side-effect of modifying pending_storage_writes
 // to remove successfully written entries.
 // Swallow `PreconditionFailed` per-PUT: on a retry after a
@@ -3479,6 +3594,18 @@ pub(crate) async fn try_commit_attempt(
         put_immutable_blob(storage.as_ref(), uri, bytes.clone())
             .await
             .map_err(SupertableCommitError::Storage)?;
+        // Pre-warm the disk cache with the bytes we just wrote, so the first
+        // post-commit query (and the next incremental tree update) reads the
+        // bundle/pages from the warm mmap instead of re-GETting them. Under
+        // heavy write traffic every commit mints a new root/bundle hash, so
+        // without this each post-commit read degenerates to an object-store
+        // GET. Best-effort: the blob is already durable on storage, so a seed
+        // failure costs only a later cold GET, never correctness.
+        if let Some(cache) = opts.disk_cache.as_ref()
+            && let Err(e) = cache.seed_blob(ContentHash::of(bytes.as_ref()), bytes.clone()).await
+        {
+            tracing::debug!("opann routing-tree blob cache pre-warm failed for {uri}: {e}");
+        }
     }
 
     // 4. Parallel-issue (touched parts) + list PUTs, then

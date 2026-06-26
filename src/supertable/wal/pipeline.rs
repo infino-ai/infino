@@ -633,6 +633,7 @@ fn build_vector_summary(
                     centroid,
                     radius,
                     clusters,
+                    cluster_offsets: Vec::new(),
                 },
             );
         }

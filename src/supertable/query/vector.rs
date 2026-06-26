@@ -283,17 +283,37 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
-    read_ids_for_locals(manifest, entry, &locals, id_column).await
+    // Routing resolves a hidden-cell superfile's per-row stable `_id`; the
+    // inline IVF region is the right (resident) source here.
+    read_ids_for_locals(manifest, entry, &locals, id_column, true).await
 }
 
 /// Read the `_id` column values at `local_ids` (in caller order) from one
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
+///
+/// `allow_inline_region` selects the resolution source:
+///
+///   - `true` — prefer the IVF blob's inline `_id` region (resident, no scalar
+///     decode). The region is laid out in **vector-blob row order**, so its
+///     `_id` at position `local` is the user `_id` dual-write stamped for that
+///     IVF row. This is the right source for the hidden-cell `_id` resolution
+///     (remap step 1 and routing): each hidden hit's `local_doc_id` indexes the
+///     IVF blob directly, so the inline lookup returns exactly that hit's id.
+///   - `false` — never use the inline region; read the scalar `_id` column. The
+///     remap's step-2 user-superfile lookup reads every row (`0..n`) and
+///     `binary_search`es the result, which is only valid when the values come
+///     back in **parquet row order** (ids minted monotonically per row). A
+///     compacted/merged user superfile carries its own IVF blob whose inline
+///     region is in cluster order, NOT row order — serving that to the
+///     binary-search caller misses every gapped lookup ("no row with id …").
+///     The scalar column is row-ordered, so it is the only correct source here.
 async fn read_ids_for_locals(
     manifest: &Manifest,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
+    allow_inline_region: bool,
 ) -> Result<Vec<i128>, QueryError> {
     let storage = manifest
         .options
@@ -303,25 +323,29 @@ async fn read_ids_for_locals(
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
     let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
-    // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
-    // straight from it (resident; no scalar `_id` column read) when available.
-    if let Some(ids) = reader
-        .vec()
-        .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
-    {
-        return Ok(ids);
-    }
-    // Cold path: the region is present but not resident (the search fetched
-    // centroids/cluster_idx + blocks, never the region). Fetch it async and
-    // index it — far cheaper than the scalar `_id` decode below, and the path
-    // the inline-`_id` region was built for. (Warm hits the sync branch above.)
-    if let Some(v) = reader.vec() {
-        if let Some(ids) = v
-            .inline_stable_ids_for_locals_async(local_ids)
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+    if allow_inline_region {
+        // Hidden cell superfiles inline the stable `_id` in the IVF blob —
+        // resolve straight from it (resident; no scalar `_id` column read) when
+        // available.
+        if let Some(ids) = reader
+            .vec()
+            .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
         {
             return Ok(ids);
+        }
+        // Cold path: the region is present but not resident (the search fetched
+        // centroids/cluster_idx + blocks, never the region). Fetch it async and
+        // index it — far cheaper than the scalar `_id` decode below, and the
+        // path the inline-`_id` region was built for. (Warm hits the sync
+        // branch above.)
+        if let Some(v) = reader.vec() {
+            if let Some(ids) = v
+                .inline_stable_ids_for_locals_async(local_ids)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?
+            {
+                return Ok(ids);
+            }
         }
     }
     if reader.parquet_bytes().is_some() {
@@ -407,8 +431,11 @@ async fn hidden_hits_user_ids(
             continue;
         }
         // Gapped span → one resident read of just the rows these hits touch.
+        // Hidden cells index the IVF blob directly by `local_doc_id`, so the
+        // inline `_id` region is the right (resident) source.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column).await?;
+        let vals =
+            read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -459,10 +486,9 @@ async fn remap_hidden_hits_to_user_hits(
 
     // Step 2: user `_id` → (user superfile, local row). Resolve the owning
     // superfile by id range; arithmetic when its span is contiguous, else
-    // binary-search the superfile's `_id` column — read once per superfile
+    // look the id up in the superfile's `_id` column — read once per superfile
     // (resident via the disk cache), grouped so a gapped superfile is never
-    // re-read per hit. A future per-superfile id-run index would make the
-    // gapped case O(1) and drop the column read entirely.
+    // re-read per hit.
     let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for (i, &user_row_id) in user_ids.iter().enumerate() {
@@ -492,17 +518,32 @@ async fn remap_hidden_hits_to_user_hits(
             })?;
         let n = user_entry.n_docs as usize;
         let all_locals: Vec<u32> = (0..n as u32).collect();
-        // Column is monotonic (ids minted in row order) → binary-searchable.
+        // Read the scalar `_id` column (NOT the inline IVF region, which is in
+        // cluster order). The column maps row → id in `local_doc_id` order, but
+        // it is NOT globally sorted: a superfile merged from several
+        // independently-id'd appends holds one monotonic run per source, and the
+        // runs are concatenated in compaction-input order (random UUID), not by
+        // id. Sort `(id, local)` once so the lookup is correct regardless of run
+        // order; a plain `binary_search` over the raw column would miss any id
+        // whose run is not first.
         let id_col =
-            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column).await?;
+            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column, false).await?;
+        let mut sorted: Vec<(i128, u32)> = id_col
+            .into_iter()
+            .enumerate()
+            .map(|(local, id)| (id, local as u32))
+            .collect();
+        sorted.sort_unstable_by_key(|&(id, _)| id);
         for &i in &idxs {
             let user_row_id = user_ids[i];
-            let pos = id_col.binary_search(&user_row_id).map_err(|_| {
-                QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
-            })?;
+            let pos = sorted
+                .binary_search_by_key(&user_row_id, |&(id, _)| id)
+                .map_err(|_| {
+                    QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
+                })?;
             remapped[i] = Some(SuperfileHit {
                 superfile: uri,
-                local_doc_id: pos as u32,
+                local_doc_id: sorted[pos].1,
                 score: hidden_hits[i].score,
                 stable_id: None,
             });
@@ -999,7 +1040,7 @@ impl SupertableReader {
             }
         };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, body).await?;
+            dispatch::fanout_with(self, units, true, body).await?;
         Ok(pairs
             .into_iter()
             .filter(|(_, bm)| !bm.is_empty())

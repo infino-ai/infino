@@ -1848,6 +1848,14 @@ pub struct VectorSummary {
     /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
     pub clusters: ClusterCentroids,
+    /// Per-cluster `doc_off` (row offset within the superfile's per-cluster
+    /// blocks region), aligned with `clusters.counts` by cluster ordinal —
+    /// captured from the cell's cluster index at write time. Lets a query
+    /// compute an individual cluster's byte range (`doc_off..doc_off+count`
+    /// × stride, relative to `subsection_offsets`) and range-GET just that
+    /// cluster — no re-reading the cell's cluster index. Empty when not
+    /// captured (legacy summaries, or no vector index).
+    pub cluster_offsets: Vec<u32>,
 }
 
 /// Per-cluster IVF centroids for one vector column, stored as Sq8+residual

@@ -794,6 +794,7 @@ mod tests {
             centroid: ClusterCentroids::single(Metric::L2Sq, &centroid),
             radius: seed * 1.7,
             clusters: ClusterCentroids::empty(),
+            cluster_offsets: Vec::new(),
         }
     }
 

@@ -56,6 +56,10 @@ pub(crate) struct LeafInsert {
     pub(crate) superfile_id: u128,
     pub(crate) doc_off: u32,
     pub(crate) count: u32,
+    /// Internal IVF cluster ordinal within `superfile_id` — selects the
+    /// cluster's Sq8 scale/offset for the offset probe's rerank decode. 0 for
+    /// the whole-cell `(0,0)` legacy leaf (unused there).
+    pub(crate) cluster_id: u32,
     pub(crate) centroid_fp32: Vec<f32>,
     pub(crate) radius: f32,
 }
@@ -148,6 +152,7 @@ fn build_genesis(
             superfile_id: l.superfile_id,
             doc_off: l.doc_off,
             count: l.count,
+            cluster_id: l.cluster_id,
         })
         .collect();
     let clusters =
@@ -434,6 +439,7 @@ fn append_leaf_into_page(page: &Page, metric: Metric, dim: usize, leaf: &LeafIns
         superfile_id: leaf.superfile_id,
         doc_off: leaf.doc_off,
         count: leaf.count,
+        cluster_id: leaf.cluster_id,
     }));
     let root_local = page.root_local();
     let new_root = match topo[root_local as usize].clone() {
@@ -567,6 +573,7 @@ mod tests {
                 superfile_id: *id,
                 doc_off: 0,
                 count: 0,
+                cluster_id: 0,
                 centroid_fp32: c.clone(),
                 radius: *r,
             })
@@ -698,6 +705,7 @@ mod tests {
                     superfile_id: NEW_ID,
                     doc_off: 0,
                     count: 0,
+                    cluster_id: 0,
                     centroid_fp32: new_centroid.clone(),
                     radius: 0.05,
                 }],

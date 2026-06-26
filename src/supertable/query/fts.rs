@@ -536,6 +536,7 @@ impl SupertableReader {
         let per_superfile = dispatch::fanout_with(
             self,
             units,
+            true,
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);

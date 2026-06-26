@@ -574,14 +574,23 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
 
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     // radius ‖ u32 len(centroid block) ‖ centroid block (Sq8+ε, n_cent=1) ‖
-    // clusters block (Sq8+ε). The length prefix delimits the two
-    // self-describing ClusterCentroids blocks.
+    // u32 len(clusters block) ‖ clusters block (Sq8+ε) ‖
+    // u32 n_offsets ‖ cluster_offsets (u32 each). The clusters block is now
+    // length-prefixed (it used to be the trailing block) so the per-cluster
+    // offsets can follow it.
     let centroid_enc = encode_cluster_centroids(&s.centroid);
-    let mut out = Vec::with_capacity(8 + centroid_enc.len());
+    let clusters_enc = encode_cluster_centroids(&s.clusters);
+    let mut out =
+        Vec::with_capacity(12 + centroid_enc.len() + clusters_enc.len() + s.cluster_offsets.len() * 4);
     out.extend_from_slice(&s.radius.to_le_bytes());
     out.extend_from_slice(&(centroid_enc.len() as u32).to_le_bytes());
     out.extend_from_slice(&centroid_enc);
-    out.extend_from_slice(&encode_cluster_centroids(&s.clusters));
+    out.extend_from_slice(&(clusters_enc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&clusters_enc);
+    out.extend_from_slice(&(s.cluster_offsets.len() as u32).to_le_bytes());
+    for &o in &s.cluster_offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
     out
 }
 
@@ -600,12 +609,36 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
         ));
     }
     let centroid = decode_cluster_centroids(&cb)?;
-    let tail = &bytes[c.position() as usize..];
-    let clusters = decode_cluster_centroids(tail)?;
+    let cllen = read_u32(&mut c, "clusters_len")? as usize;
+    let clb = read_n(&mut c, cllen, "clusters_block")?;
+    if clb.len() != cllen {
+        return Err(DecodeError::InvalidVectorSummary(
+            "truncated clusters block".into(),
+        ));
+    }
+    let clusters = decode_cluster_centroids(&clb)?;
+    // Per-cluster offsets (absent ⇒ empty, for robustness against truncation).
+    let cluster_offsets = if (c.position() as usize) < bytes.len() {
+        let n_off = read_u32(&mut c, "n_offsets")? as usize;
+        let mut v = Vec::with_capacity(n_off);
+        for _ in 0..n_off {
+            let ob = read_n(&mut c, 4, "cluster_offset")?;
+            if ob.len() != 4 {
+                return Err(DecodeError::InvalidVectorSummary(
+                    "truncated cluster offset".into(),
+                ));
+            }
+            v.push(u32::from_le_bytes([ob[0], ob[1], ob[2], ob[3]]));
+        }
+        v
+    } else {
+        Vec::new()
+    };
     Ok(VectorSummary {
         centroid,
         radius,
         clusters,
+        cluster_offsets,
     })
 }
 
@@ -1201,6 +1234,7 @@ mod vector_summary_tests {
             centroid: ClusterCentroids::single(Metric::L2Sq, &[1.0, 2.0, 3.0, 4.0]),
             radius: 9.0,
             clusters,
+            cluster_offsets: vec![0, 100, 100],
         };
 
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
@@ -1233,6 +1267,7 @@ mod vector_summary_tests {
             centroid: ClusterCentroids::single(Metric::L2Sq, &[0.5, -0.5]),
             radius: 1.0,
             clusters: ClusterCentroids::empty(),
+            cluster_offsets: Vec::new(),
         };
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
