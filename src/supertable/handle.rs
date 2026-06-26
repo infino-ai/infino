@@ -1069,6 +1069,19 @@ async fn build_handle(
     if st.inner.options.storage.is_some() {
         let _ = st.run_recovery_sweep_once().await;
         let _ = st.run_gc_sweep_once().await;
+        // Prewarm the OPANN routing tree at open so the first cold *search*
+        // doesn't pay its descent-page load. Only the hidden vector-index
+        // manifest carries a routing tree (a no-op on the user table); the open
+        // already does I/O (the sweeps above), so this folds the one-time tree
+        // load into the open-latency window instead of the search critical path.
+        // After the sweeps so the manifest is final — a recovery swap would
+        // otherwise warm a tree that's about to be replaced.
+        let m = st.inner.manifest.load_full();
+        if m.opann_routing().is_some() {
+            if let Err(e) = m.opann_resident_tree().await {
+                tracing::warn!("supertable: OPANN routing-tree prewarm at open failed: {e}");
+            }
+        }
     }
     Ok(st)
 }

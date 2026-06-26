@@ -24,11 +24,12 @@ use crate::superfile::{
             write_ivf_cluster_blocks,
         },
         cell_posting::{
-            EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
-            sq8_quant_params_equal, sq8_residual_norm_sq,
+            EncodedCellRow, manifest_centroid_components_from_row,
+            materialize_sq8_residual_row_into_cluster_quant, sq8_quant_params_equal,
+            sq8_residual_norm_sq,
         },
         centroid_block::CentroidBlock,
-        distance::Metric,
+        distance::{Metric, distance},
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry},
         rerank_codec::RerankCodec,
@@ -369,6 +370,11 @@ pub(crate) struct RoutedCellSubsection {
     /// the routing pass can stay a pure parallel map — no shared-state side
     /// channel. `0.0` when no row contributed a positive radius.
     pub shard_radius: f32,
+    /// Per-output-cluster covering radius (max member distance to the cluster's
+    /// own centroid), aligned with the cell's clusters by ordinal. Populated
+    /// onto `VectorSummary.clusters.radii` so the within-cell admission can be
+    /// radius-aware. Empty when no rows contributed.
+    pub cluster_radii: Vec<f32>,
 }
 
 /// One contributing source row, identified by `(input, source_cluster, row)`.
@@ -387,6 +393,12 @@ struct PairRouting {
     pair: (usize, usize),
     per_cell: HashMap<u32, Vec<SourceRowRef>>,
     radii: HashMap<u32, f32>,
+    /// This `(input, source_cluster)` pair's covering radius to ITS OWN source
+    /// centroid, per destination cell — i.e. the per-OUTPUT-cluster radius (the
+    /// pair becomes one output cluster in each cell it lands in). Distinct from
+    /// `radii`, which is the distance to the destination CELL centroid; this is
+    /// what the within-cell `select_cells_adaptive` admission needs.
+    cluster_radii: HashMap<u32, f32>,
 }
 
 /// Route every Sq8+ε row across `inputs` to a cell (via `route`) and emit one
@@ -415,9 +427,9 @@ pub(crate) fn encode_encoded_rows<F>(
     route: F,
 ) -> Result<HashMap<u32, RoutedCellSubsection>, BuildError>
 where
-    // Returns `(destination cell, member distance to that cell's centroid)`.
-    // `Sync` so the routing pass can call it from the rayon `par_iter` below.
-    F: Fn(&EncodedCellRow) -> (u32, f32) + Sync,
+    // Returns the SET of destination cells (SPANN closure replication) with each
+    // row's distance to that cell's centroid. `Sync` for the rayon `par_iter`.
+    F: Fn(&EncodedCellRow) -> Vec<(u32, f32)> + Sync,
 {
     if inputs.is_empty() {
         return Err(BuildError::VectorSchemaMismatch(
@@ -493,10 +505,15 @@ where
             let inp = &parsed[ii];
             let mut per_cell: HashMap<u32, Vec<SourceRowRef>> = HashMap::new();
             let mut radii: HashMap<u32, f32> = HashMap::new();
+            let mut cluster_radii: HashMap<u32, f32> = HashMap::new();
             let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count > 0 {
                 let src_scale: Arc<[f32]> = Arc::from(inp.scale[c * dim..c * dim + dim].to_vec());
                 let src_offset: Arc<[f32]> = Arc::from(inp.offset[c * dim..c * dim + dim].to_vec());
+                // Source cluster's own centroid (fp32). The per-output-cluster
+                // covering radius is the max member distance to THIS centroid —
+                // what the within-cell `select_cells_adaptive` admission scores.
+                let src_centroid = centroid_blocks[ii].cluster_components(c);
                 let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
                 let doc_ids_at = block + count * inp.code_bytes;
                 let full_at = block + count * (inp.code_bytes + id_bytes);
@@ -523,16 +540,28 @@ where
                         residuals,
                         norm_sq,
                     };
-                    let (cell, radius) = route(&encoded);
-                    per_cell.entry(cell).or_default().push(SourceRowRef {
-                        input: ii,
-                        cluster: c,
-                        row: i,
-                        src_local,
-                    });
-                    let e = radii.entry(cell).or_insert(0.0);
-                    if radius > *e {
-                        *e = radius;
+                    // Source-cluster covering radius (this row's distance to ITS
+                    // pair's centroid) is independent of destination cell —
+                    // compute once, then fold into each replica cell below.
+                    let row_fp32 = manifest_centroid_components_from_row(&encoded, dim);
+                    let cr = distance(metric, &row_fp32, &src_centroid);
+                    // SPANN closure replication: the row is written into every
+                    // cell `route` returns (interior → 1, boundary → a few).
+                    for (cell, radius) in route(&encoded) {
+                        per_cell.entry(cell).or_default().push(SourceRowRef {
+                            input: ii,
+                            cluster: c,
+                            row: i,
+                            src_local,
+                        });
+                        let e = radii.entry(cell).or_insert(0.0);
+                        if radius > *e {
+                            *e = radius;
+                        }
+                        let cre = cluster_radii.entry(cell).or_insert(0.0);
+                        if cr > *cre {
+                            *cre = cr;
+                        }
                     }
                 }
             }
@@ -540,6 +569,7 @@ where
                 pair: (ii, c),
                 per_cell,
                 radii,
+                cluster_radii,
             }
         })
         .collect();
@@ -550,6 +580,9 @@ where
     // when each subsection is built, so the output layout is fully deterministic.
     let mut by_cell: HashMap<u32, HashMap<(usize, usize), Vec<SourceRowRef>>> = HashMap::new();
     let mut cell_radius: HashMap<u32, f32> = HashMap::new();
+    // Per cell, the covering radius of each output cluster (keyed by its source
+    // `(input, source_cluster)` pair) — assembled into `clusters.radii` below.
+    let mut cell_cluster_radius: HashMap<u32, HashMap<(usize, usize), f32>> = HashMap::new();
     for pr in routed_pairs {
         for (cell, rows) in pr.per_cell {
             by_cell.entry(cell).or_default().insert(pr.pair, rows);
@@ -560,6 +593,9 @@ where
                 *e = r;
             }
         }
+        for (cell, r) in pr.cluster_radii {
+            cell_cluster_radius.entry(cell).or_default().insert(pr.pair, r);
+        }
     }
 
     let mut out: HashMap<u32, RoutedCellSubsection> = HashMap::with_capacity(by_cell.len());
@@ -569,6 +605,19 @@ where
         let mut pair_keys: Vec<(usize, usize)> = pairs.keys().copied().collect();
         pair_keys.sort_unstable();
         let out_n_cent = pair_keys.len();
+        // Per-output-cluster covering radii, aligned with `pair_keys` (= cluster
+        // ordinal). Feeds `clusters.radii` so the within-cell admission is
+        // radius-aware instead of nearest-centroid-by-distance.
+        let out_cluster_radii: Vec<f32> = pair_keys
+            .iter()
+            .map(|k| {
+                cell_cluster_radius
+                    .get(&cell_id)
+                    .and_then(|m| m.get(k))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect();
         let n_docs: u32 = pairs.values().map(|v| v.len() as u32).sum();
 
         // Per-output-cluster quantizer + centroid, carried verbatim from source.
@@ -746,6 +795,7 @@ where
                 },
                 stable_ids: stable_ids_by_local,
                 shard_radius: cell_radius.get(&cell_id).copied().unwrap_or(0.0),
+                cluster_radii: out_cluster_radii,
             },
         );
     }

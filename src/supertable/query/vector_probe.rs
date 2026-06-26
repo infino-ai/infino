@@ -91,91 +91,108 @@ pub(super) async fn select_opann_probe_leaves(
         .opann_resident_tree()
         .await
         .map_err(|e| QueryError::Store(format!("opann tree load: {e}")))?;
-    let Some(source) = tree else {
-        return Ok(None);
-    };
-    let Some((root, routing)) = manifest.opann_routing().map(|r| (r.root_page, r.routing)) else {
-        return Ok(None);
-    };
-
-    // Collect every surviving leaf (same as [`super::vector::SupertableReader::candidate_superfiles_for_vector`]):
-    // radius-aware τ admission runs over the full candidate pool and trims to
-    // `[floor, nprobe_max]`. Capping descent at `nprobe_max` first drops cells
-    // that τ would have admitted — spread-out queries need those far-but-large-
-    // radius partitions, not a smaller fixed centroid-depth budget.
-    let candidates = PagedTree::new(source, root)
-        .select_probes_where(query, usize::MAX, &survives)
-        .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
-
     let entries = super::vector::ordered_manifest_superfiles(manifest).await?;
-    let entry_by_id: HashMap<u128, Arc<SuperfileEntry>> = entries
-        .iter()
-        .map(|e| (e.superfile_id.as_u128(), Arc::clone(e)))
-        .collect();
 
-    let radius_of: HashMap<u128, f32> = entries
-        .iter()
-        .filter_map(|sf| {
-            sf.vector_summary
-                .get(column)
-                .map(|vs| (sf.superfile_id.as_u128(), vs.radius))
-        })
-        .collect();
+    let mut out: Vec<(LeafRef, f32, Arc<SuperfileEntry>)> = Vec::new();
 
-    let floor = options.nprobe.unwrap_or(routing.nprobe_min);
-    let admitted = adaptive_probe_leaves(
-        candidates,
-        &radius_of,
-        floor,
-        routing.nprobe_max,
-        routing.slack,
-    );
+    // Descend the routing tree to cell leaves — ONLY when a tree is published.
+    // Before the first drain there is no tree yet; the INCOMING-staging probes
+    // below still run, so a pre-drain query is the SAME OPANN fan-out with zero
+    // cell probes — not a separate scan path. (When there is neither a tree nor
+    // any incoming cells — e.g. a user table that isn't OPANN-routed — `out`
+    // stays empty and the caller falls back to the per-superfile IVF scan.)
+    if let (Some(source), Some(routing_info)) = (tree, manifest.opann_routing()) {
+        let root = routing_info.root_page;
+        let routing = routing_info.routing;
 
-    // Metric for scoring each admitted cell's resident per-cluster centroids.
-    let metric = manifest
-        .options
-        .vector_columns
-        .iter()
-        .find(|vc| vc.column == column)
-        .map(|vc| vc.metric)
-        .unwrap_or(Metric::L2Sq);
+        // Radius-aware τ admission runs over the full candidate pool and trims
+        // to `[floor, nprobe_max]`. Capping descent at `nprobe_max` first drops
+        // cells that τ would have admitted — spread-out queries need those
+        // far-but-large-radius partitions, not a fixed centroid-depth budget.
+        let candidates = PagedTree::new(source, root)
+            .select_probes_where(query, usize::MAX, &survives)
+            .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
 
-    let mut out = Vec::with_capacity(admitted.len());
-    for (leaf, dist) in admitted {
-        let Some(entry) = entry_by_id.get(&leaf.superfile_id) else {
-            continue;
-        };
-        if !entry_has_vector_probe_layout(entry) {
-            continue;
-        }
-        // Per-cell LOCAL cluster selection. The tree already localized to this
-        // cell; now score its OWN resident cluster centroids, take the nearest
-        // (adaptive, radius-aware), and emit one offset leaf per chosen cluster —
-        // its byte range coming from the resident per-cluster offset + count. A
-        // query then range-GETs only those clusters, so fetch cost is independent
-        // of cell size. Falls back to a whole-cell `(0, 0)` probe when the cell
-        // carries no resident per-cluster offsets (e.g. legacy/incoming cells).
-        match entry.vector_summary.get(column) {
-            Some(vs)
-                if vs.clusters.n_cent > 0
-                    && vs.cluster_offsets.len() == vs.clusters.counts.len()
-                    && !vs.cluster_offsets.is_empty() =>
-            {
-                for c in vs.clusters.select_cells_adaptive(metric, query, floor, routing) {
-                    let ci = c as usize;
-                    out.push((
-                        LeafRef {
-                            superfile_id: leaf.superfile_id,
-                            doc_off: vs.cluster_offsets[ci],
-                            count: vs.clusters.counts[ci],
-                            cluster_id: c,
-                        },
-                        dist,
-                        Arc::clone(entry),
-                    ));
-                }
+        let entry_by_id: HashMap<u128, Arc<SuperfileEntry>> = entries
+            .iter()
+            .map(|e| (e.superfile_id.as_u128(), Arc::clone(e)))
+            .collect();
+
+        let radius_of: HashMap<u128, f32> = entries
+            .iter()
+            .filter_map(|sf| {
+                sf.vector_summary
+                    .get(column)
+                    .map(|vs| (sf.superfile_id.as_u128(), vs.radius))
+            })
+            .collect();
+
+        let floor = options.nprobe.unwrap_or(routing.nprobe_min);
+        let admitted = adaptive_probe_leaves(
+            candidates,
+            &radius_of,
+            floor,
+            routing.nprobe_max,
+            routing.slack,
+        );
+
+        // Metric for scoring each admitted cell's resident per-cluster centroids.
+        let metric = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .map(|vc| vc.metric)
+            .unwrap_or(Metric::L2Sq);
+
+        out.reserve(admitted.len());
+        for (leaf, dist) in admitted {
+            let Some(entry) = entry_by_id.get(&leaf.superfile_id) else {
+                continue;
+            };
+            if !entry_has_vector_probe_layout(entry) {
+                continue;
             }
-            _ => out.push((leaf, dist, Arc::clone(entry))),
+            // Per-cell LOCAL cluster selection. The tree already localized to
+            // this cell; now score its OWN resident cluster centroids, take the
+            // nearest (adaptive, radius-aware), and emit one offset leaf per
+            // chosen cluster — its byte range coming from the resident
+            // per-cluster offset + count. A query then range-GETs only those
+            // clusters, so fetch cost is independent of cell size. Falls back to
+            // a whole-cell `(0, 0)` probe when the cell carries no resident
+            // per-cluster offsets (e.g. legacy/incoming cells).
+            match entry.vector_summary.get(column) {
+                Some(vs)
+                    if vs.clusters.n_cent > 0
+                        && vs.cluster_offsets.len() == vs.clusters.counts.len()
+                        && !vs.cluster_offsets.is_empty() =>
+                {
+                    // Within-cell cluster admission is RADIUS-aware, NOT the outer
+                    // cell nprobe: score all the cell's centroids and admit the
+                    // ones whose covering radius reaches the query (τ = d* +
+                    // slack·r*), uncapped (nprobe_max = n_cent) so a query whose
+                    // neighbours span many per-commit clusters still pulls them
+                    // all in. (Empty radii — legacy cells — collapse this back to
+                    // nearest-by-distance, the prior behaviour.)
+                    let mut inner_routing = routing;
+                    inner_routing.nprobe_min = 1;
+                    inner_routing.nprobe_max = vs.clusters.n_cent as usize;
+                    for c in vs.clusters.select_cells_adaptive(metric, query, 1, inner_routing) {
+                        let ci = c as usize;
+                        out.push((
+                            LeafRef {
+                                superfile_id: leaf.superfile_id,
+                                doc_off: vs.cluster_offsets[ci],
+                                count: vs.clusters.counts[ci],
+                                cluster_id: c,
+                            },
+                            dist,
+                            Arc::clone(entry),
+                        ));
+                    }
+                }
+                _ => out.push((leaf, dist, Arc::clone(entry))),
+            }
         }
     }
 
@@ -354,9 +371,25 @@ pub(super) async fn fanout_opann_leaf_probes(
             });
         }
     }
-    // Our `top_k_ascending` takes the per-superfile nested vec and flattens
-    // internally (opann's takes a pre-flattened vec); pass it directly.
-    Ok(super::vector::top_k_ascending(per_superfile, k))
+    // SPANN replication writes a boundary row into several cells, so the same
+    // row can surface from more than one probed cell. Dedup by stable_id (keep
+    // the best/min score per row) so replicas don't waste top-k slots. Hits
+    // with no stable_id (INCOMING cells, no inline `_id`) pass through.
+    let mut best: HashMap<i128, SuperfileHit> = HashMap::new();
+    let mut passthrough: Vec<SuperfileHit> = Vec::new();
+    for hit in per_superfile.into_iter().flatten() {
+        match hit.stable_id {
+            Some(id) => {
+                let replace = best.get(&id).map(|h| hit.score < h.score).unwrap_or(true);
+                if replace {
+                    best.insert(id, hit);
+                }
+            }
+            None => passthrough.push(hit),
+        }
+    }
+    let deduped: Vec<SuperfileHit> = best.into_values().chain(passthrough).collect();
+    Ok(super::vector::top_k_ascending(vec![deduped], k))
 }
 
 fn map_vector_err(e: VectorError) -> QueryError {

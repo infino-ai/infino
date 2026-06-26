@@ -37,6 +37,14 @@ const CELL_SPLIT_DOC_CAP_DEFAULT: u64 = 50_000;
 /// Lloyd iterations for 2-way Sq8+ε k-means at split time.
 const CELL_SPLIT_KMEANS_ITERS: usize = 5;
 
+/// SPANN closure replication: a row is written to every cell within
+/// `(1 + this)×` its nearest centroid distance (RNG-pruned, capped). Boundary
+/// rows land in a few cells so a capped query probe still finds them.
+pub(crate) const DRAIN_REPLICA_CLOSURE_RATIO: f32 = 0.1;
+
+/// SPANN `ReplicaCount` default: hard cap on how many cells one row replicates.
+pub(crate) const DRAIN_MAX_REPLICAS: usize = 8;
+
 /// Overflow threshold for cell split. Override with `INFINO_CELL_SPLIT_DOC_CAP` in tests.
 pub(crate) fn cell_split_doc_cap() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
@@ -276,6 +284,58 @@ pub(crate) fn nearest_among_cells_encoded(
         }
     }
     best
+}
+
+/// SPANN/LIRE-style closure replication: the set of cells a row should be
+/// written to. Returns every cell whose centroid is within `(1 + closure_ratio)
+/// ×` the nearest centroid distance (the "closure"), **RNG-pruned** (drop a
+/// candidate `c` if an already-kept, closer centroid `c'` is nearer to `c` than
+/// the row is — so we don't replicate into a cell already dominated by a kept
+/// one), capped at `max_replicas`. An interior row returns 1 cell; a boundary
+/// row returns a few — so a query probing a *capped* set of cells still finds
+/// boundary neighbours without uncapping the read.
+///
+/// `cent_fp32` is the decoded fp32 centroid for each cell (precomputed once by
+/// the caller — `clusters.to_encoded_rows()` then `manifest_centroid_components_
+/// from_row`), so the per-row RNG check costs no extra decode.
+pub(crate) fn spann_replica_cells_encoded(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    row: &EncodedCellRow,
+    cent_fp32: &[Vec<f32>],
+    closure_ratio: f32,
+    max_replicas: usize,
+) -> Vec<u32> {
+    let n = clusters.n_cent as usize;
+    if n == 0 {
+        return Vec::new();
+    }
+    let dim = clusters.dim as usize;
+    let row_fp32 = manifest_centroid_components_from_row(row, dim);
+    let mut scored: Vec<(u32, f32)> = (0..n)
+        .map(|c| (c as u32, clusters.score_one(metric, c, &row_fp32)))
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    let nearest = scored[0].1;
+    let threshold = nearest * (1.0 + closure_ratio);
+    let mut kept: Vec<u32> = Vec::new();
+    for (c, d) in scored {
+        if d > threshold {
+            break;
+        }
+        // RNG prune: skip `c` if a kept centroid `kc` is closer to `c` than the
+        // row is — `kc` already "covers" `c`'s direction.
+        let dominated = kept
+            .iter()
+            .any(|&kc| clusters.score_one(metric, kc as usize, &cent_fp32[c as usize]) <= d);
+        if !dominated {
+            kept.push(c);
+            if kept.len() >= max_replicas {
+                break;
+            }
+        }
+    }
+    kept
 }
 
 /// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.

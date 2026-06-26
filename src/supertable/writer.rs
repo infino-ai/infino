@@ -2056,13 +2056,18 @@ pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
-    prepare_superfile_with_uri(inner, shard, None)
+    prepare_superfile_with_uri(inner, shard, None, &[])
 }
 
 pub(super) fn prepare_superfile_with_uri(
     inner: &SupertableInner,
     shard: ShardOutput,
     reuse_uri: Option<SuperfileUri>,
+    // Per-output-cluster covering radii for the vector column, aligned with the
+    // cell's clusters by ordinal. Empty for every path except the drain's
+    // per-cell splice; populates `VectorSummary.clusters.radii` so the
+    // within-cell admission is radius-aware.
+    cluster_radii: &[f32],
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
@@ -2134,7 +2139,7 @@ pub(super) fn prepare_superfile_with_uri(
                     counts: vec![1],
                     radii: Vec::new(),
                 };
-                let clusters = vec_reader
+                let mut clusters = vec_reader
                     .cluster_centroids_encoded(&vc.column)
                     .map(
                         |(n_cent, dim, scale, offset, rows, norms, counts)| ClusterCentroids {
@@ -2149,6 +2154,12 @@ pub(super) fn prepare_superfile_with_uri(
                         },
                     )
                     .unwrap_or_default();
+                // Per-cluster covering radii (drain splice only) so the
+                // within-cell admission scores by region overlap, not nearest
+                // centroid. Aligned with `clusters` by ordinal.
+                if !cluster_radii.is_empty() && clusters.n_cent as usize == cluster_radii.len() {
+                    clusters.radii = cluster_radii.to_vec();
+                }
                 // Per-cluster byte offsets, read from the cell's cluster index
                 // (the bytes the splice just wrote), aligned with `clusters` by
                 // cluster ordinal — so a query can range-GET an individual
@@ -2710,15 +2721,41 @@ async fn route_incoming_to_manifest_cells_if_ready(
             // is under `writer_pool.install`, the half-cores pool); it reduces these
             // distances into a per-cell max radius carried on each returned
             // `RoutedCellSubsection`.
-            let route = |row: &EncodedCellRow| -> (u32, f32) {
-                let cell = if let Some(cands) = assign_among {
-                    spfresh::nearest_among_cells_encoded(&clusters, metric, cands, row)
+            // SPANN closure replication on the main drain path: a boundary row
+            // lands in a few near cells (RNG-pruned, capped) so a capped query
+            // probe still finds it — no uncapped read. The reassign path
+            // (`assign_among`, split rebalance) stays single-winner. fp32
+            // centroids precomputed once for the RNG prune.
+            let cent_fp32: Vec<Vec<f32>> = clusters
+                .to_encoded_rows()
+                .iter()
+                .map(|r| manifest_centroid_components_from_row(r, clusters.dim as usize))
+                .collect();
+            let route = |row: &EncodedCellRow| -> Vec<(u32, f32)> {
+                let cells = if let Some(cands) = assign_among {
+                    vec![spfresh::nearest_among_cells_encoded(&clusters, metric, cands, row)]
                 } else {
-                    spfresh::nearest_cell_encoded(&clusters, metric, row)
+                    spfresh::spann_replica_cells_encoded(
+                        &clusters,
+                        metric,
+                        row,
+                        &cent_fp32,
+                        spfresh::DRAIN_REPLICA_CLOSURE_RATIO,
+                        spfresh::DRAIN_MAX_REPLICAS,
+                    )
                 };
-                let dist =
-                    spfresh::encoded_shard_radius(&clusters, metric, cell, slice::from_ref(row));
-                (cell, dist)
+                cells
+                    .into_iter()
+                    .map(|cell| {
+                        let dist = spfresh::encoded_shard_radius(
+                            &clusters,
+                            metric,
+                            cell,
+                            slice::from_ref(row),
+                        );
+                        (cell, dist)
+                    })
+                    .collect()
             };
             let routed = encode_encoded_rows(&merge_inputs, &stable_ids_per_input, route)?;
 
@@ -2880,9 +2917,10 @@ fn build_one_shard_from_spliced(
     let RoutedCellSubsection {
         subsection,
         stable_ids,
-        // The drain reads `shard_radius` off the value before this point; the
-        // per-shard build only needs the subsection bytes + id order.
+        // The drain reads `shard_radius` / `cluster_radii` off the value before
+        // this point; the per-shard build only needs the subsection + id order.
         shard_radius: _,
+        cluster_radii: _,
     } = routed;
     if stable_ids.is_empty() {
         return Err(BuildError::NoDocsToBuild);
@@ -2925,10 +2963,16 @@ fn build_one_shard_from_spliced(
 fn build_prepared_ivf_from_spliced(
     inner: &SupertableInner,
     partition_hint: u32,
-    routed: RoutedCellSubsection,
+    mut routed: RoutedCellSubsection,
 ) -> Result<PreparedSuperfile, BuildError> {
+    // Per-output-cluster covering radii (taken before the splice consumes
+    // `routed`). Carried onto the cell's VectorSummary so the within-cell
+    // `select_cells_adaptive` admission is radius-aware; round-trips through the
+    // manifest encoding when populated.
+    let cluster_radii = std::mem::take(&mut routed.cluster_radii);
     let shard = build_one_shard_from_spliced(routed, &inner.options)?;
-    let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+    let prepared = prepare_superfile_with_uri(inner, shard, None, &cluster_radii)?
+        .ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
     Ok(PreparedSuperfile {
         entry,

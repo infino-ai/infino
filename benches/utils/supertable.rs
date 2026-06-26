@@ -1112,6 +1112,25 @@ pub mod vector {
                 )
             };
             if phases.warm {
+                // Measured per-search object-store GETs for a cold vector query
+                // (routed-cell range-GETs; open/tree excluded). Surfaces the
+                // request count the cost model prices — the ≤4-GET target lives
+                // here.
+                let cold_store = phases
+                    .cold
+                    .then(|| {
+                        q_correct.first().and_then(|q| {
+                            measure_cold_store_vector(
+                                &built,
+                                supertable::VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                nprobe,
+                                rerank,
+                            )
+                        })
+                    })
+                    .flatten();
                 emit_cost_warm(
                     &mut report,
                     "bench/vector/supertable/cost",
@@ -1125,7 +1144,7 @@ pub mod vector {
                     n_docs,
                     &cost::warm_from_vector(&recall_rows),
                     None,
-                    None,
+                    cold_store,
                 );
             }
             // Filtered vector recall + latency mirrors the superfile tier:
@@ -1277,6 +1296,44 @@ pub mod vector {
         ) -> Vec<(u32, f32)> {
             self.consumer.topk_global(column, query, k, nprobe, rerank)
         }
+    }
+
+    /// One metered cold vector query on a real object-store backend. Returns the
+    /// per-SEARCH object-store requests — the routed-cell range-GETs for a
+    /// single cold query. The manifest load + OPANN-tree prewarm happen at
+    /// consumer open and are excluded (snapshot taken right after open), so the
+    /// count is the steady-state per-query fetch — matching the routing
+    /// GET-budget unit test, not the one-time open (which is amortized).
+    fn measure_cold_store_vector(
+        built: &supertable::IngestResult,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank: usize,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        built.cleanup.as_ref()?;
+        let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        // Exclude the one-time open (manifest load + prewarmed OPANN tree) so the
+        // reported count is just the per-query cell fetch.
+        let after_open = meter.snapshot();
+        let _ = consumer.topk_global(column, query, k, nprobe, rerank);
+        let after_search = meter.snapshot();
+        drop(consumer);
+        drop(cache_dir);
+        Some(storage_meter::ObjectStoreMeter {
+            head_count: after_search.head_count.saturating_sub(after_open.head_count),
+            get_count: after_search.get_count.saturating_sub(after_open.get_count),
+            get_bytes: after_search.get_bytes.saturating_sub(after_open.get_bytes),
+        })
     }
 }
 
