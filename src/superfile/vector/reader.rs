@@ -2165,27 +2165,28 @@ impl VectorReader {
                 (prefix_blocks, meta_bytes, true)
             } else {
                 // Cold: fetch the **full** per-cluster blocks
-                // (`[codes][doc_ids][full]`) + Sq8 meta in one coalesced
-                // batch, so the survivor rerank rows arrive *with* the codes
-                // — collapsing the dependent rerank round-trip (wave 3) into
-                // this wave. Cold latency is RTT/wave-bound and the
-                // background cache-fill is already downloading the whole
-                // cell, so the extra rerank bytes here are bytes we'd pull
-                // regardless; we just front-load them to save a serial S3
-                // round-trip. `survivor_only_rerank_fetch = false` tells
-                // `build_shortlist` the rerank rows are in-block (no second
-                // fetch).
+                // (`[codes][doc_ids][full]`) for the admitted clusters in one
+                // coalesced batch + Sq8 meta. A cluster's bytes are CONTIGUOUS,
+                // so this is the natural S3 fetch unit: one coalesced range-GET
+                // per cluster (adjacent clusters merge), regardless of how many
+                // rows survive the in-memory shortlist. We deliberately do NOT
+                // fetch only the shortlist survivors' rerank rows on cold — they
+                // are scattered individual rows within a cluster, so that would
+                // mean either many tiny per-row GETs or a coalesce-with-gaps
+                // back to ~the whole region; both lose to this single coalesced
+                // fetch. The lever for cold byte/GET cost is FEWER admitted
+                // clusters (INNER_CLUSTER_CAP + the cell nprobe), not a
+                // finer-grained fetch. `survivor_only_rerank_fetch = false`: the
+                // rerank rows are in-block.
                 let cluster_full_ranges: Vec<Range<usize>> = filtered_meta
                     .iter()
                     .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
                     .collect();
-                // Piggyback the inline stable-`_id` region onto THIS wave:
-                // fetch it concurrently with the cluster-block GETs (same
-                // round-trip envelope) and stash it on the reader. The remap
-                // step then resolves hidden→user `_id` from the stash (sync,
-                // at the fan-out tag site) instead of issuing a trailing
-                // region GET — removing a serial cold wave. `None` when the
-                // column has no inline region (e.g. incoming superfiles).
+                // Piggyback the inline stable-`_id` region onto THIS wave: fetch
+                // it concurrently with the cluster-block GETs (same round-trip
+                // envelope) and stash it on the reader, so the remap resolves
+                // hidden→user `_id` from the stash with no trailing region GET.
+                // `None` when the column has no inline region (incoming cells).
                 let region_range = col.stable_ids_region_range();
                 let cluster_fut = get_cluster_ranges_coalesced_with_extra_async(
                     &self.source,

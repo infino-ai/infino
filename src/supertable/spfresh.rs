@@ -232,24 +232,6 @@ pub(crate) fn plan_sq8_split(
     )
 }
 
-/// Assign an encoded row to its nearest manifest cell.
-pub(crate) fn nearest_cell_encoded(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    row: &EncodedCellRow,
-) -> u32 {
-    let mut best = 0u32;
-    let mut best_score = f32::INFINITY;
-    for c in 0..clusters.n_cent as usize {
-        let score = score_row_against_cell(clusters, metric, c, row);
-        if score < best_score {
-            best_score = score;
-            best = c as u32;
-        }
-    }
-    best
-}
-
 /// Max member distance from `cell_id`'s centroid over encoded rows.
 pub(crate) fn encoded_shard_radius(
     clusters: &ClusterCentroids,

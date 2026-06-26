@@ -26,6 +26,15 @@ use crate::{
 
 use super::vector::VectorSearchOptions;
 
+/// Hard cap on how many clusters the within-cell radius-aware admission emits
+/// per cell. The radius (τ) admission already trims to the clusters whose
+/// covering radius reaches the query, sorted nearest-first; this bounds the
+/// tail so one query can't fan out to a whole big cell's clusters (the GET +
+/// warm-scoring cost). Tunable: lower → fewer GETs and lower warm CPU, but
+/// risks recall when a cell's neighbours span more than this many per-commit
+/// fragment clusters (the case compaction's cluster merge is meant to shrink).
+const INNER_CLUSTER_CAP: usize = 8;
+
 /// Radius-aware adaptive leaf admission (§7.3): always probe the
 /// `nprobe_min` nearest OPANN leaves, then admit farther leaves whose
 /// radius-aware lower bound clears τ up to `nprobe_max`.
@@ -170,13 +179,13 @@ pub(super) async fn select_opann_probe_leaves(
                     // Within-cell cluster admission is RADIUS-aware, NOT the outer
                     // cell nprobe: score all the cell's centroids and admit the
                     // ones whose covering radius reaches the query (τ = d* +
-                    // slack·r*), uncapped (nprobe_max = n_cent) so a query whose
-                    // neighbours span many per-commit clusters still pulls them
-                    // all in. (Empty radii — legacy cells — collapse this back to
-                    // nearest-by-distance, the prior behaviour.)
+                    // slack·r*), capped at INNER_CLUSTER_CAP nearest-reaching
+                    // clusters so one query can't fan out across a whole big
+                    // cell's clusters. (Empty radii — legacy cells — collapse
+                    // this back to nearest-by-distance, the prior behaviour.)
                     let mut inner_routing = routing;
                     inner_routing.nprobe_min = 1;
-                    inner_routing.nprobe_max = vs.clusters.n_cent as usize;
+                    inner_routing.nprobe_max = (vs.clusters.n_cent as usize).min(INNER_CLUSTER_CAP);
                     for c in vs.clusters.select_cells_adaptive(metric, query, 1, inner_routing) {
                         let ci = c as usize;
                         out.push((
