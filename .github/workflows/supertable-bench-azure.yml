@@ -61,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      bench_gate_metric:
+        description: "Warm gate metric used for benchmark deltas (min|p50|p90)."
+        required: false
+        default: "p90"
+        type: string
       bench_cpuset:
         description: "CPU set for bench pinning (example: 2-7). Empty = auto-pick from available cores."
         required: false
@@ -99,6 +104,8 @@ on:
       name_suffix:     { type: string, required: false, default: "" }
       # Vector only: skip recall calibration, fixed-config cold latency only.
       skip_calibration: { type: boolean, required: false, default: false }
+      # Warm gate metric used for benchmark deltas (min|p50|p90).
+      bench_gate_metric: { type: string, required: false, default: "p90" }
       # CPU set for bench pinning (example: 2-7). Empty = auto-pick.
       bench_cpuset: { type: string, required: false, default: "" }
       # PR number for comment mode.
@@ -354,6 +361,7 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_GATE_METRIC='${{ inputs.bench_gate_metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
@@ -411,6 +419,7 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
+             INFINO_BENCH_GATE_METRIC='${{ inputs.bench_gate_metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              KEEP='${{ inputs.keep_table }}' \

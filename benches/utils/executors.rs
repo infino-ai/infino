@@ -12,12 +12,54 @@
 //! per-modality trait here, so the measured + reported surface can never
 //! drift between the two tiers again.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use crate::{
-    report::{Better, Cell, context, metric},
+    markdown::fmt_time,
+    report::{Better, Cell, context, metric, text},
     rss::{self, RssStats},
 };
+
+/// Warm gate metric selector (controls which warm latency column is Δ-tracked).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmGateMetric {
+    Min,
+    P50,
+    P90,
+}
+
+/// Env var selecting the warm gate metric.
+const WARM_GATE_METRIC_ENV: &str = "INFINO_BENCH_GATE_METRIC";
+
+static WARM_GATE_METRIC: OnceLock<WarmGateMetric> = OnceLock::new();
+
+/// Read once from env: `min|p50|p90` (default `p90`).
+pub fn warm_gate_metric() -> WarmGateMetric {
+    *WARM_GATE_METRIC.get_or_init(|| {
+        let raw = std::env::var(WARM_GATE_METRIC_ENV).unwrap_or_else(|_| "p90".to_string());
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "min" => WarmGateMetric::Min,
+            "p50" => WarmGateMetric::P50,
+            "p90" => WarmGateMetric::P90,
+            _ => WarmGateMetric::P90,
+        }
+    })
+}
+
+fn gate_time_cell(ns: f64, selected: bool) -> Cell {
+    if ns.is_finite() {
+        if selected {
+            metric(ns, fmt_time(ns), Better::Lower)
+        } else {
+            context(ns, fmt_time(ns), Better::Lower)
+        }
+    } else {
+        text("—")
+    }
+}
 
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
@@ -29,9 +71,7 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
-/// Min / p50 / p90 of a timed-sample set. `min` is the gate: bench noise is
-/// one-sided (only ever adds time), so the fastest sample is the cleanest
-/// estimate of intrinsic cost. p50/p90 show spread, not gated on.
+/// Min / p50 / p90 of a timed-sample set.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
     pub min: Duration,
@@ -201,7 +241,7 @@ pub mod fts {
     use crate::{
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
-        report::{Better, Block, Cell, Report, Section, context, metric, text},
+        report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{PeakSampler, RssStats},
     };
 
@@ -676,10 +716,11 @@ pub mod fts {
                 let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
                 let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
                 let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
+                let gate = warm_gate_metric();
                 let mut cells = vec![
-                    metric(min_ns, fmt_time(min_ns), Better::Lower),
-                    context(p50_ns, fmt_time(p50_ns), Better::Lower),
-                    context(p90_ns, fmt_time(p90_ns), Better::Lower),
+                    gate_time_cell(min_ns, gate == WarmGateMetric::Min),
+                    gate_time_cell(p50_ns, gate == WarmGateMetric::P50),
+                    gate_time_cell(p90_ns, gate == WarmGateMetric::P90),
                     context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                 ];
                 cells.extend(rss_cells(&q.rss));
@@ -906,7 +947,7 @@ pub mod vector {
     use crate::{
         corpus::{self, Calibrated},
         markdown::fmt_time,
-        report::{Better, Block, Cell, Report, Section, context, metric, text},
+        report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{PeakSampler, RssStats},
     };
 
@@ -1364,9 +1405,13 @@ pub mod vector {
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
-                            cells.push(time_cell(w.warm.min.as_secs_f64() * NS_PER_SEC));
-                            cells.push(ctx_time_cell(w.warm.p50.as_secs_f64() * NS_PER_SEC));
-                            cells.push(ctx_time_cell(w.warm.p90.as_secs_f64() * NS_PER_SEC));
+                            let gate = warm_gate_metric();
+                            let min_ns = w.warm.min.as_secs_f64() * NS_PER_SEC;
+                            let p50_ns = w.warm.p50.as_secs_f64() * NS_PER_SEC;
+                            let p90_ns = w.warm.p90.as_secs_f64() * NS_PER_SEC;
+                            cells.push(gate_time_cell(min_ns, gate == WarmGateMetric::Min));
+                            cells.push(gate_time_cell(p50_ns, gate == WarmGateMetric::P50));
+                            cells.push(gate_time_cell(p90_ns, gate == WarmGateMetric::P90));
                             cells.extend(rss_cells(&w.rss));
                         }
                         None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
@@ -1578,7 +1623,7 @@ pub mod sql {
     use crate::{
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
-        report::{Better, Block, Cell, Report, Section, context, metric, text},
+        report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{PeakSampler, RssStats},
     };
 
@@ -1850,11 +1895,12 @@ pub mod sql {
         let min_ns = stat.warm.min.as_secs_f64() * 1e9;
         let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
         let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
+        let gate = warm_gate_metric();
         let mut cells = vec![
             text(stat.name),
-            metric(min_ns, fmt_time(min_ns), Better::Lower),
-            context(p50_ns, fmt_time(p50_ns), Better::Lower),
-            context(p90_ns, fmt_time(p90_ns), Better::Lower),
+            gate_time_cell(min_ns, gate == WarmGateMetric::Min),
+            gate_time_cell(p50_ns, gate == WarmGateMetric::P50),
+            gate_time_cell(p90_ns, gate == WarmGateMetric::P90),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));
