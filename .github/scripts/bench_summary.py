@@ -9,7 +9,7 @@ Inputs (env):
   REPORTS                    space-separated report names (basenames, no .json)
   BASELINE_DIR               dir holding <report>.json from the base-ref baseline
   CURRENT_DIR                dir holding <report>.json from this run
-  BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 15)
+  BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 5)
   OUT_FILE                   markdown destination (default /tmp/ai-summary.md)
   BENCH_LABEL                human label for the run (the `bench` input)
   RUN_URL                    link to the full Actions run
@@ -53,7 +53,7 @@ SUBSYSTEM = {
 MIN_LATENCY_NS = 100_000.0
 
 DEFAULT_OUT = "/tmp/ai-summary.md"
-DEFAULT_THRESHOLD = 15.0
+DEFAULT_THRESHOLD = 5.0
 MAX_BULLETS = 2
 
 

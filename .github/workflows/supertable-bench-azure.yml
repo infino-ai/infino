@@ -74,7 +74,7 @@ on:
       noise_threshold_pct:
         description: "Min |Δ%| vs base_ref to surface in the benchmark summary."
         required: false
-        default: "15"
+        default: "5"
         type: string
       summary_destination:
         description: "Publish benchmark summary to PR comment or Actions run summary."
@@ -104,7 +104,7 @@ on:
       # PR number for comment mode.
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs base_ref to surface in the benchmark summary.
-      noise_threshold_pct: { type: string, required: false, default: "15" }
+      noise_threshold_pct: { type: string, required: false, default: "5" }
       # Publish benchmark summary to PR comment or run summary.
       summary_destination: { type: string, required: false, default: pr_comment }
       # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
