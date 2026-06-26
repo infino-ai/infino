@@ -97,13 +97,13 @@ impl S3StorageProvider {
     /// Construct an S3 provider pointed at a custom endpoint
     /// + explicit credentials. Used by
     /// `tests/supertable/storage/smoke_rustfs.rs` for the RustFS
-    /// integration test (`endpoint = "http://127.0.0.1:<port>"`)
-    /// and by callers using a self-hosted S3-compatible
-    /// service (MinIO etc.).
+    /// integration test (`endpoint = "https://127.0.0.1:<port>"` with
+    /// a bench-local CA trusted via `ClientOptions`) and by callers
+    /// using a self-hosted S3-compatible service (MinIO etc.).
     ///
-    /// `allow_http` is enabled so plain-HTTP endpoints
-    /// (typical for in-process test harnesses) don't get
-    /// rejected by the AWS SDK's HTTPS check.
+    /// `allow_http` is enabled so plain-HTTP endpoints (legacy
+    /// in-process emulators, MinIO on loopback) are not rejected by
+    /// the AWS SDK's HTTPS check.
     pub fn new_with_endpoint(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,

@@ -46,6 +46,8 @@ const EPHEMERAL_PORT_MIN: u16 = 49_152;
 const EPHEMERAL_PORT_MAX: u16 = 65_535;
 /// Filename of the upstream checksum manifest on RustFS GitHub releases.
 const RUSTFS_SHA256SUMS_ASSET: &str = "SHA256SUMS";
+/// Maximum list-and-delete passes while emptying a leased bucket before DeleteBucket.
+const BUCKET_EMPTY_MAX_PASSES: u32 = 10;
 
 struct S3SignParams<'a> {
     method: &'a str,
@@ -344,9 +346,21 @@ fn provision_bucket(
 }
 
 fn empty_and_delete_bucket(session: &RustFsSession, bucket: &str) -> Result<(), String> {
-    let keys = list_bucket_object_keys(session, bucket)?;
-    for key in keys {
-        delete_object(session, bucket, &key)?;
+    for _ in 0..BUCKET_EMPTY_MAX_PASSES {
+        let keys = list_bucket_object_keys(session, bucket)?;
+        if keys.is_empty() {
+            break;
+        }
+        for key in keys {
+            delete_object(session, bucket, &key)?;
+        }
+    }
+    let remaining = list_bucket_object_keys(session, bucket)?;
+    if !remaining.is_empty() {
+        return Err(format!(
+            "bucket {bucket} still has {} object(s) after {BUCKET_EMPTY_MAX_PASSES} empty passes",
+            remaining.len()
+        ));
     }
     delete_bucket(
         &session.endpoint,
@@ -699,25 +713,31 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
 
     let reader = Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+    let tmp = dest.with_extension("tmp");
     let mut extracted = false;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = file.name().to_string();
         if name.ends_with("rustfs") || name.ends_with("rustfs.exe") {
-            let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+            let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = out.metadata().map_err(|e| e.to_string())?.permissions();
                 perms.set_mode(0o755);
-                std::fs::set_permissions(dest, perms).map_err(|e| e.to_string())?;
+                std::fs::set_permissions(&tmp, perms).map_err(|e| e.to_string())?;
             }
+            std::fs::rename(&tmp, dest).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                e.to_string()
+            })?;
             extracted = true;
             break;
         }
     }
     if !extracted {
+        let _ = std::fs::remove_file(&tmp);
         return Err(format!("rustfs binary not found inside {asset}"));
     }
     eprintln!("[rustfs] installed binary at {}", dest.display());

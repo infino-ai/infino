@@ -267,6 +267,7 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
         .expect("spawn_blocking join")
         .expect("spawn rustfs for TVF smoke");
     let dim = EMB_DIM;
+    assert!(dim > 0, "embedding dimension must be positive");
     eprintln!(
         "[rustfs-smoke-tvf] spawned on {} bucket={TVF_BUCKET}",
         _handle.endpoint
