@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Summarize benchmark deltas for a PR comment.
 
-Diffs this run against the latest `main` baseline, keeps only changes past the
-noise threshold, and writes a concise deterministic markdown summary for fast
-reviewer triage.
+Diffs this run against the latest base-ref baseline, keeps only changes past
+the noise threshold, and writes a deterministic SRE-style markdown summary.
 
 Inputs (env):
   REPORTS                    space-separated report names (basenames, no .json)
@@ -12,6 +11,9 @@ Inputs (env):
   BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 5)
   OUT_FILE                   markdown destination (default /tmp/ai-summary.md)
   BENCH_LABEL                human label for the run (the `bench` input)
+  BENCH_VM_SIZE              VM size label for context
+  BENCH_LOCATION             region label for context
+  BENCH_CPUSET               cpuset input label for context
   RUN_URL                    link to the full Actions run
   ERRORS                     newline-separated panic/error lines (may be empty)
 """
@@ -162,8 +164,8 @@ def diff(reports, baseline_dir, current_dir, threshold):
     return regressions, improvements, had_baseline, cost_present
 
 
-def bullet(entry):
-    return f"- `{entry['metric']}`: **{entry['pct']:+.0f}%** (`{entry['change']}`)"
+def finding(entry, kind):
+    return f"- `{entry['metric']}`: {entry['change']} ({entry['pct']:+.0f}%) [{kind}]"
 
 
 def main():
@@ -173,6 +175,9 @@ def main():
     out_file = os.environ.get("OUT_FILE", DEFAULT_OUT)
     label = os.environ.get("BENCH_LABEL", "benchmark")
     base_ref = os.environ.get("BASE_REF_LABEL", "main")
+    vm_size = os.environ.get("BENCH_VM_SIZE", "n/a")
+    location = os.environ.get("BENCH_LOCATION", "n/a")
+    cpuset = os.environ.get("BENCH_CPUSET", "auto")
     run_url = os.environ.get("RUN_URL", "")
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
@@ -188,58 +193,75 @@ def main():
     prim_impr = [e for e in improvements if e["tier"] == "primary"]
     secondary_present = any(e["tier"] == "secondary" for e in regressions + improvements)
 
-    if failures or (prim_regr and not prim_impr):
-        badge = "🔴"
-    elif prim_regr:
-        badge = "🟡"
-    elif prim_impr:
-        badge = "🟢"
+    if failures or prim_regr:
+        status = "FAIL"
     else:
-        badge = "⚪"
+        status = "PASS"
 
     counts = f"{len(prim_regr)} regressions · {len(prim_impr)} improvements"
-    parts = [f"## {badge} {label} - {counts} (±{threshold:g}% vs {base_ref})", ""]
+    parts = [f"## Benchmark Summary (A/B vs {base_ref})", ""]
+    parts.append(f"Status: {status}")
+    parts.append(f"Primary Gate: {counts}, threshold ±{threshold:g}%")
+    parts.append(
+        f"Run Context: bench={label} vm={vm_size} region={location} cpuset={cpuset or 'auto'}"
+    )
+    parts.append("")
 
     if failures:
         parts += ["### Failures", "```", "\n".join(failures[:20]), "```", ""]
 
     if not failures and not had_baseline:
         parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
-    elif not failures and not prim_regr and not prim_impr:
-        parts += [f"No primary regressions detected vs {base_ref}.", ""]
-
-    if prim_regr:
-        parts += ["Primary regressions:"]
-        parts.extend(bullet(e) for e in prim_regr[:MAX_BULLETS])
-        parts.append("")
-    elif prim_impr:
-        parts += ["Primary improvements:"]
-        parts.extend(bullet(e) for e in prim_impr[:MAX_BULLETS])
-        parts.append("")
-
-    if prim_regr or prim_impr:
-        touched = {e["subsystem"]: e["area"] for e in prim_regr + prim_impr if e.get("area")}
+    elif not failures:
+        parts += ["### Primary Findings"]
         if prim_regr:
-            if touched:
-                focus = " · ".join(f"`{a}`" for _, a in sorted(touched.items()))
-                parts.append(
-                    f"**Action:** treat as real perf regression unless expected by design; inspect {focus}."
-                )
-            else:
-                parts.append("**Action:** treat as real perf regression unless expected by design.")
-        else:
-            parts.append("**Action:** primary metrics improved; verify no correctness trade-off.")
+            parts.extend(finding(e, "REGRESSION") for e in prim_regr[:MAX_BULLETS])
+        if prim_impr:
+            parts.extend(finding(e, "IMPROVEMENT") for e in prim_impr[:MAX_BULLETS])
+        if not prim_regr and not prim_impr:
+            parts.append(f"- No primary regressions detected vs {base_ref}.")
         parts.append("")
 
+    parts.append("### Decision")
+    if failures or prim_regr:
+        parts.append("- Merge Gate: FAIL")
+        if prim_regr:
+            parts.append("- Reason: Primary regressions above threshold.")
+        else:
+            parts.append("- Reason: Benchmark run reported failures.")
+    else:
+        parts.append("- Merge Gate: PASS")
+        if prim_impr:
+            parts.append("- Reason: No primary regressions; primary improvements observed.")
+        else:
+            parts.append("- Reason: No primary regressions above threshold.")
+    parts.append("")
+
+    parts.append("### Actions")
+    if prim_regr:
+        touched = {e["subsystem"]: e["area"] for e in prim_regr if e.get("area")}
+        if touched:
+            focus = " · ".join(f"`{a}`" for _, a in sorted(touched.items()))
+            parts.append(f"- Owner: PR author")
+            parts.append(f"- Follow-up: investigate {focus}.")
+        else:
+            parts.append("- Owner: PR author")
+            parts.append("- Follow-up: investigate primary regressions.")
+    else:
+        parts.append("- Owner: PR author")
+        parts.append("- Follow-up: none")
+    parts.append("")
+
+    parts.append("### Notes")
     if secondary_present or cost_present:
         parts.append(
-            "_Cold-search and cost metrics are measured but non-gating for PR decisions. "
-            "Full details are in run report._"
+            "- Cold-search and cost metrics measured, non-gating."
         )
-        parts.append("")
+    else:
+        parts.append("- No secondary/cost deltas above reporting threshold.")
 
     if run_url:
-        parts.append(f"[Full report & logs ->]({run_url})")
+        parts.append(f"- Full report & logs: {run_url}")
 
     body = "\n".join(parts).rstrip() + "\n"
     with open(out_file, "w", encoding="utf-8") as fh:
