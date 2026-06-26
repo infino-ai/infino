@@ -382,6 +382,10 @@ jobs:
             echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
             exit 1
           fi
+          if ! taskset -c "$CPUSET" true >/dev/null 2>&1; then
+            echo "::error::invalid bench cpuset '$CPUSET' for this VM"
+            exit 1
+          fi
           echo "bench cpuset: $CPUSET"
           echo "===== BASELINE (main arm) ${BENCH_ARGS} START ====="
           taskset -c "$CPUSET" "$HOME/bench-main" $BENCH_ARGS 2>&1
@@ -438,6 +442,10 @@ jobs:
           CPUSET="$(resolve_cpuset "$CPUSET")"
           if ! command -v taskset >/dev/null 2>&1; then
             echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
+            exit 1
+          fi
+          if ! taskset -c "$CPUSET" true >/dev/null 2>&1; then
+            echo "::error::invalid bench cpuset '$CPUSET' for this VM"
             exit 1
           fi
           echo "bench cpuset: $CPUSET"
