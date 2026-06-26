@@ -77,7 +77,7 @@ use crate::{
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
-            partition::{PartitionKey, assign_partition, encode_partition_key},
+            partition::{assign_partition, encode_partition_key},
         },
         opann::{
             paged::ResidentPageSource,
@@ -809,58 +809,10 @@ impl Manifest {
         Ok(Arc::clone(loaded))
     }
 
-    /// All superfiles under list parts for `partition_key`.
-    ///
-    /// The flat [`SuperfileList::superfiles`] view is only populated when
-    /// `parts.len() <= eager_load_threshold_parts`; writers that replace
-    /// per-partition superfiles must use this helper instead.
-    pub(crate) async fn superfiles_for_partition_key(
-        &self,
-        partition_key: &[u8],
-    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        let Some(list) = &self.list else {
-            return Ok(self
-                .superfiles
-                .iter()
-                .filter(|e| e.partition_key == partition_key)
-                .cloned()
-                .collect());
-        };
-        let mut out = Vec::new();
-        for entry in &list.parts {
-            if entry.partition_key != partition_key {
-                continue;
-            }
-            let part = self.get_part_by_id(entry.part_id).await?;
-            out.extend(part.superfiles.iter().cloned());
-        }
-        Ok(out)
-    }
-
-    /// Load superfiles for routed VectorCell ids from list parts (works when
-    /// the flat `superfiles` view is empty under lazy manifest loading).
-    pub(crate) async fn superfiles_for_routed_cells(
-        &self,
-        routed_cells: &[u32],
-    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for cell in routed_cells {
-            let pk = encode_partition_key(&PartitionKey::VectorCell(*cell));
-            for sf in self.superfiles_for_partition_key(&pk).await? {
-                if seen.insert(sf.superfile_id) {
-                    out.push(sf);
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Resolve one superfile by storage URI. Checks the flat
     /// [`SuperfileList::superfiles`] view first; when the entry is absent
     /// there (lazy list/parts layout), walks manifest parts until a match
-    /// is found — the same source [`superfiles_for_routed_cells`] uses for
-    /// hidden-index search.
+    /// is found.
     pub(crate) async fn lookup_superfile_entry(
         &self,
         uri: SuperfileUri,

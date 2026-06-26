@@ -139,10 +139,8 @@ use crate::{
         },
         opann::{
             insert::{LeafInsert, update_tree},
-            page::LeafRef,
             paged::{OverlayPageSource, ResidentPageSource, SplitPages},
             store,
-            tree::CentroidTree,
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
