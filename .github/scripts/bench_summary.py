@@ -7,7 +7,7 @@ reviewer triage.
 
 Inputs (env):
   REPORTS                    space-separated report names (basenames, no .json)
-  BASELINE_DIR               dir holding <report>.json from the main baseline
+  BASELINE_DIR               dir holding <report>.json from the base-ref baseline
   CURRENT_DIR                dir holding <report>.json from this run
   BENCH_NOISE_THRESHOLD_PCT  threshold in percent (default 15)
   OUT_FILE                   markdown destination (default /tmp/ai-summary.md)
@@ -172,6 +172,7 @@ def main():
     current_dir = os.environ.get("CURRENT_DIR", "current")
     out_file = os.environ.get("OUT_FILE", DEFAULT_OUT)
     label = os.environ.get("BENCH_LABEL", "benchmark")
+    base_ref = os.environ.get("BASE_REF_LABEL", "main")
     run_url = os.environ.get("RUN_URL", "")
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
@@ -197,15 +198,15 @@ def main():
         badge = "⚪"
 
     counts = f"{len(prim_regr)} regressions · {len(prim_impr)} improvements"
-    parts = [f"## {badge} {label} - {counts} (±{threshold:g}% vs main)", ""]
+    parts = [f"## {badge} {label} - {counts} (±{threshold:g}% vs {base_ref})", ""]
 
     if failures:
         parts += ["### Failures", "```", "\n".join(failures[:20]), "```", ""]
 
     if not failures and not had_baseline:
-        parts += ["_No main baseline to diff against (first run or new config)._", ""]
+        parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
     elif not failures and not prim_regr and not prim_impr:
-        parts += [f"No significant primary changes (within ±{threshold:g}%).", ""]
+        parts += [f"No primary regressions detected vs {base_ref}.", ""]
 
     if prim_regr:
         parts += ["Primary regressions:"]

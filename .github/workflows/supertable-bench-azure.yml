@@ -67,12 +67,12 @@ on:
         default: ""
         type: string
       noise_threshold_pct:
-        description: "Min |Δ%| vs main to surface in the concise summary."
+        description: "Min |Δ%| vs base_ref to surface in the benchmark summary."
         required: false
         default: "15"
         type: string
       summary_destination:
-        description: "Publish concise summary to PR comment or Actions run summary."
+        description: "Publish benchmark summary to PR comment or Actions run summary."
         required: false
         default: pr_comment
         type: choice
@@ -96,9 +96,9 @@ on:
       skip_calibration: { type: boolean, required: false, default: false }
       # PR number for comment mode.
       pr_number:       { type: string, required: false, default: "" }
-      # Min |Δ%| vs main to surface in the concise summary.
+      # Min |Δ%| vs base_ref to surface in the benchmark summary.
       noise_threshold_pct: { type: string, required: false, default: "15" }
-      # Publish concise summary to PR comment or run summary.
+      # Publish benchmark summary to PR comment or run summary.
       summary_destination: { type: string, required: false, default: pr_comment }
       # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
       is_fork_pr:      { type: boolean, required: false, default: false }
@@ -481,7 +481,7 @@ jobs:
 
       # Pull this run's metric JSONs off the VM so the concise-summary step can
       # diff them against staged main-arm metrics. Best-effort per report.
-      - name: Collect metrics for concise summary
+      - name: Collect metrics for benchmark summary
         if: ${{ !cancelled() && (inputs.summary_destination == 'step_summary' || (inputs.summary_destination == 'pr_comment' && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true')) }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
@@ -498,7 +498,7 @@ jobs:
 
       # Build the concise markdown summary from metric deltas (with deterministic
       # fallback if model narration is unavailable).
-      - name: Generate concise benchmark summary
+      - name: Generate benchmark summary
         if: ${{ !cancelled() && (inputs.summary_destination == 'step_summary' || (inputs.summary_destination == 'pr_comment' && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true')) }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
@@ -506,6 +506,7 @@ jobs:
           CURRENT_DIR: current
           OUT_FILE: /tmp/ai-summary.md
           BENCH_LABEL: ${{ inputs.bench }}
+          BASE_REF_LABEL: ${{ inputs.base_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BENCH_NOISE_THRESHOLD_PCT: ${{ inputs.noise_threshold_pct }}
           AZURE_AI_ENDPOINT: ${{ secrets.AZURE_AI_ENDPOINT }}
@@ -516,24 +517,24 @@ jobs:
           ERRORS="$(cat /tmp/bench.errors 2>/dev/null || true)" \
             python3 .github/scripts/bench_summary.py
 
-      - name: Publish concise summary to run summary
+      - name: Publish benchmark summary to run summary
         if: ${{ !cancelled() && inputs.summary_destination == 'step_summary' }}
         run: |
           set -euo pipefail
           if [ -s /tmp/ai-summary.md ]; then
             {
               echo ""
-              echo "### Concise benchmark summary"
+              echo "### Benchmark summary"
               echo ""
               cat /tmp/ai-summary.md
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::No concise summary produced — see full results above."
+            echo "::warning::No benchmark summary produced — see full results above."
           fi
 
       # Sticky PR comment, one per matrix leg. The hidden marker lets a new
       # push edit in place instead of stacking comments.
-      - name: Post concise summary to PR
+      - name: Post benchmark summary to PR
         if: ${{ !cancelled() && inputs.summary_destination == 'pr_comment' && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true' }}
         uses: actions/github-script@v7
         env:
@@ -543,7 +544,7 @@ jobs:
             const fs = require('fs');
             // GitHub caps comment bodies at 65536 chars; full output is the artifact.
             const LIMIT = 60000;
-            // The concise summary is the comment body; the full report stays in
+            // The benchmark summary is the comment body; the full report stays in
             // the run's step summary + the uploaded log artifact.
             let body;
             try { body = fs.readFileSync('/tmp/ai-summary.md', 'utf8'); }
