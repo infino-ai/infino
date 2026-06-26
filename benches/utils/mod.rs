@@ -25,6 +25,7 @@ pub mod tiers;
 pub mod superfile;
 pub mod supertable;
 
+pub mod concurrent;
 pub mod scale;
 pub mod sql_diag;
 pub mod supertable_update;
