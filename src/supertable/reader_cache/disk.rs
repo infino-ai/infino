@@ -313,6 +313,11 @@ impl DiskCacheStore {
             prefetch_semaphore,
         });
 
+        // Reuse any cache files a prior run (or another handle) left on disk:
+        // rebuild the in-memory index so reads hit the NVMe bytes instead of
+        // cold-fetching them back from object storage.
+        store.restore_from_cache_root();
+
         // Idle-threshold sweep thread. Library-not-service
         // shape: holds a Weak<Self> and exits naturally when the last Arc
         // drops (no explicit shutdown signal needed; `Drop
@@ -877,27 +882,8 @@ impl DiskCacheStore {
             }
             tokio::fs::rename(&tmp, &final_path).await?;
 
-            // mmap the freshly-written file. Same Arc<Mmap>
-            // shared between CachedEntry.mmap and the
-            // reader's Bytes::from_owner so a later
-            // MADV_DONTNEED sweep touches the same mapping.
-            let mmap = open_readonly_mmap(&final_path).map_err(DiskCacheError::Io)?;
-            let mmap_arc = Arc::new(mmap);
-            let reader_bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
-            let reader = SuperfileReader::open_with(
-                reader_bytes,
-                OpenOptions {
-                    verify_crc: self.config.verify_crc_on_open,
-                },
-            )?;
-
-            let entry = Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                mmap: Some(mmap_arc),
-                size_bytes: size,
-                last_access_us: AtomicU64::new(self.now_us()),
-            });
-            Ok(entry)
+            // mmap the freshly-written file + open it as a superfile reader.
+            self.open_cached_entry(&final_path, size)
         }
         .await;
 
@@ -937,6 +923,75 @@ impl DiskCacheStore {
 
     fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
+    }
+
+    /// mmap a cache file and open it as a [`SuperfileReader`], building the
+    /// `CachedEntry`. Shared by the warm-insert path and the open-time index
+    /// rebuild ([`Self::restore_from_cache_root`]); the caller owns budget
+    /// accounting and the `cached`-map insert. The reader's bytes and
+    /// `CachedEntry.mmap` share one `Arc<Mmap>` so a later `MADV_DONTNEED`
+    /// sweep touches the same mapping.
+    fn open_cached_entry(
+        &self,
+        path: &Path,
+        size: u64,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let mmap = open_readonly_mmap(path).map_err(DiskCacheError::Io)?;
+        let mmap_arc = Arc::new(mmap);
+        let reader_bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+        let reader = SuperfileReader::open_with(
+            reader_bytes,
+            OpenOptions {
+                verify_crc: self.config.verify_crc_on_open,
+            },
+        )?;
+        Ok(Arc::new(CachedEntry {
+            reader: Arc::new(reader),
+            mmap: Some(mmap_arc),
+            size_bytes: size,
+            last_access_us: AtomicU64::new(self.now_us()),
+        }))
+    }
+
+    /// Rebuild the in-memory index from cache files a prior run (or another
+    /// handle) left under `cache_root`, so a fresh `DiskCacheStore` reuses the
+    /// NVMe bytes instead of cold-fetching them back from object storage. Each
+    /// complete `seg-<uuid>.sf.parquet` is mmap'd, opened (CRC-verified per
+    /// config), and inserted; `.tmp` in-flight files and anything that fails to
+    /// open (truncated / incompatible) are skipped and unlinked. Best-effort:
+    /// a scan error leaves the index empty (every read just cold-fetches, as
+    /// before). The budget is enforced lazily — entries are mmap-lazy (no RSS
+    /// until touched) and the first `sweep_for_budget` trims any excess.
+    fn restore_from_cache_root(self: &Arc<Self>) {
+        let dir = match fs::read_dir(&self.config.cache_root) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+                continue; // `.tmp` in-flight or foreign file — skip.
+            };
+            let size = match entry.metadata() {
+                Ok(m) if m.len() > 0 => m.len(),
+                _ => continue,
+            };
+            match self.open_cached_entry(&path, size) {
+                Ok(cached_entry) => {
+                    if self.cached.insert(uri, cached_entry).is_none() {
+                        self.current_bytes.fetch_add(size, Ordering::Release);
+                    }
+                }
+                Err(_) => {
+                    // Truncated / corrupt / incompatible: drop it so the next
+                    // read cold-fetches a clean copy.
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
     }
 
     /// Build a per-URI cache file path under `cache_root`.
@@ -2279,6 +2334,53 @@ mod tests {
             .expect_err("must exceed budget");
         assert!(matches!(err, DiskCacheError::BudgetExceeded));
         assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_from_cache_root_on_open() {
+        // A prior handle's cache files on `cache_root` must be reused by a fresh
+        // store: the constructor rebuilds the in-memory index from them, so a
+        // restart / second handle serves reads off NVMe with no cold-fetch.
+        let dir = TempDir::new().expect("tempdir");
+        let cache_root = dir.path().join("cache");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+
+        // First handle: warm-insert a superfile, then drop it (files persist).
+        {
+            let cfg = DiskCacheConfig {
+                cache_root: cache_root.clone(),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            };
+            let store = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("store1");
+            store.insert_warm(&uri, bytes).await.expect("insert_warm");
+            assert!(store.cache_path(&uri).is_file());
+        }
+
+        // Second handle on the SAME cache_root: constructor rebuilds the index.
+        let cfg2 = DiskCacheConfig {
+            cache_root: cache_root.clone(),
+            mmap_cold_threshold_secs: 0,
+            ..Default::default()
+        };
+        let store2 = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
+
+        let s = store2.stats();
+        assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
+        assert_eq!(s.current_bytes, size, "rebuilt byte accounting matches");
+        assert_eq!(s.n_cold_fetches, 0, "rebuild mmaps locally, never cold-fetches");
+
+        // A read is served from the rebuilt entry — still zero cold fetches.
+        let _r = store2.reader(&uri).await.expect("reader from rebuilt index");
+        assert_eq!(
+            store2.stats().n_cold_fetches,
+            0,
+            "read served from NVMe via rebuilt index, no object-store GET"
+        );
     }
 
     // ----- cold fetch: synchronous path -----
