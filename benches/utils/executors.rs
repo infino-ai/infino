@@ -247,8 +247,6 @@ pub mod fts {
 
     /// Nanoseconds per second, for time-cell formatting.
     const NS_PER_SEC: f64 = 1e9;
-    /// `u64::MAX` as `u128`, used for saturating duration averages.
-    const U64_MAX_AS_U128: u128 = u64::MAX as u128;
 
     /// The full FTS query battery — single source of truth for both
     /// tiers' warm + cold search and the cross-engine recall grading.
@@ -543,8 +541,6 @@ pub mod fts {
 
     /// Untimed iterations before sampling, to reach steady state.
     const WARMUP_ITERS: usize = 5;
-    /// Warm-battery passes; query stats are averaged across rounds.
-    const WARM_ROUNDS: usize = 5;
 
     /// One warm measurement of a query: query-phase `Stats` + fetch + RSS.
     fn measure_warm_once<R: FtsRead>(
@@ -575,36 +571,7 @@ pub mod fts {
         }
     }
 
-    /// Running sums for one query over warm rounds.
-    struct FtsWarmAccum {
-        name: &'static str,
-        rounds: u128,
-        min_ns_sum: u128,
-        p50_ns_sum: u128,
-        p90_ns_sum: u128,
-        fetched_ns_sum: u128,
-        peak_rss_sum: u128,
-        median_rss_sum: u128,
-        p90_rss_sum: u128,
-    }
-
-    fn avg_duration_from(sum_ns: u128, rounds: u128) -> Duration {
-        if rounds == 0 {
-            return Duration::ZERO;
-        }
-        let avg_ns = (sum_ns / rounds).min(U64_MAX_AS_U128) as u64;
-        Duration::from_nanos(avg_ns)
-    }
-
-    fn avg_u64_from(sum: u128, rounds: u128) -> u64 {
-        if rounds == 0 {
-            return 0;
-        }
-        (sum / rounds).min(U64_MAX_AS_U128) as u64
-    }
-
-    /// Measure the warm battery against an already-warm reader over
-    /// [`WARM_ROUNDS`] round-major passes, averaging each query across rounds.
+    /// Measure the warm battery against an already-warm reader once per query.
     pub fn measure_warm<R: FtsRead>(
         reader: &R,
         battery: &[FtsQuery],
@@ -613,54 +580,10 @@ pub mod fts {
         iters: usize,
         log_prefix: &str,
     ) -> Vec<FtsQueryStat> {
-        eprintln!(
-            "[{log_prefix}] warm: {} queries × {WARM_ROUNDS} rounds (avg across rounds)...",
-            battery.len()
-        );
-        let mut acc: Vec<FtsWarmAccum> = battery
+        eprintln!("[{log_prefix}] warm: {} queries...", battery.len());
+        battery
             .iter()
-            .map(|q| FtsWarmAccum {
-                name: q.name,
-                rounds: 0,
-                min_ns_sum: 0,
-                p50_ns_sum: 0,
-                p90_ns_sum: 0,
-                fetched_ns_sum: 0,
-                peak_rss_sum: 0,
-                median_rss_sum: 0,
-                p90_rss_sum: 0,
-            })
-            .collect();
-
-        for _ in 0..WARM_ROUNDS.max(1) {
-            for (i, q) in battery.iter().enumerate() {
-                let s = measure_warm_once(reader, q, column, k, iters);
-                acc[i].rounds += 1;
-                acc[i].min_ns_sum += s.warm.min.as_nanos();
-                acc[i].p50_ns_sum += s.warm.p50.as_nanos();
-                acc[i].p90_ns_sum += s.warm.p90.as_nanos();
-                acc[i].fetched_ns_sum += s.fetched_min.as_nanos();
-                acc[i].peak_rss_sum += s.rss.peak_rss_bytes as u128;
-                acc[i].median_rss_sum += s.rss.median_rss_bytes as u128;
-                acc[i].p90_rss_sum += s.rss.p90_rss_bytes as u128;
-            }
-        }
-
-        acc.into_iter()
-            .map(|a| FtsQueryStat {
-                name: a.name,
-                warm: Stats {
-                    min: avg_duration_from(a.min_ns_sum, a.rounds),
-                    p50: avg_duration_from(a.p50_ns_sum, a.rounds),
-                    p90: avg_duration_from(a.p90_ns_sum, a.rounds),
-                },
-                fetched_min: avg_duration_from(a.fetched_ns_sum, a.rounds),
-                rss: RssStats {
-                    peak_rss_bytes: avg_u64_from(a.peak_rss_sum, a.rounds),
-                    median_rss_bytes: avg_u64_from(a.median_rss_sum, a.rounds),
-                    p90_rss_bytes: avg_u64_from(a.p90_rss_sum, a.rounds),
-                },
-            })
+            .map(|q| measure_warm_once(reader, q, column, k, iters))
             .collect()
     }
 
