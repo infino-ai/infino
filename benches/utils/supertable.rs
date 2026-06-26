@@ -11,10 +11,9 @@
 //! vector.
 //!
 //! **RustFS (default), S3, or Azure** — the multi-commit build relies on
-//! conditional `If-Match` PUTs that the `s3s-fs` emulator does not implement,
-//! so this bench rejects `s3s_fs` and exits with a message. The default
-//! `rustfs` backend runs a local HTTPS RustFS daemon. Every object the run
-//! writes lands under one unique prefix per shape, all deleted before the
+//! conditional `If-Match` PUTs; the default local RustFS session implements
+//! them. Real S3 and Azure are also supported. Every object the run writes
+//! lands under one unique bucket/prefix per shape, all deleted before the
 //! runner returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
 //!
 //! ## Per-shape process isolation

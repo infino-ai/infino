@@ -605,7 +605,7 @@ mod tests {
     // end-to-end against the Azurite emulator in the gated
     // `supertable_smoke_via_azure_wire_protocol` integration test. Azurite
     // is an out-of-process Docker emulator (no in-process server crate
-    // exists the way `s3s-fs` does for S3), so it cannot be stood up from
+    // exists the way RustFS does for S3), so it cannot be stood up from
     // a `#[cfg(test)]` unit test here; these unit tests therefore cover the
     // pure, server-free surface (constructors, `translate`, path/key
     // building) directly.
