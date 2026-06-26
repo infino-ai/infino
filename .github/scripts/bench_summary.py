@@ -56,7 +56,6 @@ MIN_LATENCY_NS = 100_000.0
 
 DEFAULT_OUT = "/tmp/ai-summary.md"
 DEFAULT_THRESHOLD = 5.0
-MAX_BULLETS = 2
 
 
 def is_text_only(header):
@@ -231,9 +230,10 @@ def main():
     elif not failures:
         parts += ["### Primary Findings"]
         if prim_regr:
-            parts.extend(finding(e, "REGRESSION") for e in prim_regr[:MAX_BULLETS])
+            # Never truncate gate-failing signals.
+            parts.extend(finding(e, "REGRESSION") for e in prim_regr)
         if prim_impr:
-            parts.extend(finding(e, "IMPROVEMENT") for e in prim_impr[:MAX_BULLETS])
+            parts.extend(finding(e, "IMPROVEMENT") for e in prim_impr)
         if not prim_regr and not prim_impr:
             parts.append(f"- No primary regressions detected vs {base_ref}.")
         parts.append("")
