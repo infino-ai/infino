@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-// The crate-level docs ARE the project README, so the Rust quick example
-// runs as a `cargo test --doc` doctest and can't drift from the API.
-#![doc = include_str!("../README.md")]
+// The crate-level docs are a Rust-focused page (Rust quickstart + API map),
+// separate from the multi-language project README. The Rust quick example
+// runs as a `cargo test --doc` doctest so it can't drift from the API. The
+// Python/Node guides live in their own bindings and on the docs site.
+#![doc = include_str!("../crate-docs.md")]
 // `coverage_nightly` is set by `cargo +nightly llvm-cov`. Under it we opt
 // into `#[coverage(off)]` annotations on stable-uncoverable error paths
 // (OOM handlers, overflow guards). On stable the feature flag is inert
