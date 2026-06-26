@@ -61,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      bench_cpuset:
+        description: "CPU set for bench pinning (example: 2-7). Empty = auto-pick from available cores."
+        required: false
+        default: ""
+        type: string
       pr_number:
         description: "PR number for comment mode; ignored when summary_destination=step_summary."
         required: false
@@ -94,6 +99,8 @@ on:
       name_suffix:     { type: string, required: false, default: "" }
       # Vector only: skip recall calibration, fixed-config cold latency only.
       skip_calibration: { type: boolean, required: false, default: false }
+      # CPU set for bench pinning (example: 2-7). Empty = auto-pick.
+      bench_cpuset: { type: string, required: false, default: "" }
       # PR number for comment mode.
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs base_ref to surface in the benchmark summary.
@@ -250,6 +257,19 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential pkg-config cmake clang protobuf-compiler git
 
+          # Keep CPU behavior stable across both A/B arms.
+          for p in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -f "$p" ] && echo performance | sudo tee "$p" >/dev/null || true
+          done
+          # Best-effort turbo control: keep constant where supported.
+          [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] \
+            && echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo >/dev/null || true
+          [ -f /sys/devices/system/cpu/cpufreq/boost ] \
+            && echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost >/dev/null || true
+          echo "cpu governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+          echo "intel turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
+          echo "cpufreq boost: $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo n/a)"
+
           # Prebuilt sccache (static musl, glibc-agnostic).
           if ! command -v sccache >/dev/null 2>&1; then
             TARBALL="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
@@ -335,6 +355,7 @@ jobs:
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
+             CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/build-main.log
           set -euo pipefail
@@ -342,8 +363,28 @@ jobs:
           export INFINO_BENCH_STORE=azure
           [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           ulimit -n "$(ulimit -Hn)"
+          resolve_cpuset() { # $1 = requested cpuset
+            local req="$1"
+            if [ -n "$req" ]; then
+              printf '%s\n' "$req"
+            else
+              local ncpu
+              ncpu="$(nproc)"
+              if [ "${ncpu}" -le 2 ]; then
+                printf '0-%d\n' "$((ncpu - 1))"
+              else
+                printf '1-%d\n' "$((ncpu - 1))"
+              fi
+            fi
+          }
+          CPUSET="$(resolve_cpuset "$CPUSET")"
+          if ! command -v taskset >/dev/null 2>&1; then
+            echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
+            exit 1
+          fi
+          echo "bench cpuset: $CPUSET"
           echo "===== BASELINE (main arm) ${BENCH_ARGS} START ====="
-          "$HOME/bench-main" $BENCH_ARGS 2>&1
+          taskset -c "$CPUSET" "$HOME/bench-main" $BENCH_ARGS 2>&1
           echo "===== BASELINE (main arm) END ====="
           REMOTE
           # Stage the main-arm JSONs on the runner too — the AI-summary step
@@ -367,6 +408,7 @@ jobs:
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
+             CPUSET='${{ inputs.bench_cpuset }}' \
              KEEP='${{ inputs.keep_table }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/bench.log
@@ -379,6 +421,26 @@ jobs:
           # connections open at once; raise the fd soft limit to the hard
           # max so commits don't hit EMFILE ("too many open files").
           ulimit -n "$(ulimit -Hn)"
+          resolve_cpuset() { # $1 = requested cpuset
+            local req="$1"
+            if [ -n "$req" ]; then
+              printf '%s\n' "$req"
+            else
+              local ncpu
+              ncpu="$(nproc)"
+              if [ "${ncpu}" -le 2 ]; then
+                printf '0-%d\n' "$((ncpu - 1))"
+              else
+                printf '1-%d\n' "$((ncpu - 1))"
+              fi
+            fi
+          }
+          CPUSET="$(resolve_cpuset "$CPUSET")"
+          if ! command -v taskset >/dev/null 2>&1; then
+            echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
+            exit 1
+          fi
+          echo "bench cpuset: $CPUSET"
           echo "fd limit: $(ulimit -n)"
 
           # Exec the unified bench binary with the resolved positional
@@ -386,7 +448,7 @@ jobs:
           # $BENCH_ARGS is a token list.
           BIN="$(cat "$HOME/bench-bin")"
           echo "===== BENCH ${BENCH_ARGS} START ====="
-          "$BIN" $BENCH_ARGS 2>&1
+          taskset -c "$CPUSET" "$BIN" $BENCH_ARGS 2>&1
           echo "===== BENCH ${BENCH_ARGS} END ====="
           REMOTE
 
