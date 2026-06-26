@@ -1551,7 +1551,7 @@ pub mod sql {
     };
 
     /// Timed query repetitions per query (after one warmup).
-    pub const ITERS: usize = 10;
+    pub const ITERS: usize = 30;
 
     const BUCKET_IN_ALL: &str = "('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9')";
 
