@@ -98,22 +98,11 @@ const ALLOWED_LICENSES: &[&str] = &[
 /// that have been individually reviewed and accepted. Each entry
 /// MUST name the actual license in the comment.
 const ALLOWED_PACKAGES: &[(&str, &str, &str)] = &[
-    // Our own crate — license field unset in Cargo.toml. Set
-    // `license = "Apache-2.0"` (or the chosen license) before any
-    // open-source release.
-    (
-        "infino",
-        "0.1.0",
-        "UNSPECIFIED — local crate, set in Cargo.toml before OSS release",
-    ),
-    // Our own crate — license field unset in Cargo.toml. Set
-    // `license = "Apache-2.0"` (or the chosen license) before any
-    // open-source release.
-    (
-        "infino-bench-utils",
-        "0.1.0",
-        "UNSPECIFIED — local crate, set in Cargo.toml before OSS release",
-    ),
+    // Empty: every dependency — including our own crates `infino` and
+    // `infino-bench-utils` — now declares a license in ALLOWED_LICENSES
+    // (Apache-2.0), so no per-package exception is needed. Add an entry
+    // here only for a reviewed dependency whose license falls outside
+    // ALLOWED_LICENSES.
 ];
 
 /// True iff at least one option in the SPDX expression is exactly
