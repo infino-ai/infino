@@ -382,27 +382,8 @@ jobs:
           export INFINO_BENCH_STORE=azure
           [ "$SKIP_CALIBRATION" = "true" ] && export INFINO_BENCH_SKIP_CALIBRATION=1
           ulimit -n "$(ulimit -Hn)"
-          resolve_cpuset() { # $1 = requested cpuset
-            local req="$1"
-            if [ -n "$req" ]; then
-              printf '%s\n' "$req"
-            else
-              local ncpu
-              ncpu="$(nproc)"
-              if [ "${ncpu}" -le 2 ]; then
-                printf '0-%d\n' "$((ncpu - 1))"
-              else
-                printf '1-%d\n' "$((ncpu - 1))"
-              fi
-            fi
-          }
-          CPUSET="$(resolve_cpuset "$CPUSET")"
-          if ! command -v taskset >/dev/null 2>&1; then
-            echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
-            exit 1
-          fi
-          if ! taskset -c "$CPUSET" true >/dev/null 2>&1; then
-            echo "::error::invalid bench cpuset '$CPUSET' for this VM"
+          if ! CPUSET="$(bash "$HOME/infino-src/.github/scripts/resolve_cpuset.sh" "$CPUSET")"; then
+            echo "::error::bench cpuset validation failed"
             exit 1
           fi
           echo "bench cpuset: $CPUSET"
@@ -445,27 +426,8 @@ jobs:
           # connections open at once; raise the fd soft limit to the hard
           # max so commits don't hit EMFILE ("too many open files").
           ulimit -n "$(ulimit -Hn)"
-          resolve_cpuset() { # $1 = requested cpuset
-            local req="$1"
-            if [ -n "$req" ]; then
-              printf '%s\n' "$req"
-            else
-              local ncpu
-              ncpu="$(nproc)"
-              if [ "${ncpu}" -le 2 ]; then
-                printf '0-%d\n' "$((ncpu - 1))"
-              else
-                printf '1-%d\n' "$((ncpu - 1))"
-              fi
-            fi
-          }
-          CPUSET="$(resolve_cpuset "$CPUSET")"
-          if ! command -v taskset >/dev/null 2>&1; then
-            echo "::error::bench cpuset resolved to '$CPUSET' but taskset is unavailable on VM"
-            exit 1
-          fi
-          if ! taskset -c "$CPUSET" true >/dev/null 2>&1; then
-            echo "::error::invalid bench cpuset '$CPUSET' for this VM"
+          if ! CPUSET="$(bash "$HOME/infino-src/.github/scripts/resolve_cpuset.sh" "$CPUSET")"; then
+            echo "::error::bench cpuset validation failed"
             exit 1
           fi
           echo "bench cpuset: $CPUSET"
