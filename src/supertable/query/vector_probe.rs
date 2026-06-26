@@ -288,36 +288,16 @@ pub(super) async fn fanout_opann_leaf_probes(
         return Ok(Vec::new());
     }
 
-    let column = Arc::new(column.to_owned());
-    let query = Arc::new(query.to_vec());
-    let kernel =
-        move |r: Arc<SuperfileReader>, (plan, bitmap): (ProbePlan, Option<Arc<RoaringBitmap>>)| {
-            let column = Arc::clone(&column);
-            let query = Arc::clone(&query);
-            async move {
-                let v = r.vec().ok_or_else(|| {
-                    QueryError::Store("hidden cell superfile missing vector subsection".into())
-                })?;
-                match plan {
-                    ProbePlan::WholeCell => v
-                        .probe_leaf_async(&column, &query, k, 0, 0, rerank_mult, bitmap)
-                        .await
-                        .map_err(map_vector_err),
-                    ProbePlan::Clusters(metas) => v
-                        .probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap)
-                        .await
-                        .map_err(map_vector_err),
-                }
-            }
-        };
     // Resident deleted-user-`_id` set. The hidden cells are NOT rewritten on a
-    // user delete, so the deleted rows stay physically present and would
-    // otherwise leak into results (on the `_id`-only path especially, which
-    // does no per-superfile tombstone remap). This consolidated set — written
-    // on the delete commit, loaded through the disk cache (warm = zero GETs) —
-    // is the authoritative vector-search delete filter, applied uniformly on
-    // every projection path. Each hidden hit already carries its resolved user
-    // `_id` in `stable_id` (set during the fan-out), so the drop is in-memory.
+    // user delete, so the deleted rows stay physically present in them. This
+    // consolidated set — written on the delete commit, loaded through the disk
+    // cache (warm = zero GETs) — is the authoritative vector-search delete
+    // filter. It is applied two ways: (1) pushed into the per-cell coarse-scan
+    // kernel as a deny-set, mapped to local doc-ids via the cell's inline `_id`
+    // region, so each cell's top-k is selected from LIVE rows (this is what
+    // preserves recall@k under deletes); and (2) a post-merge backstop on the
+    // resolved `stable_id`, which also covers INCOMING staging cells that have
+    // no inline `_id` region for the kernel deny.
     let manifest = reader.manifest();
     let deleted: Vec<i128> = match (manifest.opann_routing(), manifest.options.storage.as_ref()) {
         (Some(routing), Some(storage)) if routing.deleted_ids_uri.is_some() => {
@@ -327,10 +307,46 @@ pub(super) async fn fanout_opann_leaf_probes(
         }
         _ => Vec::new(),
     };
+    let deleted = Arc::new(deleted);
+
+    let column = Arc::new(column.to_owned());
+    let query = Arc::new(query.to_vec());
+    let deleted_for_kernel = Arc::clone(&deleted);
+    let kernel =
+        move |r: Arc<SuperfileReader>, (plan, bitmap): (ProbePlan, Option<Arc<RoaringBitmap>>)| {
+            let column = Arc::clone(&column);
+            let query = Arc::clone(&query);
+            let deleted = Arc::clone(&deleted_for_kernel);
+            async move {
+                let v = r.vec().ok_or_else(|| {
+                    QueryError::Store("hidden cell superfile missing vector subsection".into())
+                })?;
+                // Per-cell deny-set: tombstoned local doc-ids (deleted user
+                // `_id`s mapped through this cell's inline `_id` region). `None`
+                // when nothing is deleted or the cell has no inline region.
+                let deny = v
+                    .inline_deleted_locals(&deleted)
+                    .await
+                    .map_err(map_vector_err)?
+                    .map(Arc::new);
+                match plan {
+                    ProbePlan::WholeCell => v
+                        .probe_leaf_async(&column, &query, k, 0, 0, rerank_mult, bitmap, deny)
+                        .await
+                        .map_err(map_vector_err),
+                    ProbePlan::Clusters(metas) => v
+                        .probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
+                        .await
+                        .map_err(map_vector_err),
+                }
+            }
+        };
 
     let mut per_superfile = dispatch::fanout_untombstoned(reader, units, kernel).await?;
     if !deleted.is_empty() {
-        // `deleted` is stored ascending, so `binary_search` is the membership test.
+        // Post-merge backstop (covers INCOMING cells with no inline `_id`
+        // region). `deleted` is stored ascending, so `binary_search` is the
+        // membership test.
         for hits in per_superfile.iter_mut() {
             hits.retain(|h| match h.stable_id {
                 Some(id) => deleted.binary_search(&id).is_err(),

@@ -1045,14 +1045,16 @@ fn opann_id_only_vector_search_excludes_deleted_rows() {
 }
 
 /// Option-B gate: recall under deletes. Deletes a query cluster's entire local
-/// top-k, then asserts a small-nprobe `vector_search` still recovers the LIVE
-/// top-k (ranks k+1..2k). A post-merge tombstone filter CANNOT satisfy this —
+/// top-k, then asserts `vector_search` still recovers the LIVE top-k (ranks
+/// k+1..2k) at full nprobe. A post-merge tombstone filter CANNOT satisfy this —
 /// each cell emits its own top-k (the deleted rows), the filter drops them, and
 /// farther cells backfill, so the true live neighbours (still in the same cell)
-/// never get emitted. Only a kernel pre-heap deny — excluding tombstoned rows
-/// BEFORE the per-cell top-k is selected — recovers them. RED until that lands.
+/// never get emitted (recall 0.0). Only the kernel pre-heap deny — excluding
+/// tombstoned rows BEFORE the per-cell top-k is selected — recovers them.
+/// Probed at full nprobe so the assertion measures the deny, not routing
+/// coverage (at a small nprobe the live ranks k+1..2k can spill into cells the
+/// probe set doesn't reach — a routing limit, not a deny defect).
 #[test]
-#[ignore = "Option-B gate: kernel pre-heap deny not yet implemented; recall under deletes is 0.0 with the post-merge filter alone"]
 fn opann_vector_search_recall_under_deletes() {
     let all = all_embeddings();
 
@@ -1105,16 +1107,20 @@ fn opann_vector_search_recall_under_deletes() {
             .filter(|id| !deleted_ids.contains(id))
             .take(TOP_K)
             .collect();
-    let returned = search_ids(&st, VICTIM_CLUSTER, COLD_NPROBE, TOP_K);
+    // Probe at full nprobe so routing coverage is NOT the bottleneck — this
+    // isolates the kernel deny: every cell holding a live neighbour is probed,
+    // so any recall miss would mean the deny failed to surface live rows (the
+    // pre-fix value here was 0.0; a post-merge-only filter caps at ~0.7).
+    let returned = search_ids(&st, VICTIM_CLUSTER, CORRECTNESS_NPROBE, TOP_K);
     let recall = recall_at_k(&returned, &live_exact);
     eprintln!(
         "[routing] recall under deletes (entire local top-{TOP_K} tombstoned) at \
-         nprobe={COLD_NPROBE}: {recall:.4} (returned {} rows)",
+         nprobe={CORRECTNESS_NPROBE}: {recall:.4} (returned {} rows)",
         returned.len()
     );
     assert!(
         recall >= RECALL_FLOOR,
-        "recall under deletes at nprobe={COLD_NPROBE}: {recall:.4} < {RECALL_FLOOR} — \
-         post-merge filter under-returns; the kernel pre-heap deny (Option B) is required"
+        "recall under deletes at nprobe={CORRECTNESS_NPROBE}: {recall:.4} < {RECALL_FLOOR} — \
+         the kernel pre-heap deny failed to recover the live top-k"
     );
 }

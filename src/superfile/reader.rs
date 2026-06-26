@@ -1203,7 +1203,7 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
         Ok(
-            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow)
+            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow, None)
                 .await?,
         )
     }
