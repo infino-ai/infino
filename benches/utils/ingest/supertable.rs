@@ -95,7 +95,7 @@ pub struct IngestResult {
     pub cleanup: Option<tiers::PrefixCleanup>,
     pub sql_sample_title: Option<String>,
     pub sql_sample_key: Option<String>,
-    /// Keeps local emulator processes (RustFS / s3s-fs) alive through search.
+    /// Keeps local RustFS daemon processes alive through search.
     _keepalive: tiers::StorageKeepalive,
 }
 

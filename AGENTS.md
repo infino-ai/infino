@@ -97,7 +97,7 @@ Recorded numbers live in `benches/README.md`; the structured source of truth is 
 - **Crash safety contract.** Committed superfiles must survive `SIGABRT` mid-flight. Verified by tests in `tests/supertable_commit_crash_localfs.rs` (parent spawns aborting child; assertions check superfiles persist). Don't break this contract; if your change touches the commit path, run that test specifically.
 - **Don't add new dependencies casually.** Supply-chain surface is part of the public crate's risk profile. New deps require justification in the PR body — what they enable, why no existing dep covers it, and the maintainer / license picture.
 - **No secrets in commits.** Agents have committed `.env` files before; the rule applies to them too.
-- **Object-store credentials** in tests use mock servers (`s3s` + `s3s-fs`); don't introduce tests that require live cloud credentials.
+- **Object-store credentials** in tests use a local RustFS HTTPS daemon (`INFINO_TEST_RUSTFS=1`) or mock Azure (Azurite); don't introduce tests that require live cloud credentials except behind explicit `INFINO_TEST_REAL_*` gates.
 
 ## Commit message guidelines
 
