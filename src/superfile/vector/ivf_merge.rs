@@ -929,11 +929,11 @@ mod tests {
         // Route: even ids to cell 0, odd ids to cell 1 (deterministic split).
         let inputs: Vec<(&VectorReader, &str)> =
             vec![(incoming.vec().expect("vec reader"), COLUMN)];
-        let route = |row: &EncodedCellRow| -> (u32, f32) {
+        let route = |row: &EncodedCellRow| -> Vec<(u32, f32)> {
             if row.stable_id % 2 == 0 {
-                (0, 0.0)
+                vec![(0, 0.0)]
             } else {
-                (1, 0.0)
+                vec![(1, 0.0)]
             }
         };
         let routed = encode_encoded_rows(&inputs, &stable_ids_per_input, route)
