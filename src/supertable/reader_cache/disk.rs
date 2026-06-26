@@ -231,11 +231,11 @@ pub struct CacheStats {
 /// Construction is sync; `reader()` is async (cold fetches
 /// go through the storage provider's async interface).
 /// A cached content-addressed blob (manifest part or OPANN routing page /
-/// resident bundle), mmap-backed and keyed by its blake3 content hash.
+/// resident bundle), mmap-backed and keyed by its blake3 content hash. `bytes`
+/// is `Bytes::from_owner` over the `Arc<Mmap>`, so it keeps the mapping alive
+/// on its own — no separate `mmap`/`size_bytes` fields are needed.
 struct CachedBlob {
     bytes: Bytes,
-    mmap: Arc<Mmap>,
-    size_bytes: u64,
     last_access_us: AtomicU64,
 }
 
@@ -1489,12 +1489,9 @@ impl DiskCacheStore {
             }
             tokio::fs::rename(&tmp, &final_path).await?;
             let mmap = open_readonly_mmap(&final_path).map_err(DiskCacheError::Io)?;
-            let mmap_arc = Arc::new(mmap);
-            let mapped = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+            let mapped = Bytes::from_owner(ArcMmapOwner(Arc::new(mmap)));
             Ok(Arc::new(CachedBlob {
                 bytes: mapped,
-                mmap: mmap_arc,
-                size_bytes: size,
                 last_access_us: AtomicU64::new(self.now_us()),
             }))
         }
