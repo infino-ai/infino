@@ -20,7 +20,7 @@
 //! All credentials/region/endpoint come from a [`StorageOptions`] map
 //! keyed by object_store's `aws_*` config strings — infino reads nothing
 //! from the environment. [`Self::new_with_prefix`] is the primary path;
-//! [`Self::new_with_endpoint`] is a convenience for s3s-fs / MinIO / Ceph.
+//! [`Self::new_with_endpoint`] is a convenience for RustFS / MinIO / Ceph.
 
 use std::{ops::Range, str::FromStr, sync::Arc, time::Duration};
 
@@ -80,7 +80,7 @@ impl S3StorageProvider {
     /// `opts` (credentials/region/endpoint, keyed by object_store's
     /// `aws_*` strings). A custom `aws_endpoint` switches to path-style +
     /// default client options; the tuned connection pool is AWS-only (it
-    /// destabilizes local s3s-fs / MinIO endpoints).
+    /// destabilizes local MinIO / RustFS endpoints).
     pub fn new_with_prefix(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -115,8 +115,8 @@ impl S3StorageProvider {
         })
     }
 
-    /// Custom S3-compatible endpoint with static credentials (s3s-fs /
-    /// MinIO / Ceph). `allow_http` is enabled for plain-HTTP endpoints.
+    /// Custom S3-compatible endpoint with static credentials (RustFS HTTPS,
+    /// MinIO, Ceph). `allow_http` is enabled for plain-HTTP endpoints.
     pub fn new_with_endpoint(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,
