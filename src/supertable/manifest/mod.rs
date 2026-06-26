@@ -1497,6 +1497,18 @@ impl SuperfileUri {
     pub fn cache_tmp_filename(self) -> String {
         format!("seg-{}.sf.parquet.tmp", self.0)
     }
+
+    /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
+    /// cache file name. The disk cache uses this to rebuild its in-memory index
+    /// from files a prior run left under `cache_root`, so a restart / second
+    /// handle reuses the NVMe bytes instead of cold-fetching from object
+    /// storage. Returns `None` for anything that isn't exactly
+    /// `seg-<uuid>.sf.parquet` — notably the `.tmp` in-flight files, whose
+    /// longer `.sf.parquet.tmp` suffix must be ignored (incomplete writes).
+    pub fn from_cache_filename(name: &str) -> Option<Self> {
+        let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
+        Uuid::parse_str(body).ok().map(SuperfileUri)
+    }
 }
 
 /// Merge min/max arrays by comparing values and keeping the actual min and max.
