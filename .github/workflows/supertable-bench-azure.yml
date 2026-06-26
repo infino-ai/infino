@@ -561,6 +561,7 @@ jobs:
           BENCH_VM_SIZE: ${{ inputs.vm_size }}
           BENCH_LOCATION: ${{ inputs.location }}
           BENCH_CPUSET: ${{ inputs.bench_cpuset }}
+          BENCH_GATE_METRIC: ${{ inputs.bench_gate_metric }}
           BASE_REF_LABEL: ${{ inputs.base_ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BENCH_NOISE_THRESHOLD_PCT: ${{ inputs.noise_threshold_pct }}

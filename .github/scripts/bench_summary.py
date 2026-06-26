@@ -33,7 +33,7 @@ TEXT_ONLY = ("Corpus", "Superfiles")
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
 
 # Primary metrics - controllable CPU / footprint, flagged at `threshold`.
-PRIMARY_HEADERS = ("warm min", "Time", "Stored")
+PRIMARY_HEADERS = ("warm p90", "Time", "Stored")
 # Secondary metrics - cold (object-store network variance) and peak RSS
 # (run-order biased) are noisy and non-gating for PR decisions.
 SECONDARY_HEADERS = ("cold search", "Peak RSS")
@@ -79,6 +79,15 @@ def tier(header):
     if any(t in header for t in SECONDARY_HEADERS):
         return "secondary"
     return None
+
+
+def primary_latency_header_from_gate_metric(metric):
+    m = (metric or "p90").strip().lower()
+    if m == "min":
+        return "warm min"
+    if m == "p50":
+        return "warm p50"
+    return "warm p90"
 
 
 def is_latency(header):
@@ -169,6 +178,7 @@ def finding(entry, kind):
 
 
 def main():
+    global PRIMARY_HEADERS
     reports = os.environ.get("REPORTS", "").split()
     baseline_dir = os.environ.get("BASELINE_DIR", "baseline")
     current_dir = os.environ.get("CURRENT_DIR", "current")
@@ -178,7 +188,13 @@ def main():
     vm_size = os.environ.get("BENCH_VM_SIZE", "n/a")
     location = os.environ.get("BENCH_LOCATION", "n/a")
     cpuset = os.environ.get("BENCH_CPUSET", "auto")
+    bench_gate_metric = os.environ.get("BENCH_GATE_METRIC", "p90")
     run_url = os.environ.get("RUN_URL", "")
+    PRIMARY_HEADERS = (
+        primary_latency_header_from_gate_metric(bench_gate_metric),
+        "Time",
+        "Stored",
+    )
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
     except ValueError:
