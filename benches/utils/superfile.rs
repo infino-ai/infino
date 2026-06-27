@@ -161,6 +161,9 @@ pub mod fts {
 
     /// Top-k for every search.
     pub const K: usize = 10;
+    /// Large top-k, run as a second warm pass to gate how query latency
+    /// scales with k — the heap/collector cost the small-k tables hide.
+    pub const K_LARGE: usize = 1000;
     /// Timed warm-search repetitions per query (after one warmup). `run_fts`
     /// reports the p50 over these.
     pub const WARM_ITERS: usize = 50;
@@ -481,6 +484,35 @@ pub mod fts {
                     warm.as_deref(),
                     None,
                     probes.as_deref(),
+                );
+            }
+            if phases.warm {
+                eprintln!(
+                    "[superfile_fts] top-{K_LARGE} battery: {} queries × {WARM_ITERS} timed iters...",
+                    FTS_BATTERY.len(),
+                );
+                let warm_large = exec_fts::measure_warm(
+                    index.reader(),
+                    FTS_BATTERY,
+                    FTS_COLUMN,
+                    K_LARGE,
+                    WARM_ITERS,
+                    "superfile_fts",
+                );
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/superfile/search-large-k",
+                    format!(
+                        "Superfile FTS — search top-{K_LARGE}, single-superfile / in-memory ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    &format!(
+                        "Identical warm path to the top-{K} table but with k = {K_LARGE}, to gate how \
+                         top-k collection cost scales with k. Δ is vs the previous run."
+                    ),
+                    Some(&warm_large),
+                    None,
+                    None,
                 );
             }
             if let Some(rows) = negations {

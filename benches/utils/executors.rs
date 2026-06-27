@@ -103,6 +103,78 @@ pub mod fts {
     /// Nanoseconds per second, for time-cell formatting.
     const NS_PER_SEC: f64 = 1e9;
 
+    /// Twenty mid-rank common terms (`term00050`..`term00069`) — a dense
+    /// disjunction whose match set covers a large fraction of the corpus.
+    /// Exercises the large-union count path, where a naive per-doc k-way
+    /// merge degrades super-linearly in the term count.
+    const TWENTY_COMMON_TERMS: &[&str] = &[
+        "term00050",
+        "term00051",
+        "term00052",
+        "term00053",
+        "term00054",
+        "term00055",
+        "term00056",
+        "term00057",
+        "term00058",
+        "term00059",
+        "term00060",
+        "term00061",
+        "term00062",
+        "term00063",
+        "term00064",
+        "term00065",
+        "term00066",
+        "term00067",
+        "term00068",
+        "term00069",
+    ];
+
+    /// Forty mid-rank common terms (`term00050`..`term00089`) — the extreme
+    /// large-union shape; the count path's worst case at this scale.
+    const FORTY_COMMON_TERMS: &[&str] = &[
+        "term00050",
+        "term00051",
+        "term00052",
+        "term00053",
+        "term00054",
+        "term00055",
+        "term00056",
+        "term00057",
+        "term00058",
+        "term00059",
+        "term00060",
+        "term00061",
+        "term00062",
+        "term00063",
+        "term00064",
+        "term00065",
+        "term00066",
+        "term00067",
+        "term00068",
+        "term00069",
+        "term00070",
+        "term00071",
+        "term00072",
+        "term00073",
+        "term00074",
+        "term00075",
+        "term00076",
+        "term00077",
+        "term00078",
+        "term00079",
+        "term00080",
+        "term00081",
+        "term00082",
+        "term00083",
+        "term00084",
+        "term00085",
+        "term00086",
+        "term00087",
+        "term00088",
+        "term00089",
+    ];
+
     /// The full FTS query battery — single source of truth for both
     /// tiers' warm + cold search and the cross-engine recall grading.
     pub const FTS_BATTERY: &[FtsQuery] = &[
@@ -164,6 +236,16 @@ pub mod fts {
             mode: BoolMode::Or,
         },
         FtsQuery {
+            name: "twenty_term_or",
+            terms: TWENTY_COMMON_TERMS,
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "forty_term_or",
+            terms: FORTY_COMMON_TERMS,
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
             name: "two_term_and",
             terms: &["term00001", "term00050"],
             mode: BoolMode::And,
@@ -217,6 +299,8 @@ pub mod fts {
         "three_similar_or",
         "five_term_or",
         "ten_term_or",
+        "twenty_term_or",
+        "forty_term_or",
     ];
 
     /// AND query names, in table order.
