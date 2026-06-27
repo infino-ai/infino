@@ -67,6 +67,7 @@ use crate::{
     supertable::{
         CommitError,
         error::ManifestError,
+        handle::INCOMING_VECTOR_CELL,
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
@@ -1349,6 +1350,17 @@ pub struct SuperfileEntry {
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
+}
+
+impl SuperfileEntry {
+    /// Whether this entry is an INCOMING pointer the hidden vector index holds
+    /// to a *user-table* superfile (registered, not copied). Such an entry's
+    /// bytes live in the user table's storage namespace — one prefix level up
+    /// from the hidden index's own prefixed storage — so the read path fetches
+    /// them through [`StorageProvider::prefix_inner`], not the hidden prefix.
+    pub(crate) fn is_incoming_pointer(&self) -> bool {
+        self.partition_hint == Some(INCOMING_VECTOR_CELL)
+    }
 }
 
 /// superfile layout offsets cached on the manifest.

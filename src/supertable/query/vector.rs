@@ -369,6 +369,10 @@ async fn read_ids_batch_object_store(
     storage: &Arc<dyn StorageProvider>,
     reader: &SuperfileReader,
 ) -> Result<arrow_array::RecordBatch, QueryError> {
+    // INCOMING pointers live in the user storage one prefix level up; read their
+    // `_id` column through that storage, not the hidden prefix.
+    let entry_storage = dispatch::storage_for_entry(entry, Some(storage));
+    let storage: &dyn StorageProvider = entry_storage.as_deref().unwrap_or(storage.as_ref());
     let (obj_store, path) = storage
         .object_store_handle(&entry.uri.storage_path())
         .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;

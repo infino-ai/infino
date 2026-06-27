@@ -62,15 +62,36 @@ pub(crate) async fn open_reader(
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
+    let entry_storage = storage_for_entry(entry, storage);
     superfile_reader(
         store,
         disk_cache,
-        storage,
+        entry_storage.as_ref(),
         &entry.uri,
         entry.subsection_offsets.as_ref(),
     )
     .await
     .map_err(|e| QueryError::Store(e.to_string()))
+}
+
+/// The storage to fetch `entry`'s bytes through. A hidden vector-index INCOMING
+/// entry is a pointer to a user-table superfile whose bytes live one prefix
+/// level up — the hidden index's storage is a prefixed view of the user storage
+/// (see [`PrefixedStorageProvider`](crate::storage::PrefixedStorageProvider)),
+/// so an INCOMING pointer must be read through that inner (user) storage;
+/// fetching it through the hidden prefix resolves to a path that does not exist.
+/// Every other entry — real hidden cells, ordinary user superfiles — uses
+/// `storage` as given.
+pub(crate) fn storage_for_entry(
+    entry: &SuperfileEntry,
+    storage: Option<&Arc<dyn StorageProvider>>,
+) -> Option<Arc<dyn StorageProvider>> {
+    if entry.is_incoming_pointer() {
+        if let Some(inner) = storage.and_then(|s| s.prefix_inner()) {
+            return Some(inner);
+        }
+    }
+    storage.map(Arc::clone)
 }
 
 /// Open one superfile for **compaction**, with its bytes locally available for

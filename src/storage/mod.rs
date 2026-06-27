@@ -265,6 +265,18 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
         None
     }
+
+    /// The storage this provider is a *prefixed view* of, if any. A
+    /// [`PrefixedStorageProvider`] returns the inner provider it wraps; every
+    /// other provider returns `None` (it is already at its own root).
+    ///
+    /// Used by the hidden vector index: its storage is a prefixed view of the
+    /// user table's storage, but the INCOMING entries it holds are pointers to
+    /// user-table superfiles that live one prefix level up — those bytes must be
+    /// fetched through this inner (user) storage, not the hidden prefix.
+    fn prefix_inner(&self) -> Option<Arc<dyn StorageProvider>> {
+        None
+    }
 }
 
 /// A wrapper that prepends a sub-prefix to every URI before delegating to an
@@ -290,6 +302,13 @@ impl PrefixedStorageProvider {
 
     fn prefixed(&self, uri: &str) -> String {
         format!("{}{}", self.sub_prefix, uri)
+    }
+}
+
+impl PrefixedStorageProvider {
+    /// The provider this is a prefixed view of — see [`StorageProvider::prefix_inner`].
+    fn inner_provider(&self) -> Arc<dyn StorageProvider> {
+        Arc::clone(&self.inner)
     }
 }
 
@@ -382,6 +401,10 @@ impl StorageProvider for PrefixedStorageProvider {
         // Without this override the default `None` forces those paths to error
         // on lazily-opened hidden superfiles.
         self.inner.object_store_handle(&self.prefixed(uri))
+    }
+
+    fn prefix_inner(&self) -> Option<Arc<dyn StorageProvider>> {
+        Some(self.inner_provider())
     }
 }
 

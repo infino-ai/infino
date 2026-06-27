@@ -210,6 +210,7 @@ impl CountingStorage {
         }
         let d = self.delay_ms.load(Ordering::Relaxed);
         if d > 0 {
+            eprintln!("[wave-dbg] observe {uri}");
             tokio::time::sleep(Duration::from_millis(d)).await;
         }
     }
@@ -227,6 +228,16 @@ impl StorageProvider for CountingStorage {
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+        if self.delay_ms.load(Ordering::Relaxed) > 0 {
+            let total = self.inner.head(uri).await.map(|m| m.size).unwrap_or(0);
+            let span = range.end - range.start;
+            eprintln!(
+                "[wave-dbg] get_range {uri} [{}..{}] {span}B / {total}B ({}%)",
+                range.start,
+                range.end,
+                if total > 0 { span * 100 / total } else { 0 }
+            );
+        }
         self.observe(uri).await;
         self.inner.get_range(uri, range).await
     }
@@ -273,9 +284,13 @@ impl StorageProvider for CountingStorage {
 
     fn object_store_handle(
         &self,
-        uri: &str,
+        _uri: &str,
     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-        self.inner.object_store_handle(uri)
+        // Return None (not the raw inner handle) so the lazy reader's range
+        // reads route through this wrapper's COUNTED `get_range` instead of a
+        // raw object-store handle that bypasses the counter — mirrors the bench's
+        // request-counting storage so per-search range GETs are observable.
+        None
     }
 }
 
@@ -340,10 +355,21 @@ fn small_optimize_opts() -> OptimizeOptions {
 
 /// Build a `DiskCacheStore` over `storage` rooted at `cache_root`.
 fn make_cache(storage: Arc<dyn StorageProvider>, cache_root: &std::path::Path) -> Arc<DiskCacheStore> {
+    make_cache_with_mode(storage, cache_root, ColdFetchMode::HybridWithPrefetch)
+}
+
+/// Build a `DiskCacheStore` with an explicit cold-fetch mode (the production
+/// default is `LazyForegroundWithBackgroundFill`, which range-GETs only the
+/// touched bytes in the foreground and fills the whole object in the background).
+fn make_cache_with_mode(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &std::path::Path,
+    cold_fetch_mode: ColdFetchMode,
+) -> Arc<DiskCacheStore> {
     let cfg = DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
         disk_budget_bytes: CACHE_BUDGET_BYTES,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        cold_fetch_mode,
         cold_fetch_streams: 4,
         cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
         mmap_cold_threshold_secs: 0,
@@ -994,7 +1020,13 @@ fn measure_cold_search(
     k: usize,
 ) -> (usize, usize, u64, f64) {
     let cold_cache_dir = TempDir::new().expect("cold cache tempdir");
-    let cold_cache = make_cache(Arc::clone(storage), cold_cache_dir.path());
+    let cold_cache = make_cache_with_mode(
+        Arc::clone(storage),
+        cold_cache_dir.path(),
+        ColdFetchMode::LazyForegroundWithBackgroundFill,
+    );
+    eprintln!("[wave-dbg] --- BEFORE OPEN ---");
+    delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
     let st_cold = Supertable::open(
         options_title_emb()
             .with_storage(Arc::clone(storage))
@@ -1002,29 +1034,24 @@ fn measure_cold_search(
     )
     .expect("open fresh cold-cache consumer");
 
-    let cold_search = |st: &Supertable, cluster: usize| {
-        st.vector_search(
-            "emb",
-            &cluster_base(cluster),
-            k,
-            VectorSearchOptions::new().with_nprobe(nprobe),
-            None,
-            None,
-        )
-    };
-
-    let warmup_cluster = query_clusters()[0];
-    if let Err(e) = cold_search(&st_cold, warmup_cluster) {
-        eprintln!("[compare] cold warmup search FAILED: {e:?}");
-        return (0, 0, 0, -1.0);
-    }
-
+    // Genuine cold search: fresh consumer, fresh disk cache, NO warmup. Reset
+    // the counter and arm the per-GET delay, then run ONE search and count
+    // every object-store fetch it issues (manifest + OPANN tree load if lazy,
+    // plus the per-probed-unit vector-blob range-GETs) and how many sequential
+    // waves they fall into.
     let measured_cluster = query_clusters()[query_clusters().len() - 1];
     fetches.store(0, Ordering::Relaxed);
     tombstone_fetches.store(0, Ordering::Relaxed);
     delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
     let t0 = Instant::now();
-    let result = cold_search(&st_cold, measured_cluster);
+    let result = st_cold.vector_search(
+        "emb",
+        &cluster_base(measured_cluster),
+        k,
+        VectorSearchOptions::new().with_nprobe(nprobe),
+        None,
+        None,
+    );
     let elapsed = t0.elapsed();
     delay_ms.store(0, Ordering::Relaxed);
 
