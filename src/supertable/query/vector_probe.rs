@@ -15,10 +15,10 @@ use roaring::RoaringBitmap;
 
 use super::{SuperfileHit, dispatch};
 use crate::{
-    superfile::{SuperfileReader, VectorError, vector::distance::Metric},
+    superfile::{SuperfileReader, VectorError},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, SupertableReader},
+        handle::SupertableReader,
         manifest::{Manifest, SuperfileEntry, SuperfileUri},
         opann::{page::LeafRef, paged::PagedTree, store},
     },
@@ -26,21 +26,12 @@ use crate::{
 
 use super::vector::{VectorSearchOptions, row_id_from_manifest_entry};
 
-/// Hard cap on how many clusters the within-cell radius-aware admission emits
-/// per cell. The radius (τ) admission already trims to the clusters whose
-/// covering radius reaches the query, sorted nearest-first; this bounds the
-/// tail so one query can't fan out to a whole big cell's clusters (the GET +
-/// warm-scoring cost). Tunable: lower → fewer GETs and lower warm CPU, but
-/// risks recall when a cell's neighbours span more than this many per-commit
-/// fragment clusters (the case compaction's cluster merge is meant to shrink).
-const INNER_CLUSTER_CAP: usize = 8;
-
 /// Radius-aware adaptive leaf admission (§7.3): always probe the
 /// `nprobe_min` nearest OPANN leaves, then admit farther leaves whose
 /// radius-aware lower bound clears τ up to `nprobe_max`.
 pub(super) fn adaptive_probe_leaves(
     candidates: Vec<(LeafRef, f32)>,
-    radius_of: &HashMap<u128, f32>,
+    radius_of: impl Fn(LeafRef) -> f32,
     nprobe_min: usize,
     nprobe_max: usize,
     slack: f32,
@@ -50,7 +41,7 @@ pub(super) fn adaptive_probe_leaves(
     }
     let mut scored = candidates;
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let radius = |leaf: LeafRef| radius_of.get(&leaf.superfile_id).copied().unwrap_or(0.0);
+    let radius = |leaf: LeafRef| radius_of(leaf);
     let lb = |i: usize| {
         let (leaf, d) = scored[i];
         (d - radius(leaf)).max(0.0)
@@ -127,33 +118,31 @@ pub(super) async fn select_opann_probe_leaves(
             .map(|e| (e.superfile_id.as_u128(), Arc::clone(e)))
             .collect();
 
-        let radius_of: HashMap<u128, f32> = entries
-            .iter()
-            .filter_map(|sf| {
-                sf.vector_summary
-                    .get(column)
-                    .map(|vs| (sf.superfile_id.as_u128(), vs.radius))
-            })
-            .collect();
+        // Per-cluster covering radius for the τ admission, read from the
+        // resident manifest summary. Every cluster of every superfile is its own
+        // tree leaf, so the radius is per-CLUSTER (indexed by `leaf.cluster_id`),
+        // not per-superfile. Falls back to 0 (collapse to centroid distance)
+        // when a leaf's cluster has no recorded radius.
+        let radius_of = |leaf: LeafRef| {
+            entry_by_id
+                .get(&leaf.superfile_id)
+                .and_then(|e| e.vector_summary.get(column))
+                .and_then(|vs| vs.clusters.radii.get(leaf.cluster_id as usize).copied())
+                .unwrap_or(0.0)
+        };
 
         let floor = options.nprobe.unwrap_or(routing.nprobe_min);
         let admitted = adaptive_probe_leaves(
             candidates,
-            &radius_of,
+            radius_of,
             floor,
             routing.nprobe_max,
             routing.slack,
         );
 
-        // Metric for scoring each admitted cell's resident per-cluster centroids.
-        let metric = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
-
+        // Every admitted leaf is already a single internal IVF cluster — the
+        // tree routed straight to it (centroid → cluster byte range). Probe that
+        // range directly: no within-superfile rescan, no whole-superfile leaf.
         out.reserve(admitted.len());
         for (leaf, dist) in admitted {
             let Some(entry) = entry_by_id.get(&leaf.superfile_id) else {
@@ -162,70 +151,7 @@ pub(super) async fn select_opann_probe_leaves(
             if !entry_has_vector_probe_layout(entry) {
                 continue;
             }
-            // Per-cell LOCAL cluster selection. The tree already localized to
-            // this cell; now score its OWN resident cluster centroids, take the
-            // nearest (adaptive, radius-aware), and emit one offset leaf per
-            // chosen cluster — its byte range coming from the resident
-            // per-cluster offset + count. A query then range-GETs only those
-            // clusters, so fetch cost is independent of cell size. Falls back to
-            // a whole-cell `(0, 0)` probe when the cell carries no resident
-            // per-cluster offsets (e.g. legacy/incoming cells).
-            match entry.vector_summary.get(column) {
-                Some(vs)
-                    if vs.clusters.n_cent > 0
-                        && vs.cluster_offsets.len() == vs.clusters.counts.len()
-                        && !vs.cluster_offsets.is_empty() =>
-                {
-                    // Within-cell cluster admission is RADIUS-aware, NOT the outer
-                    // cell nprobe: score all the cell's centroids and admit the
-                    // ones whose covering radius reaches the query (τ = d* +
-                    // slack·r*), capped at INNER_CLUSTER_CAP nearest-reaching
-                    // clusters so one query can't fan out across a whole big
-                    // cell's clusters. (Empty radii — legacy cells — collapse
-                    // this back to nearest-by-distance, the prior behaviour.)
-                    let mut inner_routing = routing;
-                    inner_routing.nprobe_min = 1;
-                    inner_routing.nprobe_max = (vs.clusters.n_cent as usize).min(INNER_CLUSTER_CAP);
-                    for c in vs.clusters.select_cells_adaptive(metric, query, 1, inner_routing) {
-                        let ci = c as usize;
-                        out.push((
-                            LeafRef {
-                                superfile_id: leaf.superfile_id,
-                                doc_off: vs.cluster_offsets[ci],
-                                count: vs.clusters.counts[ci],
-                                cluster_id: c,
-                            },
-                            dist,
-                            Arc::clone(entry),
-                        ));
-                    }
-                }
-                _ => out.push((leaf, dist, Arc::clone(entry))),
-            }
-        }
-    }
-
-    // Geometric-drain adaptation (no opann counterpart — opann dual-writes per
-    // vector, so it has no staging backlog): rows appended since the last drain
-    // live in INCOMING staging superfiles the routing tree has not clustered
-    // yet. The tree can't route to them, so always probe them — whole-scan
-    // `(doc_off, count) = (0, 0)` — in this same parallel wave, keeping
-    // un-drained rows searchable before (and between) drains. `survives` gates
-    // them on the same predicate as the routed leaves.
-    let mut seen: HashSet<u128> = out.iter().map(|(l, _, _)| l.superfile_id).collect();
-    for entry in &entries {
-        if entry.partition_hint == Some(INCOMING_VECTOR_CELL)
-            && survives(entry.superfile_id.as_u128())
-            && entry_has_vector_probe_layout(entry)
-            && seen.insert(entry.superfile_id.as_u128())
-        {
-            let leaf = LeafRef {
-                superfile_id: entry.superfile_id.as_u128(),
-                doc_off: 0,
-                count: 0,
-                cluster_id: 0,
-            };
-            out.push((leaf, 0.0, Arc::clone(entry)));
+            out.push((leaf, dist, Arc::clone(entry)));
         }
     }
 
@@ -243,25 +169,15 @@ fn entry_has_vector_probe_layout(entry: &SuperfileEntry) -> bool {
         .is_some_and(|(_, len)| len > 0)
 }
 
-/// How to probe one hidden cell superfile.
-enum ProbePlan {
-    /// Legacy / incoming / compaction-merge `(0,0)` leaf: rescan the whole cell
-    /// (cluster index + every non-empty internal cluster).
-    WholeCell,
-    /// OPANN offset leaves admitted for this cell — `(cluster_id, doc_off,
-    /// count)` per internal cluster, fetched as contiguous range-GETs.
-    Clusters(Vec<(u32, u32, u32)>),
-}
-
 /// Fan the OPANN-admitted probes across hidden cells, reusing the **normal**
 /// superfile read path. [`dispatch::fanout`] opens each cell through the same
 /// tiered opener the user-table fan-outs use (in-memory reader cache →
 /// disk-cache mmap → storage fallback), warms + applies the tombstone sidecar,
 /// and tags hits with their superfile — so the cell bytes are mmap-backed and
-/// shared. Admitted offset leaves of one cell COALESCE into a single open and
-/// one fetch batch of their cluster ranges (`probe_clusters_at_async`) — so a
-/// query is ~nprobe contiguous cluster range-GETs, independent of cell size —
-/// while a `(0,0)` leaf falls back to the whole-cell IVF rescan.
+/// shared. Every admitted leaf is a single internal IVF cluster; the clusters of
+/// one superfile COALESCE into a single open and one fetch batch of their byte
+/// ranges (`probe_clusters_at_async`) — so a query is ~nprobe contiguous cluster
+/// range-GETs, independent of superfile size. There is no whole-cell rescan.
 pub(super) async fn fanout_opann_leaf_probes(
     reader: &SupertableReader,
     leaves: Vec<(LeafRef, f32, Arc<SuperfileEntry>)>,
@@ -274,21 +190,21 @@ pub(super) async fn fanout_opann_leaf_probes(
     let filtered = allow.is_some();
     let rerank_mult = options.resolve(filtered).1;
 
-    // Group admitted leaves by their owning superfile: per-cluster offset leaves
-    // of one cell coalesce into one open + one fetch batch; a `(0,0)` leaf marks
-    // the whole cell. `order` preserves first-seen order for determinism.
+    // Group admitted leaves by their owning superfile: every leaf is a single
+    // internal IVF cluster, so the clusters of one superfile coalesce into one
+    // open + one fetch batch of their byte ranges. `order` preserves first-seen
+    // order for determinism. Empty clusters (count 0) carry no rows — skip them.
     let mut order: Vec<u128> = Vec::new();
-    let mut by_sf: HashMap<u128, (Arc<SuperfileEntry>, Vec<(u32, u32, u32)>, bool)> = HashMap::new();
+    let mut by_sf: HashMap<u128, (Arc<SuperfileEntry>, Vec<(u32, u32, u32)>)> = HashMap::new();
     for (leaf, _dist, entry) in leaves {
+        if leaf.count == 0 {
+            continue;
+        }
         let slot = by_sf.entry(leaf.superfile_id).or_insert_with(|| {
             order.push(leaf.superfile_id);
-            (Arc::clone(&entry), Vec::new(), false)
+            (Arc::clone(&entry), Vec::new())
         });
-        if leaf.doc_off == 0 && leaf.count == 0 {
-            slot.2 = true;
-        } else {
-            slot.1.push((leaf.cluster_id, leaf.doc_off, leaf.count));
-        }
+        slot.1.push((leaf.cluster_id, leaf.doc_off, leaf.count));
     }
 
     // Resident deleted-user-`_id` set. The hidden cells are NOT rewritten on a
@@ -318,10 +234,10 @@ pub(super) async fn fanout_opann_leaf_probes(
     // `allow` and dropped — it never opens or fetches.
     let mut units: Vec<(
         Arc<SuperfileEntry>,
-        (ProbePlan, Option<Arc<RoaringBitmap>>, Option<Arc<RoaringBitmap>>),
+        (Vec<(u32, u32, u32)>, Option<Arc<RoaringBitmap>>, Option<Arc<RoaringBitmap>>),
     )> = Vec::new();
     for sid in order {
-        let (entry, metas, whole) = by_sf.remove(&sid).expect("present in by_sf");
+        let (entry, metas) = by_sf.remove(&sid).expect("present in by_sf");
         let bitmap = match allow.as_ref() {
             Some(m) => match m.get(&entry.uri) {
                 Some(bm) => Some(Arc::clone(bm)),
@@ -333,12 +249,7 @@ pub(super) async fn fanout_opann_leaf_probes(
         // arithmetically here while its entry is in scope. `None` means the
         // kernel maps through the cell's inline `_id` region instead.
         let arith_deny = arith_deny_locals(&entry, &deleted);
-        let plan = if whole || metas.is_empty() {
-            ProbePlan::WholeCell
-        } else {
-            ProbePlan::Clusters(metas)
-        };
-        units.push((entry, (plan, bitmap, arith_deny)));
+        units.push((entry, (metas, bitmap, arith_deny)));
     }
     if units.is_empty() {
         return Ok(Vec::new());
@@ -348,8 +259,8 @@ pub(super) async fn fanout_opann_leaf_probes(
     let query = Arc::new(query.to_vec());
     let deleted_for_kernel = Arc::clone(&deleted);
     let kernel = move |r: Arc<SuperfileReader>,
-                       (plan, bitmap, arith_deny): (
-        ProbePlan,
+                       (metas, bitmap, arith_deny): (
+        Vec<(u32, u32, u32)>,
         Option<Arc<RoaringBitmap>>,
         Option<Arc<RoaringBitmap>>,
     )| {
@@ -368,16 +279,11 @@ pub(super) async fn fanout_opann_leaf_probes(
                 Some(d) => Some(d),
                 None => v.inline_deleted_locals(&deleted).await.map_err(map_vector_err)?.map(Arc::new),
             };
-            match plan {
-                ProbePlan::WholeCell => v
-                    .probe_leaf_async(&column, &query, k, 0, 0, rerank_mult, bitmap, deny)
-                    .await
-                    .map_err(map_vector_err),
-                ProbePlan::Clusters(metas) => v
-                    .probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
-                    .await
-                    .map_err(map_vector_err),
-            }
+            // Every leaf is a cluster range; fetch the admitted clusters as
+            // contiguous range-GETs and score them. No whole-cell rescan.
+            v.probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
+                .await
+                .map_err(map_vector_err)
         }
     };
 

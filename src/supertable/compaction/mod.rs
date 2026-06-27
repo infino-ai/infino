@@ -44,8 +44,9 @@ use crate::{
         },
         writer::{
             OpannRoutingCommit, PartitionRoutingCopy, PreparedSuperfile, ShardOutput,
-            backoff_delay, finalize_compaction_commit, opann_routing_update, prepare_superfile,
-            split_overflow_cell_after_compaction, try_commit_attempt,
+            backoff_delay, finalize_compaction_commit, opann_routing_update,
+            per_cluster_routing_leaves, prepare_superfile, split_overflow_cell_after_compaction,
+            try_commit_attempt,
         },
     },
 };
@@ -493,10 +494,11 @@ impl Supertable {
 
             // Hidden vector index: keep the OPANN routing tree consistent with
             // the merge in the SAME commit — drop the merged-away inputs' leaves
-            // and splice in the merged superfile as one whole-cell `(0, 0)` leaf
-            // carrying its summary centroid (decoded to fp32). This is the same
-            // `opann_routing_update` op the drain/split use; recomputed per OCC
-            // attempt so a retry rebuilds against the winning base. User-table
+            // and splice in the merged superfile's internal IVF clusters as
+            // per-cluster leaves (centroid → cluster byte range), so descent
+            // routes straight to clusters with no whole-cell leaf. This is the
+            // same `opann_routing_update` op the drain/commit use; recomputed per
+            // OCC attempt so a retry rebuilds against the winning base. User-table
             // compaction has no routing tree, so it inherits.
             let routing_commit = if is_hidden_vector_index_table(&inner.options) {
                 let removed: Vec<u128> = job.inputs.iter().map(|id| id.as_u128()).collect();
@@ -504,16 +506,17 @@ impl Supertable {
                     .options
                     .vector_columns
                     .first()
-                    .and_then(|vc| new_entries[0].vector_summary.get(&vc.column))
-                    .map(|summary| {
-                        vec![PartitionRoutingCopy {
-                            superfile_id: new_entries[0].superfile_id.as_u128(),
-                            doc_off: 0,
-                            count: 0,
-                            cluster_id: 0,
-                            centroid_fp32: summary.centroid.to_single_fp32(),
-                            radius: summary.radius,
-                        }]
+                    .and_then(|vc| {
+                        new_entries[0]
+                            .vector_summary
+                            .get(&vc.column)
+                            .map(|summary| {
+                                per_cluster_routing_leaves(
+                                    new_entries[0].superfile_id.as_u128(),
+                                    summary,
+                                    vc.dim,
+                                )
+                            })
                     })
                     .unwrap_or_default();
                 opann_routing_update(inner, current.as_ref(), &removed, &added)

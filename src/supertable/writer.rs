@@ -2329,6 +2329,40 @@ pub(in crate::supertable) struct PartitionRoutingCopy {
     pub(in crate::supertable) radius: f32,
 }
 
+/// Per-cluster OPANN routing leaves for one superfile: one leaf per internal IVF
+/// cluster, keyed by that cluster's own centroid and carrying its byte range
+/// (`doc_off`/`count`) + covering radius. Putting every cluster on the tree lets
+/// descent route straight to the nearest clusters across all superfiles — there
+/// is no whole-superfile `(0,0)` leaf and no within-superfile rescan at query
+/// time. Reads only the resident manifest summary (`vs`); no superfile fetch.
+pub(in crate::supertable) fn per_cluster_routing_leaves(
+    superfile_id: u128,
+    vs: &VectorSummary,
+    dim: usize,
+) -> Vec<PartitionRoutingCopy> {
+    let n_cent = vs.clusters.n_cent as usize;
+    if n_cent == 0 || vs.cluster_offsets.len() != n_cent {
+        return Vec::new();
+    }
+    let rows = vs.clusters.to_encoded_rows();
+    (0..n_cent)
+        .filter_map(|ci| {
+            let count = *vs.clusters.counts.get(ci)?;
+            if count == 0 {
+                return None;
+            }
+            Some(PartitionRoutingCopy {
+                superfile_id,
+                doc_off: *vs.cluster_offsets.get(ci)?,
+                count,
+                cluster_id: ci as u32,
+                centroid_fp32: manifest_centroid_components_from_row(rows.get(ci)?, dim),
+                radius: vs.clusters.radii.get(ci).copied().unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
 /// How a commit treats the manifest's OPANN routing root.
 pub(crate) enum OpannRoutingCommit {
     /// Carry the prior routing forward unchanged (no tree change).
@@ -2467,21 +2501,15 @@ async fn register_user_superfiles_in_hidden_index(
         reg.partition_hint = Some(super::handle::INCOMING_VECTOR_CELL);
         registrations.push(Arc::new(reg));
 
-        // One whole-superfile leaf, like the drain's whole-cell leaf: the
-        // descent routes to the superfile by its summary centroid + radius, and
-        // the within-superfile admission (now radius-aware via `clusters.radii`)
-        // picks the clusters at query time. A `(0, 0)` leaf is what the probe
-        // expects — explicit per-cluster ranges here would mis-fetch.
-        if let Some(row) = vs.centroid.to_encoded_rows().first() {
-            added.push(PartitionRoutingCopy {
-                superfile_id: entry.superfile_id.as_u128(),
-                doc_off: 0,
-                count: 0,
-                cluster_id: 0,
-                centroid_fp32: manifest_centroid_components_from_row(row, dim),
-                radius: vs.radius,
-            });
-        }
+        // Put every internal IVF cluster of this user superfile on the OPANN
+        // tree as its own leaf (centroid → cluster byte range). Descent then
+        // routes straight to the nearest clusters across all superfiles — no
+        // whole-superfile leaf, no within-superfile rescan at query time.
+        added.extend(per_cluster_routing_leaves(
+            entry.superfile_id.as_u128(),
+            vs,
+            dim,
+        ));
     }
     if registrations.is_empty() {
         return Ok(());
@@ -2782,26 +2810,19 @@ async fn route_incoming_to_manifest_cells_if_ready(
 
     // Bump per-cell counts so routing sees the now-populated cells.
     let updated_clusters = spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
-    // Each new cell superfile becomes one whole-partition leaf in the OPANN
-    // routing tree: `(doc_off, count) = (0, 0)` (fetch the whole partition, scan
-    // inside), keyed to the committed superfile UUID, with the cell's Sq8
-    // centroid decoded transiently to fp32.
+    // Put every internal IVF cluster of each new cell superfile on the OPANN
+    // tree as its own leaf (centroid → cluster byte range), read from the cell's
+    // resident manifest summary — same per-cluster routing as a plain commit, so
+    // descent routes straight to clusters with no whole-cell leaf.
     let dim = updated_clusters.dim as usize;
-    let cell_rows = updated_clusters.to_encoded_rows();
     let added: Vec<PartitionRoutingCopy> = batch
         .new_entries
         .iter()
         .filter_map(|e| {
-            let cell = e.partition_hint? as usize;
-            cell_rows.get(cell).map(|row| PartitionRoutingCopy {
-                superfile_id: e.superfile_id.as_u128(),
-                doc_off: 0,
-                count: 0,
-                cluster_id: 0,
-                centroid_fp32: manifest_centroid_components_from_row(row, dim),
-                radius: updated_clusters.radii.get(cell).copied().unwrap_or(0.0),
-            })
+            let vs = e.vector_summary.get(column.as_str())?;
+            Some(per_cluster_routing_leaves(e.superfile_id.as_u128(), vs, dim))
         })
+        .flatten()
         .collect();
     inner
         .manifest

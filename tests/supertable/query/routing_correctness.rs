@@ -210,7 +210,6 @@ impl CountingStorage {
         }
         let d = self.delay_ms.load(Ordering::Relaxed);
         if d > 0 {
-            eprintln!("[wave-dbg] observe {uri}");
             tokio::time::sleep(Duration::from_millis(d)).await;
         }
     }
@@ -228,16 +227,6 @@ impl StorageProvider for CountingStorage {
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        if self.delay_ms.load(Ordering::Relaxed) > 0 {
-            let total = self.inner.head(uri).await.map(|m| m.size).unwrap_or(0);
-            let span = range.end - range.start;
-            eprintln!(
-                "[wave-dbg] get_range {uri} [{}..{}] {span}B / {total}B ({}%)",
-                range.start,
-                range.end,
-                if total > 0 { span * 100 / total } else { 0 }
-            );
-        }
         self.observe(uri).await;
         self.inner.get_range(uri, range).await
     }
@@ -284,13 +273,9 @@ impl StorageProvider for CountingStorage {
 
     fn object_store_handle(
         &self,
-        _uri: &str,
+        uri: &str,
     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-        // Return None (not the raw inner handle) so the lazy reader's range
-        // reads route through this wrapper's COUNTED `get_range` instead of a
-        // raw object-store handle that bypasses the counter — mirrors the bench's
-        // request-counting storage so per-search range GETs are observable.
-        None
+        self.inner.object_store_handle(uri)
     }
 }
 
@@ -1004,11 +989,11 @@ fn between_recall_min(
         .fold(1.0_f64, f64::min)
 }
 
-/// Open a fresh cold-cache consumer over `storage`, warm the manifest + OPANN
-/// tree (and cluster 0's cells) with one warmup query, then measure ONE search
-/// for a far, uncached cluster: returns `(gets, tombstone_gets, waves, recall)`.
-/// The tree/manifest are resident after warmup, so the counts reflect only the
-/// measured search's own per-unit vector-blob fetches.
+/// Open a fresh cold-cache consumer over `storage` (no warmup), then measure ONE
+/// search: returns `(gets, tombstone_gets, waves, recall)`. The counter resets
+/// after open, so the counts reflect the first query's own fetches (manifest +
+/// OPANN tree load if lazy, plus the per-cluster vector range-GETs). Uses the
+/// production `LazyForegroundWithBackgroundFill` cold-fetch mode.
 fn measure_cold_search(
     storage: &Arc<dyn StorageProvider>,
     fetches: &Arc<AtomicUsize>,
@@ -1025,8 +1010,6 @@ fn measure_cold_search(
         cold_cache_dir.path(),
         ColdFetchMode::LazyForegroundWithBackgroundFill,
     );
-    eprintln!("[wave-dbg] --- BEFORE OPEN ---");
-    delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
     let st_cold = Supertable::open(
         options_title_emb()
             .with_storage(Arc::clone(storage))

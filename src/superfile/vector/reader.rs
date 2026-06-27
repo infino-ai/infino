@@ -2016,49 +2016,6 @@ impl VectorReader {
             .await
     }
 
-    /// Probe one OPANN routing leaf: fetch the cluster bytes named by
-    /// `(doc_off, count)` and score them. Skips centroid scoring — the tree
-    /// already selected this cell. Legacy manifests may still carry
-    /// `(doc_off, count) = (0, 0)` — those re-enter [`Self::search_clusters_async`]
-    /// (cluster index + one GET per non-empty cluster) until re-ingested.
-    pub(crate) async fn probe_leaf_async(
-        &self,
-        column: &str,
-        query: &[f32],
-        k: usize,
-        leaf_doc_off: u32,
-        leaf_count: u32,
-        rerank_mult: usize,
-        allow: Option<Arc<RoaringBitmap>>,
-        deny: Option<Arc<RoaringBitmap>>,
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
-        let (col, validated) = self.resolve_column(column, query, k)?;
-        if !validated {
-            return Ok(Vec::new());
-        }
-        if leaf_doc_off == 0 && leaf_count == 0 {
-            let clusters: Vec<u32> = (0..col.n_cent).collect();
-            return self
-                .search_clusters_async(column, query, k, &clusters, rerank_mult, allow, deny)
-                .await;
-        }
-        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
-        if filter_mult == 0 {
-            return Ok(Vec::new());
-        }
-        let mut q_rot = vec![0f32; col.dim];
-        col.rot.apply(query, &mut q_rot);
-        let ctx = ProbeCtx {
-            q_rot: &q_rot,
-            k,
-            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
-            allow,
-            deny,
-        };
-        let meta = vec![(0usize, leaf_doc_off, leaf_count)];
-        self.probe_cluster_meta_async(col, query, &ctx, &meta)
-            .await
-    }
 
     /// Probe a set of OPANN offset leaves that all live in THIS superfile, in
     /// one wave: each `(cluster_id, doc_off, count)` names an internal IVF
