@@ -161,9 +161,26 @@ pub mod fts {
 
     /// Top-k for every search.
     pub const K: usize = 10;
-    /// Large top-k, run as a second warm pass to gate how query latency
-    /// scales with k — the heap/collector cost the small-k tables hide.
+    /// Large top-k, timed query-only for a few representative shapes to
+    /// gate how collection cost scales with k — the cost the small-k
+    /// table hides. Query phase only over [`K_LARGE_SHAPE_NAMES`]: timing
+    /// the whole battery's *fetch* phase at this k would dominate the
+    /// bench budget without adding large-k signal.
     pub const K_LARGE: usize = 1000;
+    /// Representative shapes for the large-k gate: a common term, a small
+    /// and a large OR, and an AND — enough to see collection cost track k
+    /// across query types without timing all 15 shapes.
+    const K_LARGE_SHAPE_NAMES: &[&str] = &[
+        "single_common",
+        "two_term_or",
+        "ten_term_or",
+        "two_term_and",
+    ];
+    /// Large-union shapes that exist only to stress the multi-term count
+    /// path. Excluded from the cold object-store search tier, where their
+    /// near-full-corpus unions cost ~1 s per fresh-cache iteration for no
+    /// added count signal (the count battery runs warm).
+    const LARGE_UNION_NAMES: &[&str] = &["twenty_term_or", "forty_term_or"];
     /// Timed warm-search repetitions per query (after one warmup). `run_fts`
     /// reports the p50 over these.
     pub const WARM_ITERS: usize = 50;
@@ -487,33 +504,47 @@ pub mod fts {
                 );
             }
             if phases.warm {
-                eprintln!(
-                    "[superfile_fts] top-{K_LARGE} battery: {} queries × {WARM_ITERS} timed iters...",
-                    FTS_BATTERY.len(),
-                );
-                let warm_large = exec_fts::measure_warm(
-                    index.reader(),
-                    FTS_BATTERY,
-                    FTS_COLUMN,
-                    K_LARGE,
-                    WARM_ITERS,
-                    "superfile_fts",
-                );
-                exec_fts::emit_search(
-                    &mut report,
-                    "bench/fts/superfile/search-large-k",
-                    format!(
-                        "Superfile FTS — search top-{K_LARGE}, single-superfile / in-memory ({} docs)",
+                // Large-k gate: query-phase p50 at k = K_LARGE for a few
+                // representative shapes, to surface top-k collection cost
+                // that the top-K table hides. Query phase only over a
+                // curated subset — the full battery's fetch phase at this
+                // k dominates the bench budget without adding signal.
+                let reader = index.reader();
+                let large_k: Vec<(&'static str, Duration)> = FTS_BATTERY
+                    .iter()
+                    .filter(|q| K_LARGE_SHAPE_NAMES.contains(&q.name))
+                    .map(|q| {
+                        let query = q.terms.join(" ");
+                        let mode = exec_fts::to_infino_mode(q.mode);
+                        (
+                            q.name,
+                            hot_p50(|| reader.bm25_rows(FTS_COLUMN, &query, K_LARGE, mode)),
+                        )
+                    })
+                    .collect();
+                report.emit(&Section {
+                    anchor: "bench/fts/superfile/search-large-k".into(),
+                    title: format!(
+                        "Superfile FTS — search top-{K_LARGE} (query phase), single-superfile / in-memory ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    &format!(
-                        "Identical warm path to the top-{K} table but with k = {K_LARGE}, to gate how \
-                         top-k collection cost scales with k. Δ is vs the previous run."
+                    note: format!(
+                        "Query-phase p50 at k = {K_LARGE} for representative shapes — gates how \
+                         top-k collection cost scales with k vs the top-{K} table. Δ is vs the \
+                         previous run."
                     ),
-                    Some(&warm_large),
-                    None,
-                    None,
-                );
+                    blocks: vec![Block {
+                        subtitle: format!("top-{K_LARGE} queries"),
+                        headers: vec!["Query".into(), "warm (query)".into()],
+                        rows: large_k
+                            .iter()
+                            .map(|(name, d)| {
+                                let ns = d.as_secs_f64() * 1e9;
+                                vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                            })
+                            .collect(),
+                    }],
+                });
             }
             if let Some(rows) = negations {
                 report.emit(&Section {
@@ -681,15 +712,24 @@ pub mod fts {
         let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
             index.bytes(),
         )));
+        // Skip the large-union shapes in the cold tier: their
+        // near-full-corpus unions cost ~1 s per fresh-cache iteration
+        // (object-store reads, no warm cache) and add no cold signal the
+        // smaller shapes don't — they exist to stress the warm count path.
+        let cold_battery: Vec<_> = FTS_BATTERY
+            .iter()
+            .copied()
+            .filter(|q| !LARGE_UNION_NAMES.contains(&q.name))
+            .collect();
         eprintln!(
             "[superfile_fts] cold search: {} queries × {COLD_ITERS} fresh-cache iters...",
-            FTS_BATTERY.len(),
+            cold_battery.len(),
         );
         let storage = Arc::clone(&committed.storage);
         let uri = committed.uri;
         exec_fts::measure_cold(
             || SuperfileColdGuard::open(Arc::clone(&storage), uri, committed.object_size),
-            FTS_BATTERY,
+            &cold_battery,
             FTS_COLUMN,
             K,
             COLD_ITERS,
