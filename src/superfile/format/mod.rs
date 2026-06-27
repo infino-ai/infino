@@ -190,7 +190,7 @@ pub mod vec {
     /// ```
     ///
     /// Derived offsets (computed by the reader at open):
-    /// - `codec_meta_off = cluster_idx_off + n_cent * 8`
+    /// - `codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES`
     ///   when `codec_meta_size > 0`, else unused.
     /// - `full_off = per_cluster_blocks_off + n_docs * (code_bytes + 4)`.
     /// - per-cluster block at byte offset
@@ -200,7 +200,7 @@ pub mod vec {
     /// Only this version is accepted on read; a superfile stamped
     /// with any other value at this slot is rejected as malformed
     /// rather than carrying an alternate parse path.
-    pub const SUBSECTION_VERSION: u32 = 2;
+    pub const SUBSECTION_VERSION: u32 = 3;
 
     /// Width of a little-endian `u32` field in the vector blob.
     pub const U32_BYTES: usize = 4;
@@ -224,11 +224,18 @@ pub mod vec {
     /// On-disk `metric_id` discriminator for negated dot product.
     pub const METRIC_ID_NEGDOT: u32 = 2;
 
-    /// Cluster-index entry size: `(doc_off: u32, count: u32)`.
-    pub const CLUSTER_IDX_ENTRY_BYTES: usize = 8;
+    /// Cluster-index entry size: `(doc_off: u32, count: u32, radius: f32)`.
+    /// The `radius` (third field, `f32` LE) is the cluster's covering radius —
+    /// max member distance to its own centroid, computed from fp32 in the
+    /// build's assignment pass — so a cross-superfile query's within-superfile
+    /// admission can be radius-aware (τ = d* + slack·r*) instead of falling back
+    /// to nearest-by-centroid. `0.0` is a valid "no coverage info" sentinel.
+    pub const CLUSTER_IDX_ENTRY_BYTES: usize = 12;
     /// Byte offset of the `count` field within a cluster-index entry
     /// (it is the second `u32` of the pair).
     pub const CLUSTER_IDX_COUNT_OFFSET: usize = 4;
+    /// Byte offset of the per-cluster `radius` (`f32` LE) within an entry.
+    pub const CLUSTER_IDX_RADIUS_OFFSET: usize = 8;
 
     /// Outer-header field offsets (see the byte map above).
     pub mod outer_hdr {

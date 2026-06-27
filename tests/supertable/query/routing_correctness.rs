@@ -929,6 +929,210 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
     );
 }
 
+/// Min recall@k over the center queries — non-asserting variant of
+/// [`assert_recall`] for the pre/post-drain comparison experiment.
+fn center_recall_min(
+    st: &Supertable,
+    all: &[Vec<f32>],
+    idx_to_id: &[i128],
+    nprobe: usize,
+    k: usize,
+) -> f64 {
+    query_clusters()
+        .into_iter()
+        .map(|c| {
+            let returned = search_ids(st, c, nprobe, k);
+            let exact = brute_force_topk_ids(all, idx_to_id, &cluster_base(c), k);
+            recall_at_k(&returned, &exact)
+        })
+        .fold(1.0_f64, f64::min)
+}
+
+/// Min recall@k over the between-cluster (boundary) queries — non-asserting
+/// variant of [`assert_between_cluster_recall`].
+fn between_recall_min(
+    st: &Supertable,
+    all: &[Vec<f32>],
+    idx_to_id: &[i128],
+    nprobe: usize,
+    k: usize,
+) -> f64 {
+    between_cluster_queries()
+        .into_iter()
+        .map(|(a, b)| {
+            let query = midpoint_query(a, b);
+            let batches = st
+                .vector_search(
+                    "emb",
+                    &query,
+                    k,
+                    VectorSearchOptions::new().with_nprobe(nprobe),
+                    None,
+                    None,
+                )
+                .expect("between-cluster vector_search");
+            let returned = extract_id_set(&batches);
+            let exact = brute_force_topk_ids(all, idx_to_id, &query, k);
+            recall_at_k(&returned, &exact)
+        })
+        .fold(1.0_f64, f64::min)
+}
+
+/// Open a fresh cold-cache consumer over `storage`, warm the manifest + OPANN
+/// tree (and cluster 0's cells) with one warmup query, then measure ONE search
+/// for a far, uncached cluster: returns `(gets, tombstone_gets, waves, recall)`.
+/// The tree/manifest are resident after warmup, so the counts reflect only the
+/// measured search's own per-unit vector-blob fetches.
+fn measure_cold_search(
+    storage: &Arc<dyn StorageProvider>,
+    fetches: &Arc<AtomicUsize>,
+    tombstone_fetches: &Arc<AtomicUsize>,
+    delay_ms: &Arc<AtomicU64>,
+    all: &[Vec<f32>],
+    idx_to_id: &[i128],
+    nprobe: usize,
+    k: usize,
+) -> (usize, usize, u64, f64) {
+    let cold_cache_dir = TempDir::new().expect("cold cache tempdir");
+    let cold_cache = make_cache(Arc::clone(storage), cold_cache_dir.path());
+    let st_cold = Supertable::open(
+        options_title_emb()
+            .with_storage(Arc::clone(storage))
+            .with_disk_cache(Arc::clone(&cold_cache)),
+    )
+    .expect("open fresh cold-cache consumer");
+
+    let cold_search = |st: &Supertable, cluster: usize| {
+        st.vector_search(
+            "emb",
+            &cluster_base(cluster),
+            k,
+            VectorSearchOptions::new().with_nprobe(nprobe),
+            None,
+            None,
+        )
+    };
+
+    let warmup_cluster = query_clusters()[0];
+    if let Err(e) = cold_search(&st_cold, warmup_cluster) {
+        eprintln!("[compare] cold warmup search FAILED: {e:?}");
+        return (0, 0, 0, -1.0);
+    }
+
+    let measured_cluster = query_clusters()[query_clusters().len() - 1];
+    fetches.store(0, Ordering::Relaxed);
+    tombstone_fetches.store(0, Ordering::Relaxed);
+    delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
+    let t0 = Instant::now();
+    let result = cold_search(&st_cold, measured_cluster);
+    let elapsed = t0.elapsed();
+    delay_ms.store(0, Ordering::Relaxed);
+
+    let gets = fetches.load(Ordering::Relaxed);
+    let tombstone_gets = tombstone_fetches.load(Ordering::Relaxed);
+    let waves = ((elapsed.as_secs_f64() * 1000.0) / WAVE_PROBE_DELAY_MS as f64).round() as u64;
+    let recall = match result {
+        Ok(batches) => {
+            let returned = extract_id_set(&batches);
+            let exact = brute_force_topk_ids(all, idx_to_id, &cluster_base(measured_cluster), k);
+            recall_at_k(&returned, &exact)
+        }
+        Err(e) => {
+            eprintln!("[compare] cold measured search FAILED: {e:?}");
+            -1.0
+        }
+    };
+    (gets, tombstone_gets, waves, recall)
+}
+
+/// EXPERIMENT (run with `--nocapture`): measure recall and cold per-search
+/// GET/wave counts PRE-drain (search the registered INCOMING user superfiles
+/// directly via the OPANN tree) vs POST-drain (search the drained per-cell IVF
+/// superfiles), on one identical corpus. Answers the standing architectural
+/// question — does the drain buy recall and/or fewer GETs, or do the user
+/// superfiles-as-leaves already suffice? Prints a comparison; asserts only that
+/// both phases stay searchable so the experiment can't silently rot.
+#[test]
+fn opann_pre_vs_post_drain_compare() {
+    let all = all_embeddings();
+    let dir = TempDir::new().expect("data tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let tombstone_fetches = Arc::new(AtomicUsize::new(0));
+    let delay_ms = Arc::new(AtomicU64::new(0));
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("LocalFs provider"));
+    let counting: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
+        Arc::clone(&local),
+        Arc::clone(&fetches),
+        Arc::clone(&tombstone_fetches),
+        Arc::clone(&delay_ms),
+    ));
+    let cache = make_cache(Arc::clone(&counting), cache_dir.path());
+    let st = Supertable::create(
+        options_title_emb()
+            .with_storage(Arc::clone(&counting))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("create supertable");
+
+    let n_commits = N_DOCS / DOCS_PER_COMMIT;
+    for i in 0..n_commits {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(i * DOCS_PER_COMMIT, DOCS_PER_COMMIT))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    let idx_to_id = build_doc_index_to_id(&st);
+
+    // PRE-DRAIN: user superfiles registered as INCOMING (0,0) leaves.
+    let pre_center = center_recall_min(&st, &all, &idx_to_id, CORRECTNESS_NPROBE, TOP_K);
+    let pre_between_full = between_recall_min(&st, &all, &idx_to_id, CORRECTNESS_NPROBE, TOP_K);
+    let pre_between_pruned = between_recall_min(&st, &all, &idx_to_id, PRUNED_NPROBE, TOP_K);
+    let pre_stats = st.hidden_vector_superfile_stats();
+    eprintln!("[compare] pre-drain warm recall done: center={pre_center:.4} between_full={pre_between_full:.4} pruned={pre_between_pruned:.4} stats={pre_stats:?}");
+    let (pre_gets, pre_tomb, pre_waves, pre_cold_recall) = measure_cold_search(
+        &counting,
+        &fetches,
+        &tombstone_fetches,
+        &delay_ms,
+        &all,
+        &idx_to_id,
+        COLD_NPROBE,
+        TOP_K,
+    );
+
+    // DRAIN.
+    st.optimize(&small_optimize_opts()).expect("optimize/drain");
+
+    // POST-DRAIN: per-cell IVF superfiles with offset leaves.
+    let post_center = center_recall_min(&st, &all, &idx_to_id, CORRECTNESS_NPROBE, TOP_K);
+    let post_between_full = between_recall_min(&st, &all, &idx_to_id, CORRECTNESS_NPROBE, TOP_K);
+    let post_between_pruned = between_recall_min(&st, &all, &idx_to_id, PRUNED_NPROBE, TOP_K);
+    let post_stats = st.hidden_vector_superfile_stats();
+    let (post_gets, post_tomb, post_waves, post_cold_recall) = measure_cold_search(
+        &counting,
+        &fetches,
+        &tombstone_fetches,
+        &delay_ms,
+        &all,
+        &idx_to_id,
+        COLD_NPROBE,
+        TOP_K,
+    );
+
+    eprintln!("\n=== PRE vs POST DRAIN ({N_DOCS} docs, {n_commits} commits, k={TOP_K}) ===");
+    eprintln!("hidden superfiles (total, max/cell):   pre={pre_stats:?}  post={post_stats:?}");
+    eprintln!("recall@{TOP_K} center        (nprobe={CORRECTNESS_NPROBE}):  pre={pre_center:.4}  post={post_center:.4}");
+    eprintln!("recall@{TOP_K} between full  (nprobe={CORRECTNESS_NPROBE}):  pre={pre_between_full:.4}  post={post_between_full:.4}");
+    eprintln!("recall@{TOP_K} between pruned(nprobe={PRUNED_NPROBE}):   pre={pre_between_pruned:.4}  post={post_between_pruned:.4}");
+    eprintln!("cold search  (nprobe={COLD_NPROBE}):  pre={pre_gets} GETs/{pre_waves} wave(s)/{pre_tomb} tomb (recall {pre_cold_recall:.4})  post={post_gets} GETs/{post_waves} wave(s)/{post_tomb} tomb (recall {post_cold_recall:.4})");
+    eprintln!("=== END ===\n");
+
+    assert!(pre_center > 0.0 && post_center > 0.0, "both phases must search");
+}
+
 /// Cluster whose top-k rows are deleted in the leak test (far from cluster 0).
 const VICTIM_CLUSTER: usize = 23;
 

@@ -32,7 +32,8 @@ use crate::superfile::{
     format::{
         checksum::crc32c,
         vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, CLUSTER_IDX_RADIUS_OFFSET,
+            MAGIC_BYTES, U32_BYTES, U64_BYTES,
             dir_entry, outer_hdr, sub_hdr,
         },
         {self},
@@ -1355,6 +1356,21 @@ impl VectorReader {
         Some(offsets)
     }
 
+    /// Per-cluster covering radius (`f32`), in cluster-ordinal order — the
+    /// `radius` third of each cluster-index entry, written from fp32 in the
+    /// build's assignment pass. Lets the manifest's `VectorSummary.clusters`
+    /// carry per-cluster radii so a cross-superfile query's within-superfile
+    /// admission is radius-aware. `None` when the column has no vector index.
+    pub fn cluster_radii(&self, column: &str) -> Option<Vec<f32>> {
+        let cid = *self.column_id_by_name.get(column)?;
+        let col = &self.columns[cid as usize];
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())?;
+        let idx = &sub[col.cluster_idx_off..];
+        Some((0..col.n_cent as usize).map(|c| read_cluster_radius(idx, c)).collect())
+    }
+
     /// Async sibling of [`Self::inline_stable_ids_for_locals`] for the COLD
     /// path: when the inline `_id` region is present but **not resident** (a
     /// freshly-opened lazy reader — the search fetches centroids/cluster_idx
@@ -2282,7 +2298,7 @@ impl VectorReader {
 
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
-        let idx_end = idx_start + (col.n_cent as usize) * 8;
+        let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
         let cluster_idx = self
             .source
             .get_range(idx_start..idx_end)
@@ -2927,12 +2943,13 @@ fn candidate_full_bytes<'a>(
 }
 
 /// Decode one cluster's `(off, cnt)` entry from
-/// `cluster_idx_slice` (the `n_cent × 8` bytes of the column's
-/// cluster index header). `c` is the cluster id. Shared with the
-/// byte-splice merge path (`ivf_merge`).
+/// `cluster_idx_slice` (the `n_cent × CLUSTER_IDX_ENTRY_BYTES` bytes of the
+/// column's cluster index header). `c` is the cluster id. Shared with the
+/// byte-splice merge path (`ivf_merge`). The trailing per-cluster radius
+/// (`CLUSTER_IDX_RADIUS_OFFSET`) is read separately via [`read_cluster_radius`].
 #[inline]
 pub(crate) fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
-    let base = c * 8;
+    let base = c * CLUSTER_IDX_ENTRY_BYTES;
     let off = u32::from_le_bytes([
         cluster_idx_slice[base],
         cluster_idx_slice[base + 1],
@@ -2946,6 +2963,21 @@ pub(crate) fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u3
         cluster_idx_slice[base + 7],
     ]);
     (off, cnt)
+}
+
+/// Decode cluster `c`'s covering radius (`f32` LE) from the same
+/// `n_cent × CLUSTER_IDX_ENTRY_BYTES` cluster-index slice
+/// [`read_cluster_entry`] reads `(off, cnt)` from. Shared with the byte-splice
+/// merge path so a spliced cell copies each source cluster's radius verbatim.
+#[inline]
+pub(crate) fn read_cluster_radius(cluster_idx_slice: &[u8], c: usize) -> f32 {
+    let base = c * CLUSTER_IDX_ENTRY_BYTES + CLUSTER_IDX_RADIUS_OFFSET;
+    f32::from_le_bytes([
+        cluster_idx_slice[base],
+        cluster_idx_slice[base + 1],
+        cluster_idx_slice[base + 2],
+        cluster_idx_slice[base + 3],
+    ])
 }
 
 /// Full-precision rerank over `shortlist`, returning the top-`k`

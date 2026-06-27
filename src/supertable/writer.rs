@@ -1453,50 +1453,15 @@ impl SupertableWriter {
         if self.buffer.is_empty() {
             return Ok::<(), BuildError>(());
         }
-        if crate::supertable::handle::is_hidden_vector_index_table(&self.inner.options)
-            && self.inner.options.storage.is_some()
-        {
-            return self.commit_hidden_incoming_internal();
-        }
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
 
-        // Dual-write vectors into the hidden index writer, then build/publish
-        // user and hidden superfiles in parallel (create via rayon::join,
-        // publish via tokio::join).
-        let mut hidden_writer = None;
-        if let Some(vit) = self.inner.vector_index_table.as_ref() {
-            match vit.writer() {
-                Ok(mut vw) => {
-                    for batch in &buffer {
-                        let Some(ids) = batch
-                            .scalar
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Decimal128Array>()
-                        else {
-                            tracing::warn!(
-                                "supertable: hidden vector-index dual-write missing _id column"
-                            );
-                            continue;
-                        };
-                        if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
-                            tracing::warn!(
-                                "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
-                            );
-                            break;
-                        }
-                    }
-                    hidden_writer = Some(vw);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "supertable: hidden vector-index writer unavailable: {e} (vector search may be stale)"
-                    );
-                }
-            }
-        }
-
+        // Reuse model: the user superfiles ARE the vector-index incoming — no
+        // dual-write copy. After they are published below,
+        // `register_user_superfiles_in_hidden_index` registers each as a hidden
+        // INCOMING entry and inserts its per-cluster leaves into the OPANN tree
+        // (the same `opann_routing_update` the drain uses for cell leaves), so
+        // the vectors are searchable immediately by tree descent.
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
             return Ok::<(), BuildError>(());
@@ -1553,82 +1518,20 @@ impl SupertableWriter {
                 (shards, hints)
             };
 
-        // Parallel create: user superfile build + hidden incoming build
-        // share one writer-pool install (rayon::join, no nested install).
-        // Parallel publish: user + hidden manifest/storage commits overlap.
+        // Build and publish the user superfiles on their own; the hidden index
+        // is updated from their summaries afterward (register + tree-insert).
         let user_inner = Arc::clone(&self.inner);
-        let user_options = Arc::clone(&self.inner.options);
-        let hidden_plan = if let Some(vw) = hidden_writer.as_mut() {
-            Some(vw.plan_hidden_incoming_shard()?)
-        } else {
-            None
-        };
-        let hidden_inner = hidden_writer.as_ref().map(|vw| Arc::clone(&vw.inner));
-        let (user_batch, hidden_side) =
-            if let (Some(plan), Some(hidden_inner)) = (hidden_plan, hidden_inner) {
-                writer_pool.install(
-                || -> Result<
-                    (
-                        SuperfilePublishBatch,
-                        Option<(Arc<SupertableInner>, HiddenIncomingPrepare)>,
-                    ),
-                    BuildError,
-                > {
-                    let shards_ref = &shards;
-                    let hints = cell_hints.clone();
-                    let hidden_inner = Arc::clone(&hidden_inner);
-                    let (user_batch, hidden_prep) = rayon::join(
-                        || -> Result<SuperfilePublishBatch, BuildError> {
-                            let outputs = fanout_shards_in_pool_scope(shards_ref, |slice| {
-                                build_one_shard(slice.as_slice(), &user_options)
-                            })?;
-                            prepare_user_superfile_batch_in_scope(&user_inner, outputs, hints)
-                        },
-                        || execute_hidden_incoming_plan_in_scope(&hidden_inner, plan),
-                    );
-                    Ok((
-                        user_batch?,
-                        Some((hidden_inner, hidden_prep?)),
-                    ))
-                },
-            )?
-            } else {
-                let outputs = fanout_shards(&writer_pool, &shards, |slice| {
-                    build_one_shard(slice.as_slice(), &self.inner.options)
-                })?;
-                let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-                (batch, None)
-            };
+        let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+            build_one_shard(slice.as_slice(), &self.inner.options)
+        })?;
+        let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
 
-        let drive = async {
-            match hidden_side {
-                Some((hidden_inner, prep)) => {
-                    let hidden_storage = hidden_inner
-                        .options
-                        .storage
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| {
-                            BuildError::Store("hidden incoming commit requires storage".into())
-                        })?;
-                    let (user_res, hidden_res) = tokio::join!(
-                        persist_superfile_publish_batch_async(&user_inner, user_batch),
-                        publish_hidden_incoming_async(
-                            Arc::clone(&hidden_inner),
-                            hidden_storage,
-                            prep
-                        ),
-                    );
-                    user_res?;
-                    if let Err(e) = hidden_res {
-                        tracing::warn!(
-                            "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                        );
-                    }
-                    Ok::<(), BuildError>(())
-                }
-                None => persist_superfile_publish_batch_async(&user_inner, user_batch).await,
-            }
+        // Reuse path: register the new user superfiles in the hidden index and
+        // insert their cluster leaves into the OPANN tree once they are durable.
+        let registration_entries: Vec<Arc<SuperfileEntry>> = user_batch.new_entries.clone();
+        let drive = async move {
+            persist_superfile_publish_batch_async(&user_inner, user_batch).await?;
+            register_user_superfiles_in_hidden_index(&user_inner, &registration_entries).await
         };
         bridge_on_runtime(drive, &self.inner.query_runtime())?;
         if self.inner.options.storage.is_some() {
@@ -2154,11 +2057,15 @@ pub(super) fn prepare_superfile_with_uri(
                         },
                     )
                     .unwrap_or_default();
-                // Per-cluster covering radii (drain splice only) so the
-                // within-cell admission scores by region overlap, not nearest
-                // centroid. Aligned with `clusters` by ordinal.
+                // Per-cluster covering radii so the within-superfile admission
+                // scores by region overlap (τ = d + slack·r), not nearest
+                // centroid. Aligned with `clusters` by ordinal. The drain splice
+                // supplies them directly; a plain commit reads the radii the
+                // build folded into the superfile's own cluster index.
                 if !cluster_radii.is_empty() && clusters.n_cent as usize == cluster_radii.len() {
                     clusters.radii = cluster_radii.to_vec();
+                } else {
+                    clusters.radii = vec_reader.cluster_radii(&vc.column).unwrap_or_default();
                 }
                 // Per-cluster byte offsets, read from the cell's cluster index
                 // (the bytes the splice just wrote), aligned with `clusters` by
@@ -2509,6 +2416,98 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
             pages: Vec::new(),
         },
     }
+}
+
+/// Reuse path: after the user superfiles commit, register each in the hidden
+/// index and make its vectors searchable — without a dual-write copy.
+///
+/// For each new user superfile we add, in one hidden commit:
+///   * a hidden-manifest entry tagged `INCOMING_VECTOR_CELL` that points at the
+///     user superfile's own bytes (its `uri`); no bytes are written, and the
+///     drain selects it by that tag exactly like a built INCOMING staging file;
+///   * one OPANN leaf per internal IVF cluster (centroid + the cluster's
+///     `doc_off`/`count` byte range), via the same [`opann_routing_update`] the
+///     drain uses for cell leaves — so a query finds the vectors by ordinary
+///     tree descent and the leaf resolves through the registered entry.
+///
+/// The drain later byte-splices these same user superfiles into cells and drops
+/// the registration; compaction merges the cell deltas.
+async fn register_user_superfiles_in_hidden_index(
+    user_inner: &Arc<SupertableInner>,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<(), BuildError> {
+    let Some(hidden) = user_inner.vector_index_table.as_ref() else {
+        return Ok(());
+    };
+    let hidden_inner = hidden.inner();
+    let Some(vec_col) = user_inner.options.vector_columns.first() else {
+        return Ok(());
+    };
+    let column = vec_col.column.as_str();
+    let dim = vec_col.dim;
+    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
+        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
+            super::handle::INCOMING_VECTOR_CELL,
+        ),
+    );
+
+    let mut registrations: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(entries.len());
+    let mut added: Vec<PartitionRoutingCopy> = Vec::new();
+    for entry in entries {
+        let Some(vs) = entry.vector_summary.get(column) else {
+            continue;
+        };
+        if vs.clusters.n_cent == 0 {
+            continue;
+        }
+        // Register the user superfile as a hidden INCOMING entry: its own bytes
+        // (uri) re-tagged so the drain selects it; no copy.
+        let mut reg = (**entry).clone();
+        reg.partition_key = incoming_key.clone();
+        reg.partition_hint = Some(super::handle::INCOMING_VECTOR_CELL);
+        registrations.push(Arc::new(reg));
+
+        // One whole-superfile leaf, like the drain's whole-cell leaf: the
+        // descent routes to the superfile by its summary centroid + radius, and
+        // the within-superfile admission (now radius-aware via `clusters.radii`)
+        // picks the clusters at query time. A `(0, 0)` leaf is what the probe
+        // expects — explicit per-cluster ranges here would mis-fetch.
+        if let Some(row) = vs.centroid.to_encoded_rows().first() {
+            added.push(PartitionRoutingCopy {
+                superfile_id: entry.superfile_id.as_u128(),
+                doc_off: 0,
+                count: 0,
+                cluster_id: 0,
+                centroid_fp32: manifest_centroid_components_from_row(row, dim),
+                radius: vs.radius,
+            });
+        }
+    }
+    if registrations.is_empty() {
+        return Ok(());
+    }
+
+    let storage = hidden_inner
+        .options
+        .storage
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| BuildError::Store("hidden index registration requires storage".into()))?;
+    let current = hidden_inner.manifest.load_full();
+    let opann_commit = opann_routing_update(hidden_inner, &current, &[], &added).await?;
+    let new_manifest = persist_commit_async(
+        hidden_inner,
+        storage,
+        registrations,
+        &[],
+        Vec::new(),
+        Vec::new(),
+        opann_commit,
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    hidden_inner.manifest.store(Arc::new(new_manifest));
+    Ok(())
 }
 
 /// Copy-on-write-update the OPANN routing tree: drop every leaf whose cell id is

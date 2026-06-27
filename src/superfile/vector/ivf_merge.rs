@@ -31,7 +31,7 @@ use crate::superfile::{
         centroid_block::CentroidBlock,
         distance::{Metric, distance},
         quant::BitQuantizer,
-        reader::{VectorReader, read_cluster_entry},
+        reader::{VectorReader, read_cluster_entry, read_cluster_radius},
         rerank_codec::RerankCodec,
     },
 };
@@ -75,6 +75,13 @@ pub(crate) struct MergedIvfSubsection {
 fn cluster_entry(sub: &[u8], cluster_idx_off: usize, c: usize) -> (usize, usize) {
     let (doc_off, count) = read_cluster_entry(&sub[cluster_idx_off..], c);
     (doc_off as usize, count as usize)
+}
+
+/// Cluster `c`'s covering radius in one input (sibling of [`cluster_entry`]).
+/// A spliced output cluster is a verbatim source cluster, so its radius is the
+/// source's — copied here so the merged cell stays radius-aware.
+fn cluster_radius(sub: &[u8], cluster_idx_off: usize, c: usize) -> f32 {
+    read_cluster_radius(&sub[cluster_idx_off..], c)
 }
 
 /// Merge Sq8+ε IVF subsections by splicing per-cluster blocks.
@@ -241,6 +248,16 @@ pub(crate) fn merge_sq8_ivf_subsections(
                 .sum()
         })
         .collect();
+    // Each merged cluster c pools the inputs' cluster c (shared centroid), so its
+    // covering radius is the max of the sources' radii.
+    let merged_radii: Vec<f32> = (0..n_cent)
+        .map(|c| {
+            parsed
+                .iter()
+                .map(|inp| cluster_radius(&inp.sub, inp.cluster_idx_off, c))
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
     let id_bytes = DOC_ID_BYTES;
     let mut row_buf = vec![0u8; dim * 2];
     let stable_ids_region_off = layout.stable_ids_off;
@@ -250,6 +267,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
         &layout,
         &cluster_order,
         &merged_counts,
+        &merged_radii,
         code_bytes,
         per_vec_bytes,
         |bytes, centroid_id, blk| {
@@ -393,12 +411,6 @@ struct PairRouting {
     pair: (usize, usize),
     per_cell: HashMap<u32, Vec<SourceRowRef>>,
     radii: HashMap<u32, f32>,
-    /// This `(input, source_cluster)` pair's covering radius to ITS OWN source
-    /// centroid, per destination cell — i.e. the per-OUTPUT-cluster radius (the
-    /// pair becomes one output cluster in each cell it lands in). Distinct from
-    /// `radii`, which is the distance to the destination CELL centroid; this is
-    /// what the within-cell `select_cells_adaptive` admission needs.
-    cluster_radii: HashMap<u32, f32>,
 }
 
 /// Route every Sq8+ε row across `inputs` to a cell (via `route`) and emit one
@@ -505,15 +517,10 @@ where
             let inp = &parsed[ii];
             let mut per_cell: HashMap<u32, Vec<SourceRowRef>> = HashMap::new();
             let mut radii: HashMap<u32, f32> = HashMap::new();
-            let mut cluster_radii: HashMap<u32, f32> = HashMap::new();
             let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count > 0 {
                 let src_scale: Arc<[f32]> = Arc::from(inp.scale[c * dim..c * dim + dim].to_vec());
                 let src_offset: Arc<[f32]> = Arc::from(inp.offset[c * dim..c * dim + dim].to_vec());
-                // Source cluster's own centroid (fp32). The per-output-cluster
-                // covering radius is the max member distance to THIS centroid —
-                // what the within-cell `select_cells_adaptive` admission scores.
-                let src_centroid = centroid_blocks[ii].cluster_components(c);
                 let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
                 let doc_ids_at = block + count * inp.code_bytes;
                 let full_at = block + count * (inp.code_bytes + id_bytes);
@@ -540,11 +547,6 @@ where
                         residuals,
                         norm_sq,
                     };
-                    // Source-cluster covering radius (this row's distance to ITS
-                    // pair's centroid) is independent of destination cell —
-                    // compute once, then fold into each replica cell below.
-                    let row_fp32 = manifest_centroid_components_from_row(&encoded, dim);
-                    let cr = distance(metric, &row_fp32, &src_centroid);
                     // SPANN closure replication: the row is written into every
                     // cell `route` returns (interior → 1, boundary → a few).
                     for (cell, radius) in route(&encoded) {
@@ -558,10 +560,6 @@ where
                         if radius > *e {
                             *e = radius;
                         }
-                        let cre = cluster_radii.entry(cell).or_insert(0.0);
-                        if cr > *cre {
-                            *cre = cr;
-                        }
                     }
                 }
             }
@@ -569,7 +567,6 @@ where
                 pair: (ii, c),
                 per_cell,
                 radii,
-                cluster_radii,
             }
         })
         .collect();
@@ -580,9 +577,6 @@ where
     // when each subsection is built, so the output layout is fully deterministic.
     let mut by_cell: HashMap<u32, HashMap<(usize, usize), Vec<SourceRowRef>>> = HashMap::new();
     let mut cell_radius: HashMap<u32, f32> = HashMap::new();
-    // Per cell, the covering radius of each output cluster (keyed by its source
-    // `(input, source_cluster)` pair) — assembled into `clusters.radii` below.
-    let mut cell_cluster_radius: HashMap<u32, HashMap<(usize, usize), f32>> = HashMap::new();
     for pr in routed_pairs {
         for (cell, rows) in pr.per_cell {
             by_cell.entry(cell).or_default().insert(pr.pair, rows);
@@ -593,9 +587,6 @@ where
                 *e = r;
             }
         }
-        for (cell, r) in pr.cluster_radii {
-            cell_cluster_radius.entry(cell).or_default().insert(pr.pair, r);
-        }
     }
 
     let mut out: HashMap<u32, RoutedCellSubsection> = HashMap::with_capacity(by_cell.len());
@@ -605,19 +596,6 @@ where
         let mut pair_keys: Vec<(usize, usize)> = pairs.keys().copied().collect();
         pair_keys.sort_unstable();
         let out_n_cent = pair_keys.len();
-        // Per-output-cluster covering radii, aligned with `pair_keys` (= cluster
-        // ordinal). Feeds `clusters.radii` so the within-cell admission is
-        // radius-aware instead of nearest-centroid-by-distance.
-        let out_cluster_radii: Vec<f32> = pair_keys
-            .iter()
-            .map(|k| {
-                cell_cluster_radius
-                    .get(&cell_id)
-                    .and_then(|m| m.get(k))
-                    .copied()
-                    .unwrap_or(0.0)
-            })
-            .collect();
         let n_docs: u32 = pairs.values().map(|v| v.len() as u32).sum();
 
         // Per-output-cluster quantizer + centroid, carried verbatim from source.
@@ -700,6 +678,12 @@ where
 
         let cluster_order = centroid_storage_order(&out_centroids, out_n_cent, dim);
         let merged_counts: Vec<u32> = pair_keys.iter().map(|k| pairs[k].len() as u32).collect();
+        // Each output cluster is a verbatim source (input, source-cluster) pair,
+        // so its covering radius is exactly the source cluster's — copy it.
+        let out_cluster_radii: Vec<f32> = pair_keys
+            .iter()
+            .map(|&(ii, c)| cluster_radius(&parsed[ii].sub, parsed[ii].cluster_idx_off, c))
+            .collect();
         let stable_ids_region_off = layout.stable_ids_off;
         let mut stable_ids_by_local = vec![0i128; n_docs as usize];
 
@@ -708,6 +692,7 @@ where
             &layout,
             &cluster_order,
             &merged_counts,
+            &out_cluster_radii,
             code_bytes,
             per_vec_bytes,
             |bytes, out_cluster, blk| {

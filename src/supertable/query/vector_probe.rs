@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-use super::vector::VectorSearchOptions;
+use super::vector::{VectorSearchOptions, row_id_from_manifest_entry};
 
 /// Hard cap on how many clusters the within-cell radius-aware admission emits
 /// per cell. The radius (τ) admission already trims to the clusters whose
@@ -291,39 +291,18 @@ pub(super) async fn fanout_opann_leaf_probes(
         }
     }
 
-    // For filtered search a cell whose predicate matched no row is absent from
-    // `allow` and dropped — it never opens or fetches.
-    let mut units: Vec<(Arc<SuperfileEntry>, (ProbePlan, Option<Arc<RoaringBitmap>>))> = Vec::new();
-    for sid in order {
-        let (entry, metas, whole) = by_sf.remove(&sid).expect("present in by_sf");
-        let bitmap = match allow.as_ref() {
-            Some(m) => match m.get(&entry.uri) {
-                Some(bm) => Some(Arc::clone(bm)),
-                None => continue,
-            },
-            None => None,
-        };
-        let plan = if whole || metas.is_empty() {
-            ProbePlan::WholeCell
-        } else {
-            ProbePlan::Clusters(metas)
-        };
-        units.push((entry, (plan, bitmap)));
-    }
-    if units.is_empty() {
-        return Ok(Vec::new());
-    }
-
     // Resident deleted-user-`_id` set. The hidden cells are NOT rewritten on a
     // user delete, so the deleted rows stay physically present in them. This
     // consolidated set — written on the delete commit, loaded through the disk
     // cache (warm = zero GETs) — is the authoritative vector-search delete
-    // filter. It is applied two ways: (1) pushed into the per-cell coarse-scan
-    // kernel as a deny-set, mapped to local doc-ids via the cell's inline `_id`
-    // region, so each cell's top-k is selected from LIVE rows (this is what
-    // preserves recall@k under deletes); and (2) a post-merge backstop on the
-    // resolved `stable_id`, which also covers INCOMING staging cells that have
-    // no inline `_id` region for the kernel deny.
+    // filter. It is mapped to a per-superfile deny-set of LOCAL doc-ids and
+    // pushed into the per-cell coarse-scan kernel, so each cell's top-k is
+    // selected from LIVE rows (this preserves recall@k under deletes). Both
+    // mappings land in the kernel's DOC_ID space: a contiguous-span superfile
+    // (a registered INCOMING user superfile) maps `_id → _id - id_min` by
+    // arithmetic, no read; a gapped cell maps through its inline `_id` region.
+    // A post-merge backstop on the resolved `stable_id` (below) covers any cell
+    // neither mapping reached.
     let manifest = reader.manifest();
     let deleted: Vec<i128> = match (manifest.opann_routing(), manifest.options.storage.as_ref()) {
         (Some(routing), Some(storage)) if routing.deleted_ids_uri.is_some() => {
@@ -335,38 +314,72 @@ pub(super) async fn fanout_opann_leaf_probes(
     };
     let deleted = Arc::new(deleted);
 
+    // For filtered search a cell whose predicate matched no row is absent from
+    // `allow` and dropped — it never opens or fetches.
+    let mut units: Vec<(
+        Arc<SuperfileEntry>,
+        (ProbePlan, Option<Arc<RoaringBitmap>>, Option<Arc<RoaringBitmap>>),
+    )> = Vec::new();
+    for sid in order {
+        let (entry, metas, whole) = by_sf.remove(&sid).expect("present in by_sf");
+        let bitmap = match allow.as_ref() {
+            Some(m) => match m.get(&entry.uri) {
+                Some(bm) => Some(Arc::clone(bm)),
+                None => continue,
+            },
+            None => None,
+        };
+        // Pre-heap deny for a contiguous-span (INCOMING user) superfile, mapped
+        // arithmetically here while its entry is in scope. `None` means the
+        // kernel maps through the cell's inline `_id` region instead.
+        let arith_deny = arith_deny_locals(&entry, &deleted);
+        let plan = if whole || metas.is_empty() {
+            ProbePlan::WholeCell
+        } else {
+            ProbePlan::Clusters(metas)
+        };
+        units.push((entry, (plan, bitmap, arith_deny)));
+    }
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let column = Arc::new(column.to_owned());
     let query = Arc::new(query.to_vec());
     let deleted_for_kernel = Arc::clone(&deleted);
-    let kernel =
-        move |r: Arc<SuperfileReader>, (plan, bitmap): (ProbePlan, Option<Arc<RoaringBitmap>>)| {
-            let column = Arc::clone(&column);
-            let query = Arc::clone(&query);
-            let deleted = Arc::clone(&deleted_for_kernel);
-            async move {
-                let v = r.vec().ok_or_else(|| {
-                    QueryError::Store("hidden cell superfile missing vector subsection".into())
-                })?;
-                // Per-cell deny-set: tombstoned local doc-ids (deleted user
-                // `_id`s mapped through this cell's inline `_id` region). `None`
-                // when nothing is deleted or the cell has no inline region.
-                let deny = v
-                    .inline_deleted_locals(&deleted)
+    let kernel = move |r: Arc<SuperfileReader>,
+                       (plan, bitmap, arith_deny): (
+        ProbePlan,
+        Option<Arc<RoaringBitmap>>,
+        Option<Arc<RoaringBitmap>>,
+    )| {
+        let column = Arc::clone(&column);
+        let query = Arc::clone(&query);
+        let deleted = Arc::clone(&deleted_for_kernel);
+        async move {
+            let v = r.vec().ok_or_else(|| {
+                QueryError::Store("hidden cell superfile missing vector subsection".into())
+            })?;
+            // Per-cell deny-set of LOCAL doc-ids (deleted user `_id`s). A
+            // contiguous-span INCOMING superfile is mapped arithmetically by the
+            // caller (`arith_deny`); a gapped cell maps through its inline `_id`
+            // region here. Either way the set is in the kernel's DOC_ID space.
+            let deny = match arith_deny {
+                Some(d) => Some(d),
+                None => v.inline_deleted_locals(&deleted).await.map_err(map_vector_err)?.map(Arc::new),
+            };
+            match plan {
+                ProbePlan::WholeCell => v
+                    .probe_leaf_async(&column, &query, k, 0, 0, rerank_mult, bitmap, deny)
                     .await
-                    .map_err(map_vector_err)?
-                    .map(Arc::new);
-                match plan {
-                    ProbePlan::WholeCell => v
-                        .probe_leaf_async(&column, &query, k, 0, 0, rerank_mult, bitmap, deny)
-                        .await
-                        .map_err(map_vector_err),
-                    ProbePlan::Clusters(metas) => v
-                        .probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
-                        .await
-                        .map_err(map_vector_err),
-                }
+                    .map_err(map_vector_err),
+                ProbePlan::Clusters(metas) => v
+                    .probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
+                    .await
+                    .map_err(map_vector_err),
             }
-        };
+        }
+    };
 
     let mut per_superfile = dispatch::fanout_untombstoned(reader, units, kernel).await?;
     if !deleted.is_empty() {
@@ -403,4 +416,23 @@ pub(super) async fn fanout_opann_leaf_probes(
 
 fn map_vector_err(e: VectorError) -> QueryError {
     QueryError::Store(format!("vector leaf probe: {e}"))
+}
+
+/// Pre-heap deny-set (in DOC_ID space) for a contiguous-span superfile: row `i`
+/// carries `_id == id_min + i`, so a deleted `_id` in `[id_min, id_max]` maps to
+/// DOC_ID `_id - id_min` by arithmetic — the exact space
+/// `score_cluster_codes_into_heap` tests `deny` in, with no inline `_id` region
+/// and no read. `None` when the span is gapped (the caller maps through the
+/// cell's inline `_id` region instead) or nothing in `deleted` falls in range.
+fn arith_deny_locals(entry: &SuperfileEntry, deleted: &[i128]) -> Option<Arc<RoaringBitmap>> {
+    if deleted.is_empty() || row_id_from_manifest_entry(entry, 0).is_none() {
+        return None;
+    }
+    let (id_min, id_max) = (entry.id_min, entry.id_max);
+    let bm: RoaringBitmap = deleted
+        .iter()
+        .filter(|&&d| d >= id_min && d <= id_max)
+        .map(|&d| (d - id_min) as u32)
+        .collect();
+    (!bm.is_empty()).then(|| Arc::new(bm))
 }

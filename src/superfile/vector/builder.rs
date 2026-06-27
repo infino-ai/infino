@@ -27,7 +27,8 @@ use crate::superfile::{
         self, FST_SEPARATOR, RESERVED_PREFIX,
         checksum::{crc32c, crc32c_append},
         vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
+            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, CLUSTER_IDX_RADIUS_OFFSET,
+            MAGIC_BYTES, U32_BYTES, U64_BYTES,
             sub_hdr,
         },
     },
@@ -39,7 +40,7 @@ use crate::superfile::{
         },
         centroid_block,
         distance::{
-            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_to_id,
+            Metric, SQ8_CODE_MAX, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by, metric_to_id,
         },
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
@@ -925,6 +926,9 @@ fn build_subsection_from_materialized_impl(
         &layout,
         &cluster_order,
         &bucket_counts,
+        // 1-cluster flat append: per-cluster radius is moot (the single cluster
+        // is always fully probed), so no covering radii to emit.
+        &[],
         code_bytes,
         per_vec_bytes,
         |bytes, centroid_id, blk| {
@@ -1079,7 +1083,7 @@ fn build_subsection_streaming(
     // Per-cluster covering radius (squared, pre-sqrt): max over the cluster's
     // rows of L2² distance to its own centroid. Folded in pass 2 alongside the
     // summary radius; surfaced as each routing leaf's radius.
-    let mut cluster_radius_sq_max = vec![0.0f32; n_cent];
+    let mut cluster_radius_max = vec![0.0f32; n_cent];
     let codec = cfg.rerank_codec;
     // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
@@ -1124,6 +1128,7 @@ fn build_subsection_streaming(
         run_pass2(
             source.as_mut(),
             dim,
+            cfg.metric,
             n_cent,
             code_bytes,
             &centroids,
@@ -1133,7 +1138,7 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
-            &mut cluster_radius_sq_max,
+            &mut cluster_radius_max,
             codec,
             sq8_acc,
         )?;
@@ -1282,6 +1287,7 @@ fn build_subsection_streaming(
         &layout,
         &cluster_order,
         &bucket_counts,
+        &cluster_radius_max,
         code_bytes,
         per_vec_bytes,
         |bytes, centroid_id, blk| {
@@ -1613,6 +1619,11 @@ pub(crate) fn write_ivf_cluster_blocks<F>(
     layout: &IvfSubsectionLayout,
     cluster_order: &[usize],
     cluster_counts: &[u32],
+    // Per-cluster covering radius (aligned with `cluster_counts` by centroid id),
+    // written into each entry's `radius` field. Empty / short → `0.0` (the
+    // "no coverage info" sentinel; within-superfile admission then falls back to
+    // nearest-by-centroid).
+    cluster_radii: &[f32],
     code_bytes: usize,
     per_vec_bytes: usize,
     mut write_cluster: F,
@@ -1628,8 +1639,10 @@ where
         let idx_base = layout.cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
         bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
             .copy_from_slice(&(acc_off as u32).to_le_bytes());
-        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
+        bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_COUNT_OFFSET + U32_BYTES]
             .copy_from_slice(&(cnt as u32).to_le_bytes());
+        bytes[idx_base + CLUSTER_IDX_RADIUS_OFFSET..idx_base + CLUSTER_IDX_RADIUS_OFFSET + U32_BYTES]
+            .copy_from_slice(&cluster_radii.get(centroid_id).copied().unwrap_or(0.0).to_le_bytes());
         if cnt > 0 {
             let block_base = layout.per_cluster_blocks_off + block_cursor;
             let codes_len = cnt * code_bytes;
@@ -1663,6 +1676,7 @@ where
 fn run_pass2(
     source: &mut dyn ChunkedVectorSource,
     dim: usize,
+    metric: Metric,
     n_cent: usize,
     code_bytes: usize,
     centroids: &[f32],
@@ -1672,7 +1686,7 @@ fn run_pass2(
     bucket_writers: &mut [BufWriter<File>],
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
-    cluster_radius_sq_max: &mut [f32],
+    cluster_radius_max: &mut [f32],
     codec: RerankCodec,
     mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
@@ -1754,14 +1768,18 @@ fn run_pass2(
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
             }
-            // Fold this row into its cluster's covering radius (un-rotated input
-            // space, same convention as the summary radius). One extra distance
-            // per row against the assigned centroid only — negligible next to
-            // the `n_cent` comparisons `assign_to_centroids` already did.
+            // Fold this row into its cluster's covering radius, in the COLUMN
+            // METRIC's units (not raw L2²) — the within-superfile admission
+            // (`select_cells_adaptive`) compares this radius against
+            // `score_clusters_into`, so τ = d + slack·r only holds if both are
+            // the metric distance. One extra distance per row against the
+            // assigned centroid — negligible next to the `n_cent` comparisons
+            // `assign_to_centroids` already did.
             let row = &chunk[r * dim..(r + 1) * dim];
-            let d = l2_sq(row, &centroids[cid * dim..(cid + 1) * dim]);
-            if d > cluster_radius_sq_max[cid] {
-                cluster_radius_sq_max[cid] = d;
+            let centroid = &centroids[cid * dim..(cid + 1) * dim];
+            let d = metric_distance_by(metric, dim, |i| row[i], |i| centroid[i]);
+            if d > cluster_radius_max[cid] {
+                cluster_radius_max[cid] = d;
             }
             if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
                 let off = cid * dim;

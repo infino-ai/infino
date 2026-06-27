@@ -1284,7 +1284,7 @@ pub enum ManifestLoadError {
 /// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
 /// store routing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SuperfileEntry {
     /// Globally unique identifier (UUID v4) for debugging /
     /// observability. Distinct from `uri` so the store routing key
