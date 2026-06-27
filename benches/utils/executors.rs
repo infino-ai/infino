@@ -422,18 +422,20 @@ pub mod fts {
 
         fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
             crate::tiers::block_on(async {
-                // Single term: df is the exact match count, read O(1)
-                // from the dictionary header. Multi-term: the union /
-                // intersection cardinality from `token_match`.
+                // Single term: df is the exact match count, read O(1) from
+                // the dictionary header. Multi-term: the dedicated count
+                // primitive (union/intersection cardinality, no scoring,
+                // no id materialization) — the same path the supertable
+                // count uses, not `token_match().len()` (which would
+                // materialize the id list through the slower merge walk).
                 if terms.len() == 1 {
                     self.term_df(column, terms[0])
                         .await
                         .expect("superfile term_df")
                 } else {
-                    self.token_match(column, terms, mode)
+                    self.token_match_count(column, terms, mode)
                         .await
-                        .expect("superfile token_match")
-                        .len() as u64
+                        .expect("superfile token_match_count")
                 }
             })
         }
