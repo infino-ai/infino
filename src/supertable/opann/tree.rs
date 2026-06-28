@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! OPANN routing tree — the hierarchical centroid tree over cell centroids,
-//! searched on compute (zero object GETs) to select the `n_probe` nearest
+//! searched on compute (zero object GETs) to select the `limit` nearest
 //! cells. Leaves are cells (one per ≤8 MB IVF superfile); internal nodes are
 //! coarse routing points (the mean of the cells beneath them, with a covering
 //! radius). Every node centroid is stored Sq8+residual — held in one
@@ -129,26 +129,26 @@ impl CentroidTree {
         })
     }
 
-    /// The `n_probe` nearest cells to `query`, as `(cell_id, distance)` in the
+    /// The `limit` nearest cells to `query`, as `(cell_id, distance)` in the
     /// order the descent reached them. Pure compute — zero object GETs.
     /// Best-first descent over the Sq8+residual node centroids: pop the closest
     /// node; a leaf is a probe, an internal node pushes its children. The first
-    /// `n_probe` leaves reached are the routed cells (their ancestors are the
-    /// nearest routing points). Approximate by design — `n_probe` is the recall
+    /// `limit` leaves reached are the routed cells (their ancestors are the
+    /// nearest routing points). Approximate by design — `limit` is the recall
     /// knob; the caller GETs one object per returned cell.
     ///
     /// Test-only: production descent runs over the paged on-disk form
-    /// ([`super::paged::PagedTree::select_probes`]); this in-memory descent is
+    /// ([`super::paged::PagedTree::select_leaves`]); this in-memory descent is
     /// the oracle the page round-trip tests compare against.
     #[cfg(test)]
-    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(LeafRef, f32)> {
-        if n_probe == 0 || self.nodes.is_empty() || query.len() != self.centroids.dim as usize {
+    pub(crate) fn select_leaves(&self, query: &[f32], limit: usize) -> Vec<(LeafRef, f32)> {
+        if limit == 0 || self.nodes.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
         }
         best_first(
             self.root,
             self.score(self.root, query),
-            n_probe,
+            limit,
             |node, kids| match &self.nodes[node as usize].kind {
                 NodeKind::Leaf(leaf) => Some(*leaf),
                 NodeKind::Internal(children) => {
@@ -281,7 +281,7 @@ impl CentroidTree {
     }
 
     /// Distance from `query` to node `node`'s centroid via the single
-    /// Sq8+residual scorer. Test-only — used by the in-memory [`Self::select_probes`]
+    /// Sq8+residual scorer. Test-only — used by the in-memory [`Self::select_leaves`]
     /// oracle; production descent scores off the paged form.
     #[cfg(test)]
     #[inline]
@@ -483,7 +483,7 @@ mod tests {
             // Probing for "everything" returns exactly the cell-id set.
             let q = cells[0].0.clone();
             let all: HashSet<u128> = tree
-                .select_probes(&q, n)
+                .select_leaves(&q, n)
                 .into_iter()
                 .map(|(leaf, _)| leaf.superfile_id)
                 .collect();
@@ -493,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn select_probes_bounded_and_finds_query_cell() {
-        let (dim, n, n_probe) = (32usize, 300usize, 12usize);
+    fn select_leaves_bounded_and_finds_query_cell() {
+        let (dim, n, limit) = (32usize, 300usize, 12usize);
         let cells = synth_cells(n, dim);
         for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
@@ -504,8 +504,8 @@ mod tests {
             let probes_per = [3usize, 17, 123, 250];
             for &target in &probes_per {
                 let q = cells[target].0.clone();
-                let probes = tree.select_probes(&q, n_probe);
-                assert!(probes.len() <= n_probe, "{metric:?}: over budget");
+                let probes = tree.select_leaves(&q, limit);
+                assert!(probes.len() <= limit, "{metric:?}: over budget");
                 assert!(!probes.is_empty(), "{metric:?}: empty probe set");
                 if probes
                     .iter()
@@ -517,15 +517,15 @@ mod tests {
             assert_eq!(
                 hits,
                 probes_per.len(),
-                "{metric:?}: query-at-centroid must land its own cell in top-{n_probe}"
+                "{metric:?}: query-at-centroid must land its own cell in top-{limit}"
             );
         }
     }
 
     #[test]
     fn matches_flat_nearest_on_a_clustered_layout() {
-        // Well-separated clusters: the tree's top-n_probe should overlap the
-        // flat brute-force top-n_probe strongly (recall sanity, not exactness).
+        // Well-separated clusters: the tree's top-limit should overlap the
+        // flat brute-force top-limit strongly (recall sanity, not exactness).
         let dim = 16usize;
         let mut cells: Vec<(Vec<f32>, f32, u128)> = Vec::new();
         let mut id = 1u128;
@@ -540,14 +540,14 @@ mod tests {
         }
         let metric = Metric::L2Sq;
         let tree = build_tree(metric, dim, &cells).expect("tree");
-        let n_probe = 16usize;
+        let limit = 16usize;
         let mut total_recall = 0.0f64;
         let n_queries = 8usize;
         for cluster in 0..n_queries {
             let mut q = vec![0.0f32; dim];
             q[cluster % dim] = 5.05;
             let got: HashSet<u128> = tree
-                .select_probes(&q, n_probe)
+                .select_leaves(&q, limit)
                 .into_iter()
                 .map(|(leaf, _)| leaf.superfile_id)
                 .collect();
@@ -556,14 +556,14 @@ mod tests {
                 .map(|(c, _, cid)| (*cid, distance(metric, &q, c)))
                 .collect();
             flat.sort_by(|a, b| a.1.total_cmp(&b.1));
-            let want: HashSet<u128> = flat[..n_probe].iter().map(|(cid, _)| *cid).collect();
+            let want: HashSet<u128> = flat[..limit].iter().map(|(cid, _)| *cid).collect();
             let overlap = got.intersection(&want).count();
-            total_recall += overlap as f64 / n_probe as f64;
+            total_recall += overlap as f64 / limit as f64;
         }
         let recall = total_recall / n_queries as f64;
         assert!(
             recall >= 0.8,
-            "tree routing recall@{n_probe} = {recall:.3}, expected >= 0.8 on a clustered layout"
+            "tree routing recall@{limit} = {recall:.3}, expected >= 0.8 on a clustered layout"
         );
     }
 
@@ -619,7 +619,7 @@ mod tests {
                 .map(|c| (s_star * COPIES + c) as u128 + 1)
                 .collect();
             let got: HashSet<u128> = tree
-                .select_probes(&q, N_PROBE)
+                .select_leaves(&q, N_PROBE)
                 .into_iter()
                 .map(|(leaf, _)| leaf.superfile_id)
                 .collect();
@@ -653,8 +653,8 @@ mod tests {
                 let q = &cells[target].0;
                 for &k in &[1usize, 8, 32, n] {
                     assert_eq!(
-                        tree.select_probes(q, k),
-                        page.select_probes(q, k),
+                        tree.select_leaves(q, k),
+                        page.select_leaves(q, k),
                         "{metric:?}: page descent must match in-memory (target {target}, k {k})"
                     );
                 }

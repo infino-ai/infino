@@ -980,7 +980,7 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
 /// The reader at open time parses this back into
 /// `VectorConfig` to drive distance kernels + IVF probing.
 /// JSON form stored in `inf.vec.columns` — shared by the builder and the
-/// supertable OPANN leaf-probe path (opens `VectorReader` without Parquet).
+/// supertable OPANN leaf-fetch path (opens `VectorReader` without Parquet).
 pub(crate) fn vec_columns_json(cols: &[VectorConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {

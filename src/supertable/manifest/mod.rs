@@ -779,6 +779,16 @@ impl Manifest {
         Ok(Some(Arc::clone(source)))
     }
 
+    /// Seed this manifest version's resident routing tree directly, instead of
+    /// letting [`Self::opann_resident_tree`] page-walk it from storage. A commit
+    /// carries the prior version's tree forward + overlays its changed pages in
+    /// memory (see [`super::opann::store::build_resident_after_commit`]) and seeds
+    /// the result here, so the next query/commit on this version reuses it rather
+    /// than re-fetching + re-verifying the whole tree. No-op if already loaded.
+    pub(crate) fn seed_opann_tree(&self, source: Arc<ResidentPageSource>) {
+        let _ = self.opann_tree.set(source);
+    }
+
     /// Lazy-load entry point for manifest parts.
     ///
     /// Concurrent callers on the same not-yet-loaded `part_id`

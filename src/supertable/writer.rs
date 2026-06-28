@@ -2385,29 +2385,22 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
     split: Option<SplitPages>,
     prior_root: Option<ContentHash>,
     params: CellRoutingParams,
-    bundle: Option<(ContentHash, Vec<u8>)>,
     prior_deleted: Option<(String, ContentHash)>,
 ) -> OpannRoutingCommit {
     // Carry the prior deleted-set blob ref onto any freshly-built routing so a
     // tree-changing commit (drain / split / compaction) does not wipe it — the
     // deleted rows are still physically present in the (untouched) cells.
-    let attach_bundle = |routing: &mut OpannRouting,
-                         pages: &mut Vec<(String, Bytes)>,
-                         bundle: Option<(ContentHash, Vec<u8>)>| {
+    let attach_deleted = |routing: &mut OpannRouting| {
         if let Some((uri, hash)) = prior_deleted.as_ref() {
             routing.deleted_ids_uri = Some(uri.clone());
             routing.deleted_ids_content_hash = Some(hash.clone());
         }
-        if let Some((hash, bytes)) = bundle {
-            let uri = store::resident_uri(&hash);
-            pages.push((uri.clone(), Bytes::from(bytes)));
-            routing.resident_uri = Some(uri);
-            routing.resident_content_hash = Some(hash);
-        }
     };
     match split {
         Some(split) if !split.pages.is_empty() => {
-            let mut pages: Vec<(String, Bytes)> = split
+            // A commit writes ONLY the changed pages — the rewritten root→leaf
+            // path plus any split pages — each as its own content-addressed blob.
+            let pages: Vec<(String, Bytes)> = split
                 .pages
                 .into_iter()
                 .map(|(hash, bytes)| (store::page_uri(&hash), Bytes::from(bytes)))
@@ -2415,12 +2408,10 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
             let mut routing = OpannRouting {
                 root_page: split.root,
                 routing: params,
-                resident_uri: None,
-                resident_content_hash: None,
                 deleted_ids_uri: None,
                 deleted_ids_content_hash: None,
             };
-            attach_bundle(&mut routing, &mut pages, bundle);
+            attach_deleted(&mut routing);
             OpannRoutingCommit::Replace {
                 routing: Some(routing),
                 pages,
@@ -2429,19 +2420,16 @@ pub(in crate::supertable) fn opann_routing_commit_from_split(
         // Root moved but every rewritten page was already on object storage
         // (content-addressed dedup at a prior commit). Still stamp the new root.
         Some(split) if Some(split.root) != prior_root => {
-            let mut pages = Vec::new();
             let mut routing = OpannRouting {
                 root_page: split.root,
                 routing: params,
-                resident_uri: None,
-                resident_content_hash: None,
                 deleted_ids_uri: None,
                 deleted_ids_content_hash: None,
             };
-            attach_bundle(&mut routing, &mut pages, bundle);
+            attach_deleted(&mut routing);
             OpannRoutingCommit::Replace {
                 routing: Some(routing),
-                pages,
+                pages: Vec::new(),
             }
         }
         Some(_) => OpannRoutingCommit::Inherit,
@@ -2522,7 +2510,8 @@ async fn register_user_superfiles_in_hidden_index(
         .cloned()
         .ok_or_else(|| BuildError::Store("hidden index registration requires storage".into()))?;
     let current = hidden_inner.manifest.load_full();
-    let opann_commit = opann_routing_update(hidden_inner, &current, &[], &added).await?;
+    let (opann_commit, carry_forward) =
+        opann_routing_update(hidden_inner, &current, &[], &added).await?;
     let new_manifest = persist_commit_async(
         hidden_inner,
         storage,
@@ -2534,6 +2523,9 @@ async fn register_user_superfiles_in_hidden_index(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
+    if let Some(cf) = carry_forward {
+        new_manifest.seed_opann_tree(cf);
+    }
     hidden_inner.manifest.store(Arc::new(new_manifest));
     Ok(())
 }
@@ -2542,17 +2534,24 @@ async fn register_user_superfiles_in_hidden_index(
 /// in `removed`, splice in `added`, and return the resulting [`OpannRoutingCommit`]
 /// (the changed pages + new root, or `Inherit` when nothing changed). `root ==
 /// None` (genesis) builds the first tree from `added`.
+///
+/// Also returns the new version's resident tree carried forward **in memory** —
+/// the prior resident pages overlaid with this commit's changed pages
+/// ([`store::build_resident_after_commit`]), no object I/O. The caller seeds it
+/// into the new manifest (via [`Manifest::seed_opann_tree`]) so the next
+/// query/commit reuses it instead of re-walking the whole tree from storage.
+/// `None` when nothing changed (`Inherit`).
 pub(in crate::supertable) async fn opann_routing_update(
     inner: &SupertableInner,
     current: &Manifest,
     removed: &[u128],
     added: &[PartitionRoutingCopy],
-) -> Result<OpannRoutingCommit, BuildError> {
+) -> Result<(OpannRoutingCommit, Option<Arc<ResidentPageSource>>), BuildError> {
     let Some(vec_col) = inner.options.vector_columns.first() else {
-        return Ok(OpannRoutingCommit::Inherit);
+        return Ok((OpannRoutingCommit::Inherit, None));
     };
     if removed.is_empty() && added.is_empty() {
-        return Ok(OpannRoutingCommit::Inherit);
+        return Ok((OpannRoutingCommit::Inherit, None));
     }
     let prior = current.opann_routing();
     let prior_root = prior.map(|r| r.root_page);
@@ -2588,22 +2587,30 @@ pub(in crate::supertable) async fn opann_routing_update(
         OPANN_PAGE_MAX_NODES,
     )
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    let bundle = split.as_ref().and_then(|s| {
-        if Some(s.root) == prior_root && s.pages.is_empty() {
-            return None;
-        }
-        let overlay = OverlayPageSource::new(source.as_ref(), &s.pages);
-        store::pack_resident_bundle(&overlay, s.root)
-            .ok()
-            .map(|bytes| (ContentHash::of(bytes.as_ref()), bytes))
-    });
+    // COW: a commit writes ONLY the changed pages (`split.pages` — the rewritten
+    // root→leaf path plus any split pages), each as its own content-addressed
+    // blob. The tree is just page blobs; loading it walks the page graph from the
+    // root through the disk cache. There is no whole-tree snapshot blob.
+    //
+    // Carry the resident tree forward in memory: the new root's pages are the
+    // changed pages plus the unchanged pages already resident in `source` — built
+    // with zero object I/O and seeded into the new manifest by the caller, so the
+    // next access reuses it instead of re-walking the whole tree.
+    let carry_forward = match &split {
+        Some(sp) => Some(Arc::new(
+            store::build_resident_after_commit(source.as_ref(), &sp.pages, sp.root)
+                .map_err(|e| BuildError::Store(e.to_string()))?,
+        )),
+        None => None,
+    };
     let prior_deleted = prior.and_then(|r| {
         r.deleted_ids_uri
             .clone()
             .zip(r.deleted_ids_content_hash.clone())
     });
-    Ok(opann_routing_commit_from_split(
-        split, prior_root, params, bundle, prior_deleted,
+    Ok((
+        opann_routing_commit_from_split(split, prior_root, params, prior_deleted),
+        carry_forward,
     ))
 }
 
@@ -2838,7 +2845,8 @@ async fn route_incoming_to_manifest_cells_if_ready(
     // build the genesis tree when there is no prior root). The changed pages +
     // new root ride the commit's blob wave + pointer flip below.
     let current = inner.manifest.load_full();
-    let opann_commit = opann_routing_update(&inner, &current, &[], &added).await?;
+    let (opann_commit, carry_forward) =
+        opann_routing_update(&inner, &current, &[], &added).await?;
 
     // Publish: add the cell superfiles, remove the routed incoming superfiles,
     // and stamp the new routing root.
@@ -2853,6 +2861,9 @@ async fn route_incoming_to_manifest_cells_if_ready(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
+    if let Some(cf) = carry_forward {
+        new_manifest.seed_opann_tree(cf);
+    }
     inner.manifest.store(Arc::new(new_manifest));
 
     if let Some(cache) = inner.options.disk_cache.as_ref() {
@@ -3154,7 +3165,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     // cells and let `optimize` grow the tree as cells overflow.
     let removed: Vec<u128> = to_remove.iter().map(|e| e.superfile_id.as_u128()).collect();
     let current = inner.manifest.load_full();
-    let opann_commit = opann_routing_update(&inner, &current, &removed, &[])
+    let (opann_commit, carry_forward) = opann_routing_update(&inner, &current, &removed, &[])
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
 
@@ -3169,6 +3180,9 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
+    if let Some(cf) = carry_forward {
+        new_manifest.seed_opann_tree(cf);
+    }
     inner.manifest.store(Arc::new(new_manifest));
 
     schedule_background_storage_reclaim(Arc::clone(&inner));

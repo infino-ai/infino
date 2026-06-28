@@ -25,7 +25,6 @@
 //!
 //! Internal-node centroids are not recomputed on insert (a new leaf is attached
 //! under its page's entry node and covering radii are extended to cover it).
-//! The resulting drift is exactly what §11 hot-region rebalancing repairs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -181,23 +180,33 @@ fn insert_one_leaf(
     let path = greedy_leaf_page_path(overlay, source, root, &leaf.centroid_fp32)?;
     let leaf_page_hash = *path.last().expect("path always contains at least the root");
     let leaf_page = Page::parse(&fetch_bytes(overlay, source, &leaf_page_hash)?)?;
-    let new_page_bytes = append_leaf_into_page(&leaf_page, metric, dim, leaf);
-    // If the appended page now exceeds the node budget, split it locally into a
-    // bounded subtree (`resplit`) and hand the parent that subtree's root. The
-    // page→subtree-root swap is a single cross-page link, so the parent's node
-    // count is unchanged — the split never propagates upward, and pages stay
-    // bounded instead of one growing without limit across commits.
-    let appended = Page::parse(&new_page_bytes)?;
-    let mut new_child = if appended.topo().len() > page_budget {
-        let split = appended.resplit(page_budget);
+    // Rebuild the leaf page balanced (fresh medoids, tight radii, a real
+    // hierarchy) so the radius-bounded descent can prune it. For a page with
+    // cross-page children — whose child centroids live in other pages, out of
+    // this rebuild's reach — fall back to the flat-append + structural resplit.
+    // Either way the returned subtree replaces the leaf page under its parent via
+    // a single re-pointed cross-page link, so the parent's node count is
+    // unchanged and the split never propagates as a fan-out increase.
+    let mut new_child = if let Some(split) = rebuild_leaf_page(&leaf_page, metric, dim, leaf, page_budget) {
         for (h, b) in split.pages {
             overlay.insert(h, b);
         }
         split.root
     } else {
-        let h = ContentHash::of(&new_page_bytes);
-        overlay.insert(h, new_page_bytes);
-        h
+        let new_page_bytes = append_leaf_into_page(&leaf_page, metric, dim, leaf);
+        let appended = Page::parse(&new_page_bytes)?;
+        if appended.topo().len() > page_budget {
+            let split = appended.resplit(page_budget);
+            let root = split.root;
+            for (h, b) in split.pages {
+                overlay.insert(h, b);
+            }
+            root
+        } else {
+            let h = ContentHash::of(&new_page_bytes);
+            overlay.insert(h, new_page_bytes);
+            h
+        }
     };
     let mut old_child = leaf_page_hash;
     // Walk the page path back up to the root, redirecting each ancestor's link
@@ -352,8 +361,7 @@ fn fetch_bytes(
 
 /// The page-hash path `[root, …, P]` from the tree root down to the page `P`
 /// that holds the leaf nearest `query`, by greedy nearest-child descent (one
-/// step per level — enough to pick an attach region; exact-nearest isn't
-/// required, and §11 repairs quality). Crosses page boundaries on `Page` links.
+/// step per level). Crosses page boundaries on `Page` links.
 fn greedy_leaf_page_path(
     overlay: &HashMap<ContentHash, Vec<u8>>,
     base: &dyn PageSource,
@@ -399,6 +407,84 @@ fn greedy_leaf_page_path(
         path.push(next_page);
         page_hash = next_page;
     }
+}
+
+/// Rebuild a **pure-cluster** leaf page balanced, splicing in the new leaf —
+/// fresh medoid centroids, tight per-node covering radii, and a real hierarchy
+/// instead of a flat fan under the page root, which is what lets the
+/// radius-bounded descent prune the page. Reuses the genesis builder
+/// ([`CentroidTree::build`]) over the page's stored Sq8 leaf rows, with the new
+/// leaf encoded into the same per-page quantizer — entirely in the encoded
+/// domain, no fp32 centroid reconstructed. Re-pages the rebuilt subtree to
+/// `page_budget` via [`CentroidTree::to_pages`].
+///
+/// Returns `None` for a page that carries cross-page child links (a higher-level
+/// page): those children's centroids live in other pages, out of this rebuild's
+/// reach, so the caller keeps the flat-append + structural-resplit path for them.
+/// Almost all inserts land in pure-cluster leaf pages, so this is the common path.
+fn rebuild_leaf_page(
+    page: &Page,
+    metric: Metric,
+    dim: usize,
+    leaf: &LeafInsert,
+    page_budget: usize,
+) -> Option<SplitPages> {
+    let pure = page.topo().iter().all(|node| match node {
+        NodeTopo::Leaf(_) => true,
+        NodeTopo::Internal(children) => {
+            children.iter().all(|c| matches!(c, ChildLink::Local(_)))
+        }
+    });
+    if !pure {
+        return None;
+    }
+
+    // Slice the leaf clusters' rows (with their radii/counts) out of the page
+    // block under its shared quantizer; the internal medoid rows are dropped —
+    // `build` recomputes them.
+    let leaf_locals: Vec<u32> = page
+        .topo()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| matches!(node, NodeTopo::Leaf(_)).then_some(i as u32))
+        .collect();
+    let mut leaf_refs: Vec<LeafRef> = leaf_locals
+        .iter()
+        .map(|&i| match &page.topo()[i as usize] {
+            NodeTopo::Leaf(l) => *l,
+            NodeTopo::Internal(_) => unreachable!("filtered to leaves"),
+        })
+        .collect();
+    let mut cc = page.centroids().select_rows(&leaf_locals);
+    let store_norm = metric_stores_norm(metric);
+    let had_radii = cc.radii.len() == cc.n_cent as usize;
+
+    // Encode the new leaf's fp32 centroid into the page's quantizer and append it
+    // — the same single-row re-quantization `append_leaf_into_page` uses.
+    let single = ClusterCentroids::single(metric, &leaf.centroid_fp32);
+    let src_row = &single.to_encoded_rows()[0];
+    let mut row_bytes = vec![0u8; dim * ROW_BYTES_PER_DIM];
+    let norm = materialize_sq8_residual_row_into_cluster_quant(
+        src_row,
+        &cc.scale,
+        &cc.offset,
+        dim,
+        &mut row_bytes,
+        store_norm,
+    );
+    push_row(&mut cc, &row_bytes, leaf.radius, had_radii, store_norm, norm);
+    leaf_refs.push(LeafRef {
+        superfile_id: leaf.superfile_id,
+        doc_off: leaf.doc_off,
+        count: leaf.count,
+        cluster_id: leaf.cluster_id,
+    });
+
+    // `build` only returns `None` for empty / zero-dim / mismatched input; the
+    // leaf set is non-empty (we just pushed one) with a fixed dim and aligned
+    // refs, so this is always `Some` in practice.
+    let tree = CentroidTree::build(metric, &cc, &leaf_refs)?;
+    Some(tree.to_pages(page_budget))
 }
 
 /// Re-emit `page` with the new leaf appended: its fp32 centroid encoded under
@@ -659,7 +745,7 @@ mod tests {
             // Every inserted leaf is still reachable by descent.
             let paged = PagedTree::new(ResidentPageSource::from_pages(pages.clone()), root);
             let found: HashSet<u128> = paged
-                .select_probes(&cells[0].0, n)
+                .select_leaves(&cells[0].0, n)
                 .expect("descend")
                 .into_iter()
                 .map(|(leaf, _)| leaf.superfile_id)
@@ -671,6 +757,61 @@ mod tests {
                     c.2
                 );
             }
+        }
+    }
+
+    /// A commit's carried-forward resident tree — built in memory from the prior
+    /// resident pages overlaid with this commit's changed pages, pruned to the
+    /// new root, with zero object I/O ([`super::super::store::build_resident_after_commit`])
+    /// — must descend **identically** to a tree loaded fresh from the full merged
+    /// page set. i.e. carrying forward == reloading. And it must keep only the
+    /// pages reachable from the new root (dropping the superseded old path).
+    #[test]
+    fn carry_forward_resident_descends_like_fresh_load() {
+        use crate::supertable::opann::store::build_resident_after_commit;
+        let (dim, n, budget) = (16usize, 150usize, 8usize);
+        let cells = synth_cells(n, dim);
+        let leaves = leaves_from(&cells);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let genesis = insert_leaves(
+                &ResidentPageSource::from_pages(HashMap::new()),
+                None,
+                metric,
+                dim,
+                &leaves[..40],
+                budget,
+            )
+            .expect("genesis ok")
+            .expect("genesis some");
+            let prior = ResidentPageSource::from_pages(genesis.pages.clone());
+            let split = insert_leaves(&prior, Some(genesis.root), metric, dim, &leaves[40..90], budget)
+                .expect("insert ok")
+                .expect("insert some");
+
+            // In-memory carry-forward (prior ∪ changed, pruned to new root).
+            let carried = build_resident_after_commit(&prior, &split.pages, split.root)
+                .expect("carry forward");
+            let n_carried = carried.len();
+            // Ground truth: the full merged page set, loaded fresh.
+            let merged = merge(&genesis.pages, &split.pages);
+            let n_merged = merged.len();
+            let fresh = ResidentPageSource::from_pages(merged);
+
+            let carried_tree = PagedTree::new(carried, split.root);
+            let fresh_tree = PagedTree::new(fresh, split.root);
+            for &t in &[0usize, 1, 45, 89] {
+                for &k in &[1usize, 8, n] {
+                    assert_eq!(
+                        carried_tree.select_leaves(&cells[t].0, k).expect("carried"),
+                        fresh_tree.select_leaves(&cells[t].0, k).expect("fresh"),
+                        "{metric:?}: carry-forward descent must equal fresh load (t={t}, k={k})"
+                    );
+                }
+            }
+            assert!(
+                n_carried <= n_merged,
+                "{metric:?}: carry-forward keeps only reachable pages ({n_carried} <= {n_merged})"
+            );
         }
     }
 
@@ -717,7 +858,7 @@ mod tests {
 
             let merged = merge(&genesis.pages, &inserted.pages);
             let paged = PagedTree::new(ResidentPageSource::from_pages(merged), inserted.root);
-            let probes = paged.select_probes(&new_centroid, n + 1).expect("descend");
+            let probes = paged.select_leaves(&new_centroid, n + 1).expect("descend");
             assert!(
                 probes.iter().any(|(leaf, _)| leaf.superfile_id == NEW_ID),
                 "{metric:?}: inserted leaf {NEW_ID} not reachable by descent"
@@ -752,7 +893,7 @@ mod tests {
             let merged = merge(&genesis.pages, &updated.pages);
             let paged = PagedTree::new(ResidentPageSource::from_pages(merged), updated.root);
             // Ask for every cell; the victim must be gone, the rest present.
-            let probes = paged.select_probes(&cells[17].0, n).expect("descend");
+            let probes = paged.select_leaves(&cells[17].0, n).expect("descend");
             let got: HashSet<u128> = probes.iter().map(|(leaf, _)| leaf.superfile_id).collect();
             assert!(
                 !got.contains(&victim),

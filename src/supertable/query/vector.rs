@@ -119,7 +119,7 @@ enum Probe {
 /// All superfile entries of `manifest` in manifest order, flattening the lazy
 /// list parts when the manifest is object-store-backed (the hidden vector-index
 /// table) or returning the resident flat list for an in-process manifest. Used
-/// by the OPANN leaf-probe path to map a descended `LeafRef.superfile_id` back
+/// by the OPANN leaf-fetch path to map a descended `LeafRef.superfile_id` back
 /// to its entry (uri + radius) — loaded once per query, part GETs disk-cached.
 pub(super) async fn ordered_manifest_superfiles(
     manifest: &Manifest,
@@ -1067,17 +1067,15 @@ impl SupertableReader {
         // manifest-part lookup, no Parquet-footer decode, one wave of ~nprobe
         // GETs. Falls through to the legacy per-superfile IVF scan when no tree
         // is published or the entries lack the vector-probe subsection layout.
-        if let Some(leaves) = super::vector_probe::select_opann_probe_leaves(
-            self,
-            manifest,
-            column,
-            query,
-            &options,
-            |_| true,
+        if let Some(leaves) = super::opann_fetch::select_opann_leaves(
+            self, manifest, query, k, &options, |_| true,
         )
         .await?
         {
-            return super::vector_probe::fanout_opann_leaf_probes(
+            // The descent already pruned to the resident-bounded candidate set,
+            // which conservatively covers the top-k, so fetch it all in ONE
+            // coalesced wave and rerank — no dependent confirmation wave.
+            return super::opann_fetch::fetch_opann_leaves(
                 self, leaves, column, query, k, options, None,
             )
             .await;

@@ -157,12 +157,6 @@ pub(crate) enum PageError {
     MissingPage(String),
     #[error("page content-hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch { expected: String, actual: String },
-    #[error("resident bundle encode overflow")]
-    BundleEncodeOverflow,
-    #[error("resident bundle decode overflow")]
-    BundleDecodeOverflow,
-    #[error("resident bundle decode: {0}")]
-    BundleDecode(String),
 }
 
 /// Serialize a contiguous group of routing-tree nodes into one immutable,
@@ -329,24 +323,24 @@ impl Page {
         })
     }
 
-    /// Up to `n_probe` `(cell_id, distance)` pairs by best-first descent within
+    /// Up to `limit` `(cell_id, distance)` pairs by best-first descent within
     /// this page, scoring node centroids off the Sq8+residual bytes. Single-
     /// page: child *page* links (`NodeTopo::Internal.pages`) are not followed
     /// here — crossing a page boundary needs a page resolver, wired with the
     /// multi-page tree. A single self-contained page has none.
     ///
     /// Test-only: production descent crosses pages via
-    /// [`super::paged::PagedTree::select_probes`]; this single-page descent is a
+    /// [`super::paged::PagedTree::select_leaves`]; this single-page descent is a
     /// round-trip oracle.
     #[cfg(test)]
-    pub(crate) fn select_probes(&self, query: &[f32], n_probe: usize) -> Vec<(LeafRef, f32)> {
-        if n_probe == 0 || self.topo.is_empty() || query.len() != self.centroids.dim as usize {
+    pub(crate) fn select_leaves(&self, query: &[f32], limit: usize) -> Vec<(LeafRef, f32)> {
+        if limit == 0 || self.topo.is_empty() || query.len() != self.centroids.dim as usize {
             return Vec::new();
         }
         best_first(
             self.root_local,
             self.score_local(self.root_local, query),
-            n_probe,
+            limit,
             |node, kids| match &self.topo[node as usize] {
                 NodeTopo::Leaf(cell) => Some(*cell),
                 NodeTopo::Internal(children) => {
@@ -357,7 +351,7 @@ impl Page {
                             }
                             ChildLink::Page(_) => debug_assert!(
                                 false,
-                                "single-page select_probes reached a cross-page link; \
+                                "single-page select_leaves reached a cross-page link; \
                                  use PagedTree for a multi-page tree"
                             ),
                         }
@@ -399,6 +393,18 @@ impl Page {
     /// off this page's Sq8+residual bytes (no fp32 reconstruction).
     pub(crate) fn score_local(&self, local: u32, query: &[f32]) -> f32 {
         self.centroids.score_one(self.metric, local as usize, query)
+    }
+
+    /// Local node `local`'s covering radius — the bound (built by
+    /// [`super::tree::CentroidTree::build`]) on the distance from this node's
+    /// centroid to anything in its subtree (a leaf carries its cluster's own
+    /// radius). The radius-bounded descent uses `score_local(local) − radius_local(local)`
+    /// as the nearest-possible distance to any vector under `local`, pruning the
+    /// subtree when that lower bound can't beat the admission threshold. Returns
+    /// `0.0` when the centroid block stored no radii (collapses the bound to the
+    /// centroid distance — conservative, never over-prunes).
+    pub(crate) fn radius_local(&self, local: u32) -> f32 {
+        self.centroids.radii.get(local as usize).copied().unwrap_or(0.0)
     }
 
     /// Total node count parsed from the page. Test/observability only.
@@ -714,20 +720,20 @@ mod tests {
         let page = Page::parse(&three_node_page()).expect("parse");
         // Query at node 0's centroid → cell 100 leads, then 200.
         let probes: Vec<u128> = page
-            .select_probes(&[1.0, 0.0, 0.0, 0.0], 2)
+            .select_leaves(&[1.0, 0.0, 0.0, 0.0], 2)
             .into_iter()
             .map(|(leaf, _)| leaf.superfile_id)
             .collect();
         assert_eq!(probes, vec![100, 200]);
         // Query at node 1's centroid → cell 200 leads.
         let probes: Vec<u128> = page
-            .select_probes(&[0.0, 1.0, 0.0, 0.0], 2)
+            .select_leaves(&[0.0, 1.0, 0.0, 0.0], 2)
             .into_iter()
             .map(|(leaf, _)| leaf.superfile_id)
             .collect();
         assert_eq!(probes, vec![200, 100]);
         // Probe budget is respected.
-        assert_eq!(page.select_probes(&[1.0, 0.0, 0.0, 0.0], 1).len(), 1);
+        assert_eq!(page.select_leaves(&[1.0, 0.0, 0.0, 0.0], 1).len(), 1);
     }
 
     #[test]

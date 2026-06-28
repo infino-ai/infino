@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! OPANN path-B vector probe: tree descent selects leaves; each admitted leaf
-//! is fetched with a direct range GET on the superfile object (no Parquet
-//! footer, no internal IVF centroid scoring).
+//! OPANN vector fetch path: the radius-bounded tree descent admits leaves; each
+//! admitted leaf is fetched with a direct range GET on its superfile object (no
+//! Parquet footer, no whole-cell IVF centroid scan) and reranked.
 
 use std::{
     cmp::Ordering,
@@ -26,65 +26,43 @@ use crate::{
 
 use super::vector::{VectorSearchOptions, row_id_from_manifest_entry};
 
-/// Radius-aware adaptive leaf admission (§7.3): always probe the
-/// `nprobe_min` nearest OPANN leaves, then admit farther leaves whose
-/// radius-aware lower bound clears τ up to `nprobe_max`.
-pub(super) fn adaptive_probe_leaves(
-    candidates: Vec<(LeafRef, f32)>,
-    radius_of: impl Fn(LeafRef) -> f32,
-    nprobe_min: usize,
-    nprobe_max: usize,
-    slack: f32,
-) -> Vec<(LeafRef, f32)> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let mut scored = candidates;
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let radius = |leaf: LeafRef| radius_of(leaf);
-    let lb = |i: usize| {
-        let (leaf, d) = scored[i];
-        (d - radius(leaf)).max(0.0)
-    };
-    let (c0, d_star) = scored[0];
-    let r_star = radius(c0);
-    let tau = if r_star > 0.0 {
-        d_star + slack * r_star
-    } else {
-        d_star * (1.0 + slack)
-    };
-    let nprobe_min = nprobe_min.max(1);
-    let nprobe_max = nprobe_max.max(nprobe_min);
-    let n = scored.len();
-    let floor = nprobe_min.min(n);
-    let mut chosen: HashSet<(u128, u32)> = scored[..floor]
-        .iter()
-        .map(|(leaf, _)| (leaf.superfile_id, leaf.doc_off))
-        .collect();
-    let mut out: Vec<(LeafRef, f32)> = scored[..floor].to_vec();
-    let mut rest: Vec<usize> = (floor..n).collect();
-    rest.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
-    for i in rest {
-        if out.len() >= nprobe_max {
-            break;
-        }
-        if lb(i) <= tau {
-            let key = (scored[i].0.superfile_id, scored[i].0.doc_off);
-            if chosen.insert(key) {
-                out.push(scored[i]);
-            }
-        }
-    }
-    out
-}
+/// Coverage floor for the radius-bounded descent, as a multiple of `k`. The
+/// descent (see [`PagedTree::radius_bounded_descent`]) admits clusters by their
+/// optimistic lower bound `(d − radius)` and freezes its prune bound to the far
+/// edge of the nearest clusters once they cumulatively cover this multiple of
+/// `k` vectors.
+///
+/// Why a coverage floor and not a pure radius threshold: a cell's radius is its
+/// *intra*-cluster spread; it says nothing about how far the sibling IVF cells
+/// of the same semantic region sit from each other. When a region is fragmented
+/// across superfiles, the top-k spread across those siblings and the nearest
+/// cell's radius can't reach them — a `d* + slack·r*` threshold collapses to
+/// ~`d*` and starves admission. A doc-count floor instead pulls in as many of
+/// the nearest (by optimistic bound) clusters as it takes to cover ~`k`
+/// candidates: more small sibling clusters when fragmented (pre-drain), far fewer
+/// once consolidated (post-drain). No upper cap — fan-out tracks the data's
+/// fragmentation, not a fixed probe budget.
+///
+/// The floor is generous (32×) on purpose: the descent's prune bound derives
+/// from it on **resident** metadata (Sq8 centroid distances + tree radii, no
+/// payload fetch), so a wide floor keeps that bound a conservative cover of the
+/// true k-th NN despite Sq8 distance error. That conservativeness is what lets
+/// the kernel fetch the **whole** candidate set in ONE coalesced wave and rerank
+/// — no fetch-time confirmation round-trip — and still hold recall.
+const ADMIT_COVERAGE_K_MULT: usize = 32;
 
-/// Descend the resident OPANN tree and return admitted probe leaves.
-pub(super) async fn select_opann_probe_leaves(
+/// Descend the resident OPANN tree and return the query's candidate cluster
+/// leaves — the radius-bounded admission — each paired with its superfile entry.
+/// The descent prunes by covering radius and freezes its bound on resident
+/// metadata alone (no payload fetch), and that bound conservatively covers the
+/// true k-th NN, so the caller fetches this **whole** set in one coalesced wave
+/// and reranks: there is no fetch-time confirmation pass and no second wave.
+pub(super) async fn select_opann_leaves(
     _reader: &SupertableReader,
     manifest: &Manifest,
-    column: &str,
     query: &[f32],
-    options: &VectorSearchOptions,
+    k: usize,
+    _options: &VectorSearchOptions,
     survives: impl Fn(u128) -> bool,
 ) -> Result<Option<Vec<(LeafRef, f32, Arc<SuperfileEntry>)>>, QueryError> {
     let tree = manifest
@@ -103,14 +81,14 @@ pub(super) async fn select_opann_probe_leaves(
     // stays empty and the caller falls back to the per-superfile IVF scan.)
     if let (Some(source), Some(routing_info)) = (tree, manifest.opann_routing()) {
         let root = routing_info.root_page;
-        let routing = routing_info.routing;
 
-        // Radius-aware τ admission runs over the full candidate pool and trims
-        // to `[floor, nprobe_max]`. Capping descent at `nprobe_max` first drops
-        // cells that τ would have admitted — spread-out queries need those
-        // far-but-large-radius partitions, not a fixed centroid-depth budget.
+        // Radius-bounded descent: prune any subtree whose covering ball can't
+        // reach the bound (the far edge of the nearest clusters covering `floor`
+        // vectors — resident metadata, no payload fetched), returning only the
+        // clusters that could hold a top-k vector — P(q), not M. No probe budget.
+        let floor = ADMIT_COVERAGE_K_MULT.saturating_mul(k);
         let candidates = PagedTree::new(source, root)
-            .select_probes_where(query, usize::MAX, &survives)
+            .radius_bounded_descent(query, floor, &survives)
             .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
 
         let entry_by_id: HashMap<u128, Arc<SuperfileEntry>> = entries
@@ -118,40 +96,17 @@ pub(super) async fn select_opann_probe_leaves(
             .map(|e| (e.superfile_id.as_u128(), Arc::clone(e)))
             .collect();
 
-        // Per-cluster covering radius for the τ admission, read from the
-        // resident manifest summary. Every cluster of every superfile is its own
-        // tree leaf, so the radius is per-CLUSTER (indexed by `leaf.cluster_id`),
-        // not per-superfile. Falls back to 0 (collapse to centroid distance)
-        // when a leaf's cluster has no recorded radius.
-        let radius_of = |leaf: LeafRef| {
-            entry_by_id
-                .get(&leaf.superfile_id)
-                .and_then(|e| e.vector_summary.get(column))
-                .and_then(|vs| vs.clusters.radii.get(leaf.cluster_id as usize).copied())
-                .unwrap_or(0.0)
-        };
-
-        let floor = options.nprobe.unwrap_or(routing.nprobe_min);
-        let admitted = adaptive_probe_leaves(
-            candidates,
-            radius_of,
-            floor,
-            routing.nprobe_max,
-            routing.slack,
-        );
-
-        // Every admitted leaf is already a single internal IVF cluster — the
-        // tree routed straight to it (centroid → cluster byte range). Probe that
-        // range directly: no within-superfile rescan, no whole-superfile leaf.
-        out.reserve(admitted.len());
-        for (leaf, dist) in admitted {
-            let Some(entry) = entry_by_id.get(&leaf.superfile_id) else {
-                continue;
-            };
-            if !entry_has_vector_probe_layout(entry) {
-                continue;
+        // Every leaf is a single internal IVF cluster the tree routed straight to
+        // (centroid → cluster byte range), fetched directly with no
+        // within-superfile rescan. Keep only entries carrying the direct-fetch
+        // layout.
+        out.reserve(candidates.len());
+        for (leaf, dist) in candidates {
+            if let Some(entry) = entry_by_id.get(&leaf.superfile_id)
+                && entry_has_opann_fetch_layout(entry)
+            {
+                out.push((leaf, dist, Arc::clone(entry)));
             }
-            out.push((leaf, dist, Arc::clone(entry)));
         }
     }
 
@@ -161,7 +116,7 @@ pub(super) async fn select_opann_probe_leaves(
     Ok(Some(out))
 }
 
-fn entry_has_vector_probe_layout(entry: &SuperfileEntry) -> bool {
+fn entry_has_opann_fetch_layout(entry: &SuperfileEntry) -> bool {
     entry
         .subsection_offsets
         .as_ref()
@@ -169,16 +124,17 @@ fn entry_has_vector_probe_layout(entry: &SuperfileEntry) -> bool {
         .is_some_and(|(_, len)| len > 0)
 }
 
-/// Fan the OPANN-admitted probes across hidden cells, reusing the **normal**
+/// Fetch the OPANN-admitted leaves across hidden cells, reusing the **normal**
 /// superfile read path. [`dispatch::fanout`] opens each cell through the same
 /// tiered opener the user-table fan-outs use (in-memory reader cache →
 /// disk-cache mmap → storage fallback), warms + applies the tombstone sidecar,
 /// and tags hits with their superfile — so the cell bytes are mmap-backed and
 /// shared. Every admitted leaf is a single internal IVF cluster; the clusters of
 /// one superfile COALESCE into a single open and one fetch batch of their byte
-/// ranges (`probe_clusters_at_async`) — so a query is ~nprobe contiguous cluster
-/// range-GETs, independent of superfile size. There is no whole-cell rescan.
-pub(super) async fn fanout_opann_leaf_probes(
+/// ranges (`probe_clusters_at_async`, the IVF cluster scan) — so a query is P(q)
+/// coalesced range-GETs (one per touched superfile), independent of superfile
+/// size. There is no whole-cell rescan.
+pub(super) async fn fetch_opann_leaves(
     reader: &SupertableReader,
     leaves: Vec<(LeafRef, f32, Arc<SuperfileEntry>)>,
     column: &str,
@@ -299,17 +255,26 @@ pub(super) async fn fanout_opann_leaf_probes(
             });
         }
     }
-    // SPANN replication writes a boundary row into several cells, so the same
-    // row can surface from more than one probed cell. Dedup by stable_id (keep
-    // the best/min score per row) so replicas don't waste top-k slots. Hits
-    // with no stable_id (INCOMING cells, no inline `_id`) pass through.
+    Ok(dedup_and_top_k(
+        per_superfile.into_iter().flatten().collect(),
+        k,
+    ))
+}
+
+/// Dedup hits by `stable_id` (keep the min-score replica; pass through hits with
+/// no stable_id), then return the global top-`k` ascending by score.
+///
+/// SPANN replication writes a boundary row into several cells, so the same row
+/// can surface from more than one probed cell — and, across a confirmation pass,
+/// from cells in different fetch batches. Deduping by `stable_id` keeps the best
+/// score per row so replicas don't waste top-k slots.
+fn dedup_and_top_k(hits: Vec<SuperfileHit>, k: usize) -> Vec<SuperfileHit> {
     let mut best: HashMap<i128, SuperfileHit> = HashMap::new();
     let mut passthrough: Vec<SuperfileHit> = Vec::new();
-    for hit in per_superfile.into_iter().flatten() {
+    for hit in hits {
         match hit.stable_id {
             Some(id) => {
-                let replace = best.get(&id).map(|h| hit.score < h.score).unwrap_or(true);
-                if replace {
+                if best.get(&id).map(|h| hit.score < h.score).unwrap_or(true) {
                     best.insert(id, hit);
                 }
             }
@@ -317,11 +282,12 @@ pub(super) async fn fanout_opann_leaf_probes(
         }
     }
     let deduped: Vec<SuperfileHit> = best.into_values().chain(passthrough).collect();
-    Ok(super::vector::top_k_ascending(vec![deduped], k))
+    super::vector::top_k_ascending(vec![deduped], k)
 }
 
+
 fn map_vector_err(e: VectorError) -> QueryError {
-    QueryError::Store(format!("vector leaf probe: {e}"))
+    QueryError::Store(format!("vector leaf fetch: {e}"))
 }
 
 /// Pre-heap deny-set (in DOC_ID space) for a contiguous-span superfile: row `i`

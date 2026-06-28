@@ -4,27 +4,25 @@
 //! OPANN — Object-Partitioned Approximate Nearest Neighbor.
 //!
 //! The routing layer for the hidden vector index: a hierarchical centroid tree
-//! ([`tree::CentroidTree`]) over the cell centroids, searched on compute with
-//! zero object GETs to select the `n_probe` nearest cells. The cell payload
-//! lives in immutable, object-resident ≤8 MB IVF superfiles; a query descends
-//! the tree (cached pages, no GETs), then fetches one object per probed cell.
+//! ([`tree::CentroidTree`]) over the cluster centroids, searched on compute with
+//! zero object GETs to admit — by covering radius, no fixed probe budget — the
+//! IVF clusters that could hold a top-k vector. The cluster payload lives in
+//! immutable, object-resident ≤8 MB IVF superfiles; a query descends the tree
+//! (cached pages, no GETs), then fetches the admitted clusters' byte ranges in
+//! one coalesced wave.
 //!
 //! Every node centroid is Sq8+residual (the one internal codec), scored through
 //! `Sq8ResidualKernel`. SPANN is disk-partitioned ANN; OPANN is
 //! object-partitioned ANN.
 //!
-//! Scope of this module today: the in-memory routing tree ([`tree`]), the
-//! shared best-first [`descent`], and the paged, content-addressed on-disk form
-//! ([`page`] + [`paged`]) it descends warm with zero GETs. The object-store page
-//! store, the copy-on-write commit insert, and the rebalance maintenance are a
-//! separate wiring step; until the query path routes through this tree, its
-//! entry points are unreferenced outside the module's own tests — hence the
-//! module-scoped `dead_code` allowance below.
+//! Scope of this module: the in-memory routing tree ([`tree`]), the shared
+//! best-first [`descent`], the paged content-addressed on-disk form ([`page`] +
+//! [`paged`]), the object-store page store ([`store`]), and the copy-on-write
+//! commit insert ([`insert`]).
 #![allow(dead_code)]
 
 mod descent;
 pub(crate) mod insert;
-pub(crate) mod maintenance;
 pub(crate) mod page;
 pub(crate) mod paged;
 pub(crate) mod store;

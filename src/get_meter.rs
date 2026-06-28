@@ -15,7 +15,7 @@ pub const GET_PHASE_OPANN: u8 = 1;
 /// Vector subsection open-time speculation GETs (`vec_open_ranges`).
 pub const GET_PHASE_VEC_OPEN: u8 = 2;
 /// Direct leaf / cluster probe GETs after OPANN descent.
-pub const GET_PHASE_LEAF_PROBE: u8 = 3;
+pub const GET_PHASE_LEAF_FETCH: u8 = 3;
 
 static CURRENT: AtomicU8 = AtomicU8::new(GET_PHASE_NONE);
 
@@ -34,7 +34,7 @@ pub fn phase_label(phase: u8) -> &'static str {
     match phase {
         GET_PHASE_OPANN => "opann",
         GET_PHASE_VEC_OPEN => "vec_open",
-        GET_PHASE_LEAF_PROBE => "leaf_probe",
+        GET_PHASE_LEAF_FETCH => "leaf_fetch",
         _ => "other",
     }
 }

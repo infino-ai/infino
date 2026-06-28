@@ -500,7 +500,7 @@ impl Supertable {
             // same `opann_routing_update` op the drain/commit use; recomputed per
             // OCC attempt so a retry rebuilds against the winning base. User-table
             // compaction has no routing tree, so it inherits.
-            let routing_commit = if is_hidden_vector_index_table(&inner.options) {
+            let (routing_commit, carry_forward) = if is_hidden_vector_index_table(&inner.options) {
                 let removed: Vec<u128> = job.inputs.iter().map(|id| id.as_u128()).collect();
                 let added: Vec<PartitionRoutingCopy> = inner
                     .options
@@ -523,7 +523,7 @@ impl Supertable {
                     .await
                     .map_err(|e| CompactionError::Build(e.to_string()))?
             } else {
-                OpannRoutingCommit::Inherit
+                (OpannRoutingCommit::Inherit, None)
             };
 
             let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
@@ -541,6 +541,9 @@ impl Supertable {
             .await
             {
                 Ok(new_manifest) => {
+                    if let Some(cf) = carry_forward {
+                        new_manifest.seed_opann_tree(cf);
+                    }
                     inner.manifest.store(Arc::new(new_manifest));
                     let pending_cache_inserts = merged_segment
                         .bytes_for_cache

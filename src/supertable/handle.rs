@@ -1061,7 +1061,12 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
-        last_pointer_check: Mutex::new(None),
+        // Open already loaded the manifest from a fresh pointer read, so the
+        // BoundedStaleness clock starts now — the first query is within the
+        // window and skips a redundant pointer GET (the cold-search wave). Both
+        // the user table and the hidden index go through here, so neither pays a
+        // first-query freshness round-trip.
+        last_pointer_check: Mutex::new(Some(Instant::now())),
         pending_partition_strategy: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);

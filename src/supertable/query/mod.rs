@@ -32,7 +32,7 @@ pub mod skip;
 pub mod sql;
 pub mod superfile_reader;
 pub mod vector;
-mod vector_probe;
+mod opann_fetch;
 
 pub use vector::VectorSearchOptions;
 

@@ -19,7 +19,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// Best-first descent yielding up to `n_probe` `(cell_id, distance)` pairs in
+/// Best-first descent yielding up to `limit` `(cell_id, distance)` pairs in
 /// the order leaves are reached. The search is seeded with `root` at distance
 /// `root_dist`. `expand(node, &mut kids)` returns `Some(cell_id)` when `node`
 /// is a leaf; otherwise it pushes each child as `(child_handle, child_distance)`
@@ -30,7 +30,7 @@ use std::collections::BinaryHeap;
 pub(super) fn best_first<N: Copy, L: Copy>(
     root: N,
     root_dist: f32,
-    n_probe: usize,
+    limit: usize,
     mut expand: impl FnMut(N, &mut Vec<(N, f32)>) -> Option<L>,
 ) -> Vec<(L, f32)> {
     let mut heap: BinaryHeap<Cand<N>> = BinaryHeap::new();
@@ -44,7 +44,7 @@ pub(super) fn best_first<N: Copy, L: Copy>(
         kids.clear();
         if let Some(leaf) = expand(node, &mut kids) {
             out.push((leaf, dist));
-            if out.len() >= n_probe {
+            if out.len() >= limit {
                 break;
             }
         } else {
