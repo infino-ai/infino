@@ -372,7 +372,6 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
-             INFINO_BENCH_GATE_METRIC='${{ inputs.bench_gate_metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              SKIP_CALIBRATION='${{ inputs.skip_calibration }}' \
@@ -411,7 +410,6 @@ jobs:
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
              INFINO_BENCH_SUPERFILE_DOCS='${{ inputs.docs }}' \
              INFINO_BENCH_SUPERTABLE_DOCS='${{ inputs.docs }}' \
-             INFINO_BENCH_GATE_METRIC='${{ inputs.bench_gate_metric }}' \
              BENCH_ARGS='${{ steps.resolve.outputs.args }}' \
              CPUSET='${{ inputs.bench_cpuset }}' \
              KEEP='${{ inputs.keep_table }}' \
