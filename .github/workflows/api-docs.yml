@@ -1,0 +1,85 @@
+name: API reference
+
+# Builds the Python and Node API reference from the PUBLISHED packages and
+# deploys them to GitHub Pages, so the reference always matches what users
+# install (`pip install infino`, `npm install @infino-ai/infino`).
+#
+# Stays current three ways:
+#   - workflow_run: regenerates after any publish workflow finishes (a release
+#     tag or a manual binding patch);
+#   - schedule: a weekly safety net in case a publish was missed;
+#   - workflow_dispatch: manual, on demand.
+#
+# Rust reference is hosted on docs.rs and is only linked from the landing page.
+
+on:
+  workflow_run:
+    workflows: ["Publish crate", "Node publish", "Publish Python package"]
+    types: [completed]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel a publish-triggered run.
+concurrency:
+  group: api-docs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Python reference (pdoc, from the published package)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip pdoc
+          python -m pip install --upgrade infino
+          pdoc infino -o site/python
+
+      - name: Node reference (TypeDoc, from the published package)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: |
+          mkdir -p tsproj && cd tsproj
+          npm init -y >/dev/null
+          npm install @infino-ai/infino typedoc >/dev/null
+          npx typedoc --out ../site/node node_modules/@infino-ai/infino/infino/index.d.ts
+
+      - name: Landing page (links Python, Node, and Rust on docs.rs)
+        run: |
+          cat > site/index.html <<'HTML'
+          <!doctype html><html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Infino API reference</title>
+          <style>body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem}
+          a{color:#d24011}h1{font-size:1.6rem}li{margin:.5rem 0}</style></head>
+          <body><h1>Infino API reference</h1>
+          <p>Language API references for <a href="https://docs.infino.ai">Infino</a>.</p>
+          <ul>
+            <li><a href="./python/infino.html">Python</a> — <code>pip install infino</code></li>
+            <li><a href="./node/">Node.js</a> — <code>npm install @infino-ai/infino</code></li>
+            <li><a href="https://docs.rs/infino">Rust</a> — on docs.rs</li>
+          </ul></body></html>
+          HTML
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
