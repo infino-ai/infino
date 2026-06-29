@@ -26,15 +26,17 @@ KEY_PARTS = 4
 
 # Mirrors the bench renderer's Better enum: these headers are higher-is-better,
 # everything else comparable is lower-is-better. Text-only columns are skipped.
-HIGHER_BETTER = ("Throughput", "Bandwidth")
-TEXT_ONLY = ("Corpus", "Superfiles")
+# Tokens are lowercase; matchers lowercase the header so capitalization in the
+# report ("Time", "warm p90") never silently drops a metric from gating.
+HIGHER_BETTER = ("throughput", "bandwidth")
+TEXT_ONLY = ("corpus", "superfiles")
 # Cost cells are USD/queries-per-$ figures, not nanoseconds, and their keys
 # embed volatile text - they do not diff cleanly.
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
 
 # Secondary metrics - cold (object-store network variance) and peak RSS
 # (run-order biased) are noisy and non-gating for PR decisions.
-SECONDARY_HEADERS = ("cold search", "Peak RSS")
+SECONDARY_HEADERS = ("cold search", "peak rss")
 SECONDARY_THRESHOLD_PCT = 30.0
 
 # Map a report basename to (subsystem label, source area).
@@ -59,11 +61,11 @@ DEFAULT_THRESHOLD = 5.0
 
 
 def is_text_only(header):
-    return any(t in header for t in TEXT_ONLY)
+    return any(t in header.lower() for t in TEXT_ONLY)
 
 
 def higher_is_better(header):
-    return any(t in header for t in HIGHER_BETTER)
+    return any(t in header.lower() for t in HIGHER_BETTER)
 
 
 def is_cost(header):
@@ -78,9 +80,10 @@ def tier(header, primary_headers):
     The latency header among them tracks the run's gate metric, so it is
     resolved at call time rather than fixed as a module constant.
     """
-    if any(t in header for t in primary_headers):
+    h = header.lower()
+    if any(t in h for t in primary_headers):
         return "primary"
-    if any(t in header for t in SECONDARY_HEADERS):
+    if any(t in h for t in SECONDARY_HEADERS):
         return "secondary"
     return None
 
@@ -198,8 +201,8 @@ def main():
     run_url = os.environ.get("RUN_URL", "")
     primary_headers = (
         primary_latency_header_from_gate_metric(bench_gate_metric),
-        "Time",
-        "Stored",
+        "time",
+        "stored",
     )
     try:
         threshold = float(os.environ.get("BENCH_NOISE_THRESHOLD_PCT", DEFAULT_THRESHOLD))
