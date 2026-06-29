@@ -39,6 +39,73 @@ pub(crate) fn metric_stores_norm(metric: Metric) -> bool {
     matches!(metric, Metric::L2Sq | Metric::Cosine)
 }
 
+/// Build the one Sq8+ε centroid scorer kernel over a shared `scale`/`offset`.
+/// Every centroid distance — superfile-resident ([`CentroidBlock`]) and
+/// manifest-resident (`ClusterCentroids`) alike — folds the query through this
+/// single construction, so the scoring cannot drift between the two.
+#[inline]
+pub(crate) fn sq8_centroid_kernel(
+    metric: Metric,
+    query: &[f32],
+    scale: &[f32],
+    offset: &[f32],
+) -> Sq8ResidualKernel {
+    Sq8ResidualKernel::new(metric, query, scale, offset, SQ8_RESIDUAL_DIVISOR)
+}
+
+/// The `(codes, residuals)` byte slices of the centroid stored at `row` in a
+/// cluster-major `[codes(dim) u8 ‖ residuals(dim) i8]` buffer. The single place
+/// the centroid row layout (offset arithmetic) lives — every Sq8+ε scorer/decoder
+/// reads its row through this.
+#[inline]
+pub(crate) fn sq8_row_codes_residuals(rows: &[u8], dim: usize, row: usize) -> (&[u8], &[u8]) {
+    let base = row * dim * ROW_BYTES_PER_DIM;
+    (&rows[base..base + dim], &rows[base + dim..base + 2 * dim])
+}
+
+/// Distance from a query (already folded into `kernel`) to the centroid stored at
+/// `row` in a cluster-major `[codes(dim) u8 ‖ residuals(dim) i8]` buffer, using
+/// the row's decoded `norm`. The single Sq8+ε centroid-row scorer: [`CentroidBlock`]
+/// (row 0 = summary, so cluster `c` is row `c + 1`) and `ClusterCentroids`
+/// (clusters only, cluster `c` is row `c`) both score through it.
+#[inline]
+pub(crate) fn sq8_row_distance(
+    kernel: &Sq8ResidualKernel,
+    rows: &[u8],
+    dim: usize,
+    row: usize,
+    norm: Option<f32>,
+) -> f32 {
+    let (codes, residuals) = sq8_row_codes_residuals(rows, dim, row);
+    kernel.distance_with_norm(codes, residuals, norm)
+}
+
+/// Decode the centroid stored at `row` to `dim` fp32 components into `out`, the
+/// inverse of the Sq8+ε encode via the canonical [`encoded_component_at`]. The
+/// single decode path shared by [`CentroidBlock`] and `ClusterCentroids`; used
+/// only at the staging / oracle boundary, never the query hot path.
+pub(crate) fn sq8_decode_row_into(
+    scale: &[f32],
+    offset: &[f32],
+    rows: &[u8],
+    dim: usize,
+    row: usize,
+    out: &mut [f32],
+) {
+    let (codes, residuals) = sq8_row_codes_residuals(rows, dim, row);
+    let er = EncodedCellRow {
+        stable_id: 0,
+        scale: Arc::from(scale.to_vec()),
+        offset: Arc::from(offset.to_vec()),
+        codes: codes.to_vec(),
+        residuals: residuals.to_vec(),
+        norm_sq: None,
+    };
+    for (d, o) in out.iter_mut().enumerate().take(dim) {
+        *o = encoded_component_at(&er, d);
+    }
+}
+
 /// Number of rows in the centroid block: the summary centroid plus the
 /// `n_cent` per-cluster centroids.
 #[inline]
@@ -171,21 +238,6 @@ impl<'a> CentroidBlock<'a> {
         parse_f32_le(self.offset)
     }
 
-    /// Codes (`dim` u8) for storage row `r` (0 = summary, `1..=n_cent` =
-    /// cluster centroids).
-    #[inline]
-    fn codes(&self, r: usize) -> &[u8] {
-        let base = r * self.dim * ROW_BYTES_PER_DIM;
-        &self.rows[base..base + self.dim]
-    }
-
-    /// Residuals (`dim` i8 LE bytes) for storage row `r`.
-    #[inline]
-    fn residuals(&self, r: usize) -> &[u8] {
-        let base = r * self.dim * ROW_BYTES_PER_DIM + self.dim;
-        &self.rows[base..base + self.dim]
-    }
-
     /// Decoded norm for storage row `r` (`None` for NegDot).
     #[inline]
     fn norm(&self, r: usize) -> Option<f32> {
@@ -198,13 +250,7 @@ impl<'a> CentroidBlock<'a> {
     /// Build a per-query kernel bound to this block's shared scale/offset. Used
     /// to score the query against every centroid (cluster selection / nprobe).
     pub(crate) fn kernel(&self, query: &[f32]) -> Sq8ResidualKernel {
-        Sq8ResidualKernel::new(
-            self.metric,
-            query,
-            &self.scale(),
-            &self.offset(),
-            SQ8_RESIDUAL_DIVISOR,
-        )
+        sq8_centroid_kernel(self.metric, query, &self.scale(), &self.offset())
     }
 
     /// Distance from `query` to cluster centroid `c` (`0..n_cent`) under
@@ -212,7 +258,7 @@ impl<'a> CentroidBlock<'a> {
     #[inline]
     pub(crate) fn cluster_distance(&self, kernel: &Sq8ResidualKernel, c: usize) -> f32 {
         let r = c + 1; // row 0 is the summary centroid
-        kernel.distance_with_norm(self.codes(r), self.residuals(r), self.norm(r))
+        sq8_row_distance(kernel, self.rows, self.dim, r, self.norm(r))
     }
 
     /// Decode cluster centroid `c` (`0..n_cent`) back to `dim` fp32 components.
@@ -245,17 +291,9 @@ impl<'a> CentroidBlock<'a> {
     /// Decode storage row `r` to fp32 via the shared scale/offset and the row's
     /// codes/residuals — the inverse of [`encode_rows`].
     fn row_components(&self, r: usize) -> Vec<f32> {
-        let row = EncodedCellRow {
-            stable_id: 0,
-            scale: Arc::from(self.scale()),
-            offset: Arc::from(self.offset()),
-            codes: self.codes(r).to_vec(),
-            residuals: self.residuals(r).to_vec(),
-            norm_sq: None,
-        };
-        (0..self.dim)
-            .map(|d| encoded_component_at(&row, d))
-            .collect()
+        let mut out = vec![0.0f32; self.dim];
+        sq8_decode_row_into(&self.scale(), &self.offset(), self.rows, self.dim, r, &mut out);
+        out
     }
 }
 

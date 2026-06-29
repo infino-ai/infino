@@ -164,8 +164,10 @@ fn schema_for(modality: Modality) -> Arc<Schema> {
 }
 
 /// Target vectors **per IVF cluster** (inverted-list size). Cluster count for a
-/// build with `n_docs` vectors is `ceil(n_docs / TARGET)`.
-const TARGET_VECTORS_PER_IVF_CLUSTER: usize = 8_000;
+/// build with `n_docs` vectors is `ceil(n_docs / TARGET)`. The builder honors the
+/// `n_cent` we submit here, so this caller-side sizing is what sets the cluster
+/// count (the builder no longer derives its own).
+const TARGET_VECTORS_PER_IVF_CLUSTER: usize = 8_192;
 
 pub fn combined_schema() -> Arc<Schema> {
     schema_for(Modality::Combined)

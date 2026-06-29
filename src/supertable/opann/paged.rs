@@ -164,6 +164,57 @@ impl PartialOrd for Frontier {
     }
 }
 
+/// The radius-bounded coverage-floor admission rule, shared by the persisted-tree
+/// descent ([`PagedTree::radius_bounded_descent`]) and the pre-drain flat scan of
+/// undrained cluster centroids
+/// ([`admit_undrained_manifest_clusters`](super::live::admit_undrained_manifest_clusters))
+/// so both admit by the **same** rule on the **same** resident metadata.
+///
+/// Clusters are visited in near-edge (`max(0, d − r)`) order. Each admitted
+/// cluster advances `covered` by its vector count and widens `admitted_far` to
+/// the far edge (`d + r`) of its covering ball. Once the admitted clusters
+/// cumulatively cover `floor` vectors, the prune bound freezes to the farthest
+/// admitted ball edge: a cluster whose near edge is beyond that bound cannot hold
+/// a vector nearer than the k-th already covered, so it is pruned. Until the
+/// floor is met the bound stays open (every reachable cluster is admitted) — a
+/// conservative cover derived entirely from resident centroids/radii/counts, no
+/// payload fetch. A leaf with an unrecorded count (0) never advances `covered`,
+/// so the bound never freezes — a correct, unpruned fallback.
+pub(crate) struct CoverageBound {
+    floor: u64,
+    covered: u64,
+    admitted_far: f32,
+    bound: f32,
+}
+
+impl CoverageBound {
+    pub(crate) fn new(floor: usize) -> Self {
+        Self {
+            floor: floor as u64,
+            covered: 0,
+            admitted_far: 0.0,
+            bound: f32::INFINITY,
+        }
+    }
+
+    /// Whether a cluster whose covering ball has near edge `near` can still beat
+    /// the (possibly frozen) bound. Visiting in near order, the first `false`
+    /// means none remain — the caller stops.
+    pub(crate) fn admits(&self, near: f32) -> bool {
+        near <= self.bound
+    }
+
+    /// Record an admitted cluster: `far` = `d + r` (its ball's far edge), `count`
+    /// = its vector count. Freezes the bound once coverage reaches the floor.
+    pub(crate) fn record(&mut self, far: f32, count: u32) {
+        self.covered += count as u64;
+        self.admitted_far = self.admitted_far.max(far);
+        if self.covered >= self.floor {
+            self.bound = self.bound.min(self.admitted_far);
+        }
+    }
+}
+
 /// Reader over a multi-page routing tree. Holds the page source and the root
 /// page hash; descent is stateless across calls (each `select_leaves` builds
 /// its own per-query page cache).
@@ -324,116 +375,180 @@ impl<S: PageSource> PagedTree<S> {
         floor: usize,
         survives: impl Fn(u128) -> bool,
     ) -> Result<Vec<(LeafRef, f32)>, PageError> {
-        let mut cache: HashMap<ContentHash, Page> = HashMap::new();
-        ensure(&mut cache, &self.source, &self.root)?;
-        let root_page = &cache[&self.root];
-        if query.len() != root_page.dim() {
-            return Ok(Vec::new());
+        // Tree-only admission (empty incoming list) — the persisted-page case the
+        // routing unit tests exercise. Production goes through
+        // [`radius_bounded_admit`] with the live incoming list folded into the
+        // *same* bound; this is just that call with nothing to merge.
+        radius_bounded_admit(Some((&self.source, self.root)), &[], query, floor, survives)
+    }
+}
+
+/// A pre-scored cluster leaf for the radius-bounded admission. The undrained
+/// incoming list scores its centroids up front (so the admission treats them as
+/// already-expanded leaves, advancing a linear cursor rather than expanding tree
+/// nodes); `near`/`far` are the covering ball edges `max(0, d − r)` / `d + r`,
+/// and `d` is the centroid distance.
+pub(crate) struct ScoredLeaf {
+    pub(crate) near: f32,
+    pub(crate) d: f32,
+    pub(crate) far: f32,
+    pub(crate) count: u32,
+    pub(crate) leaf: LeafRef,
+}
+
+/// One radius-bounded admission over the logical tree = persisted routing pages
+/// (`tree` = `Some((source, root))`; the pointer advances **by tree node** via the
+/// frontier heap) ∪ the undrained incoming centroids (`extra`; the pointer
+/// advances **linearly** over a slice pre-sorted by `near`). The incoming list is
+/// the un-indexed tail of the *same* tree — searching it as a tree would cost an
+/// insert per centroid, so it is scanned flat — so a single [`CoverageBound`]
+/// governs both: its clusters tighten and are pruned by the same bound as the
+/// page leaves, never a separate floor. Each step takes the next-nearest
+/// candidate from whichever source has the smaller near edge, so both are visited
+/// in one global near order and the first near beyond the bound ends the search.
+///
+/// `extra` MUST be sorted by `near` ascending. `tree` is `None` pre-drain (no
+/// persisted pages yet) — then only the incoming list is scanned, still bounded.
+pub(crate) fn radius_bounded_admit<S: PageSource>(
+    tree: Option<(&S, ContentHash)>,
+    extra: &[ScoredLeaf],
+    query: &[f32],
+    floor: usize,
+    survives: impl Fn(u128) -> bool,
+) -> Result<Vec<(LeafRef, f32)>, PageError> {
+    let mut cache: HashMap<ContentHash, Page> = HashMap::new();
+    let mut heap: BinaryHeap<Frontier> = BinaryHeap::new();
+    let source = tree.map(|(s, _)| s);
+    if let Some((source, root)) = tree {
+        ensure(&mut cache, source, &root)?;
+        let root_page = &cache[&root];
+        // A dim mismatch means the tree can't be scored for this query; skip the
+        // tree frontier (the incoming list is scored independently and may match).
+        if query.len() == root_page.dim() {
+            let root_local = root_page.root_local();
+            let root_near = (root_page.score_local(root_local, query)
+                - root_page.radius_local(root_local))
+            .max(0.0);
+            heap.push(Frontier {
+                near: root_near,
+                node: PageNode {
+                    page: root,
+                    local: root_local,
+                },
+            });
         }
-        let root_local = root_page.root_local();
-        let root_near = (root_page.score_local(root_local, query)
-            - root_page.radius_local(root_local))
-        .max(0.0);
+    }
 
-        let mut heap: BinaryHeap<Frontier> = BinaryHeap::new();
-        heap.push(Frontier {
-            near: root_near,
-            node: PageNode {
-                page: self.root,
-                local: root_local,
-            },
-        });
+    let mut admitted: Vec<(LeafRef, f32)> = Vec::new();
+    let mut cb = CoverageBound::new(floor);
+    let mut cursor = 0usize;
+    let mut fetch_err: Option<PageError> = None;
 
-        let mut admitted: Vec<(LeafRef, f32)> = Vec::new();
-        let mut covered: u64 = 0;
-        let mut admitted_far = 0.0f32;
-        let mut bound = f32::INFINITY;
-        let mut fetch_err: Option<PageError> = None;
+    loop {
+        // Pull the next candidate from whichever source has the smaller near edge:
+        // the incoming list cursor (linear) or the tree frontier (heap). Both are
+        // visited in near order, so the first near beyond the bound ends it all.
+        let heap_near = heap.peek().map(|f| f.near);
+        let list_near = extra.get(cursor).map(|e| e.near);
+        let take_list = match (heap_near, list_near) {
+            (None, None) => break,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(h), Some(l)) => l <= h,
+        };
+        let next_near = if take_list { list_near } else { heap_near }
+            .expect("a source was selected, so its near edge is present");
+        if !cb.admits(next_near) {
+            break;
+        }
 
-        while let Some(Frontier { near, node }) = heap.pop() {
-            // The frontier is ordered by near edge ascending, so once the nearest
-            // remaining node's ball can't beat the bound, none can.
-            if near > bound {
-                break;
+        if take_list {
+            // List pointer moves linearly: a pre-scored leaf, admitted directly.
+            let e = &extra[cursor];
+            cursor += 1;
+            if survives(e.leaf.superfile_id) {
+                admitted.push((e.leaf, e.d));
+                cb.record(e.far, e.count);
             }
-            // Clone the small topology record so the page borrow is dropped before
-            // resolving child pages (which mutates the cache).
-            let topo = match cache.get(&node.page) {
-                Some(p) => p.topo_at(node.local).clone(),
-                None => continue,
-            };
-            match topo {
-                NodeTopo::Leaf(cell) => {
-                    if !survives(cell.superfile_id) {
-                        continue;
-                    }
-                    let page = &cache[&node.page];
-                    let d = page.score_local(node.local, query);
-                    let r = page.radius_local(node.local);
-                    admitted.push((cell, d));
-                    covered += cell.count as u64;
-                    admitted_far = admitted_far.max(d + r);
-                    // Freeze the bound once the nearest admitted clusters cover the
-                    // floor: a cluster whose near edge is beyond `admitted_far`
-                    // cannot hold a vector nearer than the k-th already covered.
-                    if covered >= floor as u64 {
-                        bound = bound.min(admitted_far);
-                    }
+            continue;
+        }
+
+        // Tree pointer moves by node: pop the frontier and expand it.
+        let node = heap
+            .pop()
+            .expect("heap is non-empty when the tree source was selected")
+            .node;
+        // Clone the small topology record so the page borrow is dropped before
+        // resolving child pages (which mutates the cache).
+        let topo = match cache.get(&node.page) {
+            Some(p) => p.topo_at(node.local).clone(),
+            None => continue,
+        };
+        match topo {
+            NodeTopo::Leaf(cell) => {
+                if !survives(cell.superfile_id) {
+                    continue;
                 }
-                NodeTopo::Internal(children) => {
-                    for child in &children {
-                        match child {
-                            ChildLink::Local(cl) => {
-                                let page = &cache[&node.page];
-                                let near_c = (page.score_local(*cl, query)
-                                    - page.radius_local(*cl))
-                                .max(0.0);
-                                if near_c <= bound {
-                                    heap.push(Frontier {
-                                        near: near_c,
-                                        node: PageNode {
-                                            page: node.page,
-                                            local: *cl,
-                                        },
-                                    });
-                                }
+                let page = &cache[&node.page];
+                let d = page.score_local(node.local, query);
+                let r = page.radius_local(node.local);
+                admitted.push((cell, d));
+                cb.record(d + r, cell.count);
+            }
+            NodeTopo::Internal(children) => {
+                let source = source.expect("a tree internal node implies a page source");
+                for child in &children {
+                    match child {
+                        ChildLink::Local(cl) => {
+                            let page = &cache[&node.page];
+                            let near_c = (page.score_local(*cl, query)
+                                - page.radius_local(*cl))
+                            .max(0.0);
+                            if cb.admits(near_c) {
+                                heap.push(Frontier {
+                                    near: near_c,
+                                    node: PageNode {
+                                        page: node.page,
+                                        local: *cl,
+                                    },
+                                });
                             }
-                            ChildLink::Page(ph) => {
-                                if let Err(e) = ensure(&mut cache, &self.source, ph) {
-                                    fetch_err.get_or_insert(e);
-                                    continue;
-                                }
-                                let cp = &cache[ph];
-                                if cp.dim() != query.len() {
-                                    fetch_err.get_or_insert(PageError::DimMismatch {
-                                        expected: query.len(),
-                                        actual: cp.dim(),
-                                    });
-                                    continue;
-                                }
-                                let croot = cp.root_local();
-                                let near_c = (cp.score_local(croot, query)
-                                    - cp.radius_local(croot))
-                                .max(0.0);
-                                if near_c <= bound {
-                                    heap.push(Frontier {
-                                        near: near_c,
-                                        node: PageNode {
-                                            page: *ph,
-                                            local: croot,
-                                        },
-                                    });
-                                }
+                        }
+                        ChildLink::Page(ph) => {
+                            if let Err(e) = ensure(&mut cache, source, ph) {
+                                fetch_err.get_or_insert(e);
+                                continue;
+                            }
+                            let cp = &cache[ph];
+                            if cp.dim() != query.len() {
+                                fetch_err.get_or_insert(PageError::DimMismatch {
+                                    expected: query.len(),
+                                    actual: cp.dim(),
+                                });
+                                continue;
+                            }
+                            let croot = cp.root_local();
+                            let near_c = (cp.score_local(croot, query)
+                                - cp.radius_local(croot))
+                            .max(0.0);
+                            if cb.admits(near_c) {
+                                heap.push(Frontier {
+                                    near: near_c,
+                                    node: PageNode {
+                                        page: *ph,
+                                        local: croot,
+                                    },
+                                });
                             }
                         }
                     }
                 }
             }
         }
-        match fetch_err {
-            Some(e) => Err(e),
-            None => Ok(admitted),
-        }
+    }
+    match fetch_err {
+        Some(e) => Err(e),
+        None => Ok(admitted),
     }
 }
 

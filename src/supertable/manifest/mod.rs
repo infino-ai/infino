@@ -59,8 +59,11 @@ use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::vector::{
-        cell_posting::{EncodedCellRow, encode_rows, encoded_component_at},
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
+        cell_posting::{EncodedCellRow, encode_rows},
+        centroid_block::{
+            sq8_centroid_kernel, sq8_decode_row_into, sq8_row_codes_residuals, sq8_row_distance,
+        },
+        distance::Metric,
         layout::VectorLayout,
     },
     supertable::{
@@ -2091,34 +2094,23 @@ impl ClusterCentroids {
     /// `stable_id` is the cluster index. Codes/residuals are copied as-is; no
     /// fp32 vector is reconstructed.
     pub(crate) fn to_encoded_rows(&self) -> Vec<EncodedCellRow> {
+        let dim = self.dim as usize;
         (0..self.n_cent as usize)
-            .map(|c| EncodedCellRow {
-                stable_id: c as i128,
-                // EncodedCellRow shares its quantizer as `Arc<[f32]>`; the block
-                // holds one quantizer for all clusters, so every row's `Arc`
-                // wraps a copy of the same shared scale/offset.
-                scale: self.scale.clone().into(),
-                offset: self.offset.clone().into(),
-                codes: self.codes(c).to_vec(),
-                residuals: self.residuals(c).to_vec(),
-                norm_sq: self.norm(c),
+            .map(|c| {
+                let (codes, residuals) = sq8_row_codes_residuals(&self.rows, dim, c);
+                EncodedCellRow {
+                    stable_id: c as i128,
+                    // EncodedCellRow shares its quantizer as `Arc<[f32]>`; the
+                    // block holds one quantizer for all clusters, so every row's
+                    // `Arc` wraps a copy of the same shared scale/offset.
+                    scale: self.scale.clone().into(),
+                    offset: self.offset.clone().into(),
+                    codes: codes.to_vec(),
+                    residuals: residuals.to_vec(),
+                    norm_sq: self.norm(c),
+                }
             })
             .collect()
-    }
-
-    /// Codes (`dim` u8) for cluster `c`.
-    #[inline]
-    fn codes(&self, c: usize) -> &[u8] {
-        let base = c * self.dim as usize * CENTROID_ROW_BYTES_PER_DIM;
-        &self.rows[base..base + self.dim as usize]
-    }
-
-    /// Residuals (`dim` i8 LE bytes) for cluster `c`.
-    #[inline]
-    fn residuals(&self, c: usize) -> &[u8] {
-        let d = self.dim as usize;
-        let base = c * d * CENTROID_ROW_BYTES_PER_DIM + d;
-        &self.rows[base..base + d]
     }
 
     /// Stored decoded norm for cluster `c` (`None` for NegDot).
@@ -2127,33 +2119,14 @@ impl ClusterCentroids {
         self.norms.as_ref().map(|n| n[c])
     }
 
-    /// Build a per-query Sq8+residual kernel bound to the shared
-    /// `scale`/`offset` — the single scorer used for every centroid distance,
-    /// matching how cell rows are scored. Build once per query, reuse across
-    /// clusters.
-    fn kernel(&self, metric: Metric, query: &[f32]) -> Sq8ResidualKernel {
-        Sq8ResidualKernel::new(
-            metric,
-            query,
-            &self.scale,
-            &self.offset,
-            SQ8_RESIDUAL_DIVISOR,
-        )
-    }
-
-    /// Distance from `query` to cluster `c` under a prebuilt `kernel`.
-    #[inline]
-    fn cluster_distance(&self, kernel: &Sq8ResidualKernel, c: usize) -> f32 {
-        kernel.distance_with_norm(self.codes(c), self.residuals(c), self.norm(c))
-    }
-
-    /// Score cluster `c` against `query` via the Sq8+residual kernel (same
-    /// scorer as [`Self::score_clusters_into`]). Builds a one-off kernel; for
-    /// scoring many clusters per query, use [`Self::score_clusters_into`].
+    /// Score cluster `c` against `query` through the one shared Sq8+ε scorer
+    /// ([`sq8_row_distance`]) — clusters-only, so cluster `c` is row `c`. Builds a
+    /// one-off kernel; for scoring many clusters per query, use
+    /// [`Self::score_clusters_into`].
     pub fn score_one(&self, metric: Metric, c: usize, query: &[f32]) -> f32 {
         debug_assert_eq!(query.len(), self.dim as usize);
-        let kernel = self.kernel(metric, query);
-        self.cluster_distance(&kernel, c)
+        let kernel = sq8_centroid_kernel(metric, query, &self.scale, &self.offset);
+        sq8_row_distance(&kernel, &self.rows, self.dim as usize, c, self.norm(c))
     }
 
     /// Score every populated cluster against `query` through the single
@@ -2174,12 +2147,13 @@ impl ClusterCentroids {
         if self.n_cent == 0 {
             return;
         }
-        let kernel = self.kernel(metric, query);
+        let kernel = sq8_centroid_kernel(metric, query, &self.scale, &self.offset);
+        let dim = self.dim as usize;
         for c in 0..self.n_cent as usize {
             if self.counts[c] == 0 {
                 continue;
             }
-            emit(c as u32, self.cluster_distance(&kernel, c));
+            emit(c as u32, sq8_row_distance(&kernel, &self.rows, dim, c, self.norm(c)));
         }
     }
 
@@ -2220,22 +2194,12 @@ impl ClusterCentroids {
             });
     }
 
-    /// Decode cluster `c`'s centroid into `out` (length `dim`) — the inverse of
-    /// the Sq8+residual encode, via the canonical [`encoded_component_at`] codec.
-    /// Used only at the staging / oracle boundary, never in the query path
-    /// (which scores straight off the bytes via [`Sq8ResidualKernel`]).
+    /// Decode cluster `c`'s centroid into `out` (length `dim`) through the one
+    /// shared Sq8+ε decoder ([`sq8_decode_row_into`]) — clusters-only, so cluster
+    /// `c` is row `c`. Used only at the staging / oracle boundary, never the query
+    /// path (which scores straight off the bytes).
     pub fn dequantize_into(&self, c: usize, out: &mut [f32]) {
-        let row = EncodedCellRow {
-            stable_id: 0,
-            scale: Arc::from(self.scale.clone()),
-            offset: Arc::from(self.offset.clone()),
-            codes: self.codes(c).to_vec(),
-            residuals: self.residuals(c).to_vec(),
-            norm_sq: None,
-        };
-        for (d, o) in out.iter_mut().enumerate() {
-            *o = encoded_component_at(&row, d);
-        }
+        sq8_decode_row_into(&self.scale, &self.offset, &self.rows, self.dim as usize, c, out);
     }
 }
 

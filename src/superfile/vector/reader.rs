@@ -177,6 +177,27 @@ struct ProbeCtx<'a> {
     /// cell whose nearest rows are all tombstoned still surfaces its live
     /// neighbours instead of yielding the slots to farther cells.
     deny: Option<Arc<RoaringBitmap>>,
+    /// Tombstoned user `_id`s to map into `deny` from the inline stable-`_id`
+    /// region after the cluster fetch wave (same stash as remap). Set when the
+    /// caller could not build `deny` arithmetically (hidden cells).
+    deleted_for_deny: Option<Arc<Vec<i128>>>,
+}
+
+/// Map tombstoned user `_id`s to local doc-ids from inline region bytes.
+fn deny_locals_from_stable_id_bytes(region: &[u8], deleted: &[i128]) -> Option<RoaringBitmap> {
+    if deleted.is_empty() {
+        return None;
+    }
+    let stride = format::vec::STABLE_ID_BYTES;
+    let mut deny = RoaringBitmap::new();
+    for local in 0..(region.len() / stride) {
+        let p = local * stride;
+        let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..p + stride].try_into().ok()?;
+        if deleted.binary_search(&i128::from_le_bytes(arr)).is_ok() {
+            deny.insert(local as u32);
+        }
+    }
+    (!deny.is_empty()).then_some(deny)
 }
 
 impl ColumnReader {
@@ -1266,20 +1287,7 @@ impl VectorReader {
     /// hidden hit carries.
     pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
         let col = self.columns.iter().find(|c| c.has_inline_stable_ids())?;
-        // Prefer the cold-path region stashed during the fan-out wave
-        // (`cold_stable_id_region`); otherwise serve a resident (warm) slice.
-        // Both are the full `i128 × n_docs` region, indexed identically below.
-        let region = match self
-            .cold_stable_id_region
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-        {
-            Some(bytes) => bytes,
-            None => self
-                .source
-                .try_get_range_sync(col.stable_ids_region_range()?)?,
-        };
+        let region = self.inline_stable_id_region_resident(col)?;
         let mut out = Vec::with_capacity(locals.len());
         for &local in locals {
             let p = (local as usize) * format::vec::STABLE_ID_BYTES;
@@ -1418,49 +1426,30 @@ impl VectorReader {
         Ok(Some(out))
     }
 
-    /// Build the per-cell deny-set of LOCAL doc-ids whose stable `_id` is in
-    /// `deleted` (a sorted-ascending set of tombstoned user `_id`s), straight
-    /// from the inline stable-`_id` region — one contiguous region read
-    /// (resident after the cell's data wave) and one pass. The OPANN read path
-    /// passes this to the coarse-scan kernel so tombstoned rows are excluded
-    /// *before* the per-cell top-k heap, preserving recall@k under deletes.
-    ///
-    /// `Ok(None)` when the cell has no inline region (e.g. INCOMING staging
-    /// superfiles — the caller's post-merge filter covers those) or no local is
-    /// deleted.
-    pub(crate) async fn inline_deleted_locals(
-        &self,
-        deleted: &[i128],
-    ) -> Result<Option<RoaringBitmap>, VectorError> {
-        if deleted.is_empty() {
-            return Ok(None);
-        }
-        let Some(col) = self.columns.iter().find(|c| c.has_inline_stable_ids()) else {
-            return Ok(None);
-        };
-        let Some(range) = col.stable_ids_region_range() else {
-            return Ok(None);
-        };
-        let region = self
-            .source
-            .range_async(range)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let stride = format::vec::STABLE_ID_BYTES;
-        let mut deny = RoaringBitmap::new();
-        for local in 0..(region.len() / stride) {
-            let p = local * stride;
-            let arr: [u8; format::vec::STABLE_ID_BYTES] =
-                region[p..p + stride].try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
-                })?;
-            if deleted.binary_search(&i128::from_le_bytes(arr)).is_ok() {
-                deny.insert(local as u32);
+    /// Inline stable-`_id` region bytes when resident: cold stash from the
+    /// cluster fetch wave first, else a warm mmap/range slice.
+    fn inline_stable_id_region_resident(&self, col: &ColumnReader) -> Option<Bytes> {
+        if let Ok(guard) = self.cold_stable_id_region.lock() {
+            if let Some(bytes) = guard.as_ref() {
+                return Some(bytes.clone());
             }
         }
-        Ok(if deny.is_empty() { None } else { Some(deny) })
+        let range = col.stable_ids_region_range()?;
+        self.source.try_get_range_sync(range)
+    }
+
+    /// Per-cell deny-set of LOCAL doc-ids whose stable `_id` is in `deleted`
+    /// (sorted ascending), from resident inline region bytes — no extra fetch.
+    fn deny_locals_from_inline_region(
+        &self,
+        col: &ColumnReader,
+        deleted: &[i128],
+    ) -> Option<RoaringBitmap> {
+        if deleted.is_empty() || !col.has_inline_stable_ids() {
+            return None;
+        }
+        let region = self.inline_stable_id_region_resident(col)?;
+        deny_locals_from_stable_id_bytes(region.as_ref(), deleted)
     }
 
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
@@ -1878,6 +1867,7 @@ impl VectorReader {
             rerank_mult,
             allow: None,
             deny: None,
+            deleted_for_deny: None,
         };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
@@ -2003,6 +1993,7 @@ impl VectorReader {
             rerank_mult: rerank_mult_eff,
             allow,
             deny: None,
+            deleted_for_deny: None,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -2059,6 +2050,7 @@ impl VectorReader {
             rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
             allow,
             deny,
+            deleted_for_deny: None,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -2081,6 +2073,7 @@ impl VectorReader {
         rerank_mult: usize,
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
+        deleted_for_deny: Option<Arc<Vec<i128>>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated || clusters.is_empty() {
@@ -2098,6 +2091,7 @@ impl VectorReader {
             rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
             allow,
             deny,
+            deleted_for_deny,
         };
         let meta: Vec<(usize, u32, u32)> = clusters
             .iter()
@@ -2231,6 +2225,21 @@ impl VectorReader {
             };
         debug_assert_eq!(cluster_blocks.len(), filtered_meta.len());
 
+        let inline_deny = ctx
+            .deleted_for_deny
+            .as_ref()
+            .and_then(|deleted| self.deny_locals_from_inline_region(col, deleted))
+            .map(Arc::new);
+        let scoring_deny = ctx.deny.clone().or(inline_deny);
+        let scoring_ctx = ProbeCtx {
+            q_rot: ctx.q_rot,
+            k: ctx.k,
+            rerank_mult: ctx.rerank_mult,
+            allow: ctx.allow.clone(),
+            deny: scoring_deny,
+            deleted_for_deny: None,
+        };
+
         // Shared pure-CPU shortlist + candidate-build stage (see
         // [`build_shortlist`]); only the survivor-row fetch below
         // diverges from the sync path.
@@ -2240,7 +2249,7 @@ impl VectorReader {
             &filtered_meta,
             &cluster_blocks,
             survivor_only_rerank_fetch,
-            ctx,
+            &scoring_ctx,
         )
         .await
         {

@@ -97,23 +97,10 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
 
-/// Coarse IVF: ~[`TARGET_VECTORS_PER_IVF_CLUSTER`] vectors per inverted list.
-/// Returns cluster **count** for a build holding `n_docs` vectors.
-const TARGET_VECTORS_PER_IVF_CLUSTER: usize = 8_000;
-
 /// Fixed-point scale for the per-subsection summary radius. The
 /// radius is stored as `round(radius × 100)` in a `u32` and decoded
 /// back by the reader as `value / 100.0`.
 const SUMMARY_RADIUS_SCALE: f32 = 100.0;
-
-fn n_cent_row_count_cap(n_docs: usize) -> usize {
-    if n_docs == 0 {
-        return 1;
-    }
-    n_docs
-        .div_ceil(TARGET_VECTORS_PER_IVF_CLUSTER)
-        .max(1)
-}
 
 /// Per-vector-index build configuration.
 #[derive(Debug, Clone)]
@@ -1001,7 +988,9 @@ fn build_subsection_streaming(
         drop(reservoir);
         let n_docs = rows.len();
         let n_cent = if materialized_full_ivf_merge {
-            n_cent_row_count_cap(n_docs).max(1).min(n_docs.max(1))
+            // Honor the configured `n_cent` (the caller sizes it for the merged
+            // corpus); only the hard `n_cent ≤ n_docs` correctness bound applies.
+            cfg.n_cent.max(1).min(n_docs.max(1))
         } else {
             DRAIN_APPEND_IVF_N_CENT
         };
@@ -1017,8 +1006,12 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    // ~8k vectors per cluster: cluster count from this build's row count.
-    let n_cent = n_cent_row_count_cap(n_docs)
+    // Honor the configured `n_cent` (the caller sizes it for the corpus, e.g.
+    // ~one cluster per target cluster-size). Only the hard correctness bounds
+    // apply: `n_cent ≤ n_docs` (else the IVF is degenerate) and `n_cent ≤
+    // sample_rows` (k-means asserts `k ≤ n`).
+    let n_cent = cfg
+        .n_cent
         .max(1)
         .min(n_docs.max(1))
         .min(sample_rows.max(1));

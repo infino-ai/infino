@@ -53,7 +53,6 @@ use std::{
     fmt, io,
     marker::PhantomData,
     mem,
-    path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -123,10 +122,7 @@ use crate::{
                 EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row,
             },
             distance::Metric,
-            ivf_merge::{
-                RoutedCellSubsection, merge_routed_cell_shards_from_spool,
-                route_and_splice_ivf_subsections, spool_routed_cell_shard,
-            },
+            ivf_merge::{RoutedCellSubsection, route_and_splice_ivf_subsections},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
@@ -2506,10 +2502,14 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .clone()
         .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
-    // Stream one incoming superfile at a time: open → route/splice → spool each
-    // touched cell shard to disk → drop the reader. Final merge reads at most
-    // two shards per fold from the spool (bounded RAM, not ~index size).
-    let spool_dir = TempDir::new().map_err(|e| BuildError::Store(format!("drain spool: {e}")))?;
+    // Stream one incoming superfile at a time: open → route/splice → build one
+    // partial cell superfile per touched cell → PUT it to storage now → drop the
+    // bytes. Drain is a byte-splice *append*, not a merge: a cell accumulates one
+    // partial per incoming file that routed to it, and packing those down to one
+    // per cell is compaction's job, not drain's. Only the lightweight manifest
+    // entries are kept (their bytes are PUT and dropped per file), so RAM never
+    // exceeds one incoming file — no whole-index accumulator, no on-disk
+    // spool/fold.
     let column_name = column.clone();
     let clusters_for_route = clusters.clone();
     let assign_among_owned = assign_among.map(|s| s.to_vec());
@@ -2519,9 +2519,10 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .map(|r| manifest_centroid_components_from_row(r, clusters.dim as usize))
         .collect();
     let inner_for_cpu = Arc::clone(&inner);
-    let spool_root = spool_dir.path().to_path_buf();
-    let mut spool_paths_by_cell: HashMap<u32, Vec<PathBuf>> = HashMap::new();
     let n_incoming_files = incoming.len();
+    let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::new();
+    let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
+    let mut radii_updates: HashMap<u32, f32> = HashMap::new();
     for (file_idx, entry) in incoming.iter().enumerate() {
         let reader = open_incoming_superfile_for_drain(
             &user_store,
@@ -2535,58 +2536,113 @@ async fn route_incoming_to_manifest_cells_if_ready(
             stable_ids_by_local_for_routing(&user_manifest, entry.as_ref(), reader.as_ref())
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-        let one_routed = {
+        let built = {
             let reader = Arc::clone(&reader);
             let column_name = column_name.clone();
             let clusters_for_route = clusters_for_route.clone();
             let cent_fp32 = cent_fp32.clone();
             let assign_among_owned = assign_among_owned.clone();
-            maint_pool().install(|| -> Result<HashMap<u32, RoutedCellSubsection>, BuildError> {
-                let v = reader.vec().ok_or_else(|| {
-                    BuildError::Store("incoming superfile missing vector index".into())
-                })?;
-                let route = |row: &EncodedCellRow| -> Vec<(u32, f32)> {
-                    let cells = if let Some(ref cands) = assign_among_owned {
-                        vec![cell_grid::nearest_among_cells_encoded(
-                            &clusters_for_route,
-                            metric,
-                            cands,
-                            row,
-                        )]
-                    } else {
-                        cell_grid::spann_replica_cells_encoded(
-                            &clusters_for_route,
-                            metric,
-                            row,
-                            &cent_fp32,
-                            cell_grid::DRAIN_REPLICA_CLOSURE_RATIO,
-                            cell_grid::DRAIN_MAX_REPLICAS,
-                        )
-                    };
-                    cells
-                        .into_iter()
-                        .map(|cell| {
-                            let dist = cell_grid::member_distance_to_cell(
+            let inner_for_cpu = Arc::clone(&inner_for_cpu);
+            maint_pool().install(
+                || -> Result<Vec<(u32, u32, f32, PreparedSuperfile)>, BuildError> {
+                    let v = reader.vec().ok_or_else(|| {
+                        BuildError::Store("incoming superfile missing vector index".into())
+                    })?;
+                    let route = |row: &EncodedCellRow| -> Vec<(u32, f32)> {
+                        let cells = if let Some(ref cands) = assign_among_owned {
+                            vec![cell_grid::nearest_among_cells_encoded(
                                 &clusters_for_route,
                                 metric,
-                                cell,
+                                cands,
                                 row,
-                            );
-                            (cell, dist)
+                            )]
+                        } else {
+                            cell_grid::spann_replica_cells_encoded(
+                                &clusters_for_route,
+                                metric,
+                                row,
+                                &cent_fp32,
+                                cell_grid::DRAIN_REPLICA_CLOSURE_RATIO,
+                                cell_grid::DRAIN_MAX_REPLICAS,
+                            )
+                        };
+                        cells
+                            .into_iter()
+                            .map(|cell| {
+                                let dist = cell_grid::member_distance_to_cell(
+                                    &clusters_for_route,
+                                    metric,
+                                    cell,
+                                    row,
+                                );
+                                (cell, dist)
+                            })
+                            .collect()
+                    };
+                    // Route this file's rows to cells (verbatim Sq8+ε splice), then
+                    // build one partial cell superfile per touched cell. No merge,
+                    // no cross-file accumulation — each (file, cell) lands as its
+                    // own superfile; per-cell builds run in parallel on this pool.
+                    let one_routed = route_and_splice_ivf_subsections(
+                        &[(v, column_name.as_str())],
+                        &[stable_ids],
+                        route,
+                    )?;
+                    let routed_vec: Vec<(u32, RoutedCellSubsection)> =
+                        one_routed.into_iter().collect();
+                    routed_vec
+                        .into_par_iter()
+                        .map(|(cell_id, routed)| {
+                            let added = routed.subsection.n_docs;
+                            let shard_radius = routed.shard_radius;
+                            let p = build_prepared_ivf_from_spliced(
+                                &inner_for_cpu,
+                                cell_id,
+                                routed,
+                            )?;
+                            Ok((cell_id, added, shard_radius, p))
                         })
-                        .collect()
-                };
-                Ok(route_and_splice_ivf_subsections(
-                    &[(v, column_name.as_str())],
-                    &[stable_ids],
-                    route,
-                )?)
-            })?
+                        .collect::<Result<Vec<_>, BuildError>>()
+                },
+            )?
         };
         drop(reader);
-        for (cell_id, routed) in one_routed {
-            let path = spool_routed_cell_shard(&spool_root, cell_id, file_idx, &routed)?;
-            spool_paths_by_cell.entry(cell_id).or_default().push(path);
+        // Stage this file's partials for an eager PUT, accumulating only the
+        // lightweight manifest entries + per-cell deltas. The bytes drop at the
+        // end of this iteration, so RAM stays bounded by one incoming file.
+        let mut storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
+        let mut cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+        for (cell_id, added, shard_radius, p) in built {
+            if let Some((uri, b)) = p.bytes_for_store {
+                inner
+                    .options
+                    .store
+                    .insert(uri, b)
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+            }
+            if let Some(t) = p.bytes_for_storage {
+                storage_writes.push(t);
+            }
+            if let Some(t) = p.bytes_for_cache {
+                cache_inserts.push(t);
+            }
+            let slot = added_per_cell.entry(cell_id).or_insert(0);
+            *slot = slot.saturating_add(added);
+            if shard_radius > 0.0 {
+                let r = radii_updates.entry(cell_id).or_insert(0.0);
+                if shard_radius > *r {
+                    *r = shard_radius;
+                }
+            }
+            new_entries.push(p.entry);
+        }
+        // PUT now: durable before the final manifest pointer flip (crash-safe).
+        let mut no_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+        write_superfile_list(&storage, &inner.options, &mut storage_writes, &mut no_replaces)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        if let Some(cache) = inner.options.disk_cache.as_ref() {
+            warm_cache_inserts(cache, cache_inserts).await;
         }
         if (file_idx + 1) % 16 == 0 || file_idx + 1 == n_incoming_files {
             log_drain_phase(
@@ -2598,58 +2654,24 @@ async fn route_incoming_to_manifest_cells_if_ready(
         }
     }
     log_drain_phase(
-        "route+splice incoming superfiles (done)",
+        "route+splice + build + PUT incoming superfiles (done)",
         drain_start,
         &mut lap,
-        &format!("{n_incoming_files} file(s)"),
+        &format!(
+            "{n_incoming_files} file(s), {} partial cell superfile(s)",
+            new_entries.len()
+        ),
     );
-
-    let (prepared, cell_updates, radii_updates): (
-        Vec<PreparedSuperfile>,
-        HashMap<u32, u32>,
-        HashMap<u32, f32>,
-    ) = maint_pool().install(|| -> Result<_, BuildError> {
-            let mut prepared = Vec::with_capacity(spool_paths_by_cell.len());
-            let mut cell_updates = HashMap::new();
-            let mut radii_updates = HashMap::new();
-            let wrap_lap = time::Instant::now();
-            let n_cells = spool_paths_by_cell.len();
-            for (cell_id, paths) in spool_paths_by_cell {
-                let merge_scratch = spool_root.join(format!("merge_cell_{cell_id:02}"));
-                let routed_cell = merge_routed_cell_shards_from_spool(&paths, &merge_scratch)?;
-                let added = routed_cell.subsection.n_docs;
-                let shard_radius = routed_cell.shard_radius;
-                let p = build_prepared_ivf_from_spliced(&inner_for_cpu, cell_id, routed_cell)?;
-                let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
-                if shard_radius > 0.0 {
-                    radii_updates.insert(cell_id, shard_radius);
-                }
-                cell_updates.insert(cell_id, base.saturating_add(added));
-                prepared.push(p);
-            }
-            eprintln!(
-                "[supertable drain] build_prepared_ivf_from_spliced: +{:.3}s ({n_cells} cell superfile(s))",
-                wrap_lap.elapsed().as_secs_f64(),
-            );
-            Ok((prepared, cell_updates, radii_updates))
-        })?;
-    log_drain_phase(
-        "CPU route + splice + wrap (maint pool)",
-        drain_start,
-        &mut lap,
-        "",
-    );
-    if prepared.is_empty() {
+    if new_entries.is_empty() {
         eprintln!("[supertable drain] done: no cell superfiles produced");
         return Ok(());
     }
-    let batch = collect_prepared_superfiles(&inner, prepared)?;
-    log_drain_phase(
-        "collect_prepared_superfiles (in-memory store insert)",
-        drain_start,
-        &mut lap,
-        &format!("{} new superfile(s)", batch.new_entries.len()),
-    );
+    // New absolute per-cell counts = prior base + this drain's appended rows.
+    let mut cell_updates: HashMap<u32, u32> = HashMap::with_capacity(added_per_cell.len());
+    for (cell_id, added) in &added_per_cell {
+        let base = clusters.counts.get(*cell_id as usize).copied().unwrap_or(0);
+        cell_updates.insert(*cell_id, base.saturating_add(*added));
+    }
 
     // Bump per-cell counts so routing sees the now-populated cells.
     let updated_clusters = cell_grid::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
@@ -2658,8 +2680,7 @@ async fn route_incoming_to_manifest_cells_if_ready(
     // resident manifest summary — same per-cluster routing as a plain commit, so
     // descent routes straight to clusters with no whole-cell leaf.
     let dim = updated_clusters.dim as usize;
-    let added: Vec<PartitionRoutingCopy> = batch
-        .new_entries
+    let added: Vec<PartitionRoutingCopy> = new_entries
         .iter()
         .filter_map(|e| {
             let vs = e.vector_summary.get(column.as_str())?;
@@ -2707,27 +2728,26 @@ async fn route_incoming_to_manifest_cells_if_ready(
     }
 
     // Publish cell superfiles and stamp the drain watermark; user superfiles stay
-    // on the user manifest (never removed here).
+    // on the user manifest (never removed here). The partial bytes are already
+    // durable (PUT per file above), so this commit only swaps the manifest +
+    // routing pointer — no superfile writes here.
     let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
-        batch.new_entries,
+        new_entries,
         &[],
-        batch.pending_storage_writes,
+        Vec::new(),
         Vec::new(),
         opann_commit,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    log_drain_phase("persist_commit_async (storage PUT + manifest)", drain_start, &mut lap, "");
+    log_drain_phase("persist_commit_async (manifest + routing swap)", drain_start, &mut lap, "");
     if let Some(cf) = carry_forward {
         new_manifest.seed_opann_tree(cf);
     }
     inner.manifest.store(Arc::new(new_manifest));
 
-    if let Some(cache) = inner.options.disk_cache.as_ref() {
-        warm_cache_inserts(cache, batch.pending_cache_inserts).await;
-    }
     if let (Some(cache), Some(budget)) = (
         inner.options.disk_cache.as_ref(),
         inner.options.memory_budget_bytes,

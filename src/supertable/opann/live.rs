@@ -8,8 +8,9 @@
 //! in-memory copy, no register hook on commit, no tree work until drain/compact.
 //!
 //! - **Query:** a flat SIMD scan of those centroids
-//!   ([`admit_undrained_manifest_clusters`]) — no tree build, zero GETs — merged
-//!   with the persisted base tree post-drain.
+//!   ([`score_undrained_manifest_clusters`]) — no tree build, zero GETs — folded
+//!   into the **same** radius-bounded admission as the persisted base tree (one
+//!   shared `CoverageBound`), the incoming list being the tree's un-indexed tail.
 //! - **Drain / compact:** batch tree build ([`super::insert::rebuild_tree_batch`]).
 
 use std::{cmp::Ordering, sync::Arc};
@@ -20,6 +21,7 @@ use crate::{
 };
 
 use super::page::LeafRef;
+use super::paged::ScoredLeaf;
 
 /// User superfiles not yet drained into hidden cells (by arrival ordinal).
 pub(crate) fn undrained_user_vector_entries(
@@ -47,35 +49,27 @@ pub(crate) fn undrained_user_vector_entries(
 /// Flat SIMD scan of the incoming buffer — **no tree build, no object-store GET.**
 ///
 /// Undrained user superfiles carry per-cluster Sq8+residual centroids in their
-/// manifest `vector_summary`. Score the query against each surviving cluster's
-/// centroid through the shared [`Sq8ResidualKernel`]
-/// ([`ClusterCentroids::score_one`]) and admit **every** non-empty cluster.
-/// Pre-drain user superfiles are IVF-fragmented; a doc-count coverage floor would
-/// prune sibling clusters in the same file and starve rerank, while fetch still
-/// coalesces to one range-GET per superfile. Returns each cluster's [`LeafRef`]
-/// + its centroid distance for merge with the persisted-tree descent post-drain.
-pub(crate) fn admit_undrained_manifest_clusters(
+/// manifest `vector_summary`. Score the query against each non-empty cluster's
+/// centroid through the shared `Sq8ResidualKernel` ([`ClusterCentroids::score_one`])
+/// and return them as [`ScoredLeaf`]s sorted by near edge `max(0, d − r)` — the
+/// un-indexed incoming tail of the logical routing tree.
+///
+/// Admission is **not** done here. The caller folds this list into the *same*
+/// radius-bounded [`CoverageBound`](super::paged::CoverageBound) as the
+/// persisted-tree descent via
+/// [`radius_bounded_admit`](super::paged::radius_bounded_admit), so the incoming
+/// clusters share one bound (and one coverage floor) with the page leaves rather
+/// than admitting against a separate floor. `survives` is applied there too,
+/// uniformly with the tree leaves.
+pub(crate) fn score_undrained_manifest_clusters(
     undrained: &[Arc<SuperfileEntry>],
     column: &str,
     metric: Metric,
     query: &[f32],
-    _floor: usize,
-    survives: impl Fn(u128) -> bool,
-) -> Vec<(LeafRef, f32)> {
-    // One scored candidate per surviving, non-empty cluster.
-    struct Cand {
-        near: f32,
-        d: f32,
-        far: f32,
-        count: u32,
-        leaf: LeafRef,
-    }
-    let mut cands: Vec<Cand> = Vec::new();
+) -> Vec<ScoredLeaf> {
+    let mut scored: Vec<ScoredLeaf> = Vec::new();
     for entry in undrained {
         let superfile_id = entry.superfile_id.as_u128();
-        if !survives(superfile_id) {
-            continue;
-        }
         let Some(vs) = entry.vector_summary.get(column) else {
             continue;
         };
@@ -92,7 +86,7 @@ pub(crate) fn admit_undrained_manifest_clusters(
             // SIMD Sq8+ε kernel — never a per-component scalar decode.
             let d = cc.score_one(metric, c, query);
             let r = cc.radii.get(c).copied().unwrap_or(0.0);
-            cands.push(Cand {
+            scored.push(ScoredLeaf {
                 near: (d - r).max(0.0),
                 d,
                 far: d + r,
@@ -106,10 +100,6 @@ pub(crate) fn admit_undrained_manifest_clusters(
             });
         }
     }
-    cands.sort_by(|a, b| a.near.partial_cmp(&b.near).unwrap_or(Ordering::Equal));
-    // User superfiles are IVF-fragmented: semantic neighbors sit in many internal
-    // clusters within one file. A doc-count coverage floor (meant for consolidated
-    // post-drain cells) prunes sibling clusters and starves rerank — recall@10
-    // drops while fetch cost stays one coalesced GET per superfile either way.
-    cands.into_iter().map(|c| (c.leaf, c.d)).collect()
+    scored.sort_by(|a, b| a.near.partial_cmp(&b.near).unwrap_or(Ordering::Equal));
+    scored
 }

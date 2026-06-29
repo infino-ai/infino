@@ -22,7 +22,7 @@ use crate::{
         opann::{
             live::{self, undrained_user_vector_entries},
             page::LeafRef,
-            paged::PagedTree,
+            paged::{ResidentPageSource, ScoredLeaf, radius_bounded_admit},
             store,
         },
     },
@@ -82,39 +82,42 @@ pub(super) async fn select_opann_leaves(
         .first()
         .map(|c| c.column.as_str());
 
-    let mut candidates: Vec<(LeafRef, f32)> = Vec::new();
-
-    // Base tree (post-drain): balanced radius-bounded descent over the persisted
-    // routing pages. Absent pre-drain (`opann_routing` is `None` until the first
-    // drain), so this contributes nothing then.
-    if let Some(routing) = manifest.opann_routing()
-        && let Some(source) = reader.ensure_opann_resident_tree().await?
-    {
-        candidates.extend(
-            PagedTree::new(source, routing.root_page)
-                .radius_bounded_descent(query, floor, survives)
-                .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?,
-        );
-    }
-
     // Incoming buffer (undrained user superfiles, both pre- and post-drain): a
     // flat SIMD scan of the manifest-resident cluster centroids — no tree build,
-    // no object-store GET. The balanced tree is a batch artifact of drain/compact;
-    // the live path never builds or rebuilds a tree on the query/commit path.
-    if let (Some(column), Some(user_manifest)) = (column, reader.hidden_parent_user_manifest()) {
-        let undrained =
-            undrained_user_vector_entries(user_manifest.as_ref(), manifest.opann_routing(), column);
-        if !undrained.is_empty() {
-            candidates.extend(live::admit_undrained_manifest_clusters(
-                &undrained,
+    // no object-store GET — scored and near-sorted. This is the un-indexed tail of
+    // the routing tree; the balanced tree is a batch artifact of drain/compact,
+    // and the live path never builds or rebuilds a tree on the query/commit path.
+    let extra: Vec<ScoredLeaf> = match (column, reader.hidden_parent_user_manifest()) {
+        (Some(column), Some(user_manifest)) => {
+            let undrained = undrained_user_vector_entries(
+                user_manifest.as_ref(),
+                manifest.opann_routing(),
                 column,
-                metric,
-                query,
-                floor,
-                survives,
-            ));
+            );
+            if undrained.is_empty() {
+                Vec::new()
+            } else {
+                live::score_undrained_manifest_clusters(&undrained, column, metric, query)
+            }
         }
-    }
+        _ => Vec::new(),
+    };
+
+    // ONE radius-bounded admission over the logical tree = persisted routing pages
+    // (post-drain) ∪ the incoming list, under a single shared `CoverageBound`. The
+    // tree pointer advances by node (frontier heap); the incoming-list pointer
+    // advances linearly over `extra`. The tree is absent pre-drain (`opann_routing`
+    // is `None` until the first drain), so the same bound then governs the incoming
+    // list alone — never a separate per-source floor.
+    let candidates: Vec<(LeafRef, f32)> = if let Some(routing) = manifest.opann_routing()
+        && let Some(source) = reader.ensure_opann_resident_tree().await?
+    {
+        radius_bounded_admit(Some((source.as_ref(), routing.root_page)), &extra, query, floor, survives)
+            .map_err(|e| QueryError::Store(format!("opann admit: {e}")))?
+    } else {
+        radius_bounded_admit::<ResidentPageSource>(None, &extra, query, floor, survives)
+            .map_err(|e| QueryError::Store(format!("opann admit: {e}")))?
+    };
 
     if candidates.is_empty() {
         return Ok(None);
@@ -241,11 +244,11 @@ pub(super) async fn fetch_opann_leaves(
     // filter. It is mapped to a per-superfile deny-set of LOCAL doc-ids and
     // pushed into the per-cell coarse-scan kernel, so each cell's top-k is
     // selected from LIVE rows (this preserves recall@k under deletes). Both
-    // mappings land in the kernel's DOC_ID space: a contiguous-span superfile
-    // (a registered INCOMING user superfile) maps `_id → _id - id_min` by
-    // arithmetic, no read; a gapped cell maps through its inline `_id` region.
-    // A post-merge backstop on the resolved `stable_id` (below) covers any cell
-    // neither mapping reached.
+    // mappings land in the kernel's DOC_ID space: a contiguous-span user-staged
+    // superfile maps `_id → _id - id_min` by arithmetic, no read; a hidden cell
+    // maps through its inline `_id` region piggybacked on the cluster fetch wave
+    // (same stash as remap). A post-merge backstop on the resolved `stable_id`
+    // (below) covers any cell neither mapping reached.
     let manifest = reader.manifest();
     let deleted: Vec<i128> = match (manifest.opann_routing(), manifest.options.storage.as_ref()) {
         (Some(routing), Some(storage)) if routing.deleted_ids_uri.is_some() => {
@@ -261,7 +264,12 @@ pub(super) async fn fetch_opann_leaves(
     // `allow` and dropped — it never opens or fetches.
     let mut units: Vec<(
         Arc<SuperfileEntry>,
-        (Vec<(u32, u32, u32)>, Option<Arc<RoaringBitmap>>, Option<Arc<RoaringBitmap>>),
+        (
+            Vec<(u32, u32, u32)>,
+            Option<Arc<RoaringBitmap>>,
+            Option<Arc<RoaringBitmap>>,
+            Option<Arc<Vec<i128>>>,
+        ),
     )> = Vec::new();
     for sid in order {
         let (entry, metas) = by_sf.remove(&sid).expect("present in by_sf");
@@ -272,11 +280,15 @@ pub(super) async fn fetch_opann_leaves(
             },
             None => None,
         };
-        // Pre-heap deny for a contiguous-span (INCOMING user) superfile, mapped
-        // arithmetically here while its entry is in scope. `None` means the
-        // kernel maps through the cell's inline `_id` region instead.
+        // Pre-heap deny for a user-staged (contiguous-span) superfile only.
+        // Hidden cells resolve deny from the inline `_id` region inside probe.
         let arith_deny = arith_deny_locals(&entry, &deleted);
-        units.push((entry, (metas, bitmap, arith_deny)));
+        let deleted_for_probe = if arith_deny.is_none() && !deleted.is_empty() {
+            Some(Arc::clone(&deleted))
+        } else {
+            None
+        };
+        units.push((entry, (metas, bitmap, arith_deny, deleted_for_probe)));
     }
     if units.is_empty() {
         return Ok(Vec::new());
@@ -284,33 +296,31 @@ pub(super) async fn fetch_opann_leaves(
 
     let column = Arc::new(column.to_owned());
     let query = Arc::new(query.to_vec());
-    let deleted_for_kernel = Arc::clone(&deleted);
     let kernel = move |r: Arc<SuperfileReader>,
-                       (metas, bitmap, arith_deny): (
+                       (metas, bitmap, arith_deny, deleted_for_probe): (
         Vec<(u32, u32, u32)>,
         Option<Arc<RoaringBitmap>>,
         Option<Arc<RoaringBitmap>>,
+        Option<Arc<Vec<i128>>>,
     )| {
         let column = Arc::clone(&column);
         let query = Arc::clone(&query);
-        let deleted = Arc::clone(&deleted_for_kernel);
         async move {
             let v = r.vec().ok_or_else(|| {
                 QueryError::Store("hidden cell superfile missing vector subsection".into())
             })?;
-            // Per-cell deny-set of LOCAL doc-ids (deleted user `_id`s). A
-            // contiguous-span INCOMING superfile is mapped arithmetically by the
-            // caller (`arith_deny`); a gapped cell maps through its inline `_id`
-            // region here. Either way the set is in the kernel's DOC_ID space.
-            let deny = match arith_deny {
-                Some(d) => Some(d),
-                None => v.inline_deleted_locals(&deleted).await.map_err(map_vector_err)?.map(Arc::new),
-            };
-            // Every leaf is a cluster range; fetch the admitted clusters as
-            // contiguous range-GETs and score them. No whole-cell rescan.
-            v.probe_clusters_at_async(&column, &query, k, &metas, rerank_mult, bitmap, deny)
-                .await
-                .map_err(map_vector_err)
+            v.probe_clusters_at_async(
+                &column,
+                &query,
+                k,
+                &metas,
+                rerank_mult,
+                bitmap,
+                arith_deny,
+                deleted_for_probe,
+            )
+            .await
+            .map_err(map_vector_err)
         }
     };
 
@@ -361,14 +371,17 @@ fn map_vector_err(e: VectorError) -> QueryError {
     QueryError::Store(format!("vector leaf fetch: {e}"))
 }
 
-/// Pre-heap deny-set (in DOC_ID space) for a contiguous-span superfile: row `i`
-/// carries `_id == id_min + i`, so a deleted `_id` in `[id_min, id_max]` maps to
-/// DOC_ID `_id - id_min` by arithmetic — the exact space
-/// `score_cluster_codes_into_heap` tests `deny` in, with no inline `_id` region
-/// and no read. `None` when the span is gapped (the caller maps through the
-/// cell's inline `_id` region instead) or nothing in `deleted` falls in range.
+/// Pre-heap deny-set (in DOC_ID space) for a user-staged superfile whose rows
+/// are a contiguous `_id` span: row `i` carries `_id == id_min + i`, so a
+/// deleted `_id` in `[id_min, id_max]` maps to DOC_ID `_id - id_min` by
+/// arithmetic — the exact space `score_cluster_codes_into_heap` tests `deny`
+/// in, with no inline `_id` region and no read. Hidden per-cell outputs do not
+/// qualify (gapped inline region); the probe path maps those instead.
 fn arith_deny_locals(entry: &SuperfileEntry, deleted: &[i128]) -> Option<Arc<RoaringBitmap>> {
-    if deleted.is_empty() || row_id_from_manifest_entry(entry, 0).is_none() {
+    if deleted.is_empty()
+        || !entry.is_user_staged_for_hidden_index()
+        || row_id_from_manifest_entry(entry, 0).is_none()
+    {
         return None;
     }
     let (id_min, id_max) = (entry.id_min, entry.id_max);
