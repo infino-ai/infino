@@ -8,10 +8,34 @@ name: Benchmark
 # gets none. Fork code is gated on maintainer approval before secrets are
 # exposed (see `is_fork_pr`).
 on:
+  push:
+    branches: [main]
+    # Only refresh the baseline when perf-relevant code lands. Doc/example/
+    # binding-only merges can't move performance, so skip the VM spin-up.
+    # (GitHub Actions ignores YAML anchors, so the list is repeated below.)
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/bench.yml"
+      - ".github/workflows/supertable-bench-azure.yml"
   pull_request_target:
     branches: [main]
     # Code/state changes only — never on label or comment activity.
     types: [opened, synchronize, reopened]
+    # Same allowlist: skip the 4-VM bench on doc/example/binding-only PRs.
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/bench.yml"
+      - ".github/workflows/supertable-bench-azure.yml"
 
 jobs:
   bench:

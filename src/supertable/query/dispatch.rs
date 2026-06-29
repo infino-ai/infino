@@ -217,6 +217,19 @@ where
         cache.prefetch(&ids, now).await;
     }
 
+    // Single unit (the common case for a compacted, single-superfile
+    // table): run the body inline on the current task. `tokio::spawn`
+    // here would only add a thread handoff and a join with nothing to
+    // overlap against — the spawn path's win is concurrency across units,
+    // which doesn't exist at one unit. Semantically identical to the
+    // fan-out below with a one-element result.
+    if units.len() == 1 {
+        let (entry, params) = units.into_iter().next().expect("len == 1");
+        let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+        let out = body(r, entry, tombstone_cache, now, params).await?;
+        return Ok(vec![out]);
+    }
+
     let handles = units.into_iter().map(|(entry, params)| {
         let store = Arc::clone(&store);
         let disk_cache = disk_cache.clone();

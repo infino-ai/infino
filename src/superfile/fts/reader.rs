@@ -2925,11 +2925,61 @@ fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
     out
 }
 
-/// The union's cardinality ([`or_walk_unranked`] counted) — no `Vec`
-/// materialized, for the count path.
-fn or_count_unranked(cursors: Vec<TermCursor>) -> u64 {
+/// The union's cardinality via a block-at-a-time disjunction count.
+/// Walks the cursors one fixed doc-id window at a time, marks each
+/// matching doc in a small presence bitset, and accumulates the
+/// per-window popcount. Windows partition the doc-id space disjointly,
+/// so a doc matching several terms is counted once and no doc spans two
+/// windows — the tally equals the distinct-doc union size.
+///
+/// This replaces the per-doc k-way merge the count path used to share
+/// with [`or_merge_unranked`]: that walk rescanned every cursor for each
+/// matched doc (cost ∝ union size × term count), which degraded
+/// super-linearly on long common-term unions. The windowed walk advances
+/// each cursor once per doc and scans the cursor set only once per
+/// window, so its cost scales with the union size, not the product. It
+/// mirrors the window machinery of [`FtsReader::run_windowed_union`] but
+/// drops scoring and the top-k heap, since a count needs neither order
+/// nor scores. No doc-id list is materialized.
+fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
+    let mut present = [0u64; OR_WINDOW_WORDS];
     let mut n = 0u64;
-    or_walk_unranked(cursors, |_| n += 1);
+    loop {
+        // Smallest current doc among live cursors, aligned down to a
+        // window boundary — O(terms) per window, not per doc.
+        let mut min_doc = u32::MAX;
+        for c in &cursors {
+            if !c.is_exhausted() {
+                min_doc = min_doc.min(c.current_doc_id());
+            }
+        }
+        if min_doc == u32::MAX {
+            break;
+        }
+        let base = min_doc & !(OR_WINDOW - 1);
+        // Saturate so a doc id within OR_WINDOW of u32::MAX can't overflow
+        // `base + OR_WINDOW` (matches run_windowed_union); real doc ids
+        // never reach that range, so the window stays full-width.
+        let window_end = base.saturating_add(OR_WINDOW);
+        // Mark each cursor's docs in [base, window_end). `d - base` is in
+        // range because every live cursor sits at >= min_doc >= base.
+        for c in &mut cursors {
+            while !c.is_exhausted() {
+                let d = c.current_doc_id();
+                if d >= window_end {
+                    break;
+                }
+                let local = (d - base) as usize;
+                present[local >> 6] |= 1u64 << (local & 63);
+                c.next();
+            }
+        }
+        // Count distinct docs in this window and clear for reuse.
+        for word in present.iter_mut() {
+            n += word.count_ones() as u64;
+            *word = 0;
+        }
+    }
     n
 }
 
@@ -3585,6 +3635,68 @@ mod tests {
                 .expect("token_match_count");
             assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn or_count_spans_multiple_windows() {
+        // The windowed disjunction count must equal the union's true
+        // cardinality when the doc-id space spans several OR_WINDOW
+        // windows — exercising cross-window accumulation, the per-window
+        // popcount + clear, and dedup of docs that match multiple terms
+        // within one window. The naive ascending merge (token_match
+        // length) is the reference. Tied to OR_WINDOW so it keeps crossing
+        // the boundary if the window size changes.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha "); // every doc
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: &[&[&str]] = &[
+            &["alpha"],                           // every doc
+            &["beta", "gamma"],                   // overlap on docs % 6
+            &["alpha", "beta", "gamma", "delta"], // all overlapping
+            &["gamma", "zzz_absent"],             // one absent term
+        ];
+        for terms in shapes {
+            let merge_len = r
+                .token_match("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match")
+                .len() as u64;
+            let count = r
+                .token_match_count("body", terms, BoolMode::Or)
+                .await
+                .expect("token_match_count");
+            assert_eq!(
+                count, merge_len,
+                "windowed count vs merge len for {terms:?}"
+            );
+        }
+        // `alpha` is in every doc, so its union count is exactly N_DOCS —
+        // pins the absolute multi-window cardinality, not just agreement
+        // with the merge.
+        assert_eq!(
+            r.token_match_count("body", &["alpha"], BoolMode::Or)
+                .await
+                .expect("count"),
+            N_DOCS as u64
+        );
     }
 
     #[tokio::test]

@@ -68,7 +68,7 @@ jobs:
       - run: make public-api
 
   python:
-    name: Python bindings (${{ matrix.os }})
+    name: Python wheel & tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # The bindings build `infino` as a normal dependency; don't fail the
     # build on a transitive-dependency deprecation warning. infino's own
@@ -77,8 +77,9 @@ jobs:
       RUSTFLAGS: ""
     strategy:
       fail-fast: false
+      # Native host build (no cross-compile); one abi3 wheel each, CPython >= 3.9.
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -99,10 +100,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: infino-python
-      # Builds the extension + runs the smoke tests (self-contained venv).
-      - run: make python-test
-      # Type-check the shipped stubs against a sample consumer (mypy --strict).
-      - run: make python-typecheck
+      # Release abi3 wheel — the shipped artifact.
+      - run: make python-wheel
+      # Test the wheel via the advertised `uv pip install` path.
+      # duckdb keeps the Parquet-interop test from being skipped.
+      - name: Smoke-test wheel with uv
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade uv
+          uv venv /tmp/uv-smoke
+          uv pip install --python /tmp/uv-smoke infino-python/dist/*.whl pytest pyarrow pandas duckdb
+          /tmp/uv-smoke/bin/python -m pytest infino-python/tests/ -v
+      # mypy --strict over the stubs; platform-independent, so run once.
+      - name: Type-check stubs
+        if: matrix.os == 'ubuntu-latest'
+        run: make python-typecheck
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: infino-python/dist
 
   python-examples:
     name: Python examples (end to end)
@@ -143,52 +159,6 @@ jobs:
           restore-keys: hf-${{ runner.os }}-
       # Run every notebook; the LLM answer step runs when the secrets are present.
       - run: make python-examples-test
-
-  python-wheels:
-    name: Wheel (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: ""
-    strategy:
-      fail-fast: false
-      # Native runner per platform — `make python-wheel` builds for the
-      # host, so no cross-compilation. One abi3 wheel each (CPython >= 3.9).
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: infino-python
-      - run: make python-wheel
-      # The README advertises `uv pip install infino`; verify that path
-      # against the freshly built wheel, not just pip.
-      - name: Smoke-test wheel with uv
-        shell: bash
-        run: |
-          python3 -m pip install --upgrade uv
-          uv venv /tmp/uv-smoke
-          uv pip install --python /tmp/uv-smoke infino-python/dist/*.whl pytest pyarrow pandas
-          /tmp/uv-smoke/bin/python -m pytest infino-python/tests/ -v
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.os }}
-          path: infino-python/dist
 
   node:
     name: Node bindings (${{ matrix.os }})

@@ -525,6 +525,19 @@ pub mod fts {
         fts::{FTS_BATTERY, FtsRead},
     };
 
+    /// Large top-k for the serving-scale query-phase scaling gate —
+    /// mirrors the superfile tier. Query phase only, over a small subset
+    /// (the full battery's fetch at this k would dominate the budget).
+    const K_LARGE: usize = 1000;
+    /// Representative shapes for the large-k gate: a common term, a small
+    /// and a large OR, and an AND.
+    const K_LARGE_SHAPE_NAMES: &[&str] = &[
+        "single_common",
+        "two_term_or",
+        "ten_term_or",
+        "two_term_and",
+    ];
+
     /// Build an FTS-only supertable, then measure warm and cold BM25
     /// reads through the shared FTS executor (same code superfile runs).
     pub fn run(phases: Phases) {
@@ -563,9 +576,9 @@ pub mod fts {
             drop(cache_dir);
         }
 
-        let (warm, counts) = match phases.warm.then(|| measure_warm(&built)) {
-            Some((w, c)) => (Some(w), Some(c)),
-            None => (None, None),
+        let (warm, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
+            Some((w, c, l)) => (Some(w), Some(c), Some(l)),
+            None => (None, None, None),
         };
         let cold = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
@@ -584,6 +597,32 @@ pub mod fts {
                 cold.as_ref(),
                 None,
             );
+        }
+
+        if let Some(large_k) = &large_k {
+            report.emit(&Section {
+                anchor: "bench/fts/supertable/search-large-k".into(),
+                title: format!(
+                    "Supertable FTS — search top-{K_LARGE} (query phase), multi-superfile / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                note: format!(
+                    "Query-phase p50 at k = {K_LARGE} for representative shapes — gates how top-k \
+                     collection cost scales with k vs the top-{TOP_K} table at serving scale. Δ is \
+                     vs the previous run."
+                ),
+                blocks: vec![Block {
+                    subtitle: format!("top-{K_LARGE} queries"),
+                    headers: vec!["Query".into(), "warm (query)".into()],
+                    rows: large_k
+                        .iter()
+                        .map(|(name, d)| {
+                            let ns = d.as_secs_f64() * 1e9;
+                            vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                        })
+                        .collect(),
+                }],
+            });
         }
 
         if let Some(counts) = &counts {
@@ -654,7 +693,11 @@ pub mod fts {
 
     fn measure_warm(
         built: &supertable::IngestResult,
-    ) -> (Vec<exec_fts::FtsQueryStat>, Vec<exec_fts::CountStat>) {
+    ) -> (
+        Vec<exec_fts::FtsQueryStat>,
+        Vec<exec_fts::CountStat>,
+        Vec<(&'static str, Duration)>,
+    ) {
         eprintln!(
             "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
         );
@@ -707,9 +750,31 @@ pub mod fts {
             "supertable_fts",
         );
         crate::rss::log_rss_breakdown("supertable_fts after count battery");
+        // Large-k gate (query phase only, representative subset): surfaces
+        // top-k collection cost at serving scale that the top-K table hides.
+        eprintln!(
+            "[supertable_fts] large-k: timing top-{K_LARGE} query phase × {WARM_ITERS} iters..."
+        );
+        let large_k: Vec<(&'static str, Duration)> = FTS_BATTERY
+            .iter()
+            .filter(|q| K_LARGE_SHAPE_NAMES.contains(&q.name))
+            .map(|q| {
+                let query = q.terms.join(" ");
+                let mode = exec_fts::to_infino_mode(q.mode);
+                let _ = reader.bm25_rows(supertable::TEXT_COLUMN, &query, K_LARGE, mode);
+                let mut samples = Vec::with_capacity(WARM_ITERS);
+                for _ in 0..WARM_ITERS {
+                    let t = Instant::now();
+                    let n = reader.bm25_rows(supertable::TEXT_COLUMN, &query, K_LARGE, mode);
+                    samples.push(t.elapsed());
+                    std::hint::black_box(n);
+                }
+                (q.name, crate::executors::p50(&mut samples))
+            })
+            .collect();
         drop(consumer);
         drop(cache_dir);
-        (out, counts)
+        (out, counts, large_k)
     }
 
     fn measure_cold(
