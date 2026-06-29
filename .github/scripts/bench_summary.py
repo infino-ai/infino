@@ -172,8 +172,8 @@ def diff(reports, baseline_dir, current_dir, threshold):
     return regressions, improvements, had_baseline, cost_present
 
 
-def finding(entry, kind):
-    return f"- `{entry['metric']}`: {entry['change']} ({entry['pct']:+.0f}%) [{kind}]"
+def finding(entry):
+    return f"- `{entry['metric']}`: {entry['change']} ({entry['pct']:+.0f}%)"
 
 
 def main():
@@ -228,15 +228,19 @@ def main():
     if not failures and not had_baseline:
         parts += [f"_No {base_ref} baseline to diff against (first run or new config)._", ""]
     elif not failures:
-        parts += ["### Primary Findings"]
+        parts += ["### Primary Findings", ""]
         if prim_regr:
             # Never truncate gate-failing signals.
-            parts.extend(finding(e, "REGRESSION") for e in prim_regr)
+            parts.append("**Regressions:**")
+            parts.extend(finding(e) for e in prim_regr)
+            parts.append("")
         if prim_impr:
-            parts.extend(finding(e, "IMPROVEMENT") for e in prim_impr)
+            parts.append("**Improvements:**")
+            parts.extend(finding(e) for e in prim_impr)
+            parts.append("")
         if not prim_regr and not prim_impr:
             parts.append(f"- No primary regressions detected vs {base_ref}.")
-        parts.append("")
+            parts.append("")
 
     parts.append("### Decision")
     if failures or prim_regr:
