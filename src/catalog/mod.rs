@@ -528,22 +528,13 @@ fn backend_to_provider(
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
         Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new(root.clone())?)),
-        Backend::S3 { bucket, prefix } => {
-            let p = match options.s3.as_ref() {
-                Some(s3) => S3StorageProvider::new_with_endpoint_and_prefix(
-                    &s3.endpoint,
-                    bucket,
-                    &s3.access_key,
-                    &s3.secret_key,
-                    &s3.region,
-                    prefix,
-                )?,
-                None => S3StorageProvider::new_with_prefix(bucket, prefix)?,
-            };
-            Some(Arc::new(p))
-        }
+        Backend::S3 { bucket, prefix } => Some(Arc::new(S3StorageProvider::new_with_prefix(
+            bucket,
+            prefix,
+            &options.storage_options,
+        )?)),
         Backend::Azure { container, prefix } => Some(Arc::new(
-            AzureStorageProvider::new_with_prefix(container, prefix)?,
+            AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?,
         )),
     };
     Ok(provider)

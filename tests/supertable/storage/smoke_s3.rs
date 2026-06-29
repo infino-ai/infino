@@ -201,12 +201,29 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
     .with_writer_pool(pool)
 }
 
+/// Real-S3 credential options from the AWS environment, for the gated
+/// `INFINO_TEST_REAL_S3` test. Infino's provider no longer reads the
+/// environment; the test passes these as config.
+fn real_s3_storage_options() -> std::collections::HashMap<String, String> {
+    [
+        ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+        ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+        ("AWS_SESSION_TOKEN", "aws_session_token"),
+        ("AWS_REGION", "aws_region"),
+        ("AWS_DEFAULT_REGION", "aws_region"),
+    ]
+    .iter()
+    .filter_map(|(env, key)| std::env::var(env).ok().map(|v| (key.to_string(), v)))
+    .collect()
+}
+
 fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> Config {
     Config {
         supertable: SupertableSettings::default(),
         storage: StorageSettings {
             backend: StorageBackend::S3,
             bucket: Some(bucket.to_string()),
+            storage_options: real_s3_storage_options(),
             prefix: prefix.to_string(),
             disk_cache_root: Some(cache_root.to_path_buf()),
             disk_budget_bytes: 1 << 30,
@@ -521,8 +538,9 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         Ok::<Vec<String>, String>(cleanup_keys)
     }
     .await;
-    let cleanup_storage = S3StorageProvider::new_with_prefix(&bucket, &prefix)
-        .expect("real S3 cleanup provider from AWS env");
+    let cleanup_storage =
+        S3StorageProvider::new_with_prefix(&bucket, &prefix, &real_s3_storage_options())
+            .expect("real S3 cleanup provider from AWS env");
     if let Ok(keys) = &result {
         for key in keys {
             let _ = cleanup_storage.delete(key).await;

@@ -9,8 +9,23 @@
 //! expose.  Everything here is specific to the fixed
 //! `devstoreaccount1` emulator credentials that Azurite ships with.
 
+use std::collections::HashMap;
+
 use base64::Engine;
 use sha2::{Digest, Sha256};
+
+/// Real-Azure credential options from the `AZURE_STORAGE_*` environment,
+/// for the gated `INFINO_TEST_REAL_AZURE` tests. Infino's provider no
+/// longer reads the environment; the test passes these as config.
+pub fn real_azure_storage_options() -> HashMap<String, String> {
+    [
+        ("AZURE_STORAGE_ACCOUNT_NAME", "azure_storage_account_name"),
+        ("AZURE_STORAGE_ACCOUNT_KEY", "azure_storage_account_key"),
+    ]
+    .iter()
+    .filter_map(|(env, key)| std::env::var(env).ok().map(|v| (key.to_string(), v)))
+    .collect()
+}
 
 /// Azurite blob endpoint for the well-known `devstoreaccount1` account.
 pub const EMULATOR_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";

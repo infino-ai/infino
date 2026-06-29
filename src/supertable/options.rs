@@ -854,6 +854,7 @@ impl SupertableOptions {
                 Some(Arc::new(S3StorageProvider::new_with_prefix(
                     bucket,
                     &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
                 )?) as Arc<dyn StorageProvider>)
             }
             StorageBackend::Azure => {
@@ -863,6 +864,7 @@ impl SupertableOptions {
                 Some(Arc::new(AzureStorageProvider::new_with_prefix(
                     container,
                     &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
                 )?) as Arc<dyn StorageProvider>)
             }
         };

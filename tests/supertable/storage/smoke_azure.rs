@@ -500,8 +500,12 @@ async fn supertable_real_azure_round_trip() {
     }
     .await;
 
-    let cleanup_storage = AzureStorageProvider::new_with_prefix(&container, &prefix)
-        .expect("real Azure cleanup provider from env");
+    let cleanup_storage = AzureStorageProvider::new_with_prefix(
+        &container,
+        &prefix,
+        &super::azure_helpers::real_azure_storage_options(),
+    )
+    .expect("real Azure cleanup provider from env");
     if let Ok(keys) = &result {
         for key in keys {
             let _ = cleanup_storage.delete(key).await;
@@ -653,8 +657,12 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
 
     let result = async {
         let azure: Arc<dyn StorageProvider> = Arc::new(
-            AzureStorageProvider::new_with_prefix(&container, &prefix)
-                .map_err(|e| format!("azure provider: {e}"))?,
+            AzureStorageProvider::new_with_prefix(
+                &container,
+                &prefix,
+                &super::azure_helpers::real_azure_storage_options(),
+            )
+            .map_err(|e| format!("azure provider: {e}"))?,
         );
         let counting = Arc::new(CountingStorage::new(Arc::clone(&azure)));
         let counting_dyn: Arc<dyn StorageProvider> =
@@ -784,8 +792,12 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
     }
     .await;
 
-    let cleanup = AzureStorageProvider::new_with_prefix(&container, &prefix)
-        .expect("real Azure cleanup provider");
+    let cleanup = AzureStorageProvider::new_with_prefix(
+        &container,
+        &prefix,
+        &super::azure_helpers::real_azure_storage_options(),
+    )
+    .expect("real Azure cleanup provider");
     match &result {
         Ok(keys) => {
             for key in keys {

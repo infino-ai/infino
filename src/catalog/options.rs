@@ -6,20 +6,9 @@
 //! [`connect_with`](crate::connect_with); plain [`connect`](crate::connect)
 //! uses the default.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::supertable::reader_cache::ColdFetchMode as InternalColdFetchMode;
-
-/// Explicit S3-compatible endpoint + static credentials — for MinIO,
-/// Cloudflare R2, Ceph, or a test S3 server. When unset, S3 uses the
-/// ambient AWS default-credential chain and default region.
-#[derive(Debug, Clone)]
-pub(crate) struct S3Config {
-    pub(crate) endpoint: String,
-    pub(crate) region: String,
-    pub(crate) access_key: String,
-    pub(crate) secret_key: String,
-}
 
 /// How a disk-cache miss is serviced when reading cold superfiles from
 /// object storage. Only meaningful when a disk cache is configured
@@ -57,11 +46,13 @@ impl ColdFetchMode {
 /// `connect` (`s3://…`, `az://…`, `file://…`, `memory://`, or a bare
 /// path), not from these options — `ConnectOptions` carries only what
 /// the URI can't express. The common cases need no options:
-/// `connect("./data")` and `connect("s3://bucket/prefix")` (ambient AWS
-/// credentials) both work with the default.
+/// `connect("./data")` and `connect("s3://bucket/prefix")` (ambient
+/// cloud identity) both work with the default.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
-    pub(crate) s3: Option<S3Config>,
+    /// Credentials/tuning for the URI-selected backend, keyed by
+    /// `object_store` config strings. Empty → ambient cloud identity.
+    pub(crate) storage_options: HashMap<String, String>,
     /// Disk-cache root. `None` (default) → caching off; cold reads go
     /// straight to object storage. Set → a local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
@@ -103,22 +94,66 @@ impl ConnectOptions {
         self
     }
 
-    /// Use an explicit S3-compatible endpoint with static credentials
-    /// (MinIO / R2 / Ceph / a test S3 server) instead of the ambient AWS
-    /// default-credential chain. Only affects `s3://` catalogs.
+    /// Set one storage option (e.g. `aws_access_key_id`,
+    /// `azure_storage_account_key`). An unknown or cross-backend key
+    /// errors at connect time. Chainable.
+    pub fn with_storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.storage_options.insert(key.into(), value.into());
+        self
+    }
+
+    /// Convenience for a custom S3-compatible endpoint (MinIO / R2 / Ceph)
+    /// — sets the equivalent `aws_*` options. Only affects `s3://`.
     pub fn with_s3_endpoint(
-        mut self,
+        self,
         endpoint: impl Into<String>,
         region: impl Into<String>,
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
     ) -> Self {
-        self.s3 = Some(S3Config {
-            endpoint: endpoint.into(),
-            region: region.into(),
-            access_key: access_key.into(),
-            secret_key: secret_key.into(),
-        });
-        self
+        self.with_storage_option("aws_endpoint", endpoint)
+            .with_storage_option("aws_region", region)
+            .with_storage_option("aws_access_key_id", access_key)
+            .with_storage_option("aws_secret_access_key", secret_key)
+            .with_storage_option("aws_allow_http", "true")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_storage_option_round_trips() {
+        let o = ConnectOptions::new().with_storage_option("aws_region", "us-east-1");
+        assert_eq!(
+            o.storage_options.get("aws_region").map(String::as_str),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn with_s3_endpoint_populates_storage_options() {
+        let o = ConnectOptions::new().with_s3_endpoint("http://e", "r", "ak", "sk");
+        assert_eq!(
+            o.storage_options.get("aws_endpoint").map(String::as_str),
+            Some("http://e")
+        );
+        assert_eq!(
+            o.storage_options.get("aws_region").map(String::as_str),
+            Some("r")
+        );
+        assert_eq!(
+            o.storage_options
+                .get("aws_access_key_id")
+                .map(String::as_str),
+            Some("ak")
+        );
+        assert_eq!(
+            o.storage_options
+                .get("aws_secret_access_key")
+                .map(String::as_str),
+            Some("sk")
+        );
     }
 }

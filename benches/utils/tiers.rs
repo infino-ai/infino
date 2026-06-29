@@ -11,6 +11,7 @@
 //! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, OnceLock},
 };
@@ -211,6 +212,36 @@ fn azure_prefix_root(default: &str) -> String {
     std::env::var("INFINO_REAL_AZURE_PREFIX").unwrap_or_else(|_| default.to_string())
 }
 
+/// Collect object-store credential options from `env_to_key` pairs that
+/// are set. Infino's providers no longer read the environment; the bench
+/// harness gathers credentials here and passes them as config.
+fn storage_options_from_env(env_to_key: &[(&str, &str)]) -> HashMap<String, String> {
+    env_to_key
+        .iter()
+        .filter_map(|(env, key)| std::env::var(env).ok().map(|v| (key.to_string(), v)))
+        .collect()
+}
+
+/// Standard S3 credential options from the AWS environment.
+pub fn s3_storage_options() -> HashMap<String, String> {
+    storage_options_from_env(&[
+        ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+        ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+        ("AWS_SESSION_TOKEN", "aws_session_token"),
+        ("AWS_REGION", "aws_region"),
+        ("AWS_DEFAULT_REGION", "aws_region"),
+        ("AWS_ENDPOINT", "aws_endpoint"),
+    ])
+}
+
+/// Standard Azure credential options from the environment.
+pub fn azure_storage_options() -> HashMap<String, String> {
+    storage_options_from_env(&[
+        ("AZURE_STORAGE_ACCOUNT_NAME", "azure_storage_account_name"),
+        ("AZURE_STORAGE_ACCOUNT_KEY", "azure_storage_account_key"),
+    ])
+}
+
 /// Whether to retain the run's unique prefix instead of deleting it.
 fn keep_table() -> bool {
     std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
@@ -281,10 +312,11 @@ impl Backend {
         match self {
             Self::S3sFs => None,
             Self::S3 { bucket } => Some(Arc::new(
-                S3StorageProvider::new_with_prefix(bucket, prefix).expect("real S3 provider"),
+                S3StorageProvider::new_with_prefix(bucket, prefix, &s3_storage_options())
+                    .expect("real S3 provider"),
             )),
             Self::Azure { container } => Some(Arc::new(
-                AzureStorageProvider::new_with_prefix(container, prefix)
+                AzureStorageProvider::new_with_prefix(container, prefix, &azure_storage_options())
                     .expect("real Azure provider"),
             )),
         }

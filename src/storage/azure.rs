@@ -17,11 +17,11 @@ use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions, PutPayload, UpdateVersion,
-    azure::{MicrosoftAzure, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, MicrosoftAzure, MicrosoftAzureBuilder},
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider, retry};
+use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.
@@ -33,37 +33,41 @@ pub struct AzureStorageProvider {
 }
 
 impl AzureStorageProvider {
-    /// Construct from the standard Azure credential chain
-    /// (`AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY`,
-    /// read by `from_env`) + an explicit container.
+    /// Azure provider for `container` with no explicit options —
+    /// credentials resolve through object_store's ambient chain (managed
+    /// identity). Infino never reads Azure credentials from the process
+    /// environment; pass them through [`Self::new_with_prefix`] otherwise.
     pub fn new(container: impl Into<String>) -> Result<Self, StorageError> {
-        let container = container.into();
-        let store = MicrosoftAzureBuilder::from_env()
-            .with_container_name(&container)
-            .with_client_options(tuned_client_options())
-            .with_retry(retry::config())
-            .build()
-            .map_err(|e| StorageError::Permanent {
-                uri: format!("azure://{container}"),
-                source: Box::new(e),
-            })?;
-        Ok(Self {
-            container,
-            prefix: String::new(),
-            store: Arc::new(store),
-        })
+        Self::new_with_prefix(container, "", &StorageOptions::new())
     }
 
-    /// Construct scoped to a logical table prefix inside
-    /// `container`. The prefix is prepended to every storage URI,
-    /// isolating each table under `azure://container/prefix/`.
+    /// Azure provider scoped to `prefix` inside `container`, configured
+    /// from `opts` (account/key, keyed by object_store's `azure_*`
+    /// strings). The prefix isolates each table under
+    /// `azure://container/prefix/`.
     pub fn new_with_prefix(
         container: impl Into<String>,
         prefix: impl Into<String>,
+        opts: &StorageOptions,
     ) -> Result<Self, StorageError> {
-        let mut provider = Self::new(container)?;
-        provider.prefix = normalize_prefix(prefix);
-        Ok(provider)
+        let container = container.into();
+        let uri = format!("azure://{container}");
+        let builder = MicrosoftAzureBuilder::new()
+            .with_container_name(&container)
+            .with_client_options(tuned_client_options())
+            .with_retry(retry::config());
+        let builder = apply::<AzureConfigKey, _>(builder, opts, &uri, |b, key, value| {
+            b.with_config(key, value)
+        })?;
+        let store = builder.build().map_err(|e| StorageError::Permanent {
+            uri,
+            source: Box::new(e),
+        })?;
+        Ok(Self {
+            container,
+            prefix: normalize_prefix(prefix),
+            store: Arc::new(store),
+        })
     }
 
     /// Construct against the Azurite emulator. `with_use_emulator`
@@ -441,6 +445,23 @@ mod tests {
         let p = AzureStorageProvider::new_with_emulator("emu-container")
             .expect("construct with emulator");
         assert_eq!(p.container(), "emu-container");
+    }
+
+    #[test]
+    fn applies_account_options_and_exposes_container() {
+        let opts = StorageOptions::from([
+            ("azure_storage_account_name".to_string(), "acct".to_string()),
+            ("azure_storage_account_key".to_string(), "a2V5".to_string()),
+        ]);
+        let p = AzureStorageProvider::new_with_prefix("c", "p", &opts).expect("build azure");
+        assert_eq!(p.container(), "c");
+        assert_eq!(p.prefix(), "p");
+    }
+
+    #[test]
+    fn rejects_cross_backend_aws_key() {
+        let opts = StorageOptions::from([("aws_region".to_string(), "us-east-1".to_string())]);
+        assert!(AzureStorageProvider::new_with_prefix("c", "", &opts).is_err());
     }
 
     #[test]

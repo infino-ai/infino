@@ -17,21 +17,10 @@
 //!
 //! ## Construction
 //!
-//! Three shapes, all behind the same [`Self::new`] +
-//! `*_with_endpoint` constructors:
-//!
-//!   - **AWS production**: build the underlying
-//!     `AmazonS3Builder` from environment (AWS_ACCESS_KEY_ID
-//!     etc.) and pass it via [`Self::from_object_store`].
-//!   - **s3s-fs test harness**: [`Self::new_with_endpoint`]
-//!     takes the harness's `http://127.0.0.1:<port>` endpoint
-//!     plus a bucket name + test credential pair. The
-//!     `supertable/storage/smoke_s3.rs` integration test uses
-//!     this to exercise the wire protocol without an AWS
-//!     account.
-//!   - **Self-hosted S3-compatible** (Ceph, R2, etc.): same
-//!     `new_with_endpoint` shape with the relevant endpoint +
-//!     credentials.
+//! All credentials/region/endpoint come from a [`StorageOptions`] map
+//! keyed by object_store's `aws_*` config strings — infino reads nothing
+//! from the environment. [`Self::new_with_prefix`] is the primary path;
+//! [`Self::new_with_endpoint`] is a convenience for s3s-fs / MinIO / Ceph.
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -41,11 +30,15 @@ use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectStore,
     ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut},
+    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider, retry};
+use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+
+/// Its presence in `opts` selects the S3-compatible-endpoint build
+/// profile (path-style, object_store client defaults) over the AWS one.
+const ENDPOINT_KEY: &str = "aws_endpoint";
 
 /// S3-backed `StorageProvider`. Cheap to clone; the inner
 /// `AmazonS3` shares its HTTP client across clones.
@@ -57,53 +50,55 @@ pub struct S3StorageProvider {
 }
 
 impl S3StorageProvider {
-    /// Construct an S3 provider from the standard AWS
-    /// credential chain (env vars / instance profile / etc.)
-    /// + an explicit bucket. The supertable's URIs are
-    /// keyed off `<bucket>/<uri>`.
+    /// S3 provider for `bucket` with no explicit options — credentials
+    /// resolve through object_store's ambient chain (IAM role / workload
+    /// identity). Infino never reads AWS credentials from the process
+    /// environment; pass them through [`Self::new_with_prefix`] otherwise.
     pub fn new(bucket: impl Into<String>) -> Result<Self, StorageError> {
+        Self::new_with_prefix(bucket, "", &StorageOptions::new())
+    }
+
+    /// S3 provider scoped to `prefix` inside `bucket`, configured from
+    /// `opts` (credentials/region/endpoint, keyed by object_store's
+    /// `aws_*` strings). A custom `aws_endpoint` switches to path-style +
+    /// default client options; the tuned connection pool is AWS-only (it
+    /// destabilizes local s3s-fs / MinIO endpoints).
+    pub fn new_with_prefix(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        opts: &StorageOptions,
+    ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
-        let store = AmazonS3Builder::from_env()
+        let uri = format!("s3://{bucket}");
+        let has_endpoint = opts.keys().any(|k| k.eq_ignore_ascii_case(ENDPOINT_KEY));
+
+        let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&bucket)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_client_options(tuned_client_options())
-            .with_retry(retry::config())
-            .build()
-            .map_err(|e| StorageError::Permanent {
-                uri: format!("s3://{bucket}"),
-                source: Box::new(e),
-            })?;
+            .with_retry(retry::config());
+        builder = if has_endpoint {
+            builder.with_virtual_hosted_style_request(false)
+        } else {
+            builder.with_client_options(tuned_client_options())
+        };
+        // Caller options last so they win (e.g. `aws_allow_http=true`).
+        let builder = apply::<AmazonS3ConfigKey, _>(builder, opts, &uri, |b, key, value| {
+            b.with_config(key, value)
+        })?;
+
+        let store = builder.build().map_err(|e| StorageError::Permanent {
+            uri,
+            source: Box::new(e),
+        })?;
         Ok(Self {
             bucket,
-            prefix: String::new(),
+            prefix: normalize_prefix(prefix),
             store: Arc::new(store),
         })
     }
 
-    /// Construct an S3 provider scoped to a logical table
-    /// prefix inside `bucket`. The prefix is prepended to every
-    /// storage URI, so callers can use the normal supertable
-    /// paths (`_supertable/current`, `data/seg-...`) while
-    /// isolating each table under `s3://bucket/prefix/`.
-    pub fn new_with_prefix(
-        bucket: impl Into<String>,
-        prefix: impl Into<String>,
-    ) -> Result<Self, StorageError> {
-        let mut provider = Self::new(bucket)?;
-        provider.prefix = normalize_prefix(prefix);
-        Ok(provider)
-    }
-
-    /// Construct an S3 provider pointed at a custom endpoint
-    /// + explicit credentials. Used by
-    /// `tests/supertable_smoke_s3.rs` for the s3s-fs
-    /// integration test (`endpoint = "http://127.0.0.1:<port>"`)
-    /// and by callers using a self-hosted S3-compatible
-    /// service (MinIO etc.).
-    ///
-    /// `allow_http` is enabled so plain-HTTP endpoints
-    /// (typical for in-process test harnesses) don't get
-    /// rejected by the AWS SDK's HTTPS check.
+    /// Custom S3-compatible endpoint with static credentials (s3s-fs /
+    /// MinIO / Ceph). `allow_http` is enabled for plain-HTTP endpoints.
     pub fn new_with_endpoint(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,
@@ -111,46 +106,11 @@ impl S3StorageProvider {
         secret_key: impl Into<String>,
         region: impl Into<String>,
     ) -> Result<Self, StorageError> {
-        let bucket = bucket.into();
-        let endpoint = endpoint.into();
-        let store = AmazonS3Builder::new()
-            .with_endpoint(endpoint.clone())
-            .with_bucket_name(&bucket)
-            .with_access_key_id(access_key.into())
-            .with_secret_access_key(secret_key.into())
-            .with_region(region.into())
-            .with_allow_http(true)
-            // Force path-style addressing (bucket as path
-            // prefix, not subdomain). Required for
-            // localhost-style endpoints (s3s-fs, MinIO,
-            // any non-AWS S3-compatible service that
-            // doesn't terminate `<bucket>.<endpoint>` DNS).
-            .with_virtual_hosted_style_request(false)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            // NB: do NOT apply `tuned_client_options()` here. The
-            // deep idle-connection pool / long keep-alive is tuned
-            // for real-S3 fan-out latency and destabilizes local
-            // S3-compatible endpoints (s3s-fs / MinIO): reqwest
-            // reuses connections the emulator has already closed,
-            // surfacing as "error sending request". Also,
-            // `with_client_options` would clobber the
-            // `with_allow_http(true)` above. The endpoint path keeps
-            // object_store's defaults.
-            .build()
-            .map_err(|e| StorageError::Permanent {
-                uri: format!("s3://{bucket} @ {endpoint}"),
-                source: Box::new(e),
-            })?;
-        Ok(Self {
-            bucket,
-            prefix: String::new(),
-            store: Arc::new(store),
-        })
+        Self::new_with_endpoint_and_prefix(endpoint, bucket, access_key, secret_key, region, "")
     }
 
-    /// Custom-endpoint variant of [`Self::new_with_prefix`].
-    /// Used by S3-compatible deployments that also want a
-    /// logical table prefix.
+    /// Custom-endpoint variant of [`Self::new_with_prefix`] for
+    /// S3-compatible deployments that also want a logical table prefix.
     pub fn new_with_endpoint_and_prefix(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,
@@ -159,10 +119,14 @@ impl S3StorageProvider {
         region: impl Into<String>,
         prefix: impl Into<String>,
     ) -> Result<Self, StorageError> {
-        let mut provider =
-            Self::new_with_endpoint(endpoint, bucket, access_key, secret_key, region)?;
-        provider.prefix = normalize_prefix(prefix);
-        Ok(provider)
+        let opts = StorageOptions::from([
+            (ENDPOINT_KEY.to_string(), endpoint.into()),
+            ("aws_access_key_id".to_string(), access_key.into()),
+            ("aws_secret_access_key".to_string(), secret_key.into()),
+            ("aws_region".to_string(), region.into()),
+            ("aws_allow_http".to_string(), "true".to_string()),
+        ]);
+        Self::new_with_prefix(bucket, prefix, &opts)
     }
 
     /// Wrap an already-constructed `AmazonS3` — for advanced
@@ -663,6 +627,20 @@ mod tests {
     fn new_with_endpoint_builds_succeeds_and_exposes_bucket() {
         let p = endpoint_provider();
         assert_eq!(p.bucket(), "test-bucket");
+    }
+
+    #[test]
+    fn rejects_unknown_storage_option_key() {
+        let opts = StorageOptions::from([("not_a_real_key".to_string(), "x".to_string())]);
+        let err = S3StorageProvider::new_with_prefix("b", "", &opts).unwrap_err();
+        assert!(matches!(err, StorageError::Permanent { .. }));
+    }
+
+    #[test]
+    fn rejects_cross_backend_azure_key() {
+        let opts =
+            StorageOptions::from([("azure_storage_account_name".to_string(), "acct".to_string())]);
+        assert!(S3StorageProvider::new_with_prefix("b", "", &opts).is_err());
     }
 
     #[test]

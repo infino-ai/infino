@@ -760,8 +760,12 @@ async fn compact_real_azure_two_jobs_results_preserved() {
     // Cleanup: list and delete every blob written under the prefix.  A
     // no-prefix provider is used so the full object-store paths returned by
     // list_with_prefix can be passed directly to delete().
-    let cleanup_storage =
-        AzureStorageProvider::new(&container).expect("real Azure cleanup provider");
+    let cleanup_storage = AzureStorageProvider::new_with_prefix(
+        &container,
+        "",
+        &super::azure_helpers::real_azure_storage_options(),
+    )
+    .expect("real Azure cleanup provider");
     let all_keys = cleanup_storage
         .list_with_prefix(&prefix)
         .await

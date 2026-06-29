@@ -34,6 +34,7 @@
 //! 3. Add a docstring and a unit test exercising the override path.
 
 use std::{
+    collections::HashMap,
     env, fmt,
     path::{Path, PathBuf},
     time::Duration,
@@ -240,6 +241,9 @@ pub struct StorageSettings {
     pub local_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
+    /// Credentials/tuning for the backend, keyed by `object_store`
+    /// config strings (`aws_*` / `azure_*`). Empty → ambient identity.
+    pub storage_options: HashMap<String, String>,
     /// Logical key prefix inside the bucket. All manifest and
     /// superfile objects are written under
     /// `<bucket>/<prefix>/<manifest|superfiles>/…`. Empty means the
@@ -281,6 +285,7 @@ impl Default for StorageSettings {
             backend: StorageBackend::None,
             local_root: None,
             bucket: None,
+            storage_options: HashMap::new(),
             prefix: String::new(),
             disk_cache_root: None,
             disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
