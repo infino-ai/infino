@@ -84,7 +84,7 @@ on:
       summary_destination:
         description: "Publish benchmark summary to PR comment or Actions run summary."
         required: false
-        default: pr_comment
+        default: step_summary
         type: choice
         options: [pr_comment, step_summary]
   # Callable from other workflows (e.g. the PR group in ci.yml). Same
@@ -112,8 +112,9 @@ on:
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs base_ref to surface in the benchmark summary.
       noise_threshold_pct: { type: string, required: false, default: "5" }
-      # Publish benchmark summary to PR comment or run summary.
-      summary_destination: { type: string, required: false, default: pr_comment }
+      # Publish benchmark summary to PR comment or run summary. Defaults to the
+      # Actions run summary; set pr_comment to also post a sticky PR comment.
+      summary_destination: { type: string, required: false, default: step_summary }
       # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
       is_fork_pr:      { type: boolean, required: false, default: false }
 
