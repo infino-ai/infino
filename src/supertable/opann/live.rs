@@ -49,20 +49,17 @@ pub(crate) fn undrained_user_vector_entries(
 /// Undrained user superfiles carry per-cluster Sq8+residual centroids in their
 /// manifest `vector_summary`. Score the query against each surviving cluster's
 /// centroid through the shared [`Sq8ResidualKernel`]
-/// ([`ClusterCentroids::score_one`]) and admit clusters by the *same*
-/// radius-bounded coverage floor the persisted-tree descent uses
-/// ([`super::paged::PagedTree::radius_bounded_descent`]) — process clusters by
-/// near edge `(d − r)`, freeze the prune bound to the far edge `(d + r)` of the
-/// nearest clusters once they cumulatively cover `floor` vectors, and admit
-/// every cluster whose near edge still reaches that bound. Returns each admitted
-/// cluster's [`LeafRef`] + its centroid distance, identical in shape to the tree
-/// descent's output so the two candidate sets merge directly.
+/// ([`ClusterCentroids::score_one`]) and admit **every** non-empty cluster.
+/// Pre-drain user superfiles are IVF-fragmented; a doc-count coverage floor would
+/// prune sibling clusters in the same file and starve rerank, while fetch still
+/// coalesces to one range-GET per superfile. Returns each cluster's [`LeafRef`]
+/// + its centroid distance for merge with the persisted-tree descent post-drain.
 pub(crate) fn admit_undrained_manifest_clusters(
     undrained: &[Arc<SuperfileEntry>],
     column: &str,
     metric: Metric,
     query: &[f32],
-    floor: usize,
+    _floor: usize,
     survives: impl Fn(u128) -> bool,
 ) -> Vec<(LeafRef, f32)> {
     // One scored candidate per surviving, non-empty cluster.
@@ -110,20 +107,9 @@ pub(crate) fn admit_undrained_manifest_clusters(
         }
     }
     cands.sort_by(|a, b| a.near.partial_cmp(&b.near).unwrap_or(Ordering::Equal));
-    let mut admitted: Vec<(LeafRef, f32)> = Vec::new();
-    let mut covered: u64 = 0;
-    let mut admitted_far = 0.0f32;
-    let mut bound = f32::INFINITY;
-    for cand in cands {
-        if cand.near > bound {
-            break;
-        }
-        admitted.push((cand.leaf, cand.d));
-        covered += cand.count as u64;
-        admitted_far = admitted_far.max(cand.far);
-        if bound.is_infinite() && covered >= floor as u64 {
-            bound = admitted_far;
-        }
-    }
-    admitted
+    // User superfiles are IVF-fragmented: semantic neighbors sit in many internal
+    // clusters within one file. A doc-count coverage floor (meant for consolidated
+    // post-drain cells) prunes sibling clusters and starves rerank — recall@10
+    // drops while fetch cost stays one coalesced GET per superfile either way.
+    cands.into_iter().map(|c| (c.leaf, c.d)).collect()
 }

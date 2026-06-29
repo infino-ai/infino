@@ -113,8 +113,8 @@ const CLUSTER_SEED: u64 = 0xC0FFEE;
 /// Seed offset for per-doc noise (xored with the global doc index).
 const NOISE_SEED: u64 = 0xBEEF;
 
-/// IVF centroid count (~8k vectors per cluster at this corpus size).
-const N_CENT: usize = 1;
+/// IVF centroid count (~64 docs/centroid at this corpus size against the 64-cell grid).
+const N_CENT: usize = 16;
 /// Random rotation seed for the vector index.
 const VECTOR_ROT_SEED: u64 = 99;
 

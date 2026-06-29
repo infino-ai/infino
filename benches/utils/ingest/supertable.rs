@@ -196,12 +196,19 @@ pub fn options_for(
         }
         return opts;
     }
-    // Table-scale IVF: ~8k vectors per cluster ⇒ n_cent ≈ total_docs / 8000.
-    // The builder clamps down per physical superfile from its local row count.
-    let n_cent_total = n_docs()
+    // Table-scale IVF: ~8k vectors per cluster. The per-superfile `n_cent` must
+    // be sized from THIS superfile's row count, not the corpus-wide centroid
+    // total: ingest shards each commit across the writer pool, so a superfile
+    // holds ~ n_docs / (n_commits * n_writers) rows. Passing the corpus total
+    // (e.g. 125 at 1M) per superfile over-clusters tiny staging files — the
+    // builder caps at N_CENT_SMALL=64, yielding ~122 docs/centroid instead of
+    // the intended ~8 000, which then fragments into ~100k routing leaves at drain.
+    let per_superfile_docs = n_docs()
+        .div_ceil(n_commits().saturating_mul(n_writers()).max(1))
+        .max(1);
+    let n_cent_per_superfile = per_superfile_docs
         .div_ceil(TARGET_VECTORS_PER_IVF_CLUSTER)
         .max(1);
-    let n_cent_per_superfile = n_cent_total;
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
