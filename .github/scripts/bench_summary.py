@@ -50,9 +50,11 @@ SUBSYSTEM = {
     "sql": ("SQL", "src/supertable/query/"),
 }
 
-# Latency at/under this (ns) rounds to ~0.00 ms - a big percentage of nearly
-# nothing. Do not flag it. 0.1 ms.
+# Below this, latency rounds to ~0.00 ms - a big percent of nearly nothing. 0.1 ms.
 MIN_LATENCY_NS = 100_000.0
+
+# Smallest absolute latency move worth flagging - smaller deltas are noise. 0.1 ms.
+MIN_LATENCY_DELTA_NS = 100_000.0
 
 DEFAULT_OUT = "/tmp/ai-summary.md"
 DEFAULT_THRESHOLD = 5.0
@@ -151,8 +153,11 @@ def diff(reports, baseline_dir, current_dir, threshold):
             if old is None or old == 0.0:
                 continue
             had_baseline = True
-            if is_latency(header) and max(abs(old), abs(new)) < MIN_LATENCY_NS:
-                continue
+            if is_latency(header):
+                if max(abs(old), abs(new)) < MIN_LATENCY_NS:
+                    continue
+                if abs(new - old) < MIN_LATENCY_DELTA_NS:
+                    continue
             limit = threshold if t == "primary" else max(threshold, SECONDARY_THRESHOLD_PCT)
             pct = (new - old) / old * 100.0
             if abs(pct) < limit:
