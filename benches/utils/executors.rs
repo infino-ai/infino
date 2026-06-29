@@ -104,31 +104,6 @@ pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duratio
     samples
 }
 
-/// Measure each item `rounds` times, round-major (whole battery per round),
-/// keeping the cleanest round (lowest `min_key`) per item. Round-major
-/// spaces an item's repeats in time, so a transient slow window hits at
-/// most one round and `min` drops it.
-pub fn repeat_cleanest<I, S>(
-    rounds: usize,
-    items: &[I],
-    mut measure: impl FnMut(&I) -> S,
-    min_key: impl Fn(&S) -> Duration,
-) -> Vec<S> {
-    let mut best: Vec<Option<S>> = Vec::with_capacity(items.len());
-    best.resize_with(items.len(), || None);
-    for _ in 0..rounds.max(1) {
-        for (i, item) in items.iter().enumerate() {
-            let s = measure(item);
-            if best[i].as_ref().is_none_or(|b| min_key(&s) < min_key(b)) {
-                best[i] = Some(s);
-            }
-        }
-    }
-    best.into_iter()
-        .map(|s| s.expect("each item measured at least once"))
-        .collect()
-}
-
 /// Peak / median / p90 RSS cells. Peak gates; median and p90 are context.
 fn rss_cells(stats: &RssStats) -> Vec<Cell> {
     vec![
@@ -2044,9 +2019,9 @@ pub mod sql {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, time::Duration};
+    use std::time::Duration;
 
-    use super::{repeat_cleanest, sample_batched, summarize};
+    use super::{sample_batched, summarize};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -2066,30 +2041,6 @@ mod tests {
         assert_eq!(summarize(&mut [ms(7)]).p90, ms(7));
         let z = summarize(&mut []);
         assert_eq!((z.min, z.p50, z.p90), (ms(0), ms(0), ms(0)));
-    }
-
-    #[test]
-    fn repeat_cleanest_keeps_min_per_item_in_order() {
-        // per item, per round latency; cleanest round = the min.
-        let table = [
-            [ms(5), ms(1), ms(9)],
-            [ms(3), ms(3), ms(3)],
-            [ms(8), ms(2), ms(7)],
-        ];
-        let items = [0usize, 1, 2];
-        let calls = Cell::new(0);
-        let out = repeat_cleanest(
-            3,
-            &items,
-            |i| {
-                let k = calls.get();
-                calls.set(k + 1);
-                table[*i][k / items.len()] // round = call / n_items
-            },
-            |d| *d,
-        );
-        assert_eq!(out, vec![ms(1), ms(3), ms(2)]);
-        assert_eq!(calls.get(), 9); // 3 items × 3 rounds
     }
 
     #[test]
