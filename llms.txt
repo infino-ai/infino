@@ -18,16 +18,16 @@ as Python and Node.js bindings.
 
 ## Concepts
 
-- [Object-storage-native retrieval](docs/concepts/object-storage-native-retrieval.md):
+Full concepts, guides, and examples live at the documentation site,
+https://docs.infino.ai.
+
+- [How Infino works](https://docs.infino.ai/how-it-works): the mental model —
+  one copy of your data as Parquet, indexed and queried four ways, in-process.
+- [Object-storage-native retrieval](https://docs.infino.ai/concepts/object-storage-native-retrieval):
   the core idea — search that runs directly on data in object storage instead
   of in a database or cluster that owns its own copy.
-- [Hybrid search](docs/concepts/hybrid-search.md): keyword (BM25) + vector
-  retrieval fused into one ranked list, in one engine over one copy of the data.
-- [Retrieval for agents](docs/concepts/retrieval-for-agents.md): the read path
-  an agent calls hundreds of times per task — why speed-per-dollar compounds and
-  what to reach for.
-- [Embedded retrieval](docs/concepts/embedded-retrieval.md): the in-process,
-  no-server model — add it as a library and query, the way you'd use SQLite.
+- [Hybrid search](https://docs.infino.ai/guides/search/hybrid): keyword (BM25) +
+  vector retrieval fused into one ranked list, in one engine over one copy of the data.
 
 ## Architecture
 
@@ -41,10 +41,10 @@ as Python and Node.js bindings.
 
 ## Reference
 
-- [FAQ](docs/faq.md): operational and architecture answers for evaluating
+- [FAQ](https://docs.infino.ai/faq): operational and architecture answers for evaluating
   Infino — whether it needs a server, durability and crash-safety, concurrency,
   Parquet compatibility, and how SQL runs in-process.
-- [Tradeoffs and limits](docs/tradeoffs.md): the honest envelope — what Infino
+- [Tradeoffs and limits](https://docs.infino.ai/tradeoffs): the honest envelope — what Infino
   is good at (warm-query speed, multi-modal retrieval, flat storage cost) and
   what it is not built for (cold first-touch latency, write-dominated and
   transactional workloads).

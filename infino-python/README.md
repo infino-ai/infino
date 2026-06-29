@@ -67,7 +67,8 @@ print(hits.column_names)        # ['_id', 'score']
   filterable in SQL, and returnable via projection.
 - **Commits** — every `append`, `update`, and `delete` is a single atomic
   commit. Readers see a consistent snapshot and are never torn by a
-  concurrent write.
+  concurrent write. Batch rows into one `append` rather than calling it
+  per row — each call writes a file and commits.
 - **Arrow everywhere** — searches return `pyarrow.Table`; `append` and
   `update` accept Arrow, pandas, or `list[dict]`.
 
@@ -175,7 +176,12 @@ decoded. Name the columns you want to materialize:
 ```python
 docs.bm25_search("title", "fox", k=10)                          # _id + score only
 docs.bm25_search("title", "fox", k=10, projection=["_id", "title", "score"])
+vecs.vector_search("emb", query_vector, k=10, projection=["_id", "emb", "score"])
 ```
+
+The SQL table-valued functions differ: they decode every scalar column by
+default (`_id`, all scalars, trailing `score`). To return only `_id` and
+`score`, select those columns explicitly in the query.
 
 ## Updates and deletes
 

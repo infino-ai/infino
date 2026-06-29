@@ -34,9 +34,9 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store` | `concurrent`,
 //!                 by name, or grouped under the `diagnostic` keyword —
-//!                 `cargo bench -- diagnostic` runs all five,
+//!                 `cargo bench -- diagnostic` runs all six,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -67,6 +67,7 @@ enum Diagnostic {
     Update,
     SqlDiag,
     ObjectStore,
+    Concurrent,
 }
 
 impl Diagnostic {
@@ -77,6 +78,7 @@ impl Diagnostic {
             Diagnostic::Update => "update",
             Diagnostic::SqlDiag => "sql-diag",
             Diagnostic::ObjectStore => "object-store",
+            Diagnostic::Concurrent => "concurrent",
         }
     }
 
@@ -87,6 +89,7 @@ impl Diagnostic {
             Diagnostic::Update => infino_bench_utils::supertable_update::run(),
             Diagnostic::SqlDiag => infino_bench_utils::sql_diag::run(),
             Diagnostic::ObjectStore => infino_bench_utils::unified_object_store::run(),
+            Diagnostic::Concurrent => infino_bench_utils::concurrent::run(),
         }
     }
 }
@@ -293,8 +296,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | object-store,\n\
-         \x20           or `diagnostic` for all five / `diagnostic <names>` for a subset\n\
+         Diagnostic: scale | tombstone | update | sql-diag | object-store | concurrent,\n\
+         \x20           or `diagnostic` for all six / `diagnostic <names>` for a subset\n\
          \n\
          Examples:\n\
          \x20 cargo bench\n\
@@ -379,6 +382,7 @@ fn parse_args() -> Selection {
             "update" | "supertable-update" => diagnostics.push(Diagnostic::Update),
             "sql-diag" | "sql_diag" => diagnostics.push(Diagnostic::SqlDiag),
             "object-store" | "object_store" => diagnostics.push(Diagnostic::ObjectStore),
+            "concurrent" => diagnostics.push(Diagnostic::Concurrent),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => unknown.push(other.to_string()),
         }
@@ -400,6 +404,7 @@ fn parse_args() -> Selection {
             Diagnostic::Update,
             Diagnostic::SqlDiag,
             Diagnostic::ObjectStore,
+            Diagnostic::Concurrent,
         ];
     }
 
