@@ -325,6 +325,7 @@ mod tests {
 
     fn empty_seg() -> SuperfileEntry {
         SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid::Uuid::nil(),
             uri: SuperfileUri(uuid::Uuid::nil()),
             n_docs: 0,

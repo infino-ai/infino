@@ -791,6 +791,13 @@ pub mod fts {
 }
 
 pub mod vector {
+    use std::io::Write;
+
+    use infino::{
+        Supertable,
+        supertable::storage::StorageProvider,
+        test_helpers::opann_routing_measure::CountingStorage,
+    };
     use infino::roaring::RoaringBitmap;
 
     use super::*;
@@ -846,27 +853,74 @@ pub mod vector {
     }
 
     fn log_hidden_stats(consumer: &Supertable, label: &str) {
-        if let Some((total, max_per_cell)) = consumer.hidden_vector_superfile_stats() {
-            eprintln!(
-                "[supertable_vector] hidden vector index {label}: {total} superfiles, max {max_per_cell} per cell"
-            );
+        let Some(hidden) = consumer.vector_index_table() else {
+            return;
+        };
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        let flat = manifest.superfiles.len();
+        let parts = manifest.get_num_parts();
+        eprintln!(
+            "[supertable_vector] hidden index {label}: {flat} resident flat superfiles, \
+             {parts} manifest list part(s) (per-cell IVF lives here post-drain; pre-drain \
+             vectors are still in user superfiles + live OPANN carry)"
+        );
+    }
+
+    /// Build the live OPANN genesis tree before pre-drain search so the first
+    /// query is not charged for a one-shot batch build over staged superfiles.
+    fn prewarm_live_opann_tree(consumer: &Supertable) {
+        eprintln!("[supertable_vector] pre-drain: building live OPANN routing tree...");
+        consumer
+            .prewarm_hidden_opann_tree()
+            .expect("live OPANN genesis prewarm");
+        eprintln!("[supertable_vector] pre-drain: live OPANN routing tree ready");
+    }
+
+    fn p50_u64(samples: &mut [u64]) -> u64 {
+        if samples.is_empty() {
+            return 0;
         }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn open_consumer_on_storage(
+        modality: Modality,
+        built: &supertable::IngestResult,
+        storage: Arc<dyn StorageProvider>,
+    ) -> (TempDir, Supertable) {
+        let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+            Arc::clone(&storage),
+            Some(built.total_index_bytes),
+        );
+        let opts = tiers::consumer_options(
+            supertable::options_for(modality, None),
+            storage,
+            cache,
+        );
+        (cache_dir, tiers::open_consumer(opts))
     }
 
     /// Drain hidden INCOMING IVF into per-cell superfiles (same path as optimize).
     fn drain_hidden_incoming(consumer: &Supertable) {
+        let pending = consumer.undrained_user_superfile_count().unwrap_or(0);
+        eprintln!(
+            "[supertable_vector] drain starting: {pending} undrained user superfile(s) \
+             → hidden per-cell IVF..."
+        );
+        let _ = std::io::stderr().flush();
         let hidden = consumer
             .vector_index_table()
             .expect("vector table keeps hidden index");
-        eprintln!("[supertable_vector] draining hidden incoming IVF into cell superfiles...");
         hidden.drain().expect("hidden incoming drain");
-        log_hidden_stats(hidden, "after drain");
+        log_hidden_stats(consumer, "after drain");
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
-    /// at calibrated recall targets (and a default config), with a
-    /// correctness recall gate — the same measurement the superfile vector
-    /// runner produces, over the multi-superfile object-store consumer.
+    /// with a correctness recall gate and default-config timing — the same
+    /// measurement the superfile vector runner produces, over the multi-
+    /// superfile object-store consumer.
     pub fn run(phases: Phases) {
         if let Err(reason) = tiers::supertable_backend_check() {
             eprintln!("[supertable_vector] skipped: {reason}");
@@ -1009,15 +1063,11 @@ pub mod vector {
             // only.
             drop(corpus);
 
-            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
-            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after SPFresh route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
-            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
+            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING. Warm = one untimed prewarm then timed iterations; cold = fresh cache per iter with p50 GET/wave counted in the same loop. Δ vs previous run.";
+            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after drain; queries hit ~nprobe cell-local IVF superfiles only. Warm = one untimed prewarm then timed iterations; cold = fresh cache per iteration. Δ vs previous run.";
+            const LEGACY_NOTE: &str = "OPANN tree admission (`nprobe` ignored). Recall rows use correctness gate only (no probe/refine grid). Warm = one untimed prewarm then timed iterations; cold = fresh cache per iteration. Δ vs previous run.";
 
-            // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
-            // tables may already be post-drain — run the two-phase comparison only
-            // when we just built the table in this process.
             let pre_post_drain = ingest_metrics.is_some();
-
             let search_title = |phase: &str| {
                 format!(
                     "Supertable vector — search {phase}, multi-superfile / object-store ({} docs × dim={})",
@@ -1026,17 +1076,30 @@ pub mod vector {
                 )
             };
 
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
+            let counting = built.cleanup.as_ref().map(|_| {
+                CountingStorage::wrap(Arc::clone(&built.storage))
+            });
+            let search_storage = counting
+                .as_ref()
+                .map(|(s, _)| Arc::clone(s) as Arc<dyn StorageProvider>)
+                .unwrap_or_else(|| Arc::clone(&built.storage));
+            let cold_counters = counting.as_ref().map(|(_, c)| c);
+
+            let (cache_dir, consumer) =
+                open_consumer_on_storage(Modality::Vector, &built, Arc::clone(&search_storage));
+            let open_cold = || SupertableVecColdGuard::open(&built, Arc::clone(&search_storage));
 
             let recall_rows = if pre_post_drain {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (pre-drain)");
+                    prewarm_live_opann_tree(&consumer);
                 }
+
                 eprintln!("[supertable_vector] === pre-drain search (incoming staging) ===");
                 let _pre = exec_vec::run_search(
                     &mut report,
                     &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &open_cold,
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1050,6 +1113,8 @@ pub mod vector {
                     phases.cold,
                     COLD_ITERS,
                     skip_cal,
+                    exec_vec::CorrectnessGate::OpannTree,
+                    cold_counters,
                     "supertable_vector/pre-drain",
                     "bench/vector/supertable/search/pre-drain",
                     search_title("pre-drain"),
@@ -1065,7 +1130,7 @@ pub mod vector {
                 exec_vec::run_search(
                     &mut report,
                     &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &open_cold,
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1079,6 +1144,8 @@ pub mod vector {
                     phases.cold,
                     COLD_ITERS,
                     skip_cal,
+                    exec_vec::CorrectnessGate::OpannTree,
+                    cold_counters,
                     "supertable_vector/post-drain",
                     "bench/vector/supertable/search/post-drain",
                     search_title("post-drain"),
@@ -1091,7 +1158,7 @@ pub mod vector {
                 exec_vec::run_search(
                     &mut report,
                     &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &open_cold,
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1105,6 +1172,8 @@ pub mod vector {
                     phases.cold,
                     COLD_ITERS,
                     skip_cal,
+                    exec_vec::CorrectnessGate::OpannTree,
+                    cold_counters,
                     "supertable_vector",
                     "bench/vector/supertable/search",
                     search_title(""),
@@ -1270,14 +1339,9 @@ pub mod vector {
     }
 
     impl SupertableVecColdGuard {
-        fn open(built: &supertable::IngestResult) -> Self {
-            // Open-on-demand: do NOT force-open every superfile. A vector
-            // query routes to ~nprobe cells and opens only those (lazily, via
-            // the disk cache) — that's the realistic cold path. Force-opening
-            // all user+hidden superfiles spawned a background fill per cell
-            // (an S3-throttling storm) and an open cost unrelated to the
-            // query's working set.
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
+        fn open(built: &supertable::IngestResult, storage: Arc<dyn StorageProvider>) -> Self {
+            let (cache_dir, consumer) =
+                open_consumer_on_storage(Modality::Vector, built, storage);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -1298,12 +1362,8 @@ pub mod vector {
         }
     }
 
-    /// One metered cold vector query on a real object-store backend. Returns the
-    /// per-SEARCH object-store requests — the routed-cell range-GETs for a
-    /// single cold query. The manifest load + OPANN-tree prewarm happen at
-    /// consumer open and are excluded (snapshot taken right after open), so the
-    /// count is the steady-state per-query fetch — matching the routing
-    /// GET-budget unit test, not the one-time open (which is amortized).
+    /// p50 object-store GET count for a cold vector query on a real backend:
+    /// `{COLD_ITERS}` fresh-cache opens, one query each (open excluded).
     fn measure_cold_store_vector(
         built: &supertable::IngestResult,
         column: &str,
@@ -1314,25 +1374,45 @@ pub mod vector {
     ) -> Option<storage_meter::ObjectStoreMeter> {
         built.cleanup.as_ref()?;
         let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
-        let (cache_dir, cache) =
-            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
-        let opts = tiers::consumer_options(
-            supertable::options_for(Modality::Vector, None),
-            meter.provider(),
-            cache,
-        );
-        let consumer = tiers::open_consumer(opts);
-        // Exclude the one-time open (manifest load + prewarmed OPANN tree) so the
-        // reported count is just the per-query cell fetch.
-        let after_open = meter.snapshot();
-        let _ = consumer.topk_global(column, query, k, nprobe, rerank);
-        let after_search = meter.snapshot();
-        drop(consumer);
-        drop(cache_dir);
+        let mut get_counts = Vec::with_capacity(COLD_ITERS);
+        let mut head_counts = Vec::with_capacity(COLD_ITERS);
+        let mut byte_counts = Vec::with_capacity(COLD_ITERS);
+        for _ in 0..COLD_ITERS {
+            let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+                meter.provider(),
+                Some(built.total_index_bytes),
+            );
+            let opts = tiers::consumer_options(
+                supertable::options_for(Modality::Vector, None),
+                meter.provider(),
+                cache,
+            );
+            let consumer = tiers::open_consumer(opts);
+            let after_open = meter.snapshot();
+            let _ = consumer.topk_global(column, query, k, nprobe, rerank);
+            let after_search = meter.snapshot();
+            head_counts.push(
+                after_search
+                    .head_count
+                    .saturating_sub(after_open.head_count),
+            );
+            get_counts.push(
+                after_search
+                    .get_count
+                    .saturating_sub(after_open.get_count),
+            );
+            byte_counts.push(
+                after_search
+                    .get_bytes
+                    .saturating_sub(after_open.get_bytes),
+            );
+            drop(consumer);
+            drop(cache_dir);
+        }
         Some(storage_meter::ObjectStoreMeter {
-            head_count: after_search.head_count.saturating_sub(after_open.head_count),
-            get_count: after_search.get_count.saturating_sub(after_open.get_count),
-            get_bytes: after_search.get_bytes.saturating_sub(after_open.get_bytes),
+            head_count: p50_u64(&mut head_counts),
+            get_count: p50_u64(&mut get_counts),
+            get_bytes: p50_u64(&mut byte_counts),
         })
     }
 }

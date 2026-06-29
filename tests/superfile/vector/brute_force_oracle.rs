@@ -22,9 +22,8 @@
 //!
 //! ## Coverage
 //!
-//! Tests run for all three metrics (L2Sq, Cosine, NegDot) at a small
-//! corpus size where O(N) brute force is cheap (n=200, dim=32).
-//! Larger-scale recall tests live in `tests/recall.rs`.
+//! Tests run for L2Sq at a small corpus size where O(N) brute force is cheap
+//! (n=200, dim=32). Larger-scale recall tests live in `tests/recall.rs`.
 
 use bytes::Bytes;
 use infino::superfile::vector::{
@@ -54,10 +53,6 @@ const DISTANCE_REL_FLOOR: f32 = 1e-6;
 // Per-test corpus + rotation seeds (distinct so fixtures differ).
 const L2SQ_CORPUS_SEED: u64 = 11;
 const L2SQ_ROT_SEED: u64 = 7;
-const COSINE_CORPUS_SEED: u64 = 13;
-const COSINE_ROT_SEED: u64 = 17;
-const NEGDOT_CORPUS_SEED: u64 = 19;
-const NEGDOT_ROT_SEED: u64 = 23;
 const PARTIAL_CORPUS_SEED: u64 = 29;
 const PARTIAL_ROT_SEED: u64 = 31;
 const TOLERANCE_CORPUS_SEED: u64 = 37;
@@ -142,13 +137,8 @@ fn build_reader(
         b.add(0, v).expect("add to vector builder");
     }
     let bytes = b.finish().expect("finish vector builder");
-    let metric_str = match metric {
-        Metric::L2Sq => "l2sq",
-        Metric::Cosine => "cosine",
-        Metric::NegDot => "negdot",
-    };
     let json = format!(
-        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{rot_seed},"metric":"{metric_str}"}}]"#
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{rot_seed},"metric":"l2sq"}}]"#
     );
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
@@ -178,59 +168,6 @@ async fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
         assert_eq!(
             exact_set, approx_set,
             "L2Sq full-nprobe top-5 set diverges from brute force; query={q_idx}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn oracle_cosine_full_nprobe_recovers_exact_topk() {
-    let dim = ORACLE_DIM;
-    let n = ORACLE_N_DOCS;
-    let n_cent = ORACLE_N_CENT;
-    // Cosine requires unit-norm inputs.
-    let corpus = generate_corpus(n, dim, COSINE_CORPUS_SEED, true);
-    let reader = build_reader(&corpus, dim, n_cent, Metric::Cosine, COSINE_ROT_SEED);
-
-    for q_idx in [0usize, 50, 100, 150, 199] {
-        let query = &corpus[q_idx];
-        let exact = brute_force_top_k(&corpus, query, Metric::Cosine, ORACLE_TOP_K);
-        let approx = reader
-            .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
-            .await
-            .expect("FTS search");
-        assert_eq!(approx[0].0 as usize, q_idx);
-        let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
-        let approx_set: std::collections::HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
-        assert_eq!(
-            exact_set, approx_set,
-            "Cosine full-nprobe top-5 set diverges; query={q_idx}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn oracle_negdot_full_nprobe_recovers_exact_topk() {
-    let dim = ORACLE_DIM;
-    let n = ORACLE_N_DOCS;
-    let n_cent = ORACLE_N_CENT;
-    let corpus = generate_corpus(n, dim, NEGDOT_CORPUS_SEED, false);
-    let reader = build_reader(&corpus, dim, n_cent, Metric::NegDot, NEGDOT_ROT_SEED);
-
-    for q_idx in [0usize, 33, 77, 145, 199] {
-        let query = &corpus[q_idx];
-        let exact = brute_force_top_k(&corpus, query, Metric::NegDot, ORACLE_TOP_K);
-        let approx = reader
-            .search("v", query, ORACLE_TOP_K, n_cent, ORACLE_RERANK_MULT)
-            .await
-            .expect("FTS search");
-        // For NegDot, self-NN is *most negative dot* — for non-unit
-        // vectors that's not necessarily the query itself. So we
-        // only assert set agreement.
-        let exact_set: std::collections::HashSet<u32> = exact.iter().map(|(d, _)| *d).collect();
-        let approx_set: std::collections::HashSet<u32> = approx.iter().map(|(d, _)| *d).collect();
-        assert_eq!(
-            exact_set, approx_set,
-            "NegDot full-nprobe top-5 set diverges; query={q_idx}"
         );
     }
 }

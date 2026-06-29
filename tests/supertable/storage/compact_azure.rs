@@ -238,7 +238,7 @@ fn options_title_emb() -> SupertableOptions {
             dim: EMB_DIM,
             n_cent: N_CENT,
             rot_seed: VECTOR_ROT_SEED,
-            metric: Metric::Cosine,
+            metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
         }],
         Some(default_tokenizer()),

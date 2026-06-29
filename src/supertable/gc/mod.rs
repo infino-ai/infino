@@ -121,6 +121,7 @@ mod tests {
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: Uuid::new_v4(),
             uri,
             n_docs: 1,

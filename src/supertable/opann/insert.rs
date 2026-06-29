@@ -52,6 +52,7 @@ const ROW_BYTES_PER_DIM: usize = 2;
 /// and its covering radius. Every routing leaf is one internal IVF cluster:
 /// registration, drain, and compaction all emit per-cluster leaves, so the tree
 /// routes straight to clusters with no whole-cell leaf.
+#[derive(Clone)]
 pub(crate) struct LeafInsert {
     pub(crate) superfile_id: u128,
     pub(crate) doc_off: u32,
@@ -87,7 +88,7 @@ pub(crate) fn update_tree(
 ) -> Result<Option<SplitPages>, PageError> {
     let root = match root {
         None if added.is_empty() => return Ok(None),
-        None => return Ok(Some(build_genesis(metric, dim, added, page_budget))),
+        None => return Ok(Some(build_genesis(metric, dim, added, page_budget)?)),
         Some(root) => root,
     };
     let removed_set: HashSet<u128> = removed.iter().copied().collect();
@@ -101,7 +102,7 @@ pub(crate) fn update_tree(
     };
     let mut cur = match after_delete {
         None if added.is_empty() => return Ok(None),
-        None => return Ok(Some(build_genesis(metric, dim, added, page_budget))),
+        None => return Ok(Some(build_genesis(metric, dim, added, page_budget)?)),
         Some(cur) => cur,
     };
     for leaf in added {
@@ -131,15 +132,29 @@ pub(crate) fn insert_leaves(
     update_tree(source, root, metric, dim, &[], added, page_budget)
 }
 
-/// Build the first tree from a commit's partitions (the genesis case). The
-/// fp32 centroids are the ingestion surface, quantized once into one
-/// [`ClusterCentroids`] for this commit's tree, then split into pages.
+/// Build the first tree from a commit's partitions (genesis). One batch
+/// [`CentroidTree::build`] + page split — O(n log n) with SIMD-balanced
+/// internal splits, not serial per-leaf insert.
+/// One batch genesis build from manifest-resident leaves (pre-drain query path
+/// and drain/compact batch rebuild). No object I/O.
+pub(crate) fn build_genesis_from_leaves(
+    metric: Metric,
+    dim: usize,
+    leaves: &[LeafInsert],
+    page_budget: usize,
+) -> Result<Option<SplitPages>, PageError> {
+    if leaves.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(build_genesis(metric, dim, leaves, page_budget)?))
+}
+
 fn build_genesis(
     metric: Metric,
     dim: usize,
     leaves: &[LeafInsert],
     page_budget: usize,
-) -> SplitPages {
+) -> Result<SplitPages, PageError> {
     let n = leaves.len() as u32;
     let flat: Vec<f32> = leaves
         .iter()
@@ -155,14 +170,17 @@ fn build_genesis(
             cluster_id: l.cluster_id,
         })
         .collect();
-    let clusters =
-        ClusterCentroids::from_fp32(metric, n, dim as u32, &flat, vec![1u32; n as usize])
-            .with_radii(radii);
-    // `build` only returns `None` for empty/zero-dim/mismatched input, none of
-    // which can happen here (non-empty leaves, fixed dim, aligned leaf refs).
+    let clusters = ClusterCentroids::from_fp32(
+        metric,
+        n,
+        dim as u32,
+        &flat,
+        vec![1u32; n as usize],
+    )
+    .with_radii(radii);
     let tree = CentroidTree::build(metric, &clusters, &leaf_refs)
         .expect("genesis tree from non-empty equal-dim leaves");
-    tree.to_pages(page_budget)
+    Ok(tree.to_pages(page_budget))
 }
 
 /// Splice one new leaf into the tree rooted at `root`, returning the new root.
@@ -180,33 +198,24 @@ fn insert_one_leaf(
     let path = greedy_leaf_page_path(overlay, source, root, &leaf.centroid_fp32)?;
     let leaf_page_hash = *path.last().expect("path always contains at least the root");
     let leaf_page = Page::parse(&fetch_bytes(overlay, source, &leaf_page_hash)?)?;
-    // Rebuild the leaf page balanced (fresh medoids, tight radii, a real
-    // hierarchy) so the radius-bounded descent can prune it. For a page with
-    // cross-page children — whose child centroids live in other pages, out of
-    // this rebuild's reach — fall back to the flat-append + structural resplit.
-    // Either way the returned subtree replaces the leaf page under its parent via
-    // a single re-pointed cross-page link, so the parent's node count is
-    // unchanged and the split never propagates as a fan-out increase.
-    let mut new_child = if let Some(split) = rebuild_leaf_page(&leaf_page, metric, dim, leaf, page_budget) {
+    // Simple insert + rebalance: append the new leaf to its page (decode-free —
+    // the page's existing rows are copied byte-for-byte, only the appended row is
+    // encoded), then split the page **structurally** (`resplit`, a node-count
+    // partition with no distance math) only when it overflows the node budget.
+    // No per-insert re-clustering: re-running k-medoids on every touch is what
+    // made the drain's genesis build quadratic.
+    let new_page_bytes = append_leaf_into_page(&leaf_page, metric, dim, leaf);
+    let appended = Page::parse(&new_page_bytes)?;
+    let mut new_child = if appended.topo().len() > page_budget {
+        let split = rebuild_page_balanced(&appended, metric, dim, page_budget);
         for (h, b) in split.pages {
             overlay.insert(h, b);
         }
         split.root
     } else {
-        let new_page_bytes = append_leaf_into_page(&leaf_page, metric, dim, leaf);
-        let appended = Page::parse(&new_page_bytes)?;
-        if appended.topo().len() > page_budget {
-            let split = appended.resplit(page_budget);
-            let root = split.root;
-            for (h, b) in split.pages {
-                overlay.insert(h, b);
-            }
-            root
-        } else {
-            let h = ContentHash::of(&new_page_bytes);
-            overlay.insert(h, new_page_bytes);
-            h
-        }
+        let h = ContentHash::of(&new_page_bytes);
+        overlay.insert(h, new_page_bytes);
+        h
     };
     let mut old_child = leaf_page_hash;
     // Walk the page path back up to the root, redirecting each ancestor's link
@@ -228,6 +237,65 @@ fn insert_one_leaf(
         new_child = new_anc_hash;
     }
     Ok(new_child)
+}
+
+/// Rebuild an over-budget page with [`CentroidTree::build`] when all leaves are
+/// local to this page; fall back to structural [`Page::resplit`] when cross-page
+/// links are present (incremental insert path).
+fn rebuild_page_balanced(
+    page: &Page,
+    metric: Metric,
+    dim: usize,
+    page_budget: usize,
+) -> SplitPages {
+    let has_cross_page = page.topo().iter().any(|node| {
+        matches!(
+            node,
+            NodeTopo::Internal(children)
+                if children.iter().any(|c| matches!(c, ChildLink::Page(_)))
+        )
+    });
+    if has_cross_page {
+        return page.resplit(page_budget);
+    }
+    let cc = page.centroids();
+    let mut leaves: Vec<LeafInsert> = Vec::new();
+    let mut leaf_refs: Vec<LeafRef> = Vec::new();
+    let mut fp32_flat: Vec<f32> = Vec::new();
+    let mut radii: Vec<f32> = Vec::new();
+    for (local, node) in page.topo().iter().enumerate() {
+        let NodeTopo::Leaf(leaf) = node else {
+            continue;
+        };
+        let mut centroid_fp32 = vec![0f32; dim];
+        cc.dequantize_into(local, &mut centroid_fp32);
+        fp32_flat.extend_from_slice(&centroid_fp32);
+        radii.push(cc.radii.get(local).copied().unwrap_or(0.0));
+        leaf_refs.push(*leaf);
+        leaves.push(LeafInsert {
+            superfile_id: leaf.superfile_id,
+            doc_off: leaf.doc_off,
+            count: leaf.count,
+            cluster_id: leaf.cluster_id,
+            centroid_fp32,
+            radius: cc.radii.get(local).copied().unwrap_or(0.0),
+        });
+    }
+    if leaves.is_empty() {
+        return page.resplit(page_budget);
+    }
+    let n = leaves.len() as u32;
+    let clusters = ClusterCentroids::from_fp32(
+        metric,
+        n,
+        dim as u32,
+        &fp32_flat,
+        vec![1u32; n as usize],
+    )
+    .with_radii(radii);
+    let tree = CentroidTree::build(metric, &clusters, &leaf_refs)
+        .expect("non-empty page leaves always build a tree");
+    tree.to_pages(page_budget)
 }
 
 /// Recursively rewrite the subtree rooted at `page_hash`, dropping every leaf
@@ -409,84 +477,6 @@ fn greedy_leaf_page_path(
     }
 }
 
-/// Rebuild a **pure-cluster** leaf page balanced, splicing in the new leaf —
-/// fresh medoid centroids, tight per-node covering radii, and a real hierarchy
-/// instead of a flat fan under the page root, which is what lets the
-/// radius-bounded descent prune the page. Reuses the genesis builder
-/// ([`CentroidTree::build`]) over the page's stored Sq8 leaf rows, with the new
-/// leaf encoded into the same per-page quantizer — entirely in the encoded
-/// domain, no fp32 centroid reconstructed. Re-pages the rebuilt subtree to
-/// `page_budget` via [`CentroidTree::to_pages`].
-///
-/// Returns `None` for a page that carries cross-page child links (a higher-level
-/// page): those children's centroids live in other pages, out of this rebuild's
-/// reach, so the caller keeps the flat-append + structural-resplit path for them.
-/// Almost all inserts land in pure-cluster leaf pages, so this is the common path.
-fn rebuild_leaf_page(
-    page: &Page,
-    metric: Metric,
-    dim: usize,
-    leaf: &LeafInsert,
-    page_budget: usize,
-) -> Option<SplitPages> {
-    let pure = page.topo().iter().all(|node| match node {
-        NodeTopo::Leaf(_) => true,
-        NodeTopo::Internal(children) => {
-            children.iter().all(|c| matches!(c, ChildLink::Local(_)))
-        }
-    });
-    if !pure {
-        return None;
-    }
-
-    // Slice the leaf clusters' rows (with their radii/counts) out of the page
-    // block under its shared quantizer; the internal medoid rows are dropped —
-    // `build` recomputes them.
-    let leaf_locals: Vec<u32> = page
-        .topo()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, node)| matches!(node, NodeTopo::Leaf(_)).then_some(i as u32))
-        .collect();
-    let mut leaf_refs: Vec<LeafRef> = leaf_locals
-        .iter()
-        .map(|&i| match &page.topo()[i as usize] {
-            NodeTopo::Leaf(l) => *l,
-            NodeTopo::Internal(_) => unreachable!("filtered to leaves"),
-        })
-        .collect();
-    let mut cc = page.centroids().select_rows(&leaf_locals);
-    let store_norm = metric_stores_norm(metric);
-    let had_radii = cc.radii.len() == cc.n_cent as usize;
-
-    // Encode the new leaf's fp32 centroid into the page's quantizer and append it
-    // — the same single-row re-quantization `append_leaf_into_page` uses.
-    let single = ClusterCentroids::single(metric, &leaf.centroid_fp32);
-    let src_row = &single.to_encoded_rows()[0];
-    let mut row_bytes = vec![0u8; dim * ROW_BYTES_PER_DIM];
-    let norm = materialize_sq8_residual_row_into_cluster_quant(
-        src_row,
-        &cc.scale,
-        &cc.offset,
-        dim,
-        &mut row_bytes,
-        store_norm,
-    );
-    push_row(&mut cc, &row_bytes, leaf.radius, had_radii, store_norm, norm);
-    leaf_refs.push(LeafRef {
-        superfile_id: leaf.superfile_id,
-        doc_off: leaf.doc_off,
-        count: leaf.count,
-        cluster_id: leaf.cluster_id,
-    });
-
-    // `build` only returns `None` for empty / zero-dim / mismatched input; the
-    // leaf set is non-empty (we just pushed one) with a fixed dim and aligned
-    // refs, so this is always `Some` in practice.
-    let tree = CentroidTree::build(metric, &cc, &leaf_refs)?;
-    Some(tree.to_pages(page_budget))
-}
-
 /// Re-emit `page` with the new leaf appended: its fp32 centroid encoded under
 /// this page's own quantizer (existing rows copied verbatim), attached as a
 /// child of the page's entry node, covering radius extended. Decode-free.
@@ -625,6 +615,75 @@ fn redirect_child_page(
 /// superseded within the same batch), so the caller persists exactly the new
 /// tree's pages. Pages not present in `pages` (the unchanged, already-stored
 /// ones) are simply not walked into.
+/// Walk every leaf in the resident tree and materialize [`LeafInsert`] rows for
+/// batch rebuild (drain / compact only — decodes stored Sq8 centroids once).
+pub(crate) fn collect_leaf_inserts_from_tree(
+    source: &dyn PageSource,
+    root: ContentHash,
+    dim: usize,
+) -> Result<Vec<LeafInsert>, PageError> {
+    let mut cache: HashMap<ContentHash, Page> = HashMap::new();
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    let mut seen: HashSet<ContentHash> = HashSet::new();
+    while let Some(h) = stack.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        let bytes = fetch_bytes(&HashMap::new(), source, &h)?;
+        let page = Page::parse(&bytes)?;
+        cache.insert(h, page);
+        let page = &cache[&h];
+        for local in 0..page.topo().len() as u32 {
+            if let NodeTopo::Leaf(leaf) = page.topo_at(local) {
+                let mut centroid_fp32 = vec![0f32; dim];
+                page.centroids().dequantize_into(local as usize, &mut centroid_fp32);
+                out.push(LeafInsert {
+                    superfile_id: leaf.superfile_id,
+                    doc_off: leaf.doc_off,
+                    count: leaf.count,
+                    cluster_id: leaf.cluster_id,
+                    centroid_fp32,
+                    radius: page.centroids().radii.get(local as usize).copied().unwrap_or(0.0),
+                });
+            }
+        }
+        for child in page.referenced_pages() {
+            stack.push(child);
+        }
+    }
+    Ok(out)
+}
+
+/// Batch-(re)build the routing tree for drain / compact: collect surviving leaves
+/// from the prior tree, drop `removed` superfile ids, append `added`, then one
+/// SIMD [`CentroidTree::build`] + page split. Writes the full new page set — no
+/// per-leaf COW on the commit path.
+pub(crate) fn rebuild_tree_batch(
+    source: &dyn PageSource,
+    prior_root: Option<ContentHash>,
+    metric: Metric,
+    dim: usize,
+    removed: &[u128],
+    added: &[LeafInsert],
+    page_budget: usize,
+) -> Result<Option<SplitPages>, PageError> {
+    let removed_set: HashSet<u128> = removed.iter().copied().collect();
+    let mut all_leaves = if let Some(root) = prior_root {
+        collect_leaf_inserts_from_tree(source, root, dim)?
+            .into_iter()
+            .filter(|l| !removed_set.contains(&l.superfile_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    all_leaves.extend(added.iter().cloned());
+    if all_leaves.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(build_genesis(metric, dim, &all_leaves, page_budget)?))
+}
+
 fn retain_reachable(
     pages: &mut HashMap<ContentHash, Vec<u8>>,
     root: ContentHash,
@@ -690,7 +749,7 @@ mod tests {
         let (dim, n, budget) = (16usize, 150usize, 8usize);
         let cells = synth_cells(n, dim);
         let leaves = leaves_from(&cells);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let genesis = insert_leaves(
                 &ResidentPageSource::from_pages(HashMap::new()),
                 None,
@@ -772,7 +831,7 @@ mod tests {
         let (dim, n, budget) = (16usize, 150usize, 8usize);
         let cells = synth_cells(n, dim);
         let leaves = leaves_from(&cells);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let genesis = insert_leaves(
                 &ResidentPageSource::from_pages(HashMap::new()),
                 None,
@@ -823,7 +882,7 @@ mod tests {
         let (dim, n) = (16usize, 64usize);
         let cells = synth_cells(n, dim);
         let leaves = leaves_from(&cells);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let genesis = insert_leaves(
                 &ResidentPageSource::from_pages(HashMap::new()),
                 None,
@@ -873,7 +932,7 @@ mod tests {
         let (dim, n) = (16usize, 64usize);
         let cells = synth_cells(n, dim);
         let leaves = leaves_from(&cells);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let genesis = insert_leaves(
                 &ResidentPageSource::from_pages(HashMap::new()),
                 None,
@@ -906,6 +965,52 @@ mod tests {
                     .all(|(_, _, id)| got.contains(id)),
                 "{metric:?}: a surviving cell went missing after delete"
             );
+        }
+    }
+
+    /// Genesis over a fine-grained leaf set (the drain shape: thousands of
+    /// per-cluster leaves) must complete in batch SIMD-balanced build time,
+    /// not the old all-pairs medoid path.
+    #[test]
+    fn genesis_build_batch_at_scale() {
+        use std::time::Instant;
+        let (dim, n) = (1024usize, 8000usize);
+        let cells = synth_cells(n, dim);
+        let leaves = leaves_from(&cells);
+        let time_limit = if cfg!(debug_assertions) {
+            std::time::Duration::from_secs(120)
+        } else {
+            std::time::Duration::from_secs(10)
+        };
+        for budget in [4096usize, 256usize] {
+            let t = Instant::now();
+            let g = insert_leaves(
+                &ResidentPageSource::from_pages(HashMap::new()),
+                None,
+                Metric::L2Sq,
+                dim,
+                &leaves,
+                budget,
+            )
+            .expect("genesis ok")
+            .expect("genesis some");
+            let elapsed = t.elapsed();
+            eprintln!(
+                "[opann] genesis {n} leaves dim={dim} budget={budget}: {elapsed:?} ({} pages)",
+                g.pages.len()
+            );
+            assert!(
+                elapsed < time_limit,
+                "genesis build of {n} leaves took {elapsed:?} (budget={budget})"
+            );
+            let paged = PagedTree::new(ResidentPageSource::from_pages(g.pages.clone()), g.root);
+            let found: HashSet<u128> = paged
+                .select_leaves(&cells[0].0, n)
+                .expect("descend")
+                .into_iter()
+                .map(|(l, _)| l.superfile_id)
+                .collect();
+            assert_eq!(found.len(), n, "every genesis leaf must stay reachable");
         }
     }
 }

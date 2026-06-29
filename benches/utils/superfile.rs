@@ -1320,6 +1320,8 @@ pub mod vector {
                 phases.cold,
                 3,
                 false,
+                exec_vec::CorrectnessGate::IvfNprobe,
+                None,
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(

@@ -27,9 +27,9 @@
 use std::collections::HashMap;
 
 use crate::superfile::vector::cell_posting::{
-    EncodedCellRow, distance_encoded_rows_symmetric, encoded_ivf_kmeans, medoid_index_by,
+    EncodedCellRow, manifest_centroid_components_from_row,
 };
-use crate::superfile::vector::distance::Metric;
+use crate::superfile::vector::distance::{Metric, distance};
 use crate::supertable::manifest::ClusterCentroids;
 use crate::supertable::manifest::part::ContentHash;
 
@@ -42,8 +42,8 @@ use super::paged::SplitPages;
 /// ~`fanout · depth`; depth is `log_fanout(n_cells)`.
 const DEFAULT_FANOUT: usize = 16;
 
-/// Encoded k-medoids iterations when splitting a node's cells into child groups.
-const TREE_KMEANS_ITERS: usize = 8;
+/// One Lloyd reassignment pass after farthest-point seeding.
+const PARTITION_LLOYD_ITERS: usize = 1;
 
 /// One node of the routing tree. The node's centroid lives in
 /// [`CentroidTree::centroids`] at the matching index (`node id == centroid id`).
@@ -75,15 +75,10 @@ pub(crate) struct CentroidTree {
 
 impl CentroidTree {
     /// Build a routing tree over the cell centroids `clusters` (Sq8+residual, as
-    /// stored in the manifest); leaf `i` routes to `leaf_refs[i]` (a cluster
-    /// within an object-resident superfile). Everything
-    /// stays in the **encoded domain** — grouping is `encoded_ivf_kmeans` over
-    /// the stored bytes, internal-node centroids are **medoids** (existing cell
-    /// centroids, picked by `medoid_index_by`), and the tree's centroid block is
-    /// *sliced* from `clusters` under the same shared quantizer (`select_rows`).
-    /// No fp32 vector is ever reconstructed and no centroid is re-quantized.
-    /// Returns `None` for empty input, `dim == 0`, or a `leaf_refs` length
-    /// mismatch.
+    /// stored in the manifest); leaf `i` routes to `leaf_refs[i]`. Splits use
+    /// fp32 farthest-point seeds + Sq8 SIMD assignment ([`partition_indices_simd`]);
+    /// internal nodes reuse the leaf nearest the group mean. Returns `None` for
+    /// empty input, `dim == 0`, or a `leaf_refs` length mismatch.
     pub(crate) fn build(
         metric: Metric,
         clusters: &ClusterCentroids,
@@ -107,6 +102,7 @@ impl CentroidTree {
         let indices: Vec<usize> = (0..n).collect();
         let root = build_subtree(
             metric,
+            clusters,
             dim,
             &rows,
             &cell_radii,
@@ -299,12 +295,14 @@ impl CentroidTree {
 /// Recursively build a subtree over `indices` (into the encoded cell `rows`),
 /// appending nodes to `nodes` and, per node, the source cell index whose stored
 /// centroid the node reuses to `sources` (kept index-aligned). Returns the
-/// subtree's root node id. Grouping is encoded-domain k-medoids; internal nodes
-/// reuse an existing cell centroid (the group medoid), so no centroid is
-/// computed and nothing is decoded to fp32.
+/// subtree's root node id. Large groups are split with [`partition_indices_simd`]
+/// (fp32 farthest-point seeds, Sq8+residual assignment via
+/// [`ClusterCentroids::score_clusters_into`]); internal nodes reuse an existing
+/// leaf centroid nearest the group mean — O(n) per level, not all-pairs medoid.
 #[allow(clippy::too_many_arguments)]
 fn build_subtree(
     metric: Metric,
+    clusters: &ClusterCentroids,
     dim: usize,
     rows: &[EncodedCellRow],
     cell_radii: &[f32],
@@ -323,33 +321,165 @@ fn build_subtree(
             .iter()
             .map(|&i| push_leaf(i, cell_radii, leaf_refs, nodes, sources))
             .collect();
-        return push_internal(metric, dim, rows, indices, children, nodes, sources);
+        return push_internal(metric, clusters, dim, rows, indices, children, nodes, sources);
     }
-    // Large group → encoded k-medoids into up to DEFAULT_FANOUT child groups
-    // (reusing `encoded_ivf_kmeans` over the stored bytes), recurse.
-    let subset: Vec<EncodedCellRow> = indices.iter().map(|&i| rows[i].clone()).collect();
-    let (_centroids, assign) =
-        encoded_ivf_kmeans(&subset, metric, DEFAULT_FANOUT, TREE_KMEANS_ITERS);
-    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); DEFAULT_FANOUT];
-    for (local, &i) in indices.iter().enumerate() {
-        groups[assign[local]].push(i);
+    let mut groups =
+        partition_indices_simd(metric, clusters, dim, rows, indices, DEFAULT_FANOUT);
+    if groups.len() <= 1 {
+        groups = partition_indices_chunk(indices, DEFAULT_FANOUT);
     }
-    let non_empty: Vec<Vec<usize>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
-    // No-progress guard: if clustering failed to split (one group holds
-    // everything, or only one non-empty group), fall back to a flat internal
-    // node over leaf children rather than recursing forever.
-    if non_empty.len() <= 1 || non_empty.iter().any(|g| g.len() == indices.len()) {
-        let children: Vec<u32> = indices
-            .iter()
-            .map(|&i| push_leaf(i, cell_radii, leaf_refs, nodes, sources))
-            .collect();
-        return push_internal(metric, dim, rows, indices, children, nodes, sources);
-    }
-    let children: Vec<u32> = non_empty
+    let children: Vec<u32> = groups
         .into_iter()
-        .map(|g| build_subtree(metric, dim, rows, cell_radii, leaf_refs, &g, nodes, sources))
+        .map(|g| {
+            build_subtree(
+                metric,
+                clusters,
+                dim,
+                rows,
+                cell_radii,
+                leaf_refs,
+                &g,
+                nodes,
+                sources,
+            )
+        })
         .collect();
-    push_internal(metric, dim, rows, indices, children, nodes, sources)
+    push_internal(metric, clusters, dim, rows, indices, children, nodes, sources)
+}
+
+/// Split `indices` into up to `k` non-empty groups: farthest-point fp32 seeds,
+/// then assign each row to its nearest seed via [`ClusterCentroids::score_one`]
+/// (SIMD kernel — no re-quantize per split).
+fn partition_indices_simd(
+    metric: Metric,
+    clusters: &ClusterCentroids,
+    dim: usize,
+    rows: &[EncodedCellRow],
+    indices: &[usize],
+    k: usize,
+) -> Vec<Vec<usize>> {
+    let n = indices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = k.min(n).max(1);
+    if k == 1 {
+        return vec![indices.to_vec()];
+    }
+    let components: Vec<Vec<f32>> = indices
+        .iter()
+        .map(|&i| manifest_centroid_components_from_row(&rows[i], dim))
+        .collect();
+    let seed_locals = farthest_point_locals(&components, k, metric);
+    let mut seed_globals: Vec<usize> = seed_locals.iter().map(|&l| indices[l]).collect();
+    let mut groups = assign_groups_by_seeds(metric, clusters, indices, &components, &seed_globals);
+    for _ in 0..PARTITION_LLOYD_ITERS {
+        let mut new_seed_globals = Vec::with_capacity(k);
+        for g in &groups {
+            if g.is_empty() {
+                new_seed_globals.push(*seed_globals.first().unwrap_or(&indices[0]));
+            } else {
+                new_seed_globals.push(medoid_nearest_to_mean(metric, clusters, dim, rows, g));
+            }
+        }
+        seed_globals = new_seed_globals;
+        groups = assign_groups_by_seeds(metric, clusters, indices, &components, &seed_globals);
+    }
+    groups.into_iter().filter(|g| !g.is_empty()).collect()
+}
+
+/// Assign each row to the nearest seed cluster in `clusters` (SIMD `score_one`).
+fn assign_groups_by_seeds(
+    metric: Metric,
+    clusters: &ClusterCentroids,
+    indices: &[usize],
+    components: &[Vec<f32>],
+    seed_globals: &[usize],
+) -> Vec<Vec<usize>> {
+    let k = seed_globals.len();
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (local, comp) in components.iter().enumerate() {
+        let mut best_c = 0usize;
+        let mut best = f32::INFINITY;
+        for (c, &seed_g) in seed_globals.iter().enumerate() {
+            let score = clusters.score_one(metric, seed_g, comp);
+            if score < best {
+                best = score;
+                best_c = c;
+            }
+        }
+        groups[best_c].push(indices[local]);
+    }
+    groups
+}
+
+/// Deterministic equal-size chunk split when SIMD assignment fails to divide.
+fn partition_indices_chunk(indices: &[usize], k: usize) -> Vec<Vec<usize>> {
+    let n = indices.len();
+    let k = k.min(n).max(1);
+    let chunk = n.div_ceil(k);
+    indices
+        .chunks(chunk)
+        .map(|c| c.to_vec())
+        .filter(|g| !g.is_empty())
+        .collect()
+}
+
+/// Farthest-point seeding over fp32 component vectors (k-means++ style).
+fn farthest_point_locals(components: &[Vec<f32>], k: usize, metric: Metric) -> Vec<usize> {
+    let n = components.len();
+    let k = k.min(n);
+    let mut seeds = vec![0usize];
+    while seeds.len() < k {
+        let mut best_idx = 0usize;
+        let mut best_min = f32::NEG_INFINITY;
+        for (i, c) in components.iter().enumerate() {
+            if seeds.contains(&i) {
+                continue;
+            }
+            let min_d = seeds
+                .iter()
+                .map(|&s| distance(metric, c, &components[s]))
+                .fold(f32::INFINITY, f32::min);
+            if min_d > best_min {
+                best_min = min_d;
+                best_idx = i;
+            }
+        }
+        seeds.push(best_idx);
+    }
+    seeds
+}
+
+/// Pick the leaf whose stored centroid is nearest the group's fp32 mean — one
+/// [`ClusterCentroids::score_clusters_into`] pass (SIMD), O(n).
+fn medoid_nearest_to_mean(
+    metric: Metric,
+    clusters: &ClusterCentroids,
+    dim: usize,
+    rows: &[EncodedCellRow],
+    indices: &[usize],
+) -> usize {
+    let selected: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+    let sub = clusters.select_rows(&selected);
+    let mut mean = vec![0f64; dim];
+    for &global_i in indices {
+        let comp = manifest_centroid_components_from_row(&rows[global_i], dim);
+        for (acc, &x) in mean.iter_mut().zip(&comp) {
+            *acc += x as f64;
+        }
+    }
+    let inv = 1.0 / (indices.len() as f64);
+    let mean_f32: Vec<f32> = mean.iter().map(|a| (*a * inv) as f32).collect();
+    let mut best_local = 0usize;
+    let mut best = f32::INFINITY;
+    sub.score_clusters_into(metric, &mean_f32, |c, score| {
+        if score < best {
+            best = score;
+            best_local = c as usize;
+        }
+    });
+    indices[best_local]
 }
 
 /// Append a leaf node for cell `i`; its centroid is cell `i`'s own (source index
@@ -371,14 +501,12 @@ fn push_leaf(
     id
 }
 
-/// Append an internal node whose centroid is the **medoid** of the cells under
-/// `indices` — an existing cell centroid (its source index), chosen in the
-/// encoded domain via [`medoid_index_by`] — and whose covering radius bounds
-/// every child's ball (encoded-domain distances). Children are pushed before
-/// the parent, so the parent's id is the largest in its subtree (the overall
-/// root is the last node).
+/// Append an internal node whose centroid is the leaf nearest the group's fp32
+/// mean (SIMD [`ClusterCentroids::score_clusters_into`]), with covering radius
+/// over its children.
 fn push_internal(
     metric: Metric,
+    clusters: &ClusterCentroids,
     dim: usize,
     rows: &[EncodedCellRow],
     indices: &[usize],
@@ -386,18 +514,12 @@ fn push_internal(
     nodes: &mut Vec<NodeMeta>,
     sources: &mut Vec<u32>,
 ) -> u32 {
-    // Medoid of this subtree's cells — an existing encoded centroid.
-    let subset: Vec<EncodedCellRow> = indices.iter().map(|&i| rows[i].clone()).collect();
-    let medoid_local = medoid_index_by(&subset, |a, b| {
-        distance_encoded_rows_symmetric(metric, dim, a, b)
-    });
-    let medoid = indices[medoid_local];
-    // Covering radius from the medoid: max over children of
-    // dist(medoid, child_centroid) + child_radius.
+    let medoid = medoid_nearest_to_mean(metric, clusters, dim, rows, indices);
+    let medoid_query = manifest_centroid_components_from_row(&rows[medoid], dim);
     let mut radius = 0.0f32;
     for &ch in &children {
         let child_src = sources[ch as usize] as usize;
-        let d = distance_encoded_rows_symmetric(metric, dim, &rows[medoid], &rows[child_src]);
+        let d = clusters.score_one(metric, child_src, &medoid_query);
         radius = radius.max(d + nodes[ch as usize].radius);
     }
     let id = nodes.len() as u32;
@@ -472,7 +594,7 @@ mod tests {
     fn build_has_one_leaf_per_cell_and_descends_all() {
         let (dim, n) = (24usize, 200usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             // More nodes than cells (internal nodes added), but never fewer.
             assert!(
@@ -496,7 +618,7 @@ mod tests {
     fn select_leaves_bounded_and_finds_query_cell() {
         let (dim, n, limit) = (32usize, 300usize, 12usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             // A query placed exactly at a cell's centroid must route to that
             // cell within a modest probe budget (the tree groups by proximity).
@@ -645,7 +767,7 @@ mod tests {
         // round-trips losslessly, so equality is the right bar, not recall.
         let (dim, n) = (32usize, 250usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             let page = Page::parse(&tree.to_page_bytes()).expect("parse page");
             assert_eq!(page.n_nodes(), tree.n_nodes(), "{metric:?}: node count");

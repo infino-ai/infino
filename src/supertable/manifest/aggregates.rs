@@ -264,6 +264,7 @@ mod tests {
         let mut cols = HashMap::new();
         cols.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
@@ -326,6 +327,7 @@ mod tests {
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
@@ -376,6 +378,7 @@ mod tests {
             let mut cols = HashMap::new();
             cols.insert("n".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                arrival_ordinal: 0,
                 superfile_id: uuid::Uuid::new_v4(),
                 uri: SuperfileUri::new_v4(),
                 n_docs: 1,

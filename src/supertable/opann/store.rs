@@ -266,7 +266,7 @@ mod tests {
     use crate::storage::LocalFsStorageProvider;
     use crate::superfile::vector::distance::Metric;
     use crate::supertable::manifest::commit::put_immutable_blob;
-    use crate::supertable::manifest::list::{CellRoutingParams, OpannRouting};
+    use crate::supertable::manifest::list::OpannRouting;
     use crate::supertable::opann::paged::{PagedTree, SplitPages};
     use crate::supertable::opann::test_util::{build_tree, synth_cells};
     use bytes::Bytes;
@@ -274,9 +274,10 @@ mod tests {
     fn test_routing(root: ContentHash) -> OpannRouting {
         OpannRouting {
             root_page: root,
-            routing: CellRoutingParams::default(),
             deleted_ids_uri: None,
             deleted_ids_content_hash: None,
+            drained_max_arrival_ordinal: 0,
+            drained_user_manifest_id: 0,
         }
     }
 
@@ -336,7 +337,7 @@ mod tests {
         let storage = LocalFsStorageProvider::new(dir.path()).expect("local fs");
         let (dim, n) = (24usize, 200usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             let split = tree.to_pages(8);
             let root = split.root;

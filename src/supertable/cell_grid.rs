@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! MVCC SPFresh maintenance for the hidden global vector cell index.
+//! Global vector cell grid for the hidden index.
 //!
-//! The user table stays time-ordered and immutable. The hidden index is a
-//! derived, cell-ordered acceleration layer maintained with SPFresh/LIRE-style
-//! logical updates expressed as append/MVCC physical swaps:
+//! The hidden manifest carries a fixed [`ClusterCentroids`] grid (typically 64
+//! cells, bootstrapped at user commit). This module holds encoded-domain helpers
+//! for that grid:
 //!
-//!   1. Assign incoming vectors to nearest manifest centroids with zero GETs.
-//!   2. For each touched cell only: append one delta superfile (no GETs).
-//!   3. Compaction merges multiple small IVF superfiles per cell toward one packed
-//!      base via the standard `merge_superfiles` path.
-//!   4. Locally refresh touched cell centroids and member radii.
-//!   5. Split overflow cells (Sq8+ε k-means, N→N+1 centroids).
-//!   6. Reassign vectors in the split neighborhood (P−1, P, P₂, P+1).
-//!   7. Redrive reassigned rows through the incoming staging region; route
-//!      them into per-cell IVF superfiles (same path as commit ingest).
+//! - **Drain routing** — assign Sq8+ε rows to cell(s) via SPANN closure
+//!   replication, then byte-splice into per-cell IVF superfiles.
+//! - **Manifest bookkeeping** — bump per-cell doc counts and covering radii.
+//! - **Overflow split** — 2-way Sq8+ε k-means when a merged cell superfile
+//!   exceeds the doc cap; reassign the split neighborhood and redrive rows.
 //!
-//! Split/reassign stays on stored Sq8+ε bytes. Row assignment and k-means both
-//! score via [`distance_encoded_to_centroid`]; rows are re-spliced with
-//! [`encode_encoded_rows`], never decoded to fp32 corpora.
+//! All scoring stays on stored Sq8+ε bytes; rows are re-spliced with
+//! [`route_and_splice_ivf_subsections`](crate::superfile::vector::ivf_merge::route_and_splice_ivf_subsections),
+//! never decoded to a full fp32 corpus.
 
 use std::{cmp::Ordering, collections::HashMap, env, sync::OnceLock};
 
@@ -31,7 +27,7 @@ use crate::{
     supertable::manifest::ClusterCentroids,
 };
 
-/// Doc count above which a merged cell superfile is split (SPFresh step 7).
+/// Doc count above which a merged cell superfile is split into two sub-cells.
 const CELL_SPLIT_DOC_CAP_DEFAULT: u64 = 50_000;
 
 /// Lloyd iterations for 2-way Sq8+ε k-means at split time.
@@ -232,23 +228,6 @@ pub(crate) fn plan_sq8_split(
     )
 }
 
-/// Max member distance from `cell_id`'s centroid over encoded rows.
-pub(crate) fn encoded_shard_radius(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    cell_id: u32,
-    rows: &[EncodedCellRow],
-) -> f32 {
-    let mut max_r = 0.0f32;
-    for row in rows {
-        let dist = score_row_against_cell(clusters, metric, cell_id as usize, row);
-        if dist > max_r {
-            max_r = dist;
-        }
-    }
-    max_r
-}
-
 /// Assign an encoded row to the nearest cell among `candidates`.
 pub(crate) fn nearest_among_cells_encoded(
     clusters: &ClusterCentroids,
@@ -266,6 +245,16 @@ pub(crate) fn nearest_among_cells_encoded(
         }
     }
     best
+}
+
+/// Distance from an encoded row to a global cell's stored centroid.
+pub(crate) fn member_distance_to_cell(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    cell: u32,
+    row: &EncodedCellRow,
+) -> f32 {
+    score_row_against_cell(clusters, metric, cell as usize, row)
 }
 
 /// SPANN/LIRE-style closure replication: the set of cells a row should be

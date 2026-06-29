@@ -86,7 +86,7 @@ pub(crate) fn storage_for_entry(
     entry: &SuperfileEntry,
     storage: Option<&Arc<dyn StorageProvider>>,
 ) -> Option<Arc<dyn StorageProvider>> {
-    if entry.is_incoming_pointer() {
+    if entry.is_user_staged_for_hidden_index() {
         if let Some(inner) = storage.and_then(|s| s.prefix_inner()) {
             return Some(inner);
         }

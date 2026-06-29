@@ -35,7 +35,6 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
@@ -164,6 +163,15 @@ impl SuperfileList {
         }
     }
 
+    /// Highest [`SuperfileEntry::arrival_ordinal`] in this snapshot (`0` when empty).
+    pub(crate) fn max_arrival_ordinal(&self) -> u64 {
+        self.superfiles
+            .iter()
+            .map(|e| e.arrival_ordinal)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Build a successor SuperfileList with `new_entries` appended to
     /// the end of `superfiles`. Original is unchanged. `manifest_id`
     /// of the result is `self.manifest_id + 1`.
@@ -217,6 +225,10 @@ pub struct Manifest {
     /// (lazily, on first access / open pre-warm) and reused by every query,
     /// swapping with the manifest. Empty for tables without an OPANN root.
     opann_tree: OnceCell<Arc<ResidentPageSource>>,
+    /// In-memory genesis root when the tree was built live from manifest
+    /// summaries (pre-drain). Persisted routing uses [`list::OpannRouting`]
+    /// instead; this slot is empty after drain publishes page blobs.
+    live_opann_root: OnceCell<ContentHash>,
 }
 
 impl fmt::Debug for Manifest {
@@ -265,6 +277,7 @@ impl Manifest {
             );
             Self {
                 opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
                 superfile_list,
                 list: Some(list),
                 parts: DashMap::new(),
@@ -274,6 +287,7 @@ impl Manifest {
         } else {
             Self {
                 opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
                 superfile_list,
                 list: None,
                 parts: DashMap::new(),
@@ -296,6 +310,7 @@ impl Manifest {
     pub fn empty(options: Arc<SupertableOptions>) -> Self {
         Self {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(options),
             list: None,
             parts: DashMap::new(),
@@ -310,6 +325,7 @@ impl Manifest {
     ) -> Self {
         Self {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty_with_vector_index_prefix(
                 options,
                 vector_index_storage_prefix,
@@ -541,6 +557,7 @@ impl Manifest {
         new_superfile_list.superfiles = all_superfiles;
         let new_manifest = Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(list),
             parts,
@@ -685,6 +702,7 @@ impl Manifest {
     pub fn with_appended(&self, new_entries: Vec<Arc<SuperfileEntry>>) -> Self {
         Self {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: self.superfile_list.with_appended(new_entries),
             list: self.list.clone(),
             parts: DashMap::new(),
@@ -707,6 +725,7 @@ impl Manifest {
         };
         Self {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: self.manifest_id,
                 options: Arc::clone(&self.options),
@@ -724,6 +743,20 @@ impl Manifest {
     /// published (`None` ⇒ readers fall back to flat cell selection).
     pub(crate) fn opann_routing(&self) -> Option<&list::OpannRouting> {
         self.list.as_ref().and_then(|l| l.opann_routing.as_ref())
+    }
+
+    /// Root page for OPANN tree descent: persisted routing after drain, or the
+    /// in-memory genesis root built live from manifest summaries pre-drain.
+    pub(crate) fn opann_descent_root(&self) -> Option<ContentHash> {
+        if let Some(r) = self.opann_routing() {
+            return Some(r.root_page);
+        }
+        self.live_opann_root.get().copied()
+    }
+
+    /// Already-loaded resident OPANN pages for this manifest snapshot, if any.
+    pub(crate) fn loaded_opann_resident(&self) -> Option<Arc<ResidentPageSource>> {
+        self.opann_tree.get().map(Arc::clone)
     }
 
     /// Return a manifest with `opann_routing` set on its list — the drain stamps
@@ -747,36 +780,39 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
         }
     }
 
-    /// The resident OPANN routing tree for this manifest, loaded once (through
-    /// `load_resident` against this manifest's storage) and reused for every
-    /// query — it swaps with the manifest. `Ok(None)` if there is no OPANN
-    /// routing root or no storage backend.
+    /// The resident OPANN routing tree for this manifest, loaded once and reused
+    /// for every query — it swaps with the manifest. When persisted routing
+    /// exists, pages are loaded from object storage. Pre-drain live trees are
+    /// Pre-drain incoming clusters are read from the user manifest at query time;
+    /// post-drain pages load from object storage once and are reused.
     pub(crate) async fn opann_resident_tree(
         &self,
     ) -> Result<Option<Arc<ResidentPageSource>>, OpannStoreError> {
-        let Some(routing) = self.opann_routing() else {
-            return Ok(None);
-        };
-        let Some(storage) = self.options.storage.as_ref() else {
-            return Ok(None);
-        };
-        let storage = Arc::clone(storage);
-        // Route page loads through the shared disk cache when attached, so the
-        // routing tree is mmap-backed + evictable like superfile blobs.
-        let cache = self.options.disk_cache.clone();
-        let routing = routing.clone();
-        let source = self
-            .opann_tree
-            .get_or_try_init(|| async move {
-                load_resident(cache.as_ref(), storage.as_ref(), &routing)
-                    .await
-                    .map(Arc::new)
-            })
-            .await?;
-        Ok(Some(Arc::clone(source)))
+        if let Some(tree) = self.opann_tree.get() {
+            return Ok(Some(Arc::clone(tree)));
+        }
+        if let Some(routing) = self.opann_routing() {
+            let Some(storage) = self.options.storage.as_ref() else {
+                return Ok(None);
+            };
+            let storage = Arc::clone(storage);
+            let cache = self.options.disk_cache.clone();
+            let routing = routing.clone();
+            let source = self
+                .opann_tree
+                .get_or_try_init(|| async move {
+                    load_resident(cache.as_ref(), storage.as_ref(), &routing)
+                        .await
+                        .map(Arc::new)
+                })
+                .await?;
+            return Ok(Some(Arc::clone(source)));
+        }
+        Ok(None)
     }
 
     /// Seed this manifest version's resident routing tree directly, instead of
@@ -786,6 +822,16 @@ impl Manifest {
     /// the result here, so the next query/commit on this version reuses it rather
     /// than re-fetching + re-verifying the whole tree. No-op if already loaded.
     pub(crate) fn seed_opann_tree(&self, source: Arc<ResidentPageSource>) {
+        let _ = self.opann_tree.set(source);
+    }
+
+    /// Seed the in-memory pre-drain routing tree and its genesis root.
+    pub(crate) fn seed_live_opann_tree(
+        &self,
+        source: Arc<ResidentPageSource>,
+        root: ContentHash,
+    ) {
+        let _ = self.live_opann_root.set(root);
         let _ = self.opann_tree.set(source);
     }
 
@@ -837,6 +883,35 @@ impl Manifest {
         for part_entry in &list.parts {
             let part = self.get_part_by_id(part_entry.part_id).await?;
             if let Some(entry) = part.superfiles.iter().find(|e| e.uri == uri) {
+                return Ok(Some(Arc::clone(entry)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve one superfile entry by id. Checks the resident flat list first,
+    /// then walks manifest parts until a match (loads only the parts visited).
+    pub(crate) async fn lookup_superfile_entry_by_id(
+        &self,
+        superfile_id: uuid::Uuid,
+    ) -> Result<Option<Arc<SuperfileEntry>>, ManifestLoadError> {
+        if let Some(entry) = self
+            .superfiles
+            .iter()
+            .find(|e| e.superfile_id == superfile_id)
+        {
+            return Ok(Some(Arc::clone(entry)));
+        }
+        let Some(list) = &self.list else {
+            return Ok(None);
+        };
+        for part_entry in &list.parts {
+            let part = self.get_part_by_id(part_entry.part_id).await?;
+            if let Some(entry) = part
+                .superfiles
+                .iter()
+                .find(|e| e.superfile_id == superfile_id)
+            {
                 return Ok(Some(Arc::clone(entry)));
             }
         }
@@ -1127,6 +1202,7 @@ impl Manifest {
 
         let new_manifest = Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(new_list),
             parts,
@@ -1360,16 +1436,47 @@ pub struct SuperfileEntry {
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
+    /// Monotonic per-table ordinal assigned at user commit. Compaction inherits
+    /// `min(inputs)` so a merged superfile stays below the drain watermark when
+    /// any input was already drained. Legacy manifests decode as `0`.
+    pub arrival_ordinal: u64,
 }
 
 impl SuperfileEntry {
-    /// Whether this entry is an INCOMING pointer the hidden vector index holds
-    /// to a *user-table* superfile (registered, not copied). Such an entry's
-    /// bytes live in the user table's storage namespace — one prefix level up
-    /// from the hidden index's own prefixed storage — so the read path fetches
-    /// them through [`StorageProvider::prefix_inner`], not the hidden prefix.
+    /// Legacy hidden INCOMING partition marker (`partition_hint ==
+    /// INCOMING_VECTOR_CELL`). Watermark-model staging uses user-manifest entries
+    /// with [`Self::arrival_ordinal`] instead of duplicating pointers on the
+    /// hidden manifest. Such entries' bytes live in the user storage namespace —
+    /// fetch via [`StorageProvider::prefix_inner`], not the hidden prefix.
     pub(crate) fn is_incoming_pointer(&self) -> bool {
         self.partition_hint == Some(INCOMING_VECTOR_CELL)
+    }
+
+    /// User-table superfile whose bytes live in the parent storage namespace when
+    /// opened from the hidden vector-index sibling. INCOMING pointers (legacy) and
+    /// user-manifest entries stamped with [`Self::arrival_ordinal`] at commit
+    /// qualify. Hidden per-cell IVF outputs do not — they carry an `_id` scalar
+    /// column for remap but live under the hidden storage prefix only.
+    pub(crate) fn is_user_staged_for_hidden_index(&self) -> bool {
+        self.is_incoming_pointer() || self.arrival_ordinal > 0
+    }
+
+    pub(crate) fn with_arrival_ordinal(self: &Arc<Self>, ordinal: u64) -> Arc<Self> {
+        Arc::new(SuperfileEntry {
+            superfile_id: self.superfile_id,
+            uri: self.uri.clone(),
+            n_docs: self.n_docs,
+            id_min: self.id_min,
+            id_max: self.id_max,
+            scalar_stats: self.scalar_stats.clone(),
+            fts_summary: self.fts_summary.clone(),
+            vector_summary: self.vector_summary.clone(),
+            partition_key: self.partition_key.clone(),
+            partition_hint: self.partition_hint,
+            subsection_offsets: self.subsection_offsets.clone(),
+            vector_layout: self.vector_layout,
+            arrival_ordinal: ordinal,
+        })
     }
 }
 
@@ -2114,63 +2221,6 @@ impl ClusterCentroids {
         }
     }
 
-    pub fn select_cells_adaptive(
-        &self,
-        metric: Metric,
-        query: &[f32],
-        nprobe_floor: usize,
-        routing: list::CellRoutingParams,
-    ) -> Vec<u32> {
-        let dim = self.dim as usize;
-        if self.n_cent == 0 || dim == 0 || query.len() != dim {
-            return (0..self.n_cent).collect();
-        }
-        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(self.n_cent as usize);
-        self.score_clusters_into(metric, query, |c, score| {
-            scored.push((c, score));
-        });
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        if scored.is_empty() {
-            return Vec::new();
-        }
-        let d_star = scored[0].1;
-        let r_star = self.radii.get(scored[0].0 as usize).copied().unwrap_or(0.0);
-        let tau = if r_star > 0.0 {
-            d_star + routing.slack * r_star
-        } else {
-            d_star * (1.0 + routing.slack)
-        };
-        let lb = |idx: usize| {
-            let (c, d) = scored[idx];
-            let r = self.radii.get(c as usize).copied().unwrap_or(0.0);
-            (d - r).max(0.0)
-        };
-        let nprobe_min = nprobe_floor.max(routing.nprobe_min).max(1);
-        let nprobe_max = routing.nprobe_max.max(nprobe_min);
-        let n = scored.len();
-        let floor = nprobe_min.min(n);
-        let mut chosen = vec![false; n];
-        let mut order: Vec<usize> = Vec::with_capacity(nprobe_max.min(n));
-        for (i, slot) in chosen.iter_mut().enumerate().take(floor) {
-            *slot = true;
-            order.push(i);
-        }
-        let mut by_lb: Vec<usize> = (0..n).filter(|&i| !chosen[i]).collect();
-        by_lb.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
-        for i in by_lb {
-            if order.len() >= nprobe_max {
-                break;
-            }
-            if lb(i) <= tau {
-                order.push(i);
-            }
-        }
-        order.sort_unstable();
-        order.into_iter().map(|i| scored[i].0).collect()
-    }
-
-    /// Return the cell whose centroid is closest to `query` under `metric`.
-    /// Uses [`Self::score_clusters_into`] — the single Sq8+residual scorer.
     pub fn nearest_cell(&self, metric: Metric, query: &[f32]) -> u32 {
         let mut best_cell = 0u32;
         let mut best_score = f32::INFINITY;
@@ -2273,9 +2323,7 @@ mod tests {
     /// (the prior selection path) up to f32 association order, for all
     /// three metrics, and must skip count-0 clusters.
     #[test]
-    fn cluster_centroids_radii_roundtrip_and_adaptive_floor() {
-        use crate::supertable::manifest::{encoding, list::CellRoutingParams};
-
+    fn cluster_centroids_radii_roundtrip() {
         let clusters = ClusterCentroids::from_fp32(
             Metric::L2Sq,
             4,
@@ -2289,17 +2337,6 @@ mod tests {
         let bytes = encoding::encode_cluster_centroids(&clusters);
         let decoded = encoding::decode_cluster_centroids(&bytes).expect("decode");
         assert_eq!(decoded.radii, clusters.radii);
-
-        let query = [0.1, 0.0, 0.0, 0.0];
-        let routing = CellRoutingParams {
-            nprobe_min: 2,
-            nprobe_max: 4,
-            slack: 0.0,
-        };
-        let routed = decoded.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
-        assert!(routed.len() >= 2);
-        assert!(routed.len() <= 4);
-        assert_eq!(routed[0], decoded.nearest_cell(Metric::L2Sq, &query));
     }
 
     #[test]
@@ -2427,6 +2464,7 @@ mod tests {
 
     fn seg_entry(uuid: Uuid, n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid,
             uri: SuperfileUri(uuid),
             n_docs,
@@ -2765,6 +2803,7 @@ mod tests {
             let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
             Manifest {
                 opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
                 superfile_list: SuperfileList::empty(options_for_test()),
                 list: Some(list),
                 parts: DashMap::new(),
@@ -2992,6 +3031,7 @@ mod tests {
         };
         let m = Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),
@@ -3076,6 +3116,7 @@ mod tests {
     // ---- Manifest::update-------------------------------------------
     fn make_superfile_entry(docs: u64, pk: Vec<u8>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: docs,
@@ -3113,6 +3154,7 @@ mod tests {
     fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<Manifest> {
         Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
                 opann_routing: None,
@@ -3247,6 +3289,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3390,6 +3433,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3607,6 +3651,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3704,6 +3749,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3750,6 +3796,7 @@ mod tests {
 
     fn make_superfile_entry_hinted(docs: u64, pk: Vec<u8>, hint: u32) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: docs,
@@ -3854,6 +3901,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3988,6 +4036,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4121,6 +4170,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4301,6 +4351,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4414,6 +4465,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4507,6 +4559,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4635,6 +4688,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4775,6 +4829,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4886,6 +4941,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4970,6 +5026,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5094,6 +5151,7 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5186,6 +5244,7 @@ mod tests {
     fn manifest_with_list(list: list::ManifestList) -> Manifest {
         Manifest {
             opann_tree: OnceCell::new(),
+            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),

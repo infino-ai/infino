@@ -6,7 +6,6 @@
 //! Parquet footer, no whole-cell IVF centroid scan) and reranked.
 
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -20,7 +19,12 @@ use crate::{
         error::QueryError,
         handle::SupertableReader,
         manifest::{Manifest, SuperfileEntry, SuperfileUri},
-        opann::{page::LeafRef, paged::PagedTree, store},
+        opann::{
+            live::{self, undrained_user_vector_entries},
+            page::LeafRef,
+            paged::PagedTree,
+            store,
+        },
     },
 };
 
@@ -58,55 +62,79 @@ const ADMIT_COVERAGE_K_MULT: usize = 32;
 /// true k-th NN, so the caller fetches this **whole** set in one coalesced wave
 /// and reranks: there is no fetch-time confirmation pass and no second wave.
 pub(super) async fn select_opann_leaves(
-    _reader: &SupertableReader,
+    reader: &SupertableReader,
     manifest: &Manifest,
     query: &[f32],
     k: usize,
     _options: &VectorSearchOptions,
-    survives: impl Fn(u128) -> bool,
+    survives: impl Fn(u128) -> bool + Copy,
 ) -> Result<Option<Vec<(LeafRef, f32, Arc<SuperfileEntry>)>>, QueryError> {
-    let tree = manifest
-        .opann_resident_tree()
-        .await
-        .map_err(|e| QueryError::Store(format!("opann tree load: {e}")))?;
-    let entries = super::vector::ordered_manifest_superfiles(manifest).await?;
+    let floor = ADMIT_COVERAGE_K_MULT.saturating_mul(k);
+    let metric = reader
+        .options()
+        .vector_columns
+        .first()
+        .map(|c| c.metric)
+        .unwrap_or(crate::superfile::vector::distance::Metric::L2Sq);
+    let column = reader
+        .options()
+        .vector_columns
+        .first()
+        .map(|c| c.column.as_str());
+
+    let mut candidates: Vec<(LeafRef, f32)> = Vec::new();
+
+    // Base tree (post-drain): balanced radius-bounded descent over the persisted
+    // routing pages. Absent pre-drain (`opann_routing` is `None` until the first
+    // drain), so this contributes nothing then.
+    if let Some(routing) = manifest.opann_routing()
+        && let Some(source) = reader.ensure_opann_resident_tree().await?
+    {
+        candidates.extend(
+            PagedTree::new(source, routing.root_page)
+                .radius_bounded_descent(query, floor, survives)
+                .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?,
+        );
+    }
+
+    // Incoming buffer (undrained user superfiles, both pre- and post-drain): a
+    // flat SIMD scan of the manifest-resident cluster centroids — no tree build,
+    // no object-store GET. The balanced tree is a batch artifact of drain/compact;
+    // the live path never builds or rebuilds a tree on the query/commit path.
+    if let (Some(column), Some(user_manifest)) = (column, reader.hidden_parent_user_manifest()) {
+        let undrained =
+            undrained_user_vector_entries(user_manifest.as_ref(), manifest.opann_routing(), column);
+        if !undrained.is_empty() {
+            candidates.extend(live::admit_undrained_manifest_clusters(
+                &undrained,
+                column,
+                metric,
+                query,
+                floor,
+                survives,
+            ));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let admitted_ids: Vec<u128> = candidates
+        .iter()
+        .map(|(leaf, _)| leaf.superfile_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let entry_by_id = resolve_opann_leaf_entries(reader, manifest, &admitted_ids).await?;
 
     let mut out: Vec<(LeafRef, f32, Arc<SuperfileEntry>)> = Vec::new();
-
-    // Descend the routing tree to cell leaves — ONLY when a tree is published.
-    // Before the first drain there is no tree yet; the INCOMING-staging probes
-    // below still run, so a pre-drain query is the SAME OPANN fan-out with zero
-    // cell probes — not a separate scan path. (When there is neither a tree nor
-    // any incoming cells — e.g. a user table that isn't OPANN-routed — `out`
-    // stays empty and the caller falls back to the per-superfile IVF scan.)
-    if let (Some(source), Some(routing_info)) = (tree, manifest.opann_routing()) {
-        let root = routing_info.root_page;
-
-        // Radius-bounded descent: prune any subtree whose covering ball can't
-        // reach the bound (the far edge of the nearest clusters covering `floor`
-        // vectors — resident metadata, no payload fetched), returning only the
-        // clusters that could hold a top-k vector — P(q), not M. No probe budget.
-        let floor = ADMIT_COVERAGE_K_MULT.saturating_mul(k);
-        let candidates = PagedTree::new(source, root)
-            .radius_bounded_descent(query, floor, &survives)
-            .map_err(|e| QueryError::Store(format!("opann descent: {e}")))?;
-
-        let entry_by_id: HashMap<u128, Arc<SuperfileEntry>> = entries
-            .iter()
-            .map(|e| (e.superfile_id.as_u128(), Arc::clone(e)))
-            .collect();
-
-        // Every leaf is a single internal IVF cluster the tree routed straight to
-        // (centroid → cluster byte range), fetched directly with no
-        // within-superfile rescan. Keep only entries carrying the direct-fetch
-        // layout.
-        out.reserve(candidates.len());
-        for (leaf, dist) in candidates {
-            if let Some(entry) = entry_by_id.get(&leaf.superfile_id)
-                && entry_has_opann_fetch_layout(entry)
-            {
-                out.push((leaf, dist, Arc::clone(entry)));
-            }
+    out.reserve(candidates.len());
+    for (leaf, dist) in candidates {
+        if let Some(entry) = entry_by_id.get(&leaf.superfile_id)
+            && entry_has_opann_fetch_layout(entry)
+        {
+            out.push((leaf, dist, Arc::clone(entry)));
         }
     }
 
@@ -122,6 +150,49 @@ fn entry_has_opann_fetch_layout(entry: &SuperfileEntry) -> bool {
         .as_ref()
         .and_then(|o| o.vec)
         .is_some_and(|(_, len)| len > 0)
+}
+
+/// Map admitted OPANN leaf superfile ids to entries. Undrained user-table
+/// superfiles are resolved from the parent manifest (no GET); hidden cells
+/// load only the parts that contain each id — not the full list flatten.
+async fn resolve_opann_leaf_entries(
+    reader: &SupertableReader,
+    manifest: &Manifest,
+    superfile_ids: &[u128],
+) -> Result<HashMap<u128, Arc<SuperfileEntry>>, QueryError> {
+    let mut out = HashMap::with_capacity(superfile_ids.len());
+    if let Some(column) = reader
+        .options()
+        .vector_columns
+        .first()
+        .map(|c| c.column.as_str())
+        && let Some(user_manifest) = reader.hidden_parent_user_manifest()
+    {
+        for entry in crate::supertable::opann::live::undrained_user_vector_entries(
+            user_manifest.as_ref(),
+            manifest.opann_routing(),
+            column,
+        ) {
+            let id = entry.superfile_id.as_u128();
+            if superfile_ids.contains(&id) {
+                out.insert(id, entry);
+            }
+        }
+    }
+    for &id in superfile_ids {
+        if out.contains_key(&id) {
+            continue;
+        }
+        let Some(entry) = manifest
+            .lookup_superfile_entry_by_id(uuid::Uuid::from_u128(id))
+            .await
+            .map_err(QueryError::ManifestLoad)?
+        else {
+            continue;
+        };
+        out.insert(id, entry);
+    }
+    Ok(out)
 }
 
 /// Fetch the OPANN-admitted leaves across hidden cells, reusing the **normal**

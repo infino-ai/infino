@@ -40,12 +40,9 @@ use crate::{
         shutdown_query_runtime_on_drop,
     },
     storage::PrefixedStorageProvider,
-    superfile::vector::{
-        distance::Metric,
-        kmeans::kmeans,
-    },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
+        opann::live::undrained_user_vector_entries,
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -153,9 +150,8 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
-    /// One-shot partition strategy for the next hidden-index commit
-    /// (synced from the user table's trained global centroids).
-    pub(super) pending_partition_strategy: Mutex<Option<super::manifest::list::PartitionStrategy>>,
+    /// Back-reference to the parent user table (hidden vector-index sibling only).
+    pub(super) user_table: std::sync::OnceLock<std::sync::Weak<SupertableInner>>,
 }
 
 impl Drop for SupertableInner {
@@ -520,6 +516,23 @@ impl Supertable {
     }
     }
 
+    test_visible! {
+    /// Build or load the hidden index OPANN routing tree so the first vector
+    /// query on this handle does not pay genesis / page-load on the hot path.
+    fn prewarm_hidden_opann_tree(&self) -> Result<(), super::error::QueryError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(());
+        };
+        self.block_on_query(async {
+            hidden
+                .reader()
+                .ensure_opann_resident_tree()
+                .await
+                .map(|_| ())
+        })
+    }
+    }
+
     /// Block until the on-disk cache has fully promoted every superfile
     /// in the current manifest to an mmap-backed reader, or `timeout`
     /// elapses for one of them. This is the public "warm-readiness"
@@ -759,6 +772,25 @@ impl Supertable {
     }
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// User superfiles not yet routed into hidden per-cell IVF (bench / test diagnostics).
+    fn undrained_user_superfile_count(&self) -> Option<usize> {
+        let hidden = self.inner.vector_index_table.as_ref()?;
+        let vec_col = hidden.inner.options.vector_columns.first()?;
+        let user_manifest = self.inner.manifest.load_full();
+        let hidden_manifest = hidden.inner.manifest.load();
+        Some(
+            undrained_user_vector_entries(
+                &user_manifest,
+                hidden_manifest.opann_routing(),
+                &vec_col.column,
+            )
+            .len(),
+        )
+    }
+    }
+
     /// Internal accessor used by the writer module. Not part of
     /// the public API.
     pub(super) fn inner(&self) -> &Arc<SupertableInner> {
@@ -838,11 +870,11 @@ impl Supertable {
 pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
-/// region. Each hidden commit writes one IVF superfile under this sentinel
+/// region. Each commit writes one IVF superfile under this sentinel
 /// partition holding that whole batch (all cells mixed, unsorted). Queries
-/// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles. Call [`Supertable::optimize`] (or the internal [`Supertable::drain`]
-/// hook on the hidden table) to route INCOMING rows into per-cell IVF superfiles.
+/// route via the OPANN tree to admitted cluster leaves. Call [`Supertable::optimize`]
+/// (or the internal [`Supertable::drain`] hook on the hidden table) to route
+/// INCOMING rows into per-cell IVF superfiles.
 /// `u32::MAX` is out of the
 /// valid cell range `0..n_cent`, so it never collides with a real cell.
 pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
@@ -878,72 +910,6 @@ pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
             opts.partition_strategy,
             Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
         )
-}
-
-pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
-    let strategy = inner
-        .pending_partition_strategy
-        .lock()
-        .expect("pending_partition_strategy mutex poisoned")
-        .take();
-    let Some(strategy) = strategy else {
-        return false;
-    };
-    let current = inner.manifest.load_full();
-    inner
-        .manifest
-        .store(Arc::new(current.with_partition_strategy(strategy)));
-    true
-}
-
-/// Open-time bootstrap only: derive initial global centroids from an
-/// existing user-table IVF summary. Hidden commits use
-/// [`super::spfresh`] MVCC maintenance — never call this per commit.
-pub(crate) fn train_global_centroids(
-    user_opts: &SupertableOptions,
-    manifest: &super::manifest::Manifest,
-    n_cells: usize,
-) -> Option<super::manifest::ClusterCentroids> {
-    let vc = user_opts.vector_columns.first()?;
-    let mut all_centroids = Vec::new();
-    let mut dim = 0usize;
-    for entry in manifest.superfiles.iter() {
-        let Some(vs) = entry.vector_summary.get(&vc.column) else {
-            continue;
-        };
-        let cc = &vs.clusters;
-        if cc.is_empty() {
-            continue;
-        }
-        dim = cc.dim as usize;
-        let mut row = vec![0f32; dim];
-        for c in 0..cc.n_cent as usize {
-            if cc.counts[c] == 0 {
-                continue;
-            }
-            cc.dequantize_into(c, &mut row);
-            all_centroids.extend_from_slice(&row);
-        }
-    }
-    if all_centroids.is_empty() || dim == 0 {
-        return None;
-    }
-    let n_src = all_centroids.len() / dim;
-    let n = n_cells.min(n_src).max(1);
-    let centroids = kmeans(
-        &all_centroids,
-        dim,
-        n,
-        GLOBAL_VECTOR_KMEANS_ITERS,
-        GLOBAL_VECTOR_KMEANS_SEED,
-    );
-    Some(super::manifest::ClusterCentroids::from_fp32(
-        Metric::L2Sq,
-        n as u32,
-        dim as u32,
-        &centroids,
-        vec![1u32; n],
-    ))
 }
 
 pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
@@ -1026,18 +992,6 @@ fn build_vector_index_options(
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
-    if let Some(manifest) = user_manifest
-        && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, GLOBAL_VECTOR_CELL_COUNT)
-    {
-        hidden_opts = hidden_opts.with_partition_strategy(
-            crate::supertable::manifest::list::PartitionStrategy::VectorCell {
-                column: user_opts.vector_columns[0].column.clone(),
-                clusters,
-                routing: Default::default(),
-            },
-        );
-    }
     Some(hidden_opts)
 }
 
@@ -1067,10 +1021,16 @@ async fn build_handle(
         // the user table and the hidden index go through here, so neither pays a
         // first-query freshness round-trip.
         last_pointer_check: Mutex::new(Some(Instant::now())),
-        pending_partition_strategy: Mutex::new(None),
+        user_table: std::sync::OnceLock::new(),
     });
     install_disk_cache_pinning(&inner);
-    let st = Supertable { inner };
+    let st = Supertable { inner: Arc::clone(&inner) };
+    if let Some(vit) = st.inner.vector_index_table.as_ref() {
+        let _ = vit
+            .inner()
+            .user_table
+            .set(Arc::downgrade(&st.inner));
+    }
     if st.inner.options.storage.is_some() {
         let _ = st.run_recovery_sweep_once().await;
         let _ = st.run_gc_sweep_once().await;
@@ -1085,6 +1045,20 @@ async fn build_handle(
         if m.opann_routing().is_some() {
             if let Err(e) = m.opann_resident_tree().await {
                 tracing::warn!("supertable: OPANN routing-tree prewarm at open failed: {e}");
+            }
+        }
+        if let Some(vit) = st.inner.vector_index_table.as_ref() {
+            let vit_reader = vit.reader();
+            let hm = vit_reader.manifest();
+            // Post-drain: warm persisted routing pages. Pre-drain: incoming centroids
+            // live in the user manifest summaries — no tree to warm.
+            let warm_hidden = hm.opann_routing().is_some();
+            if warm_hidden {
+                if let Err(e) = vit_reader.ensure_opann_resident_tree().await {
+                    tracing::warn!(
+                        "supertable: hidden-index OPANN routing-tree prewarm at open failed: {e}"
+                    );
+                }
             }
         }
     }
@@ -1289,6 +1263,42 @@ impl SupertableReader {
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
     }
+
+    /// Parent user table for the hidden vector-index sibling (if any).
+    pub(crate) fn hidden_parent_user_manifest(&self) -> Option<Arc<Manifest>> {
+        self.inner
+            .user_table
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|u| u.manifest.load_full())
+    }
+
+    /// Load persisted OPANN pages when post-drain; pre-drain incoming centroids
+    /// are built live from the user manifest at query time.
+    pub(crate) async fn ensure_opann_resident_tree(
+        &self,
+    ) -> Result<Option<Arc<crate::supertable::opann::paged::ResidentPageSource>>, crate::supertable::error::QueryError>
+    {
+        self.manifest()
+            .opann_resident_tree()
+            .await
+            .map_err(|e| crate::supertable::error::QueryError::Store(format!("opann tree load: {e}")))
+    }
+
+    /// Resident routing metadata only — persisted page graph + live incoming
+    /// genesis tree. Does not open or fetch vector IVF blobs. Test-only warming
+    /// helper (no production caller); `pub` under `test-helpers` so the
+    /// integration tests can prime the cold-GET measurement.
+    #[cfg(feature = "test-helpers")]
+    pub async fn warm_opann_routing_metadata(
+        &self,
+    ) -> Result<(), crate::supertable::error::QueryError> {
+        // Only the persisted base tree's pages need warming (post-drain). The
+        // incoming buffer is a manifest-resident SIMD scan — already in memory,
+        // no GET to prime.
+        let _ = self.ensure_opann_resident_tree().await?;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for SupertableReader {
@@ -1343,6 +1353,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs,

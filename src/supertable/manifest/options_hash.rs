@@ -124,19 +124,12 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
                 buf.extend_from_slice(b);
             }
         }
-        PartitionStrategy::VectorCell {
-            column,
-            clusters,
-            routing,
-        } => {
+        PartitionStrategy::VectorCell { column, clusters } => {
             push_tag(&mut buf, b"vector_cell");
             push_str(&mut buf, column);
             let enc = encode_cluster_centroids(clusters);
             buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
             buf.extend_from_slice(&enc);
-            buf.extend_from_slice(&(routing.nprobe_min as u64).to_le_bytes());
-            buf.extend_from_slice(&(routing.nprobe_max as u64).to_le_bytes());
-            buf.extend_from_slice(&routing.slack.to_le_bytes());
         }
     }
 
@@ -496,7 +489,6 @@ mod tests {
             &PartitionStrategy::VectorCell {
                 column: "emb".into(),
                 clusters: clusters.clone(),
-                routing: Default::default(),
             },
         );
         let h_hash = compute_options_hash(

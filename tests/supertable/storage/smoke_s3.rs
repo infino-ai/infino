@@ -192,7 +192,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             dim,
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
-            metric: infino::superfile::vector::distance::Metric::Cosine,
+            metric: infino::superfile::vector::distance::Metric::L2Sq,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
         }],
         Some(infino::test_helpers::default_tokenizer()),

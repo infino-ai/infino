@@ -163,6 +163,10 @@ fn schema_for(modality: Modality) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
+/// Target vectors **per IVF cluster** (inverted-list size). Cluster count for a
+/// build with `n_docs` vectors is `ceil(n_docs / TARGET)`.
+const TARGET_VECTORS_PER_IVF_CLUSTER: usize = 8_000;
+
 pub fn combined_schema() -> Arc<Schema> {
     schema_for(Modality::Combined)
 }
@@ -192,8 +196,12 @@ pub fn options_for(
         }
         return opts;
     }
-    let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
+    // Table-scale IVF: ~8k vectors per cluster ⇒ n_cent ≈ total_docs / 8000.
+    // The builder clamps down per physical superfile from its local row count.
+    let n_cent_total = n_docs()
+        .div_ceil(TARGET_VECTORS_PER_IVF_CLUSTER)
+        .max(1);
+    let n_cent_per_superfile = n_cent_total;
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
@@ -240,7 +248,9 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
     crate::dataset::Knobs {
         doc_count: n_docs(),
         dim: DIM,
-        n_cent_total: corpus::n_cent(n_docs()),
+        n_cent_total: n_docs()
+            .div_ceil(TARGET_VECTORS_PER_IVF_CLUSTER)
+            .max(1),
         vec_seed: CORPUS_VEC_SEED,
         text_seed: CORPUS_TEXT_SEED,
         rot_seed: ROT_SEED,

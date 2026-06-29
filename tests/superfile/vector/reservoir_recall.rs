@@ -125,7 +125,7 @@ fn build_reader_with_sample_size(
             dim,
             n_cent,
             rot_seed: ROT_SEED,
-            metric: Metric::Cosine,
+            metric: Metric::L2Sq,
             rerank_codec,
         })
         .expect("register column");
@@ -183,7 +183,7 @@ async fn recall_under_undersized_reservoir_matches_brute_force() {
                 .into_iter()
                 .map(|(d, _)| d)
                 .collect();
-            let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::Cosine, top_k);
+            let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::L2Sq, top_k);
 
             // Self-NN invariant: query is exactly a corpus row, so
             // its own doc id must be top-1 regardless of codec.
@@ -241,7 +241,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         dim,
         n_cent,
         rot_seed: ROT_SEED,
-        metric: Metric::Cosine,
+        metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
@@ -264,7 +264,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
             .into_iter()
             .map(|(d, _)| d)
             .collect();
-        let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::Cosine, top_k);
+        let exact = brute_force_top_k(&flat, dim, n_docs, query, Metric::L2Sq, top_k);
         let a: HashSet<u32> = approx.iter().copied().collect();
         let e: HashSet<u32> = exact.iter().copied().collect();
         assert_eq!(

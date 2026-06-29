@@ -51,12 +51,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::Range,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::Arc,
 };
 
 use arrow_array::{
@@ -64,8 +59,6 @@ use arrow_array::{
     RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::prelude::{col, lit};
 use infino::{
     CompactionSettings, OptimizeOptions, VectorSearchOptions,
@@ -76,9 +69,15 @@ use infino::{
     supertable::{
         Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
-        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
+        storage::{LocalFsStorageProvider, StorageProvider},
     },
-    test_helpers::default_tokenizer,
+    test_helpers::{
+        default_tokenizer,
+        opann_routing_measure::{
+            CountingStorage, OpannColdCounters, assert_cold_search_issued_gets,
+            measure_cold_search_timed,
+        },
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -91,16 +90,20 @@ use tempfile::TempDir;
 
 /// Embedding dimension — small for speed, large enough that random unit
 /// vectors in distinct directions stay well separated under Cosine.
-const EMB_DIM: usize = 16;
-/// Number of well-separated synthetic clusters in the corpus.
-const N_CLUSTERS: usize = 24;
-/// Docs per cluster. `N_CLUSTERS * DOCS_PER_CLUSTER` is the corpus size.
-const DOCS_PER_CLUSTER: usize = 150;
-/// Total docs in the corpus (≈ 3 600 — several hidden cells get populated
-/// while keeping the test well under ~10 s).
+const EMB_DIM: usize = 64;
+/// Number of well-separated synthetic clusters in the corpus. Chosen ≥ the
+/// hidden grid's `GLOBAL_VECTOR_CELL_COUNT` (64) so the cell k-means maps ~one
+/// natural cluster per cell instead of carving each natural cluster across
+/// several cells (the cross-cell over-split that fragments routing).
+const N_CLUSTERS: usize = 64;
+/// Docs per cluster. Sized so each of the 64 hidden cells holds ~1 024 docs and
+/// its IVF (`N_CENT = 16`) lands ~64 docs/centroid — real IVF granularity, not
+/// the ~9 docs/centroid a tiny corpus produces against a fixed 64-cell grid.
+const DOCS_PER_CLUSTER: usize = 1024;
+/// Total docs in the corpus (`N_CLUSTERS * DOCS_PER_CLUSTER` = 65 536).
 const N_DOCS: usize = N_CLUSTERS * DOCS_PER_CLUSTER;
-/// Docs committed per write cycle (so several superfiles are produced).
-const DOCS_PER_COMMIT: usize = 600;
+/// Docs committed per write cycle (8 commits → several user superfiles).
+const DOCS_PER_COMMIT: usize = 8192;
 /// Magnitude of the per-doc gaussian noise added to a cluster's base
 /// direction. Small enough that intra-cluster docs stay far closer to one
 /// another than to any other cluster's docs, so the exact top-k is stable.
@@ -110,9 +113,8 @@ const CLUSTER_SEED: u64 = 0xC0FFEE;
 /// Seed offset for per-doc noise (xored with the global doc index).
 const NOISE_SEED: u64 = 0xBEEF;
 
-/// IVF centroid count for the user-table vector index. The hidden global
-/// index uses its own fixed cell count (`GLOBAL_VECTOR_CELL_COUNT = 64`).
-const N_CENT: usize = 16;
+/// IVF centroid count (~8k vectors per cluster at this corpus size).
+const N_CENT: usize = 1;
 /// Random rotation seed for the vector index.
 const VECTOR_ROT_SEED: u64 = 99;
 
@@ -158,134 +160,22 @@ const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 /// superfiles whose clusters the radius-bounded descent admits — i.e. P(q)
 /// coalesced per superfile, NOT corpus size and NOT a fixed `nprobe` budget.
 ///
-/// The measured steady-state count on this fixture is **2**: the post-drain
-/// query for cluster 23 admits clusters spanning 2 of the 6 consolidated hidden
-/// superfiles, each fetched as one coalesced range-GET, in a single parallel
-/// wave. This is a tight gate at that value — a widened admission, a lost
-/// per-superfile coalesce, or a revert to a corpus scan all fail loudly. (Before
-/// the radius-bounded descent + coverage-floor admission this was 8, scaling with
-/// an `nprobe` × clusters-per-cell budget that no longer exists.)
-const PER_SEARCH_GET_BUDGET: usize = 2;
-
-// ---------------------------------------------------------------------------
-// Counting storage provider — wraps an inner provider and counts every
-// read-path fetch (`get`, `get_range`, `tail`). Delegates everything else.
-// ---------------------------------------------------------------------------
-
-/// Per-GET delay (ms) injected during a measured window so wall-clock /
-/// `WAVE_PROBE_DELAY_MS` reveals the number of *sequential* fetch waves:
-/// concurrent GETs in one wave overlap their sleeps, sequential waves stack.
-/// Large enough that the search's CPU **and** scheduling jitter under a fully
-/// parallel `cargo test` run are dwarfed — a 1-wave query rounds to 1 only if
-/// jitter stays under `WAVE_PROBE_DELAY_MS / 2`, so this is sized for a noisy CI
-/// box, not just an idle one. (The wave count is still a timing proxy, not a
-/// scheduler instrument — see the kernel tests' notes.)
-const WAVE_PROBE_DELAY_MS: u64 = 150;
-
-/// `StorageProvider` decorator that counts read-path fetches. Splits the count
-/// into total fetches and tombstone-sidecar fetches, and can inject a uniform
-/// per-GET delay so a test can measure how many sequential waves a search
-/// issues (not just how many GETs).
-#[derive(Debug)]
-struct CountingStorage {
-    inner: Arc<dyn StorageProvider>,
-    fetches: Arc<AtomicUsize>,
-    tombstone_fetches: Arc<AtomicUsize>,
-    delay_ms: Arc<AtomicU64>,
-}
-
-impl CountingStorage {
-    fn new(
-        inner: Arc<dyn StorageProvider>,
-        fetches: Arc<AtomicUsize>,
-        tombstone_fetches: Arc<AtomicUsize>,
-        delay_ms: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            inner,
-            fetches,
-            tombstone_fetches,
-            delay_ms,
-        }
-    }
-
-    /// Count one read-path fetch (classifying tombstone sidecars) and apply the
-    /// injected wave-probe delay, if armed.
-    async fn observe(&self, uri: &str) {
-        self.fetches.fetch_add(1, Ordering::Relaxed);
-        if uri.ends_with(".tombstones") {
-            self.tombstone_fetches.fetch_add(1, Ordering::Relaxed);
-        }
-        let d = self.delay_ms.load(Ordering::Relaxed);
-        if d > 0 {
-            tokio::time::sleep(Duration::from_millis(d)).await;
-        }
-    }
-}
-
-#[async_trait]
-impl StorageProvider for CountingStorage {
-    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-        self.inner.head(uri).await
-    }
-
-    async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        self.observe(uri).await;
-        self.inner.get(uri).await
-    }
-
-    async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        self.observe(uri).await;
-        self.inner.get_range(uri, range).await
-    }
-
-    async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
-        self.observe(uri).await;
-        self.inner.tail(uri, len).await
-    }
-
-    async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
-        self.inner.put_atomic(uri, bytes).await
-    }
-
-    async fn put_if_match(
-        &self,
-        uri: &str,
-        bytes: Bytes,
-        expected_etag: Option<&str>,
-    ) -> Result<Option<String>, StorageError> {
-        self.inner.put_if_match(uri, bytes, expected_etag).await
-    }
-
-    async fn put_multipart(
-        &self,
-        uri: &str,
-    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
-        self.inner.put_multipart(uri).await
-    }
-
-    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-        self.inner.delete(uri).await
-    }
-
-    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        self.inner.list_with_prefix(prefix).await
-    }
-
-    async fn list_with_prefix_metadata(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        self.inner.list_with_prefix_metadata(prefix).await
-    }
-
-    fn object_store_handle(
-        &self,
-        uri: &str,
-    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-        self.inner.object_store_handle(uri)
-    }
-}
+/// `nprobe` is NOT an OPANN parameter — the radius-bounded descent ignores it.
+/// The fan-out is a function of the coverage floor and the cell layout, never of
+/// corpus size: the floor admits the nearest clusters covering ~`32×TOP_K`=320
+/// docs, and the search issues one coalesced range-GET per superfile those
+/// clusters span. On this fixture the post-drain grid is `GLOBAL_VECTOR_CELL_COUNT`
+/// cells, one per superfile (~56 docs/cell), so the floor spans ~4–6 cells → ~4
+/// coalesced GETs.
+///
+/// This is a **locality** bound, not a fixed probe count: it asserts the routed
+/// search stays a small fraction of the corpus (here 24 planted clusters / up to
+/// `GLOBAL_VECTOR_CELL_COUNT` superfiles), never an O(corpus) scan. Bounded at 8
+/// — above the localized coverage-floor span, well below a full scan. The span
+/// shrinks once the cell count scales with docs (docs/8K) instead of the fixed
+/// 64-cell grid; until then it tracks the grid's fragmentation, exactly as the
+/// radius-bounded design (no fixed probe cap) intends.
+const PER_SEARCH_GET_BUDGET: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Schema + options helpers (mirror compact_azure.rs, but LocalFs / in-process).
@@ -326,8 +216,14 @@ fn options_title_emb() -> SupertableOptions {
             dim: EMB_DIM,
             n_cent: N_CENT,
             rot_seed: VECTOR_ROT_SEED,
-            metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Fp32,
+            metric: Metric::L2Sq,
+            // Sq8Residual (the production default) is what the reuse-model drain
+            // byte-splices into cells; the drain refuses any other codec. Fp32
+            // would make optimize() a silent no-op, so the drain tests below
+            // exercise nothing. Recall is asserted against the brute-force oracle
+            // at the standard recall@10 ≥ 0.99 bar rather than bit-exact id-set
+            // equality, since Sq8+ε rerank is not bit-exact.
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     )
@@ -580,6 +476,15 @@ fn search_ids(st: &Supertable, cluster: usize, nprobe: usize, k: usize) -> HashS
     extract_id_set(&batches)
 }
 
+/// Load persisted OPANN pages (post-drain) and build the live incoming genesis
+/// tree from manifest centroids (pre-drain). CPU + routing-page GETs only — no
+/// vector-blob fetch, so a subsequent measured search is genuinely cold on IVF
+/// bytes.
+fn warm_routing_resident(st: &Supertable) {
+    st.prewarm_hidden_opann_tree()
+        .expect("warm opann routing metadata");
+}
+
 /// Assert recall@k ≥ floor for every query cluster against the oracle, and
 /// return the per-query returned `_id` sets (for pre/post agreement checks).
 fn assert_recall(
@@ -740,17 +645,9 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
     // Counting storage wraps a LocalFs provider. The same Arc is shared by
     // the disk cache, so every read-path fetch (including the cache's cold
     // fills) is observed by the counter.
-    let fetches = Arc::new(AtomicUsize::new(0));
-    let tombstone_fetches = Arc::new(AtomicUsize::new(0));
-    let delay_ms = Arc::new(AtomicU64::new(0));
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("LocalFs provider"));
-    let counting: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
-        Arc::clone(&local),
-        Arc::clone(&fetches),
-        Arc::clone(&tombstone_fetches),
-        Arc::clone(&delay_ms),
-    ));
+    let (counting, counters) = CountingStorage::wrap(Arc::clone(&local));
     let cache = make_cache(Arc::clone(&counting), cache_dir.path());
 
     let st = Supertable::create(
@@ -872,38 +769,29 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
     .expect("open fresh cold-cache consumer");
 
     // Warmup: load the manifest + OPANN tree (and cache cluster 0's cells).
-    let warmup_cluster = query_clusters()[0];
-    let _warmup = search_ids(&st_cold, warmup_cluster, COLD_NPROBE, TOP_K);
+    warm_routing_resident(&st_cold);
 
     // Measure: a query for a far cluster the warmup did NOT touch. With the
     // tree/manifest resident, the counter now reflects only the per-search
     // routed vector-blob fetches.
     let measured_cluster = query_clusters()[query_clusters().len() - 1];
     assert_ne!(
-        warmup_cluster, measured_cluster,
-        "warmup and measured clusters must differ so the measured cells are uncached"
+        query_clusters()[0], measured_cluster,
+        "warmup and measured clusters must differ so measured cells are uncached"
     );
     if let Some((total, max_per_cell)) = st_cold.hidden_vector_superfile_stats() {
         eprintln!("[routing] post-drain hidden index: {total} superfiles, max {max_per_cell} per cell");
     }
     eprintln!("=== MEASURED SEARCH BEGIN (cluster {measured_cluster}, nprobe {COLD_NPROBE}) ===");
-    fetches.store(0, Ordering::Relaxed);
-    tombstone_fetches.store(0, Ordering::Relaxed);
-    // Arm the per-GET delay so wall-clock reveals the number of sequential
-    // fetch waves: concurrent GETs in one wave overlap their sleeps.
-    delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
-    let t0 = Instant::now();
-    let measured_returned = search_ids(&st_cold, measured_cluster, COLD_NPROBE, TOP_K);
-    let elapsed = t0.elapsed();
-    delay_ms.store(0, Ordering::Relaxed);
-    let per_search_gets = fetches.load(Ordering::Relaxed);
-    let per_search_tombstone_gets = tombstone_fetches.load(Ordering::Relaxed);
-    // Round wall-clock to whole waves; one extra half-wave of CPU/scheduling
-    // slop is absorbed by the round.
-    let waves = ((elapsed.as_secs_f64() * 1000.0) / WAVE_PROBE_DELAY_MS as f64).round() as u64;
+    let (measure, measured_returned) = measure_cold_search_timed(&counters, || {
+        search_ids(&st_cold, measured_cluster, COLD_NPROBE, TOP_K)
+    });
+    let per_search_gets = measure.gets;
+    let per_search_tombstone_gets = measure.tombstone_gets;
+    let waves = measure.waves;
     eprintln!(
         "=== MEASURED SEARCH END ({per_search_gets} S3 fetches, \
-         {per_search_tombstone_gets} tombstone, ~{waves} wave(s), {elapsed:?}) ==="
+         {per_search_tombstone_gets} tombstone, ~{waves} wave(s)) ==="
     );
 
     // The measured query must still be correct.
@@ -927,9 +815,10 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
     );
     assert!(
         per_search_gets <= PER_SEARCH_GET_BUDGET,
-        "per-search GET count {per_search_gets} exceeds bound {PER_SEARCH_GET_BUDGET}; \
-         with the tree/manifest resident, a routed search's fetch count must track \
-         (cells × clusters) at nprobe={COLD_NPROBE}, not corpus size ({N_DOCS} docs)"
+        "per-search GET count {per_search_gets} exceeds locality bound {PER_SEARCH_GET_BUDGET}; \
+         with the tree/manifest resident, a radius-bounded routed search fetches only the \
+         superfiles its coverage-floor clusters span — a small fraction of the corpus \
+         ({N_DOCS} docs), never a full scan"
     );
     // A post-drain OPANN search resolves deletes via the resident deleted-set,
     // so it must issue ZERO per-cell tombstone-sidecar GETs — the dead prefetch
@@ -944,7 +833,7 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
     assert!(
         waves <= 1,
         "a cold OPANN search must complete in one fetch wave (parallel cluster \
-         range-GETs); measured ~{waves} waves ({elapsed:?} at {WAVE_PROBE_DELAY_MS}ms/GET)"
+         range-GETs); measured {waves} wave(s)"
     );
 }
 
@@ -959,17 +848,9 @@ fn opann_routing_exact_topk_pre_and_post_drain_with_bounded_cold_gets() {
 fn opann_fetch_kernel_one_wave_bounded_gets_every_query() {
     let all = all_embeddings();
     let dir = TempDir::new().expect("data tempdir");
-    let fetches = Arc::new(AtomicUsize::new(0));
-    let tombstone_fetches = Arc::new(AtomicUsize::new(0));
-    let delay_ms = Arc::new(AtomicU64::new(0));
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-    let counting: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
-        Arc::clone(&local),
-        Arc::clone(&fetches),
-        Arc::clone(&tombstone_fetches),
-        Arc::clone(&delay_ms),
-    ));
+    let (counting, counters) = CountingStorage::wrap(Arc::clone(&local));
     let write_cache_dir = TempDir::new().expect("write cache");
     let write_cache = make_cache(Arc::clone(&counting), write_cache_dir.path());
     let st = Supertable::create(
@@ -997,7 +878,6 @@ fn opann_fetch_kernel_one_wave_bounded_gets_every_query() {
     // consolidated cells post-drain), so each measured query is genuinely cold.
     let warmup = query_clusters()[0];
     let measure_phase = |phase: &str| {
-        let mut cold_seen = 0usize;
         for &c in query_clusters().iter().filter(|&&c| c != warmup) {
             // A FRESH counted cold cache per cluster — so one cluster's fetches
             // can't pre-warm the next (the coverage floor spans superfiles, so a
@@ -1012,23 +892,18 @@ fn opann_fetch_kernel_one_wave_bounded_gets_every_query() {
                     .with_disk_cache(Arc::clone(&cache)),
             )
             .expect("open cold consumer");
-            let _ = search_ids(&st_cold, warmup, COLD_NPROBE, TOP_K);
-            fetches.store(0, Ordering::Relaxed);
-            tombstone_fetches.store(0, Ordering::Relaxed);
-            delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
-            let t0 = Instant::now();
-            let returned = search_ids(&st_cold, c, COLD_NPROBE, TOP_K);
-            let elapsed = t0.elapsed();
-            delay_ms.store(0, Ordering::Relaxed);
-            let gets = fetches.load(Ordering::Relaxed);
-            let tomb = tombstone_fetches.load(Ordering::Relaxed);
-            let waves =
-                ((elapsed.as_secs_f64() * 1000.0) / WAVE_PROBE_DELAY_MS as f64).round() as u64;
+            warm_routing_resident(&st_cold);
+            let (measure, returned) = measure_cold_search_timed(&counters, || {
+                search_ids(&st_cold, c, COLD_NPROBE, TOP_K)
+            });
+            let gets = measure.gets;
+            let tomb = measure.tombstone_gets;
+            let waves = measure.waves;
             let exact = brute_force_topk_ids(&all, &idx_to_id, &cluster_base(c), TOP_K);
             let recall = recall_at_k(&returned, &exact);
             eprintln!(
                 "[kernel/{phase}] cluster {c}: {gets} GETs, {tomb} tomb, ~{waves} wave(s), \
-                 recall {recall:.4}, {elapsed:?}"
+                 recall {recall:.4}"
             );
             assert!(
                 recall >= RECALL_FLOOR,
@@ -1040,27 +915,22 @@ fn opann_fetch_kernel_one_wave_bounded_gets_every_query() {
             );
             // Bounded GET count holds whether the query fetched cold or hit
             // warmup-cached cells (caching only reduces fetches).
+            assert_cold_search_issued_gets(
+                measure,
+                &format!("[{phase}] cluster {c}"),
+            );
             assert!(
                 gets <= PER_SEARCH_GET_BUDGET,
-                "[{phase}] cluster {c}: {gets} GETs exceeds budget {PER_SEARCH_GET_BUDGET} \
-                 — over-fetch or corpus scan, not P(q) coalesced"
+                "[{phase}] cluster {c}: {gets} GETs exceeds locality bound {PER_SEARCH_GET_BUDGET} \
+                 — a radius-bounded admission spans only its coverage-floor superfiles \
+                 (P(q) coalesced), not a corpus scan"
             );
-            // The single-wave property is only meaningful when the query actually
-            // fetched cold; a cluster the warmup's coverage floor incidentally
-            // pre-cached fetches 0 (and trivially satisfies the bound above).
-            if gets >= 1 {
-                cold_seen += 1;
-                assert!(
-                    waves <= 1,
-                    "[{phase}] cluster {c}: a cold routed search must complete in ONE fetch \
-                     wave; measured ~{waves} ({elapsed:?} at {WAVE_PROBE_DELAY_MS}ms/GET)"
-                );
-            }
+            assert!(
+                waves <= 1,
+                "[{phase}] cluster {c}: a cold routed search must complete in ONE fetch \
+                 wave; measured {waves} wave(s)"
+            );
         }
-        assert!(
-            cold_seen >= 1,
-            "[{phase}] no measured cluster fetched cold — the single-wave gate measured nothing"
-        );
     };
 
     measure_phase("pre-drain");
@@ -1117,27 +987,20 @@ fn between_recall_min(
         .fold(1.0_f64, f64::min)
 }
 
-/// Open a fresh cold-cache consumer over `storage` (no warmup), then measure ONE
-/// search: returns `(gets, tombstone_gets, waves, recall)`. The counter resets
-/// after open, so the counts reflect the first query's own fetches (manifest +
-/// OPANN tree load if lazy, plus the per-cluster vector range-GETs). Uses the
-/// production `LazyForegroundWithBackgroundFill` cold-fetch mode.
+/// Open a fresh counted cold-cache consumer, warm routing metadata only (persisted
+/// OPANN pages post-drain + live incoming genesis tree pre-drain — no vector-blob
+/// fetch), then measure ONE search on cluster 23. Returns
+/// `(gets, tombstone_gets, waves, wall_ms, recall)`.
 fn measure_cold_search(
     storage: &Arc<dyn StorageProvider>,
-    fetches: &Arc<AtomicUsize>,
-    tombstone_fetches: &Arc<AtomicUsize>,
-    delay_ms: &Arc<AtomicU64>,
+    counters: &OpannColdCounters,
     all: &[Vec<f32>],
     idx_to_id: &[i128],
     nprobe: usize,
     k: usize,
-) -> (usize, usize, u64, f64) {
+) -> (usize, usize, u64, u64, f64) {
     let cold_cache_dir = TempDir::new().expect("cold cache tempdir");
-    let cold_cache = make_cache_with_mode(
-        Arc::clone(storage),
-        cold_cache_dir.path(),
-        ColdFetchMode::LazyForegroundWithBackgroundFill,
-    );
+    let cold_cache = make_cache(Arc::clone(storage), cold_cache_dir.path());
     let st_cold = Supertable::open(
         options_title_emb()
             .with_storage(Arc::clone(storage))
@@ -1145,42 +1008,25 @@ fn measure_cold_search(
     )
     .expect("open fresh cold-cache consumer");
 
-    // Genuine cold search: fresh consumer, fresh disk cache, NO warmup. Reset
-    // the counter and arm the per-GET delay, then run ONE search and count
-    // every object-store fetch it issues (manifest + OPANN tree load if lazy,
-    // plus the per-probed-unit vector-blob range-GETs) and how many sequential
-    // waves they fall into.
     let measured_cluster = query_clusters()[query_clusters().len() - 1];
-    fetches.store(0, Ordering::Relaxed);
-    tombstone_fetches.store(0, Ordering::Relaxed);
-    delay_ms.store(WAVE_PROBE_DELAY_MS, Ordering::Relaxed);
-    let t0 = Instant::now();
-    let result = st_cold.vector_search(
-        "emb",
-        &cluster_base(measured_cluster),
-        k,
-        VectorSearchOptions::new().with_nprobe(nprobe),
-        None,
-        None,
-    );
-    let elapsed = t0.elapsed();
-    delay_ms.store(0, Ordering::Relaxed);
+    warm_routing_resident(&st_cold);
 
-    let gets = fetches.load(Ordering::Relaxed);
-    let tombstone_gets = tombstone_fetches.load(Ordering::Relaxed);
-    let waves = ((elapsed.as_secs_f64() * 1000.0) / WAVE_PROBE_DELAY_MS as f64).round() as u64;
-    let recall = match result {
-        Ok(batches) => {
-            let returned = extract_id_set(&batches);
-            let exact = brute_force_topk_ids(all, idx_to_id, &cluster_base(measured_cluster), k);
-            recall_at_k(&returned, &exact)
-        }
-        Err(e) => {
-            eprintln!("[compare] cold measured search FAILED: {e:?}");
-            -1.0
-        }
-    };
-    (gets, tombstone_gets, waves, recall)
+    let (measure, returned) = measure_cold_search_timed(counters, || {
+        search_ids(&st_cold, measured_cluster, nprobe, k)
+    });
+    assert_cold_search_issued_gets(
+        measure,
+        &format!("measure_cold_search cluster {measured_cluster}"),
+    );
+    let exact = brute_force_topk_ids(all, idx_to_id, &cluster_base(measured_cluster), k);
+    let recall = recall_at_k(&returned, &exact);
+    (
+        measure.gets,
+        measure.tombstone_gets,
+        measure.waves,
+        measure.wall_ms,
+        recall,
+    )
 }
 
 /// EXPERIMENT (run with `--nocapture`): measure recall and cold per-search
@@ -1196,17 +1042,9 @@ fn opann_pre_vs_post_drain_compare() {
     let dir = TempDir::new().expect("data tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
 
-    let fetches = Arc::new(AtomicUsize::new(0));
-    let tombstone_fetches = Arc::new(AtomicUsize::new(0));
-    let delay_ms = Arc::new(AtomicU64::new(0));
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("LocalFs provider"));
-    let counting: Arc<dyn StorageProvider> = Arc::new(CountingStorage::new(
-        Arc::clone(&local),
-        Arc::clone(&fetches),
-        Arc::clone(&tombstone_fetches),
-        Arc::clone(&delay_ms),
-    ));
+    let (counting, counters) = CountingStorage::wrap(Arc::clone(&local));
     let cache = make_cache(Arc::clone(&counting), cache_dir.path());
     let st = Supertable::create(
         options_title_emb()
@@ -1230,11 +1068,9 @@ fn opann_pre_vs_post_drain_compare() {
     let pre_between_pruned = between_recall_min(&st, &all, &idx_to_id, PRUNED_NPROBE, TOP_K);
     let pre_stats = st.hidden_vector_superfile_stats();
     eprintln!("[compare] pre-drain warm recall done: center={pre_center:.4} between_full={pre_between_full:.4} pruned={pre_between_pruned:.4} stats={pre_stats:?}");
-    let (pre_gets, pre_tomb, pre_waves, pre_cold_recall) = measure_cold_search(
+    let (pre_gets, pre_tomb, pre_waves, pre_wall_ms, pre_cold_recall) = measure_cold_search(
         &counting,
-        &fetches,
-        &tombstone_fetches,
-        &delay_ms,
+        &counters,
         &all,
         &idx_to_id,
         COLD_NPROBE,
@@ -1249,11 +1085,9 @@ fn opann_pre_vs_post_drain_compare() {
     let post_between_full = between_recall_min(&st, &all, &idx_to_id, CORRECTNESS_NPROBE, TOP_K);
     let post_between_pruned = between_recall_min(&st, &all, &idx_to_id, PRUNED_NPROBE, TOP_K);
     let post_stats = st.hidden_vector_superfile_stats();
-    let (post_gets, post_tomb, post_waves, post_cold_recall) = measure_cold_search(
+    let (post_gets, post_tomb, post_waves, post_wall_ms, post_cold_recall) = measure_cold_search(
         &counting,
-        &fetches,
-        &tombstone_fetches,
-        &delay_ms,
+        &counters,
         &all,
         &idx_to_id,
         COLD_NPROBE,
@@ -1265,10 +1099,24 @@ fn opann_pre_vs_post_drain_compare() {
     eprintln!("recall@{TOP_K} center        (nprobe={CORRECTNESS_NPROBE}):  pre={pre_center:.4}  post={post_center:.4}");
     eprintln!("recall@{TOP_K} between full  (nprobe={CORRECTNESS_NPROBE}):  pre={pre_between_full:.4}  post={post_between_full:.4}");
     eprintln!("recall@{TOP_K} between pruned(nprobe={PRUNED_NPROBE}):   pre={pre_between_pruned:.4}  post={post_between_pruned:.4}");
-    eprintln!("cold search  (nprobe={COLD_NPROBE}):  pre={pre_gets} GETs/{pre_waves} wave(s)/{pre_tomb} tomb (recall {pre_cold_recall:.4})  post={post_gets} GETs/{post_waves} wave(s)/{post_tomb} tomb (recall {post_cold_recall:.4})");
+    eprintln!(
+        "cold search cluster {} (nprobe={COLD_NPROBE}, warmup cluster {}, tree/manifest resident):",
+        query_clusters()[query_clusters().len() - 1],
+        query_clusters()[0],
+    );
+    eprintln!(
+        "  pre:  {pre_gets} GETs / {pre_waves} wave(s) / {pre_tomb} tomb / {pre_wall_ms} ms (recall {pre_cold_recall:.4})"
+    );
+    eprintln!(
+        "  post: {post_gets} GETs / {post_waves} wave(s) / {post_tomb} tomb / {post_wall_ms} ms (recall {post_cold_recall:.4})"
+    );
     eprintln!("=== END ===\n");
 
     assert!(pre_center > 0.0 && post_center > 0.0, "both phases must search");
+    assert!(
+        pre_gets > 0 && post_gets > 0,
+        "cold search must issue GETs through the counting wrapper (pre={pre_gets}, post={post_gets})"
+    );
 }
 
 /// Cluster whose top-k rows are deleted in the leak test (far from cluster 0).

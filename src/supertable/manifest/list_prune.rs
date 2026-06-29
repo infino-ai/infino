@@ -192,10 +192,8 @@ pub fn prune_parts_for_id_range(
 }
 
 // The fp32 centroid-envelope part scan (`prune_parts_for_vector`) is gone.
-// Vector nprobe routing scores the query against the flat [`ClusterCentroids`]
-// list already stored in the manifest (`select_cells_adaptive`), then filters
-// superfiles by routed cell partition keys — not by scanning list-part
-// envelopes. The remaining vector paths enumerate the full superfile set
+// Vector search on the hidden index routes via the OPANN tree; the remaining
+// vector paths enumerate the full superfile set
 // (`Manifest::get_pruned_superfiles_for_vector`).
 
 #[cfg(test)]
@@ -275,6 +273,7 @@ mod tests {
             );
         }
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: ((id_max - id_min) + 1) as u64,
@@ -363,6 +362,7 @@ mod tests {
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 5,
@@ -397,6 +397,7 @@ mod tests {
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 0,
@@ -464,6 +465,7 @@ mod tests {
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                arrival_ordinal: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
@@ -510,6 +512,7 @@ mod tests {
             );
             cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                arrival_ordinal: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,

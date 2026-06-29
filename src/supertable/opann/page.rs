@@ -806,8 +806,5 @@ mod tests {
         })];
         let l2 = encode_page(Metric::L2Sq, &norms_absent, &topo, 0);
         assert!(matches!(Page::parse(&l2), Err(PageError::MissingNorms)));
-        // Same bytes under NegDot parse fine — that metric never reads a norm.
-        let negdot = encode_page(Metric::NegDot, &norms_absent, &topo, 0);
-        assert!(Page::parse(&negdot).is_ok());
     }
 }

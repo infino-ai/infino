@@ -16,7 +16,8 @@ use crate::superfile::{
     BuildError,
     format::{
         checksum::crc32c,
-        vec::{DOC_ID_BYTES, STABLE_ID_BYTES},
+        CRC_BYTES,
+        vec::{sub_hdr, DOC_ID_BYTES, STABLE_ID_BYTES},
     },
     vector::{
         builder::{
@@ -27,7 +28,7 @@ use crate::superfile::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
-        centroid_block::CentroidBlock,
+        centroid_block::{self, CentroidBlock},
         distance::Metric,
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry, read_cluster_radius},
@@ -412,6 +413,382 @@ struct PairRouting {
     radii: HashMap<u32, f32>,
 }
 
+fn read_u64_le(sub: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(
+        sub[off..off + 8]
+            .try_into()
+            .expect("8-byte u64 slice"),
+    )
+}
+
+/// Recover vector dimension from the per-cluster blocks region and doc count.
+fn infer_ivf_subsection_dim(sub: &[u8], per_cluster_blocks_off: usize, n_docs: u32) -> Option<usize> {
+    if n_docs == 0 || sub.len() < per_cluster_blocks_off + CRC_BYTES {
+        return None;
+    }
+    let cluster_region = sub.len() - per_cluster_blocks_off - CRC_BYTES;
+    let stride = cluster_region / (n_docs as usize);
+    if stride <= DOC_ID_BYTES {
+        return None;
+    }
+    // stride = dim/8 + DOC_ID_BYTES + 2*dim
+    let num = stride.checked_mul(8)?.saturating_sub(DOC_ID_BYTES * 8);
+    if num % 17 != 0 {
+        return None;
+    }
+    let dim = num / 17;
+    (dim >= 16 && dim <= 4096).then_some(dim)
+}
+
+fn infer_ivf_subsection_metric(
+    summary_off: usize,
+    cluster_idx_off: usize,
+    dim: usize,
+    n_cent: usize,
+) -> Metric {
+    for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        if summary_off + centroid_block::centroid_block_bytes(dim, n_cent, metric) == cluster_idx_off
+        {
+            return metric;
+        }
+    }
+    Metric::L2Sq
+}
+
+/// Parse a byte-spliced cell subsection back into a merge input (for incremental
+/// drain concat — one superfile at a time).
+fn sq8_ivf_merge_input_from_merged_subsection(
+    merged: &MergedIvfSubsection,
+    stable_ids: Vec<i128>,
+) -> Result<Sq8IvfMergeInput, BuildError> {
+    let sub = &merged.bytes;
+    let n_cent = merged.n_cent;
+    let n_docs = merged.n_docs;
+    let cluster_idx_off = read_u64_le(sub, sub_hdr::CLUSTER_IDX_OFF_OFF) as usize;
+    let per_cluster_blocks_off = read_u64_le(sub, sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF) as usize;
+    let summary_off = read_u64_le(sub, sub_hdr::SUMMARY_OFF_OFF) as usize;
+    let summary_radius_x100 = u32::from_le_bytes(
+        sub[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + 4]
+            .try_into()
+            .expect("summary radius"),
+    );
+    let codec_meta_off = merged.codec_meta_offset_in_sub;
+    let dim = infer_ivf_subsection_dim(sub, per_cluster_blocks_off, n_docs).ok_or_else(|| {
+        BuildError::VectorSchemaMismatch("cannot infer IVF dim from merged subsection".into())
+    })?;
+    let metric = infer_ivf_subsection_metric(summary_off, cluster_idx_off, dim, n_cent);
+    let scale_end = codec_meta_off + n_cent * dim * 4;
+    let offset_end = scale_end + n_cent * dim * 4;
+    let scale = cast_slice(&sub[codec_meta_off..scale_end]).to_vec();
+    let offset = cast_slice(&sub[scale_end..offset_end]).to_vec();
+    let codec = RerankCodec::Sq8Residual;
+    let quant = BitQuantizer::new(dim);
+    let code_bytes = quant.code_bytes();
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    let stride = code_bytes + DOC_ID_BYTES + per_vec_bytes;
+    Ok(Sq8IvfMergeInput {
+        sub: sub.to_vec(),
+        dim,
+        n_cent,
+        n_docs,
+        metric,
+        doc_id_offset: 0,
+        cluster_idx_off,
+        centroid_block_off: summary_off,
+        per_cluster_blocks_off,
+        code_bytes,
+        per_vec_bytes,
+        stride,
+        scale,
+        offset,
+        summary_radius_x100,
+        stable_ids: Some(stable_ids),
+    })
+}
+
+/// Every non-empty `(input, source_cluster)` in `parsed`, with rows in cluster order.
+fn pairs_all_clusters(parsed: &[Sq8IvfMergeInput]) -> HashMap<(usize, usize), Vec<SourceRowRef>> {
+    let id_bytes = DOC_ID_BYTES;
+    let mut pairs = HashMap::new();
+    for (ii, inp) in parsed.iter().enumerate() {
+        for c in 0..inp.n_cent {
+            let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+            if count == 0 {
+                continue;
+            }
+            let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
+            let doc_ids_at = block + count * inp.code_bytes;
+            let rows: Vec<SourceRowRef> = (0..count)
+                .map(|i| {
+                    let idb = doc_ids_at + i * id_bytes;
+                    let src_local = u32::from_le_bytes([
+                        inp.sub[idb],
+                        inp.sub[idb + 1],
+                        inp.sub[idb + 2],
+                        inp.sub[idb + 3],
+                    ]);
+                    SourceRowRef {
+                        input: ii,
+                        cluster: c,
+                        row: i,
+                        src_local,
+                    }
+                })
+                .collect();
+            pairs.insert((ii, c), rows);
+        }
+    }
+    pairs
+}
+
+/// Build one routed cell subsection from regrouped `(input, source_cluster)` buckets.
+fn build_routed_cell_subsection_from_pairs(
+    pairs: HashMap<(usize, usize), Vec<SourceRowRef>>,
+    parsed: &[Sq8IvfMergeInput],
+    stable_ids_per_input: &[Vec<i128>],
+    shard_radius: f32,
+) -> Result<RoutedCellSubsection, BuildError> {
+    let dim = parsed[0].dim;
+    let metric = parsed[0].metric;
+    for inp in &parsed[1..] {
+        if inp.dim != dim || inp.metric != metric {
+            return Err(BuildError::VectorSchemaMismatch(
+                "Sq8 IVF encode inputs must share dim and metric".into(),
+            ));
+        }
+    }
+
+    let codec = RerankCodec::Sq8Residual;
+    let quant = BitQuantizer::new(dim);
+    let code_bytes = quant.code_bytes();
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
+    let id_bytes = DOC_ID_BYTES;
+    let produce_region = true;
+
+    let centroid_blocks: Vec<CentroidBlock> = parsed
+        .iter()
+        .map(|inp| {
+            CentroidBlock::new(
+                &inp.sub[inp.centroid_block_off..],
+                inp.metric,
+                inp.dim,
+                inp.n_cent,
+            )
+        })
+        .collect();
+
+    let mut pair_keys: Vec<(usize, usize)> = pairs.keys().copied().collect();
+    pair_keys.sort_unstable();
+    let out_n_cent = pair_keys.len();
+    let n_docs: u32 = pairs.values().map(|v| v.len() as u32).sum();
+
+    let mut out_scale = vec![0.0f32; out_n_cent * dim];
+    let mut out_offset = vec![0.0f32; out_n_cent * dim];
+    let mut out_centroids = vec![0.0f32; out_n_cent * dim];
+    for (k, &(ii, c)) in pair_keys.iter().enumerate() {
+        out_scale[k * dim..k * dim + dim].copy_from_slice(&parsed[ii].scale[c * dim..c * dim + dim]);
+        out_offset[k * dim..k * dim + dim]
+            .copy_from_slice(&parsed[ii].offset[c * dim..c * dim + dim]);
+        let cv = centroid_blocks[ii].cluster_components(c);
+        out_centroids[k * dim..k * dim + dim].copy_from_slice(&cv);
+    }
+
+    let mut summary_centroid = vec![0.0f32; dim];
+    if out_n_cent > 0 {
+        let mut acc = vec![0.0f64; dim];
+        for c in 0..out_n_cent {
+            let cv = &out_centroids[c * dim..(c + 1) * dim];
+            for (a, &x) in acc.iter_mut().zip(cv) {
+                *a += x as f64;
+            }
+        }
+        let inv = 1.0 / (out_n_cent as f64);
+        for (s, a) in summary_centroid.iter_mut().zip(&acc) {
+            *s = (*a * inv) as f32;
+        }
+    }
+
+    let summary_radius_x100 = pair_keys
+        .iter()
+        .map(|&(ii, _)| parsed[ii].summary_radius_x100)
+        .max()
+        .unwrap_or(0);
+
+    let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, out_n_cent, metric);
+    let cluster_stride = code_bytes + id_bytes + per_vec_bytes;
+    let stable_ids_region_bytes = if produce_region {
+        n_docs as usize * STABLE_ID_BYTES
+    } else {
+        0
+    };
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        out_n_cent,
+        n_docs as usize,
+        cluster_stride,
+        codec_meta_size,
+        stable_ids_region_bytes,
+        metric,
+    );
+
+    let mut bytes = alloc_ivf_subsection_with_header(
+        &layout,
+        codec_meta_size,
+        summary_radius_x100,
+        metric,
+        dim,
+        out_n_cent,
+        &summary_centroid,
+        &out_centroids,
+    );
+
+    let sq8_scale_block_off = layout.codec_meta_off;
+    let sq8_offset_block_off = sq8_scale_block_off + out_n_cent * dim * 4;
+    let sq8_norms_block_off = if store_norm {
+        Some(sq8_offset_block_off + out_n_cent * dim * 4)
+    } else {
+        None
+    };
+    for c in 0..out_n_cent {
+        let sc_off = sq8_scale_block_off + c * dim * 4;
+        bytes[sc_off..sc_off + dim * 4].copy_from_slice(cast_slice(&out_scale[c * dim..c * dim + dim]));
+        let oc_off = sq8_offset_block_off + c * dim * 4;
+        bytes[oc_off..oc_off + dim * 4].copy_from_slice(cast_slice(&out_offset[c * dim..c * dim + dim]));
+    }
+
+    let cluster_order = centroid_storage_order(&out_centroids, out_n_cent, dim);
+    let merged_counts: Vec<u32> = pair_keys.iter().map(|k| pairs[k].len() as u32).collect();
+    let out_cluster_radii: Vec<f32> = pair_keys
+        .iter()
+        .map(|&(ii, c)| cluster_radius(&parsed[ii].sub, parsed[ii].cluster_idx_off, c))
+        .collect();
+    let stable_ids_region_off = layout.stable_ids_off;
+    let mut stable_ids_by_local = vec![0i128; n_docs as usize];
+
+    write_ivf_cluster_blocks(
+        &mut bytes,
+        &layout,
+        &cluster_order,
+        &merged_counts,
+        &out_cluster_radii,
+        code_bytes,
+        per_vec_bytes,
+        |bytes, out_cluster, blk| {
+            let (ii, c) = pair_keys[out_cluster];
+            let inp = &parsed[ii];
+            let scale_c = &out_scale[out_cluster * dim..out_cluster * dim + dim];
+            let offset_c = &out_offset[out_cluster * dim..out_cluster * dim + dim];
+            debug_assert!(sq8_quant_params_equal(
+                &inp.scale[c * dim..c * dim + dim],
+                &inp.offset[c * dim..c * dim + dim],
+                scale_c,
+                offset_c,
+            ));
+
+            let (doc_off, src_count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+            let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
+            let full_at = block + src_count * (inp.code_bytes + id_bytes);
+
+            let rows = &pairs[&(ii, c)];
+            for (out_i, row_ref) in rows.iter().enumerate() {
+                let i = row_ref.row;
+                bytes[blk.codes_base + out_i * code_bytes..blk.codes_base + (out_i + 1) * code_bytes]
+                    .copy_from_slice(
+                        &inp.sub[block + i * inp.code_bytes..block + (i + 1) * inp.code_bytes],
+                    );
+
+                let local_id = (blk.first_row + out_i) as u32;
+                let id_off = blk.ids_base + out_i * id_bytes;
+                bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
+
+                let stable_id = stable_ids_per_input[ii][row_ref.src_local as usize];
+                stable_ids_by_local[local_id as usize] = stable_id;
+                if let Some(region_off) = stable_ids_region_off {
+                    let p = region_off + (local_id as usize) * STABLE_ID_BYTES;
+                    bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&stable_id.to_le_bytes());
+                }
+
+                let rowb = full_at + i * inp.per_vec_bytes;
+                let full_off = blk.rerank_base + out_i * per_vec_bytes;
+                bytes[full_off..full_off + dim * 2]
+                    .copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
+
+                if let Some(norms_off) = sq8_norms_block_off {
+                    let n_sq = sq8_residual_norm_sq(
+                        dim,
+                        scale_c,
+                        offset_c,
+                        &inp.sub[rowb..rowb + dim],
+                        &inp.sub[rowb + dim..rowb + dim + dim],
+                    );
+                    let n_off = norms_off + (blk.first_row + out_i) * 4;
+                    bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                }
+                debug_assert_eq!(row_ref.input, ii);
+                debug_assert_eq!(row_ref.cluster, c);
+            }
+            Ok(())
+        },
+    )?;
+
+    let crc = crc32c(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+
+    Ok(RoutedCellSubsection {
+        subsection: MergedIvfSubsection {
+            bytes,
+            n_cent: out_n_cent,
+            n_docs,
+            summary_offset_in_sub: layout.summary_off,
+            codec_meta_offset_in_sub: if codec_meta_size == 0 {
+                0
+            } else {
+                layout.codec_meta_off
+            },
+            codec_meta_size,
+        },
+        stable_ids: stable_ids_by_local,
+        shard_radius,
+        cluster_radii: out_cluster_radii,
+    })
+}
+
+/// Append `add` onto `acc` in place (incremental drain: one incoming superfile at a time).
+pub(crate) fn concat_routed_cell_subsections_in_place(
+    acc: &mut RoutedCellSubsection,
+    add: RoutedCellSubsection,
+) -> Result<(), BuildError> {
+    let left_ids = std::mem::take(&mut acc.stable_ids);
+    let left_shard = acc.shard_radius;
+    let left_sub = std::mem::replace(
+        &mut acc.subsection,
+        MergedIvfSubsection {
+            bytes: Vec::new(),
+            n_cent: 0,
+            n_docs: 0,
+            summary_offset_in_sub: 0,
+            codec_meta_offset_in_sub: 0,
+            codec_meta_size: 0,
+        },
+    );
+    let left_inp = sq8_ivf_merge_input_from_merged_subsection(&left_sub, left_ids)?;
+    let right_inp = sq8_ivf_merge_input_from_merged_subsection(&add.subsection, add.stable_ids)?;
+    let parsed = [left_inp, right_inp];
+    let stable_ids_per_input: Vec<Vec<i128>> = parsed
+        .iter()
+        .map(|p| p.stable_ids.clone().unwrap_or_default())
+        .collect();
+    let pairs = pairs_all_clusters(&parsed);
+    *acc = build_routed_cell_subsection_from_pairs(
+        pairs,
+        &parsed,
+        &stable_ids_per_input,
+        left_shard.max(add.shard_radius),
+    )?;
+    Ok(())
+}
+
 /// Route every Sq8+ε row across `inputs` to a cell (via `route`) and emit one
 /// byte-spliced IVF subsection per touched cell — **without ever re-quantizing**.
 ///
@@ -428,7 +805,7 @@ struct PairRouting {
 /// Mirrors [`merge_sq8_ivf_subsections`]'s header / centroid-block / cluster-block
 /// / CRC writing; only the cluster grouping (per source pair, not pooled by
 /// shared cluster index) and the routing differ.
-pub(crate) fn encode_encoded_rows<F>(
+pub(crate) fn route_and_splice_ivf_subsections<F>(
     inputs: &[(&VectorReader, &str)],
     // Per-input stable `_id`s in local-doc-id order, resolved by the caller.
     // Incoming superfiles are streaming-built and carry NO inline `_id` region,
@@ -444,12 +821,12 @@ where
 {
     if inputs.is_empty() {
         return Err(BuildError::VectorSchemaMismatch(
-            "encode_encoded_rows requires at least one IVF input".into(),
+            "route_and_splice_ivf_subsections requires at least one IVF input".into(),
         ));
     }
     if stable_ids_per_input.len() != inputs.len() {
         return Err(BuildError::VectorSchemaMismatch(
-            "encode_encoded_rows: stable_ids_per_input must match inputs len".into(),
+            "route_and_splice_ivf_subsections: stable_ids_per_input must match inputs len".into(),
         ));
     }
     let parsed: Vec<Sq8IvfMergeInput> = inputs
@@ -467,28 +844,8 @@ where
         }
     }
 
-    let codec = RerankCodec::Sq8Residual;
-    let quant = BitQuantizer::new(dim);
-    let code_bytes = quant.code_bytes();
-    let per_vec_bytes = codec.per_vector_bytes(dim);
     let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
     let id_bytes = DOC_ID_BYTES;
-
-    // The caller always supplies resolved ids, so always emit the inline `_id`
-    // region (gives the cold-search path its fast id lookup in the cell delta).
-    let produce_region = true;
-
-    let centroid_blocks: Vec<CentroidBlock> = parsed
-        .iter()
-        .map(|inp| {
-            CentroidBlock::new(
-                &inp.sub[inp.centroid_block_off..],
-                inp.metric,
-                inp.dim,
-                inp.n_cent,
-            )
-        })
-        .collect();
 
     // Routing pass: reconstruct each row as an `EncodedCellRow` (codes/residuals
     // straight from the rerank bytes, scale/offset from the source cluster's
@@ -590,198 +947,13 @@ where
 
     let mut out: HashMap<u32, RoutedCellSubsection> = HashMap::with_capacity(by_cell.len());
     for (cell_id, pairs) in by_cell {
-        // Stable output-cluster order: by source (input, source_cluster). Each
-        // such pair becomes one output cluster carrying its source quantizer.
-        let mut pair_keys: Vec<(usize, usize)> = pairs.keys().copied().collect();
-        pair_keys.sort_unstable();
-        let out_n_cent = pair_keys.len();
-        let n_docs: u32 = pairs.values().map(|v| v.len() as u32).sum();
-
-        // Per-output-cluster quantizer + centroid, carried verbatim from source.
-        let mut out_scale = vec![0.0f32; out_n_cent * dim];
-        let mut out_offset = vec![0.0f32; out_n_cent * dim];
-        let mut out_centroids = vec![0.0f32; out_n_cent * dim];
-        for (k, &(ii, c)) in pair_keys.iter().enumerate() {
-            out_scale[k * dim..k * dim + dim]
-                .copy_from_slice(&parsed[ii].scale[c * dim..c * dim + dim]);
-            out_offset[k * dim..k * dim + dim]
-                .copy_from_slice(&parsed[ii].offset[c * dim..c * dim + dim]);
-            let cv = centroid_blocks[ii].cluster_components(c);
-            out_centroids[k * dim..k * dim + dim].copy_from_slice(&cv);
-        }
-
-        let mut summary_centroid = vec![0.0f32; dim];
-        if out_n_cent > 0 {
-            let mut acc = vec![0.0f64; dim];
-            for c in 0..out_n_cent {
-                let cv = &out_centroids[c * dim..(c + 1) * dim];
-                for (a, &x) in acc.iter_mut().zip(cv) {
-                    *a += x as f64;
-                }
-            }
-            let inv = 1.0 / (out_n_cent as f64);
-            for (s, a) in summary_centroid.iter_mut().zip(&acc) {
-                *s = (*a * inv) as f32;
-            }
-        }
-
-        let summary_radius_x100 = pair_keys
-            .iter()
-            .map(|&(ii, _)| parsed[ii].summary_radius_x100)
-            .max()
-            .unwrap_or(0);
-
-        let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, out_n_cent, metric);
-        let cluster_stride = code_bytes + id_bytes + per_vec_bytes;
-        let stable_ids_region_bytes = if produce_region {
-            n_docs as usize * STABLE_ID_BYTES
-        } else {
-            0
-        };
-        let layout = IvfSubsectionLayout::compute(
-            dim,
-            out_n_cent,
-            n_docs as usize,
-            cluster_stride,
-            codec_meta_size,
-            stable_ids_region_bytes,
-            metric,
-        );
-
-        let mut bytes = alloc_ivf_subsection_with_header(
-            &layout,
-            codec_meta_size,
-            summary_radius_x100,
-            metric,
-            dim,
-            out_n_cent,
-            &summary_centroid,
-            &out_centroids,
-        );
-
-        let sq8_scale_block_off = layout.codec_meta_off;
-        let sq8_offset_block_off = sq8_scale_block_off + out_n_cent * dim * 4;
-        let sq8_norms_block_off = if store_norm {
-            Some(sq8_offset_block_off + out_n_cent * dim * 4)
-        } else {
-            None
-        };
-        for c in 0..out_n_cent {
-            let sc_off = sq8_scale_block_off + c * dim * 4;
-            bytes[sc_off..sc_off + dim * 4]
-                .copy_from_slice(cast_slice(&out_scale[c * dim..c * dim + dim]));
-            let oc_off = sq8_offset_block_off + c * dim * 4;
-            bytes[oc_off..oc_off + dim * 4]
-                .copy_from_slice(cast_slice(&out_offset[c * dim..c * dim + dim]));
-        }
-
-        let cluster_order = centroid_storage_order(&out_centroids, out_n_cent, dim);
-        let merged_counts: Vec<u32> = pair_keys.iter().map(|k| pairs[k].len() as u32).collect();
-        // Each output cluster is a verbatim source (input, source-cluster) pair,
-        // so its covering radius is exactly the source cluster's — copy it.
-        let out_cluster_radii: Vec<f32> = pair_keys
-            .iter()
-            .map(|&(ii, c)| cluster_radius(&parsed[ii].sub, parsed[ii].cluster_idx_off, c))
-            .collect();
-        let stable_ids_region_off = layout.stable_ids_off;
-        let mut stable_ids_by_local = vec![0i128; n_docs as usize];
-
-        write_ivf_cluster_blocks(
-            &mut bytes,
-            &layout,
-            &cluster_order,
-            &merged_counts,
-            &out_cluster_radii,
-            code_bytes,
-            per_vec_bytes,
-            |bytes, out_cluster, blk| {
-                let (ii, c) = pair_keys[out_cluster];
-                let inp = &parsed[ii];
-                let scale_c = &out_scale[out_cluster * dim..out_cluster * dim + dim];
-                let offset_c = &out_offset[out_cluster * dim..out_cluster * dim + dim];
-                // Destination quantizer is the source quantizer by construction.
-                debug_assert!(sq8_quant_params_equal(
-                    &inp.scale[c * dim..c * dim + dim],
-                    &inp.offset[c * dim..c * dim + dim],
-                    scale_c,
-                    offset_c,
-                ));
-
-                let (doc_off, src_count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
-                let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
-                let full_at = block + src_count * (inp.code_bytes + id_bytes);
-
-                let rows = &pairs[&(ii, c)];
-                for (out_i, row_ref) in rows.iter().enumerate() {
-                    let i = row_ref.row;
-                    // 1-bit RaBitQ code: verbatim copy.
-                    bytes[blk.codes_base + out_i * code_bytes
-                        ..blk.codes_base + (out_i + 1) * code_bytes]
-                        .copy_from_slice(
-                            &inp.sub[block + i * inp.code_bytes..block + (i + 1) * inp.code_bytes],
-                        );
-
-                    // Fresh contiguous local id within this cell subsection.
-                    let local_id = (blk.first_row + out_i) as u32;
-                    let id_off = blk.ids_base + out_i * id_bytes;
-                    bytes[id_off..id_off + id_bytes].copy_from_slice(&local_id.to_le_bytes());
-
-                    let stable_id = stable_ids_per_input[ii][row_ref.src_local as usize];
-                    stable_ids_by_local[local_id as usize] = stable_id;
-                    if let Some(region_off) = stable_ids_region_off {
-                        let p = region_off + (local_id as usize) * STABLE_ID_BYTES;
-                        bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&stable_id.to_le_bytes());
-                    }
-
-                    // Rerank payload (Sq8 codes ‖ ε residuals): verbatim copy.
-                    // The cluster-level assert above proves the destination
-                    // quantizer equals the source's, so no transcode is needed.
-                    let rowb = full_at + i * inp.per_vec_bytes;
-                    let full_off = blk.rerank_base + out_i * per_vec_bytes;
-                    bytes[full_off..full_off + dim * 2]
-                        .copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
-
-                    if let Some(norms_off) = sq8_norms_block_off {
-                        let n_sq = sq8_residual_norm_sq(
-                            dim,
-                            scale_c,
-                            offset_c,
-                            &inp.sub[rowb..rowb + dim],
-                            &inp.sub[rowb + dim..rowb + dim + dim],
-                        );
-                        let n_off = norms_off + (blk.first_row + out_i) * 4;
-                        bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
-                    }
-                    debug_assert_eq!(row_ref.input, ii);
-                    debug_assert_eq!(row_ref.cluster, c);
-                }
-                Ok(())
-            },
+        let routed = build_routed_cell_subsection_from_pairs(
+            pairs,
+            &parsed,
+            stable_ids_per_input,
+            cell_radius.get(&cell_id).copied().unwrap_or(0.0),
         )?;
-
-        let crc = crc32c(&bytes);
-        bytes.extend_from_slice(&crc.to_le_bytes());
-
-        out.insert(
-            cell_id,
-            RoutedCellSubsection {
-                subsection: MergedIvfSubsection {
-                    bytes,
-                    n_cent: out_n_cent,
-                    n_docs,
-                    summary_offset_in_sub: layout.summary_off,
-                    codec_meta_offset_in_sub: if codec_meta_size == 0 {
-                        0
-                    } else {
-                        layout.codec_meta_off
-                    },
-                    codec_meta_size,
-                },
-                stable_ids: stable_ids_by_local,
-                shard_radius: cell_radius.get(&cell_id).copied().unwrap_or(0.0),
-                cluster_radii: out_cluster_radii,
-            },
-        );
+        out.insert(cell_id, routed);
     }
 
     Ok(out)
@@ -884,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encode_encoded_rows_splices_verbatim_and_preserves_recall() {
+    async fn route_and_splice_ivf_subsections_splices_verbatim_and_preserves_recall() {
         let (incoming, ids) = build_streaming_incoming().await;
 
         // Streaming-built incoming carries no inline region, so the read-back
@@ -920,8 +1092,8 @@ mod tests {
                 vec![(1, 0.0)]
             }
         };
-        let routed = encode_encoded_rows(&inputs, &stable_ids_per_input, route)
-            .expect("encode_encoded_rows");
+        let routed = route_and_splice_ivf_subsections(&inputs, &stable_ids_per_input, route)
+            .expect("route_and_splice_ivf_subsections");
         assert_eq!(routed.len(), 2, "both cells should be touched");
 
         // (a)+(b): every spliced row's code + rerank bytes are byte-identical to

@@ -231,6 +231,7 @@ mod tests {
             ),
         );
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -380,6 +381,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: titles.len() as u64,
@@ -486,6 +488,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: bloom_tokens.len().max(1) as u64,

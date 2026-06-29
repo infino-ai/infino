@@ -31,7 +31,7 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
-        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
+        vector::layout::VectorLayout,
     },
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
@@ -327,20 +327,8 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats) = {
-            let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
-                reader.vec().and_then(|v| {
-                    v.vector_columns_config()
-                        .next()
-                        .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
-                })
-            });
-            if sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
-            } else {
-                SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
-            }
-        };
+        let (merged_bytes, superfile_stats) =
+            SuperfileBuilder::build_from_readers(&readers_with_tombstones)?;
         let merged_bytes = Bytes::from(merged_bytes);
 
         let shard = ShardOutput::new_with_params(
@@ -461,6 +449,7 @@ impl Supertable {
                 .first()
                 .map(|e| e.vector_layout)
                 .unwrap_or(VectorLayout::Ivf),
+            arrival_ordinal: inputs.iter().map(|e| e.arrival_ordinal).min().unwrap_or(0),
         });
         let new_entries = vec![merged_entry];
         let mut pending_storage_writes = vec![

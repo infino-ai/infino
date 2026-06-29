@@ -83,7 +83,6 @@ use super::{
     candidate::CandidatePlan,
     dispatch,
     exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
-    hierarchical_iter,
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -114,28 +113,6 @@ pub struct VectorFilter<'a> {
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
-}
-
-/// All superfile entries of `manifest` in manifest order, flattening the lazy
-/// list parts when the manifest is object-store-backed (the hidden vector-index
-/// table) or returning the resident flat list for an in-process manifest. Used
-/// by the OPANN leaf-fetch path to map a descended `LeafRef.superfile_id` back
-/// to its entry (uri + radius) — loaded once per query, part GETs disk-cached.
-pub(super) async fn ordered_manifest_superfiles(
-    manifest: &Manifest,
-) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
-    if !manifest.is_in_process_only() {
-        let part_ids: Vec<_> = manifest
-            .get_all_list_entries()
-            .iter()
-            .map(|e| e.part_id)
-            .collect();
-        hierarchical_iter::load_and_flatten(manifest, &part_ids)
-            .await
-            .map_err(QueryError::ManifestLoad)
-    } else {
-        Ok(hierarchical_iter::fallback_to_flat_superfiles(manifest))
-    }
 }
 
 /// Split hits into those already on the user table vs hidden-index hits
@@ -1107,14 +1084,10 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         if let Some(vit) = self.vector_index_table() {
-            let vit_reader = vit.reader();
-            let vit_manifest = vit_reader.manifest();
-            let has_data = !vit_manifest.superfiles.is_empty() || vit_manifest.get_num_parts() > 0;
-            if has_data {
-                return vit_reader
-                    .vector_search_user_table_async(column, query, k, options)
-                    .await;
-            }
+            return vit
+                .reader()
+                .vector_search_user_table_async(column, query, k, options)
+                .await;
         }
         self.vector_search_user_table_async(column, query, k, options)
             .await
@@ -1719,6 +1692,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id,
             uri: SuperfileUri(superfile_id),
             n_docs: 100,

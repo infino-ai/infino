@@ -48,19 +48,6 @@ use crate::supertable::manifest::{
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
 
-/// Default nearest cells always probed by the hidden VectorCell index — the
-/// recall floor before the radius-aware threshold widens the probe set.
-const DEFAULT_CELL_NPROBE_MIN: usize = 4;
-/// Default hard cap on cells probed per query (bounds the object-store GET fan).
-/// Held at the nprobe floor so adaptive expansion is off by default: with the
-/// current (poorly-separated, large-radius) cells the radius-aware threshold
-/// otherwise widens to ~all cells, fanning every query out across the whole
-/// index. Raise it (or `INFINO_CELL_NPROBE_MAX`) once cells separate well
-/// enough that a few probes recall the neighbors.
-const DEFAULT_CELL_NPROBE_MAX: usize = 8;
-/// Default margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
-const DEFAULT_CELL_SLACK: f32 = 1.0;
-
 // ---------- Public in-memory shapes ----------
 
 /// Top-level manifest list. The wire format is the JSON
@@ -129,44 +116,19 @@ pub struct VectorColumnInfo {
     pub metric: String,
 }
 
-/// Adaptive cell-probe tuning for the hidden VectorCell index.
-/// Calibrated per table; persisted in the manifest list.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CellRoutingParams {
-    /// Nearest cells always probed (recall floor).
-    pub nprobe_min: usize,
-    /// Hard cap on cells probed per query (GET budget).
-    pub nprobe_max: usize,
-    /// Margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
-    pub slack: f32,
-}
-
-impl Default for CellRoutingParams {
-    fn default() -> Self {
-        Self {
-            nprobe_min: DEFAULT_CELL_NPROBE_MIN,
-            nprobe_max: DEFAULT_CELL_NPROBE_MAX,
-            slack: DEFAULT_CELL_SLACK,
-        }
-    }
-}
-
 /// OPANN routing-tree reference stamped into the manifest: the content hash of
 /// the root page (entry into the paged hierarchical cell router, stored under
-/// the hidden vector-index prefix) plus the probe tuning. `opann_routing == None`
-/// means the table has no OPANN tree.
+/// the hidden vector-index prefix). `opann_routing == None` means the table has
+/// no OPANN tree.
 ///
-/// The tree itself — every leaf's cell id (`= superfile_id.as_u128()`),
-/// Sq8+residual centroid, and covering radius — lives entirely in the
-/// content-addressed pages reachable from `root_page`. Nothing fp32 is persisted
-/// here; a commit/compaction updates the tree by copy-on-write insert/delete
-/// against the page graph, rewriting only the affected leaf→root path.
+/// Query admission is radius-bounded tree descent only — no flat cell-probe list.
+/// The tree — every leaf's cluster `(superfile_id, doc_off, count)`, Sq8+residual
+/// centroid, and covering radius — lives entirely in the content-addressed pages
+/// reachable from `root_page`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpannRouting {
     /// Content hash of the root routing page.
     pub root_page: ContentHash,
-    /// Probe tuning — reuses the cell-routing knobs.
-    pub routing: CellRoutingParams,
     /// Content-addressed blob of the hidden index's consolidated deleted
     /// user-`_id` set (the rows tombstoned in the user table but not yet
     /// physically removed by a drain). Loaded through the disk cache and
@@ -176,6 +138,13 @@ pub struct OpannRouting {
     /// pending.
     pub deleted_ids_uri: Option<String>,
     pub deleted_ids_content_hash: Option<ContentHash>,
+    /// User superfiles with `arrival_ordinal` at or below this value have been
+    /// drained into hidden per-cell IVF superfiles. `0` means nothing drained yet.
+    pub drained_max_arrival_ordinal: u64,
+    /// User manifest id observed when the drain that set
+    /// [`Self::drained_max_arrival_ordinal`] completed. Selection and completion
+    /// share one snapshot so a concurrent append cannot be half-drained.
+    pub drained_user_manifest_id: u64,
 }
 
 /// How superfiles are routed into manifest parts. Stamped into
@@ -199,11 +168,10 @@ pub enum PartitionStrategy {
         boundaries: Vec<Vec<u8>>,
     },
     /// Partition by vector distance to fixed global centroids.
-    /// Each row is assigned to the cell whose centroid is nearest.
+    /// Each row is assigned to the cell whose centroid is nearest (drain / ingest).
     VectorCell {
         column: String,
         clusters: super::ClusterCentroids,
-        routing: CellRoutingParams,
     },
 }
 
@@ -843,57 +811,20 @@ enum PartitionStrategyDto {
     VectorCell {
         column: String,
         clusters_b64: String,
-        #[serde(default)]
-        routing: Option<CellRoutingParamsDto>,
     },
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct CellRoutingParamsDto {
-    #[serde(default)]
-    nprobe_min: usize,
-    #[serde(default)]
-    nprobe_max: usize,
-    #[serde(default)]
-    slack: f32,
-}
-
-impl From<CellRoutingParams> for CellRoutingParamsDto {
-    fn from(r: CellRoutingParams) -> Self {
-        Self {
-            nprobe_min: r.nprobe_min,
-            nprobe_max: r.nprobe_max,
-            slack: r.slack,
-        }
-    }
-}
-
-impl From<CellRoutingParamsDto> for CellRoutingParams {
-    fn from(d: CellRoutingParamsDto) -> Self {
-        let mut r = CellRoutingParams::default();
-        if d.nprobe_min > 0 {
-            r.nprobe_min = d.nprobe_min;
-        }
-        if d.nprobe_max > 0 {
-            r.nprobe_max = d.nprobe_max;
-        }
-        if d.slack > 0.0 {
-            r.slack = d.slack;
-        }
-        r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
-        r
-    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct OpannRoutingDto {
     root_page: String, // "blake3:<64hex>"
     #[serde(default)]
-    routing: Option<CellRoutingParamsDto>,
-    #[serde(default)]
     deleted_ids_uri: Option<String>,
     #[serde(default)]
     deleted_ids_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default)]
+    drained_max_arrival_ordinal: u64,
+    #[serde(default)]
+    drained_user_manifest_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1201,16 +1132,11 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 boundaries: boundaries.iter().map(|b| encode_b64(b)).collect(),
             }
         }
-        PartitionStrategy::VectorCell {
-            column,
-            clusters,
-            routing,
-        } => {
+        PartitionStrategy::VectorCell { column, clusters } => {
             let enc = encode_cluster_centroids(clusters);
             PartitionStrategyDto::VectorCell {
                 column: column.clone(),
                 clusters_b64: encode_b64(&enc),
-                routing: Some(CellRoutingParamsDto::from(*routing)),
             }
         }
     }
@@ -1241,17 +1167,12 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
         PartitionStrategyDto::VectorCell {
             column,
             clusters_b64,
-            routing,
         } => {
             let bytes = decode_b64(&clusters_b64, "partition_strategy.clusters")?;
             let clusters = decode_cluster_centroids(&bytes).map_err(|e| {
                 ListParseError::BadFieldValue("partition_strategy.clusters", e.to_string())
             })?;
-            PartitionStrategy::VectorCell {
-                column,
-                clusters,
-                routing: routing.map(CellRoutingParams::from).unwrap_or_default(),
-            }
+            PartitionStrategy::VectorCell { column, clusters }
         }
     })
 }
@@ -1284,9 +1205,10 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         opann_routing: l.opann_routing.as_ref().map(|r| OpannRoutingDto {
             root_page: encode_hash(&r.root_page),
-            routing: Some(r.routing.into()),
             deleted_ids_uri: r.deleted_ids_uri.clone(),
             deleted_ids_content_hash: r.deleted_ids_content_hash.as_ref().map(encode_hash),
+            drained_max_arrival_ordinal: r.drained_max_arrival_ordinal,
+            drained_user_manifest_id: r.drained_user_manifest_id,
         }),
         parts,
     })
@@ -1324,13 +1246,14 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             .map(|r| -> Result<OpannRouting, ListParseError> {
                 Ok(OpannRouting {
                     root_page: decode_hash(&r.root_page)?,
-                    routing: r.routing.map(CellRoutingParams::from).unwrap_or_default(),
                     deleted_ids_uri: r.deleted_ids_uri,
                     deleted_ids_content_hash: r
                         .deleted_ids_content_hash
                         .as_deref()
                         .map(decode_hash)
                         .transpose()?,
+                    drained_max_arrival_ordinal: r.drained_max_arrival_ordinal,
+                    drained_user_manifest_id: r.drained_user_manifest_id,
                 })
             })
             .transpose()?,
@@ -2040,7 +1963,6 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![1, 1],
             ),
-            routing: Default::default(),
         };
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");

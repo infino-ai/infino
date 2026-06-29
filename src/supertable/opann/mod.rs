@@ -23,6 +23,7 @@
 
 mod descent;
 pub(crate) mod insert;
+pub(crate) mod live;
 pub(crate) mod page;
 pub(crate) mod paged;
 pub(crate) mod store;

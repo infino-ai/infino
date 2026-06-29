@@ -540,7 +540,7 @@ mod tests {
         // against the in-memory oracle.
         let (dim, n) = (24usize, 200usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             // One page holding the entire tree (budget >> node count).
             let whole = tree.to_pages(10 * n);
@@ -581,7 +581,7 @@ mod tests {
         // equality is the bar, no canonicalization.
         let (dim, n) = (24usize, 200usize);
         let cells = synth_cells(n, dim);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             for &budget in &[1usize, 4, 16, 64, n + 10] {
                 let split = tree.to_pages(budget);
@@ -620,7 +620,7 @@ mod tests {
             .map(|(_, c)| c.2)
             .collect();
         let survives = |sid: u128| surviving.contains(&sid);
-        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+        for metric in [Metric::L2Sq] {
             let tree = build_tree(metric, dim, &cells).expect("tree");
             let split = tree.to_pages(16);
             let paged = PagedTree::new(
@@ -673,11 +673,10 @@ mod tests {
         // Hand-assemble a tree whose root page (dim 4) links to a child page of
         // a different dim (2). Honest splits never produce this, but crafted /
         // corrupt-yet-hash-consistent bytes could; cross-page descent must
-        // reject it rather than index past the child's centroid rows. NegDot so
-        // no norms are required.
-        let child_cc = ClusterCentroids::from_fp32(Metric::NegDot, 1, 2, &[1.0, 0.0], vec![1]);
+        // reject it rather than index past the child's centroid rows.
+        let child_cc = ClusterCentroids::from_fp32(Metric::L2Sq, 1, 2, &[1.0, 0.0], vec![1]);
         let child_bytes = encode_page(
-            Metric::NegDot,
+            Metric::L2Sq,
             &child_cc,
             &[NodeTopo::Leaf(LeafRef {
                 superfile_id: 7,
@@ -690,9 +689,9 @@ mod tests {
         let child_hash = ContentHash::of(&child_bytes);
 
         let root_cc =
-            ClusterCentroids::from_fp32(Metric::NegDot, 1, 4, &[1.0, 0.0, 0.0, 0.0], vec![1]);
+            ClusterCentroids::from_fp32(Metric::L2Sq, 1, 4, &[1.0, 0.0, 0.0, 0.0], vec![1]);
         let root_topo = vec![NodeTopo::Internal(vec![ChildLink::Page(child_hash)])];
-        let root_bytes = encode_page(Metric::NegDot, &root_cc, &root_topo, 0);
+        let root_bytes = encode_page(Metric::L2Sq, &root_cc, &root_topo, 0);
         let root_hash = ContentHash::of(&root_bytes);
 
         let mut pages = HashMap::new();

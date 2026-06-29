@@ -35,7 +35,8 @@ use crate::superfile::{
     vector::{
         cell_posting::{
             MaterializedIvfRow, cluster_quant_from_medoid, encode_sq8_residual_dim,
-            encoded_component_at, ivf_centroid_components_from_materialized_bucket,
+            encoded_component_at, encoded_ivf_kmeans,
+            ivf_centroid_components_from_materialized_bucket,
             materialize_sq8_residual_row_into_cluster_quant,
         },
         centroid_block,
@@ -96,19 +97,9 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
 
-/// Superfile-local document thresholds for capping the physical IVF centroid
-/// count. Caller-supplied `n_cent` remains a tuning knob, but the builder will
-/// not train more centroids than this row-count policy permits for the physical
-/// superfile being written.
-const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
-/// Maximum IVF centroids for large physical vector indexes.
-const N_CENT_LARGE: usize = 4096;
-/// Medium-index document threshold for the IVF centroid cap.
-const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
-/// Maximum IVF centroids for medium physical vector indexes.
-const N_CENT_MEDIUM: usize = 1024;
-/// Maximum IVF centroids for small physical vector indexes.
-const N_CENT_SMALL: usize = 64;
+/// Coarse IVF: ~[`TARGET_VECTORS_PER_IVF_CLUSTER`] vectors per inverted list.
+/// Returns cluster **count** for a build holding `n_docs` vectors.
+const TARGET_VECTORS_PER_IVF_CLUSTER: usize = 8_000;
 
 /// Fixed-point scale for the per-subsection summary radius. The
 /// radius is stored as `round(radius × 100)` in a `u32` and decoded
@@ -116,13 +107,12 @@ const N_CENT_SMALL: usize = 64;
 const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
-    if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
-        N_CENT_LARGE
-    } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {
-        N_CENT_MEDIUM
-    } else {
-        N_CENT_SMALL
+    if n_docs == 0 {
+        return 1;
     }
+    n_docs
+        .div_ceil(TARGET_VECTORS_PER_IVF_CLUSTER)
+        .max(1)
 }
 
 /// Per-vector-index build configuration.
@@ -208,6 +198,9 @@ struct ColumnState {
     /// Sq8-native maintenance rows: when set, finish uses the materialized IVF
     /// rebuild path instead of the fp32 ingest pipeline.
     materialized_rows: Option<Vec<MaterializedIvfRow>>,
+    /// When true, materialized rows are re-clustered with full IVF (`cfg.n_cent`)
+    /// on finish — compaction merge. When false, rows land in one bucket (drain).
+    materialized_full_ivf_merge: bool,
     /// Pre-built subsection bytes from byte-splice merge (compaction path).
     prebuilt_subsection: Option<SubsectionBytes>,
 }
@@ -370,6 +363,7 @@ impl VectorBuilder {
             spill: None,
             spill_threshold_bytes,
             materialized_rows: None,
+            materialized_full_ivf_merge: false,
             prebuilt_subsection: None,
         });
         Ok(column_id)
@@ -381,6 +375,7 @@ impl VectorBuilder {
         &mut self,
         column_id: u32,
         rows: Vec<MaterializedIvfRow>,
+        full_ivf_merge: bool,
     ) -> Result<(), BuildError> {
         let idx = column_id as usize;
         let col = self
@@ -398,6 +393,7 @@ impl VectorBuilder {
         }
         col.n_docs = rows.len() as u32;
         col.materialized_rows = Some(rows);
+        col.materialized_full_ivf_merge = full_ivf_merge;
         Ok(())
     }
 
@@ -784,20 +780,6 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///    cluster-index entries.
 /// Build one column's subsection from Sq8+ε maintenance rows. Reuses the same
 /// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
-/// LIRE drain append: one IVF cluster, re-splice Sq8 rows — no k-means.
-fn build_subsection_from_materialized(
-    cfg: VectorConfig,
-    rows: Vec<MaterializedIvfRow>,
-) -> Result<SubsectionBytes, BuildError> {
-    let n_docs = rows.len();
-    if n_docs == 0 {
-        return Err(BuildError::VectorSchemaMismatch(
-            "materialized IVF rebuild requires at least one row".into(),
-        ));
-    }
-    build_subsection_from_materialized_impl(cfg, rows, DRAIN_APPEND_IVF_N_CENT)
-}
-
 fn build_subsection_from_materialized_impl(
     cfg: VectorConfig,
     mut rows: Vec<MaterializedIvfRow>,
@@ -813,14 +795,25 @@ fn build_subsection_from_materialized_impl(
     let dim = cfg.dim;
 
     let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
-    for row in &rows {
-        buckets[0].push(row);
+    if n_cent <= 1 {
+        for row in &rows {
+            buckets[0].push(row);
+        }
+    } else {
+        let encoded: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
+        let k = n_cent.min(n_docs);
+        let (_, assign) = encoded_ivf_kmeans(&encoded, cfg.metric, k, KMEANS_ITERS);
+        for (row, &cell) in rows.iter().zip(assign.iter()) {
+            buckets[cell].push(row);
+        }
     }
     let mut centroids = vec![0.0f32; n_cent * dim];
-    if !buckets[0].is_empty() {
-        let comps =
-            ivf_centroid_components_from_materialized_bucket(cfg.metric, dim, &buckets[0]);
-        centroids[..dim].copy_from_slice(&comps);
+    for (c, bucket) in buckets.iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        let comps = ivf_centroid_components_from_materialized_bucket(cfg.metric, dim, bucket);
+        centroids[c * dim..(c + 1) * dim].copy_from_slice(&comps);
     }
 
     let mut summary_centroid = vec![0.0f32; dim];
@@ -1000,12 +993,19 @@ fn build_subsection_streaming(
         spill,
         spill_threshold_bytes: _,
         materialized_rows,
+        materialized_full_ivf_merge,
         prebuilt_subsection: _,
     } = col;
 
     if let Some(rows) = materialized_rows {
         drop(reservoir);
-        return build_subsection_from_materialized(cfg, rows);
+        let n_docs = rows.len();
+        let n_cent = if materialized_full_ivf_merge {
+            n_cent_row_count_cap(n_docs).max(1).min(n_docs.max(1))
+        } else {
+            DRAIN_APPEND_IVF_N_CENT
+        };
+        return build_subsection_from_materialized_impl(cfg, rows, n_cent);
     }
 
     let dim = cfg.dim;
@@ -1017,10 +1017,9 @@ fn build_subsection_streaming(
     // by the trainer). At steady-state shapes (`n_docs > sample_size`,
     // `sample_size ≥ 100_000`) the sample_rows bound is the active
     // one and is comfortably above any sane n_cent.
-    let n_cent = cfg
-        .n_cent
+    // ~8k vectors per cluster: cluster count from this build's row count.
+    let n_cent = n_cent_row_count_cap(n_docs)
         .max(1)
-        .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1))
         .min(sample_rows.max(1));
 
@@ -1769,12 +1768,8 @@ fn run_pass2(
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
             }
             // Fold this row into its cluster's covering radius, in the COLUMN
-            // METRIC's units (not raw L2²) — the within-superfile admission
-            // (`select_cells_adaptive`) compares this radius against
-            // `score_clusters_into`, so τ = d + slack·r only holds if both are
-            // the metric distance. One extra distance per row against the
-            // assigned centroid — negligible next to the `n_cent` comparisons
-            // `assign_to_centroids` already did.
+            // METRIC's units (not raw L2²) — OPANN leaf admission compares this
+            // radius during radius-bounded tree descent.
             let row = &chunk[r * dim..(r + 1) * dim];
             let centroid = &centroids[cid * dim..(cid + 1) * dim];
             let d = metric_distance_by(metric, dim, |i| row[i], |i| centroid[i]);

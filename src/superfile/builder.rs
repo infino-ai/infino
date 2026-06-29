@@ -642,7 +642,20 @@ impl SuperfileBuilder {
             .vec_builder
             .as_mut()
             .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
-        vb.load_materialized_rows(0, rows)?;
+        vb.load_materialized_rows(0, rows, false)?;
+        Ok(())
+    }
+
+    /// Compaction merge: feed preserved Sq8+ε rows and re-cluster with full IVF.
+    pub(crate) fn load_materialized_ivf_rows_for_compaction_merge(
+        &mut self,
+        rows: Vec<MaterializedIvfRow>,
+    ) -> Result<(), BuildError> {
+        let vb = self
+            .vec_builder
+            .as_mut()
+            .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
+        vb.load_materialized_rows(0, rows, true)?;
         Ok(())
     }
 
@@ -660,9 +673,9 @@ impl SuperfileBuilder {
         Ok(())
     }
 
-    /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
-    /// per-cluster IVF blocks and remaps doc ids.
-    pub fn build_from_sq8_ivf_readers(
+    /// Byte-splice Sq8 IVF superfiles without fp32 corpus decode — splices
+    /// per-cluster IVF blocks and remaps doc ids (drain path, not compaction).
+    pub fn splice_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
@@ -802,6 +815,82 @@ impl SuperfileBuilder {
         Ok(superfile_stats)
     }
 
+    /// Sq8Residual compaction merge: rebuild FTS + scalar Parquet from each input,
+    /// collect encoded IVF rows (no fp32 corpus decode), then finish via
+    /// [`Self::load_materialized_ivf_rows_for_compaction_merge`].
+    fn add_batch_from_reader_sq8_materialized(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+        materialized_rows: &mut Vec<MaterializedIvfRow>,
+    ) -> Result<SuperfileStats, BuildError> {
+        self.opts.check_mergeability(
+            reader.id_column(),
+            reader.schema(),
+            reader.fts().map(|f| f.fts_columns().collect::<Vec<_>>()),
+            reader
+                .vec()
+                .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+        )?;
+        let record_batch = reader
+            .get_record_batch(deleted_docs_bitmap.clone())
+            .map_err(|_| BuildError::BatchReadError)?;
+
+        let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
+
+        let n_rows = record_batch.num_rows();
+        let doc_base = self.next_local_doc_id;
+
+        if let Some(v) = reader.vec() {
+            let reader_columns: Vec<_> = v.vector_columns_config().collect();
+            if reader_columns.len() != self.opts.vector_columns.len() {
+                return Err(BuildError::VectorDimMismatch {
+                    column: format!(
+                        "vector index count mismatch: expected {}, got {}",
+                        self.opts.vector_columns.len(),
+                        reader_columns.len()
+                    ),
+                    expected: self.opts.vector_columns.len(),
+                    actual: reader_columns.len(),
+                });
+            }
+            for (reader_col, builder_col) in reader_columns.iter().zip(&self.opts.vector_columns) {
+                if reader_col.name != builder_col.column || reader_col.dim != builder_col.dim {
+                    return Err(BuildError::VectorDimMismatch {
+                        column: reader_col.name.clone(),
+                        expected: builder_col.dim,
+                        actual: reader_col.dim,
+                    });
+                }
+                if reader_col.rerank_codec != RerankCodec::Sq8Residual {
+                    return Err(BuildError::VectorReadError);
+                }
+                let Some(mut rows) = v.materialized_index_rows(&reader_col.name) else {
+                    return Err(BuildError::VectorReadError);
+                };
+                if let Some(ref bitmap) = deleted_docs_bitmap {
+                    rows.retain(|r| !bitmap.contains(r.local_doc_id));
+                }
+                rows.sort_by_key(|r| r.local_doc_id);
+                if rows.len() != n_rows {
+                    return Err(BuildError::VectorSchemaMismatch(format!(
+                        "Sq8 materialized row count {} != parquet row count {} for column '{}'",
+                        rows.len(),
+                        n_rows,
+                        reader_col.name
+                    )));
+                }
+                for (i, row) in rows.iter_mut().enumerate() {
+                    row.local_doc_id = doc_base + i as u32;
+                }
+                materialized_rows.extend(rows);
+            }
+        }
+
+        self.add_batch_fts_and_scalar(&record_batch)?;
+        Ok(superfile_stats)
+    }
+
     /// Builds a superfile from the given readers, merging them into one.
     pub fn build_from_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
@@ -811,10 +900,29 @@ impl SuperfileBuilder {
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
+        let sq8_materialized = first.0.vec().is_some_and(|v| {
+            v.vector_columns_config()
+                .next()
+                .is_some_and(|c| c.rerank_codec == RerankCodec::Sq8Residual)
+        });
+
         let mut stats_collector = Vec::with_capacity(readers.len());
+        let mut materialized_rows = Vec::new();
         for reader in readers {
-            let stats = superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?;
+            let stats = if sq8_materialized {
+                superfile_builder.add_batch_from_reader_sq8_materialized(
+                    &reader.0,
+                    reader.1.clone(),
+                    &mut materialized_rows,
+                )?
+            } else {
+                superfile_builder.add_batch_from_reader(&reader.0, reader.1.clone())?
+            };
             stats_collector.push(stats);
+        }
+
+        if sq8_materialized && !materialized_rows.is_empty() {
+            superfile_builder.load_materialized_ivf_rows_for_compaction_merge(materialized_rows)?;
         }
 
         let bytes = superfile_builder.finish()?;

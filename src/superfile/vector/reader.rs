@@ -1617,6 +1617,54 @@ impl VectorReader {
         out
     }
 
+    fn sq8_scale_offset_blocks(&self, col: &ColumnReader) -> Option<(Vec<f32>, Vec<f32>)> {
+        let dim = col.dim;
+        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+        match &col.sq8_meta {
+            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => Some((scale.clone(), offset.clone())),
+            Some(Sq8ColumnMeta::Lazy {
+                scale_abs_off,
+                offset_abs_off,
+                ..
+            }) => {
+                let scale_bytes = self
+                    .source
+                    .get_range(*scale_abs_off..*scale_abs_off + so_block_bytes)
+                    .ok()?;
+                let offset_bytes = self
+                    .source
+                    .get_range(*offset_abs_off..*offset_abs_off + so_block_bytes)
+                    .ok()?;
+                Some((
+                    parse_f32_le_vec(scale_bytes.as_ref()),
+                    parse_f32_le_vec(offset_bytes.as_ref()),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Sync read-back of every Sq8+ε IVF row for compaction merge — encoded bytes
+    /// only, no fp32 corpus decode.
+    pub(crate) fn materialized_index_rows(
+        &self,
+        index_name: &str,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        let cid = *self.column_id_by_name.get(index_name)?;
+        let col = &self.columns[cid as usize];
+        if col.rerank_codec != RerankCodec::Sq8Residual {
+            return None;
+        }
+        let (scale_buf, offset_buf) = self.sq8_scale_offset_blocks(col)?;
+        let sub = self.source.get_range(col.subsection_range.clone()).ok()?;
+        Some(Self::parse_materialized_index_rows(
+            col,
+            sub.as_ref(),
+            &scale_buf,
+            &offset_buf,
+        ))
+    }
+
     /// Async read-back for SPFresh drain/maintenance on cold lazy sources.
     pub(crate) async fn materialized_index_rows_async(
         &self,
@@ -1627,8 +1675,6 @@ impl VectorReader {
         if col.rerank_codec != RerankCodec::Sq8Residual {
             return None;
         }
-        let dim = col.dim;
-        let so_block_bytes = (col.n_cent as usize) * dim * 4;
         let (scale_buf, offset_buf) = match &col.sq8_meta {
             Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
             Some(Sq8ColumnMeta::Lazy {
@@ -1636,6 +1682,8 @@ impl VectorReader {
                 offset_abs_off,
                 ..
             }) => {
+                let dim = col.dim;
+                let so_block_bytes = (col.n_cent as usize) * dim * 4;
                 let scale_bytes = self
                     .source
                     .range_async(*scale_abs_off..*scale_abs_off + so_block_bytes)
@@ -2368,7 +2416,7 @@ impl VectorReader {
             RerankCodec::Fp32 => self.get_vectors_fp32(column),
             RerankCodec::Sq8Residual => {
                 Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses Sq8Residual — merge via build_from_sq8_ivf_readers",
+                    "column '{}' uses Sq8Residual — merge via build_from_readers materialized path",
                     col.name
                 ))))
             }

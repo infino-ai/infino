@@ -1557,6 +1557,7 @@ mod tests {
         fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
             Arc::new(SuperfileEntry {
+                arrival_ordinal: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs,
@@ -1606,6 +1607,7 @@ mod tests {
         let id = Uuid::new_v4();
         // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
         let big = Arc::new(SuperfileEntry {
+            arrival_ordinal: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 200_000,

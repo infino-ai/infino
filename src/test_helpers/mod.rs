@@ -25,6 +25,7 @@
 //! used as the FTS correctness oracle.
 
 pub mod brute_force_bm25;
+pub mod opann_routing_measure;
 
 use std::sync::Arc;
 
@@ -92,7 +93,7 @@ pub fn default_vector_config(column: &str, rot_seed: u64) -> VectorConfig {
         dim: 16,
         n_cent: 4,
         rot_seed,
-        metric: Metric::Cosine,
+        metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
     }
 }

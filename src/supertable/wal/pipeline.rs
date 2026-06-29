@@ -430,6 +430,7 @@ async fn do_apply(
         // writer).
         subsection_offsets: build_subsection_offsets(&bytes),
         vector_layout: read_vector_layout_from_bytes(&bytes),
+        arrival_ordinal: 0,
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----

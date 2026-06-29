@@ -36,7 +36,7 @@ pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
-pub(crate) mod spfresh;
+pub(crate) mod cell_grid;
 pub mod stats;
 pub mod tombstones;
 pub mod utils;

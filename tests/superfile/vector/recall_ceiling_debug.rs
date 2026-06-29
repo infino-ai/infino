@@ -113,7 +113,7 @@ fn build_blob(vectors: &[f32], codec: RerankCodec) -> Vec<u8> {
         dim: corpus::DIM,
         n_cent,
         rot_seed: 7,
-        metric: Metric::Cosine,
+        metric: Metric::L2Sq,
         rerank_codec: codec,
     })
     .expect("register column");

@@ -63,7 +63,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         dim: TEXT_EMB_DIM,
         n_cent: TWO_COL_N_CENT,
         rot_seed: TEXT_EMB_ROT_SEED,
-        metric: Metric::Cosine,
+        metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");

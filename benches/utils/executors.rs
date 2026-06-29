@@ -675,7 +675,7 @@ pub mod vector {
     use super::*;
     use crate::{
         corpus::{self, Calibrated},
-        markdown::fmt_time,
+        markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{self, PeakSampler, RssStats},
     };
@@ -684,6 +684,18 @@ pub mod vector {
     pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;
+
+    /// Which correctness gates [`run_search`] applies before calibration.
+    #[derive(Debug, Clone, Copy)]
+    pub enum CorrectnessGate {
+        /// Global / per-superfile IVF: high-`nprobe` gate, then default `nprobe`,
+        /// then probe×refine calibration grid.
+        IvfNprobe,
+        /// OPANN tree admission: correctness gate only — no probe/refine
+        /// calibration (`nprobe` is ignored; object-store GET/wave cost is
+        /// measured separately, not swept as a grid).
+        OpannTree,
+    }
     pub const N_CORRECTNESS_QUERIES: usize = 20;
     /// Calibration battery + p50 reps per timed grid point.
     pub const N_CALIBRATION_QUERIES: usize = 100;
@@ -1079,6 +1091,72 @@ pub mod vector {
         }
     }
 
+    /// Cold p50 latency **and** object-store GET/wave p50 in one loop — each
+    /// iter opens a fresh cache, resets the counter, times open + one query.
+    pub fn measure_cold_metered<G: VectorRead>(
+        open_fresh: &impl Fn() -> G,
+        counters: &infino::test_helpers::opann_routing_measure::OpannColdCounters,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank: usize,
+        iters: usize,
+    ) -> (
+        ColdTiming,
+        infino::test_helpers::opann_routing_measure::ColdVectorSearchMeasure,
+    ) {
+        use infino::test_helpers::opann_routing_measure::measure_cold_search_timed;
+
+        let mut open_samples = Vec::with_capacity(iters);
+        let mut search_samples = Vec::with_capacity(iters);
+        let mut gets_samples = Vec::with_capacity(iters);
+        let mut waves_samples = Vec::with_capacity(iters);
+        let mut tomb_samples = Vec::with_capacity(iters);
+        let mut wall_samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t_open = Instant::now();
+            let guard = open_fresh();
+            open_samples.push(t_open.elapsed());
+            let (fetch, hits) = measure_cold_search_timed(counters, || {
+                guard.topk_global(column, query, k, nprobe, rerank)
+            });
+            search_samples.push(Duration::from_millis(fetch.wall_ms));
+            wall_samples.push(fetch.wall_ms);
+            gets_samples.push(fetch.gets);
+            waves_samples.push(fetch.waves);
+            tomb_samples.push(fetch.tombstone_gets);
+            black_box(hits);
+            drop(guard);
+        }
+        let p50_usize = |samples: &mut [usize]| {
+            if samples.is_empty() {
+                return 0;
+            }
+            samples.sort_unstable();
+            samples[(samples.len() - 1) / 2]
+        };
+        let p50_u64 = |samples: &mut [u64]| {
+            if samples.is_empty() {
+                return 0;
+            }
+            samples.sort_unstable();
+            samples[(samples.len() - 1) / 2]
+        };
+        (
+            ColdTiming {
+                open: p50(&mut open_samples),
+                search: p50(&mut search_samples),
+            },
+            infino::test_helpers::opann_routing_measure::ColdVectorSearchMeasure {
+                gets: p50_usize(&mut gets_samples),
+                waves: p50_u64(&mut waves_samples),
+                tombstone_gets: p50_usize(&mut tomb_samples),
+                wall_ms: p50_u64(&mut wall_samples),
+            },
+        )
+    }
+
     /// One rendered recall-table row.
     pub struct RecallRow {
         pub target: String,
@@ -1086,6 +1164,7 @@ pub mod vector {
         pub recall: String,
         pub warm: Option<VecTiming>,
         pub cold: Option<ColdTiming>,
+        pub cold_fetch: Option<infino::test_helpers::opann_routing_measure::ColdVectorSearchMeasure>,
     }
 
     fn time_cell(ns: f64) -> Cell {
@@ -1143,6 +1222,11 @@ pub mod vector {
             headers.push("cold open".to_string());
             headers.push("cold search".to_string());
         }
+        let include_cold_fetch = rows.iter().any(|r| r.cold_fetch.is_some());
+        if include_cold_fetch {
+            headers.push("cold GETs".to_string());
+            headers.push("cold waves".to_string());
+        }
         let body: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
@@ -1161,6 +1245,26 @@ pub mod vector {
                         Some(t) => {
                             cells.push(time_cell(t.open.as_secs_f64() * NS_PER_SEC));
                             cells.push(time_cell(t.search.as_secs_f64() * NS_PER_SEC));
+                        }
+                        None => {
+                            cells.push(text("—"));
+                            cells.push(text("—"));
+                        }
+                    }
+                }
+                if include_cold_fetch {
+                    match r.cold_fetch {
+                        Some(f) => {
+                            cells.push(metric(
+                                f.gets as f64,
+                                fmt_count(f.gets),
+                                Better::Lower,
+                            ));
+                            cells.push(metric(
+                                f.waves as f64,
+                                fmt_count(f.waves as usize),
+                                Better::Lower,
+                            ));
                         }
                         None => {
                             cells.push(text("—"));
@@ -1205,6 +1309,8 @@ pub mod vector {
         include_cold: bool,
         cold_iters: usize,
         skip_calibration: bool,
+        correctness_gate: CorrectnessGate,
+        cold_counters: Option<&infino::test_helpers::opann_routing_measure::OpannColdCounters>,
         log_prefix: &str,
         anchor: &str,
         title: String,
@@ -1245,108 +1351,162 @@ pub mod vector {
                 default_recall = Some(default);
             }
         } else {
-            eprintln!(
-                "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
-                q_correct.len(),
-            );
-            let recall = mean_recall(
-                warm_reader,
-                column,
-                q_correct,
-                gt_correct,
-                k,
-                CORRECTNESS_NPROBE,
-                CORRECTNESS_RERANK_MULT,
-            );
-            assert!(
-                recall >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-            );
-            eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+            match correctness_gate {
+                CorrectnessGate::IvfNprobe => {
+                    eprintln!(
+                        "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                        q_correct.len(),
+                    );
+                    let recall = mean_recall(
+                        warm_reader,
+                        column,
+                        q_correct,
+                        gt_correct,
+                        k,
+                        CORRECTNESS_NPROBE,
+                        CORRECTNESS_RERANK_MULT,
+                    );
+                    assert!(
+                        recall >= CORRECTNESS_RECALL_FLOOR,
+                        "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                    );
+                    eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
 
-            eprintln!(
-                "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
-                q_correct.len(),
-            );
-            let default = mean_recall(
-                warm_reader,
-                column,
-                q_correct,
-                gt_correct,
-                k,
-                default_nprobe,
-                default_rerank,
-            );
-            assert!(
-                default >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-            );
-            eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
-            default_recall = Some(default);
-            // Small corpora afford the exhaustive grid; past the cap the
-            // staircase walk gets the same answers from O(P + R)
-            // evaluations (see `calibrate_staircase`).
-            let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
-                RECALL_TARGETS
-                    .iter()
-                    .map(|&target| {
+                    eprintln!(
+                        "[{log_prefix}] default-config recall@{k} on {} queries (nprobe={default_nprobe}, rerank={default_rerank})...",
+                        q_correct.len(),
+                    );
+                    let default = mean_recall(
+                        warm_reader,
+                        column,
+                        q_correct,
+                        gt_correct,
+                        k,
+                        default_nprobe,
+                        default_rerank,
+                    );
+                    assert!(
+                        default >= CORRECTNESS_RECALL_FLOOR,
+                        "{log_prefix} default-config vector recall@{k} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                    );
+                    eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
+                    default_recall = Some(default);
+                    // Small corpora afford the exhaustive grid; past the cap the
+                    // staircase walk gets the same answers from O(P + R)
+                    // evaluations (see `calibrate_staircase`).
+                    let cal: Vec<Option<Calibrated>> = if n_docs <= FULL_CALIBRATION_MAX_DOCS {
+                        RECALL_TARGETS
+                            .iter()
+                            .map(|&target| {
+                                eprintln!(
+                                    "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                                    q_cal.len(),
+                                );
+                                calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
+                            })
+                            .collect()
+                    } else {
                         eprintln!(
-                            "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                            "[{log_prefix}] calibrating {} targets: staircase walk over the (probe, refine) grid ({} queries)...",
+                            RECALL_TARGETS.len(),
                             q_cal.len(),
                         );
-                        calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
-                    })
-                    .collect()
-            } else {
-                eprintln!(
-                    "[{log_prefix}] calibrating {} targets: staircase walk over the (probe, refine) grid ({} queries)...",
-                    RECALL_TARGETS.len(),
-                    q_cal.len(),
-                );
-                calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
-            };
+                        calibrate_staircase(warm_reader, column, q_cal, gt_cal, k, log_prefix)
+                    };
 
-            for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-                match cal[i] {
-                    Some(c) => rows.push(RecallRow {
-                        target: format!("{target:.2}"),
-                        params: format!("p={}, r={}", c.probe, c.refine),
-                        recall: format!("{:.3}", c.recall),
-                        warm: include_warm
-                            .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
-                        cold: include_cold.then(|| {
-                            measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
-                        }),
-                    }),
-                    None => rows.push(RecallRow {
-                        target: format!("{target:.2}"),
-                        params: "—".into(),
-                        recall: "—".into(),
-                        warm: None,
-                        cold: None,
-                    }),
+                    for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+                        match cal[i] {
+                            Some(c) => rows.push(RecallRow {
+                                target: format!("{target:.2}"),
+                                params: format!("p={}, r={}", c.probe, c.refine),
+                                recall: format!("{:.3}", c.recall),
+                                warm: include_warm
+                                    .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
+                                cold: include_cold.then(|| {
+                                    measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+                                }),
+                                cold_fetch: None,
+                            }),
+                            None => rows.push(RecallRow {
+                                target: format!("{target:.2}"),
+                                params: "—".into(),
+                                recall: "—".into(),
+                                warm: None,
+                                cold: None,
+                                cold_fetch: None,
+                            }),
+                        }
+                    }
+                }
+                CorrectnessGate::OpannTree => {
+                    eprintln!(
+                        "[{log_prefix}] correctness (OPANN tree): recall@{k} on {} queries (rerank={default_rerank}; nprobe ignored)...",
+                        q_correct.len(),
+                    );
+                    let default = mean_recall(
+                        warm_reader,
+                        column,
+                        q_correct,
+                        gt_correct,
+                        k,
+                        default_nprobe,
+                        default_rerank,
+                    );
+                    assert!(
+                        default >= CORRECTNESS_RECALL_FLOOR,
+                        "{log_prefix} OPANN recall@{k} at rerank={default_rerank} {default:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                    );
+                    eprintln!("[{log_prefix}] correctness OK: recall@{k} = {default:.3}");
+                    default_recall = Some(default);
+                    // No probe/refine calibration on the OPANN path — admission is
+                    // tree-driven; per-search GET + wave counts are reported by the
+                    // supertable cost row, not swept here.
                 }
             }
         }
-        rows.push(RecallRow {
-            target: "default".into(),
-            params: format!("p={default_nprobe}, r={default_rerank}"),
-            recall: default_recall
-                .map(|r| format!("{r:.3}"))
-                .unwrap_or_else(|| "—".into()),
-            warm: include_warm
-                .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
-            cold: include_cold.then(|| {
-                measure_cold(
+        let default_cold = if include_cold {
+            if let Some(counters) = cold_counters {
+                let (timing, fetch) = measure_cold_metered(
                     &open_cold,
+                    counters,
                     column,
                     q0,
                     k,
                     default_nprobe,
                     default_rerank,
                     cold_iters,
-                )
-            }),
+                );
+                Some((timing, Some(fetch)))
+            } else {
+                Some((
+                    measure_cold(
+                        &open_cold,
+                        column,
+                        q0,
+                        k,
+                        default_nprobe,
+                        default_rerank,
+                        cold_iters,
+                    ),
+                    None,
+                ))
+            }
+        } else {
+            None
+        };
+        rows.push(RecallRow {
+            target: "default".into(),
+            params: match correctness_gate {
+                CorrectnessGate::OpannTree => format!("p=(ignored), r={default_rerank}"),
+                CorrectnessGate::IvfNprobe => format!("p={default_nprobe}, r={default_rerank}"),
+            },
+            recall: default_recall
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "—".into()),
+            warm: include_warm
+                .then(|| measure_warm(warm_reader, column, q0, k, default_nprobe, default_rerank)),
+            cold: default_cold.map(|(timing, _)| timing),
+            cold_fetch: default_cold.and_then(|(_, fetch)| fetch),
         });
 
         emit_recall_table(
