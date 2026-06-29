@@ -225,10 +225,6 @@ pub struct Manifest {
     /// (lazily, on first access / open pre-warm) and reused by every query,
     /// swapping with the manifest. Empty for tables without an OPANN root.
     opann_tree: OnceCell<Arc<ResidentPageSource>>,
-    /// In-memory genesis root when the tree was built live from manifest
-    /// summaries (pre-drain). Persisted routing uses [`list::OpannRouting`]
-    /// instead; this slot is empty after drain publishes page blobs.
-    live_opann_root: OnceCell<ContentHash>,
 }
 
 impl fmt::Debug for Manifest {
@@ -277,7 +273,6 @@ impl Manifest {
             );
             Self {
                 opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
                 superfile_list,
                 list: Some(list),
                 parts: DashMap::new(),
@@ -287,7 +282,6 @@ impl Manifest {
         } else {
             Self {
                 opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
                 superfile_list,
                 list: None,
                 parts: DashMap::new(),
@@ -310,7 +304,6 @@ impl Manifest {
     pub fn empty(options: Arc<SupertableOptions>) -> Self {
         Self {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(options),
             list: None,
             parts: DashMap::new(),
@@ -325,7 +318,6 @@ impl Manifest {
     ) -> Self {
         Self {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty_with_vector_index_prefix(
                 options,
                 vector_index_storage_prefix,
@@ -557,7 +549,6 @@ impl Manifest {
         new_superfile_list.superfiles = all_superfiles;
         let new_manifest = Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(list),
             parts,
@@ -702,7 +693,6 @@ impl Manifest {
     pub fn with_appended(&self, new_entries: Vec<Arc<SuperfileEntry>>) -> Self {
         Self {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: self.superfile_list.with_appended(new_entries),
             list: self.list.clone(),
             parts: DashMap::new(),
@@ -725,7 +715,6 @@ impl Manifest {
         };
         Self {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: self.manifest_id,
                 options: Arc::clone(&self.options),
@@ -743,20 +732,6 @@ impl Manifest {
     /// published (`None` ⇒ readers fall back to flat cell selection).
     pub(crate) fn opann_routing(&self) -> Option<&list::OpannRouting> {
         self.list.as_ref().and_then(|l| l.opann_routing.as_ref())
-    }
-
-    /// Root page for OPANN tree descent: persisted routing after drain, or the
-    /// in-memory genesis root built live from manifest summaries pre-drain.
-    pub(crate) fn opann_descent_root(&self) -> Option<ContentHash> {
-        if let Some(r) = self.opann_routing() {
-            return Some(r.root_page);
-        }
-        self.live_opann_root.get().copied()
-    }
-
-    /// Already-loaded resident OPANN pages for this manifest snapshot, if any.
-    pub(crate) fn loaded_opann_resident(&self) -> Option<Arc<ResidentPageSource>> {
-        self.opann_tree.get().map(Arc::clone)
     }
 
     /// Return a manifest with `opann_routing` set on its list — the drain stamps
@@ -780,15 +755,13 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
         }
     }
 
     /// The resident OPANN routing tree for this manifest, loaded once and reused
-    /// for every query — it swaps with the manifest. When persisted routing
-    /// exists, pages are loaded from object storage. Pre-drain live trees are
-    /// Pre-drain incoming clusters are read from the user manifest at query time;
-    /// post-drain pages load from object storage once and are reused.
+    /// for every query — it swaps with the manifest. Pre-drain incoming clusters
+    /// are read from the user manifest at query time; post-drain pages load from
+    /// object storage once and are reused.
     pub(crate) async fn opann_resident_tree(
         &self,
     ) -> Result<Option<Arc<ResidentPageSource>>, OpannStoreError> {
@@ -822,16 +795,6 @@ impl Manifest {
     /// the result here, so the next query/commit on this version reuses it rather
     /// than re-fetching + re-verifying the whole tree. No-op if already loaded.
     pub(crate) fn seed_opann_tree(&self, source: Arc<ResidentPageSource>) {
-        let _ = self.opann_tree.set(source);
-    }
-
-    /// Seed the in-memory pre-drain routing tree and its genesis root.
-    pub(crate) fn seed_live_opann_tree(
-        &self,
-        source: Arc<ResidentPageSource>,
-        root: ContentHash,
-    ) {
-        let _ = self.live_opann_root.set(root);
         let _ = self.opann_tree.set(source);
     }
 
@@ -1202,7 +1165,6 @@ impl Manifest {
 
         let new_manifest = Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: new_superfile_list,
             list: Some(new_list),
             parts,
@@ -2803,7 +2765,6 @@ mod tests {
             let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
             Manifest {
                 opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
                 superfile_list: SuperfileList::empty(options_for_test()),
                 list: Some(list),
                 parts: DashMap::new(),
@@ -3031,7 +2992,6 @@ mod tests {
         };
         let m = Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),
@@ -3154,7 +3114,6 @@ mod tests {
     fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<Manifest> {
         Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
                 opann_routing: None,
@@ -3289,7 +3248,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3433,7 +3391,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3651,7 +3608,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3749,7 +3705,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3901,7 +3856,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4036,7 +3990,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4170,7 +4123,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4351,7 +4303,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4465,7 +4416,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4559,7 +4509,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4688,7 +4637,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4829,7 +4777,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4941,7 +4888,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5026,7 +4972,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5151,7 +5096,6 @@ mod tests {
         );
         let old_manifest = Arc::new(Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5244,7 +5188,6 @@ mod tests {
     fn manifest_with_list(list: list::ManifestList) -> Manifest {
         Manifest {
             opann_tree: OnceCell::new(),
-            live_opann_root: OnceCell::new(),
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),

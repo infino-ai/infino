@@ -49,10 +49,11 @@
 
 use std::{
     cmp,
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     fmt, io,
     marker::PhantomData,
     mem,
+    path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -71,6 +72,7 @@ use futures::{
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::time::sleep;
+use tempfile::TempDir;
 
 use super::{
     build::fanout_shards,
@@ -122,8 +124,8 @@ use crate::{
             },
             distance::Metric,
             ivf_merge::{
-                RoutedCellSubsection, concat_routed_cell_subsections_in_place,
-                route_and_splice_ivf_subsections,
+                RoutedCellSubsection, merge_routed_cell_shards_from_spool,
+                route_and_splice_ivf_subsections, spool_routed_cell_shard,
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -2504,9 +2506,10 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .clone()
         .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
 
-    // Stream one incoming superfile at a time: open → route/splice → append into
-    // per-cell accumulators → drop the reader before the next file. Bulk-open +
-    // all-at-once splice duplicated every IVF subsection in RAM (~20 GiB at 10M).
+    // Stream one incoming superfile at a time: open → route/splice → spool each
+    // touched cell shard to disk → drop the reader. Final merge reads at most
+    // two shards per fold from the spool (bounded RAM, not ~index size).
+    let spool_dir = TempDir::new().map_err(|e| BuildError::Store(format!("drain spool: {e}")))?;
     let column_name = column.clone();
     let clusters_for_route = clusters.clone();
     let assign_among_owned = assign_among.map(|s| s.to_vec());
@@ -2516,7 +2519,8 @@ async fn route_incoming_to_manifest_cells_if_ready(
         .map(|r| manifest_centroid_components_from_row(r, clusters.dim as usize))
         .collect();
     let inner_for_cpu = Arc::clone(&inner);
-    let mut routed_by_cell: HashMap<u32, RoutedCellSubsection> = HashMap::new();
+    let spool_root = spool_dir.path().to_path_buf();
+    let mut spool_paths_by_cell: HashMap<u32, Vec<PathBuf>> = HashMap::new();
     let n_incoming_files = incoming.len();
     for (file_idx, entry) in incoming.iter().enumerate() {
         let reader = open_incoming_superfile_for_drain(
@@ -2581,14 +2585,8 @@ async fn route_incoming_to_manifest_cells_if_ready(
         };
         drop(reader);
         for (cell_id, routed) in one_routed {
-            match routed_by_cell.entry(cell_id) {
-                Entry::Vacant(slot) => {
-                    slot.insert(routed);
-                }
-                Entry::Occupied(mut slot) => {
-                    concat_routed_cell_subsections_in_place(slot.get_mut(), routed)?;
-                }
-            }
+            let path = spool_routed_cell_shard(&spool_root, cell_id, file_idx, &routed)?;
+            spool_paths_by_cell.entry(cell_id).or_default().push(path);
         }
         if (file_idx + 1) % 16 == 0 || file_idx + 1 == n_incoming_files {
             log_drain_phase(
@@ -2611,12 +2609,14 @@ async fn route_incoming_to_manifest_cells_if_ready(
         HashMap<u32, u32>,
         HashMap<u32, f32>,
     ) = maint_pool().install(|| -> Result<_, BuildError> {
-            let mut prepared = Vec::with_capacity(routed_by_cell.len());
+            let mut prepared = Vec::with_capacity(spool_paths_by_cell.len());
             let mut cell_updates = HashMap::new();
             let mut radii_updates = HashMap::new();
             let wrap_lap = time::Instant::now();
-            let n_cells = routed_by_cell.len();
-            for (cell_id, routed_cell) in routed_by_cell {
+            let n_cells = spool_paths_by_cell.len();
+            for (cell_id, paths) in spool_paths_by_cell {
+                let merge_scratch = spool_root.join(format!("merge_cell_{cell_id:02}"));
+                let routed_cell = merge_routed_cell_shards_from_spool(&paths, &merge_scratch)?;
                 let added = routed_cell.subsection.n_docs;
                 let shard_radius = routed_cell.shard_radius;
                 let p = build_prepared_ivf_from_spliced(&inner_for_cpu, cell_id, routed_cell)?;

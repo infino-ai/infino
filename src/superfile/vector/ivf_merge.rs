@@ -10,6 +10,7 @@
 use bytemuck::cast_slice;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::superfile::{
@@ -754,39 +755,249 @@ fn build_routed_cell_subsection_from_pairs(
     })
 }
 
-/// Append `add` onto `acc` in place (incremental drain: one incoming superfile at a time).
-pub(crate) fn concat_routed_cell_subsections_in_place(
-    acc: &mut RoutedCellSubsection,
-    add: RoutedCellSubsection,
-) -> Result<(), BuildError> {
-    let left_ids = std::mem::take(&mut acc.stable_ids);
-    let left_shard = acc.shard_radius;
-    let left_sub = std::mem::replace(
-        &mut acc.subsection,
-        MergedIvfSubsection {
-            bytes: Vec::new(),
-            n_cent: 0,
-            n_docs: 0,
-            summary_offset_in_sub: 0,
-            codec_meta_offset_in_sub: 0,
-            codec_meta_size: 0,
-        },
-    );
-    let left_inp = sq8_ivf_merge_input_from_merged_subsection(&left_sub, left_ids)?;
-    let right_inp = sq8_ivf_merge_input_from_merged_subsection(&add.subsection, add.stable_ids)?;
-    let parsed = [left_inp, right_inp];
-    let stable_ids_per_input: Vec<Vec<i128>> = parsed
+/// Merge per-file routed cell shards into one cell subsection (one pass at
+/// drain end — avoids O(n²) rebuilds from pairwise concat during ingest).
+pub(crate) fn merge_routed_cell_shards(
+    shards: Vec<RoutedCellSubsection>,
+) -> Result<RoutedCellSubsection, BuildError> {
+    let Some(first) = shards.first() else {
+        return Err(BuildError::VectorSchemaMismatch(
+            "merge_routed_cell_shards requires at least one shard".into(),
+        ));
+    };
+    if shards.len() == 1 {
+        return Ok(shards.into_iter().next().expect("len checked"));
+    }
+    let shard_radius = shards
         .iter()
-        .map(|p| p.stable_ids.clone().unwrap_or_default())
-        .collect();
+        .map(|s| s.shard_radius)
+        .fold(first.shard_radius, f32::max);
+    let mut parsed = Vec::with_capacity(shards.len());
+    let mut stable_ids_per_input = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let inp = sq8_ivf_merge_input_from_merged_subsection(&shard.subsection, shard.stable_ids)?;
+        stable_ids_per_input.push(inp.stable_ids.clone().unwrap_or_default());
+        parsed.push(inp);
+    }
     let pairs = pairs_all_clusters(&parsed);
-    *acc = build_routed_cell_subsection_from_pairs(
-        pairs,
-        &parsed,
-        &stable_ids_per_input,
-        left_shard.max(add.shard_radius),
-    )?;
-    Ok(())
+    build_routed_cell_subsection_from_pairs(pairs, &parsed, &stable_ids_per_input, shard_radius)
+}
+
+/// Magic tag on a drain spool shard file (`IFSD` — IVF drain spool).
+const DRAIN_SPOOL_MAGIC: &[u8; 4] = b"IFSD";
+/// On-disk drain spool format version.
+const DRAIN_SPOOL_VERSION: u32 = 1;
+
+fn spool_format_err(msg: impl Into<String>) -> BuildError {
+    BuildError::VectorSchemaMismatch(msg.into())
+}
+
+fn append_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn append_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn append_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
+    append_u32(buf, v.len() as u32);
+    for &x in v {
+        buf.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+fn append_i128_vec(buf: &mut Vec<u8>, v: &[i128]) {
+    append_u32(buf, v.len() as u32);
+    for &x in v {
+        buf.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+fn read_u32_at(data: &[u8], off: &mut usize) -> Result<u32, BuildError> {
+    let end = off
+        .checked_add(4)
+        .ok_or_else(|| spool_format_err("drain spool u32 overflow"))?;
+    if end > data.len() {
+        return Err(spool_format_err("drain spool u32 truncated"));
+    }
+    let v = u32::from_le_bytes(data[*off..end].try_into().map_err(|_| {
+        spool_format_err("drain spool u32 truncated")
+    })?);
+    *off = end;
+    Ok(v)
+}
+
+fn read_u64_at(data: &[u8], off: &mut usize) -> Result<u64, BuildError> {
+    let end = off
+        .checked_add(8)
+        .ok_or_else(|| spool_format_err("drain spool u64 overflow"))?;
+    if end > data.len() {
+        return Err(spool_format_err("drain spool u64 truncated"));
+    }
+    let v = u64::from_le_bytes(data[*off..end].try_into().map_err(|_| {
+        spool_format_err("drain spool u64 truncated")
+    })?);
+    *off = end;
+    Ok(v)
+}
+
+fn read_f32_vec(data: &[u8], off: &mut usize) -> Result<Vec<f32>, BuildError> {
+    let n = read_u32_at(data, off)? as usize;
+    let end = off
+        .checked_add(n.checked_mul(4).ok_or_else(|| spool_format_err("drain spool f32 vec overflow"))?)
+        .ok_or_else(|| spool_format_err("drain spool f32 vec overflow"))?;
+    if end > data.len() {
+        return Err(spool_format_err("drain spool f32 vec truncated"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let start = *off;
+    for i in 0..n {
+        let b: [u8; 4] = data[start + i * 4..start + i * 4 + 4]
+            .try_into()
+            .map_err(|_| spool_format_err("drain spool f32 truncated"))?;
+        out.push(f32::from_le_bytes(b));
+    }
+    *off = end;
+    Ok(out)
+}
+
+fn read_i128_vec(data: &[u8], off: &mut usize) -> Result<Vec<i128>, BuildError> {
+    let n = read_u32_at(data, off)? as usize;
+    let end = off
+        .checked_add(n.checked_mul(16).ok_or_else(|| spool_format_err("drain spool id vec overflow"))?)
+        .ok_or_else(|| spool_format_err("drain spool id vec overflow"))?;
+    if end > data.len() {
+        return Err(spool_format_err("drain spool id vec truncated"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let start = *off;
+    for i in 0..n {
+        let b: [u8; 16] = data[start + i * 16..start + i * 16 + 16]
+            .try_into()
+            .map_err(|_| spool_format_err("drain spool id truncated"))?;
+        out.push(i128::from_le_bytes(b));
+    }
+    *off = end;
+    Ok(out)
+}
+
+fn write_routed_cell_shard_file(path: &Path, routed: &RoutedCellSubsection) -> Result<(), BuildError> {
+    let sub = &routed.subsection;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(DRAIN_SPOOL_MAGIC);
+    append_u32(&mut buf, DRAIN_SPOOL_VERSION);
+    buf.extend_from_slice(&routed.shard_radius.to_le_bytes());
+    append_f32_vec(&mut buf, &routed.cluster_radii);
+    append_i128_vec(&mut buf, &routed.stable_ids);
+    append_u32(&mut buf, sub.n_cent as u32);
+    append_u32(&mut buf, sub.n_docs);
+    append_u64(&mut buf, sub.summary_offset_in_sub as u64);
+    append_u64(&mut buf, sub.codec_meta_offset_in_sub as u64);
+    append_u32(&mut buf, sub.codec_meta_size as u32);
+    append_u64(&mut buf, sub.bytes.len() as u64);
+    buf.extend_from_slice(&sub.bytes);
+    std::fs::write(path, buf).map_err(BuildError::Io)
+}
+
+/// Write one per-(incoming file, cell) routed shard to the drain spool directory.
+pub(crate) fn spool_routed_cell_shard(
+    spool_root: &Path,
+    cell_id: u32,
+    file_idx: usize,
+    routed: &RoutedCellSubsection,
+) -> Result<PathBuf, BuildError> {
+    let cell_dir = spool_root.join(format!("cell_{cell_id:02}"));
+    std::fs::create_dir_all(&cell_dir).map_err(BuildError::Io)?;
+    let path = cell_dir.join(format!("file_{file_idx:05}.shard"));
+    write_routed_cell_shard_file(&path, routed)?;
+    Ok(path)
+}
+
+fn read_routed_cell_shard(path: &Path) -> Result<RoutedCellSubsection, BuildError> {
+    let data = std::fs::read(path).map_err(BuildError::Io)?;
+    let mut off = 0usize;
+    if data.len() < DRAIN_SPOOL_MAGIC.len() + 4 {
+        return Err(spool_format_err("drain spool shard too small"));
+    }
+    if data[0..4] != DRAIN_SPOOL_MAGIC[..] {
+        return Err(spool_format_err("drain spool shard bad magic"));
+    }
+    off += 4;
+    let version = read_u32_at(&data, &mut off)?;
+    if version != DRAIN_SPOOL_VERSION {
+        return Err(spool_format_err(format!(
+            "drain spool shard unsupported version {version}"
+        )));
+    }
+    let shard_radius = f32::from_le_bytes(
+        data[off..off + 4]
+            .try_into()
+            .map_err(|_| spool_format_err("drain spool shard_radius truncated"))?,
+    );
+    off += 4;
+    let cluster_radii = read_f32_vec(&data, &mut off)?;
+    let stable_ids = read_i128_vec(&data, &mut off)?;
+    let n_cent = read_u32_at(&data, &mut off)? as usize;
+    let n_docs = read_u32_at(&data, &mut off)?;
+    let summary_offset_in_sub = read_u64_at(&data, &mut off)? as usize;
+    let codec_meta_offset_in_sub = read_u64_at(&data, &mut off)? as usize;
+    let codec_meta_size = read_u32_at(&data, &mut off)? as usize;
+    let byte_len = read_u64_at(&data, &mut off)? as usize;
+    let end = off
+        .checked_add(byte_len)
+        .ok_or_else(|| spool_format_err("drain spool subsection overflow"))?;
+    if end > data.len() {
+        return Err(spool_format_err("drain spool subsection truncated"));
+    }
+    let bytes = data[off..end].to_vec();
+    Ok(RoutedCellSubsection {
+        subsection: MergedIvfSubsection {
+            bytes,
+            n_cent,
+            n_docs,
+            summary_offset_in_sub,
+            codec_meta_offset_in_sub,
+            codec_meta_size,
+        },
+        stable_ids,
+        shard_radius,
+        cluster_radii,
+    })
+}
+
+/// Fold spooled shards for one cell pairwise from disk — at most two shards plus
+/// one merge output resident at a time.
+pub(crate) fn merge_routed_cell_shards_from_spool(
+    paths: &[PathBuf],
+    merge_scratch: &Path,
+) -> Result<RoutedCellSubsection, BuildError> {
+    if paths.is_empty() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "merge_routed_cell_shards_from_spool requires at least one shard".into(),
+        ));
+    }
+    if paths.len() == 1 {
+        return read_routed_cell_shard(&paths[0]);
+    }
+    std::fs::create_dir_all(merge_scratch).map_err(BuildError::Io)?;
+    let mut acc_path = paths[0].clone();
+    for (fold_idx, path) in paths.iter().enumerate().skip(1) {
+        let left = read_routed_cell_shard(&acc_path)?;
+        let right = read_routed_cell_shard(path)?;
+        let merged = merge_routed_cell_shards(vec![left, right])?;
+        let _ = std::fs::remove_file(&acc_path);
+        let _ = std::fs::remove_file(path);
+        if fold_idx + 1 == paths.len() {
+            return Ok(merged);
+        }
+        let fold_path = merge_scratch.join(format!("fold_{fold_idx:05}.shard"));
+        write_routed_cell_shard_file(&fold_path, &merged)?;
+        acc_path = fold_path;
+    }
+    Err(spool_format_err(
+        "merge_routed_cell_shards_from_spool: fold loop did not terminate",
+    ))
 }
 
 /// Route every Sq8+ε row across `inputs` to a cell (via `route`) and emit one
@@ -1191,5 +1402,74 @@ mod tests {
             let recall = inter as f32 / a.len() as f32;
             assert_eq!(recall, 1.0, "splice must preserve recall exactly");
         }
+    }
+
+    #[tokio::test]
+    async fn merge_routed_cell_shards_from_spool_matches_in_memory_merge() {
+        let (incoming, ids) = build_streaming_incoming().await;
+        let stable_ids_per_input: Vec<Vec<i128>> = vec![ids.clone()];
+        let inputs: Vec<(&VectorReader, &str)> =
+            vec![(incoming.vec().expect("vec reader"), COLUMN)];
+        let route = |_row: &EncodedCellRow| -> Vec<(u32, f32)> { vec![(0, 0.0)] };
+        let routed = route_and_splice_ivf_subsections(&inputs, &stable_ids_per_input, route)
+            .expect("route_and_splice_ivf_subsections");
+        let routed_cell = routed.get(&0).expect("cell 0");
+
+        let spool_root = tempfile::tempdir().expect("spool tempdir");
+        let path = spool_routed_cell_shard(spool_root.path(), 0, 0, routed_cell)
+            .expect("spool shard");
+        let roundtrip =
+            merge_routed_cell_shards_from_spool(&[path], &spool_root.path().join("merge_scratch"))
+                .expect("single-shard spool read");
+        assert_eq!(roundtrip.stable_ids, routed_cell.stable_ids);
+        assert_eq!(roundtrip.subsection.bytes, routed_cell.subsection.bytes);
+
+        let mid = N_ROWS / 2;
+        let (ids_a, ids_b) = ids.split_at(mid);
+        let vecs = corpus().1;
+        let (vecs_a, vecs_b) = vecs.split_at(mid * DIM);
+
+        async fn half_incoming(ids: &[i128], vecs: &[f32]) -> (Arc<SuperfileReader>, Vec<i128>) {
+            let opts =
+                BuilderOptions::new(id_schema(), "doc_id", vec![], vec![vector_config()], None);
+            let mut b = SuperfileBuilder::new(opts).expect("new builder");
+            b.add_batch(&id_batch(ids), &[vecs])
+                .expect("add_batch");
+            let bytes = b.finish().expect("finish incoming");
+            (
+                Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open incoming")),
+                ids.to_vec(),
+            )
+        }
+        let (incoming_a, ids_a) = half_incoming(ids_a, vecs_a).await;
+        let (incoming_b, ids_b) = half_incoming(ids_b, vecs_b).await;
+        let shard_a = route_and_splice_ivf_subsections(
+            &[(incoming_a.vec().expect("vec"), COLUMN)],
+            &[ids_a],
+            route,
+        )
+        .expect("route a")
+        .remove(&0)
+        .expect("cell 0");
+        let shard_b = route_and_splice_ivf_subsections(
+            &[(incoming_b.vec().expect("vec"), COLUMN)],
+            &[ids_b],
+            route,
+        )
+        .expect("route b")
+        .remove(&0)
+        .expect("cell 0");
+
+        let path_a = spool_routed_cell_shard(spool_root.path(), 0, 0, &shard_a).expect("spool a");
+        let path_b = spool_routed_cell_shard(spool_root.path(), 0, 1, &shard_b).expect("spool b");
+        let in_mem = merge_routed_cell_shards(vec![shard_a, shard_b]).expect("in-memory merge");
+        let from_spool = merge_routed_cell_shards_from_spool(
+            &[path_a, path_b],
+            &spool_root.path().join("merge_cell_00"),
+        )
+        .expect("two-shard spool merge");
+        assert_eq!(in_mem.stable_ids, from_spool.stable_ids);
+        assert_eq!(in_mem.subsection.n_docs, from_spool.subsection.n_docs);
+        assert_eq!(in_mem.subsection.bytes, from_spool.subsection.bytes);
     }
 }

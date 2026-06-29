@@ -1085,7 +1085,7 @@ pub mod vector {
                 .unwrap_or_else(|| Arc::clone(&built.storage));
             let cold_counters = counting.as_ref().map(|(_, c)| c);
 
-            let (cache_dir, consumer) =
+            let (mut cache_dir, mut consumer) =
                 open_consumer_on_storage(Modality::Vector, &built, Arc::clone(&search_storage));
             let open_cold = || SupertableVecColdGuard::open(&built, Arc::clone(&search_storage));
 
@@ -1120,6 +1120,16 @@ pub mod vector {
                     search_title("pre-drain"),
                     PRE_DRAIN_NOTE,
                 );
+
+                // Pre-drain search fills the disk cache (~index size). Drop the
+                // consumer before drain so routing does not sit on top of that
+                // working set — drain only needs object-store reads for each
+                // incoming superfile, one at a time.
+                drop(consumer);
+                drop(cache_dir);
+                crate::rss::log_rss_breakdown("supertable_vector before drain (cache dropped)");
+                (cache_dir, consumer) =
+                    open_consumer_on_storage(Modality::Vector, &built, Arc::clone(&search_storage));
 
                 drain_hidden_incoming(&consumer);
 
