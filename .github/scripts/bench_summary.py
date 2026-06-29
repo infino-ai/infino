@@ -32,8 +32,6 @@ TEXT_ONLY = ("Corpus", "Superfiles")
 # embed volatile text - they do not diff cleanly.
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
 
-# Primary metrics - controllable CPU / footprint, flagged at `threshold`.
-PRIMARY_HEADERS = ("warm p90", "Time", "Stored")
 # Secondary metrics - cold (object-store network variance) and peak RSS
 # (run-order biased) are noisy and non-gating for PR decisions.
 SECONDARY_HEADERS = ("cold search", "Peak RSS")
@@ -73,9 +71,14 @@ def is_cost(header):
     return any(t in h for t in COST_TOKENS)
 
 
-def tier(header):
-    """`primary`, `secondary`, or None (context - not surfaced)."""
-    if any(t in header for t in PRIMARY_HEADERS):
+def tier(header, primary_headers):
+    """`primary`, `secondary`, or None (context - not surfaced).
+
+    Primary metrics - controllable CPU / footprint, flagged at `threshold`.
+    The latency header among them tracks the run's gate metric, so it is
+    resolved at call time rather than fixed as a module constant.
+    """
+    if any(t in header for t in primary_headers):
         return "primary"
     if any(t in header for t in SECONDARY_HEADERS):
         return "secondary"
@@ -122,7 +125,7 @@ def load(path):
         return {}
 
 
-def diff(reports, baseline_dir, current_dir, threshold):
+def diff(reports, baseline_dir, current_dir, threshold, primary_headers):
     """Classify changes per report.
 
     Returns (regressions, improvements, had_baseline, cost_present).
@@ -146,7 +149,7 @@ def diff(reports, baseline_dir, current_dir, threshold):
             if is_cost(header):
                 cost_present = True
                 continue
-            t = tier(header)
+            t = tier(header, primary_headers)
             if t is None:
                 continue
             old = base.get(key)
@@ -182,7 +185,6 @@ def finding(entry):
 
 
 def main():
-    global PRIMARY_HEADERS
     reports = os.environ.get("REPORTS", "").split()
     baseline_dir = os.environ.get("BASELINE_DIR", "baseline")
     current_dir = os.environ.get("CURRENT_DIR", "current")
@@ -194,7 +196,7 @@ def main():
     cpuset = os.environ.get("BENCH_CPUSET", "auto")
     bench_gate_metric = os.environ.get("BENCH_GATE_METRIC", "p90")
     run_url = os.environ.get("RUN_URL", "")
-    PRIMARY_HEADERS = (
+    primary_headers = (
         primary_latency_header_from_gate_metric(bench_gate_metric),
         "Time",
         "Stored",
@@ -206,7 +208,7 @@ def main():
 
     failures = [ln.strip() for ln in os.environ.get("ERRORS", "").splitlines() if ln.strip()]
     regressions, improvements, had_baseline, cost_present = diff(
-        reports, baseline_dir, current_dir, threshold
+        reports, baseline_dir, current_dir, threshold, primary_headers
     )
 
     prim_regr = [e for e in regressions if e["tier"] == "primary"]
