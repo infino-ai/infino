@@ -280,14 +280,8 @@ on-disk bytes:
   path, pluggable storage, query fan-out with manifest-only skip
   pruning, and reader/writer concurrency.
 
-For the idea behind the design and the honest envelope:
-
-- **[Object-storage-native retrieval →](docs/concepts/object-storage-native-retrieval.md)**
-  — the core model: search that runs directly on data in object storage
-  instead of a database or cluster that owns its own copy.
-- **[Tradeoffs and limits →](docs/tradeoffs.md)** — what Infino is good at
-  (warm-query speed, multi-modal retrieval over one copy, flat storage cost)
-  and what it isn't built for.
+For concepts, quickstart, guides, and examples (Python, Node.js, and Rust), see
+the full documentation at **[docs.infino.ai](https://docs.infino.ai)**.
 
 ## SQL joins across tables
 
