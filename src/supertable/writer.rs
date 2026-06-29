@@ -71,7 +71,6 @@ use futures::{
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::time::sleep;
-use tempfile::TempDir;
 
 use super::{
     build::fanout_shards,
