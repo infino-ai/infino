@@ -37,6 +37,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub mod azure;
+pub(crate) mod credentials;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
