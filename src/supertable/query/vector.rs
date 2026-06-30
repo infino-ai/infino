@@ -1636,6 +1636,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            birth_version: 0,
             superfile_id,
             uri: SuperfileUri(superfile_id),
             n_docs: 100,

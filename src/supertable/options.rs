@@ -125,6 +125,10 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
+/// Default user-superfile batch size for the hidden-index drain. Bounds drain
+/// working-set RAM to O(batch) regardless of corpus size (the >3M memory wall).
+/// `-1` = unbounded (single merge), `0` = skip the drain.
+const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
@@ -302,6 +306,17 @@ pub struct SupertableOptions {
     /// `target_superfiles_per_partition`. Default `10 * (1 << 20)`
     /// (10 MiB).
     pub part_size_threshold_bytes: u64,
+    /// Number of user superfiles the hidden-index drain materializes per batch
+    /// before publishing that batch's cell superfiles and freeing its working
+    /// set. Bounds drain RAM to O(batch) instead of O(corpus) — the lever for
+    /// draining at 10M/1B on a fixed-memory box. Each batch appends one
+    /// superfile per touched cell; compaction collapses them later.
+    ///
+    /// `-1` = unbounded (all user superfiles in one merge: lowest cell
+    /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
+    /// skip the drain entirely. Default [`DEFAULT_DRAIN_BATCH_SUPERFILES`].
+    /// The `INFINO_DRAIN_BATCH_SUPERFILES` env var overrides this (bench/ops).
+    pub drain_batch_superfiles: i64,
     /// Eager-load threshold for manifest parts at
     /// [`Supertable::open`] time. When the manifest list
     /// references this many parts or fewer, open parallel-
@@ -520,6 +535,7 @@ impl SupertableOptions {
             vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
+            drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
@@ -690,6 +706,14 @@ impl SupertableOptions {
     /// Default `10_000`.
     pub fn with_target_superfiles_per_part(mut self, n: u64) -> Self {
         self.target_superfiles_per_part = n;
+        self
+    }
+
+    /// Override the hidden-index drain batch size (user superfiles per batch).
+    /// `-1` = unbounded single merge, `0` = skip the drain. See
+    /// [`Self::drain_batch_superfiles`].
+    pub fn with_drain_batch_superfiles(mut self, n: i64) -> Self {
+        self.drain_batch_superfiles = n;
         self
     }
 

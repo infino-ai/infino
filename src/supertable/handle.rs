@@ -1352,6 +1352,7 @@ mod tests {
     fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs,
@@ -2049,6 +2050,259 @@ mod tests {
         assert!(
             max_visible >= 2,
             "each drain should append a file per cell, got {max_visible}"
+        );
+    }
+
+    /// Bounded-batch drain: with `drain_batch_superfiles = 1`, a SINGLE drain
+    /// call over N user superfiles processes them in N batches, each appending
+    /// one file per touched cell — so the (single) cell ends up with N files.
+    /// `drain_batch_superfiles = 0` skips the drain entirely. This exercises the
+    /// per-batch loop itself (vs. the multi-drain-call path above).
+    #[test]
+    fn bounded_drain_batches_by_superfile_count() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+
+        let make = |batch_sf: i64| {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let dir = TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            let options = SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+            .with_drain_batch_superfiles(batch_sf);
+            let st = Supertable::create(options).expect("create");
+            // Three commits → three user superfiles (identical vectors → one cell).
+            for commit in 0..3 {
+                let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
+                let flat = Float32Array::from(vec![1.0f32; dim]);
+                let fsl =
+                    FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(titles) as Arc<dyn Array>,
+                        Arc::new(fsl) as Arc<dyn Array>,
+                    ],
+                )
+                .expect("batch");
+                let mut w = st.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+            // ONE drain call — the batching happens inside it.
+            st.drain_vectors_to_cells_sync().expect("drain");
+            st
+        };
+
+        let max_files_per_cell = |st: &Supertable| -> usize {
+            let hidden = st
+                .reader()
+                .vector_index_table()
+                .expect("hidden index")
+                .clone();
+            let reader = hidden.reader();
+            let manifest = reader.manifest();
+            let mut by_cell = HashMap::<Vec<u8>, usize>::new();
+            for entry in manifest.superfiles.iter() {
+                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+            }
+            by_cell.values().copied().max().unwrap_or(0)
+        };
+
+        // batch=1: 3 user superfiles → 3 batches → 3 files in the cell.
+        let st1 = make(1);
+        assert_eq!(
+            max_files_per_cell(&st1),
+            3,
+            "batch=1 over 3 user superfiles must append 3 cell files in one drain"
+        );
+
+        // batch=-1 (unbounded): all 3 in one merge → 1 file in the cell.
+        let st_unb = make(-1);
+        assert_eq!(
+            max_files_per_cell(&st_unb),
+            1,
+            "unbounded drain must merge all user superfiles into one file per cell"
+        );
+
+        // batch=0: drain skipped → hidden index stays empty.
+        let st0 = make(0);
+        assert_eq!(
+            st0.reader()
+                .vector_index_table()
+                .expect("hidden index")
+                .reader()
+                .n_superfiles(),
+            0,
+            "batch=0 must skip the drain"
+        );
+    }
+
+    /// Incremental drain: each drain consumes only user commits not already in
+    /// the hidden manifest's `drained_ranges`, and a drain with no new commits
+    /// is a no-op (no re-drive, no duplicate cells). The distinguishing signal
+    /// is the *third* drain: with incrementality it adds nothing; without it,
+    /// it would re-drain everything and append another per-cell file.
+    #[test]
+    fn incremental_drain_skips_already_drained_commits() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        let commit = |tag: &str| {
+            let titles = LargeStringArray::from(vec![format!("doc-{tag}")]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        };
+        let cell_files = || -> usize {
+            let hidden = st
+                .reader()
+                .vector_index_table()
+                .expect("hidden index")
+                .clone();
+            let reader = hidden.reader();
+            let manifest = reader.manifest();
+            let mut by_cell = HashMap::<Vec<u8>, usize>::new();
+            for e in manifest.superfiles.iter() {
+                *by_cell.entry(e.partition_key.clone()).or_default() += 1;
+            }
+            by_cell.values().copied().max().unwrap_or(0)
+        };
+
+        // Commit A, drain → one cell file; the commit's version is now drained.
+        commit("a");
+        st.drain_vectors_to_cells_sync().expect("drain 1");
+        assert_eq!(cell_files(), 1, "first drain populates the cell");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        assert!(
+            !hidden.reader().manifest().get_drained_ranges().is_empty(),
+            "drain must record progress in drained_ranges"
+        );
+
+        // Commit B, drain → only B is new, so exactly one more cell file.
+        commit("b");
+        st.drain_vectors_to_cells_sync().expect("drain 2");
+        assert_eq!(cell_files(), 2, "second drain consumes only the new commit");
+
+        // No new commit: the third drain is a NO-OP (incrementality).
+        st.drain_vectors_to_cells_sync().expect("drain 3 (no-op)");
+        assert_eq!(
+            cell_files(),
+            2,
+            "drain with nothing new must not re-drive already-drained commits"
+        );
+        // Watermark stays a single genesis-anchored interval (contiguous commits).
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        assert_eq!(
+            hidden.reader().manifest().get_drained_ranges().intervals().len(),
+            1,
+            "contiguous commits must leave drained_ranges as one interval"
         );
     }
 

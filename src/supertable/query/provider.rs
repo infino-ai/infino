@@ -1693,6 +1693,7 @@ mod tests {
         let mut scalar_stats = HashMap::new();
         scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,

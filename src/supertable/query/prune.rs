@@ -231,6 +231,7 @@ mod tests {
             ),
         );
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -265,6 +266,7 @@ mod tests {
 
     fn list_with(parts: Vec<ManifestPartEntry>) -> ManifestList {
         ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -380,6 +382,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: titles.len() as u64,
@@ -486,6 +489,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: bloom_tokens.len().max(1) as u64,

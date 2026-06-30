@@ -211,6 +211,11 @@ pub struct Manifest {
     /// this on the first commit-with-vectors, and `update` reads it back via
     /// [`Manifest::get_global_vector_index`] to persist it into the new list.
     stamped_global_vector_index: Option<list::GlobalVectorIndex>,
+    /// Stamped drained-version set before the (hidden) list lands. The drain
+    /// advances this via [`Manifest::with_drained_ranges`] and `update` reads
+    /// it back via [`Manifest::get_drained_ranges`] to persist it. Hidden
+    /// manifest only.
+    stamped_drained_ranges: Option<list::DrainedVersionRanges>,
 }
 
 impl fmt::Debug for Manifest {
@@ -261,6 +266,7 @@ impl Manifest {
                 loader: Some(loader),
                 stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
             }
         } else {
             Self {
@@ -270,6 +276,7 @@ impl Manifest {
                 loader: None,
                 stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
             }
         }
     }
@@ -292,6 +299,7 @@ impl Manifest {
             loader: None,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         }
     }
 
@@ -309,6 +317,7 @@ impl Manifest {
             loader: None,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         }
     }
 
@@ -343,6 +352,19 @@ impl Manifest {
             return Some(g.clone());
         }
         self.list.as_ref().and_then(|l| l.global_vector_index.clone())
+    }
+
+    /// Drained user commit-versions recorded on this (hidden) manifest. Honors
+    /// the in-memory stamp set by [`Manifest::with_drained_ranges`] before the
+    /// first list lands, then the persisted list. Empty by default.
+    pub fn get_drained_ranges(&self) -> list::DrainedVersionRanges {
+        if let Some(d) = &self.stamped_drained_ranges {
+            return d.clone();
+        }
+        self.list
+            .as_ref()
+            .map(|l| l.drained_ranges.clone())
+            .unwrap_or_default()
     }
 
     pub fn get_num_parts(&self) -> usize {
@@ -545,6 +567,7 @@ impl Manifest {
             loader: Some(loader),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         };
 
         Ok(Arc::new(new_manifest))
@@ -690,6 +713,7 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
         }
     }
 
@@ -717,6 +741,7 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: Some(strategy),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
         }
     }
 
@@ -742,6 +767,34 @@ impl Manifest {
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: Some(index),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// Stamp the drained user commit-versions on this (hidden) snapshot, so the
+    /// next `update`/commit persists them. Mirrors the other stampers: updates
+    /// the list when present, and the in-memory stamp before the first hidden
+    /// list lands. The drain calls this with the advanced set in the same
+    /// commit that appends the batch's cells (atomic via the manifest CAS).
+    pub fn with_drained_ranges(&self, ranges: list::DrainedVersionRanges) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.drained_ranges = ranges.clone();
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: Some(ranges),
         }
     }
 
@@ -838,9 +891,26 @@ impl Manifest {
         let strategy = self.get_partition_strategy();
 
         // 2. Group new entries by partition_key (the on-disk
-        //    encoding the list + parts carry).
+        //    encoding the list + parts carry). Stamp each new entry's
+        //    `birth_version` to the version this commit will publish
+        //    (`get_next_manifest_id`). Re-derived on every OCC attempt, so a
+        //    CAS conflict that bumps the version re-stamps — the published
+        //    manifest always has `manifest_id == new entries' birth_version`.
+        //    Carried-over entries (below) keep their original birth_version.
+        let birth_version = self.get_next_manifest_id();
+        // Stamp ONCE so both the parts and the flat `superfiles` view (which the
+        // drain reads via `get_all_superfiles`) carry the same birth_version.
+        let stamped_new_entries: Vec<Arc<SuperfileEntry>> = new_entries
+            .iter()
+            .map(|e| {
+                Arc::new(SuperfileEntry {
+                    birth_version,
+                    ..(**e).clone()
+                })
+            })
+            .collect();
         let mut new_by_partition: BTreeMap<Vec<u8>, Vec<Arc<SuperfileEntry>>> = BTreeMap::new();
-        for entry in new_entries {
+        for entry in &stamped_new_entries {
             let pk = assign_partition(entry, &strategy)?;
             new_by_partition
                 .entry(encode_partition_key(&pk))
@@ -1028,6 +1098,10 @@ impl Manifest {
             })
             .collect();
         let new_list = ManifestList {
+            // Carry/advance the hidden drain watermark via the stamp (the drain
+            // sets it with `with_drained_ranges` in the same commit). Empty on
+            // the user manifest.
+            drained_ranges: self.get_drained_ranges(),
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
             options_hash: opts_hash,
@@ -1064,7 +1138,7 @@ impl Manifest {
         let mut new_superfile_list = self
             .get_all_superfiles()
             .iter()
-            .chain(new_entries.iter())
+            .chain(stamped_new_entries.iter())
             .map(Arc::clone)
             .collect::<Vec<_>>();
         new_superfile_list.retain(|e| !ids_to_remove.contains(&e.superfile_id));
@@ -1107,6 +1181,7 @@ impl Manifest {
             loader,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -1257,7 +1332,7 @@ pub enum ManifestLoadError {
 /// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
 /// store routing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SuperfileEntry {
     /// Globally unique identifier (UUID v4) for debugging /
     /// observability. Distinct from `uri` so the store routing key
@@ -1322,6 +1397,17 @@ pub struct SuperfileEntry {
     /// `DiskCacheStore::reader_with_hints`.
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
+    /// The `manifest_id` of the commit that introduced this superfile — its
+    /// **birth version**. Stamped in [`Manifest::update`] for newly-added
+    /// entries (re-derived per OCC attempt, so it always equals the winning
+    /// commit's version); carried over unchanged for entries that survive a
+    /// commit. The hidden-index drain uses it to track which user commits it
+    /// has consumed into cells (see the hidden manifest's `drained_ranges`):
+    /// because the manifest-pointer CAS serializes every commit across all
+    /// writers/hosts into one gap-free version sequence, this is the only
+    /// total order that's safe to watermark on. `0` on entries from before
+    /// the field existed (treated as the genesis version).
+    pub birth_version: u64,
 }
 
 /// superfile layout offsets cached on the manifest.
@@ -2314,6 +2400,7 @@ mod tests {
 
     fn seg_entry(uuid: Uuid, n_docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid,
             uri: SuperfileUri(uuid),
             n_docs,
@@ -2619,6 +2706,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
             ManifestList {
+                drained_ranges: Default::default(),
                 global_vector_index: None,
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
@@ -2657,6 +2745,7 @@ mod tests {
                 loader: Some(loader),
                 stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
             }
         }
 
@@ -2850,6 +2939,7 @@ mod tests {
         use list::{ManifestList, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -2884,6 +2974,7 @@ mod tests {
             loader: None,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -2963,6 +3054,7 @@ mod tests {
     // ---- Manifest::update-------------------------------------------
     fn make_superfile_entry(docs: u64, pk: Vec<u8>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: docs,
@@ -3001,6 +3093,7 @@ mod tests {
         Arc::new(Manifest {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
+                drained_ranges: Default::default(),
                 global_vector_index: None,
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
@@ -3020,6 +3113,7 @@ mod tests {
             loader: None,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         })
     }
 
@@ -3098,6 +3192,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3144,6 +3239,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3247,6 +3343,7 @@ mod tests {
         // entry for partition A (the rewrite candidate); A_old is the
         // frozen older entry; B is an untouched partition.
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3292,6 +3389,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Commit one new superfile into partition A. Keep `new_entry`
@@ -3458,6 +3556,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3504,6 +3603,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3555,6 +3655,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3601,6 +3702,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3637,6 +3739,7 @@ mod tests {
 
     fn make_superfile_entry_hinted(docs: u64, pk: Vec<u8>, hint: u32) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: docs,
@@ -3690,6 +3793,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3751,6 +3855,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Add one new entry for the partition
@@ -3821,6 +3926,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -3885,6 +3991,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let new_entries = vec![
@@ -3954,6 +4061,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4018,6 +4126,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // Only touch partition A
@@ -4108,6 +4217,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4198,6 +4308,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let new_entries = vec![
@@ -4266,6 +4377,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4311,6 +4423,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4359,6 +4472,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4404,6 +4518,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4468,6 +4583,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4532,6 +4648,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4608,6 +4725,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4676,6 +4794,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4738,6 +4857,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4783,6 +4903,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4822,6 +4943,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4867,6 +4989,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -4927,6 +5050,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -4995,6 +5119,7 @@ mod tests {
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -5053,6 +5178,7 @@ mod tests {
             })
             .collect();
         ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -5078,6 +5204,7 @@ mod tests {
             loader: None,
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
         }
     }
 

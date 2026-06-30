@@ -447,6 +447,10 @@ impl Supertable {
         let partition_hint = inputs.first().and_then(|e| e.partition_hint);
         let merged_old = merged_segment.entry.as_ref();
         let merged_entry = Arc::new(SuperfileEntry {
+            // Carry the OLDEST input's birth_version so a merge of
+            // already-drained inputs stays <= the drain watermark (skipped, not
+            // re-drained). See the hidden-index `drained_ranges` design.
+            birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
             superfile_id: merged_old.superfile_id,
             uri: merged_old.uri,
             n_docs: merged_old.n_docs,

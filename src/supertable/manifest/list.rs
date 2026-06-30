@@ -109,6 +109,10 @@ pub struct ManifestList {
     /// drain writes, carrying live per-cell counts/radii on top). `None` until
     /// the first commit with vectors, and on tables without vector columns.
     pub global_vector_index: Option<GlobalVectorIndex>,
+    /// Drained user commit-versions — **hidden manifest only** (empty on the
+    /// user manifest). The hidden-index drain advances this as it consumes user
+    /// commits into cells; see [`DrainedVersionRanges`].
+    pub drained_ranges: DrainedVersionRanges,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -127,6 +131,84 @@ pub struct GlobalVectorIndex {
     /// Immutable global cell centroids, trained at first commit. Cell `c` of
     /// the hidden index corresponds to centroid `c` here.
     pub grid: super::ClusterCentroids,
+}
+
+/// Normalized set of drained user commit-versions, stored **only on the hidden
+/// manifest**. Tracks which user `manifest_id`s the hidden-index drain has
+/// consumed into cells, so repeated/incremental drains skip already-drained
+/// commits. Intervals are inclusive `[lo, hi]`, sorted, disjoint, and
+/// adjacent-merged.
+///
+/// The maximal contiguous drained prefix from genesis is just the first
+/// interval; out-of-order completions from **parallel drainers** appear as
+/// extra intervals that merge as the gaps between them fill. Interval count is
+/// bounded by in-flight drain concurrency — not corpus size — so it stays tiny.
+/// Empty on the user manifest (which never drains).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrainedVersionRanges {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DrainedVersionRanges {
+    /// Rebuild from persisted intervals (normalizes defensively).
+    pub fn from_intervals(intervals: Vec<(u64, u64)>) -> Self {
+        let mut s = Self { ranges: Vec::new() };
+        for (lo, hi) in intervals {
+            s.insert_range(lo, hi);
+        }
+        s
+    }
+
+    /// The normalized intervals, for serialization.
+    pub fn intervals(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Is `version` covered by a drained interval?
+    pub fn contains(&self, version: u64) -> bool {
+        self.ranges.iter().any(|&(lo, hi)| lo <= version && version <= hi)
+    }
+
+    /// End of the maximal contiguous drained run anchored at genesis (0), or
+    /// `None` if version 0 isn't covered (no genesis-anchored prefix yet). The
+    /// drain uses this to extend the prefix over **vacuous version gaps** —
+    /// commit-versions that added no superfile (deletes, compaction outputs that
+    /// carry an older birth_version, empty commits). Those versions are never
+    /// reused, so folding them into the prefix keeps the set from fragmenting
+    /// permanently around every superfile-less commit.
+    pub fn prefix_end(&self) -> Option<u64> {
+        match self.ranges.first() {
+            Some(&(0, hi)) => Some(hi),
+            _ => None,
+        }
+    }
+
+    /// Mark a single version drained (merging into the normalized set).
+    pub fn insert(&mut self, version: u64) {
+        self.insert_range(version, version);
+    }
+
+    /// Mark an inclusive `[lo, hi]` interval drained, keeping the set
+    /// normalized (sorted, disjoint, adjacent-merged). Adjacent means
+    /// gap-free: `[1,3]` + `[4,6]` → `[1,6]` (version 4 = 3+1, no hole),
+    /// whereas `[1,3]` + `[5,6]` stays split (version 4 is undrained).
+    pub fn insert_range(&mut self, lo: u64, hi: u64) {
+        debug_assert!(lo <= hi);
+        self.ranges.push((lo, hi));
+        self.ranges.sort_unstable_by_key(|&(l, _)| l);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.ranges.len());
+        for &(l, h) in &self.ranges {
+            match merged.last_mut() {
+                Some(last) if l <= last.1.saturating_add(1) => last.1 = last.1.max(h),
+                _ => merged.push((l, h)),
+            }
+        }
+        self.ranges = merged;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -780,6 +862,8 @@ struct ManifestListDto {
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
+    #[serde(default)]
+    drained_ranges: Vec<(u64, u64)>,
     parts: Vec<ManifestPartEntryDto>,
 }
 
@@ -1270,6 +1354,7 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             column: g.column.clone(),
             grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
         }),
+        drained_ranges: l.drained_ranges.intervals().to_vec(),
         parts,
     })
 }
@@ -1315,6 +1400,7 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
                 })
             })
             .transpose()?,
+        drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges),
         parts,
     })
 }
@@ -1788,6 +1874,7 @@ mod tests {
 
     fn empty_list() -> ManifestList {
         ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -2043,6 +2130,68 @@ mod tests {
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         // Absent by default (back-compat: old manifests without the field).
         assert!(empty_list().global_vector_index.is_none());
+    }
+
+    #[test]
+    fn drained_version_ranges_merge_and_contains() {
+        let mut d = DrainedVersionRanges::default();
+        assert!(!d.contains(1));
+        // Contiguous inserts merge into one interval.
+        d.insert(1);
+        d.insert(2);
+        d.insert(3);
+        assert_eq!(d.intervals(), &[(1, 3)]);
+        // A gap stays split.
+        d.insert(5);
+        assert_eq!(d.intervals(), &[(1, 3), (5, 5)]);
+        assert!(d.contains(2) && d.contains(5) && !d.contains(4));
+        // Filling the gap merges everything.
+        d.insert(4);
+        assert_eq!(d.intervals(), &[(1, 5)]);
+        // Out-of-order inserts (the parallel-drainer case) coalesce as holes fill.
+        d.insert_range(10, 12);
+        d.insert(8);
+        assert_eq!(d.intervals(), &[(1, 5), (8, 8), (10, 12)]);
+        d.insert(9);
+        assert_eq!(d.intervals(), &[(1, 5), (8, 12)]);
+        // from_intervals normalizes unsorted/overlapping input.
+        let d2 = DrainedVersionRanges::from_intervals(vec![(5, 7), (1, 3), (4, 4)]);
+        assert_eq!(d2.intervals(), &[(1, 7)]);
+    }
+
+    #[test]
+    fn drained_ranges_prefix_absorbs_vacuous_gaps() {
+        // The drain's lo logic: extend the genesis-anchored prefix over
+        // commit-versions that have no superfile (deletes, etc.).
+        let mut p = DrainedVersionRanges::default();
+        assert_eq!(p.prefix_end(), None);
+        p.insert_range(0, 3);
+        assert_eq!(p.prefix_end(), Some(3));
+        // Versions 4..6 are vacuous (no superfiles); next drained superfile is v7.
+        // The drain inserts [prefix_end+1 ..= 7] = [4..=7], folding the gap.
+        let lo = p.prefix_end().map(|e| e + 1).unwrap_or(0);
+        p.insert_range(lo, 7);
+        assert_eq!(
+            p.intervals(),
+            &[(0, 7)],
+            "vacuous gap [4..6] must fold into the prefix, not fragment"
+        );
+        assert_eq!(p.prefix_end(), Some(7));
+        // A set not anchored at genesis (e.g. a parallel high-slice) has no prefix.
+        assert_eq!(
+            DrainedVersionRanges::from_intervals(vec![(5, 7)]).prefix_end(),
+            None
+        );
+    }
+
+    #[test]
+    fn drained_ranges_roundtrip() {
+        let mut list = empty_list();
+        list.drained_ranges = DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]);
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.drained_ranges, list.drained_ranges);
+        assert!(empty_list().drained_ranges.is_empty());
     }
 
     #[test]

@@ -667,6 +667,7 @@ mod tests {
         // columns, an empty schema. Encoding only requires the
         // format header + the empty collections.
         let list = ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,

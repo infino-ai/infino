@@ -307,6 +307,7 @@ mod tests {
             );
         }
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: ((id_max - id_min) + 1) as u64,
@@ -341,6 +342,7 @@ mod tests {
 
     fn list_with(entries: Vec<ManifestPartEntry>) -> ManifestList {
         ManifestList {
+            drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -395,6 +397,7 @@ mod tests {
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 5,
@@ -429,6 +432,7 @@ mod tests {
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 0,
@@ -498,6 +502,7 @@ mod tests {
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
@@ -544,6 +549,7 @@ mod tests {
             );
             cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,

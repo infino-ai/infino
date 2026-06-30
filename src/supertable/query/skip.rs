@@ -398,6 +398,7 @@ mod tests {
     fn empty_superfile() -> SuperfileEntry {
         let uri = SuperfileUri::new_v4();
         SuperfileEntry {
+            birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri,
             n_docs: 0,

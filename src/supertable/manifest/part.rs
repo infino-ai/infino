@@ -227,7 +227,8 @@ fn schema() -> &'static AvroSchema {
                 {"name": "fts_summary", "type": "bytes"},
                 {"name": "vector_summary", "type": "bytes"},
                 {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
-                {"name": "vector_layout", "type": ["null", "string"], "default": null}
+                {"name": "vector_layout", "type": ["null", "string"], "default": null},
+                {"name": "birth_version", "type": "long", "default": 0}
               ]
             }}}
           ]
@@ -311,6 +312,10 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                         AVRO_UNION_VALUE_INDEX,
                         Box::new(AvroValue::String(seg.vector_layout.as_kv_value().into())),
                     ),
+                ),
+                (
+                    "birth_version".into(),
+                    AvroValue::Long(seg.birth_version as i64),
                 ),
             ])
         })
@@ -418,6 +423,12 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let vector_layout = take_optional_string(&mut map, "vector_layout")?
         .and_then(|s| VectorLayout::from_kv_value(&s))
         .unwrap_or(VectorLayout::Ivf);
+    // Tolerant of absence (0 = genesis) so parts written before the field
+    // decode losslessly.
+    let birth_version = match map.remove("birth_version") {
+        Some(AvroValue::Long(n)) => n as u64,
+        _ => 0,
+    };
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -432,6 +443,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         partition_hint,
         subsection_offsets,
         vector_layout,
+        birth_version,
     })
 }
 
@@ -755,6 +767,7 @@ mod tests {
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs,
@@ -848,6 +861,7 @@ mod tests {
         vec_summary.insert("img".into(), make_vector_summary(16, 1.25));
 
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 12_345,
@@ -1017,6 +1031,7 @@ mod tests {
     fn partition_hint_some_and_none_both_roundtrip() {
         let id = Uuid::new_v4();
         let seg_with = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -1032,6 +1047,7 @@ mod tests {
         });
         let id2 = Uuid::new_v4();
         let seg_without = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id2,
             uri: SuperfileUri(id2),
             n_docs: 1,
@@ -1156,6 +1172,7 @@ mod tests {
             open_blob: vec![(50, vec![1, 2, 3, 4]), (9000, vec![9, 9])],
         };
         let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 3,
@@ -1185,6 +1202,7 @@ mod tests {
     fn vector_layout_cell_posting_roundtrip_through_part() {
         let id = Uuid::new_v4();
         let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -1220,6 +1238,7 @@ mod tests {
             open_blob: vec![],
         };
         let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 0,

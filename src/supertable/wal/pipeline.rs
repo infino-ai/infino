@@ -409,6 +409,8 @@ async fn do_apply(
 
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
+        // Stamped to the winning commit version later, in `Manifest::update`.
+        birth_version: 0,
         superfile_id: preallocated_superfile_id,
         uri,
         n_docs: flat_ids.len() as u64,
