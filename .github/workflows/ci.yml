@@ -265,6 +265,7 @@ jobs:
   object-store-e2e-guard:
     name: Object store e2e (secret check)
     runs-on: ubuntu-latest
+    environment: ci
     outputs:
       present: ${{ steps.check.outputs.present }}
     steps:
@@ -286,6 +287,7 @@ jobs:
     needs: object-store-e2e-guard
     if: needs.object-store-e2e-guard.outputs.present == 'true'
     runs-on: ubuntu-latest
+    environment: ci
     timeout-minutes: 30
     env:
       RUSTFLAGS: ""
