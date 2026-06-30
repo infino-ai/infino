@@ -276,8 +276,9 @@ on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph), set
 credentials.
 
 When a static key rotates, swap it in without reconnecting:
-`db.rotateCredentials(storageOptions)` takes effect on the next request for the
-connection and its open tables.
+`db.rotateCredentials({...})` with the new credential keys takes effect on the
+next request for the connection and its open tables. Only credentials rotate;
+changing endpoint/region needs a reconnect.
 
 ### Local disk cache
 
@@ -314,7 +315,8 @@ const db = connect("s3://bucket/prefix", {
 - `Connection`
   - `createTable(name, schema, IndexSpec)` / `openTable(name)` /
     `dropTable(name, purge?)` (`purge = true` also deletes the data) /
-    `listTables()` / `querySql(sql, { arrow? })`.
+    `listTables()` / `querySql(sql, { arrow? })` /
+    `rotateCredentials(storageOptions)` (swap a rotated static key, no reconnect).
 - `Table`
   - `append(data)` — one `append` is one commit.
   - `bm25Search(col, q, k, { mode?, projection?, arrow? })` — ranked BM25.
