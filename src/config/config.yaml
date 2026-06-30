@@ -80,6 +80,22 @@ storage:
   bucket:
   prefix: ""
 
+  # Object-store credentials and tuning, keyed by object_store's config
+  # strings. Infino reads no credentials from the environment — set them
+  # here (or via ConnectOptions). Empty → ambient cloud identity (IAM
+  # instance role / managed identity). Examples:
+  #   backend: s3
+  #   storage_options:
+  #     aws_access_key_id: ...
+  #     aws_secret_access_key: ...
+  #     aws_region: us-east-1
+  #     # aws_endpoint: http://localhost:9000   # MinIO / R2 / Ceph
+  #   backend: azure   # `bucket` names the container
+  #   storage_options:
+  #     azure_storage_account_name: ...
+  #     azure_storage_account_key: ...
+  storage_options: {}
+
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
   # cold path: foreground opens/searches with exact range GETs (or zero
