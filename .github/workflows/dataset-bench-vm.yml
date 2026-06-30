@@ -146,10 +146,12 @@ jobs:
         run: |
           set -euo pipefail
           SIZE="${{ inputs.vm_size }}"
-          # Tags attribute spend in Cost Management. Every resource is named
-          # from $VM so teardown deletes by exact name. No default inbound
-          # rule; SSH is opened only to the runner's address, below.
-          TAGS=(purpose=dataset-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}" "modality=${{ inputs.modality }}")
+          # Tags attribute spend by purpose / run; delete-after lets the
+          # bench janitor reclaim this if teardown is skipped (cancel / lost
+          # runner). Every resource is named from $VM so teardown deletes by
+          # exact name. No default inbound rule; SSH opens to the runner IP below.
+          DELETE_AFTER="$(date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"
+          TAGS=(purpose=dataset-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}" "modality=${{ inputs.modality }}" auto-delete=true "delete-after=${DELETE_AFTER}")
           az vm create \
             -g "$RG" -n "$VM" \
             --image Ubuntu2204 \

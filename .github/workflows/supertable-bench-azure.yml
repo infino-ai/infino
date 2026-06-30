@@ -205,8 +205,10 @@ jobs:
           LOC="${{ inputs.location }}"
           SIZE="${{ inputs.vm_size }}"
 
-          # Tag the VM so Cost Management attributes spend by purpose / run.
-          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}")
+          # Tags attribute spend by purpose / run; delete-after lets the
+          # bench janitor reclaim this if teardown is skipped (cancel / lost runner).
+          DELETE_AFTER="$(date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"
+          TAGS=(purpose=supertable-bench "run-id=${{ github.run_id }}" "ref=${{ inputs.ref }}" auto-delete=true "delete-after=${DELETE_AFTER}")
 
           # Every resource is named with the unique per-run VM name so
           # teardown can delete this run's resources by exact name (never

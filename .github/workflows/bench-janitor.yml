@@ -1,0 +1,92 @@
+name: Bench janitor (Azure)
+
+# Reclaims ephemeral bench VMs (and their networking/disks) that outlive
+# their TTL. The bench workflows tear down on exit, but that is skipped on
+# force-cancel or a lost runner; this sweep is the independent backstop.
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, offset off the hour
+  workflow_dispatch:
+    inputs:
+      ttl_hours:
+        description: "Delete bench resources older than this many hours."
+        default: "3"
+      dry_run:
+        description: "List what would be deleted without deleting."
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: bench-janitor
+  cancel-in-progress: false
+
+env:
+  RG: rg-infino-bench
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sweep expired bench resources
+        env:
+          TTL_HOURS: ${{ inputs.ttl_hours || '3' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          cutoff=$(( now - TTL_HOURS * 3600 ))
+
+          # Delete, or just announce under dry-run. Best-effort: a resource
+          # another sweep already removed must not fail the run.
+          del() {
+            if [ "$DRY_RUN" = "true" ]; then echo "DRY-RUN would delete: $*"; return; fi
+            echo "deleting: $*"; "$@" || true
+          }
+
+          # Expired = delete-after tag in the past, or timeCreated older
+          # than the TTL (the latter backstops VMs with no tag).
+          live_vms=()
+          while IFS=$'\t' read -r name created after; do
+            [ -z "$name" ] && continue
+            expired=false
+            [ -n "$after" ] && [ "$now" -gt "$(date -u -d "$after" +%s)" ] && expired=true
+            [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ] && expired=true
+            if [ "$expired" = true ]; then
+              del az vm delete -g "$RG" -n "$name" --yes
+            else
+              live_vms+=("$name")
+            fi
+          done < <(az vm list -g "$RG" -o json \
+            | jq -r '.[] | [.name, .timeCreated, (.tags["delete-after"] // "")] | @tsv')
+
+          # Networking/disks are untagged, so attribute each to its VM by
+          # name and reclaim it once that VM is gone (a live VM still owns
+          # its resources, so in-flight runs are never touched).
+          owner() { sed -E 's/(VMNic|-osdisk|-nsg|-pip|-vnet)$//' <<<"$1"; }
+          is_live() { local v; for v in "${live_vms[@]:-}"; do [ "$v" = "$1" ] && return 0; done; return 1; }
+
+          # NICs first (they hold the IP/NSG/subnet), then disks, then the
+          # IP/NSG/VNet the NICs freed.
+          for kind in "network nic" "disk" "network public-ip" "network nsg" "network vnet"; do
+            read -ra cmd <<<"$kind"
+            while IFS= read -r n; do
+              [ -z "$n" ] && continue
+              is_live "$(owner "$n")" && continue
+              if [ "$kind" = "disk" ]; then del az "${cmd[@]}" delete -g "$RG" -n "$n" --yes
+              else del az "${cmd[@]}" delete -g "$RG" -n "$n"; fi
+            done < <(az "${cmd[@]}" list -g "$RG" --query '[].name' -o tsv 2>/dev/null || true)
+          done
+
+          echo "resources remaining in $RG: $(az resource list -g "$RG" --query 'length(@)' -o tsv)"
