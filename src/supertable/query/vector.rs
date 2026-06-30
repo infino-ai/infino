@@ -1306,6 +1306,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )
@@ -1375,6 +1376,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         );

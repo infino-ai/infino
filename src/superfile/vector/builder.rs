@@ -1856,6 +1856,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }
     }
 
@@ -1973,6 +1974,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            provided_centroids: None,
         };
 
         // Streaming build: distinct vectors at local_doc_ids 0..n.
@@ -2034,6 +2036,182 @@ mod tests {
     /// subsections must carry the inline stable-`_id` region forward, rewritten
     /// in merged local-id order (each input's ids shifted by its `doc_id_offset`).
     /// Without carry-through a compacted cell would silently lose its inline ids.
+    /// Repro: does the 1-bit RaBitQ shortlist survive a cell rebuild?
+    /// EC2 post-drain, RaBitQ-only (rerank=1) recall collapses 0.996 → 0.030 for
+    /// cell superfiles but not source user superfiles. Isolate locally: build a
+    /// clustered source, rebuild it through the materialized (kmeans) path into a
+    /// "cell", compare r=1 recall.
+    #[test]
+    fn rabitq_shortlist_survives_cell_rebuild() {
+        use crate::superfile::vector::reader::VectorReader;
+        use bytes::Bytes;
+        let dim = 256usize;
+        let n = 512usize;
+        let ncl = 16usize;
+        let json =
+            format!(r#"[{{"column":"v","dim":{dim},"n_cent":16,"rot_seed":7,"metric":"cosine"}}]"#);
+        let mkcfg = || VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent: 16,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            provided_centroids: None,
+        };
+        // Well-separated clusters: a deterministic per-cluster direction +
+        // small per-doc noise, normalized. Cosine NN ⇒ same-cluster docs, so a
+        // working 1-bit shortlist should hit high recall at dim=256.
+        let vec_for = |i: usize| -> Vec<f32> {
+            let c = i % ncl;
+            let mut v = vec![0.0f32; dim];
+            for d in 0..dim {
+                let base = ((c as f32 + 1.0) * 1.7 + d as f32 * 0.3).sin();
+                let noise = ((i as f32) * 0.11 + d as f32 * 0.7).sin() * 0.05;
+                v[d] = base + noise;
+            }
+            let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in &mut v {
+                *x /= nrm;
+            }
+            v
+        };
+        let vecs: Vec<Vec<f32>> = (0..n).map(vec_for).collect();
+
+        let mut b = VectorBuilder::new();
+        b.register_column(mkcfg()).expect("register");
+        for v in &vecs {
+            b.add(0, v).expect("add");
+        }
+        let src = VectorReader::open(Bytes::from(b.finish().expect("finish src")), &json)
+            .expect("open src");
+
+        let mut rows = block_on(src.materialized_index_rows_async("v")).expect("src rows");
+        for r in &mut rows {
+            r.stable_id = r.local_doc_id as i128;
+            r.encoded.stable_id = r.stable_id;
+        }
+        let mut mb = VectorBuilder::new();
+        mb.register_column(mkcfg()).expect("register mat");
+        mb.load_materialized_rows(0, rows).expect("load mat");
+        let cell = VectorReader::open(Bytes::from(mb.finish().expect("finish mat")), &json)
+            .expect("open cell");
+
+        let cell_rows = block_on(cell.materialized_index_rows_async("v")).expect("cell rows");
+        let cell_local_to_orig: std::collections::HashMap<u32, usize> =
+            cell_rows.iter().map(|r| (r.local_doc_id, r.stable_id as usize)).collect();
+
+        // Multi-source cell: split the corpus across TWO source superfiles (each
+        // local_doc_id restarts at 0), read both, tag stable_id = global index,
+        // concat, build one cell — mimicking the drain aggregating many user
+        // superfiles into a cell (where an id/ordering mismatch could appear).
+        let mut multi_rows = Vec::new();
+        for half in 0..2usize {
+            let lo = half * (n / 2);
+            let hi = lo + n / 2;
+            let mut sb = VectorBuilder::new();
+            sb.register_column(mkcfg()).expect("reg half");
+            for j in lo..hi {
+                sb.add(0, &vecs[j]).expect("add half");
+            }
+            let sr = VectorReader::open(Bytes::from(sb.finish().expect("finish half")), &json)
+                .expect("open half");
+            let mut rs = block_on(sr.materialized_index_rows_async("v")).expect("half rows");
+            for r in &mut rs {
+                let orig = lo + r.local_doc_id as usize;
+                r.stable_id = orig as i128;
+                r.encoded.stable_id = r.stable_id;
+            }
+            multi_rows.extend(rs);
+        }
+        // Faithful to the drain: reassign UNIQUE local_doc_ids across the
+        // combined sources (each source restarted at 0 → collisions otherwise).
+        multi_rows.sort_by_key(|r| r.stable_id);
+        for (i, r) in multi_rows.iter_mut().enumerate() {
+            r.local_doc_id = i as u32;
+        }
+        let mut mmb = VectorBuilder::new();
+        mmb.register_column(mkcfg()).expect("register multi");
+        mmb.load_materialized_rows(0, multi_rows).expect("load multi");
+        let cell_multi =
+            VectorReader::open(Bytes::from(mmb.finish().expect("finish multi")), &json)
+                .expect("open cell_multi");
+        let cm_rows = block_on(cell_multi.materialized_index_rows_async("v")).expect("cm rows");
+        let cm_local_to_orig: std::collections::HashMap<u32, usize> =
+            cm_rows.iter().map(|r| (r.local_doc_id, r.stable_id as usize)).collect();
+
+        // Does the SAME doc carry the SAME 1-bit code in the single-source cell
+        // vs the multi-source cell? If not, the multi-source build scrambled the
+        // code↔doc pairing — the "bits in the wrong order" hypothesis.
+        let codes_by_orig = |rows: &[crate::superfile::vector::cell_posting::MaterializedIvfRow]| {
+            rows.iter()
+                .map(|r| (r.stable_id as usize, r.rabitq_code.clone()))
+                .collect::<std::collections::HashMap<usize, Vec<u8>>>()
+        };
+        let single_codes = codes_by_orig(&cell_rows);
+        let multi_codes = codes_by_orig(&cm_rows);
+        let mut code_mismatch = 0usize;
+        for (orig, c) in &single_codes {
+            if multi_codes.get(orig) != Some(c) {
+                code_mismatch += 1;
+            }
+        }
+        eprintln!(
+            "[repro] same-doc code mismatch single-vs-multi: {}/{}",
+            code_mismatch,
+            single_codes.len()
+        );
+
+        let cosine = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            1.0 - dot / (na * nb + 1e-9)
+        };
+        let k = 10usize;
+        let nq = 16usize;
+        let mut recall_src = 0.0f32;
+        let mut recall_cell = 0.0f32;
+        let mut recall_multi = 0.0f32;
+        for qi in 0..nq {
+            let q = &vecs[qi * (n / nq)];
+            let mut d: Vec<(usize, f32)> = (0..n).map(|j| (j, cosine(q, &vecs[j]))).collect();
+            d.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let truth: std::collections::HashSet<usize> = d[..k].iter().map(|(j, _)| *j).collect();
+            let hs = block_on(src.search("v", q, k, 8, 1)).expect("src search");
+            recall_src += hs.iter().filter(|(id, _)| truth.contains(&(*id as usize))).count()
+                as f32
+                / k as f32;
+            let hc = block_on(cell.search("v", q, k, 8, 1)).expect("cell search");
+            recall_cell += hc
+                .iter()
+                .filter(|(id, _)| cell_local_to_orig.get(id).is_some_and(|o| truth.contains(o)))
+                .count() as f32
+                / k as f32;
+            let hm = block_on(cell_multi.search("v", q, k, 8, 1)).expect("multi search");
+            recall_multi += hm
+                .iter()
+                .filter(|(id, _)| cm_local_to_orig.get(id).is_some_and(|o| truth.contains(o)))
+                .count() as f32
+                / k as f32;
+        }
+        recall_src /= nq as f32;
+        recall_cell /= nq as f32;
+        recall_multi /= nq as f32;
+        eprintln!(
+            "[repro] r=1 recall  src={recall_src:.3}  cell(1-src)={recall_cell:.3}  cell(2-src)={recall_multi:.3}"
+        );
+        assert!(recall_src > 0.7, "source r=1 recall low ({recall_src}) — setup issue");
+        assert!(
+            recall_cell > 0.7,
+            "REPRO(1-src): cell r=1 recall collapsed to {recall_cell} (src {recall_src})"
+        );
+        assert!(
+            recall_multi > 0.7,
+            "REPRO(2-src): multi-source cell r=1 recall collapsed to {recall_multi} (src {recall_src})"
+        );
+    }
+
     #[test]
     fn sq8_merge_carries_inline_stable_ids_through_compaction() {
         use bytes::Bytes;
@@ -2053,6 +2231,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            provided_centroids: None,
         };
 
         // Build one materialized cell blob of `n` rows whose stable `_id`s are
@@ -2135,6 +2314,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            provided_centroids: None,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");
@@ -2211,6 +2391,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         })
         .expect("register column");
         // Generate a small but distinguishable corpus where each
@@ -2269,6 +2450,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             })
             .expect("register column");
             for d in 0..n_docs {
@@ -2413,6 +2595,7 @@ mod tests {
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         })
         .expect("register column");
         for d in 0..n_docs {

@@ -704,6 +704,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )

@@ -1392,6 +1392,7 @@ mod tests {
             rot_seed: 99,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }];
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
@@ -1847,6 +1848,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                provided_centroids: None,
             }],
             None,
         );

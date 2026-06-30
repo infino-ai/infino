@@ -916,6 +916,7 @@ mod tests {
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         };
         let mut b = CellPostingBuilder::new();
         b.register_column(cfg).expect("register");

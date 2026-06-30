@@ -410,6 +410,7 @@ mod tests {
                 rot_seed: 0,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::default(),
+                provided_centroids: None,
             }],
             Some(default_tokenizer()),
         )
@@ -436,6 +437,7 @@ mod tests {
                     rot_seed: 0,
                     metric,
                     rerank_codec: RerankCodec::default(),
+                    provided_centroids: None,
                 }],
                 Some(default_tokenizer()),
             )
