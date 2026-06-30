@@ -293,6 +293,8 @@ jobs:
       AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
       AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
       AZURE_STORAGE_CONTAINER_NAME: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+      # Run-scoped so cleanup can't touch a parallel run's blobs.
+      INFINO_E2E_PREFIX: e2e/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -327,3 +329,14 @@ jobs:
           npm install
           npm run build:debug
           node --test __test__/azure.e2e.test.mjs
+      # Clears this run's blobs, incl. the catalog object drop_table leaves.
+      # Best-effort: a hiccup must not fail the job.
+      - name: Clean up e2e blobs
+        if: always()
+        continue-on-error: true
+        run: |
+          az storage blob delete-batch \
+            --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
+            --account-key "$AZURE_STORAGE_ACCOUNT_KEY" \
+            --source "$AZURE_STORAGE_CONTAINER_NAME" \
+            --pattern "$INFINO_E2E_PREFIX/*"
