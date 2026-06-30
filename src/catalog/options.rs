@@ -111,22 +111,6 @@ impl ConnectOptions {
         self.validate = validate;
         self
     }
-
-    /// Convenience for a custom S3-compatible endpoint (MinIO / R2 / Ceph)
-    /// — sets the equivalent `aws_*` options. Only affects `s3://`.
-    pub fn with_s3_endpoint(
-        self,
-        endpoint: impl Into<String>,
-        region: impl Into<String>,
-        access_key: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
-        self.with_storage_option("aws_endpoint", endpoint)
-            .with_storage_option("aws_region", region)
-            .with_storage_option("aws_access_key_id", access_key)
-            .with_storage_option("aws_secret_access_key", secret_key)
-            .with_storage_option("aws_allow_http", "true")
-    }
 }
 
 #[cfg(test)]
@@ -139,31 +123,6 @@ mod tests {
         assert_eq!(
             o.storage_options.get("aws_region").map(String::as_str),
             Some("us-east-1")
-        );
-    }
-
-    #[test]
-    fn with_s3_endpoint_populates_storage_options() {
-        let o = ConnectOptions::new().with_s3_endpoint("http://e", "r", "ak", "sk");
-        assert_eq!(
-            o.storage_options.get("aws_endpoint").map(String::as_str),
-            Some("http://e")
-        );
-        assert_eq!(
-            o.storage_options.get("aws_region").map(String::as_str),
-            Some("r")
-        );
-        assert_eq!(
-            o.storage_options
-                .get("aws_access_key_id")
-                .map(String::as_str),
-            Some("ak")
-        );
-        assert_eq!(
-            o.storage_options
-                .get("aws_secret_access_key")
-                .map(String::as_str),
-            Some("sk")
         );
     }
 }
