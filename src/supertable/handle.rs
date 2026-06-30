@@ -149,9 +149,6 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
-    /// One-shot partition strategy for the next hidden-index commit
-    /// (synced from the user table's trained global centroids).
-    pub(super) pending_partition_strategy: Mutex<Option<super::manifest::list::PartitionStrategy>>,
 }
 
 impl Drop for SupertableInner {
@@ -502,25 +499,6 @@ impl Supertable {
     /// per call.
     pub(crate) fn block_on_query<F: Future>(&self, fut: F) -> F::Output {
         bridge_on_runtime(fut, &self.query_runtime())
-    }
-
-    // Gated to the same cfg as `writer::await_incoming_routed_to_cells`, which
-    // this calls: `test_visible!` only flips visibility (`pub` under
-    // test-helpers, else `pub(crate)`) and does not gate compilation, so
-    // without the cfg this would be compiled in plain builds and reference a
-    // function that only exists under test/test-helpers.
-    #[cfg(any(test, feature = "test-helpers"))]
-    test_visible! {
-    /// Block until every accumulated hidden incoming IVF superfile is
-    /// routed into per-cell IVF superfiles. Benches use this between
-    /// pre-drain and post-drain search phases; unit tests use it to
-    /// await background maintenance before compacting the hidden table.
-    fn await_incoming_routed_to_cells_sync(&self) -> Result<(), BuildError> {
-        bridge_on_runtime(
-            super::writer::await_incoming_routed_to_cells(Arc::clone(&self.inner)),
-            &self.query_runtime(),
-        )
-    }
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -911,22 +889,6 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
     }
 }
 
-pub(super) fn apply_pending_partition_strategy(inner: &SupertableInner) -> bool {
-    let strategy = inner
-        .pending_partition_strategy
-        .lock()
-        .expect("pending_partition_strategy mutex poisoned")
-        .take();
-    let Some(strategy) = strategy else {
-        return false;
-    };
-    let current = inner.manifest.load_full();
-    inner
-        .manifest
-        .store(Arc::new(current.with_partition_strategy(strategy)));
-    true
-}
-
 /// Open-time bootstrap only: derive initial global centroids from an
 /// existing user-table IVF summary. Hidden commits use
 /// [`super::spfresh`] MVCC maintenance — never call this per commit.
@@ -1089,7 +1051,6 @@ async fn build_handle(
         handle_id,
         vector_index_table,
         last_pointer_check: Mutex::new(None),
-        pending_partition_strategy: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

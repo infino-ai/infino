@@ -251,46 +251,6 @@ pub(crate) fn nearest_cell_encoded(
     best
 }
 
-/// Max member distance from `cell_id`'s centroid over encoded rows.
-// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-#[allow(dead_code)]
-pub(crate) fn encoded_shard_radius(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    cell_id: u32,
-    rows: &[EncodedCellRow],
-) -> f32 {
-    let mut max_r = 0.0f32;
-    for row in rows {
-        let dist = score_row_against_cell(clusters, metric, cell_id as usize, row);
-        if dist > max_r {
-            max_r = dist;
-        }
-    }
-    max_r
-}
-
-/// Assign an encoded row to the nearest cell among `candidates`.
-// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-#[allow(dead_code)]
-pub(crate) fn nearest_among_cells_encoded(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    candidates: &[u32],
-    row: &EncodedCellRow,
-) -> u32 {
-    let mut best = candidates[0];
-    let mut best_score = f32::INFINITY;
-    for &c in candidates {
-        let score = score_row_against_cell(clusters, metric, c as usize, row);
-        if score < best_score {
-            best_score = score;
-            best = c;
-        }
-    }
-    best
-}
-
 /// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.
 pub(crate) fn insert_split_centroid(
     base: &ClusterCentroids,

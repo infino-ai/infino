@@ -203,7 +203,7 @@ struct BufferedBatch {
 
 /// Row-balanced split of the writer's buffered batches into
 /// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
-/// that [`build_one_shard`] can consume directly. The split walks
+/// that [`build_one_shard_with_layout`] can consume directly. The split walks
 /// rows across the original buffer in order and emits zero-copy
 /// Arrow slices (`RecordBatch::slice` + `Float32Array::slice` —
 /// adjust buffer offsets only; underlying memory stays Arc-counted),
@@ -344,79 +344,6 @@ async fn materialized_ivf_rows_in_doc_order(
             })
         })
         .collect())
-}
-
-/// One commit's hidden-index batch, ready to build into a single
-/// "incoming" IVF superfile. No per-cell split happens here — that is deferred
-/// to background SPFresh maintenance.
-struct HiddenIncomingPlan {
-    buffer: Vec<BufferedBatch>,
-    clusters: ClusterCentroids,
-    column: String,
-}
-
-/// Build ONE "incoming" IVF superfile from a commit's hidden batch,
-/// tagged with the reserved incoming partition. This reuses the standard IVF
-/// superfile writer (`build_one_shard`) verbatim — no per-cell work. Queries
-/// always scan incoming superfiles; background SPFresh maintenance later routes
-/// them into per-cell IVF superfiles and deletes them.
-fn execute_hidden_incoming_plan_in_scope(
-    inner: &SupertableInner,
-    plan: HiddenIncomingPlan,
-) -> Result<HiddenIncomingPrepare, BuildError> {
-    let HiddenIncomingPlan {
-        buffer,
-        clusters,
-        column,
-    } = plan;
-    let empty_batch = SuperfilePublishBatch {
-        new_entries: Vec::new(),
-        to_remove: Vec::new(),
-        pending_storage_writes: Vec::new(),
-        pending_cache_inserts: Vec::new(),
-    };
-    if buffer.is_empty() {
-        return Ok(HiddenIncomingPrepare {
-            batch: empty_batch,
-            cell_updates: HashMap::new(),
-            radii_updates: HashMap::new(),
-            clusters,
-            column,
-        });
-    }
-    // IVF layout for the incoming append region, partitioned against the
-    // global cell centroids (not local k-means) so every incoming shard shares
-    // cell ordinals — the precondition for splicing cluster `c` → cell `c` at
-    // drain instead of re-clustering. Empty global model ⇒ fall back to local.
-    let global_centroids: Option<std::sync::Arc<[f32]>> = if clusters.is_empty() {
-        None
-    } else {
-        Some(clusters.to_fp32().into())
-    };
-    let shard =
-        build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf, global_centroids)?;
-    let prepared = prepare_superfile(inner, shard)?
-        .ok_or_else(|| BuildError::Store("hidden incoming superfile unexpectedly empty".into()))?;
-    let entry = finish_superfile_entry(
-        inner,
-        prepared.entry,
-        Some(super::handle::INCOMING_VECTOR_CELL),
-    )?;
-    let prepared = PreparedSuperfile {
-        entry,
-        bytes_for_store: prepared.bytes_for_store,
-        bytes_for_storage: prepared.bytes_for_storage,
-        bytes_for_cache: prepared.bytes_for_cache,
-    };
-    let batch = collect_prepared_superfiles(inner, vec![prepared])?;
-    Ok(HiddenIncomingPrepare {
-        batch,
-        // Counts are bumped by maintenance when rows actually land in cells.
-        cell_updates: HashMap::new(),
-        radii_updates: HashMap::new(),
-        clusters,
-        column,
-    })
 }
 
 /// Split buffered rows into per-cell shards based on nearest centroid.
@@ -777,52 +704,6 @@ impl SupertableWriter {
             self.commit_appends_internal()?;
         }
 
-        Ok(())
-    }
-
-    /// Dual-write helper for the hidden vector-index supertable: buffer one
-    /// shard batch using the user table's stable row ids instead of minting
-    /// new ones so global-index hits can map back to user superfiles.
-    // Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-    #[allow(dead_code)]
-    pub(crate) fn append_dual_write_batch(
-        &mut self,
-        ids: &Decimal128Array,
-        vectors: &[Arc<Float32Array>],
-    ) -> Result<(), BuildError> {
-        let options = &self.inner.options;
-        let n_rows = ids.len();
-        if n_rows == 0 {
-            return Ok::<(), BuildError>(());
-        }
-        if vectors.len() != options.vector_columns.len() {
-            return Err(BuildError::BatchSchemaMismatch);
-        }
-        let id_array = ids
-            .clone()
-            .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
-            )
-            .expect(
-                "invariant: precision 38 + scale 0 always valid \
-                 for any i128 payload",
-            );
-        let scalar = RecordBatch::try_new(
-            options.scalar_schema(),
-            vec![Arc::new(id_array) as ArrayRef],
-        )
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
-        let bytes = scalar.get_array_memory_size()
-            + vectors
-                .iter()
-                .map(|v| v.len() * std::mem::size_of::<f32>())
-                .sum::<usize>();
-        self.buffer.push(BufferedBatch {
-            scalar,
-            vectors: vectors.to_vec(),
-        });
-        self.buffer_bytes += bytes;
         Ok(())
     }
 
@@ -1257,120 +1138,6 @@ impl SupertableWriter {
         })
     }
 
-    /// Plan one incoming IVF superfile from the hidden writer's buffered vectors.
-    /// Bootstraps the global cell centroids from the first batch if they don't
-    /// exist yet (routing and maintenance both need them), but does NOT split
-    /// by cell and does NOT touch per-cell counts — that is deferred to
-    /// background SPFresh routing, which is when the rows actually land in cells.
-    fn plan_hidden_incoming_shard(&mut self) -> Result<HiddenIncomingPlan, BuildError> {
-        let empty = HiddenIncomingPlan {
-            buffer: Vec::new(),
-            clusters: ClusterCentroids::default(),
-            column: String::new(),
-        };
-        if self.buffer.is_empty() {
-            return Ok(empty);
-        }
-        super::handle::apply_pending_partition_strategy(&self.inner);
-        let vec_dim = self
-            .inner
-            .options
-            .vector_columns
-            .first()
-            .map(|vc| vc.dim)
-            .unwrap_or(0);
-        if vec_dim == 0 {
-            return Ok(empty);
-        }
-        let column = self
-            .inner
-            .options
-            .vector_columns
-            .first()
-            .map(|vc| vc.column.clone())
-            .unwrap_or_default();
-
-        let metric = self
-            .inner
-            .options
-            .vector_columns
-            .first()
-            .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
-
-        // Ensure the global cell grid exists (bootstrap once from the first
-        // batch). Counts are left untouched — maintenance bumps them when it
-        // moves incoming rows into cells.
-        let mut strategy = self.inner.manifest.load().get_partition_strategy();
-        let clusters = match &strategy {
-            PartitionStrategy::VectorCell { clusters, .. }
-                if clusters.n_cent > 0 && clusters.dim > 0 =>
-            {
-                clusters.clone()
-            }
-            _ => {
-                let boot = bootstrap_centroids_from_batch(
-                    &self.buffer,
-                    vec_dim,
-                    super::handle::GLOBAL_VECTOR_CELL_COUNT,
-                    metric,
-                )
-                .ok_or_else(|| {
-                    BuildError::Store("hidden index: bootstrap centroids from batch failed".into())
-                })?;
-                strategy = PartitionStrategy::VectorCell {
-                    column: column.clone(),
-                    clusters: boot.clone(),
-                    routing: Default::default(),
-                };
-                self.inner.manifest.store(Arc::new(
-                    self.inner
-                        .manifest
-                        .load()
-                        .with_partition_strategy(strategy.clone()),
-                ));
-                boot
-            }
-        };
-
-        let buffer = std::mem::take(&mut self.buffer);
-        self.buffer_bytes = 0;
-        Ok(HiddenIncomingPlan {
-            buffer,
-            clusters,
-            column,
-        })
-    }
-
-    fn prepare_hidden_incoming_build(&mut self) -> Result<HiddenIncomingPrepare, BuildError> {
-        let plan = self.plan_hidden_incoming_shard()?;
-        let inner = Arc::clone(&self.inner);
-        self.inner
-            .options
-            .writer_pool
-            .install(|| execute_hidden_incoming_plan_in_scope(&inner, plan))
-    }
-
-    fn commit_hidden_incoming_internal(&mut self) -> Result<(), BuildError> {
-        let prep = self.prepare_hidden_incoming_build()?;
-        if prep.batch.new_entries.is_empty() {
-            return Ok(());
-        }
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| BuildError::Store("hidden incoming commit requires storage".into()))?;
-        let inner = Arc::clone(&self.inner);
-        bridge_on_runtime(
-            publish_hidden_incoming_async(inner, storage, prep),
-            &self.inner.query_runtime(),
-        )?;
-        Ok(())
-    }
-
     /// [`SupertableWriter::commit`] calls this first before
     /// driving pending mutations.
     ///
@@ -1380,11 +1147,6 @@ impl SupertableWriter {
     fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok::<(), BuildError>(());
-        }
-        if crate::supertable::handle::is_hidden_vector_index_table(&self.inner.options)
-            && self.inner.options.storage.is_some()
-        {
-            return self.commit_hidden_incoming_internal();
         }
         let buffer = mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
@@ -1577,20 +1339,10 @@ impl ShardOutput {
     }
 }
 
-/// Build one superfile from one slice of buffered batches. Runs on
-/// a rayon worker thread inside the writer pool's `install`.
-// Superseded by `build_one_shard_with_layout` (Phase B) — the commit path now
-// always passes an explicit layout + optional global centroids.
-#[allow(dead_code)]
-fn build_one_shard(
-    slice: &[BufferedBatch],
-    options: &SupertableOptions,
-) -> Result<ShardOutput, BuildError> {
-    build_one_shard_with_layout(slice, options, options.vector_layout, None)
-}
-
-/// Same as [`build_one_shard`] but with an explicit vector layout override.
-/// The hidden index's "incoming" append superfile is always built in IVF layout.
+/// Build one superfile from one slice of buffered batches with an explicit
+/// vector layout override. Runs on a rayon worker thread inside the writer
+/// pool's `install`. The commit path always passes an explicit layout +
+/// optional global centroids.
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
@@ -2128,15 +1880,6 @@ struct SuperfilePublishBatch {
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 }
 
-/// Hidden incoming build artifacts produced before manifest swap.
-struct HiddenIncomingPrepare {
-    batch: SuperfilePublishBatch,
-    cell_updates: HashMap<u32, u32>,
-    radii_updates: HashMap<u32, f32>,
-    clusters: ClusterCentroids,
-    column: String,
-}
-
 fn collect_prepared_superfiles(
     inner: &SupertableInner,
     prepared: Vec<PreparedSuperfile>,
@@ -2244,14 +1987,6 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Minimum number of accumulated "incoming" IVF superfiles before background
-/// maintenance routes them into per-cell IVF superfiles. Amortizes the
-/// per-cell build so it isn't paid on every commit; until routing fires the
-/// incoming superfiles are simply scanned by queries (recall is unaffected).
-// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-#[allow(dead_code)]
-const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
-
 /// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
 /// superfile encode). Installing the build under this pool pins all its nested
 /// `par_iter`/`join` to one thread instead of fanning out across every core, so
@@ -2266,92 +2001,6 @@ fn maint_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("hidden maintenance rayon pool")
     })
-}
-
-/// Background SPFresh maintenance: route the hidden index's "incoming" IVF
-/// superfiles into per-cell IVF superfiles and delete the incoming ones. Only
-/// runs once enough incoming superfiles accumulate so the per-cell build amortizes.
-///
-/// The routing future's async work (object-store + disk-cache I/O) MUST run on the same
-/// `query_runtime` as the foreground path: the disk cache's async coordination
-/// primitives (per-URI fetch coordinators, background-fill notifications) are
-/// bound to that runtime, and awaiting them from a *different* runtime loses
-/// wakeups and intermittently deadlocks the commit. A short-lived thread drives
-/// it via `block_on` (the routing future borrows through `write_superfile_list`,
-/// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
-/// not by a separate runtime. The `compaction_outstanding` single-flight guard
-/// makes concurrent invocations cheap no-ops, so threads don't pile up.
-// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-#[allow(dead_code)]
-fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
-    let runtime = inner.query_runtime();
-    std::thread::Builder::new()
-        .name("hidden-maint".into())
-        .spawn(move || {
-            if let Err(e) = runtime.block_on(route_incoming_to_manifest_cells(inner)) {
-                tracing::warn!(
-                    "supertable: hidden SPFresh maintenance failed: {e} (vector search may be stale)"
-                );
-            }
-        })
-        .ok();
-}
-
-/// Read each accumulated incoming IVF superfile's Sq8+ε rows, assign every row
-/// to its nearest global cell, build one Sq8 IVF superfile per touched cell,
-/// then publish those cell superfiles and remove the routed incoming
-/// superfiles in one OCC commit.
-// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
-#[allow(dead_code)]
-async fn route_incoming_to_manifest_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
-    route_incoming_to_manifest_cells_if_ready(inner, INCOMING_ROUTE_MIN_SUPERFILES, None).await
-}
-
-/// Route every accumulated incoming IVF superfile (threshold = 1). Used by
-/// tests and by [`await_incoming_routed_to_cells`] so maintenance can be awaited
-/// before compaction runs on the per-cell IVF superfiles.
-#[cfg(any(test, feature = "test-helpers"))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::supertable) async fn await_incoming_routed_to_cells(
-    inner: Arc<SupertableInner>,
-) -> Result<(), BuildError> {
-    const FLUSH_MAX_ROUNDS: usize = 64;
-    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
-        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
-            super::handle::INCOMING_VECTOR_CELL,
-        ),
-    );
-    for _ in 0..FLUSH_MAX_ROUNDS {
-        while inner.compaction_outstanding.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, None).await?;
-        let remaining = inner
-            .manifest
-            .load_full()
-            .get_all_superfiles()
-            .iter()
-            .filter(|e| e.partition_key == incoming_key)
-            .count();
-        if remaining == 0 {
-            return Ok(());
-        }
-    }
-    Err(BuildError::Store(
-        "hidden incoming routing flush exceeded round budget".into(),
-    ))
-}
-
-/// Retired: the hidden cell index is now drained directly from the user
-/// superfiles by [`drain_user_superfiles_to_hidden_cells`] (the user
-/// superfiles *are* the staging — no separate incoming partition). Kept as a
-/// no-op so the maintenance hook and the test-only flush wrapper still resolve.
-async fn route_incoming_to_manifest_cells_if_ready(
-    _inner: Arc<SupertableInner>,
-    _min_incoming: usize,
-    _assign_among: Option<&[u32]>,
-) -> Result<(), BuildError> {
-    Ok(())
 }
 
 /// No-staging drain: splice each user-table vector superfile's cluster `c`
@@ -3048,68 +2697,6 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
 
     schedule_background_storage_reclaim(Arc::clone(&inner));
 
-    // Step 9: redrive through incoming → route into per-cell IVF superfiles.
-    // Step 6 neighborhood reassignment: restrict assignment to P−1/P/P₂/P+1.
-    route_incoming_to_manifest_cells_if_ready(Arc::clone(&inner), 1, Some(&neighborhood)).await
-}
-
-async fn publish_hidden_incoming_async(
-    inner: Arc<SupertableInner>,
-    storage: Arc<dyn crate::storage::StorageProvider>,
-    prep: HiddenIncomingPrepare,
-) -> Result<(), BuildError> {
-    if prep.batch.new_entries.is_empty() {
-        return Ok(());
-    }
-    let manifest_before = inner.manifest.load();
-    let routing = match manifest_before.get_partition_strategy() {
-        PartitionStrategy::VectorCell { routing, .. } => routing,
-        _ => Default::default(),
-    };
-    let updated_clusters =
-        spfresh::apply_cell_updates(&prep.clusters, &prep.cell_updates, &prep.radii_updates);
-    let updated_strategy = PartitionStrategy::VectorCell {
-        column: prep.column,
-        clusters: updated_clusters,
-        routing,
-    };
-    inner.manifest.store(Arc::new(
-        manifest_before.with_partition_strategy(updated_strategy),
-    ));
-    // We already hold the incoming superfile's bytes here. Warm them onto local
-    // disk so the background SPFresh routing pass reads them via mmap instead of
-    // cold-fetching ~one superfile per accumulated commit back from object
-    // storage — those GETs otherwise contend with foreground ingest PUTs and
-    // stall the commit. Cheap clone (Bytes is Arc-backed).
-    let incoming_writes: Vec<(SuperfileUri, Bytes)> = prep.batch.pending_storage_writes.clone();
-    let new_manifest = persist_commit_async(
-        &inner,
-        Arc::clone(&storage),
-        prep.batch.new_entries,
-        &prep.batch.to_remove,
-        prep.batch.pending_storage_writes,
-        Vec::new(),
-    )
-    .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
-    inner.manifest.store(Arc::new(new_manifest));
-    // We're already in async context here — warm the disk cache by awaiting
-    // directly. (Do NOT use `warm_cache_after_commit`, which does a nested
-    // sync `block_in_place` + `block_on`; calling that from inside this commit
-    // future deadlocks the runtime.)
-    if let Some(cache) = inner.options.disk_cache.as_ref() {
-        warm_cache_inserts(cache, incoming_writes).await;
-    }
-    schedule_background_storage_reclaim(Arc::clone(&inner));
-    if let Some(cache) = inner.options.disk_cache.as_ref() {
-        warm_cache_inserts(cache, prep.batch.pending_cache_inserts).await;
-    }
-    if let (Some(cache), Some(budget)) = (
-        inner.options.disk_cache.as_ref(),
-        inner.options.memory_budget_bytes,
-    ) {
-        cache.sweep_for_budget(budget);
-    }
     Ok(())
 }
 
