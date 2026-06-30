@@ -284,6 +284,7 @@ impl SupertableReader {
         // config, not table size. Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
 
         // `fanout_with`, not `fanout`: the body needs each superfile's  tombstone bitmap *before* its kernel
         // to push it in as a deny set (`fanout` only drops tombstones post-rank, which underflows).
@@ -294,6 +295,7 @@ impl SupertableReader {
                          (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
             let column = Arc::clone(&column_arc);
             let query = Arc::clone(&query_arc);
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 // For unfiltered path:
                 //  - it resolve this superfile's tombstone  bitmap once (a warm cache hit after the orchestrator's
@@ -307,17 +309,20 @@ impl SupertableReader {
                     }
                     _ => None,
                 };
+                let pool = Some(Arc::clone(&reader_pool));
                 let hits = match probe {
                     Probe::Clusters(ids) => {
                         reader
                             .vector_search_clusters_filtered(
-                                &column, &query, k, &ids, options, bitmap, deny,
+                                &column, &query, k, &ids, options, bitmap, deny, pool,
                             )
                             .await
                     }
                     Probe::Nprobe => {
                         reader
-                            .vector_hits_filtered_async(&column, &query, k, options, bitmap, deny)
+                            .vector_hits_filtered_async(
+                                &column, &query, k, options, bitmap, deny, pool,
+                            )
                             .await
                     }
                 }

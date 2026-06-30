@@ -157,6 +157,7 @@ fn mean_recall_filtered(
             opts(nprobe, rerank_mult),
             Some(Arc::clone(allow)),
             None,
+            None,
         ))
         .expect("vector_hits_filtered");
         sum += corpus::recall_at_k(&hits, truth);

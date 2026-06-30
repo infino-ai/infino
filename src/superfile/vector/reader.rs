@@ -20,7 +20,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use rayon::prelude::*;
+use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
 use tokio::sync::oneshot;
@@ -166,6 +166,8 @@ struct ProbeCtx<'a> {
     // enters ranking — so the top-k ranks only live rows and never
     // contains deleted docs. The opposite-polarity sibling of `allow`.
     deny: Option<Arc<RoaringBitmap>>,
+    /// Rayon pool for CPU work. `None` falls back to the global pool.
+    pool: Option<Arc<ThreadPool>>,
 }
 
 impl ColumnReader {
@@ -1354,6 +1356,7 @@ impl VectorReader {
             rerank_mult,
             allow: None,
             deny: None,
+            pool: None,
         };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
@@ -1396,6 +1399,7 @@ impl VectorReader {
             &candidates,
             col,
             query,
+            None,
             k,
         )
         .await
@@ -1414,7 +1418,7 @@ impl VectorReader {
     /// `bm25_search_pretokenized` path — rather than serializing cold
     /// object-store GETs. The CPU steps (centroid/code scoring,
     /// rerank) call the same helpers as the sync path and parallelize
-    /// on the global rayon pool; warm/in-memory ranges still resolve
+    /// on the configured rayon pool; warm/in-memory ranges still resolve
     /// sync/zero-copy via `try_get_range_sync` with no `await`.
     pub async fn search_async(
         &self,
@@ -1430,6 +1434,7 @@ impl VectorReader {
         // Tombstone deny-set excluded before ranking on the unfiltered
         // path; `None` leaves ranking unchanged.
         deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1484,6 +1489,7 @@ impl VectorReader {
             rerank_mult: rerank_mult_eff,
             allow,
             deny,
+            pool,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -1510,6 +1516,7 @@ impl VectorReader {
         // Tombstone deny-set excluded before ranking on the unfiltered
         // path; `None` leaves ranking unchanged.
         deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1540,6 +1547,7 @@ impl VectorReader {
             rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
             allow,
             deny,
+            pool,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -1647,6 +1655,7 @@ impl VectorReader {
             &candidates,
             col,
             query,
+            ctx.pool.clone(),
             ctx.k,
         )
         .await
@@ -1969,6 +1978,14 @@ enum ShortlistOutcome {
     },
 }
 
+/// Dispatch `f` onto `pool` if provided, or the global rayon pool otherwise.
+fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
+    match pool {
+        Some(p) => p.spawn(f),
+        None => rayon::spawn(f),
+    }
+}
+
 /// Pure-CPU stage shared by the sync and async vector search paths.
 ///
 /// Scores the probed clusters' 1-bit codes into a bounded shortlist,
@@ -2032,7 +2049,7 @@ async fn build_shortlist(
             );
         };
     let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-        // Parallelize the coarse 1-bit scan across the global rayon pool,
+        // Parallelize the coarse 1-bit scan across the configured rayon pool,
         // bridged back via a oneshot so no tokio worker blocks under the
         // compute. Cluster scoring is order-independent — every survivor
         // is re-sorted below — so chunked-parallel and serial shortlists
@@ -2049,7 +2066,7 @@ async fn build_shortlist(
         // Same for the tombstone deny-set.
         let deny_owned = ctx.deny.clone();
         let (tx, rx) = oneshot::channel();
-        rayon::spawn(move || {
+        spawn_on(ctx.pool.as_deref(), move || {
             let acc = meta_owned
                 .par_chunks(chunk)
                 .zip(blocks_owned.par_chunks(chunk))
@@ -2262,12 +2279,12 @@ fn parallel_chunks(n_items: usize) -> usize {
         .max(1)
 }
 
-/// Map `f` over `items` on the global rayon pool, preserving input
+/// Map `f` over `items` on the configured rayon pool, preserving input
 /// order. The order-independent vector scans (rerank) use this; the
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
 /// the async caller via a oneshot, so no tokio worker blocks under it.
 /// `f` and the items must be `'static` so the work can move onto rayon.
-async fn par_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+async fn par_map<T, R, F>(items: Vec<T>, f: F, pool: Option<Arc<ThreadPool>>) -> Vec<R>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
@@ -2277,7 +2294,7 @@ where
         return items.iter().map(&f).collect();
     }
     let (tx, rx) = oneshot::channel();
-    rayon::spawn(move || {
+    spawn_on(pool.as_deref(), move || {
         let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
     });
@@ -2497,6 +2514,7 @@ async fn rerank_candidates_from_blocks(
     candidates: &[RerankCandidate],
     col: &ColumnReader,
     query: &[f32],
+    pool: Option<Arc<ThreadPool>>,
     k: usize,
 ) -> Result<Vec<(u32, f32)>, LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
@@ -2514,15 +2532,19 @@ async fn rerank_candidates_from_blocks(
                 let survivors: Option<Arc<Vec<Bytes>>> =
                     survivor_full_rows.map(|s| Arc::new(s.to_vec()));
                 let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
-                par_map(candidates.to_vec(), move |cand: &RerankCandidate| {
-                    let bytes = candidate_full_bytes(
-                        &blocks,
-                        survivors.as_deref().map(|s| s.as_slice()),
-                        cand,
-                        stride,
-                    );
-                    (cand.did, distance_bytes_codec(metric, codec, &query, bytes))
-                })
+                par_map(
+                    candidates.to_vec(),
+                    move |cand: &RerankCandidate| {
+                        let bytes = candidate_full_bytes(
+                            &blocks,
+                            survivors.as_deref().map(|s| s.as_slice()),
+                            cand,
+                            stride,
+                        );
+                        (cand.did, distance_bytes_codec(metric, codec, &query, bytes))
+                    },
+                    pool.clone(),
+                )
                 .await
             } else {
                 candidates
@@ -2562,6 +2584,7 @@ async fn rerank_candidates_from_blocks(
                         scale,
                         offset,
                         per_doc_norms.clone(),
+                        pool.clone(),
                         k,
                         stride,
                     )
@@ -2591,6 +2614,7 @@ async fn rerank_candidates_from_blocks(
                             parsed.scale.as_slice(),
                             parsed.offset.as_slice(),
                             parsed.per_doc_norms.clone(),
+                            pool.clone(),
                             k,
                             stride,
                         )
@@ -2757,6 +2781,7 @@ async fn sq8_score_and_refine(
     scale: &[f32],
     offset: &[f32],
     per_doc_norms: Option<Arc<[f32]>>,
+    pool: Option<Arc<ThreadPool>>,
     k: usize,
     stride: usize,
 ) -> Vec<(u32, f32)> {
@@ -2798,26 +2823,30 @@ async fn sq8_score_and_refine(
         let blocks: Arc<Vec<Bytes>> = Arc::new(cluster_blocks.to_vec());
         let survivors: Option<Arc<Vec<Bytes>>> = survivor_full_rows.map(|s| Arc::new(s.to_vec()));
         let items: Vec<(usize, RerankCandidate)> = candidates.iter().cloned().enumerate().collect();
-        par_map(items, move |item: &(usize, RerankCandidate)| {
-            let (i, cand) = (item.0, &item.1);
-            let row = candidate_full_bytes(
-                &blocks,
-                survivors.as_deref().map(|s| s.as_slice()),
-                cand,
-                stride,
-            );
-            let code = &row[..dim];
-            let kernel = kernels
-                .get(&cand.cluster_id)
-                .expect("kernel prebuilt for every probed cluster");
-            (
-                cand.did,
-                kernel.distance_at(cand.pos, code),
-                i,
-                cand.pos,
-                cand.cluster_id,
-            )
-        })
+        par_map(
+            items,
+            move |item: &(usize, RerankCandidate)| {
+                let (i, cand) = (item.0, &item.1);
+                let row = candidate_full_bytes(
+                    &blocks,
+                    survivors.as_deref().map(|s| s.as_slice()),
+                    cand,
+                    stride,
+                );
+                let code = &row[..dim];
+                let kernel = kernels
+                    .get(&cand.cluster_id)
+                    .expect("kernel prebuilt for every probed cluster");
+                (
+                    cand.did,
+                    kernel.distance_at(cand.pos, code),
+                    i,
+                    cand.pos,
+                    cand.cluster_id,
+                )
+            },
+            pool,
+        )
         .await
     } else {
         candidates.iter().enumerate().map(score_one).collect()
@@ -3361,7 +3390,7 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank, None, None)
+            .search_async("v", q, k, n_cent as usize, rerank, None, None, None)
             .await
             .expect("search_async");
         let probed = r
@@ -3371,6 +3400,7 @@ mod tests {
                 k,
                 &(0..n_cent).collect::<Vec<_>>(),
                 rerank,
+                None,
                 None,
                 None,
             )
@@ -3388,7 +3418,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank, None, None)
+            .search_clusters_async("v", q, k, &[], rerank, None, None, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -6296,7 +6326,7 @@ mod tests {
     #[tokio::test]
     async fn par_map_serial_fallback_for_small_input() {
         // parallel_chunks(items) <= 1 takes the serial map arm.
-        let out = par_map(vec![1u32, 2, 3], |x| x * 10).await;
+        let out = par_map(vec![1u32, 2, 3], |x| x * 10, None).await;
         assert_eq!(out, vec![10, 20, 30]);
     }
 
@@ -6496,11 +6526,11 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20, None, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20, None, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
@@ -6533,11 +6563,11 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None, None)
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None, None)
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6547,7 +6577,7 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None, None)
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None, None, None)
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6559,16 +6589,16 @@ mod tests {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let unknown = r
-            .search_async("nope", &[0.0; 16], 5, 4, 5, None, None)
+            .search_async("nope", &[0.0; 16], 5, 4, 5, None, None, None)
             .await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
         let dim = r
-            .search_async("embedding", &[0.0; 8], 5, 4, 5, None, None)
+            .search_async("embedding", &[0.0; 8], 5, 4, 5, None, None, None)
             .await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());
@@ -7162,7 +7192,7 @@ mod tests {
         .expect("open_lazy for search_async");
         flaky_a.fail_from_now();
         let err = ra
-            .search_async("embedding", &all[0], 5, 4, 5, None, None)
+            .search_async("embedding", &all[0], 5, 4, 5, None, None, None)
             .await
             .expect_err("search_async must surface failure");
         assert!(
@@ -7180,7 +7210,7 @@ mod tests {
         .expect("open_lazy for search_clusters_async");
         flaky_c.fail_from_now();
         let err = rc
-            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None)
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None, None)
             .await
             .expect_err("search_clusters_async must surface failure");
         assert!(
@@ -7405,7 +7435,7 @@ mod tests {
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
             match ra
-                .search_async("embedding", &all[0], 5, 4, 5, None, None)
+                .search_async("embedding", &all[0], 5, 4, 5, None, None, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
@@ -7423,7 +7453,7 @@ mod tests {
             .expect("open_lazy search_clusters_async");
             flaky_c.fail_after_call(fail_at);
             match rc
-                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None)
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => clusters_errors += 1,
