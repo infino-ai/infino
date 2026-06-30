@@ -258,10 +258,18 @@ const db = connect("az://container/prefix", {
 ```
 
 `connect` probes the backend before returning, so wrong credentials or an
-unreachable bucket throw immediately instead of failing on the first query. An
-unknown key is rejected at `connect`. For an S3-compatible endpoint (MinIO / R2
-/ Ceph), `endpoint` / `region` / `accessKey` / `secretKey` remain as a shorthand
-for the matching `aws_*` options.
+unreachable bucket throw immediately instead of failing on the first query.
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown key
+is rejected at `connect`. For an S3-compatible endpoint (MinIO / R2 / Ceph),
+`endpoint` / `region` / `accessKey` / `secretKey` remain as a shorthand for the
+matching `aws_*` options.
 
 ### Local disk cache
 
