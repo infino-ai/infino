@@ -73,7 +73,7 @@ use rayon::prelude::*;
 use tokio::time::sleep;
 
 use super::{
-    build::{fanout_shards, fanout_shards_in_pool_scope},
+    build::fanout_shards,
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
@@ -783,6 +783,8 @@ impl SupertableWriter {
     /// Dual-write helper for the hidden vector-index supertable: buffer one
     /// shard batch using the user table's stable row ids instead of minting
     /// new ones so global-index hits can map back to user superfiles.
+    // Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+    #[allow(dead_code)]
     pub(crate) fn append_dual_write_batch(
         &mut self,
         ids: &Decimal128Array,
@@ -1390,35 +1392,31 @@ impl SupertableWriter {
         // Dual-write vectors into the hidden index writer, then build/publish
         // user and hidden superfiles in parallel (create via rayon::join,
         // publish via tokio::join).
-        let mut hidden_writer = None;
-        if let Some(vit) = self.inner.vector_index_table.as_ref() {
-            match vit.writer() {
-                Ok(mut vw) => {
-                    for batch in &buffer {
-                        let Some(ids) = batch
-                            .scalar
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Decimal128Array>()
-                        else {
-                            tracing::warn!(
-                                "supertable: hidden vector-index dual-write missing _id column"
-                            );
-                            continue;
-                        };
-                        if let Err(e) = vw.append_dual_write_batch(ids, &batch.vectors) {
-                            tracing::warn!(
-                                "supertable: hidden vector-index append failed: {e} (user-table commit continues; vector search may be stale)"
-                            );
-                            break;
-                        }
-                    }
-                    hidden_writer = Some(vw);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "supertable: hidden vector-index writer unavailable: {e} (vector search may be stale)"
-                    );
+        // Phase A — bootstrap the global cell grid from the FIRST committed batch
+        // into THIS (the user) table's manifest, which is the source of truth for
+        // the grid. The global-aligned user build (below) and the drain read it
+        // from here, and it persists with this commit (`Manifest::update` carries
+        // `global_vector_index` through). The hidden cell-index sibling gets the
+        // grid as a derived copy, written by the drain. No dual-write, no hidden
+        // writer in the commit path. Idempotent: only trains while absent.
+        if self.inner.vector_index_table.is_some()
+            && self.inner.manifest.load().get_global_vector_index().is_none()
+            && !buffer.is_empty()
+        {
+            if let Some(vc) = self.inner.options.vector_columns.first() {
+                if let Some(grid) = bootstrap_centroids_from_batch(
+                    &buffer,
+                    vc.dim,
+                    super::handle::GLOBAL_VECTOR_CELL_COUNT,
+                    vc.metric,
+                ) {
+                    let index = super::manifest::GlobalVectorIndex {
+                        column: vc.column.clone(),
+                        grid,
+                    };
+                    self.inner.manifest.store(Arc::new(
+                        self.inner.manifest.load().with_global_vector_index(index),
+                    ));
                 }
             }
         }
@@ -1484,108 +1482,42 @@ impl SupertableWriter {
         // Parallel publish: user + hidden manifest/storage commits overlap.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
-        let hidden_plan = if let Some(vw) = hidden_writer.as_mut() {
-            Some(vw.plan_hidden_incoming_shard()?)
-        } else {
-            None
-        };
-        let hidden_inner = hidden_writer.as_ref().map(|vw| Arc::clone(&vw.inner));
         // A/B knob (`INFINO_USER_CENTROIDS=global`): build user superfiles
         // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
-        // k-means. With global-aligned user superfiles, the splice drain routes
-        // cluster c → cell c doc-correctly (no scatter), so splice can query at
-        // low nprobe with its cheap drain. The grid is the just-bootstrapped
-        // `plan.clusters` (available even on commit 1 — `plan_hidden_incoming_shard`
-        // bootstrapped it synchronously above). Default `local` is unchanged.
+        // k-means — so the splice/kmeans drain routes cluster c → cell c
+        // doc-correctly. The grid is read from THIS table's manifest (bootstrapped
+        // above, Phase A). Default `local` is unchanged.
         let user_global_centroids: Option<std::sync::Arc<[f32]>> =
             if std::env::var("INFINO_USER_CENTROIDS")
                 .map(|v| v == "global")
                 .unwrap_or(false)
             {
-                hidden_plan
-                    .as_ref()
-                    .filter(|p| p.clusters.n_cent > 0 && p.clusters.dim > 0)
-                    .map(|p| p.clusters.to_fp32().into())
+                self.inner
+                    .manifest
+                    .load()
+                    .get_global_vector_index()
+                    .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
+                    .map(|g| g.grid.to_fp32().into())
             } else {
                 None
             };
-        let (user_batch, hidden_side) =
-            if let (Some(plan), Some(hidden_inner)) = (hidden_plan, hidden_inner) {
-                writer_pool.install(
-                || -> Result<
-                    (
-                        SuperfilePublishBatch,
-                        Option<(Arc<SupertableInner>, HiddenIncomingPrepare)>,
-                    ),
-                    BuildError,
-                > {
-                    let shards_ref = &shards;
-                    let hints = cell_hints.clone();
-                    let hidden_inner = Arc::clone(&hidden_inner);
-                    let (user_batch, hidden_prep) = rayon::join(
-                        || -> Result<SuperfilePublishBatch, BuildError> {
-                            let outputs = fanout_shards_in_pool_scope(shards_ref, |slice| {
-                                build_one_shard_with_layout(
-                                    slice.as_slice(),
-                                    &user_options,
-                                    user_options.vector_layout,
-                                    user_global_centroids.clone(),
-                                )
-                            })?;
-                            prepare_user_superfile_batch_in_scope(&user_inner, outputs, hints)
-                        },
-                        || execute_hidden_incoming_plan_in_scope(&hidden_inner, plan),
-                    );
-                    Ok((
-                        user_batch?,
-                        Some((hidden_inner, hidden_prep?)),
-                    ))
-                },
-            )?
-            } else {
-                let outputs = fanout_shards(&writer_pool, &shards, |slice| {
-                    build_one_shard(slice.as_slice(), &self.inner.options)
-                })?;
-                let batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-                (batch, None)
-            };
 
-        let drive = async {
-            match hidden_side {
-                Some((hidden_inner, prep)) => {
-                    let hidden_storage = hidden_inner
-                        .options
-                        .storage
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| {
-                            BuildError::Store("hidden incoming commit requires storage".into())
-                        })?;
-                    let (user_res, hidden_res) = tokio::join!(
-                        persist_superfile_publish_batch_async(&user_inner, user_batch),
-                        publish_hidden_incoming_async(
-                            Arc::clone(&hidden_inner),
-                            hidden_storage,
-                            prep
-                        ),
-                    );
-                    user_res?;
-                    match hidden_res {
-                        Ok(()) => {
-                            spawn_hidden_spfresh_maintenance(Arc::clone(&hidden_inner));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "supertable: hidden vector-index commit failed: {e} (vector search may be stale)"
-                            );
-                        }
-                    }
-                    Ok::<(), BuildError>(())
-                }
-                None => persist_superfile_publish_batch_async(&user_inner, user_batch).await,
-            }
-        };
-        bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Phase B: user-only build + publish. No hidden incoming build/publish;
+        // the hidden cell index is drained later straight from these user
+        // superfiles, and pre-drain queries fall back to them.
+        let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+            build_one_shard_with_layout(
+                slice.as_slice(),
+                &user_options,
+                user_options.vector_layout,
+                user_global_centroids.clone(),
+            )
+        })?;
+        let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+        bridge_on_runtime(
+            persist_superfile_publish_batch_async(&user_inner, user_batch),
+            &self.inner.query_runtime(),
+        )?;
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
@@ -1650,6 +1582,9 @@ impl ShardOutput {
 
 /// Build one superfile from one slice of buffered batches. Runs on
 /// a rayon worker thread inside the writer pool's `install`.
+// Superseded by `build_one_shard_with_layout` (Phase B) — the commit path now
+// always passes an explicit layout + optional global centroids.
+#[allow(dead_code)]
 fn build_one_shard(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
@@ -2312,6 +2247,8 @@ async fn persist_superfile_publish_batch_async(
 /// maintenance routes them into per-cell IVF superfiles. Amortizes the
 /// per-cell build so it isn't paid on every commit; until routing fires the
 /// incoming superfiles are simply scanned by queries (recall is unaffected).
+// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+#[allow(dead_code)]
 const INCOMING_ROUTE_MIN_SUPERFILES: usize = 4;
 
 /// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
@@ -2343,6 +2280,8 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 /// so it isn't `'static` enough for `spawn`); CPU is bounded by `maint_pool`,
 /// not by a separate runtime. The `compaction_outstanding` single-flight guard
 /// makes concurrent invocations cheap no-ops, so threads don't pile up.
+// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+#[allow(dead_code)]
 fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
     let runtime = inner.query_runtime();
     std::thread::Builder::new()
@@ -2361,6 +2300,8 @@ fn spawn_hidden_spfresh_maintenance(inner: Arc<SupertableInner>) {
 /// to its nearest global cell, build one Sq8 IVF superfile per touched cell,
 /// then publish those cell superfiles and remove the routed incoming
 /// superfiles in one OCC commit.
+// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+#[allow(dead_code)]
 async fn route_incoming_to_manifest_cells(inner: Arc<SupertableInner>) -> Result<(), BuildError> {
     route_incoming_to_manifest_cells_if_ready(inner, INCOMING_ROUTE_MIN_SUPERFILES, None).await
 }
@@ -2441,19 +2382,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
     let _slot = Slot(&hidden_inner.compaction_outstanding);
 
-    // The global cell grid lives in the hidden manifest (bootstrapped at ingest).
-    let (clusters, column, routing) = match hidden_inner.manifest.load_full().get_partition_strategy()
-    {
-        PartitionStrategy::VectorCell {
-            clusters,
-            column,
-            routing,
-        } => (clusters, column, routing),
-        _ => return Ok(()),
+    // The global cell grid is owned by the USER manifest (bootstrapped at the
+    // first commit). The hidden cell index is the derived copy this drain writes.
+    let Some(gvi) = user_inner.manifest.load_full().get_global_vector_index() else {
+        return Ok(());
     };
+    let clusters = gvi.grid;
+    let column = gvi.column;
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(());
     }
+    // Preserve any existing hidden-side query tuning (`routing`) across drains.
+    let routing = match hidden_inner.manifest.load_full().get_partition_strategy() {
+        PartitionStrategy::VectorCell { routing, .. } => routing,
+        _ => Default::default(),
+    };
 
     // Source: every user-table vector superfile.
     let user_manifest = user_inner.manifest.load_full();

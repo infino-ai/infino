@@ -252,6 +252,8 @@ pub(crate) fn nearest_cell_encoded(
 }
 
 /// Max member distance from `cell_id`'s centroid over encoded rows.
+// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+#[allow(dead_code)]
 pub(crate) fn encoded_shard_radius(
     clusters: &ClusterCentroids,
     metric: Metric,
@@ -269,6 +271,8 @@ pub(crate) fn encoded_shard_radius(
 }
 
 /// Assign an encoded row to the nearest cell among `candidates`.
+// Retired by the Phase B dual-write removal; pending incoming-subsystem deletion.
+#[allow(dead_code)]
 pub(crate) fn nearest_among_cells_encoded(
     clusters: &ClusterCentroids,
     metric: Metric,

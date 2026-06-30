@@ -102,10 +102,31 @@ pub struct ManifestList {
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
     pub vector_index_storage_prefix: Option<String>,
+    /// Global vector cell-index coordination state, owned by THIS (the user)
+    /// table. Source of truth for the immutable global cell grid, trained from
+    /// the first committed batch. The hidden cell-index sibling mirrors the
+    /// grid into its own `PartitionStrategy::VectorCell` (a derived copy the
+    /// drain writes, carrying live per-cell counts/radii on top). `None` until
+    /// the first commit with vectors, and on tables without vector columns.
+    pub global_vector_index: Option<GlobalVectorIndex>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
     pub parts: Vec<ManifestPartEntry>,
+}
+
+/// Global vector cell-index state owned by the user-table manifest (see
+/// [`ManifestList::global_vector_index`]). Distinct from
+/// [`PartitionStrategy`]: it describes the *global grid the table's vectors are
+/// indexed into*, not how this table partitions its own superfiles (user
+/// superfiles are append-only and span all cells).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalVectorIndex {
+    /// Vector column this grid indexes.
+    pub column: String,
+    /// Immutable global cell centroids, trained at first commit. Cell `c` of
+    /// the hidden index corresponds to centroid `c` here.
+    pub grid: super::ClusterCentroids,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,7 +778,15 @@ struct ManifestListDto {
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     partition_strategy: PartitionStrategyDto,
+    #[serde(default)]
+    global_vector_index: Option<GlobalVectorIndexDto>,
     parts: Vec<ManifestPartEntryDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GlobalVectorIndexDto {
+    column: String,
+    grid_b64: String,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1237,6 +1266,10 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        global_vector_index: l.global_vector_index.as_ref().map(|g| GlobalVectorIndexDto {
+            column: g.column.clone(),
+            grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
+        }),
         parts,
     })
 }
@@ -1269,6 +1302,19 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
+        global_vector_index: d
+            .global_vector_index
+            .map(|g| -> Result<GlobalVectorIndex, ListParseError> {
+                let bytes = decode_b64(&g.grid_b64, "global_vector_index.grid")?;
+                let grid = decode_cluster_centroids(&bytes).map_err(|e| {
+                    ListParseError::BadFieldValue("global_vector_index.grid", e.to_string())
+                })?;
+                Ok(GlobalVectorIndex {
+                    column: g.column,
+                    grid,
+                })
+            })
+            .transpose()?,
         parts,
     })
 }
@@ -1742,6 +1788,7 @@ mod tests {
 
     fn empty_list() -> ManifestList {
         ManifestList {
+            global_vector_index: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -1976,6 +2023,26 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    #[test]
+    fn global_vector_index_roundtrip() {
+        use super::super::ClusterCentroids;
+        let mut list = empty_list();
+        list.global_vector_index = Some(GlobalVectorIndex {
+            column: "emb".into(),
+            grid: ClusterCentroids::from_fp32(
+                2,
+                4,
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![3, 5],
+            ),
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.global_vector_index, list.global_vector_index);
+        // Absent by default (back-compat: old manifests without the field).
+        assert!(empty_list().global_vector_index.is_none());
     }
 
     #[test]

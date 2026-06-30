@@ -1631,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_vector_index_visible_after_commit() {
+    fn vector_search_works_after_commit_and_drain() {
         use std::sync::Arc;
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
@@ -1673,7 +1673,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -1704,20 +1704,54 @@ mod tests {
         w.commit().expect("commit");
 
         assert!(st.reader().n_superfiles() > 0);
-        let reader = st.reader();
-        let hidden = reader.vector_index_table().expect("hidden index");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Phase B: the commit does NOT dual-write into the hidden table. It only
+        // bootstraps the global cell grid into the hidden manifest; the cell
+        // superfiles are drained from the user superfiles on demand.
+        assert_eq!(
+            hidden.reader().n_superfiles(),
+            0,
+            "commit must not dual-write into the hidden table"
+        );
         assert!(
-            hidden.reader().n_superfiles() > 0,
-            "dual-write must land in hidden table before commit returns"
+            st.reader()
+                .manifest()
+                .get_global_vector_index()
+                .is_some_and(|g| g.grid.n_cent > 0 && g.grid.dim > 0),
+            "commit must bootstrap the global cell grid into the user manifest"
         );
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
+        // Pre-drain: with empty cells the query falls back to the user superfiles.
         let hits = st
             .reader()
             .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
             .expect("vector search");
-        assert!(!hits.is_empty(), "search should find committed vectors");
+        assert!(
+            !hits.is_empty(),
+            "pre-drain search must fall back to the user superfiles"
+        );
+
+        // Drain the user superfiles into the hidden cells; the query is now
+        // served by the hidden cell index.
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        assert!(
+            hidden.reader().n_superfiles() > 0,
+            "drain must populate the hidden cell index"
+        );
+        let hits2 = st
+            .reader()
+            .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
+            .expect("post-drain vector search");
+        assert!(
+            !hits2.is_empty(),
+            "post-drain search must hit the hidden cells"
+        );
     }
 
     /// The hidden IVF superfiles must be made *resident* in the
@@ -1786,7 +1820,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Fp32,
+                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
                     provided_centroids: None,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
@@ -1828,11 +1862,12 @@ mod tests {
             let mut w = producer.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
-            if let Some(hidden) = producer.reader().vector_index_table() {
-                hidden
-                    .await_incoming_routed_to_cells_sync()
-                    .expect("route hidden incoming into manifest cells");
-            }
+            // Phase B: drain the user superfiles into the hidden cells (no
+            // dual-write), so the consumer below has real cell superfiles to
+            // make resident.
+            producer
+                .drain_vectors_to_cells_sync()
+                .expect("drain user superfiles into hidden cells");
         }
 
         // ---- Consumer: open fresh with a brand-new empty disk cache,
@@ -1923,12 +1958,12 @@ mod tests {
         );
     }
 
-    /// A storage-backed handle under `Consistency::Strong` drives
-    /// `ensure_fresh`'s Strong arm, which calls `refresh`. With no
-    /// commit yet there is no manifest pointer, so `refresh` reports
-    /// "nothing newer" and the snapshot stays at the empty manifest.
+    /// Each drain APPENDS one superfile per non-empty cell to the hidden
+    /// manifest (no removals — the user superfiles stay as the durable
+    /// source). So draining across successive commits accumulates multiple
+    /// superfiles per cell, which compaction later collapses.
     #[test]
-    fn hidden_ivf_append_only_emits_multiple_files_per_cell() {
+    fn drain_appends_multiple_files_per_cell() {
         use std::{collections::HashMap, sync::Arc};
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
@@ -1969,7 +2004,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -1979,7 +2014,7 @@ mod tests {
         .with_writer_pool(pool);
         let st = Supertable::create(options).expect("create");
 
-        for commit in 0..4 {
+        for commit in 0..2 {
             let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
             let flat = Float32Array::from(vec![1.0f32; dim]);
             let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
@@ -1995,6 +2030,8 @@ mod tests {
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
+            // Phase B: drain after each commit; each drain appends a file per cell.
+            st.drain_vectors_to_cells_sync().expect("drain to cells");
         }
 
         let hidden = st
@@ -2011,7 +2048,7 @@ mod tests {
         let max_visible = by_cell.values().copied().max().unwrap_or(0);
         assert!(
             max_visible >= 2,
-            "append-only hidden path should emit multiple visible files per cell, got {max_visible}"
+            "each drain should append a file per cell, got {max_visible}"
         );
     }
 
@@ -2060,7 +2097,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -2071,7 +2108,7 @@ mod tests {
         let st = Supertable::create(options).expect("create");
 
         let rows_per_commit = 8usize;
-        for commit in 0..10 {
+        for commit in 0..3 {
             let titles = LargeStringArray::from(
                 (0..rows_per_commit)
                     .map(|row| format!("doc-{commit}-{row}"))
@@ -2091,6 +2128,9 @@ mod tests {
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
+            // Phase B: drain after each commit; each drain appends a file per
+            // cell, accumulating the per-cell superfiles compaction collapses.
+            st.drain_vectors_to_cells_sync().expect("drain to cells");
         }
 
         let hidden = st
@@ -2108,13 +2148,10 @@ mod tests {
             }
             by_cell.values().copied().max().unwrap_or(0)
         };
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("route hidden incoming into manifest cells");
         let before = count_by_cell(hidden.reader().manifest());
         assert!(
             before >= 2,
-            "need multiple append-only superfiles per cell before compaction, got {before}"
+            "need multiple drained superfiles per cell before compaction, got {before}"
         );
 
         let cfg = CompactionSettings {

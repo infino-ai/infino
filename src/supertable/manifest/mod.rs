@@ -50,7 +50,7 @@ use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, ScalarStatsAgg};
+pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg};
 use rayon::prelude::*;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -206,6 +206,11 @@ pub struct Manifest {
     /// Stamped partition strategy before the first list lands, or
     /// when updating strategy without rebuilding options.
     stamped_partition_strategy: Option<PartitionStrategy>,
+    /// Stamped global vector grid before the first list lands (mirrors
+    /// `stamped_partition_strategy`): the user commit bootstraps the grid into
+    /// this on the first commit-with-vectors, and `update` reads it back via
+    /// [`Manifest::get_global_vector_index`] to persist it into the new list.
+    stamped_global_vector_index: Option<list::GlobalVectorIndex>,
 }
 
 impl fmt::Debug for Manifest {
@@ -255,6 +260,7 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
             }
         } else {
             Self {
@@ -263,6 +269,7 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: None,
                 stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
             }
         }
     }
@@ -284,6 +291,7 @@ impl Manifest {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         }
     }
 
@@ -300,6 +308,7 @@ impl Manifest {
             parts: dashmap::DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         }
     }
 
@@ -323,6 +332,17 @@ impl Manifest {
             .as_ref()
             .map(|l| l.partition_strategy.clone())
             .unwrap_or(self.superfile_list.options.effective_partition_strategy())
+    }
+
+    /// The global vector cell-index grid this (user) table owns, or `None`
+    /// before the first commit-with-vectors. Honors the in-memory stamp set by
+    /// [`Manifest::with_global_vector_index`] before the first list lands, then
+    /// the persisted list.
+    pub fn get_global_vector_index(&self) -> Option<list::GlobalVectorIndex> {
+        if let Some(g) = &self.stamped_global_vector_index {
+            return Some(g.clone());
+        }
+        self.list.as_ref().and_then(|l| l.global_vector_index.clone())
     }
 
     pub fn get_num_parts(&self) -> usize {
@@ -524,6 +544,7 @@ impl Manifest {
             parts,
             loader: Some(loader),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         };
 
         Ok(Arc::new(new_manifest))
@@ -668,6 +689,7 @@ impl Manifest {
             parts: DashMap::new(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
         }
     }
 
@@ -694,6 +716,32 @@ impl Manifest {
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: Some(strategy),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+        }
+    }
+
+    /// Stamp (or replace) the global vector cell-index grid on this snapshot.
+    /// Mirrors [`Manifest::with_partition_strategy`]: updates the persisted list
+    /// metadata when present, and the in-memory stamp used before the first
+    /// list write lands (the first commit-with-vectors).
+    pub fn with_global_vector_index(&self, index: list::GlobalVectorIndex) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.global_vector_index = Some(index.clone());
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: Some(index),
         }
     }
 
@@ -1005,6 +1053,7 @@ impl Manifest {
                 .collect(),
             partition_strategy: strategy,
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
+            global_vector_index: self.get_global_vector_index(),
             parts: out_list_entries_after_removal,
         };
 
@@ -1057,6 +1106,7 @@ impl Manifest {
             parts,
             loader,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -2569,6 +2619,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
             ManifestList {
+                global_vector_index: None,
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2605,6 +2656,7 @@ mod tests {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
             }
         }
 
@@ -2798,6 +2850,7 @@ mod tests {
         use list::{ManifestList, PartitionStrategy};
         let entry = part::PartId::new_v4();
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2830,6 +2883,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -2947,6 +3001,7 @@ mod tests {
         Arc::new(Manifest {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(ManifestList {
+                global_vector_index: None,
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -2964,6 +3019,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         })
     }
 
@@ -3042,6 +3098,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3086,6 +3143,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3189,6 +3247,7 @@ mod tests {
         // entry for partition A (the rewrite candidate); A_old is the
         // frozen older entry; B is an untouched partition.
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3232,6 +3291,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Commit one new superfile into partition A. Keep `new_entry`
@@ -3398,6 +3458,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3442,6 +3503,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3493,6 +3555,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3537,6 +3600,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3626,6 +3690,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3685,6 +3750,7 @@ mod tests {
             parts,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Add one new entry for the partition
@@ -3755,6 +3821,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3817,6 +3884,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let new_entries = vec![
@@ -3886,6 +3954,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3948,6 +4017,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // Only touch partition A
@@ -4038,6 +4108,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4126,6 +4197,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let new_entries = vec![
@@ -4194,6 +4266,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4237,6 +4310,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4285,6 +4359,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4328,6 +4403,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4392,6 +4468,7 @@ mod tests {
             .expect("write part_b");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4454,6 +4531,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4530,6 +4608,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4596,6 +4675,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4658,6 +4738,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4701,6 +4782,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4740,6 +4822,7 @@ mod tests {
             .expect("write part");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4783,6 +4866,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -4843,6 +4927,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4909,6 +4994,7 @@ mod tests {
             parts: parts_map,
             loader: Some(Arc::new(loader)),
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4967,6 +5053,7 @@ mod tests {
             })
             .collect();
         ManifestList {
+            global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -4990,6 +5077,7 @@ mod tests {
             parts: DashMap::new(),
             loader: None,
             stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
         }
     }
 
