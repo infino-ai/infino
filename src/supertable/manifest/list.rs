@@ -102,6 +102,11 @@ pub struct ManifestList {
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
     pub vector_index_storage_prefix: Option<String>,
+    /// Content-addressed blob of tombstoned user `_id`s not yet physically
+    /// removed from hidden cell superfiles. Consulted in memory by vector
+    /// search on the hidden index (zero per-cell tombstone GETs).
+    pub deleted_user_ids_uri: Option<String>,
+    pub deleted_user_ids_content_hash: Option<ContentHash>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -756,6 +761,10 @@ struct ManifestListDto {
     vector_columns: Vec<VectorColumnInfoDto>,
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
+    #[serde(default)]
+    deleted_user_ids_uri: Option<String>,
+    #[serde(default)]
+    deleted_user_ids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     parts: Vec<ManifestPartEntryDto>,
 }
@@ -1237,6 +1246,11 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
+        deleted_user_ids_content_hash: l
+            .deleted_user_ids_content_hash
+            .as_ref()
+            .map(encode_hash),
         parts,
     })
 }
@@ -1269,6 +1283,12 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
+        deleted_user_ids_uri: d.deleted_user_ids_uri,
+        deleted_user_ids_content_hash: d
+            .deleted_user_ids_content_hash
+            .as_deref()
+            .map(decode_hash)
+            .transpose()?,
         parts,
     })
 }
@@ -1755,6 +1775,8 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![],
         }
     }

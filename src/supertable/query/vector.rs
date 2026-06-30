@@ -92,7 +92,8 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader, is_hidden_vector_index_table},
+        hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
@@ -309,17 +310,24 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
-    read_ids_for_locals(manifest, entry, &locals, id_column).await
+    read_ids_for_locals(manifest, entry, &locals, id_column, true).await
 }
 
 /// Read the `_id` column values at `local_ids` (in caller order) from one
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
+///
+/// `allow_inline_region` selects the resolution source:
+///
+///   - `true` — prefer the IVF blob's inline `_id` region (hidden cells).
+///   - `false` — never use the inline region; read the scalar `_id` column
+///     (user superfiles after compaction — inline region is cluster-ordered).
 async fn read_ids_for_locals(
     manifest: &Manifest,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
+    allow_inline_region: bool,
 ) -> Result<Vec<i128>, QueryError> {
     let storage = manifest
         .options
@@ -329,25 +337,24 @@ async fn read_ids_for_locals(
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
     let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
-    // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
-    // straight from it (resident; no scalar `_id` column read) when available.
-    if let Some(ids) = reader
-        .vec()
-        .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
-    {
-        return Ok(ids);
-    }
-    // Cold path: the region is present but not resident (the search fetched
-    // centroids/cluster_idx + blocks, never the region). Fetch it async and
-    // index it — far cheaper than the scalar `_id` decode below, and the path
-    // the inline-`_id` region was built for. (Warm hits the sync branch above.)
-    if let Some(v) = reader.vec() {
-        if let Some(ids) = v
-            .inline_stable_ids_for_locals_async(local_ids)
-            .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+    if allow_inline_region {
+        // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
+        // straight from it (resident; no scalar `_id` column read) when available.
+        if let Some(ids) = reader
+            .vec()
+            .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
         {
             return Ok(ids);
+        }
+        // Cold path: fetch the inline region async when present but not resident.
+        if let Some(v) = reader.vec() {
+            if let Some(ids) = v
+                .inline_stable_ids_for_locals_async(local_ids)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?
+            {
+                return Ok(ids);
+            }
         }
     }
     if reader.parquet_bytes().is_some() {
@@ -434,7 +441,8 @@ async fn hidden_hits_user_ids(
         }
         // Gapped span → one resident read of just the rows these hits touch.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column).await?;
+        let vals =
+            read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -520,7 +528,7 @@ async fn remap_hidden_hits_to_user_hits(
         let all_locals: Vec<u32> = (0..n as u32).collect();
         // Column is monotonic (ids minted in row order) → binary-searchable.
         let id_col =
-            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column).await?;
+            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column, false).await?;
         for &i in &idxs {
             let user_row_id = user_ids[i];
             let pos = id_col.binary_search(&user_row_id).map_err(|_| {
@@ -554,8 +562,28 @@ impl SupertableReader {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(superfiles.to_vec(), column, query, k, options, None)
-            .await
+        let hidden_deleted = if is_hidden_vector_index_table(&self.manifest().options) {
+            let manifest = self.manifest();
+            let Some(storage) = manifest.options.storage.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let deleted = hidden_deleted::load_deleted_user_ids(manifest, storage.as_ref())
+                .await
+                .map_err(|e| QueryError::Store(e.to_string()))?;
+            Some(Arc::new(deleted))
+        } else {
+            None
+        };
+        self.vector_fanout_over_superfiles(
+            superfiles.to_vec(),
+            column,
+            query,
+            k,
+            options,
+            None,
+            hidden_deleted,
+        )
+        .await
     }
 
     async fn vector_fanout_over_superfiles(
@@ -566,6 +594,7 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+        hidden_deleted: Option<Arc<Vec<i128>>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let filtered = allow.is_some();
         let (nprobe, _) = options.resolve(filtered);
@@ -683,23 +712,39 @@ impl SupertableReader {
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let deleted_for_kernel = hidden_deleted.clone();
         let kernel =
             move |reader: Arc<SuperfileReader>,
                   (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
+                let deleted = deleted_for_kernel.clone();
                 async move {
+                    let deny = if let Some(ref deleted) = deleted {
+                        match reader.vec() {
+                            Some(v) => v
+                                .inline_deleted_locals(deleted.as_slice())
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let deny = deny.map(Arc::new);
                     let res = match probe {
                         Probe::Clusters(ids) => {
                             reader
                                 .vector_search_clusters_filtered(
-                                    &column, &query, k, &ids, options, bitmap,
+                                    &column, &query, k, &ids, options, bitmap, deny,
                                 )
                                 .await
                         }
                         Probe::Nprobe => {
                             reader
-                                .vector_hits_filtered_async(&column, &query, k, options, bitmap)
+                                .vector_hits_filtered_async(
+                                    &column, &query, k, options, bitmap, deny,
+                                )
                                 .await
                         }
                     };
@@ -711,20 +756,38 @@ impl SupertableReader {
         // width so transient memory stays bounded. The unfiltered path
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
+        let use_untombstoned = hidden_deleted.is_some();
         let per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
             let mut collected = Vec::new();
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(dispatch::fanout(self, wave, kernel.clone()).await?);
+                collected.extend(if use_untombstoned {
+                    dispatch::fanout_untombstoned(self, wave, kernel.clone()).await?
+                } else {
+                    dispatch::fanout(self, wave, kernel.clone()).await?
+                });
             }
             collected
+        } else if use_untombstoned {
+            dispatch::fanout_untombstoned(self, units, kernel).await?
         } else {
             dispatch::fanout(self, units, kernel).await?
         };
 
-        Ok(top_k_ascending(per_superfile, k))
+        let mut hits = top_k_ascending(per_superfile, k);
+        // Backstop for INCOMING staging superfiles (no inline `_id` region for
+        // kernel deny): drop hits whose resolved user `_id` is tombstoned.
+        if let Some(deleted) = hidden_deleted.as_ref() {
+            if !deleted.is_empty() {
+                hits.retain(|h| {
+                    h.stable_id
+                        .is_none_or(|id| deleted.binary_search(&id).is_err())
+                });
+            }
+        }
+        Ok(hits)
     }
 
     /// Filtered single-column vector kNN: the k-nearest rows **among
@@ -802,7 +865,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
             .await
     }
 
@@ -901,7 +964,7 @@ impl SupertableReader {
         if allow.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
             .await
     }
 
@@ -962,7 +1025,7 @@ impl SupertableReader {
             .into_iter()
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect();
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
             .await
     }
 
@@ -1025,7 +1088,7 @@ impl SupertableReader {
             }
         };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, body).await?;
+            dispatch::fanout_with(self, units, true, body).await?;
         Ok(pairs
             .into_iter()
             .filter(|(_, bm)| !bm.is_empty())

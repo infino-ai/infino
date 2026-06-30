@@ -128,11 +128,12 @@ use crate::{
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
         error::ManifestError,
+        hidden_deleted::{self, encode_deleted_ids, storage_path},
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
-            part::{self as part_mod, PartId},
+            part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
         query::{
@@ -1270,6 +1271,16 @@ impl SupertableWriter {
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
+        // The hidden vector-index cells are not rewritten on a user delete, so
+        // the deleted rows stay physically present in them. Record the resolved
+        // user `_id`s into the hidden index's resident deleted-set so vector
+        // search drops them in memory (zero per-cell tombstone GETs).
+        let hidden_inner = self
+            .inner
+            .vector_index_table
+            .as_ref()
+            .map(|vit| Arc::clone(vit.inner()));
+        let deleted_ids: Vec<i128> = entry.target_ids.clone();
         let drive = async move {
             let etag = wal_store
                 .create(&wal_doc)
@@ -1288,6 +1299,15 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
+            if let Some(hi) = hidden_inner {
+                if let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await {
+                    tracing::warn!(
+                        "supertable: hidden vector-index deleted-set record failed: {e} \
+                         (user-table delete is durable; vector search may transiently \
+                         return deleted rows until the next successful record)"
+                    );
+                }
+            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -2980,6 +3000,66 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// superfiles go into one `ManifestPart` with a fresh `PartId`.
 /// With a real `PartitionStrategy`, `try_commit_attempt` runs
 /// the per-partition part-reuse path described on that fn.
+async fn record_hidden_deleted_ids(
+    inner: &SupertableInner,
+    new_deleted: &[i128],
+) -> Result<(), BuildError> {
+    if new_deleted.is_empty() {
+        return Ok(());
+    }
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let has_data = !old.superfiles.is_empty() || old.get_num_parts() > 0;
+        if !has_data {
+            return Ok(());
+        }
+        let mut ids = hidden_deleted::load_deleted_user_ids(&old, storage.as_ref())
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let before = ids.len();
+        ids.extend_from_slice(new_deleted);
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() == before {
+            return Ok(());
+        }
+        let bytes = encode_deleted_ids(&ids);
+        let hash = ContentHash::of(&bytes);
+        let uri = storage_path(&hash);
+        storage
+            .put_atomic(&uri, Bytes::from(bytes))
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let new_manifest = old.with_deleted_user_ids(uri, hash);
+        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(
+        "deleted-set record: write contention exhausted".into(),
+    ))
+}
+
 pub(in crate::supertable) async fn persist_commit_async(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,

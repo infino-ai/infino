@@ -667,6 +667,40 @@ impl Manifest {
         }
     }
 
+    pub(crate) fn deleted_user_ids_blob(&self) -> Option<(&str, part::ContentHash)> {
+        let list = self.list.as_ref()?;
+        Some((
+            list.deleted_user_ids_uri.as_deref()?,
+            list.deleted_user_ids_content_hash?,
+        ))
+    }
+
+    /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
+    /// blob reference. Bumps `manifest_id` like a normal commit without
+    /// touching superfiles or parts.
+    pub fn with_deleted_user_ids(&self, uri: String, hash: part::ContentHash) -> Self {
+        let next_id = self.get_next_manifest_id();
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.manifest_id = next_id;
+            list.deleted_user_ids_uri = Some(uri);
+            list.deleted_user_ids_content_hash = Some(hash);
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: next_id,
+                options: Arc::clone(&self.superfile_list.options),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self.superfile_list.vector_index_storage_prefix.clone(),
+            },
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+        }
+    }
+
     /// Stamp (or replace) the partition strategy on this manifest snapshot.
     /// Updates both the persisted list metadata and the in-memory options
     /// fallback used before the first list write lands.
@@ -1025,6 +1059,14 @@ impl Manifest {
                 .collect(),
             partition_strategy: strategy,
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
+            deleted_user_ids_uri: self
+                .list
+                .as_ref()
+                .and_then(|l| l.deleted_user_ids_uri.clone()),
+            deleted_user_ids_content_hash: self
+                .list
+                .as_ref()
+                .and_then(|l| l.deleted_user_ids_content_hash),
             parts: out_list_entries_after_removal,
         };
 
@@ -2636,6 +2678,8 @@ mod tests {
                     n_buckets: 64,
                 },
                 vector_index_storage_prefix: None,
+                deleted_user_ids_uri: None,
+                deleted_user_ids_content_hash: None,
                 parts: entries,
             }
         }
@@ -2865,6 +2909,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -3014,6 +3060,8 @@ mod tests {
                     n_buckets: 1,
                 },
                 vector_index_storage_prefix: None,
+                deleted_user_ids_uri: None,
+                deleted_user_ids_content_hash: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -3109,6 +3157,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3256,6 +3306,8 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 entry_for(&pw_a_old, &pk_a),
                 entry_for(&pw_a_latest, &pk_a),
@@ -3465,6 +3517,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3560,6 +3614,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3693,6 +3749,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -3822,6 +3880,8 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -3953,6 +4013,8 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -4105,6 +4167,8 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -4261,6 +4325,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4352,6 +4418,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4459,6 +4527,8 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -4597,6 +4667,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -4725,6 +4797,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4807,6 +4881,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4910,6 +4986,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -5034,6 +5112,8 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts,
         }
     }

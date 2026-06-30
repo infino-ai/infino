@@ -168,6 +168,12 @@ struct ProbeCtx<'a> {
     k: usize,
     rerank_mult: usize,
     allow: Option<Arc<RoaringBitmap>>,
+    /// Deny-set of local doc-ids to EXCLUDE before the coarse heap — tombstoned
+    /// rows on the hidden vector path. Distinct from `allow` (keep-only): a
+    /// candidate is scored iff it is in `allow` (when set) AND not in `deny`.
+    /// Applying it pre-heap (not as a post-filter) preserves recall@k under
+    /// deletes — each cell's top-k is selected from live rows only.
+    deny: Option<Arc<RoaringBitmap>>,
 }
 
 impl ColumnReader {
@@ -1373,6 +1379,52 @@ impl VectorReader {
         Ok(Some(out))
     }
 
+    /// Build the per-cell deny-set of LOCAL doc-ids whose stable `_id` is in
+    /// `deleted` (a sorted-ascending set of tombstoned user `_id`s), straight
+    /// from the inline stable-`_id` region — one contiguous region read
+    /// (resident after the cell's data wave) and one pass. The hidden read
+    /// path passes this to the coarse-scan kernel so tombstoned rows are
+    /// excluded *before* the per-cell top-k heap, preserving recall@k under
+    /// deletes.
+    ///
+    /// `Ok(None)` when the cell has no inline region (e.g. INCOMING staging
+    /// superfiles — the caller's post-merge filter covers those) or no local is
+    /// deleted.
+    pub(crate) async fn inline_deleted_locals(
+        &self,
+        deleted: &[i128],
+    ) -> Result<Option<RoaringBitmap>, VectorError> {
+        if deleted.is_empty() {
+            return Ok(None);
+        }
+        let Some(col) = self.columns.iter().find(|c| c.has_inline_stable_ids()) else {
+            return Ok(None);
+        };
+        let Some(range) = col.stable_ids_region_range() else {
+            return Ok(None);
+        };
+        let region = self
+            .source
+            .range_async(range)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let stride = format::vec::STABLE_ID_BYTES;
+        let mut deny = RoaringBitmap::new();
+        for local in 0..(region.len() / stride) {
+            let p = local * stride;
+            let arr: [u8; format::vec::STABLE_ID_BYTES] =
+                region[p..p + stride].try_into().map_err(|_| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "inline stable_id region slice".into(),
+                    ))
+                })?;
+            if deleted.binary_search(&i128::from_le_bytes(arr)).is_ok() {
+                deny.insert(local as u32);
+            }
+        }
+        Ok(if deny.is_empty() { None } else { Some(deny) })
+    }
+
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
     pub(crate) fn sq8_ivf_merge_input(
         &self,
@@ -1739,6 +1791,7 @@ impl VectorReader {
             k,
             rerank_mult,
             allow: None,
+            deny: None,
         };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
@@ -1812,6 +1865,7 @@ impl VectorReader {
         // `None` = unfiltered; threaded to the coarse shortlist so the
         // top-k is the true k-nearest among matching rows.
         allow: Option<Arc<RoaringBitmap>>,
+        deny: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1863,6 +1917,7 @@ impl VectorReader {
             k,
             rerank_mult: rerank_mult_eff,
             allow,
+            deny,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -1886,6 +1941,9 @@ impl VectorReader {
         // `None` = unfiltered; threaded to the coarse shortlist so the
         // top-k is the true k-nearest among matching rows.
         allow: Option<Arc<RoaringBitmap>>,
+        // Tombstone deny-set (per-superfile deleted local doc-ids), excluded
+        // before the coarse heap so the top-k is selected from live rows.
+        deny: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1915,6 +1973,7 @@ impl VectorReader {
             k,
             rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
             allow,
+            deny,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -2339,6 +2398,7 @@ async fn build_shortlist(
                 &col.quant,
                 ctx.q_rot,
                 ctx.allow.as_deref(),
+                ctx.deny.as_deref(),
                 heap,
             );
         };
@@ -2354,9 +2414,10 @@ async fn build_shortlist(
         let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
-        // Move an `Arc` clone of the allow-set into the rayon task; each
-        // chunk borrows it as `Option<&RoaringBitmap>` via `as_deref`.
+        // Move an `Arc` clone of the allow-set + deny-set into the rayon task;
+        // each chunk borrows them as `Option<&RoaringBitmap>` via `as_deref`.
         let allow_owned = ctx.allow.clone();
+        let deny_owned = ctx.deny.clone();
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
             let acc = meta_owned
@@ -2378,6 +2439,7 @@ async fn build_shortlist(
                             &quant,
                             &q_rot_v,
                             allow_owned.as_deref(),
+                            deny_owned.as_deref(),
                             &mut heap,
                         );
                     }
@@ -2600,6 +2662,7 @@ fn score_cluster_codes_into_heap(
     quant: &BitQuantizer,
     q_rot: &[f32],
     allow: Option<&roaring::RoaringBitmap>,
+    deny: Option<&roaring::RoaringBitmap>,
     out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
@@ -2619,6 +2682,11 @@ fn score_cluster_codes_into_heap(
         // post-filter. Decode the code (the hot work) only for an
         // allowed candidate.
         if allow.is_some_and(|bm| !bm.contains(did)) {
+            continue;
+        }
+        // Tombstone deny-set: exclude deleted rows here, before they can take a
+        // coarse-heap slot, so the per-cell top-k is selected from live rows.
+        if deny.is_some_and(|bm| bm.contains(did)) {
             continue;
         }
         let code = &cluster_codes[i * cb..(i + 1) * cb];
@@ -3576,11 +3644,11 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank, None)
+            .search_async("v", q, k, n_cent as usize, rerank, None, None)
             .await
             .expect("search_async");
         let probed = r
-            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None)
+            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None, None)
             .await
             .expect("search_clusters_async");
 
@@ -3595,7 +3663,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank, None)
+            .search_clusters_async("v", q, k, &[], rerank, None, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -6698,11 +6766,11 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
@@ -6735,11 +6803,11 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None)
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None)
+            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None)
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6749,7 +6817,7 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None)
+            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None, None)
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6760,13 +6828,13 @@ mod tests {
         // resolve_column error arms reached through the async entry point.
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None).await;
+        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None, None).await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
-        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None).await;
+        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None, None).await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5, None)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());
@@ -7361,7 +7429,7 @@ mod tests {
         .expect("open_lazy for search_async");
         flaky_a.fail_from_now();
         let err = ra
-            .search_async("embedding", &all[0], 5, 4, 5, None)
+            .search_async("embedding", &all[0], 5, 4, 5, None, None)
             .await
             .expect_err("search_async must surface failure");
         assert!(
@@ -7379,7 +7447,7 @@ mod tests {
         .expect("open_lazy for search_clusters_async");
         flaky_c.fail_from_now();
         let err = rc
-            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
+            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None)
             .await
             .expect_err("search_clusters_async must surface failure");
         assert!(
@@ -7603,7 +7671,7 @@ mod tests {
             .await
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
-            match ra.search_async("embedding", &all[0], 5, 4, 5, None).await {
+            match ra.search_async("embedding", &all[0], 5, 4, 5, None, None).await {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
                 Ok(_) => {}
                 other => panic!("search_async unexpected outcome: {other:?}"),
@@ -7619,7 +7687,7 @@ mod tests {
             .expect("open_lazy search_clusters_async");
             flaky_c.fail_after_call(fail_at);
             match rc
-                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None)
+                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => clusters_errors += 1,

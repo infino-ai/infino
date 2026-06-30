@@ -195,6 +195,7 @@ where
     fanout_with(
         reader,
         units,
+        true,
         move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
             async move {
@@ -207,6 +208,49 @@ where
                 // on cold, resident on warm). INCOMING staging superfiles:
                 // scalar `_id` column via sync `take_by_local_doc_ids` on
                 // resident bytes — both skip the trailing remap GET.
+                if !tagged.is_empty() {
+                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
+                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
+                        for (h, id) in tagged.iter_mut().zip(ids) {
+                            h.stable_id = Some(id);
+                        }
+                    }
+                }
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        },
+    )
+    .await
+}
+
+/// Fan-out for the hidden vector-index path. Identical to [`fanout`] — runs
+/// the kernel, tags hits, and piggybacks the hidden→user `_id` resolve — but
+/// does NOT prefetch or apply per-cell tombstone sidecars. The hidden cells'
+/// sidecars are never populated (user deletes are recorded in the resident
+/// deleted-set instead), so the prefetch wave fetched only empty objects on
+/// the cold critical path and the post-score filter was a no-op. Deletes are
+/// dropped by the caller against the resident deleted-set, keyed by the
+/// `stable_id` resolved here.
+pub(crate) async fn fanout_untombstoned<P, K, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    fanout_with(
+        reader,
+        units,
+        false,
+        move |r, entry, _tombstone_cache, _now, params| {
+            let kernel = kernel.clone();
+            async move {
+                let reader_for_ids = Arc::clone(&r);
+                let hits = kernel(r, params).await?;
+                let mut tagged = tag_hits(&entry, hits);
                 if !tagged.is_empty() {
                     let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
                     if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
@@ -243,6 +287,7 @@ where
 pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
+    prefetch_tombstones: bool,
     body: B,
 ) -> Result<Vec<R>, QueryError>
 where
@@ -265,12 +310,17 @@ where
     let now = Instant::now();
 
     // Warm the tombstone sidecars for every distinct superfile in one
-    // concurrent batch before the per-superfile fan-out.
-    if let Some(cache) = tombstone_cache.as_ref() {
-        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        cache.prefetch(&ids, now).await;
+    // concurrent batch before the per-superfile fan-out. Skipped by callers
+    // whose tombstones are resolved elsewhere (the hidden path filters via
+    // the resident deleted-set, so its per-cell sidecars are always empty
+    // and prefetching them is a wasted wave of GETs on the cold critical path).
+    if prefetch_tombstones {
+        if let Some(cache) = tombstone_cache.as_ref() {
+            let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            cache.prefetch(&ids, now).await;
+        }
     }
 
     let handles = units.into_iter().map(|(entry, params)| {
