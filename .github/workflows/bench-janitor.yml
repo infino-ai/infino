@@ -31,6 +31,8 @@ env:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    # OIDC subject and Azure secrets are scoped to `ci`.
+    environment: ci
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
