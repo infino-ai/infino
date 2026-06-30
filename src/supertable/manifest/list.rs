@@ -113,6 +113,11 @@ pub struct ManifestList {
     /// user manifest). The hidden-index drain advances this as it consumes user
     /// commits into cells; see [`DrainedVersionRanges`].
     pub drained_ranges: DrainedVersionRanges,
+    /// Content-addressed blob of tombstoned user `_id`s not yet physically
+    /// removed from hidden cell superfiles. Consulted in memory by vector
+    /// search on the hidden index (zero per-cell tombstone GETs).
+    pub deleted_user_ids_uri: Option<String>,
+    pub deleted_user_ids_content_hash: Option<ContentHash>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -859,6 +864,10 @@ struct ManifestListDto {
     vector_columns: Vec<VectorColumnInfoDto>,
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
+    #[serde(default)]
+    deleted_user_ids_uri: Option<String>,
+    #[serde(default)]
+    deleted_user_ids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1355,6 +1364,11 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
         }),
         drained_ranges: l.drained_ranges.intervals().to_vec(),
+        deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
+        deleted_user_ids_content_hash: l
+            .deleted_user_ids_content_hash
+            .as_ref()
+            .map(encode_hash),
         parts,
     })
 }
@@ -1401,6 +1415,12 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             })
             .transpose()?,
         drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges),
+        deleted_user_ids_uri: d.deleted_user_ids_uri,
+        deleted_user_ids_content_hash: d
+            .deleted_user_ids_content_hash
+            .as_deref()
+            .map(decode_hash)
+            .transpose()?,
         parts,
     })
 }
@@ -1888,6 +1908,8 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: vec![],
         }
     }

@@ -27,6 +27,7 @@ pub(crate) mod build;
 pub(crate) mod compaction;
 pub mod error;
 pub(crate) mod gc;
+pub(crate) mod hidden_deleted;
 pub mod handle;
 pub mod lazy_source;
 pub mod manifest;

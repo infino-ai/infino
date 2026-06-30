@@ -356,6 +356,8 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
             parts: entries,
         }
     }
