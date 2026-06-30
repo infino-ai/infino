@@ -115,6 +115,7 @@ fn build_blob(vectors: &[f32], codec: RerankCodec) -> Vec<u8> {
         rot_seed: 7,
         metric: Metric::Cosine,
         rerank_codec: codec,
+        provided_centroids: None,
     })
     .expect("register column");
     for i in 0..N_DOCS {

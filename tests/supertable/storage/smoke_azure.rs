@@ -120,6 +120,7 @@ fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            provided_centroids: None,
         }],
         Some(infino::test_helpers::default_tokenizer()),
     )

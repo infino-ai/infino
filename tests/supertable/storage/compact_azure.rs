@@ -240,6 +240,7 @@ fn options_title_emb() -> SupertableOptions {
             rot_seed: VECTOR_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     )

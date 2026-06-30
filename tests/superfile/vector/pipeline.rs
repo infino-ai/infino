@@ -65,6 +65,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         rot_seed: TEXT_EMB_ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
     b.register_column(VectorConfig {
@@ -74,6 +75,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         rot_seed: IMAGE_EMB_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
 
@@ -254,6 +256,7 @@ async fn end_to_end_planted_clusters_recovered() {
         rot_seed: CLUSTER_TEST_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
 

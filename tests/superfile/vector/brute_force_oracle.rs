@@ -136,6 +136,7 @@ fn build_reader(
         rot_seed,
         metric,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
     for v in corpus {

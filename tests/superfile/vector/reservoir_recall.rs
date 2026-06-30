@@ -127,6 +127,7 @@ fn build_reader_with_sample_size(
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec,
+            provided_centroids: None,
         })
         .expect("register column");
     b.set_kmeans_sample_size(cid, sample_size)
@@ -243,6 +244,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         rot_seed: ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
     for i in 0..n_docs {
