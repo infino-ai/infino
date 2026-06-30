@@ -270,16 +270,6 @@ tokio = { version = "1", features = ["test-util"] }
 
 proptest = "1"
 hdrhistogram = "7"
-# s3s + s3s-fs power the "real S3 wire protocol" smoke test.
-# s3s is the S3-compatible HTTP server library; s3s-fs is its
-# filesystem backend. The test crate spawns s3s-fs on a random
-# port in a tempdir; the supertable's S3StorageProvider talks to
-# it via object_store::aws::AmazonS3.
-s3s = "0.13"
-s3s-fs = "0.13"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
-futures = "0.3"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"

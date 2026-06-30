@@ -3,22 +3,22 @@
 
 //! **Quick-iteration harness** for the object-store cold-fetch path.
 //!
-//! Fast dev-loop probe on a single superfile over `s3s-fs` (default 100k docs;
+//! Fast dev-loop probe on a single superfile over RustFS (default 100k docs;
 //! `INFINO_BENCH_FULL=1` → 1M). Canonical tiered benchmarks (superfile 1M /
 //! supertable 10M × warm/warm/cold) live in `vector_*` / `fts_*` via `tiers.rs`.
 //! Use this bench to iterate on request shape and diagnostics, not headline SLA rows.
 //!
 //! Exercises unified vector + FTS cold-open / cold-first-search
-//! / warm-search against an in-process S3 server (`s3s-fs`).
+//! / warm-search against a local RustFS HTTPS daemon.
 //!
 //! Backend selection here is intentionally **S3-only and inference-based**
-//! (`s3s-fs`, or real S3 when `INFINO_REAL_S3_BUCKET` is set) — it does not
+//! (RustFS session, or real S3 when `INFINO_REAL_S3_BUCKET` is set) — it does not
 //! use the `INFINO_BENCH_STORE` selector or the Azure backend that the
 //! canonical benches do. This is a diagnostics probe, not a headline bench,
 //! so it keeps its own minimal fixture rather than routing through
 //! `tiers::Backend`.
 //!
-//! Spawns `s3s-fs` on a random port, points an
+//! Uses the shared RustFS session (`rustfs_server::session()`), points an
 //! `S3StorageProvider` at it, uploads a real **unified**
 //! superfile (one Parquet file carrying both a vector
 //! subsection and an FTS subsection — the "consolidated
@@ -57,7 +57,7 @@
 //! Scale is fixed by shape at [`corpus::SUPERFILE_DOCS`] (1M × 384,
 //! ~1.5 GiB) — this is the superfile warm/cold tier and matches the
 //! superfile warm benches. There is no `INFINO_BENCH_FULL` knob. The
-//! Criterion rows run over the in-process `s3s-fs` server by default;
+//! Criterion rows run over the local RustFS session by default;
 //! setting `INFINO_REAL_S3_BUCKET` (or `INFINO_TEST_REAL_S3_BUCKET`)
 //! reruns the same rows against real AWS S3.
 //!
@@ -66,7 +66,7 @@
 //! additionally rewrites the matching section in
 //! `benches/vector/README.md`.
 //!
-//! ## Why s3s-fs (plus adjusted reporting, not LocalFs-only)
+//! ## Why RustFS (plus adjusted reporting, not LocalFs-only)
 //!
 //! - `LocalFsStorageProvider`'s `get_range` is a `pread64`;
 //!   the request never crosses an HTTP boundary, so the
@@ -75,18 +75,17 @@
 //!   header encoding, connection reuse).
 //! - Real AWS S3 has region-dependent + time-dependent p50
 //!   tails that distort a regression bench.
-//! - `s3s-fs` gives us the full S3 wire path (path-style URL
-//!   + SigV4 + HTTP/1.1 range headers), so it is useful for
+//! - RustFS gives us the full S3 wire path (path-style URL
+//!   + SigV4 + HTTPS range headers), so it is useful for
 //!     validating request shape: GET count, byte ranges, and
 //!     overlap. Its loopback latency is not treated as S3 latency;
 //!     the diagnostic prints an adjusted model line that replaces
-//!     the observed s3s-fs blocking span with a configurable S3
+//!     the observed RustFS blocking span with a configurable S3
 //!     TTFB + throughput model.
 
 #![allow(clippy::too_many_arguments)]
 
 use std::{
-    net::SocketAddr,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -114,17 +113,12 @@ use infino::{
     },
     test_helpers::default_tokenizer,
 };
-use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
-use s3s_fs::FileSystem;
 use tempfile::TempDir;
-use tokio::{net::TcpListener, runtime::Runtime};
+use tokio::runtime::Runtime;
+
+use crate::rustfs_server::{self, RustFsBucketLease};
 
 // ─── Constants ───────────────────────────────────────────────────────
-
-const TEST_BUCKET: &str = "infino-objstore-bench";
-const TEST_REGION: &str = "us-east-1";
-const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
 const QUICK_ITER_DEFAULT_DOCS: usize = 100_000;
 const REAL_S3_MAX_ITERS: u64 = 3;
@@ -294,7 +288,7 @@ fn build_superfile_bytes() -> Bytes {
 
 // ─── S3 latency model (adjusted diagnostic) ────────────
 //
-// `s3s-fs` over loopback faithfully reproduces the S3 *request
+// `RustFS` over loopback faithfully reproduces the S3 *request
 // count* and *byte volume* (the things GET-minimization
 // optimizes), but not S3's *wall-clock* — its per-request latency
 // is environment-dependent and unrelated to real S3. To get a
@@ -307,7 +301,7 @@ fn build_superfile_bytes() -> Bytes {
 // TTFB models the round-trip + first-byte latency S3 charges per
 // request regardless of size; the throughput term models single-
 // stream transfer bandwidth. The diagnostic does not sleep in
-// the measured path. It records actual s3s-fs request intervals,
+// the measured path. It records actual RustFS request intervals,
 // subtracts their observed blocking span from wall-clock, and adds
 // back this model grouped by the same observed parallel batches.
 //
@@ -397,75 +391,30 @@ impl S3CostModel {
     }
 }
 
-// ─── s3s-fs harness ──────────────────────────────────────────────────
+// ─── RustFS harness ──────────────────────────────────────────────────
 
-/// Spawn s3s-fs on a random loopback port. Returns the bound
-/// addr + the tempdir that owns the FS root (kept alive by
-/// the caller).
-async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
-    let fs_root = TempDir::new().expect("s3s-fs root tempdir");
-    std::fs::create_dir_all(fs_root.path().join(TEST_BUCKET)).expect("create bucket dir");
-
-    let fs_backend = FileSystem::new(fs_root.path()).expect("s3s-fs FileSystem");
-    let service = {
-        let mut b = S3ServiceBuilder::new(fs_backend);
-        b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-        b.build()
-    };
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-
-    tokio::spawn(async move {
-        use hyper_util::{
-            rt::{TokioExecutor, TokioIo},
-            server::conn::auto::Builder as ConnBuilder,
-        };
-        let http = ConnBuilder::new(TokioExecutor::new());
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(t) => t,
-                Err(_) => break,
-            };
-            let service = service.clone();
-            let http = http.clone();
-            tokio::spawn(async move {
-                let _ = http.serve_connection(TokioIo::new(stream), service).await;
-            });
-        }
-    });
-    (addr, fs_root)
-}
-
-/// One-time s3s-fs setup: spawn server, upload superfile,
-/// return the storage handle + URI to query. The tempdir
-/// stays alive in the returned tuple — drop it after the
-/// bench to GC the bucket data.
-async fn setup_s3_fixture(
+async fn setup_rustfs_fixture(
     superfile: &Bytes,
-) -> (SocketAddr, TempDir, Arc<dyn StorageProvider>, SuperfileUri) {
-    let (addr, fs_root) = spawn_s3s_fs().await;
-    let endpoint = format!("http://{addr}");
-    let storage: Arc<dyn StorageProvider> = Arc::new(
-        S3StorageProvider::new_with_endpoint(
-            &endpoint,
-            TEST_BUCKET,
-            TEST_ACCESS_KEY,
-            TEST_SECRET_KEY,
-            TEST_REGION,
-        )
-        .expect("S3StorageProvider"),
-    );
+) -> (Arc<dyn StorageProvider>, SuperfileUri, RustFsBucketLease) {
+    let lease = tokio::task::spawn_blocking(|| {
+        rustfs_server::session()
+            .open_unique_bucket("")
+            .expect("rustfs object-store bench bucket")
+    })
+    .await
+    .expect("rustfs spawn_blocking join");
+    let storage = Arc::clone(&lease.storage);
     let uri = SuperfileUri::new_v4();
     let path = uri.storage_path();
-    // Upload against the raw provider — fixture-setup latency is
-    // not part of the measured cold path.
     storage
         .put_atomic(&path, superfile.clone())
         .await
-        .expect("upload superfile to s3s-fs");
-    eprintln!("[object_store_bench] s3s-fs spawned on {endpoint}, superfile uploaded to {path}");
-    (addr, fs_root, storage, uri)
+        .expect("upload superfile to rustfs");
+    eprintln!(
+        "[object_store_bench] rustfs bucket={} superfile uploaded to {path}",
+        lease.bucket
+    );
+    (storage, uri, lease)
 }
 
 struct BenchFixture {
@@ -474,7 +423,7 @@ struct BenchFixture {
     storage_label: &'static str,
     real_s3: bool,
     cleanup_path: Option<String>,
-    _fs_root: Option<TempDir>,
+    _rustfs_bucket: Option<RustFsBucketLease>,
 }
 
 impl BenchFixture {
@@ -528,17 +477,17 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
             storage_label: "real_s3",
             real_s3: true,
             cleanup_path: Some(path),
-            _fs_root: None,
+            _rustfs_bucket: None,
         }
     } else {
-        let (_addr, fs_root, storage, uri) = setup_s3_fixture(superfile).await;
+        let (storage, uri, lease) = setup_rustfs_fixture(superfile).await;
         BenchFixture {
             storage,
             uri,
-            storage_label: "s3s_fs",
+            storage_label: "rustfs",
             real_s3: false,
             cleanup_path: None,
-            _fs_root: Some(fs_root),
+            _rustfs_bucket: Some(lease),
         }
     }
 }
@@ -552,7 +501,7 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
 // ─── Benches ─────────────────────────────────────────────────────────
 
 /// Cold-row iteration count. Bounded for real S3 (each iter is a real
-/// network round trip + a fresh-cache cold open), more samples on s3s-fs
+/// network round trip + a fresh-cache cold open), more samples on RustFS
 /// for a stabler p50.
 fn cold_iters(real_s3: bool) -> usize {
     if real_s3 {
@@ -590,7 +539,7 @@ pub fn run() {
     );
 
     // Upload once to the selected object-store backend. Default remains
-    // s3s-fs; set INFINO_REAL_S3_BUCKET to run the same rows against
+    // RustFS; set INFINO_REAL_S3_BUCKET to run the same rows against
     // actual AWS S3.
     let fixture = rt.block_on(setup_bench_fixture(superfile));
     let storage = Arc::clone(&fixture.storage);
@@ -601,7 +550,7 @@ pub fn run() {
 
     // Each phase runs through a request-counting store: it prints the
     // detailed per-iter `[diag]` line (modeled S3 latency + estimated cost
-    // for s3s-fs; true wall-clock + cost for real S3) and returns the p50
+    // for RustFS; true wall-clock + cost for real S3) and returns the p50
     // latency + median cost for the summary table. The RSS sampler bounds
     // the whole phase.
     let measure = |name: &str, op: diag::ColdOp| {
@@ -633,7 +582,7 @@ pub fn run() {
 /// Emit the three measured cold rows through the custom report harness:
 /// terminal table + run-to-run deltas, plus (when
 /// `INFINO_BENCH_UPDATE_README=1`) the `bench/vector/object_store/cold`
-/// README anchor. The `p50` column is the modeled S3 latency for s3s-fs
+/// README anchor. The `p50` column is the modeled S3 latency for RustFS
 /// (loopback removed, TTFB+throughput added back) or the true wall-clock
 /// for real S3; `Est S3 cost` is the modeled per-op request+data cost.
 fn emit_object_store(
@@ -691,8 +640,8 @@ fn emit_object_store(
     let backend_note = if real_s3 {
         "Latency is the true real-S3 wall-clock; cost is the modeled per-op request + data cost."
     } else {
-        "Latency is the modeled S3 wall-clock (the s3s-fs loopback blocking span is subtracted and \
-         a TTFB + throughput model added back per overlap-coalesced GET batch — the raw s3s-fs \
+        "Latency is the modeled S3 wall-clock (the RustFS loopback blocking span is subtracted and \
+         a TTFB + throughput model added back per overlap-coalesced GET batch — the raw RustFS \
          loopback time is environment-dependent and not representative); cost is the modeled per-op \
          request + data cost. Set INFINO_REAL_S3_BUCKET to measure real S3 directly."
     };
@@ -706,7 +655,7 @@ fn emit_object_store(
         note: format!(
             "One unified superfile (vector subsection + FTS subsection in a single Parquet file) \
              served through one `DiskCacheStore` in `LazyForegroundWithBackgroundFill` mode. \
-             In-process `s3s-fs` exercises the full SigV4 + HTTP/1.1 path-style range-GET path for \
+             Local RustFS exercises the full SigV4 + HTTPS path-style range-GET path for \
              request shape. {backend_note} The detailed per-range `[diag]` breakdown prints above \
              this table. p50 over repeated fresh-cache runs. Δ is vs the previous run."
         ),
@@ -742,14 +691,14 @@ fn emit_object_store(
 // repo have `harness = false`, so `#[test]` items would be silently
 // dropped by the build — a `#[test] #[ignore]` diag would never
 // actually run. Instead the diag is a regular module + a regular
-// `pub fn diagnose_s3s_fs_cold_path()` which `bench()` invokes
+// `pub fn diagnose_rustfs_cold_path()` which `bench()` invokes
 // at the top of its body when `INFINO_DIAG_COLD_PATH=1` is set.
 //
 // Invocation:
 //
 //   INFINO_DIAG_COLD_PATH=1 cargo bench -- object-store
 //
-// to localize where cold-path time is going (raw s3s-fs RTT vs.
+// to localize where cold-path time is going (raw RustFS RTT vs.
 // our cold-fetch path's range count). When the env var is set,
 // `bench()` runs the diagnostic and returns before any of the
 // criterion rows fire.
@@ -1037,7 +986,7 @@ pub(crate) mod diag {
             // measurement. We deliberately omit the synthetic
             // `S3LatencyModel` projection (ttfb/mbps/
             // adjusted_s3_model) — that model exists only to
-            // estimate S3 latency from the in-process s3s-fs
+            // estimate S3 latency from the in-process RustFS
             // path and is meaningless when the wall clock IS
             // real S3. `raw_block` is the real time spent
             // blocked on overlap-coalesced GET batches; the
@@ -1160,7 +1109,7 @@ pub(crate) mod diag {
 
     /// One cold phase's aggregate for the default report table.
     pub(super) struct ColdPhase {
-        /// p50 latency — the modeled S3 wall-clock for s3s-fs (loopback
+        /// p50 latency — the modeled S3 wall-clock for RustFS (loopback
         /// blocking subtracted, TTFB+throughput model added back), or the
         /// true wall-clock for real S3.
         pub(super) p50: Duration,
@@ -1177,7 +1126,7 @@ pub(crate) mod diag {
 
     /// Run `iters` fresh-cache cold operations through a request-counting
     /// store. Prints the per-iter `[diag]` breakdown (modeled S3 latency +
-    /// estimated cost for s3s-fs; true wall-clock + cost for real S3) via
+    /// estimated cost for RustFS; true wall-clock + cost for real S3) via
     /// [`report`], and returns the p50 (modeled/real) latency + median
     /// estimated cost for the summary table. `raw_storage` is the
     /// un-instrumented backend.
@@ -1258,7 +1207,7 @@ pub(crate) mod diag {
         }
     }
 
-    /// Probe raw s3s-fs / `S3StorageProvider` round-trip latency
+    /// Probe raw RustFS / `S3StorageProvider` round-trip latency
     /// for three range sizes (header-sized, MiB-sized, chunk-sized)
     /// then exercise the cold-open + cold-first-search paths with
     /// the counting wrapper installed so we can see exactly what
@@ -1266,14 +1215,17 @@ pub(crate) mod diag {
     /// unhinted-vs-hinted A/B + raw-RTT probes here go beyond the
     /// always-on summary `run()` emits; kept as an opt-in deep dive.
     #[allow(dead_code)]
-    pub fn diagnose_s3s_fs_cold_path() {
+    pub fn diagnose_rustfs_cold_path() {
         let rt = Runtime::new().expect("tokio runtime");
         let superfile = superfile_bytes();
         let n = quick_iter_n_docs();
         let nprobe = BENCH_NPROBE;
         let query = query_vector().to_vec();
 
-        let (_addr, _fs_root, raw_storage, uri) = rt.block_on(setup_s3_fixture(superfile));
+        let (raw_storage, uri, _lease) = rt.block_on(async {
+            let (storage, uri, lease) = setup_rustfs_fixture(superfile).await;
+            (storage, uri, lease)
+        });
         let storage = Arc::new(CountingStorage::new(raw_storage));
         let storage_dyn: Arc<dyn StorageProvider> =
             Arc::clone(&storage) as Arc<dyn StorageProvider>;
@@ -1324,7 +1276,7 @@ pub(crate) mod diag {
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
             report(&format!("cold_open_unhinted[{i}]"), &snap, wall, false);
-            // Let the previous iter's bg fill stop touching s3s-fs
+            // Let the previous iter's bg fill stop touching RustFS
             // before the next cold timing starts, so contention
             // doesn't poison the measurement. The `sleep` itself
             // must be `await`ed inside `block_on` so it enters
@@ -1501,7 +1453,7 @@ pub(crate) mod diag {
         );
     }
 
-    /// Same cold-path diagnostic as `diagnose_s3s_fs_cold_path`,
+    /// Same cold-path diagnostic as `diagnose_rustfs_cold_path`,
     /// but against actual AWS S3 using the normal `S3StorageProvider`.
     ///
     /// Invocation:
@@ -2123,7 +2075,7 @@ pub(crate) mod diag {
     /// (kernel-direct) vs `consumer.reader().query_sql("SELECT _id FROM
     /// bm25_search(...)")` / `query_sql("... vector_search ...")`
     /// (DataFusion path) side-by-side on the same warm Supertable
-    /// over an in-process `s3s-fs`. Prints min / p50 / p95 / mean
+    /// over an in-process `RustFS`. Prints min / p50 / p95 / mean
     /// for each path plus the p50 dispatch-tax delta to stderr.
     ///
     /// Storage backend doesn't matter for this measurement —
@@ -2151,19 +2103,11 @@ pub(crate) mod diag {
              (override via INFINO_DIAG_QUERY_SQL_ITERS, INFINO_BENCH_FULL=1 for 1M)"
         );
 
-        // 1. Spawn s3s-fs + storage provider.
-        let (addr, _fs_root) = rt.block_on(spawn_s3s_fs());
-        let endpoint = format!("http://{addr}");
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_endpoint(
-                &endpoint,
-                TEST_BUCKET,
-                TEST_ACCESS_KEY,
-                TEST_SECRET_KEY,
-                TEST_REGION,
-            )
-            .expect("s3 provider"),
-        );
+        // 1. RustFS session + storage provider.
+        let storage: Arc<dyn StorageProvider> = rt.block_on(async {
+            let (storage, _uri, _lease) = setup_rustfs_fixture(superfile_bytes()).await;
+            storage
+        });
 
         // 2. Disk cache (so warm == mmap, not re-fetch).
         let cache_dir = TempDir::new().expect("cache tempdir");
@@ -2183,7 +2127,7 @@ pub(crate) mod diag {
         let cache = DiskCacheStore::new(Arc::clone(&storage), cache_cfg, pinned).expect("cache");
 
         // 3. Producer: write n docs through Supertable's writer.
-        eprintln!("[diag-qsql-overhead] writing {n}-doc Supertable to s3s-fs ...");
+        eprintln!("[diag-qsql-overhead] writing {n}-doc Supertable to rustfs ...");
         let build_t0 = Instant::now();
         rt.block_on(async {
             let producer =
@@ -2191,7 +2135,7 @@ pub(crate) mod diag {
                     .expect("create producer Supertable");
             let mut writer = producer.writer().expect("producer writer");
             append_unified_supertable_batches(&mut writer, n);
-            writer.commit().expect("commit Supertable to s3s-fs");
+            writer.commit().expect("commit Supertable to rustfs");
         });
         eprintln!(
             "[diag-qsql-overhead] commit OK in {:.1} s",
@@ -2205,7 +2149,7 @@ pub(crate) mod diag {
                     .with_storage(Arc::clone(&storage))
                     .with_disk_cache(Arc::clone(&cache)),
             )
-            .expect("Supertable::open from s3s-fs")
+            .expect("Supertable::open from rustfs")
         });
         // 5. Warm the cache: cold pass + mmap-promotion sleep.
         eprintln!("[diag-qsql-overhead] warming cache (cold pass + 2s mmap promotion sleep)");

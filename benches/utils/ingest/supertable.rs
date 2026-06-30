@@ -95,6 +95,8 @@ pub struct IngestResult {
     pub cleanup: Option<tiers::PrefixCleanup>,
     pub sql_sample_title: Option<String>,
     pub sql_sample_key: Option<String>,
+    /// Keeps local RustFS daemon processes alive through search.
+    _keepalive: tiers::StorageKeepalive,
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
@@ -327,7 +329,6 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             tiers::supertable_storage_fixture().await
         }
     });
-    let cleanup = storage_backend.cleanup.clone();
     // Disk cache attached only to keep superfile bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
@@ -419,14 +420,16 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             sql_sample_key.clone(),
         );
     }
+    let (storage, storage_label, cleanup, keepalive) = storage_backend.into_ingest_parts();
     IngestResult {
-        storage: storage_backend.storage,
-        storage_label: storage_backend.storage_label,
+        storage,
+        storage_label,
         n_superfiles,
         total_index_bytes,
         cleanup,
         sql_sample_title,
         sql_sample_key,
+        _keepalive: keepalive,
     }
 }
 
@@ -474,14 +477,16 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         meta.total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
     );
+    let (storage, storage_label, _, keepalive) = storage_backend.into_ingest_parts();
     IngestResult {
-        storage: storage_backend.storage,
-        storage_label: storage_backend.storage_label,
+        storage,
+        storage_label,
         n_superfiles: meta.n_superfiles,
         total_index_bytes: meta.total_index_bytes,
         cleanup: None,
         sql_sample_title: meta.sql_sample_title,
         sql_sample_key: meta.sql_sample_key,
+        _keepalive: keepalive,
     }
 }
 
@@ -513,14 +518,16 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
         total_index_bytes as f64 / GIB_BYTES as f64,
         fixture.storage_label,
     );
+    let (storage, storage_label, _, keepalive) = fixture.into_ingest_parts();
     IngestResult {
-        storage: fixture.storage,
-        storage_label: fixture.storage_label,
+        storage,
+        storage_label,
         n_superfiles,
         total_index_bytes,
         cleanup: None,
         sql_sample_title: None,
         sql_sample_key: None,
+        _keepalive: keepalive,
     }
 }
 

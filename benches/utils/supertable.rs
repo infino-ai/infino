@@ -10,12 +10,11 @@
 //! single-modality peers: FTS-only, vector-only, SQL, and combined FTS +
 //! vector.
 //!
-//! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
-//! multi-commit build relies on conditional `If-Match` PUTs that the
-//! `s3s-fs` emulator does not implement, so this bench rejects `s3s_fs` (the
-//! default) and exits with a message otherwise. Every object the run writes
-//! lands under one unique prefix per shape, all deleted before the runner
-//! returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
+//! **RustFS (default), S3, or Azure** — the multi-commit build relies on
+//! conditional `If-Match` PUTs; the default local RustFS session implements
+//! them. Real S3 and Azure are also supported. Every object the run writes
+//! lands under one unique bucket/prefix per shape, all deleted before the
+//! runner returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
 //!
 //! ## Per-shape process isolation
 //!
@@ -31,6 +30,7 @@
 //! ## Invocation
 //!
 //! ```text
+//! cargo bench -- supertable
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench -- supertable
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
 //!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench -- supertable
