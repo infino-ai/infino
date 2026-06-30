@@ -113,15 +113,34 @@ const OR_WINDOW_MIN_TERMS: usize = 3;
 /// on MaxScore). Calibrated on the 1M tier.
 const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
-/// Choose the windowed union scorer over MaxScore+BMM for a multi-term
-/// OR: true when there are enough terms to amortize the window and **no
-/// single term dominates** the score upper bound (so MaxScore's essential
-/// set won't shrink and it degrades to scoring the whole union). Cheap —
-/// the per-term upper bounds are already on the cursors.
-fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
-    if cursors.len() < OR_WINDOW_MIN_TERMS {
-        return false;
-    }
+/// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
+/// MaxScore. WAND's pivot pruning needs a high top-k threshold to skip
+/// blocks: at small `k` the threshold is high and it clears MaxScore
+/// decisively on two comparable terms, but as `k` grows the threshold
+/// falls until WAND can no longer prune and its per-iteration cursor
+/// re-sort becomes pure overhead — so above this `k` MaxScore wins. The
+/// cutoff sits between the common small-`k` page sizes and the rare deep
+/// `k`; large-`k` 2-term ORs stay on MaxScore.
+const WAND_BMW_2TERM_MAX_K: usize = 128;
+
+/// Route a 2-term OR to WAND+BMW only when one term's posting list is at
+/// least this many times shorter than the other's (df ratio). That rare
+/// "anchor" term is what lets WAND pivot and skip the common term's long
+/// list — the source of its win. Two comparable-length lists (e.g. two
+/// common words) give WAND nothing to skip, so it loses to MaxScore and
+/// stays there. A *score* upper-bound ratio is the wrong test here: a
+/// term can dominate the BM25 UB (higher idf) while still being common
+/// (long list), which WAND can't skip — only df separates the cases.
+const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
+
+/// True when **no single term dominates** the score upper bound:
+/// `max_ub <= OR_WINDOW_DOMINANCE_MULT * avg_ub`. Uniform terms sit near
+/// the average — MaxScore can't prune them (its essential set never
+/// shrinks); a dominant (typically rare) term sits well above it, and
+/// MaxScore / WAND can skip hard against it. Shared by the windowed-union
+/// and 2-term WAND routers, which want opposite sides of this test. Cheap
+/// — the per-term upper bounds are already on the cursors.
+fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
     let total: f32 = cursors.iter().map(|c| c.term_max_bm25).sum();
     if total <= 0.0 {
         return false;
@@ -132,6 +151,27 @@ fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
         .fold(0.0f32, f32::max);
     let avg = total / cursors.len() as f32;
     max <= OR_WINDOW_DOMINANCE_MULT * avg
+}
+
+/// Choose the windowed union scorer over MaxScore+BMM for a multi-term
+/// OR: true when there are enough terms to amortize the window and no
+/// single term dominates (so MaxScore degrades to scoring the whole
+/// union).
+fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
+    cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
+}
+
+/// True for a 2-term cursor set where one term's posting list is at least
+/// [`WAND_BMW_2TERM_DF_RATIO`]× shorter than the other's — a rare anchor
+/// WAND+BMW can pivot on to skip the common term's long list. The whole
+/// reason to prefer WAND over MaxScore on a 2-term OR.
+fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
+    if cursors.len() != 2 {
+        return false;
+    }
+    let lo = cursors[0].df.min(cursors[1].df);
+    let hi = cursors[0].df.max(cursors[1].df);
+    lo > 0 && hi >= lo.saturating_mul(WAND_BMW_2TERM_DF_RATIO)
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
@@ -1261,11 +1301,17 @@ impl FtsReader {
     /// Result invariants: top-k by descending BM25 score, ties broken
     /// by ascending doc_id.
     ///
-    /// Not on the production path. `dispatch_multi_term_or` always
-    /// routes to [`Self::run_max_score_bmm`]; this entry point is
-    /// kept for `search_with_algo_for_bench` so the bench harness
-    /// can compare algorithms under identical inputs. Cursor
-    /// construction is shared with the BMM path.
+    /// Production path for small-`k`, **floor-free** 2-term ORs (see
+    /// `dispatch_multi_term_or`), and the `search_with_algo_for_bench`
+    /// entry point. Cursor construction is shared with the BMM path.
+    ///
+    /// Carries **no cross-segment floor and no exclude filter** — the
+    /// dispatcher only routes here when both are absent (`floor_eff` is
+    /// `NEG_INFINITY` and the query has no negation). Seeding WAND's pivot
+    /// threshold from a finite floor was tried and reverted: it skipped
+    /// blocks that still held qualifying docs at higher floors (caught by
+    /// `wand_bmw_2term_no_floor_agrees_with_bmm` vs the floored BMM). When
+    /// a floor is live, MaxScore handles it instead.
     fn run_wand_bmw(
         &self,
         column_id: u32,
@@ -2556,7 +2602,29 @@ impl FtsReader {
         // there. A dominant-term query stays on MaxScore, which prunes
         // hard (its block-skip / f→1 fast path); windowing would lose by
         // scoring every windowed doc.
-        if prefer_windowed_union(&cursors) {
+        // A 2-term OR of one rare + one common term is a worst case for
+        // MaxScore: it scores the common term's long posting list end to
+        // end. WAND+BMW pivots on the rare (short) term and skips most of
+        // the common term's list — a large win. For two comparable-length
+        // common terms there is no short anchor to skip on, so WAND's
+        // per-iteration cursor re-sort just adds overhead and MaxScore
+        // wins; those fall through. Route 2-term ORs to WAND only when
+        // (a) one list is much shorter than the other (df ratio,
+        // `two_term_has_rare_anchor`); (b) k is small — at large k the
+        // top-k threshold is too low for WAND to prune; (c) no negation —
+        // `run_wand_bmw` applies no exclude filter; and (d) no
+        // cross-segment floor (`floor_eff` unset) — seeding WAND's
+        // threshold from a floor mis-prunes, so a live floor stays on
+        // MaxScore.
+        let no_floor = floor_eff == f32::NEG_INFINITY;
+        if cursors.len() == 2
+            && k <= WAND_BMW_2TERM_MAX_K
+            && filter.is_none()
+            && no_floor
+            && two_term_has_rare_anchor(&cursors)
+        {
+            self.run_wand_bmw(column_id, cursors, k)
+        } else if prefer_windowed_union(&cursors) {
             self.run_windowed_union(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         } else {
             self.run_max_score_bmm(column_id, cursors, k, filter, floor_eff)
@@ -3137,6 +3205,10 @@ struct TermCursor {
     /// Maximum block-max-BM25 across all blocks. Used by the WAND
     /// pivot test (term-level upper bound).
     term_max_bm25: f32,
+    /// Document frequency of the term (postings list length). Used by
+    /// the 2-term OR router to detect a rare anchor term (short list),
+    /// where WAND+BMW can skip the other term's long list.
+    df: u64,
     /// Per-block metadata.
     blocks: Vec<BlockMeta>,
     /// Decoded buffers for the current block. Reused across decodes.
@@ -3201,6 +3273,7 @@ impl TermCursor {
         let mut cursor = Self {
             idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
+            df: term_meta.df,
             blocks,
             block_doc_ids: vec![0u32; BLOCK_LEN],
             block_tfs: vec![0u32; BLOCK_LEN],
@@ -3246,6 +3319,7 @@ impl TermCursor {
         Self {
             idf_x_k1p1,
             term_max_bm25: block_max_bm25,
+            df: 1,
             blocks,
             block_doc_ids,
             block_tfs,
@@ -4557,6 +4631,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn wand_bmw_2term_no_floor_agrees_with_bmm() {
+        // The small-k 2-term production path (`run_wand_bmw`) must return
+        // the identical top-k as MaxScore+BMM on the same inputs, across k.
+        // It is only reached floor-free (the dispatcher routes to MaxScore
+        // when a cross-segment floor is live), so both sides run unfloored
+        // (`NEG_INFINITY`). Multi-window corpus so WAND exercises block
+        // skips; `gamma` rarer than `beta` rarer than `alpha`.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha ");
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        let shapes: &[&[&str]] = &[&["alpha", "beta"], &["beta", "gamma"], &["alpha", "gamma"]];
+        for terms in shapes {
+            for k in [1usize, 5, 50, 128] {
+                let cw = r.build_term_cursors(col, terms).await.expect("cursors");
+                let cb = r.build_term_cursors(col, terms).await.expect("cursors");
+                let wand = r.run_wand_bmw(col, cw, k).expect("wand");
+                let bmm = r
+                    .run_max_score_bmm(col, cb, k, None, f32::NEG_INFINITY)
+                    .expect("bmm");
+                assert_eq!(wand.len(), bmm.len(), "len mismatch {terms:?} k={k}");
+                for ((dw, sw), (db, sb)) in wand.iter().zip(bmm.iter()) {
+                    assert_eq!(dw, db, "doc mismatch {terms:?} k={k}: {dw} vs {db}");
+                    assert!(
+                        (sw - sb).abs() < 1e-4,
+                        "score mismatch {terms:?} k={k}: {sw} vs {sb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_term_rare_anchor_gates_on_df_ratio() {
+        // `df` is read onto the cursor, and the 2-term WAND router fires
+        // only when one posting list is >= WAND_BMW_2TERM_DF_RATIO× shorter
+        // than the other (a rare anchor), not when both terms are common.
+        const N_DOCS: u32 = 4000;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into()).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common "); // every doc
+            if i % 2 == 0 {
+                text.push_str("frequent "); // half the docs
+            }
+            if i % 200 == 0 {
+                text.push_str("rare "); // ~1/200 of docs
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+
+        // common (df≈N) + rare (df≈N/200): ratio 200 ≥ 16 → anchor.
+        let anchored = r
+            .build_term_cursors(col, &["common", "rare"])
+            .await
+            .expect("cursors");
+        assert!(
+            two_term_has_rare_anchor(&anchored),
+            "rare+common should have a rare anchor"
+        );
+        // common (df≈N) + frequent (df≈N/2): ratio 2 < 16 → no anchor.
+        let uniform = r
+            .build_term_cursors(col, &["common", "frequent"])
+            .await
+            .expect("cursors");
+        assert!(
+            !two_term_has_rare_anchor(&uniform),
+            "two common terms should not anchor"
+        );
     }
 
     #[tokio::test]
