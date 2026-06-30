@@ -855,6 +855,7 @@ impl SupertableOptions {
                     bucket,
                     &cfg.storage.prefix,
                     &cfg.storage.storage_options,
+                    None,
                 )?) as Arc<dyn StorageProvider>)
             }
             StorageBackend::Azure => {
@@ -865,6 +866,7 @@ impl SupertableOptions {
                     container,
                     &cfg.storage.prefix,
                     &cfg.storage.storage_options,
+                    None,
                 )?) as Arc<dyn StorageProvider>)
             }
         };

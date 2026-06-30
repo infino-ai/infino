@@ -37,13 +37,14 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub mod azure;
-pub(crate) mod credentials;
+pub mod credentials;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
 pub mod s3;
 
 pub use azure::AzureStorageProvider;
+pub use credentials::BackendCredentials;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;

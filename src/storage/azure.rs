@@ -21,7 +21,12 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    BackendCredentials, ObjectMeta, StorageError, StorageOptions, StorageProvider,
+    credentials::is_azure_credential_key,
+    options::{apply, non_credential_options},
+    retry,
+};
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.
@@ -38,17 +43,21 @@ impl AzureStorageProvider {
     /// identity). Infino never reads Azure credentials from the process
     /// environment; pass them through [`Self::new_with_prefix`] otherwise.
     pub fn new(container: impl Into<String>) -> Result<Self, StorageError> {
-        Self::new_with_prefix(container, "", &StorageOptions::new())
+        Self::new_with_prefix(container, "", &StorageOptions::new(), None)
     }
 
     /// Azure provider scoped to `prefix` inside `container`, configured
     /// from `opts` (account/key, keyed by object_store's `azure_*`
     /// strings). The prefix isolates each table under
     /// `azure://container/prefix/`.
+    ///
+    /// When `creds` is set, the account key comes from that rotating provider
+    /// and the credential keys in `opts` are ignored; other options apply.
     pub fn new_with_prefix(
         container: impl Into<String>,
         prefix: impl Into<String>,
         opts: &StorageOptions,
+        creds: Option<&BackendCredentials>,
     ) -> Result<Self, StorageError> {
         let container = container.into();
         let uri = format!("azure://{container}");
@@ -56,9 +65,20 @@ impl AzureStorageProvider {
             .with_container_name(&container)
             .with_client_options(tuned_client_options())
             .with_retry(retry::config());
-        let builder = apply::<AzureConfigKey, _>(builder, opts, &uri, |b, key, value| {
-            b.with_config(key, value)
-        })?;
+        let builder = match creds.and_then(BackendCredentials::as_azure) {
+            Some(provider) => {
+                let config = non_credential_options(opts, is_azure_credential_key);
+                apply::<AzureConfigKey, _>(
+                    builder.with_credentials(provider),
+                    &config,
+                    &uri,
+                    |b, key, value| b.with_config(key, value),
+                )?
+            }
+            None => apply::<AzureConfigKey, _>(builder, opts, &uri, |b, key, value| {
+                b.with_config(key, value)
+            })?,
+        };
         let store = builder.build().map_err(|e| StorageError::Permanent {
             uri,
             source: Box::new(e),
@@ -462,7 +482,7 @@ mod tests {
             ("azure_storage_account_name".to_string(), "acct".to_string()),
             ("azure_storage_account_key".to_string(), "a2V5".to_string()),
         ]);
-        let p = AzureStorageProvider::new_with_prefix("c", "p", &opts).expect("build azure");
+        let p = AzureStorageProvider::new_with_prefix("c", "p", &opts, None).expect("build azure");
         assert_eq!(p.container(), "c");
         assert_eq!(p.prefix(), "p");
     }
@@ -470,7 +490,7 @@ mod tests {
     #[test]
     fn rejects_cross_backend_aws_key() {
         let opts = StorageOptions::from([("aws_region".to_string(), "us-east-1".to_string())]);
-        assert!(AzureStorageProvider::new_with_prefix("c", "", &opts).is_err());
+        assert!(AzureStorageProvider::new_with_prefix("c", "", &opts, None).is_err());
     }
 
     #[test]
