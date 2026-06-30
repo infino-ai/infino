@@ -119,6 +119,7 @@ use crate::{
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::Metric,
+            ivf_merge::{MergedIvfSubsection, route_clusters_into_cells},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
@@ -383,8 +384,17 @@ fn execute_hidden_incoming_plan_in_scope(
             column,
         });
     }
-    // Normal IVF layout for the incoming append region (same as user-table vectors).
-    let shard = build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf)?;
+    // IVF layout for the incoming append region, partitioned against the
+    // global cell centroids (not local k-means) so every incoming shard shares
+    // cell ordinals — the precondition for splicing cluster `c` → cell `c` at
+    // drain instead of re-clustering. Empty global model ⇒ fall back to local.
+    let global_centroids: Option<std::sync::Arc<[f32]>> = if clusters.is_empty() {
+        None
+    } else {
+        Some(clusters.to_fp32().into())
+    };
+    let shard =
+        build_one_shard_with_layout(&buffer, &inner.options, VectorLayout::Ivf, global_centroids)?;
     let prepared = prepare_superfile(inner, shard)?
         .ok_or_else(|| BuildError::Store("hidden incoming superfile unexpectedly empty".into()))?;
     let entry = finish_superfile_entry(
@@ -1480,6 +1490,25 @@ impl SupertableWriter {
             None
         };
         let hidden_inner = hidden_writer.as_ref().map(|vw| Arc::clone(&vw.inner));
+        // A/B knob (`INFINO_USER_CENTROIDS=global`): build user superfiles
+        // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
+        // k-means. With global-aligned user superfiles, the splice drain routes
+        // cluster c → cell c doc-correctly (no scatter), so splice can query at
+        // low nprobe with its cheap drain. The grid is the just-bootstrapped
+        // `plan.clusters` (available even on commit 1 — `plan_hidden_incoming_shard`
+        // bootstrapped it synchronously above). Default `local` is unchanged.
+        let user_global_centroids: Option<std::sync::Arc<[f32]>> =
+            if std::env::var("INFINO_USER_CENTROIDS")
+                .map(|v| v == "global")
+                .unwrap_or(false)
+            {
+                hidden_plan
+                    .as_ref()
+                    .filter(|p| p.clusters.n_cent > 0 && p.clusters.dim > 0)
+                    .map(|p| p.clusters.to_fp32().into())
+            } else {
+                None
+            };
         let (user_batch, hidden_side) =
             if let (Some(plan), Some(hidden_inner)) = (hidden_plan, hidden_inner) {
                 writer_pool.install(
@@ -1496,7 +1525,12 @@ impl SupertableWriter {
                     let (user_batch, hidden_prep) = rayon::join(
                         || -> Result<SuperfilePublishBatch, BuildError> {
                             let outputs = fanout_shards_in_pool_scope(shards_ref, |slice| {
-                                build_one_shard(slice.as_slice(), &user_options)
+                                build_one_shard_with_layout(
+                                    slice.as_slice(),
+                                    &user_options,
+                                    user_options.vector_layout,
+                                    user_global_centroids.clone(),
+                                )
                             })?;
                             prepare_user_superfile_batch_in_scope(&user_inner, outputs, hints)
                         },
@@ -1620,7 +1654,7 @@ fn build_one_shard(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
 ) -> Result<ShardOutput, BuildError> {
-    build_one_shard_with_layout(slice, options, options.vector_layout)
+    build_one_shard_with_layout(slice, options, options.vector_layout, None)
 }
 
 /// Same as [`build_one_shard`] but with an explicit vector layout override.
@@ -1629,9 +1663,14 @@ fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     options: &SupertableOptions,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
+    provided_centroids: Option<std::sync::Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
-    let mut builder =
-        SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
+    let mut builder = SuperfileBuilder::new(
+        options
+            .builder_options()
+            .with_vector_layout(vector_layout)
+            .with_vector_centroids(provided_centroids),
+    )?;
 
     let scalar_schema = options.scalar_schema();
     // The supertable always prepends the id column at index 0
@@ -2361,13 +2400,33 @@ pub(in crate::supertable) async fn await_incoming_routed_to_cells(
     ))
 }
 
+/// Retired: the hidden cell index is now drained directly from the user
+/// superfiles by [`drain_user_superfiles_to_hidden_cells`] (the user
+/// superfiles *are* the staging — no separate incoming partition). Kept as a
+/// no-op so the maintenance hook and the test-only flush wrapper still resolve.
 async fn route_incoming_to_manifest_cells_if_ready(
-    inner: Arc<SupertableInner>,
-    min_incoming: usize,
-    assign_among: Option<&[u32]>,
+    _inner: Arc<SupertableInner>,
+    _min_incoming: usize,
+    _assign_among: Option<&[u32]>,
 ) -> Result<(), BuildError> {
-    // Single-flight: skip if another routing/compaction pass is already running.
-    if inner
+    Ok(())
+}
+
+/// No-staging drain: splice each user-table vector superfile's cluster `c`
+/// (the user superfiles are global-aligned, so cluster `c` == cell `c`) into
+/// fresh cell superfiles in the hidden index table. Reads from `user_inner`,
+/// writes cells to `hidden_inner`; user superfiles are the durable source and
+/// are NOT removed. No dual-write, no staging copy, no decode/re-k-means.
+///
+/// Drains **all** user vector superfiles every call (no undrained marker yet),
+/// so it is meant to run once after ingest — re-running would duplicate cells.
+/// Pre-drain queries see an empty hidden index (0 results) until this runs.
+pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+    user_inner: Arc<SupertableInner>,
+    hidden_inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    // Single-flight on the hidden side.
+    if hidden_inner
         .compaction_outstanding
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -2380,25 +2439,11 @@ async fn route_incoming_to_manifest_cells_if_ready(
             self.0.store(false, Ordering::Release);
         }
     }
-    let _slot = Slot(&inner.compaction_outstanding);
+    let _slot = Slot(&hidden_inner.compaction_outstanding);
 
-    let manifest = inner.manifest.load_full();
-    let incoming_key = crate::supertable::manifest::partition::encode_partition_key(
-        &crate::supertable::manifest::partition::PartitionKey::VectorCell(
-            super::handle::INCOMING_VECTOR_CELL,
-        ),
-    );
-    let incoming: Vec<Arc<SuperfileEntry>> = manifest
-        .get_all_superfiles()
-        .iter()
-        .filter(|e| e.partition_key == incoming_key)
-        .cloned()
-        .collect();
-    if incoming.len() < min_incoming {
-        return Ok(());
-    }
-
-    let (clusters, column, routing) = match manifest.get_partition_strategy() {
+    // The global cell grid lives in the hidden manifest (bootstrapped at ingest).
+    let (clusters, column, routing) = match hidden_inner.manifest.load_full().get_partition_strategy()
+    {
         PartitionStrategy::VectorCell {
             clusters,
             column,
@@ -2409,46 +2454,51 @@ async fn route_incoming_to_manifest_cells_if_ready(
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(());
     }
-    let Some(vec_col) = inner.options.vector_columns.first().cloned() else {
+
+    // Source: every user-table vector superfile.
+    let user_manifest = user_inner.manifest.load_full();
+    let sources: Vec<Arc<SuperfileEntry>> = user_manifest.get_all_superfiles().to_vec();
+    if sources.is_empty() {
         return Ok(());
-    };
-    let metric = vec_col.metric;
+    }
 
-    let store = inner.options.store.clone();
-    let disk_cache = inner.options.disk_cache.clone();
-    let storage_opt = inner.options.storage.clone();
-    let storage = storage_opt
-        .clone()
-        .ok_or_else(|| BuildError::Store("incoming routing requires storage".into()))?;
+    let store = user_inner.options.store.clone();
+    let storage_opt = user_inner.options.storage.clone();
 
-    // Read Sq8+ε IVF rows from each incoming superfile — same open path as
-    // query fan-out (`dispatch::open_reader` → disk cache / in-memory tier).
-    let manifest = inner.manifest.load_full();
+    let drain_t0 = std::time::Instant::now();
+    let drain_rss0 = proc_rss_mib();
+    let n_sources = sources.len();
     let column_name = column.clone();
-    // Bound the reader fan-out to the commit write-concurrency cap (rather than
-    // an unbounded `try_join_all`) so a routing pass over many accumulated
-    // incoming superfiles doesn't saturate the object-store connection pool
-    // while a concurrent ingest commit is in flight. `buffered` (not
-    // `buffer_unordered`) preserves input order so the concatenated rows stay
-    // deterministic.
-    let row_sets = stream::iter(incoming.iter().map(|entry| {
+    let readers: Vec<(Arc<SuperfileReader>, Vec<i128>)> = stream::iter(sources.iter().map(|entry| {
         let entry = Arc::clone(entry);
         let store = Arc::clone(&store);
-        let disk_cache = disk_cache.clone();
         let storage_opt = storage_opt.clone();
-        let manifest = Arc::clone(&manifest);
-        let column_name = column_name.clone();
+        let manifest = Arc::clone(&user_manifest);
         async move {
-            let reader = open_reader(&store, disk_cache.as_ref(), storage_opt.as_ref(), &entry)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            // Open the user superfile FULLY RESIDENT: the splice reads via
+            // `try_get_range_sync` on rayon workers, which needs the whole
+            // superfile in memory — a lazy reader yields VectorReadError. Reuse a
+            // resident cached reader if present, else fetch the full bytes + open.
+            let reader = match store.reader(&entry.uri) {
+                Ok(r) if r.parquet_bytes().is_some() => r,
+                _ => {
+                    let storage = storage_opt.as_ref().ok_or_else(|| {
+                        BuildError::Store("drain requires storage to load user superfiles".into())
+                    })?;
+                    let (bytes, _) = storage
+                        .get(&entry.uri.storage_path())
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    Arc::new(
+                        SuperfileReader::open(bytes)
+                            .map_err(|e| BuildError::Store(e.to_string()))?,
+                    )
+                }
+            };
             let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            let vec_reader = reader.vec().ok_or_else(|| {
-                BuildError::Store("incoming superfile missing vector index".into())
-            })?;
-            materialized_ivf_rows_in_doc_order(vec_reader, &column_name, &stable_ids, None).await
+            Ok::<_, BuildError>((reader, stable_ids))
         }
     }))
     .buffered(commit_write_concurrency())
@@ -2456,82 +2506,225 @@ async fn route_incoming_to_manifest_cells_if_ready(
     .await
     .into_iter()
     .collect::<Result<Vec<_>, BuildError>>()?;
-    let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for mut rows in row_sets {
-        all_materialized.append(&mut rows);
-    }
+    eprintln!(
+        "[supertable drain] open + stable_ids: {n_sources} user superfile(s) in {:.1}ms",
+        drain_t0.elapsed().as_secs_f64() * 1e3,
+    );
 
-    // Assign rows to cells and build one IVF superfile per touched cell.
-    let (prepared, cell_updates, radii_updates): (
-        Vec<PreparedSuperfile>,
-        HashMap<u32, u32>,
-        HashMap<u32, f32>,
-    ) = maint_pool().install(|| -> Result<_, BuildError> {
-        let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-        for row in all_materialized {
-            let cell = if let Some(cands) = assign_among {
-                spfresh::nearest_among_cells_encoded(&clusters, metric, cands, &row.encoded)
-            } else {
-                spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded)
-            };
-            by_cell.entry(cell).or_default().push(row);
-        }
-        let mut prepared: Vec<PreparedSuperfile> = Vec::new();
-        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
-        let mut radii_updates: HashMap<u32, f32> = HashMap::new();
-        for (cell_id, mut rows) in by_cell {
-            if rows.is_empty() {
-                continue;
-            }
-            rows.sort_by_key(|r| r.stable_id);
-            for (local, row) in rows.iter_mut().enumerate() {
-                row.local_doc_id = local as u32;
-            }
-            let encoded_only: Vec<_> = rows.iter().map(|r| r.encoded.clone()).collect();
-            let added = rows.len() as u32;
-            let shard_radius =
-                spfresh::encoded_shard_radius(&clusters, metric, cell_id, &encoded_only);
-            if shard_radius > 0.0 {
-                radii_updates.insert(cell_id, shard_radius);
-            }
-            let p = build_prepared_ivf_from_materialized(&inner, cell_id, rows)?;
+    let metric = hidden_inner
+        .options
+        .vector_columns
+        .first()
+        .map(|c| c.metric)
+        .unwrap_or(Metric::L2Sq);
+
+    // A/B the per-cell consolidation op. BOTH modes build straight from the
+    // user-superfile `readers` opened above — no staging region is read in
+    // either path (the dual-write `INCOMING_VECTOR_CELL` is ignored here; killing
+    // it entirely is the separate ingest change). Toggle with
+    // `INFINO_DRAIN_CONSOLIDATE`:
+    //   `kmeans` (default) — materialize each superfile's rows, assign to the
+    //     nearest global cell, and re-cluster per cell via the shared sampled
+    //     k-means (`build_prepared_ivf_from_materialized`) → few clean clusters
+    //     per cell → query prunes at low nprobe. Reuses the same leaf build the
+    //     incoming router uses, just sourced from user superfiles.
+    //   `splice` — route each superfile's LOCAL clusters to their nearest global
+    //     cell and keep them verbatim as multi-cluster fragments (no re-cluster).
+    //     Cheaper to build but the fragment count per cell forces a high nprobe.
+    let mode = std::env::var("INFINO_DRAIN_CONSOLIDATE").unwrap_or_else(|_| "kmeans".into());
+    let mut prepared: Vec<PreparedSuperfile> = Vec::new();
+    let mut cell_updates: HashMap<u32, u32> = HashMap::new();
+    let radii_updates: HashMap<u32, f32> = HashMap::new();
+
+    if mode == "splice" {
+        let column_name_ref = column_name.as_str();
+        let stable_ids_per_input: Vec<Vec<i128>> =
+            readers.iter().map(|(_, ids)| ids.clone()).collect();
+        let routed: HashMap<u32, (MergedIvfSubsection, Vec<i128>)> =
+            hidden_inner.options.writer_pool.install(
+                || -> Result<HashMap<u32, (MergedIvfSubsection, Vec<i128>)>, BuildError> {
+                    let inputs: Vec<(&VectorReader, &str)> = readers
+                        .iter()
+                        .map(|(r, _)| {
+                            r.vec()
+                                .ok_or_else(|| {
+                                    BuildError::Store("user superfile missing vector index".into())
+                                })
+                                .map(|vr| (vr, column_name_ref))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let clusters_ref = &clusters;
+                    route_clusters_into_cells(&inputs, &stable_ids_per_input, |centroid: &[f32]| {
+                        let mut assign = [0u32];
+                        clusters_ref.assign_rows(metric, centroid, &mut assign);
+                        vec![assign[0]]
+                    })
+                    .map_err(|e| e.into())
+                },
+            )?;
+        eprintln!(
+            "[supertable drain] route+splice ({} thread cap): {} cell superfile(s), total {:.1}ms",
+            commit_write_concurrency(),
+            routed.len(),
+            drain_t0.elapsed().as_secs_f64() * 1e3,
+        );
+        for (cell_id, (subsection, ids)) in routed {
+            let added = subsection.n_docs;
+            let shard = build_one_shard_from_merged(subsection, &ids, &hidden_inner.options)?;
+            let prep = prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+            let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
             let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
             cell_updates.insert(cell_id, base.saturating_add(added));
-            prepared.push(p);
+            prepared.push(PreparedSuperfile {
+                entry,
+                bytes_for_store: prep.bytes_for_store,
+                bytes_for_storage: prep.bytes_for_storage,
+                bytes_for_cache: prep.bytes_for_cache,
+            });
         }
-        Ok((prepared, cell_updates, radii_updates))
-    })?;
+    } else {
+        // kmeans: materialize rows from the SAME user-superfile readers, assign
+        // each to its nearest global cell, then re-cluster per cell. (Drain-all
+        // for now — the materialized set is O(corpus); bounded batching is the
+        // next step for the >3M memory wall.) Parallelized to mirror splice:
+        // async-concurrent materialize, rayon assign, rayon per-cell build; only
+        // prepare/finish stays sequential (as splice does — it touches the
+        // writer's superfile-id/manifest staging).
+
+        // Phase A — materialize each user superfile's rows, concurrently.
+        let column_for_mat = column_name.clone();
+        let row_sets: Vec<Vec<MaterializedIvfRow>> =
+            stream::iter(readers.iter().map(|(reader, stable_ids)| {
+                let column_for_mat = column_for_mat.clone();
+                async move {
+                    let vec_reader = reader.vec().ok_or_else(|| {
+                        BuildError::Store("user superfile missing vector index".into())
+                    })?;
+                    materialized_ivf_rows_in_doc_order(vec_reader, &column_for_mat, stable_ids, None)
+                        .await
+                }
+            }))
+            .buffered(commit_write_concurrency())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, BuildError>>()?;
+        let t_mat = drain_t0.elapsed().as_secs_f64() * 1e3;
+
+        // Phase B — group rows by global cell.
+        //   assign-skip (user superfiles global-aligned, `INFINO_USER_CENTROIDS=global`):
+        //     cluster c == cell c, so group by the row's own cluster ordinal —
+        //     no per-row scoring. Saves the O(n·n_cent) assign.
+        //   else: assign each row to its nearest global cell (rayon).
+        let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
+        let assign_skip = std::env::var("INFINO_USER_CENTROIDS")
+            .map(|v| v == "global")
+            .unwrap_or(false);
+        let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+        if assign_skip {
+            for row in all_rows {
+                by_cell.entry(row.cluster).or_default().push(row);
+            }
+        } else {
+            let assignments: Vec<u32> = hidden_inner.options.writer_pool.install(|| {
+                all_rows
+                    .par_iter()
+                    .map(|row| spfresh::nearest_cell_encoded(&clusters, metric, &row.encoded))
+                    .collect()
+            });
+            for (row, cell) in all_rows.into_iter().zip(assignments) {
+                by_cell.entry(cell).or_default().push(row);
+            }
+        }
+        let t_assign = drain_t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[supertable drain] materialize {:.1}ms + {} {:.1}ms (kmeans): {} cell(s)",
+            t_mat,
+            if assign_skip { "group(assign-skip)" } else { "assign" },
+            t_assign - t_mat,
+            by_cell.len(),
+        );
+
+        // Phase C — re-cluster each cell into a clean IVF (rayon across cells).
+        let shards: Vec<(u32, ShardOutput, u32)> = hidden_inner.options.writer_pool.install(|| {
+            by_cell
+                .into_par_iter()
+                .filter(|(_, rows)| !rows.is_empty())
+                .map(|(cell_id, mut rows)| {
+                    rows.sort_by_key(|r| r.stable_id);
+                    for (local, row) in rows.iter_mut().enumerate() {
+                        row.local_doc_id = local as u32;
+                    }
+                    let added = rows.len() as u32;
+                    let shard = build_one_shard_from_materialized(
+                        &rows,
+                        &hidden_inner.options,
+                        VectorLayout::Ivf,
+                    )?;
+                    Ok::<_, BuildError>((cell_id, shard, added))
+                })
+                .collect::<Result<Vec<_>, BuildError>>()
+        })?;
+        eprintln!(
+            "[supertable drain] build {:.1}ms (kmeans, parallel): {} cell superfile(s)",
+            drain_t0.elapsed().as_secs_f64() * 1e3 - t_assign,
+            shards.len(),
+        );
+
+        // Sequential prepare/finish (matches splice — touches writer staging).
+        for (cell_id, shard, added) in shards {
+            let prep = prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+            let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
+            let base = clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
+            cell_updates.insert(cell_id, base.saturating_add(added));
+            prepared.push(PreparedSuperfile {
+                entry,
+                bytes_for_store: prep.bytes_for_store,
+                bytes_for_storage: prep.bytes_for_storage,
+                bytes_for_cache: prep.bytes_for_cache,
+            });
+        }
+    }
+    eprintln!(
+        "[supertable drain] prepare + finish done ({mode}): total {:.1}ms; RSS {} → {} MiB",
+        drain_t0.elapsed().as_secs_f64() * 1e3,
+        drain_rss0.map(|v| format!("{v:.0}")).unwrap_or_else(|| "?".into()),
+        proc_rss_mib().map(|v| format!("{v:.0}")).unwrap_or_else(|| "?".into()),
+    );
     if prepared.is_empty() {
         return Ok(());
     }
-    let batch = collect_prepared_superfiles(&inner, prepared)?;
-
-    // Bump per-cell counts so routing sees the now-populated cells.
+    let batch = collect_prepared_superfiles(&hidden_inner, prepared)?;
     let updated_clusters = spfresh::apply_cell_updates(&clusters, &cell_updates, &radii_updates);
-    inner
+    hidden_inner
         .manifest
-        .store(Arc::new(inner.manifest.load().with_partition_strategy(
+        .store(Arc::new(hidden_inner.manifest.load().with_partition_strategy(
             PartitionStrategy::VectorCell {
                 column,
                 clusters: updated_clusters,
                 routing,
             },
         )));
-
-    // Publish: add the cell superfiles, remove the routed incoming superfiles.
+    let storage = hidden_inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
+    // No superfiles removed: user superfiles stay (durable source), and there is
+    // no staging incoming to drop.
+    let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = persist_commit_async(
-        &inner,
+        &hidden_inner,
         Arc::clone(&storage),
         batch.new_entries,
-        &incoming,
+        &no_removals,
         batch.pending_storage_writes,
         Vec::new(),
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
-    inner.manifest.store(Arc::new(new_manifest));
-
-    schedule_background_storage_reclaim(Arc::clone(&inner));
+    hidden_inner.manifest.store(Arc::new(new_manifest));
+    schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
 }
 
@@ -2588,6 +2781,57 @@ fn build_prepared_ivf_from_materialized(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+    })
+}
+
+/// Coarse current RSS in MiB from `/proc/self/status` (Linux); `None` elsewhere
+/// or on parse failure. Drain instrumentation only — not a hot path.
+fn proc_rss_mib() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb / 1024.0);
+        }
+    }
+    None
+}
+
+/// Build one Sq8 IVF **cell** superfile from a pre-spliced single-cluster
+/// subsection (the aligned concat drain), paired with a parquet id column built
+/// from `stable_ids` in merged local-id order. No fp32 decode, no re-k-means —
+/// the vector blob is set verbatim via `set_prebuilt_ivf_subsection`.
+fn build_one_shard_from_merged(
+    merged: MergedIvfSubsection,
+    stable_ids: &[i128],
+    options: &SupertableOptions,
+) -> Result<ShardOutput, BuildError> {
+    let id_array = Decimal128Array::from_iter_values(stable_ids.iter().copied())
+        .with_precision_and_scale(
+            crate::supertable::options::DECIMAL128_PRECISION,
+            crate::supertable::options::DECIMAL128_SCALE,
+        )
+        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+    let scalar = RecordBatch::try_new(options.scalar_schema(), vec![Arc::new(id_array) as ArrayRef])
+        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+    let mut builder =
+        SuperfileBuilder::new(options.builder_options().with_vector_layout(VectorLayout::Ivf))?;
+    builder.add_batch_ids_only(&scalar)?;
+    builder.set_prebuilt_ivf_subsection(0, merged)?;
+
+    let id_min = stable_ids.iter().copied().min().unwrap_or(0);
+    let id_max = stable_ids.iter().copied().max().unwrap_or(0);
+    let n_docs = stable_ids.len() as u64;
+    let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
+    let bytes = Bytes::from(builder.finish()?);
+
+    Ok(ShardOutput {
+        bytes,
+        n_docs,
+        id_min,
+        id_max,
+        scalar_stats,
     })
 }
 

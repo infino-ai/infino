@@ -241,6 +241,7 @@ fn build_superfile_bytes() -> Bytes {
             column: FTS_COLUMN.into(),
         }],
         vec![VectorConfig {
+            provided_centroids: None,
             column: VEC_COLUMN.into(),
             dim,
             n_cent,
@@ -1887,6 +1888,7 @@ pub(crate) mod diag {
                 column: FTS_COLUMN.into(),
             }],
             vec![VectorConfig {
+                provided_centroids: None,
                 column: VEC_COLUMN.into(),
                 dim: crate::corpus::DIM,
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),

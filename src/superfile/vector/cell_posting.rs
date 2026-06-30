@@ -616,6 +616,11 @@ pub struct EncodedCellRow {
 pub struct MaterializedIvfRow {
     pub local_doc_id: u32,
     pub stable_id: i128,
+    /// IVF cluster ordinal this row was decoded from. When the source
+    /// subsection was built against the global cell grid (provided centroids),
+    /// this ordinal IS the global cell id — letting the drain group rows by
+    /// cell without an O(n·n_cent) per-row re-assignment (assign-skip).
+    pub cluster: u32,
     pub rabitq_code: Vec<u8>,
     pub encoded: EncodedCellRow,
 }

@@ -859,10 +859,10 @@ pub mod vector {
         let hidden = consumer
             .vector_index_table()
             .expect("vector table keeps hidden index");
-        eprintln!("[supertable_vector] draining hidden incoming IVF into cell superfiles...");
-        hidden
-            .await_incoming_routed_to_cells_sync()
-            .expect("hidden incoming drain");
+        eprintln!("[supertable_vector] draining user superfiles into cell superfiles...");
+        consumer
+            .drain_vectors_to_cells_sync()
+            .expect("hidden cell drain");
         log_hidden_stats(hidden, "after drain");
     }
 

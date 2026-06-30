@@ -1539,6 +1539,7 @@ impl VectorReader {
                 out.push(MaterializedIvfRow {
                     local_doc_id: local_id,
                     stable_id,
+                    cluster: c as u32,
                     rabitq_code: rabitq,
                     encoded: EncodedCellRow {
                         stable_id,

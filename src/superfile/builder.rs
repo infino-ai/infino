@@ -259,6 +259,20 @@ impl BuilderOptions {
         self
     }
 
+    /// Stamp caller-supplied global centroids onto every vector column so
+    /// the IVF build partitions against them instead of training local
+    /// k-means. See [`VectorConfig::provided_centroids`]. `None` is a no-op
+    /// (local k-means, the default).
+    pub(crate) fn with_vector_centroids(
+        mut self,
+        centroids: Option<std::sync::Arc<[f32]>>,
+    ) -> Self {
+        for vc in &mut self.vector_columns {
+            vc.provided_centroids = centroids.clone();
+        }
+        self
+    }
+
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
         // TODO: Fetch tokenizer from reader. Not possible at the moment because we don't
         // store the tokenizer in the reader. Should work for now because we only have AsciiLowerTokenizer.

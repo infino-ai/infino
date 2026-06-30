@@ -55,6 +55,7 @@ fn build_superfile(
         ID_COLUMN,
         vec![],
         vec![VectorConfig {
+            provided_centroids: None,
             column: column.into(),
             dim,
             n_cent,

@@ -1787,6 +1787,28 @@ impl ClusterCentroids {
         self.n_cent == 0
     }
 
+    /// Dequantize the Sq8-stored centroids back to cluster-major fp32
+    /// (`n_cent * dim` floats): `fp32[c][j] = mins[c] + scales[c] * codes`.
+    /// Every caller that decodes the *same* `ClusterCentroids` gets
+    /// byte-identical fp32, so superfiles built against these centroids
+    /// share cluster ordinals exactly — the precondition that lets the
+    /// drain splice cluster `c` into cell `c` without re-clustering.
+    pub fn to_fp32(&self) -> Vec<f32> {
+        let nc = self.n_cent as usize;
+        let d = self.dim as usize;
+        let mut out = vec![0f32; nc * d];
+        for c in 0..nc {
+            let min = self.mins[c];
+            let scale = self.scales[c];
+            let dst = &mut out[c * d..(c + 1) * d];
+            let src = &self.codes[c * d..(c + 1) * d];
+            for (o, &code) in dst.iter_mut().zip(src) {
+                *o = min + scale * code as f32;
+            }
+        }
+        out
+    }
+
     /// Sq8-quantize fp32 cluster centroids (`centroids` is cluster-major,
     /// `n_cent * dim` floats) with per-cluster calibration: each cluster
     /// centroid spans the full 8-bit range against its own component

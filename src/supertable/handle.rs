@@ -523,6 +523,27 @@ impl Supertable {
     }
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// No-staging drain: build the hidden per-cell index by routing + splicing
+    /// the **user** superfiles' local clusters into cells (multi-cluster
+    /// fragments — inner pruning preserved). Called on the user-facing table
+    /// (it owns the hidden `vector_index_table`); benches invoke it between the
+    /// pre-drain and post-drain search phases.
+    fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
+        let Some(hidden) = self.inner.vector_index_table.as_ref() else {
+            return Ok(());
+        };
+        bridge_on_runtime(
+            super::writer::drain_user_superfiles_to_hidden_cells(
+                Arc::clone(&self.inner),
+                Arc::clone(&hidden.inner),
+            ),
+            &self.query_runtime(),
+        )
+    }
+    }
+
     /// Block until the on-disk cache has fully promoted every superfile
     /// in the current manifest to an mmap-backed reader, or `timeout`
     /// elapses for one of them. This is the public "warm-readiness"

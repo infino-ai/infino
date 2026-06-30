@@ -1104,6 +1104,7 @@ pub fn build_vector_index(
 ) -> VectorBuilder {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
+        provided_centroids: None,
         column: "v".into(),
         dim: DIM,
         n_cent,
@@ -1156,6 +1157,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             column: "title".into(),
         }],
         vec![SfVectorConfig {
+            provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
             n_cent,
@@ -1202,6 +1204,7 @@ pub fn build_superfile_with_metric(
             column: "title".into(),
         }],
         vec![SfVectorConfig {
+            provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
             n_cent,

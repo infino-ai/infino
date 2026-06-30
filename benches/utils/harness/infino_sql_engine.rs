@@ -138,6 +138,7 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             },
         ],
         vec![VectorConfig {
+            provided_centroids: None,
             column: VECTOR_COLUMN.into(),
             dim: SQL_DIM,
             n_cent: n_cent_for(n_rows),

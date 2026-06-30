@@ -91,7 +91,7 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
     supertable::{
         error::QueryError,
-        handle::{INCOMING_VECTOR_CELL, Supertable, SupertableReader},
+        handle::{Supertable, SupertableReader},
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
@@ -556,7 +556,17 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        let budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
+        // Inner fragment budget. Default = `nprobe × eligible superfiles` (couples
+        // the inner cluster count to the cell-selection nprobe). `INFINO_INNER_BUDGET`
+        // OVERRIDES it with an absolute cluster count, decoupling the inner probe
+        // from the top-level cell count — so a splice index (many fragments/cell)
+        // can probe enough fragments within the few selected cells to compare
+        // recall against the kmeans index at a fixed cell selection.
+        let budget = std::env::var("INFINO_INNER_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|b| b.max(1))
+            .unwrap_or_else(|| nprobe.saturating_mul(n_eligible.max(1)).max(nprobe));
         if scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
@@ -985,11 +995,11 @@ impl SupertableReader {
                             options.resolve(false).0,
                             routing_with_env_overrides(routing),
                         );
-                        // Always scan the "incoming" append region in addition
-                        // to the nprobe-routed cells: those rows have not been
-                        // distributed into cells by maintenance yet, so routing
-                        // by centroid can't see them.
-                        routed.push(INCOMING_VECTOR_CELL);
+                        // No-staging model: the hidden index is built by draining
+                        // the user superfiles into cells, so there is no separate
+                        // "incoming" staging region to scan. Pre-drain the hidden
+                        // index is empty (0 results) — accepted for now; the
+                        // watermark/incremental path comes post-1M.
                         if vit_manifest.superfiles.is_empty() {
                             vit_manifest
                                 .superfiles_for_routed_cells(&routed)

@@ -153,6 +153,13 @@ pub struct VectorConfig {
     /// On-disk rerank codec for this column. See [`RerankCodec`]
     /// for the supported codecs and their size/recall trade-offs.
     pub rerank_codec: RerankCodec,
+    /// When `Some`, the IVF build skips local k-means and partitions
+    /// against these caller-supplied centroids (cluster-major fp32,
+    /// `n_cent * dim`). Used by the hidden-index incoming build so every
+    /// shard shares the global cell ordinals and the drain can splice
+    /// cluster `c` → cell `c` without re-clustering. `n_cent` is taken
+    /// from the supplied centroids (`len / dim`), overriding the field.
+    pub provided_centroids: Option<std::sync::Arc<[f32]>>,
 }
 
 impl VectorConfig {
@@ -167,6 +174,7 @@ impl VectorConfig {
             rot_seed,
             metric,
             rerank_codec: RerankCodec::default(),
+            provided_centroids: None,
         }
     }
 
@@ -174,6 +182,14 @@ impl VectorConfig {
     #[must_use]
     pub fn with_rerank_codec(mut self, codec: RerankCodec) -> Self {
         self.rerank_codec = codec;
+        self
+    }
+
+    /// Partition against caller-supplied global centroids instead of
+    /// local k-means. See [`Self::provided_centroids`].
+    #[must_use]
+    pub fn with_provided_centroids(mut self, centroids: Option<std::sync::Arc<[f32]>>) -> Self {
+        self.provided_centroids = centroids;
         self
     }
 }
@@ -809,31 +825,43 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
-    let n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_cent_row_count_cap(n_docs))
-        .min(n_docs.max(1));
-    // Train centroids the same way the user-superfile build does: on a bounded
-    // sample (NOT every row), via the shared `kmeans` (random init + parallel).
-    // The previous bespoke `encoded_ivf_kmeans` trained over every row with
-    // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
-    // on large cells. Only the sampled rows are decoded to fp32, so there is no
-    // full-corpus fp32 buffer.
-    let sample_size = default_kmeans_sample_size(n_cent).min(n_docs);
-    let mut sample = vec![0f32; sample_size * dim];
-    for s in 0..sample_size {
-        let idx = if sample_size == n_docs {
-            s
-        } else {
-            s * n_docs / sample_size
-        };
-        let enc = &rows[idx].encoded;
-        for (d, slot) in sample[s * dim..(s + 1) * dim].iter_mut().enumerate() {
-            *slot = encoded_component_at(enc, d);
+    let (n_cent, centroids) = if let Some(global) = cfg.provided_centroids.as_ref() {
+        // Partition against the global cell centroids instead of training
+        // local ones. Every incoming shard then shares cell ordinals, so the
+        // drain splices cluster `c` → cell `c` with no re-clustering. Keep all
+        // `n_cent` cells even when this shard has fewer rows (empty clusters are
+        // count-0) so ordinal `c` always means cell `c`.
+        debug_assert!(dim > 0 && global.len() % dim == 0);
+        let nc = global.len() / dim.max(1);
+        (nc, global.to_vec())
+    } else {
+        let n_cent = cfg
+            .n_cent
+            .max(1)
+            .min(n_cent_row_count_cap(n_docs))
+            .min(n_docs.max(1));
+        // Train centroids the same way the user-superfile build does: on a bounded
+        // sample (NOT every row), via the shared `kmeans` (random init + parallel).
+        // The previous bespoke `encoded_ivf_kmeans` trained over every row with
+        // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
+        // on large cells. Only the sampled rows are decoded to fp32, so there is no
+        // full-corpus fp32 buffer.
+        let sample_size = default_kmeans_sample_size(n_cent).min(n_docs);
+        let mut sample = vec![0f32; sample_size * dim];
+        for s in 0..sample_size {
+            let idx = if sample_size == n_docs {
+                s
+            } else {
+                s * n_docs / sample_size
+            };
+            let enc = &rows[idx].encoded;
+            for (d, slot) in sample[s * dim..(s + 1) * dim].iter_mut().enumerate() {
+                *slot = encoded_component_at(enc, d);
+            }
         }
-    }
-    let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+        let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+        (n_cent, centroids)
+    };
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
@@ -1055,28 +1083,41 @@ fn build_subsection_streaming(
     let dim = cfg.dim;
     let n_docs = n_docs_u32 as usize;
     let sample_rows = reservoir.n_rows();
-    // n_cent must be in `[1, min(n_docs, sample_rows)]`. Both bounds
-    // are required: `n_cent > n_docs` makes the IVF degenerate;
-    // `n_cent > sample_rows` would crash k-means (`k > n` is asserted
-    // by the trainer). At steady-state shapes (`n_docs > sample_size`,
-    // `sample_size ≥ 100_000`) the sample_rows bound is the active
-    // one and is comfortably above any sane n_cent.
-    let n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_cent_row_count_cap(n_docs))
-        .min(n_docs.max(1))
-        .min(sample_rows.max(1));
-
-    // ---- Pass 1: k-means on the reservoir sample ----
-    let centroids = if sample_rows == 0 || n_docs == 0 {
-        vec![0.0f32; n_cent * dim]
+    // ---- Pass 1: centroids ----
+    // If a GLOBAL grid is provided, partition against it (cluster c == global
+    // cell c) instead of training local k-means — the precondition for the
+    // splice drain to route c → cell c doc-correctly. Keep all `n_cent` cells
+    // even when this shard has fewer rows (empty clusters are count-0), so
+    // ordinal c always means cell c. Otherwise train local centroids on the
+    // reservoir sample. (Mirrors `build_subsection_from_materialized`.)
+    let (n_cent, centroids) = if let Some(global) = cfg.provided_centroids.as_ref() {
+        debug_assert!(dim > 0 && global.len() % dim == 0);
+        let nc = (global.len() / dim.max(1)).max(1);
+        drop(reservoir);
+        (nc, global.to_vec())
     } else {
-        kmeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
+        // n_cent must be in `[1, min(n_docs, sample_rows)]`. Both bounds
+        // are required: `n_cent > n_docs` makes the IVF degenerate;
+        // `n_cent > sample_rows` would crash k-means (`k > n` is asserted
+        // by the trainer). At steady-state shapes (`n_docs > sample_size`,
+        // `sample_size ≥ 100_000`) the sample_rows bound is the active
+        // one and is comfortably above any sane n_cent.
+        let n_cent = cfg
+            .n_cent
+            .max(1)
+            .min(n_cent_row_count_cap(n_docs))
+            .min(n_docs.max(1))
+            .min(sample_rows.max(1));
+        let centroids = if sample_rows == 0 || n_docs == 0 {
+            vec![0.0f32; n_cent * dim]
+        } else {
+            kmeans(reservoir.sample(), dim, n_cent, KMEANS_ITERS, cfg.rot_seed)
+        };
+        // Drop the reservoir immediately — k-means has converged
+        // and the sample bytes aren't needed for pass 2.
+        drop(reservoir);
+        (n_cent, centroids)
     };
-    // Drop the reservoir immediately — k-means has converged
-    // and the sample bytes aren't needed for pass 2.
-    drop(reservoir);
 
     // Summary centroid: mean of trained centroids. Cheap and only
     // depends on centroids, so compute now before pass 2 so we can
