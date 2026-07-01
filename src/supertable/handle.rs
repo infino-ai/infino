@@ -501,14 +501,11 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
-    test_visible! {
-    /// No-staging drain: build the hidden per-cell index by routing + splicing
-    /// the **user** superfiles' local clusters into cells (multi-cluster
-    /// fragments — inner pruning preserved). Called on the user-facing table
-    /// (it owns the hidden `vector_index_table`); benches invoke it between the
-    /// pre-drain and post-drain search phases.
-    fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
+    /// Route undrained user superfiles into the hidden per-cell index. Not part
+    /// of the public API — [`Supertable::optimize`] calls this before compact;
+    /// tests and benches may invoke it directly via
+    /// [`Supertable::drain_vectors_to_cells_sync`].
+    pub(crate) fn drain_hidden_vector_cells_sync(&self) -> Result<(), BuildError> {
         let Some(hidden) = self.inner.vector_index_table.as_ref() else {
             return Ok(());
         };
@@ -519,6 +516,17 @@ impl Supertable {
             ),
             &self.query_runtime(),
         )
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// No-staging drain: build the hidden per-cell index by routing + splicing
+    /// the **user** superfiles' local clusters into cells (multi-cluster
+    /// fragments — inner pruning preserved). Called on the user-facing table
+    /// (it owns the hidden `vector_index_table`); benches invoke it between the
+    /// pre-drain and post-drain search phases.
+    fn drain_vectors_to_cells_sync(&self) -> Result<(), BuildError> {
+        self.drain_hidden_vector_cells_sync()
     }
     }
 
