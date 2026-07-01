@@ -542,6 +542,69 @@ impl Table {
         batches_to_ipc(&batches)
     }
 
+    /// Prefix-expanded BM25 search over one FTS column: `prefix` matches every
+    /// indexed term it begins, scored as one BM25 query. Returns Arrow rows
+    /// like [`Table::bm25_search`]; `projection` selects columns.
+    #[napi]
+    pub fn bm25_search_prefix(
+        &self,
+        column: String,
+        prefix: String,
+        k: u32,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .bm25_search_prefix(&column, &prefix, k as usize, proj.as_deref())
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
+    /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
+    /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
+    /// `vector_query` (a `Float32Array`, with optional `nprobe`) drive vector
+    /// kNN. Returns Arrow rows like [`Table::bm25_search`], with `score` the
+    /// fused RRF score (higher is better); `projection` selects columns.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        text_column: String,
+        text_query: String,
+        vector_column: String,
+        vector_query: Float32Array,
+        k: u32,
+        mode: Option<String>,
+        nprobe: Option<u32>,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let mode = parse_mode(mode.as_deref())?;
+        let mut opts = VectorSearchOptions::new();
+        if let Some(n) = nprobe {
+            opts = opts.with_nprobe(n as usize);
+        }
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .hybrid_search(
+                &text_column,
+                &text_query,
+                mode,
+                &vector_column,
+                vector_query.as_ref(),
+                opts,
+                k as usize,
+                proj.as_deref(),
+            )
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
     /// Delete every row matching a SQL `predicate` (e.g. `"status = 'spam'"`),
     /// returning the mutation counts. Requires durable storage — a `memory://`
     /// table surfaces a clear error.
