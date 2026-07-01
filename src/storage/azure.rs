@@ -194,7 +194,7 @@ impl StorageProvider for AzureStorageProvider {
         let path = self.path(uri)?;
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        retry::with_reissue(|| async {
+        retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,

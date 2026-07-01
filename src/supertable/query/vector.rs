@@ -84,6 +84,7 @@ use super::{
     dispatch,
     exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
     hierarchical_iter,
+    prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
@@ -833,17 +834,10 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Tokenize the predicate once with the index tokenizer (the same
-        // tokenizer used at build time, so the terms match the postings).
-        // No tokens (e.g. empty / punctuation-only) ⇒ nothing matches.
+        // tokenizer used at build time, so the terms match the postings AND
+        // the manifest term blooms). No tokens (empty / punctuation-only) ⇒
+        // nothing matches.
         let Some(tokenizer) = manifest.options.tokenizer.as_ref() else {
             return Ok(Vec::new());
         };
@@ -852,13 +846,33 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Build the per-superfile allow-set: one `token_match` per
-        // candidate superfile (postings only — the same retrieval
-        // `CandidatePlan::TermsAll` uses), grouped to a
-        // `superfile → RoaringBitmap` map. Empty bitmaps are dropped so
-        // their superfile never fans out. Reuses the shared `fanout`
-        // orchestrator (concurrent reader opens) but keeps each unit's
-        // result keyed to its superfile URI.
+        // Manifest-only leaf survival: part-tier term bloom / range, then
+        // per-superfile summaries — no superfile reads. Intersect with the
+        // vector centroid prune so `token_match` opens only superfiles that
+        // could match the predicate *and* might hold vector-near rows.
+        let prune_leaves = [PruneLeaf::TermPresence {
+            column: filter.column.to_owned(),
+            terms: tokens.clone(),
+            mode: filter.mode,
+        }];
+        let surviving: HashSet<u128> = select_superfiles(&manifest, &prune_leaves)
+            .await?
+            .iter()
+            .map(|e| e.superfile_id.as_u128())
+            .collect();
+        if surviving.is_empty() {
+            return Ok(Vec::new());
+        }
+        let superfiles = self
+            .vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+            .await?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve the exact per-superfile allow-set (`token_match` postings)
+        // over the survivors; superfiles whose predicate matched no row are
+        // dropped so they never fan out.
         let allow = self
             .candidate_bitmaps(&superfiles, filter.column, &tokens, filter.mode)
             .await?;
@@ -868,6 +882,23 @@ impl SupertableReader {
 
         self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
             .await
+    }
+
+    /// Vector centroid prune intersected with a manifest-only survival set.
+    async fn vector_pruned_superfiles_intersect(
+        &self,
+        manifest: &Manifest,
+        column: &str,
+        query: &[f32],
+        surviving: &HashSet<u128>,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        Ok(manifest
+            .get_pruned_superfiles_for_vector(column, query)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .into_iter()
+            .filter(|e| surviving.contains(&e.superfile_id.as_u128()))
+            .collect())
     }
 
     /// Resolve the text predicate (`filter_col` contains `tokens` under
@@ -914,13 +945,10 @@ impl SupertableReader {
     /// kernel ranks distance only among the `local_doc_id`s the plan admits,
     /// so the result is the true k-nearest among matching rows.
     ///
-    /// There is deliberately **no selectivity gate** here (unlike the scan
-    /// provider, which skips the index path above ~1% match density because
-    /// a Parquet `RowSelection` can't skip saturated pages). The vector
-    /// kernel reads the same IVF clusters either way; the allow-set only
-    /// filters which candidates enter the shortlist heap, and even a
-    /// non-selective predicate must still yield exactly-k matching hits — so
-    /// a bounded plan is always pushed down.
+    /// Manifest-only leaf survival runs before any superfile opens: bounded
+    /// FTS leaves are lowered to term-bloom prunes and intersected with the
+    /// vector centroid prune. The per-superfile allow-set (`plan.evaluate`)
+    /// then runs only over that intersection.
     pub(crate) async fn vector_hits_filtered_by_plan(
         &self,
         column: &str,
@@ -933,10 +961,17 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
+        let superfiles = match plan.surviving_superfile_ids(&manifest).await? {
+            None => manifest
+                .get_pruned_superfiles_for_vector(column, query)
+                .await
+                .map_err(QueryError::ManifestLoad)?,
+            Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
+            Some(surviving) => {
+                self.vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+                    .await?
+            }
+        };
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
