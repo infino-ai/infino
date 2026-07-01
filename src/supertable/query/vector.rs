@@ -1161,7 +1161,7 @@ impl SupertableReader {
                     PartitionStrategy::VectorCell {
                         clusters, routing, ..
                     } => {
-                        let mut routed = clusters.select_cells_adaptive(
+                        let routed = clusters.select_cells_adaptive(
                             vit_metric,
                             query,
                             options.resolve(false).0,
