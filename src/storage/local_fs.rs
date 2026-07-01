@@ -413,6 +413,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cas_conformance_holds() {
+        let (_dir, p) = provider();
+        crate::test_helpers::cas_conformance::cas_conformance(&p, "ptr/cas-conf", true).await;
+    }
+
+    #[tokio::test]
     async fn put_if_match_with_stale_etag_fails() {
         let (_dir, p) = provider();
         p.put_atomic("ptr/current", Bytes::from_static(b"v1"))

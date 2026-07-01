@@ -357,6 +357,27 @@ async fn azure_tail_uses_head_plus_range_not_suffix() {
     delete_emulator_container(&container).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn azure_cas_conformance_holds() {
+    if std::env::var("INFINO_TEST_AZURE").is_err() {
+        eprintln!("azure_cas_conformance_holds: skipped (set INFINO_TEST_AZURE=1 to enable)");
+        return;
+    }
+
+    let container = format!("infino-azure-cas-{}", uuid::Uuid::new_v4());
+    ensure_emulator_container(&container).await;
+
+    let storage: Arc<dyn StorageProvider> = Arc::new(
+        AzureStorageProvider::new_with_emulator(&container).expect("azure provider for cas conf"),
+    );
+    // Azurite enforces the etag precondition, so stale rejection is asserted.
+    infino::test_helpers::cas_conformance::cas_conformance(storage.as_ref(), "cas/conf", true)
+        .await;
+
+    eprintln!("[azure] CAS conformance OK");
+    delete_emulator_container(&container).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn supertable_real_azure_round_trip() {
     if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {

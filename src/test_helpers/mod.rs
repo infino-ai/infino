@@ -25,6 +25,7 @@
 //! used as the FTS correctness oracle.
 
 pub mod brute_force_bm25;
+pub mod cas_conformance;
 
 use std::sync::Arc;
 

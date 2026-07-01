@@ -788,6 +788,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cas_conformance_holds() {
+        // s3s-fs does not enforce a stale conditional update (its 412 path is
+        // covered by the real-S3 integration smoke), so stale rejection is
+        // not asserted here — the chained-token step is what matters.
+        let (p, _guard) = harness_provider().await;
+        crate::test_helpers::cas_conformance::cas_conformance(&p, "cas/conf", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_atomic_twice_is_precondition_failed() {
         let (p, _guard) = harness_provider().await;
         let body = Bytes::from_static(b"first");
