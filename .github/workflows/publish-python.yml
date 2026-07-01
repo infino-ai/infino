@@ -170,12 +170,8 @@ jobs:
           manylinux: ${{ contains(matrix.target, 'musl') && 'musllinux_1_2' || 'auto' }}
           args: --release --locked --out dist -m infino-python/Cargo.toml
 
-      # Install the freshly built wheel into a clean interpreter and run the
-      # smoke suite, proving it imports and round-trips before publish. glibc
-      # wheels install directly; musl wheels run in an Alpine container matching
-      # the runner arch, since they can't install on the glibc-based runner.
-      # Optional interop deps (pandas, duckdb) are installed so no test is
-      # silently skipped.
+      # Smoke-test the wheel before publish. Interop deps (pandas, duckdb) keep
+      # tests from silently skipping; musl runs in Alpine (can't install on glibc).
       - name: Smoke-test wheel (glibc)
         if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
