@@ -17,12 +17,12 @@ use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions, PutPayload, UpdateVersion,
-    azure::{AzureConfigKey, MicrosoftAzure, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredentialProvider, MicrosoftAzure, MicrosoftAzureBuilder},
     path::Path as ObjPath,
 };
 
 use super::{
-    BackendCredentials, ObjectMeta, StorageError, StorageOptions, StorageProvider,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider,
     credentials::is_azure_credential_key,
     options::{apply, non_credential_options},
     retry,
@@ -51,13 +51,13 @@ impl AzureStorageProvider {
     /// strings). The prefix isolates each table under
     /// `azure://container/prefix/`.
     ///
-    /// When `creds` is set, the account key comes from that rotating provider
-    /// and the credential keys in `opts` are ignored; other options apply.
+    /// When `creds` is set, the account key comes from that provider and the
+    /// credential keys in `opts` are ignored; other options apply.
     pub fn new_with_prefix(
         container: impl Into<String>,
         prefix: impl Into<String>,
         opts: &StorageOptions,
-        creds: Option<&BackendCredentials>,
+        creds: Option<AzureCredentialProvider>,
     ) -> Result<Self, StorageError> {
         let container = container.into();
         let uri = format!("azure://{container}");
@@ -65,7 +65,7 @@ impl AzureStorageProvider {
             .with_container_name(&container)
             .with_client_options(tuned_client_options())
             .with_retry(retry::config());
-        let builder = match creds.and_then(BackendCredentials::as_azure) {
+        let builder = match creds {
             Some(provider) => {
                 let config = non_credential_options(opts, is_azure_credential_key);
                 apply::<AzureConfigKey, _>(

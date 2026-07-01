@@ -30,12 +30,12 @@ use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectStore,
     ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
+    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredentialProvider, S3ConditionalPut},
     path::Path as ObjPath,
 };
 
 use super::{
-    BackendCredentials, ObjectMeta, StorageError, StorageOptions, StorageProvider,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider,
     credentials::is_s3_credential_key,
     options::{apply, non_credential_options},
     retry,
@@ -83,14 +83,14 @@ impl S3StorageProvider {
     /// default client options; the tuned connection pool is AWS-only (it
     /// destabilizes local s3s-fs / MinIO endpoints).
     ///
-    /// When `creds` is set, credentials come from that rotating provider and
-    /// the credential keys in `opts` are ignored (so a static key can't
-    /// shadow it); other options still apply.
+    /// When `creds` is set, credentials come from that provider and the
+    /// credential keys in `opts` are ignored (so a static key can't shadow
+    /// it); other options still apply.
     pub fn new_with_prefix(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         opts: &StorageOptions,
-        creds: Option<&BackendCredentials>,
+        creds: Option<AwsCredentialProvider>,
     ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let uri = format!("s3://{bucket}");
@@ -106,7 +106,7 @@ impl S3StorageProvider {
         };
 
         // Caller options last so they win (e.g. `aws_allow_http=true`).
-        let builder = match creds.and_then(BackendCredentials::as_aws) {
+        let builder = match creds {
             Some(provider) => {
                 let config = non_credential_options(opts, is_s3_credential_key);
                 apply::<AmazonS3ConfigKey, _>(

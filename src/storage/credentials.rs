@@ -1,101 +1,112 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Runtime-swappable object-store credentials.
+//! Runtime-swappable storage options.
 //!
-//! [`RotatingCredentialProvider`] backs `object_store`'s `with_credentials`
-//! with an `ArcSwap`, so a worker can rotate a static key without rebuilding
-//! the store.
+//! [`SharedStorageOptions`] is a connection-scoped `ArcSwap<StorageOptions>`
+//! shared (cloned `Arc`) into every provider a connection builds. The
+//! credential providers it hands to `object_store`'s `with_credentials` read
+//! the latest map on each request, so a worker can update a static key without
+//! rebuilding any store.
 
 use std::{fmt::Debug, str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use object_store::{
-    CredentialProvider,
+    CredentialProvider, Error as ObjError,
     aws::{AmazonS3ConfigKey, AwsCredential, AwsCredentialProvider},
     azure::{AzureAccessKey, AzureConfigKey, AzureCredential, AzureCredentialProvider},
 };
 
 use super::{StorageError, StorageOptions};
 
+/// A `CredentialProvider` that re-extracts its credential from a shared
+/// options cell on every request, so a swap of the cell takes effect without
+/// rebuilding the store. `extract` pulls the backend's credential out of the
+/// current map (`None` if the keys are absent, `Err` if malformed).
 #[derive(Debug)]
-pub struct RotatingCredentialProvider<T> {
-    current: ArcSwap<T>,
-}
-
-impl<T: Debug + Send + Sync> RotatingCredentialProvider<T> {
-    pub(crate) fn new(initial: T) -> Self {
-        Self {
-            current: ArcSwap::from_pointee(initial),
-        }
-    }
-
-    /// Publish a new credential; the next `get_credential` returns it.
-    pub(crate) fn store(&self, next: T) {
-        self.current.store(Arc::new(next));
-    }
+struct OptionsCredentialProvider<T> {
+    options: Arc<ArcSwap<StorageOptions>>,
+    extract: fn(&StorageOptions) -> Result<Option<T>, StorageError>,
 }
 
 #[async_trait]
-impl<T: Debug + Send + Sync> CredentialProvider for RotatingCredentialProvider<T> {
+impl<T: Debug + Send + Sync> CredentialProvider for OptionsCredentialProvider<T> {
     type Credential = T;
 
     async fn get_credential(&self) -> object_store::Result<Arc<T>> {
-        Ok(self.current.load_full())
-    }
-}
-
-/// Swappable credential shared (cloned `Arc`) into every provider a
-/// connection builds. Holds only the rotatable static credential.
-#[derive(Debug, Clone)]
-pub enum BackendCredentials {
-    S3(Arc<RotatingCredentialProvider<AwsCredential>>),
-    Azure(Arc<RotatingCredentialProvider<AzureCredential>>),
-}
-
-impl BackendCredentials {
-    /// `Some` when `opts` carries static S3 credentials, else `None`
-    /// (ambient identity / role — object_store refreshes those itself).
-    pub(crate) fn s3_from_options(opts: &StorageOptions) -> Result<Option<Self>, StorageError> {
-        Ok(aws_credential(opts)?.map(|c| Self::S3(Arc::new(RotatingCredentialProvider::new(c)))))
-    }
-
-    /// `Some` when `opts` carries a static Azure account key, else `None`.
-    pub(crate) fn azure_from_options(opts: &StorageOptions) -> Result<Option<Self>, StorageError> {
-        Ok(azure_credential(opts)?
-            .map(|c| Self::Azure(Arc::new(RotatingCredentialProvider::new(c)))))
-    }
-
-    /// Swap in the credential parsed from `opts`. Errors (leaving the old
-    /// credential live) if `opts` carries none for this backend.
-    pub(crate) fn rotate(&self, opts: &StorageOptions) -> Result<(), StorageError> {
-        match self {
-            Self::S3(provider) => provider.store(aws_credential(opts)?.ok_or_else(no_credential)?),
-            Self::Azure(provider) => {
-                provider.store(azure_credential(opts)?.ok_or_else(no_credential)?)
-            }
+        let options = self.options.load();
+        match (self.extract)(&options) {
+            Ok(Some(cred)) => Ok(Arc::new(cred)),
+            Ok(None) => Err(cred_error("storage options no longer carry a credential")),
+            Err(e) => Err(cred_error(&e.to_string())),
         }
+    }
+}
+
+/// Connection-scoped storage options that can be updated at runtime.
+///
+/// Cloning shares the same cell (one `Arc`), so an [`Self::update`] on any
+/// clone is seen by every provider built from it. Only credential keys take
+/// effect on already-built stores (via the credential providers below);
+/// non-credential keys apply to stores built after the update.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedStorageOptions {
+    options: Arc<ArcSwap<StorageOptions>>,
+}
+
+impl SharedStorageOptions {
+    pub(crate) fn new(options: StorageOptions) -> Self {
+        Self {
+            options: Arc::new(ArcSwap::from_pointee(options)),
+        }
+    }
+
+    /// Current options, for building a store's `with_config`.
+    pub(crate) fn snapshot(&self) -> Arc<StorageOptions> {
+        self.options.load_full()
+    }
+
+    /// Merge `patch` over the current options and publish the result. Rejects
+    /// (leaving the old options live) if the merged view carries a malformed
+    /// or incomplete credential.
+    pub(crate) fn update(&self, patch: &StorageOptions) -> Result<(), StorageError> {
+        let mut merged = self.options.load().as_ref().clone();
+        merged.extend(patch.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Validate both backends' credentials parse before publishing.
+        aws_credential(&merged)?;
+        azure_credential(&merged)?;
+        self.options.store(Arc::new(merged));
         Ok(())
     }
 
-    pub(crate) fn as_aws(&self) -> Option<AwsCredentialProvider> {
-        match self {
-            Self::S3(provider) => Some(Arc::clone(provider) as AwsCredentialProvider),
-            Self::Azure(_) => None,
-        }
+    /// An S3 credential provider reading this cell, or `None` when the options
+    /// carry no static S3 credential (ambient identity — object_store refreshes
+    /// that itself). `Err` if the credential is present but incomplete.
+    pub(crate) fn aws_provider(&self) -> Result<Option<AwsCredentialProvider>, StorageError> {
+        Ok(aws_credential(&self.options.load())?.map(|_| {
+            Arc::new(OptionsCredentialProvider {
+                options: Arc::clone(&self.options),
+                extract: aws_credential,
+            }) as AwsCredentialProvider
+        }))
     }
 
-    pub(crate) fn as_azure(&self) -> Option<AzureCredentialProvider> {
-        match self {
-            Self::Azure(provider) => Some(Arc::clone(provider) as AzureCredentialProvider),
-            Self::S3(_) => None,
-        }
+    /// An Azure credential provider reading this cell, or `None` when the
+    /// options carry no static account key.
+    pub(crate) fn azure_provider(&self) -> Result<Option<AzureCredentialProvider>, StorageError> {
+        Ok(azure_credential(&self.options.load())?.map(|_| {
+            Arc::new(OptionsCredentialProvider {
+                options: Arc::clone(&self.options),
+                extract: azure_credential,
+            }) as AzureCredentialProvider
+        }))
     }
 }
 
 /// Whether `key` is a rotatable static credential — kept out of
-/// `with_config` so it can't shadow the rotating provider. Matches by
+/// `with_config` so it can't shadow the credential provider. Matches by
 /// config-key variant, so aliases are covered too.
 pub(crate) fn is_s3_credential_key(key: &str) -> bool {
     matches!(
@@ -144,8 +155,11 @@ fn azure_credential(opts: &StorageOptions) -> Result<Option<AzureCredential>, St
     Ok(None)
 }
 
-fn no_credential() -> StorageError {
-    invalid("no rotatable credential in storage options for this backend")
+fn cred_error(msg: &str) -> ObjError {
+    ObjError::Generic {
+        store: "credentials",
+        source: msg.to_string().into(),
+    }
 }
 
 fn invalid(msg: &str) -> StorageError {
@@ -159,15 +173,6 @@ fn invalid(msg: &str) -> StorageError {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn get_credential_reflects_latest_store() {
-        let provider = RotatingCredentialProvider::new("first".to_string());
-        assert_eq!(*provider.get_credential().await.expect("cred"), "first");
-
-        provider.store("second".to_string());
-        assert_eq!(*provider.get_credential().await.expect("cred"), "second");
-    }
-
     fn opts(pairs: &[(&str, &str)]) -> StorageOptions {
         pairs
             .iter()
@@ -176,66 +181,67 @@ mod tests {
     }
 
     #[test]
-    fn s3_from_options_builds_or_skips() {
-        let creds = BackendCredentials::s3_from_options(&opts(&[
+    fn aws_provider_present_only_with_static_credentials() {
+        let cell = SharedStorageOptions::new(opts(&[
             ("aws_access_key_id", "ak"),
             ("aws_secret_access_key", "sk"),
-        ]))
-        .expect("parse");
-        let creds = creds.expect("some");
-        assert!(creds.as_aws().is_some() && creds.as_azure().is_none());
+        ]));
+        assert!(cell.aws_provider().expect("parse").is_some());
+        assert!(cell.azure_provider().expect("parse").is_none());
 
-        // Non-credential options alone → nothing to rotate.
-        assert!(
-            BackendCredentials::s3_from_options(&opts(&[("aws_region", "us-east-1")]))
-                .expect("parse")
-                .is_none()
-        );
+        // Non-credential options alone → ambient identity, no provider.
+        let ambient = SharedStorageOptions::new(opts(&[("aws_region", "us-east-1")]));
+        assert!(ambient.aws_provider().expect("parse").is_none());
     }
 
     #[test]
-    fn s3_partial_credentials_error() {
-        assert!(
-            BackendCredentials::s3_from_options(&opts(&[("aws_access_key_id", "ak")])).is_err()
-        );
+    fn partial_s3_credentials_error() {
+        let cell = SharedStorageOptions::new(opts(&[("aws_access_key_id", "ak")]));
+        assert!(cell.aws_provider().is_err());
     }
 
     #[test]
     fn azure_account_key_validated() {
         // "a2V5" is valid base64; a bare "key" is not.
-        assert!(
-            BackendCredentials::azure_from_options(&opts(&[("azure_storage_account_key", "a2V5")]))
-                .expect("parse")
-                .is_some()
-        );
-        assert!(
-            BackendCredentials::azure_from_options(&opts(&[(
-                "azure_storage_account_key",
-                "not-base64!"
-            )]))
-            .is_err()
-        );
+        let ok = SharedStorageOptions::new(opts(&[("azure_storage_account_key", "a2V5")]));
+        assert!(ok.azure_provider().expect("parse").is_some());
+
+        let bad = SharedStorageOptions::new(opts(&[("azure_storage_account_key", "not-base64!")]));
+        assert!(bad.azure_provider().is_err());
+    }
+
+    #[tokio::test]
+    async fn get_credential_reflects_latest_update() {
+        let cell = SharedStorageOptions::new(opts(&[
+            ("aws_access_key_id", "ak"),
+            ("aws_secret_access_key", "sk"),
+        ]));
+        let provider = cell.aws_provider().expect("parse").expect("some");
+        assert_eq!(provider.get_credential().await.expect("cred").key_id, "ak");
+
+        cell.update(&opts(&[("aws_access_key_id", "ak2")]))
+            .expect("update");
+        // Merge keeps the old secret; the swapped access key is now served.
+        assert_eq!(provider.get_credential().await.expect("cred").key_id, "ak2");
     }
 
     #[test]
-    fn rotate_swaps_or_rejects() {
-        let creds = BackendCredentials::s3_from_options(&opts(&[
+    fn update_merges_and_rejects_malformed() {
+        let cell = SharedStorageOptions::new(opts(&[
             ("aws_access_key_id", "ak"),
             ("aws_secret_access_key", "sk"),
-        ]))
-        .expect("parse")
-        .expect("some");
-
+        ]));
+        // A non-credential key merges cleanly (takes effect on future stores).
+        assert!(cell.update(&opts(&[("aws_region", "eu-west-1")])).is_ok());
+        // A malformed azure key is rejected; the old options stay live.
         assert!(
-            creds
-                .rotate(&opts(&[
-                    ("aws_access_key_id", "ak2"),
-                    ("aws_secret_access_key", "sk2"),
-                ]))
-                .is_ok()
+            cell.update(&opts(&[("azure_storage_account_key", "not-base64!")]))
+                .is_err()
         );
-        // No credential in the new options → rejected, old stays live.
-        assert!(creds.rotate(&opts(&[("aws_region", "eu-west-1")])).is_err());
+        assert_eq!(
+            cell.snapshot().get("aws_access_key_id").map(String::as_str),
+            Some("ak")
+        );
     }
 
     #[test]

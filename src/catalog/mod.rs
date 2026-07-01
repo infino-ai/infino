@@ -43,7 +43,7 @@ use uri::{Backend, parse_uri};
 use crate::{
     InfinoError,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
-    storage::{BackendCredentials, StorageError, StorageProvider},
+    storage::{SharedStorageOptions, StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
         fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
@@ -91,13 +91,13 @@ pub fn connect_with(
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
     let backend = parse_uri(uri.as_ref())?;
-    // Built once and shared into every provider this connection makes, so
-    // `rotate_credentials` swaps the key for all current and future tables.
-    let credentials = build_credentials(&backend, &options)?;
+    // One options cell shared into every provider this connection makes, so
+    // `update_storage_options` reaches all current and future tables.
+    let storage_options = SharedStorageOptions::new(options.storage_options.clone());
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
         _ => {
-            let root = backend_to_provider(&backend, &options, credentials.as_ref())?
+            let root = backend_to_provider(&backend, &storage_options)?
                 .expect("non-memory backend yields a storage provider");
             // Opt-in probe: fail at connect on bad credentials, not first use.
             if options.validate {
@@ -111,7 +111,7 @@ pub fn connect_with(
             backend,
             options,
             store,
-            credentials,
+            storage_options,
             query_runtime: OnceLock::new(),
         }),
     })
@@ -128,9 +128,9 @@ struct ConnectionInner {
     backend: Backend,
     options: ConnectOptions,
     store: CatalogStore,
-    /// Rotatable credentials shared into every provider, or `None` for
-    /// ambient-identity / memory / local-fs connections.
-    credentials: Option<BackendCredentials>,
+    /// Runtime-updatable storage options shared into every provider this
+    /// connection builds.
+    storage_options: SharedStorageOptions,
     /// Runtime for the table-free `query_sql` fallback — search TVFs name
     /// their table in an argument, not a `FROM` relation, so no supertable
     /// runtime is in scope. See [`build_query_runtime`] for why it must be
@@ -231,8 +231,7 @@ impl Connection {
 
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&location),
-                    &self.inner.options,
-                    self.inner.credentials.as_ref(),
+                    &self.inner.storage_options,
                 )?
                 .expect("non-memory backend yields a storage provider");
                 // Disk cache is keyed on the stable name (not the unique
@@ -315,8 +314,7 @@ impl Connection {
 
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
-                    &self.inner.options,
-                    self.inner.credentials.as_ref(),
+                    &self.inner.storage_options,
                 )?
                 .expect("non-memory backend yields a storage provider");
                 // Cache directory is keyed on the stable name, matching
@@ -424,24 +422,27 @@ impl Connection {
         }
     }
 
-    /// Swap rotated static credentials (`aws_*` / `azure_*` keys) into this
-    /// live connection and its open tables — no reconnect. Errors when there's
-    /// no rotatable credential (ambient identity, `memory://`, local fs).
-    pub fn rotate_credentials(
+    /// Merge `storage_options` into this live connection's options — no
+    /// reconnect. The given keys (object_store `aws_*` / `azure_*` strings)
+    /// overlay the existing ones. Credential keys take effect immediately on
+    /// this connection's open tables; other keys (region, endpoint) apply to
+    /// tables opened afterwards. Errors for backends without storage options
+    /// (`memory://`, local fs), or when the merged credential is malformed.
+    pub fn update_storage_options(
         &self,
         storage_options: HashMap<String, String>,
     ) -> Result<(), InfinoError> {
-        self.inner
-            .credentials
-            .as_ref()
-            .ok_or_else(|| {
-                InfinoError::Backend(
-                    "connection has no rotatable credentials (ambient identity or non-object-store backend)"
-                        .to_string(),
-                )
-            })?
-            .rotate(&storage_options)
-            .map_err(InfinoError::from)
+        match &self.inner.backend {
+            Backend::S3 { .. } | Backend::Azure { .. } => self
+                .inner
+                .storage_options
+                .update(&storage_options)
+                .map_err(InfinoError::from),
+            Backend::LocalFs { .. } | Backend::Memory => Err(InfinoError::Backend(
+                "connection has no storage options to update (non-object-store backend)"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Run SQL across the tables in this catalog. Every relation the query
@@ -557,27 +558,12 @@ fn table_tokenizer(indexes: &IndexSpec) -> Option<Arc<dyn Tokenizer>> {
     }
 }
 
-/// Build the rotatable credential cell for `backend` from `options`, or
-/// `None` when there's nothing static to rotate (ambient identity, memory,
-/// local fs).
-fn build_credentials(
-    backend: &Backend,
-    options: &ConnectOptions,
-) -> Result<Option<BackendCredentials>, InfinoError> {
-    let creds = match backend {
-        Backend::S3 { .. } => BackendCredentials::s3_from_options(&options.storage_options)?,
-        Backend::Azure { .. } => BackendCredentials::azure_from_options(&options.storage_options)?,
-        Backend::LocalFs { .. } | Backend::Memory => None,
-    };
-    Ok(creds)
-}
-
 /// Construct the storage provider for `backend` (None for `memory://`),
-/// wiring in the shared rotatable `credentials` when present.
+/// reading config from the shared `storage_options` cell and wiring in a
+/// credential provider that tracks it (so a later update propagates).
 fn backend_to_provider(
     backend: &Backend,
-    options: &ConnectOptions,
-    credentials: Option<&BackendCredentials>,
+    storage_options: &SharedStorageOptions,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
     use crate::storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider};
 
@@ -587,15 +573,15 @@ fn backend_to_provider(
         Backend::S3 { bucket, prefix } => Some(Arc::new(S3StorageProvider::new_with_prefix(
             bucket,
             prefix,
-            &options.storage_options,
-            credentials,
+            storage_options.snapshot().as_ref(),
+            storage_options.aws_provider()?,
         )?)),
         Backend::Azure { container, prefix } => {
             Some(Arc::new(AzureStorageProvider::new_with_prefix(
                 container,
                 prefix,
-                &options.storage_options,
-                credentials,
+                storage_options.snapshot().as_ref(),
+                storage_options.azure_provider()?,
             )?))
         }
     };
@@ -1179,36 +1165,45 @@ mod tests {
     }
 
     #[test]
-    fn rotate_credentials_swaps_or_rejects() {
+    fn update_storage_options_merges_or_rejects() {
         let opts = ConnectOptions::new()
             .with_storage_option("aws_access_key_id", "ak")
             .with_storage_option("aws_secret_access_key", "sk");
         let db = connect_with("s3://bucket/prefix", opts).expect("offline connect");
 
+        // Swap the credential.
         assert!(
-            db.rotate_credentials(HashMap::from([
+            db.update_storage_options(HashMap::from([
                 ("aws_access_key_id".to_string(), "ak2".to_string()),
                 ("aws_secret_access_key".to_string(), "sk2".to_string()),
             ]))
             .is_ok()
         );
-        // New options with no credential → rejected.
+        // A non-credential key merges cleanly (applies to future tables).
         assert!(
-            db.rotate_credentials(HashMap::from([(
+            db.update_storage_options(HashMap::from([(
                 "aws_region".to_string(),
                 "eu-west-1".to_string()
+            )]))
+            .is_ok()
+        );
+        // A malformed azure key is rejected.
+        assert!(
+            db.update_storage_options(HashMap::from([(
+                "azure_storage_account_key".to_string(),
+                "not-base64!".to_string()
             )]))
             .is_err()
         );
     }
 
     #[test]
-    fn rotate_credentials_without_credentials_errors() {
-        // memory:// has nothing static to rotate.
+    fn update_storage_options_errors_on_non_object_store() {
+        // memory:// / local fs have no storage options to update.
         assert!(
             connect("memory://")
                 .expect("connect")
-                .rotate_credentials(HashMap::new())
+                .update_storage_options(HashMap::new())
                 .is_err()
         );
     }
