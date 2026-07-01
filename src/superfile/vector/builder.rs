@@ -36,7 +36,7 @@ use crate::superfile::{
             MaterializedIvfRow, encoded_component_at,
             materialize_sq8_residual_row_into_cluster_quant,
         },
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq, metric_distance_by},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq},
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
@@ -942,19 +942,21 @@ fn build_subsection_from_materialized(
     let buckets: Vec<Vec<&MaterializedIvfRow>> =
         build_phase_timers::timed(&build_phase_timers::ASSIGN_US, || {
             let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
+            // Decode each row to fp32 once into a reusable buffer, then argmin
+            // over the centroids with SIMD `l2_sq`. L2 matches the k-means
+            // training above and equals the cosine argmin for unit-normalized
+            // inputs.
+            let mut row_fp = vec![0f32; dim];
             for row in &rows {
+                for (d, slot) in row_fp.iter_mut().enumerate() {
+                    *slot = encoded_component_at(&row.encoded, d);
+                }
                 let mut best_c = 0usize;
-                let mut best_score = f32::INFINITY;
+                let mut best = f32::INFINITY;
                 for c in 0..n_cent {
-                    let cv = &centroids[c * dim..(c + 1) * dim];
-                    let score = metric_distance_by(
-                        cfg.metric,
-                        dim,
-                        |d| encoded_component_at(&row.encoded, d),
-                        |d| cv[d],
-                    );
-                    if score < best_score {
-                        best_score = score;
+                    let dist = l2_sq(&row_fp, &centroids[c * dim..(c + 1) * dim]);
+                    if dist < best {
+                        best = dist;
                         best_c = c;
                     }
                 }
