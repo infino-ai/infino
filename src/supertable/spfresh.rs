@@ -121,11 +121,7 @@ fn centroid_prototype_from_row(
     ClusterCentroids::from_fp32(1, template.dim, &fp32, vec![1])
 }
 
-fn fp32_distance_between_rows(
-    metric: Metric,
-    a: &EncodedCellRow,
-    b: &EncodedCellRow,
-) -> f32 {
+fn fp32_distance_between_rows(metric: Metric, a: &EncodedCellRow, b: &EncodedCellRow) -> f32 {
     let dim = a.scale.len();
     let mut af = vec![0f32; dim];
     let mut bf = vec![0f32; dim];

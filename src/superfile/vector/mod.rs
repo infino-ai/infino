@@ -23,5 +23,6 @@ pub mod rerank_codec;
 pub(crate) mod reservoir;
 pub mod rotation;
 pub mod simd_dispatch;
+pub(crate) mod spfresh;
 pub(crate) mod spill;
 pub mod sq8_simd;

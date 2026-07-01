@@ -179,9 +179,9 @@ async fn partition_hits_by_table(
     let hidden_manifest = user_reader
         .vector_index_table()
         .map(|vit| Arc::clone(vit.reader().manifest()));
-    let hidden_has_data = hidden_manifest.as_ref().is_some_and(|m| {
-        !m.superfiles.is_empty() || m.get_num_parts() > 0
-    });
+    let hidden_has_data = hidden_manifest
+        .as_ref()
+        .is_some_and(|m| !m.superfiles.is_empty() || m.get_num_parts() > 0);
     let mut on_user = Vec::new();
     let mut on_hidden = Vec::new();
     for hit in hits {
@@ -441,8 +441,7 @@ async fn hidden_hits_user_ids(
         }
         // Gapped span → one resident read of just the rows these hits touch.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals =
-            read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
+        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -500,8 +499,7 @@ async fn remap_hidden_hits_to_user_hits(
     let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for (i, &user_row_id) in user_ids.iter().enumerate() {
-        let user_entry =
-            lookup_user_superfile_by_id(user_manifest, user_row_id).await?;
+        let user_entry = lookup_user_superfile_by_id(user_manifest, user_row_id).await?;
         if row_id_from_manifest_entry(&user_entry, 0).is_some() {
             // Contiguous span (single-append): invert `id_min + local`.
             let local = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
@@ -626,10 +624,9 @@ impl SupertableReader {
             }
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
-                    vs.clusters
-                        .score_clusters_into(metric, query, |c, score| {
-                            scored.push((si, c, score));
-                        });
+                    vs.clusters.score_clusters_into(metric, query, |c, score| {
+                        scored.push((si, c, score));
+                    });
                 }
                 _ => fallback.push(si),
             }

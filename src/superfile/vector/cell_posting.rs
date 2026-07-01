@@ -748,10 +748,15 @@ where
 /// Sq8+ε row → `dim` fp32 components (manifest centroids, medoid seeds, etc.).
 pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
-    dequantize_sq8_residual_into(&row.scale, &row.offset, &row.codes, &row.residuals, &mut out);
+    dequantize_sq8_residual_into(
+        &row.scale,
+        &row.offset,
+        &row.codes,
+        &row.residuals,
+        &mut out,
+    );
     out
 }
-
 
 /// Load live Sq8+ε rows from a cell-posting blob aligned with scalar `_id` order.
 pub fn load_encoded_rows_from_blob(
@@ -844,7 +849,11 @@ mod tests {
         let stable_ids: Vec<i128> = (0..n as i128).collect();
         let rows = load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load");
         assert_eq!(rows.len(), n as usize);
-        assert_eq!(rows[0].scale.len(), dim, "scale is per-dim, not per-row sized");
+        assert_eq!(
+            rows[0].scale.len(),
+            dim,
+            "scale is per-dim, not per-row sized"
+        );
 
         let distinct_scale: std::collections::HashSet<*const f32> =
             rows.iter().map(|r| r.scale.as_ptr()).collect();

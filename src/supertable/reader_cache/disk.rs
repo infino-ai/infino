@@ -2372,10 +2372,16 @@ mod tests {
         let s = store2.stats();
         assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
         assert_eq!(s.current_bytes, size, "rebuilt byte accounting matches");
-        assert_eq!(s.n_cold_fetches, 0, "rebuild mmaps locally, never cold-fetches");
+        assert_eq!(
+            s.n_cold_fetches, 0,
+            "rebuild mmaps locally, never cold-fetches"
+        );
 
         // A read is served from the rebuilt entry — still zero cold fetches.
-        let _r = store2.reader(&uri).await.expect("reader from rebuilt index");
+        let _r = store2
+            .reader(&uri)
+            .await
+            .expect("reader from rebuilt index");
         assert_eq!(
             store2.stats().n_cold_fetches,
             0,

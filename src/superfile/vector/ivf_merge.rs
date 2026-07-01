@@ -27,10 +27,7 @@ use crate::superfile::{
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
         distance::{
-            Metric,
-            add_weighted_f32_to_f64_acc,
-            decode_f32_le_into,
-            f64_acc_mean_into_f32,
+            Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, f64_acc_mean_into_f32,
             mean_f32_cluster_major,
         },
         quant::BitQuantizer,
@@ -130,7 +127,11 @@ pub(crate) fn merge_sq8_ivf_subsections(
             add_weighted_f32_to_f64_acc(&mut acc, &cent_buf, count as f64);
         }
         if total > 0 {
-            f64_acc_mean_into_f32(&acc, 1.0 / total as f64, &mut out_centroids[c * dim..(c + 1) * dim]);
+            f64_acc_mean_into_f32(
+                &acc,
+                1.0 / total as f64,
+                &mut out_centroids[c * dim..(c + 1) * dim],
+            );
         }
     }
 
@@ -268,8 +269,8 @@ pub(crate) fn merge_sq8_ivf_subsections(
                     // (remapped) local id. `produce_region` guarantees every
                     // input has `stable_ids`, so the index is in range.
                     if let Some(region_off) = stable_ids_region_off {
-                        let sid = inp.stable_ids.as_ref().expect("produce_region")
-                            [src_local as usize];
+                        let sid =
+                            inp.stable_ids.as_ref().expect("produce_region")[src_local as usize];
                         let p = region_off + (local_id as usize) * STABLE_ID_BYTES;
                         bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&sid.to_le_bytes());
                     }
@@ -337,8 +338,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
         codec_meta_size,
     })
 }
-
-
 
 /// Splice routed source clusters into one hidden-cell superfile as a
 /// **multi-cluster** IVF: each fragment (one source cluster from one input)
@@ -521,7 +520,6 @@ pub(crate) fn splice_fragments_into_cell(
         out_stable_ids,
     )))
 }
-
 
 /// Route each input's local clusters to their nearest global cell(s) and splice
 /// the routed clusters into per-cell **multi-cluster (fragment)** subsections —

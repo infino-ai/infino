@@ -208,7 +208,13 @@ pub mod io_counters {
 
     /// Record a completed op. `start` is the value from [`timeline_start`];
     /// the end is stamped now. No-op when `start` is `None`.
-    pub fn timeline_record(op: &'static str, uri: &str, off: u64, len: u64, start: Option<Instant>) {
+    pub fn timeline_record(
+        op: &'static str,
+        uri: &str,
+        off: u64,
+        len: u64,
+        start: Option<Instant>,
+    ) {
         let Some(start) = start else { return };
         let epoch = {
             let mut e = match EPOCH.lock() {
@@ -245,7 +251,10 @@ pub mod io_counters {
 
     /// Take all spans recorded since the last reset, sorted by start time.
     pub fn timeline_take() -> Vec<FetchSpan> {
-        let mut out = SPANS.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+        let mut out = SPANS
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default();
         out.sort_by_key(|s| s.start_us);
         out
     }
@@ -287,7 +296,10 @@ pub mod io_counters {
 
     /// Take all phases recorded since the last reset, in insertion order.
     pub fn phase_take() -> Vec<(&'static str, u64)> {
-        PHASES.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default()
+        PHASES
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
     }
 }
 

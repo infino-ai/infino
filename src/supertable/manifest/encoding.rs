@@ -36,11 +36,7 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::Arc,
-};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};

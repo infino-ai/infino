@@ -175,7 +175,9 @@ impl DrainedVersionRanges {
 
     /// Is `version` covered by a drained interval?
     pub fn contains(&self, version: u64) -> bool {
-        self.ranges.iter().any(|&(lo, hi)| lo <= version && version <= hi)
+        self.ranges
+            .iter()
+            .any(|&(lo, hi)| lo <= version && version <= hi)
     }
 
     /// End of the maximal contiguous drained run anchored at genesis (0), or
@@ -1359,16 +1361,16 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
-        global_vector_index: l.global_vector_index.as_ref().map(|g| GlobalVectorIndexDto {
-            column: g.column.clone(),
-            grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
-        }),
+        global_vector_index: l
+            .global_vector_index
+            .as_ref()
+            .map(|g| GlobalVectorIndexDto {
+                column: g.column.clone(),
+                grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
+            }),
         drained_ranges: l.drained_ranges.intervals().to_vec(),
         deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
-        deleted_user_ids_content_hash: l
-            .deleted_user_ids_content_hash
-            .as_ref()
-            .map(encode_hash),
+        deleted_user_ids_content_hash: l.deleted_user_ids_content_hash.as_ref().map(encode_hash),
         parts,
     })
 }

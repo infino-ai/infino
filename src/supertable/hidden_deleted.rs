@@ -13,9 +13,7 @@ use bytes::Bytes;
 
 use crate::{
     storage::StorageProvider,
-    supertable::{
-        manifest::{Manifest, part::ContentHash},
-    },
+    supertable::manifest::{Manifest, part::ContentHash},
 };
 
 /// Magic prefix on a packed deleted-user-`_id` blob.
@@ -127,6 +125,10 @@ mod tests {
         let bytes = encode_deleted_ids(&ids);
         assert_eq!(decode_deleted_ids(&bytes).expect("decode"), ids);
         assert!(decode_deleted_ids(&[]).is_err());
-        assert!(decode_deleted_ids(&encode_deleted_ids(&[])).expect("empty").is_empty());
+        assert!(
+            decode_deleted_ids(&encode_deleted_ids(&[]))
+                .expect("empty")
+                .is_empty()
+        );
     }
 }

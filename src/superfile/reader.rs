@@ -1163,8 +1163,10 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
-        Ok(v.search_async(column, query, k, nprobe, rerank_mult, allow, deny)
-            .await?)
+        Ok(
+            v.search_async(column, query, k, nprobe, rerank_mult, allow, deny)
+                .await?,
+        )
     }
 
     /// As [`Self::vector_search`], but probes an **externally chosen**

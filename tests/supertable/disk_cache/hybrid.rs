@@ -186,10 +186,13 @@ fn fresh_cache(
 // ============================================================
 
 #[tokio::test]
-async fn hybrid_mode_is_default() {
+async fn lazy_foreground_mode_is_default() {
     // Just construct via Default and read the mode back.
     let cfg = DiskCacheConfig::default();
-    assert_eq!(cfg.cold_fetch_mode, ColdFetchMode::HybridWithPrefetch);
+    assert_eq!(
+        cfg.cold_fetch_mode,
+        ColdFetchMode::LazyForegroundWithBackgroundFill
+    );
 }
 
 #[tokio::test]

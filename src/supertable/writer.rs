@@ -1177,7 +1177,12 @@ impl SupertableWriter {
         // grid as a derived copy, written by the drain. No dual-write, no hidden
         // writer in the commit path. Idempotent: only trains while absent.
         if self.inner.vector_index_table.is_some()
-            && self.inner.manifest.load().get_global_vector_index().is_none()
+            && self
+                .inner
+                .manifest
+                .load()
+                .get_global_vector_index()
+                .is_none()
             && !buffer.is_empty()
         {
             if let Some(vc) = self.inner.options.vector_columns.first() {
@@ -2250,7 +2255,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let min_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
             let max_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
             let wall_us = max_end.saturating_sub(min_start);
-            let sum_us: u64 = spans.iter().map(|s| s.end_us.saturating_sub(s.start_us)).sum();
+            let sum_us: u64 = spans
+                .iter()
+                .map(|s| s.end_us.saturating_sub(s.start_us))
+                .sum();
             let bytes: u64 = spans.iter().map(|s| s.len).sum();
             let concurrency = if wall_us > 0 {
                 sum_us as f64 / wall_us as f64
@@ -2312,7 +2320,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let prep =
                     prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
                 let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
-                let base = running_clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
+                let base = running_clusters
+                    .counts
+                    .get(cell_id as usize)
+                    .copied()
+                    .unwrap_or(0);
                 cell_updates.insert(cell_id, base.saturating_add(added));
                 prepared.push(PreparedSuperfile {
                     entry,
@@ -2367,7 +2379,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let assignments: Vec<u32> = hidden_inner.options.writer_pool.install(|| {
                     all_rows
                         .par_iter()
-                        .map(|row| spfresh::nearest_cell_encoded(clusters_ref, metric, &row.encoded))
+                        .map(|row| {
+                            spfresh::nearest_cell_encoded(clusters_ref, metric, &row.encoded)
+                        })
                         .collect()
                 });
                 for (row, cell) in all_rows.into_iter().zip(assignments) {
@@ -2403,7 +2417,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let prep =
                     prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
                 let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
-                let base = running_clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
+                let base = running_clusters
+                    .counts
+                    .get(cell_id as usize)
+                    .copied()
+                    .unwrap_or(0);
                 cell_updates.insert(cell_id, base.saturating_add(added));
                 prepared.push(PreparedSuperfile {
                     entry,
@@ -2418,7 +2436,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 n_batches,
                 batch_sources.len(),
                 t_mat,
-                if assign_skip { "group(assign-skip)" } else { "assign" },
+                if assign_skip {
+                    "group(assign-skip)"
+                } else {
+                    "assign"
+                },
                 t_assign - t_mat,
                 batch_t0.elapsed().as_secs_f64() * 1e3 - t_assign,
                 n_cells,
@@ -2528,8 +2550,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         n_batches,
         batch_cfg,
         drain_t0.elapsed().as_secs_f64() * 1e3,
-        drain_rss0.map(|v| format!("{v:.0}")).unwrap_or_else(|| "?".into()),
-        proc_rss_mib().map(|v| format!("{v:.0}")).unwrap_or_else(|| "?".into()),
+        drain_rss0
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "?".into()),
+        proc_rss_mib()
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "?".into()),
     );
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
@@ -2619,11 +2645,17 @@ fn build_one_shard_from_merged(
             crate::supertable::options::DECIMAL128_SCALE,
         )
         .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
-    let scalar = RecordBatch::try_new(options.scalar_schema(), vec![Arc::new(id_array) as ArrayRef])
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+    let scalar = RecordBatch::try_new(
+        options.scalar_schema(),
+        vec![Arc::new(id_array) as ArrayRef],
+    )
+    .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
-    let mut builder =
-        SuperfileBuilder::new(options.builder_options().with_vector_layout(VectorLayout::Ivf))?;
+    let mut builder = SuperfileBuilder::new(
+        options
+            .builder_options()
+            .with_vector_layout(VectorLayout::Ivf),
+    )?;
     builder.add_batch_ids_only(&scalar)?;
     builder.set_prebuilt_ivf_subsection(0, merged)?;
 
@@ -3710,7 +3742,10 @@ mod tests {
         assert_eq!(vs.clusters.dim as usize, dim);
         assert!(vs.clusters.n_cent >= 1);
         assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.centroids.len(), vs.clusters.n_cent as usize * dim);
+        assert_eq!(
+            vs.clusters.centroids.len(),
+            vs.clusters.n_cent as usize * dim
+        );
         // Every indexed doc lands in exactly one cluster, so the
         // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();

@@ -265,8 +265,8 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
-            stamped_global_vector_index: None,
-            stamped_drained_ranges: None,
+                stamped_global_vector_index: None,
+                stamped_drained_ranges: None,
             }
         } else {
             Self {
@@ -275,8 +275,8 @@ impl Manifest {
                 parts: DashMap::new(),
                 loader: None,
                 stamped_partition_strategy: None,
-            stamped_global_vector_index: None,
-            stamped_drained_ranges: None,
+                stamped_global_vector_index: None,
+                stamped_drained_ranges: None,
             }
         }
     }
@@ -351,7 +351,9 @@ impl Manifest {
         if let Some(g) = &self.stamped_global_vector_index {
             return Some(g.clone());
         }
-        self.list.as_ref().and_then(|l| l.global_vector_index.clone())
+        self.list
+            .as_ref()
+            .and_then(|l| l.global_vector_index.clone())
     }
 
     /// Drained user commit-versions recorded on this (hidden) manifest. Honors
@@ -742,7 +744,10 @@ impl Manifest {
                 manifest_id: next_id,
                 options: Arc::clone(&self.superfile_list.options),
                 superfiles: self.superfile_list.superfiles.clone(),
-                vector_index_storage_prefix: self.superfile_list.vector_index_storage_prefix.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
             },
             list: new_list,
             parts: self.parts.clone(),
@@ -2143,7 +2148,6 @@ impl ClusterCentroids {
                 *slot = self.nearest_cell(metric, &vectors[d * dim..(d + 1) * dim]);
             });
     }
-
 }
 
 #[cfg(test)]
@@ -2649,8 +2653,8 @@ mod tests {
                 parts: DashMap::new(),
                 loader: Some(loader),
                 stamped_partition_strategy: None,
-            stamped_global_vector_index: None,
-            stamped_drained_ranges: None,
+                stamped_global_vector_index: None,
+                stamped_drained_ranges: None,
             }
         }
 

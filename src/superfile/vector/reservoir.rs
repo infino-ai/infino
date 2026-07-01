@@ -101,7 +101,8 @@ pub fn partition_kmeans_sample_size(n_cent: usize) -> usize {
             .filter(|&m| m > 0)
             .unwrap_or(KMEANS_SAMPLE_NCENT_MULT)
     });
-    mult.saturating_mul(n_cent).clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
+    mult.saturating_mul(n_cent)
+        .clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
 }
 
 /// Online reservoir for f32 vector samples.

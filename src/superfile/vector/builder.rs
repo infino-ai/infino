@@ -32,9 +32,7 @@ use crate::superfile::{
         },
     },
     vector::{
-        cell_posting::{
-            MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant,
-        },
+        cell_posting::{MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant},
         distance::{Metric, dequantize_sq8_residual_into, l2_sq, mean_f32_cluster_major},
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
@@ -873,48 +871,48 @@ fn build_subsection_from_materialized(
     }
     let dim = cfg.dim;
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
-    if let Some(global) = cfg.provided_centroids.as_ref() {
-        // Partition against the global cell centroids instead of training
-        // local ones. Every incoming shard then shares cell ordinals, so the
-        // drain splices cluster `c` → cell `c` with no re-clustering. Keep all
-        // `n_cent` cells even when this shard has fewer rows (empty clusters are
-        // count-0) so ordinal `c` always means cell `c`.
-        debug_assert!(dim > 0 && global.len() % dim == 0);
-        let nc = global.len() / dim.max(1);
-        (nc, global.to_vec())
-    } else {
-        let n_cent = cfg
-            .n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
-            .min(n_docs.max(1));
-        // Train centroids the same way the user-superfile build does: on a bounded
-        // sample (NOT every row), via the shared `kmeans` (random init + parallel).
-        // The previous bespoke `encoded_ivf_kmeans` trained over every row with
-        // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
-        // on large cells. Only the sampled rows are decoded to fp32, so there is no
-        // full-corpus fp32 buffer.
-        // Per-cell sub-build: sample points-per-centroid, bounded by the cell.
-        let sample_size = partition_kmeans_sample_size(n_cent).min(n_docs);
-        let mut sample = vec![0f32; sample_size * dim];
-        for s in 0..sample_size {
-            let idx = if sample_size == n_docs {
-                s
-            } else {
-                s * n_docs / sample_size
-            };
-            let enc = &rows[idx].encoded;
-            dequantize_sq8_residual_into(
-                &enc.scale,
-                &enc.offset,
-                &enc.codes,
-                &enc.residuals,
-                &mut sample[s * dim..(s + 1) * dim],
-            );
+        if let Some(global) = cfg.provided_centroids.as_ref() {
+            // Partition against the global cell centroids instead of training
+            // local ones. Every incoming shard then shares cell ordinals, so the
+            // drain splices cluster `c` → cell `c` with no re-clustering. Keep all
+            // `n_cent` cells even when this shard has fewer rows (empty clusters are
+            // count-0) so ordinal `c` always means cell `c`.
+            debug_assert!(dim > 0 && global.len() % dim == 0);
+            let nc = global.len() / dim.max(1);
+            (nc, global.to_vec())
+        } else {
+            let n_cent = cfg
+                .n_cent
+                .max(1)
+                .min(n_cent_row_count_cap(n_docs))
+                .min(n_docs.max(1));
+            // Train centroids the same way the user-superfile build does: on a bounded
+            // sample (NOT every row), via the shared `kmeans` (random init + parallel).
+            // The previous bespoke `encoded_ivf_kmeans` trained over every row with
+            // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
+            // on large cells. Only the sampled rows are decoded to fp32, so there is no
+            // full-corpus fp32 buffer.
+            // Per-cell sub-build: sample points-per-centroid, bounded by the cell.
+            let sample_size = partition_kmeans_sample_size(n_cent).min(n_docs);
+            let mut sample = vec![0f32; sample_size * dim];
+            for s in 0..sample_size {
+                let idx = if sample_size == n_docs {
+                    s
+                } else {
+                    s * n_docs / sample_size
+                };
+                let enc = &rows[idx].encoded;
+                dequantize_sq8_residual_into(
+                    &enc.scale,
+                    &enc.offset,
+                    &enc.codes,
+                    &enc.residuals,
+                    &mut sample[s * dim..(s + 1) * dim],
+                );
+            }
+            let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+            (n_cent, centroids)
         }
-        let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
-        (n_cent, centroids)
-    }
     });
 
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
@@ -1992,9 +1990,8 @@ mod tests {
 
         let dim = 16;
         let n = 24usize;
-        let json = format!(
-            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
-        );
+        let json =
+            format!(r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#);
         let cfg = || VectorConfig {
             column: "v".into(),
             dim,
@@ -2018,8 +2015,8 @@ mod tests {
         let stream_blob = b.finish().expect("finish streaming");
         let stream_reader =
             VectorReader::open(Bytes::from(stream_blob), &json).expect("open streaming");
-        let mut stream_rows = block_on(stream_reader.materialized_index_rows_async("v"))
-            .expect("streaming rows");
+        let mut stream_rows =
+            block_on(stream_reader.materialized_index_rows_async("v")).expect("streaming rows");
         // Streaming subsection has no inline region.
         assert!(
             stream_rows.iter().all(|r| r.stable_id == 0),
@@ -2043,8 +2040,8 @@ mod tests {
             VectorReader::open(Bytes::from(mat_blob), &json).expect("open materialized");
         assert_eq!(mat_reader.n_docs(), n as u64);
 
-        let mat_rows = block_on(mat_reader.materialized_index_rows_async("v"))
-            .expect("materialized rows");
+        let mat_rows =
+            block_on(mat_reader.materialized_index_rows_async("v")).expect("materialized rows");
         assert_eq!(mat_rows.len(), n);
         for r in &mat_rows {
             assert_eq!(
@@ -2073,9 +2070,8 @@ mod tests {
         };
 
         let dim = 16;
-        let json = format!(
-            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#
-        );
+        let json =
+            format!(r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":7,"metric":"cosine"}}]"#);
         let cfg = || VectorConfig {
             column: "v".into(),
             dim,
@@ -2107,7 +2103,8 @@ mod tests {
             }
             let mut mb = VectorBuilder::new();
             mb.register_column(cfg()).expect("register mat");
-            mb.load_materialized_rows(0, rows).expect("load materialized");
+            mb.load_materialized_rows(0, rows)
+                .expect("load materialized");
             Bytes::from(mb.finish().expect("finish materialized"))
         };
 
@@ -2118,17 +2115,13 @@ mod tests {
         let reader_b = VectorReader::open(blob_b, &json).expect("open B");
 
         // Merge: B's local ids shift by `na` (its doc_id_offset).
-        let merged = merge_sq8_ivf_subsections(&[
-            (&reader_a, "v", 0),
-            (&reader_b, "v", na as u32),
-        ])
-        .expect("merge");
+        let merged = merge_sq8_ivf_subsections(&[(&reader_a, "v", 0), (&reader_b, "v", na as u32)])
+            .expect("merge");
         assert_eq!(merged.n_docs as usize, na + nb);
 
         let mut wb = VectorBuilder::new();
         wb.register_column(cfg()).expect("register merged");
-        wb.set_prebuilt_subsection(0, merged)
-            .expect("set prebuilt");
+        wb.set_prebuilt_subsection(0, merged).expect("set prebuilt");
         let merged_blob = wb.finish().expect("finish merged");
         let reader_m = VectorReader::open(Bytes::from(merged_blob), &json).expect("open merged");
 

@@ -1004,7 +1004,11 @@ impl VectorReader {
             // non-empty); 0 means "no codec_meta" and skips the
             // sq8_meta parse below.
             let cluster_idx_size = (n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-            let codec_meta_off = if codec_meta_size == 0 { 0 } else { cluster_idx_off + cluster_idx_size };
+            let codec_meta_off = if codec_meta_size == 0 {
+                0
+            } else {
+                cluster_idx_off + cluster_idx_size
+            };
             // End of the last fixed region before the per-cluster blocks: the
             // codec_meta region (Sq8), else the cluster index (Fp32/RabitqOnly).
             let preceding_end = if codec_meta_size == 0 {
@@ -1043,7 +1047,8 @@ impl VectorReader {
             let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
             // The stable-`_id` region, when present, is exactly one i128 per doc.
             let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
-            if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
+            if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes
+            {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
                      bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
@@ -1222,7 +1227,10 @@ impl VectorReader {
         let mut centroids = vec![0f32; n_cent * dim];
         for c in 0..n_cent {
             let base = col.centroids_off + c * stride;
-            decode_f32_le_into(&sub[base..base + stride], &mut centroids[c * dim..(c + 1) * dim]);
+            decode_f32_le_into(
+                &sub[base..base + stride],
+                &mut centroids[c * dim..(c + 1) * dim],
+            );
         }
 
         // cluster_idx: `n_cent` × `(doc_off: u32, count: u32)`; we want
@@ -1313,11 +1321,12 @@ impl VectorReader {
                     region.len()
                 ))));
             }
-            let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end]
-                .try_into()
-                .map_err(|_| VectorError::Read(ReadError::MalformedVersion(
-                    "inline stable_id region slice".into(),
-                )))?;
+            let arr: [u8; format::vec::STABLE_ID_BYTES] =
+                region[p..end].try_into().map_err(|_| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "inline stable_id region slice".into(),
+                    ))
+                })?;
             out.push(i128::from_le_bytes(arr));
         }
         Ok(Some(out))
@@ -3685,7 +3694,15 @@ mod tests {
             .await
             .expect("search_async");
         let probed = r
-            .search_clusters_async("v", q, k, &(0..n_cent).collect::<Vec<_>>(), rerank, None, None)
+            .search_clusters_async(
+                "v",
+                q,
+                k,
+                &(0..n_cent).collect::<Vec<_>>(),
+                rerank,
+                None,
+                None,
+            )
             .await
             .expect("search_clusters_async");
 
@@ -6889,9 +6906,13 @@ mod tests {
         // resolve_column error arms reached through the async entry point.
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        let unknown = r.search_async("nope", &[0.0; 16], 5, 4, 5, None, None).await;
+        let unknown = r
+            .search_async("nope", &[0.0; 16], 5, 4, 5, None, None)
+            .await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
-        let dim = r.search_async("embedding", &[0.0; 8], 5, 4, 5, None, None).await;
+        let dim = r
+            .search_async("embedding", &[0.0; 8], 5, 4, 5, None, None)
+            .await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
@@ -7732,7 +7753,10 @@ mod tests {
             .await
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
-            match ra.search_async("embedding", &all[0], 5, 4, 5, None, None).await {
+            match ra
+                .search_async("embedding", &all[0], 5, 4, 5, None, None)
+                .await
+            {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
                 Ok(_) => {}
                 other => panic!("search_async unexpected outcome: {other:?}"),

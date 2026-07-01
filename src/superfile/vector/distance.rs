@@ -935,12 +935,7 @@ pub(crate) fn dequantize_sq8_residual_into(
 }
 
 #[inline]
-fn sq8_residual_component_scalar(
-    scale: f32,
-    offset: f32,
-    code: u8,
-    residual_byte: u8,
-) -> f32 {
+fn sq8_residual_component_scalar(scale: f32, offset: f32, code: u8, residual_byte: u8) -> f32 {
     let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
     offset + scale * (code as f32 + (i8::from_le_bytes([residual_byte]) as f32) * inv_div)
 }
@@ -1079,15 +1074,11 @@ pub(crate) fn sq8_residual_norm_sq(
     {
         if avx512_enabled() {
             // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
-            return unsafe {
-                sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, dim)
-            };
+            return unsafe { sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, dim) };
         }
         if avx2_enabled() {
             // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe {
-                sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, dim)
-            };
+            return unsafe { sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, dim) };
         }
     }
     sq8_residual_norm_sq_wide(scale, offset, codes, residuals, dim)
@@ -1255,24 +1246,14 @@ fn decode_f32_le_wide(bytes: &[u8], out: &mut [f32], n: usize) {
         let mut lane = [0f32; F32X8_LANES];
         for (j, slot) in lane.iter_mut().enumerate() {
             let b = (i + j) * F32_BYTES;
-            *slot = f32::from_le_bytes([
-                bytes[b],
-                bytes[b + 1],
-                bytes[b + 2],
-                bytes[b + 3],
-            ]);
+            *slot = f32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
         }
         out[i..i + F32X8_LANES].copy_from_slice(&lane);
         i += F32X8_LANES;
     }
     while i < n {
         let b = i * F32_BYTES;
-        out[i] = f32::from_le_bytes([
-            bytes[b],
-            bytes[b + 1],
-            bytes[b + 2],
-            bytes[b + 3],
-        ]);
+        out[i] = f32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
         i += 1;
     }
 }
