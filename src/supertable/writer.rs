@@ -2189,6 +2189,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
         let batch_t0 = std::time::Instant::now();
+        // Zero the I/O timeline so the readout below reflects only this batch's
+        // superfile reads (INFINO_IO_TIMELINE; a no-op otherwise).
+        if crate::storage::io_counters::timeline_enabled() {
+            let _ = crate::storage::io_counters::take();
+            crate::storage::io_counters::timeline_reset();
+        }
         // Open this batch's user superfiles FULLY RESIDENT: the splice/materialize
         // read via `try_get_range_sync` on rayon workers, which needs the whole
         // superfile in memory — a lazy reader yields VectorReadError. Reuse a
@@ -2229,6 +2235,36 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .await
             .into_iter()
             .collect::<Result<Vec<_>, BuildError>>()?;
+
+        // The batch's superfile reads land here (opens are fully resident). The
+        // timeline distinguishes a serial dependent chain (concurrency ~1x) from
+        // overlapped reads (concurrency ~ buffered fan-out) — the lever for the
+        // materialize phase. Gated on INFINO_IO_TIMELINE.
+        if crate::storage::io_counters::timeline_enabled() {
+            let spans = crate::storage::io_counters::timeline_take();
+            let (range_gets, _, _, _) = crate::storage::io_counters::take();
+            let min_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
+            let max_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
+            let wall_us = max_end.saturating_sub(min_start);
+            let sum_us: u64 = spans.iter().map(|s| s.end_us.saturating_sub(s.start_us)).sum();
+            let bytes: u64 = spans.iter().map(|s| s.len).sum();
+            let concurrency = if wall_us > 0 {
+                sum_us as f64 / wall_us as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[supertable drain] batch {}/{} materialize I/O: {} object reads, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x ({} range-gets)",
+                batch_idx + 1,
+                n_batches,
+                spans.len(),
+                bytes as f64 / (1u64 << 20) as f64,
+                wall_us as f64 / 1e3,
+                sum_us as f64 / 1e3,
+                concurrency,
+                range_gets,
+            );
+        }
 
         let mut prepared: Vec<PreparedSuperfile> = Vec::new();
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();

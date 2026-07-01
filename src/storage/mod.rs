@@ -103,6 +103,194 @@ pub enum StorageError {
     },
 }
 
+pub mod io_counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FETCHES: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static HIDDEN_FETCHES: AtomicU64 = AtomicU64::new(0);
+    static HIDDEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one object-store range fetch returning `bytes` bytes. The real
+    /// providers call this on every `get_range`, so it counts the *total*.
+    pub fn record_get(bytes: u64) {
+        FETCHES.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Tag a fetch as targeting the hidden vector index (prefixed namespace).
+    /// Called by `PrefixedStorageProvider` *in addition to* the inner provider's
+    /// `record_get`, so `hidden ⊆ total` and `user = total − hidden`.
+    pub fn record_hidden_get(bytes: u64) {
+        HIDDEN_FETCHES.fetch_add(1, Ordering::Relaxed);
+        HIDDEN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call;
+    /// resets all. Derive the user-table share as `total − hidden`.
+    pub fn take() -> (u64, u64, u64, u64) {
+        (
+            FETCHES.swap(0, Ordering::Relaxed),
+            BYTES.swap(0, Ordering::Relaxed),
+            HIDDEN_FETCHES.swap(0, Ordering::Relaxed),
+            HIDDEN_BYTES.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
+    ///
+    /// Fetch counts/bytes tell us breadth; they can't tell us whether the cold
+    /// floor is a *serial dependent chain* (each read gated on the prior's
+    /// offsets — gaps = network RTT) or *parallel breadth* (many overlapping
+    /// reads — wall-time = slowest single chain). This records each
+    /// object-store op's `[start, end)` relative to a shared epoch, so a
+    /// post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
+    /// implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
+    /// no-op (one relaxed env check) otherwise so the hot path is unaffected.
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    /// One recorded object-store fetch on the timeline.
+    #[derive(Clone)]
+    pub struct FetchSpan {
+        pub op: &'static str,
+        pub uri: String,
+        pub off: u64,
+        pub len: u64,
+        /// microseconds since the epoch (first recorded span / last reset).
+        pub start_us: u64,
+        pub end_us: u64,
+        /// `true` if issued by a background cache-fill task (off the
+        /// query-critical path), `false` for foreground query reads.
+        pub background: bool,
+    }
+
+    tokio::task_local! {
+        /// Set to `true` inside a background cache-fill task so its
+        /// object-store reads are distinguishable from foreground
+        /// query reads. Absent (→ foreground) on the query path.
+        static IO_BACKGROUND: bool;
+    }
+
+    /// Whether the current task is a background cache-fill (default
+    /// `false` outside a [`scope_background`]).
+    pub fn io_is_background() -> bool {
+        IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
+    }
+
+    /// Run `fut` with its object-store reads tagged as background.
+    pub async fn scope_background<F: std::future::Future>(fut: F) -> F::Output {
+        IO_BACKGROUND.scope(true, fut).await
+    }
+
+    static TIMELINE_ON: OnceLock<bool> = OnceLock::new();
+    static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
+    static SPANS: Mutex<Vec<FetchSpan>> = Mutex::new(Vec::new());
+
+    /// Whether timeline capture is active (`INFINO_IO_TIMELINE` set & truthy).
+    pub fn timeline_enabled() -> bool {
+        *TIMELINE_ON.get_or_init(|| {
+            std::env::var("INFINO_IO_TIMELINE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Capture an op-start `Instant` *iff* the timeline is active; `None`
+    /// disables recording for this op with zero overhead when off.
+    pub fn timeline_start() -> Option<Instant> {
+        if timeline_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Record a completed op. `start` is the value from [`timeline_start`];
+    /// the end is stamped now. No-op when `start` is `None`.
+    pub fn timeline_record(op: &'static str, uri: &str, off: u64, len: u64, start: Option<Instant>) {
+        let Some(start) = start else { return };
+        let epoch = {
+            let mut e = match EPOCH.lock() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            *e.get_or_insert(start)
+        };
+        let to_us = |t: Instant| t.saturating_duration_since(epoch).as_micros() as u64;
+        if let Ok(mut spans) = SPANS.lock() {
+            spans.push(FetchSpan {
+                op,
+                uri: uri.to_string(),
+                off,
+                len,
+                start_us: to_us(start),
+                end_us: to_us(Instant::now()),
+                background: io_is_background(),
+            });
+        }
+    }
+
+    /// Drop all recorded spans AND reset the epoch — call right before the
+    /// unit of work to profile (e.g. one cold query or one drain batch).
+    pub fn timeline_reset() {
+        if let Ok(mut spans) = SPANS.lock() {
+            spans.clear();
+        }
+        // Re-arm the epoch off the next recorded span.
+        if let Ok(mut e) = EPOCH.lock() {
+            *e = None;
+        }
+    }
+
+    /// Take all spans recorded since the last reset, sorted by start time.
+    pub fn timeline_take() -> Vec<FetchSpan> {
+        let mut out = SPANS.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+        out.sort_by_key(|s| s.start_us);
+        out
+    }
+
+    /// Coarse *phase* log — diagnostic for the non-I/O portion of a profiled
+    /// unit of work (the gap between its measured wall and the GET-timeline
+    /// wall). The timeline only sees object-store ops; this records named
+    /// CPU/await spans so a post-hoc dump shows where the non-read time goes.
+    /// Same gate (`INFINO_IO_TIMELINE`); ordered by insertion (caller-sequenced).
+    static PHASES: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+    /// Record `name` took `micros` µs. No-op unless the timeline is enabled.
+    pub fn phase_record(name: &'static str, micros: u64) {
+        if !timeline_enabled() {
+            return;
+        }
+        if let Ok(mut p) = PHASES.lock() {
+            p.push((name, micros));
+        }
+    }
+
+    /// Time `f` and record it under `name` (returns `f`'s value).
+    pub fn phase_timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+        if !timeline_enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let out = f();
+        phase_record(name, t.elapsed().as_micros() as u64);
+        out
+    }
+
+    /// Drop all recorded phases — call right before the unit of work to profile.
+    pub fn phase_reset() {
+        if let Ok(mut p) = PHASES.lock() {
+            p.clear();
+        }
+    }
+
+    /// Take all phases recorded since the last reset, in insertion order.
+    pub fn phase_take() -> Vec<(&'static str, u64)> {
+        PHASES.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default()
+    }
+}
+
 /// Storage backend abstraction.
 ///
 /// Implementations wrap `object_store` crate types (or fakes
@@ -308,7 +496,11 @@ impl StorageProvider for PrefixedStorageProvider {
         uri: &str,
         range: std::ops::Range<u64>,
     ) -> Result<bytes::Bytes, StorageError> {
-        self.inner.get_range(&self.prefixed(uri), range).await
+        let out = self.inner.get_range(&self.prefixed(uri), range).await;
+        if let Ok(b) = &out {
+            io_counters::record_hidden_get(b.len() as u64);
+        }
+        out
     }
 
     async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {

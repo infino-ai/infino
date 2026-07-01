@@ -298,9 +298,10 @@ impl StorageProvider for S3StorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
+        let tl = crate::storage::io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        retry::complete_get(uri, || async {
+        let out = retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
@@ -310,18 +311,29 @@ impl StorageProvider for S3StorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
         })
-        .await
+        .await;
+        if let Ok((b, _)) = &out {
+            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+        }
+        out
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        retry::complete_range(uri, range, |r| async {
+        let off = range.start;
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
                 .await
                 .map_err(|e| translate(uri, e))
         })
-        .await
+        .await;
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+        }
+        out
     }
 
     /// Tail-fetch path: — single-RTT tail fetch via S3's native
@@ -343,7 +355,8 @@ impl StorageProvider for S3StorageProvider {
             return Ok((Bytes::new(), meta.size));
         }
         let path = self.path(uri)?;
-        retry::with_reissue(|| async {
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::with_reissue(|| async {
             let opts = GetOptions {
                 range: Some(GetRange::Suffix(len)),
                 ..Default::default()
@@ -357,7 +370,17 @@ impl StorageProvider for S3StorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, size))
         })
-        .await
+        .await;
+        if let Ok((b, size)) = &out {
+            crate::storage::io_counters::timeline_record(
+                "tail",
+                uri,
+                size.saturating_sub(b.len() as u64),
+                b.len() as u64,
+                tl,
+            );
+        }
+        out
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
