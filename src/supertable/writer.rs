@@ -2195,10 +2195,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let _ = crate::storage::io_counters::take();
             crate::storage::io_counters::timeline_reset();
         }
+        let read_concurrency = drain_read_concurrency();
         // Open this batch's user superfiles FULLY RESIDENT: the splice/materialize
         // read via `try_get_range_sync` on rayon workers, which needs the whole
         // superfile in memory — a lazy reader yields VectorReadError. Reuse a
         // resident cached reader if present, else fetch the full bytes + open.
+        // `buffer_unordered` yields each open as it completes, so one straggler
+        // read can't stall the fan-out window (order is irrelevant — rows are
+        // bucketed by cell downstream). Routing-id resolution is resident (no
+        // object-store I/O), so it rides each open's future and overlaps the
+        // other reads' in-flight bytes.
         let readers: Vec<(Arc<SuperfileReader>, Vec<i128>)> =
             stream::iter(batch_sources.iter().map(|entry| {
                 let entry = Arc::clone(entry);
@@ -2230,7 +2236,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     Ok::<_, BuildError>((reader, stable_ids))
                 }
             }))
-            .buffered(commit_write_concurrency())
+            .buffer_unordered(read_concurrency)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -2482,6 +2488,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .with_drained_ranges(new_drained),
         ));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        // Cheap write-side readout: wall + bytes across the publish (cell-file
+        // PUTs + manifest CAS). A single timer, no per-put provider hooks — enough
+        // to tell whether the publish is I/O throughput or commit overhead, and
+        // whether it's a lever. Gated on INFINO_IO_TIMELINE.
+        let publish_bytes: u64 = publish_batch
+            .pending_storage_writes
+            .iter()
+            .map(|(_, b)| b.len() as u64)
+            .sum();
+        let n_puts = publish_batch.pending_storage_writes.len();
+        let publish_t0 = std::time::Instant::now();
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
@@ -2493,6 +2510,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        if crate::storage::io_counters::timeline_enabled() {
+            let ms = publish_t0.elapsed().as_secs_f64() * 1e3;
+            let mib = publish_bytes as f64 / (1u64 << 20) as f64;
+            let rate = if ms > 0.0 { mib / (ms / 1e3) } else { 0.0 };
+            eprintln!(
+                "[supertable drain] batch {}/{} publish: {} puts + CAS, {:.1} MiB, wall {:.1}ms → {:.0} MiB/s",
+                batch_idx + 1,
+                n_batches,
+                n_puts,
+                mib,
+                ms,
+                rate,
+            );
+        }
     }
     eprintln!(
         "[supertable drain] done ({mode}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
@@ -3014,6 +3045,34 @@ fn commit_write_concurrency() -> usize {
         .map(|n| n.get() / 2)
         .unwrap_or(1)
         .max(1)
+}
+
+/// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
+/// from stampeding a single S3 prefix. An explicit env override is not clamped.
+const DRAIN_READ_CONCURRENCY_CAP: usize = 64;
+
+/// Read fan-out for the drain's superfile opens — bulk S3 reads off the
+/// query-critical path. Ideal sizing tracks network bandwidth; vCPU count is the
+/// portable runtime proxy for it (a cloud instance's NIC scales with its size).
+/// The auto default is one in-flight read per hardware thread, floored at the
+/// read layer's background-fill default (`prefetch_concurrency`) so small boxes
+/// still fan out, and capped at [`DRAIN_READ_CONCURRENCY_CAP`]. Overridable
+/// (unclamped) with `INFINO_DRAIN_READ_CONCURRENCY`.
+fn drain_read_concurrency() -> usize {
+    if let Some(n) = std::env::var("INFINO_DRAIN_READ_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(
+            crate::config::DEFAULT_PREFETCH_CONCURRENCY,
+            DRAIN_READ_CONCURRENCY_CAP,
+        )
 }
 
 pub async fn write_superfile_list(

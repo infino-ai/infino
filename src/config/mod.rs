@@ -291,7 +291,7 @@ const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default cold-fetch range chunk size (4 MiB).
 const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 4 * (1 << 20);
 /// Default concurrent background full-superfile fills.
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is swept.
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds).
