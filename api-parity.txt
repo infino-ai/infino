@@ -1,0 +1,28 @@
+# Parity map for the engine's public operation surface — enforced by
+# scripts/check_api_parity.py. Every method in public-api.txt must be here as
+# `covered` (wrapped in Node AND Python) or `exempt` (with a reason).
+# Regenerate signatures with `make api-parity-update`.
+#
+# <method>\tcovered\t<engine signature>
+# <method>\texempt\t<reason>
+
+Connection::create_table	covered	(&self, &str, SchemaRef, IndexSpec) -> Result<Supertable, InfinoError>
+Connection::drop_table	covered	(&self, &str, bool) -> Result<(), InfinoError>
+Connection::list_tables	covered	(&self) -> Result<Vec<String>, InfinoError>
+Connection::open_table	covered	(&self, &str) -> Result<Supertable, InfinoError>
+Connection::query_sql	covered	(&self, &str) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::append	covered	(&self, &RecordBatch) -> Result<(), InfinoError>
+Supertable::bm25_search	covered	(&self, &str, &str, usize, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::count	covered	(&self, &str, &str, BoolMode) -> Result<u64, InfinoError>
+Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
+Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
+Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], VectorSearchOptions, usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
+Supertable::schema	covered	(&self) -> SchemaRef
+Supertable::token_match	covered	(&self, &str, &str, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::update	covered	(&self, Expr, &RecordBatch) -> Result<MutationStats, InfinoError>
+Supertable::vector_search	covered	(&self, &str, &[f32], usize, VectorSearchOptions, Option<VectorFilter<'_>>, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+connect	covered	(impl AsRef<str>) -> Result<Connection, InfinoError>
+connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, InfinoError>
+

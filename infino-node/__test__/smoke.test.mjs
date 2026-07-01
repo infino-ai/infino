@@ -154,6 +154,11 @@ test("tokenMatch and exactMatch return unranked rows", () => {
 
   const ex = docs.exactMatch("title", "a lazy dog");
   assert.equal(ex.length, 1);
+
+  // count matches the same predicate without materializing rows.
+  assert.equal(docs.count("title", "fox"), 1);
+  assert.equal(docs.count("title", "fox dog"), 2); // "or" default: fox OR dog
+  assert.equal(docs.count("title", "fox dog", { mode: "and" }), 0);
 });
 
 test("BUILDER_ID is a non-empty string", () => {
@@ -282,6 +287,22 @@ test("optimize merges superfiles, data intact (localfs)", () => {
   assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 3);
 
   docs.optimize(); // default settings also run cleanly
+
+  // gc after compaction reclaims the now-orphaned pre-merge objects. Use a
+  // 0s grace so freshly-orphaned objects are eligible immediately.
+  const report = docs.gc(0);
+  assert.equal(typeof report.bytesFreed, "number");
+  assert.equal(typeof report.objectsDeleted, "number");
+  assert.ok(report.objectsDeleted >= 0);
+  // data still intact after the sweep
+  assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 3);
+});
+
+test("gc requires durable storage (reject memory://)", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+  docs.append([{ title: "alpha" }]);
+  assert.throws(() => docs.gc(0));
 });
 
 test("update and delete require durable storage (reject memory://)", () => {

@@ -59,6 +59,20 @@ export interface MutationStats {
   nNotFound: number;
 }
 
+/** Counts from a `gc` sweep. */
+export interface GcReport {
+  /** Bytes reclaimed by deleting orphaned objects. */
+  bytesFreed: number;
+  /** Orphaned objects deleted. */
+  objectsDeleted: number;
+  /** Objects kept because they are still referenced by the live set. */
+  objectsSkippedLive: number;
+  /** Objects kept because they are younger than the grace period. */
+  objectsSkippedTooNew: number;
+  /** Objects that failed to delete (left for the next sweep). */
+  deleteErrors: number;
+}
+
 /** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
 export interface OptimizeOptions {
   /** Build-time memory budget, in MB. */
@@ -114,6 +128,9 @@ export interface TokenMatchOptions {
 export interface MatchOptions {
   projection?: string[];
   arrow?: boolean;
+}
+export interface CountOptions {
+  mode?: BoolMode;
 }
 export interface QueryOptions {
   arrow?: boolean;
@@ -331,6 +348,12 @@ export class Table {
     return decode(buf, opts.arrow);
   }
 
+  /** Count rows matching a BM25 keyword `query` over `column`, without
+   * fetching them. `mode` is `"or"` (default) or `"and"`. */
+  count(column: string, query: string, opts: CountOptions = {}): number {
+    return this.inner.count(column, query, opts.mode);
+  }
+
   /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
@@ -348,6 +371,13 @@ export class Table {
    * for engine defaults). */
   optimize(settings?: OptimizeOptions): void {
     this.inner.optimize(settings);
+  }
+
+  /** Delete orphaned storage objects left by compaction or interrupted writes.
+   * Only objects older than `graceSecs` (a safety window against racing
+   * readers/writers) are removed. Requires durable storage (not `memory://`). */
+  gc(graceSecs: number): GcReport {
+    return this.inner.gc(graceSecs);
   }
 }
 

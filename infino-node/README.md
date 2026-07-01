@@ -114,6 +114,10 @@ docs.bm25Search("title", "quick fox", 10, { mode: "and" }); // require all terms
 // or an exact whole-value match.
 docs.tokenMatch("title", "fox");
 docs.exactMatch("title", "the quick brown fox");
+
+// Count matches without materializing any rows.
+docs.count("title", "fox");                                 // OR by default
+docs.count("title", "quick fox", { mode: "and" });         // require all terms
 ```
 
 ## Vector search
@@ -226,6 +230,16 @@ docs.optimize();                                                  // engine defa
 docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
 ```
 
+Compaction and interrupted writes can leave behind storage objects that are no
+longer referenced. `gc` deletes them, reclaiming space. It only removes objects
+older than a grace window (in seconds) so it never races a concurrent reader or
+writer; requires durable storage.
+
+```javascript
+const report = docs.gc(3600);                                     // older than 1 hour
+console.log(report.bytesFreed, report.objectsDeleted);
+```
+
 ## Storage backends
 
 `connect` selects the backend from the URI:
@@ -319,10 +333,14 @@ const db = connect("s3://bucket/prefix", {
     a pushdown pre-filter.
   - `tokenMatch(col, q, { mode?, projection?, arrow? })` /
     `exactMatch(col, value, { projection?, arrow? })` — unranked (`score` is `0`).
+  - `count(col, q, { mode? })` — match tally, no rows fetched.
   - `update(predicate, data)` / `delete(predicate)` — mutate rows matching a SQL
     predicate; return `{ matched, nTombstoned, nNotFound }`; require durable
     storage.
   - `optimize({ maxMemoryMb?, minFillPercent?, targetSuperfileSizeMb? })`.
+  - `gc(graceSecs)` — delete orphaned storage objects older than the grace
+    window; returns `{ bytesFreed, objectsDeleted, objectsSkippedLive,
+    objectsSkippedTooNew, deleteErrors }`; requires durable storage.
   - `schema()` — the table's apache-arrow `Schema`.
 - `IndexSpec().fts(col).vector(col, dim, nCent, metric)`.
 - `BUILDER_ID` (named export) — the engine's build identifier string.

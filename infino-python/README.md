@@ -86,6 +86,10 @@ docs.bm25_search("title", "quick fox", k=10, mode="and")   # require all terms
 # or an exact whole-value match.
 docs.token_match("title", "fox")
 docs.exact_match("title", "the quick brown fox")
+
+# Count matches without materializing any rows.
+docs.count("title", "fox")                                 # OR by default
+docs.count("title", "quick fox", mode="and")               # require all terms
 ```
 
 ## Vector search
@@ -236,6 +240,16 @@ docs.optimize(infino.OptimizeOptions(target_superfile_size_mb=256,
                                      min_fill_percent=50))
 ```
 
+Compaction and interrupted writes can leave behind storage objects that
+are no longer referenced. `gc` deletes them, reclaiming space. It only
+removes objects older than a grace window (in seconds) so it never races
+a concurrent reader or writer; requires durable storage.
+
+```python
+report = docs.gc(3600.0)                                    # older than 1 hour
+print(report.bytes_freed, report.objects_deleted)
+```
+
 ## Storage backends
 
 `connect` selects the backend from the URI:
@@ -327,13 +341,16 @@ db = infino.connect(
   - `hybrid_search(text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
+  - `count(column, query, mode="or") -> int` — match tally, no rows fetched
   - `delete(predicate) -> MutationStats`
   - `update(predicate, new_rows) -> MutationStats`
   - `optimize(settings=None)`
+  - `gc(grace_secs) -> GcReport` — delete orphaned storage objects older than the grace window
   - `schema() -> pyarrow.Schema`
 - `IndexSpec().fts(column).vector(column, dim, n_cent, metric)`
 - `OptimizeOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
 - `MutationStats` — returned by `delete` / `update`; read-only attributes `matched`, `n_tombstoned`, `n_not_found`
+- `GcReport` — returned by `gc`; read-only attributes `bytes_freed`, `objects_deleted`, `objects_skipped_live`, `objects_skipped_too_new`, `delete_errors`
 
 ## Building from source
 

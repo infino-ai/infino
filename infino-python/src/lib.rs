@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -29,7 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
+    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError, InfinoError, Metric,
     OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
@@ -49,6 +50,10 @@ fn py_err(e: InfinoError) -> PyErr {
 }
 
 fn optimize_err(e: OptimizeError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+fn gc_err(e: GcError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
@@ -270,6 +275,47 @@ impl MutationStats {
     }
 }
 
+#[pyclass(name = "GcReport", frozen)]
+struct GcReport {
+    #[pyo3(get)]
+    bytes_freed: u64,
+    #[pyo3(get)]
+    objects_deleted: u64,
+    #[pyo3(get)]
+    objects_skipped_live: u64,
+    #[pyo3(get)]
+    objects_skipped_too_new: u64,
+    #[pyo3(get)]
+    delete_errors: u64,
+}
+
+impl GcReport {
+    fn from_core(r: &infino::GcReport) -> Self {
+        Self {
+            bytes_freed: r.bytes_freed,
+            objects_deleted: r.objects_deleted,
+            objects_skipped_live: r.objects_skipped_live,
+            objects_skipped_too_new: r.objects_skipped_too_new,
+            delete_errors: r.delete_errors,
+        }
+    }
+}
+
+#[pymethods]
+impl GcReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "GcReport(bytes_freed={}, objects_deleted={}, objects_skipped_live={}, \
+             objects_skipped_too_new={}, delete_errors={})",
+            self.bytes_freed,
+            self.objects_deleted,
+            self.objects_skipped_live,
+            self.objects_skipped_too_new,
+            self.delete_errors,
+        )
+    }
+}
+
 /// Tuning for `optimize`; omitted fields fall back to engine defaults.
 #[pyclass(name = "OptimizeOptions", skip_from_py_object)]
 #[derive(Clone, Default)]
@@ -460,6 +506,21 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
+    /// Count rows matching a BM25 keyword `query` over `column`, without
+    /// fetching them. `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, mode=None))]
+    fn count(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        query: &str,
+        mode: Option<&str>,
+    ) -> PyResult<u64> {
+        let mode = parse_mode(mode)?;
+        py.detach(|| self.inner.count(column, query, mode))
+            .map_err(py_err)
+    }
+
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
     /// `vector_column` / `vector_query` (with optional `nprobe`) drive
@@ -559,6 +620,15 @@ impl Table {
         let opts = OptimizeOptions::compact(s);
         py.detach(|| self.inner.optimize(&opts))
             .map_err(optimize_err)
+    }
+
+    /// Delete orphaned storage objects left by compaction or interrupted
+    /// writes. Only objects older than `grace_secs` (a safety window against
+    /// racing readers/writers) are removed. Requires durable storage.
+    fn gc(&self, py: Python<'_>, grace_secs: f64) -> PyResult<GcReport> {
+        let grace = Duration::from_secs_f64(grace_secs.max(0.0));
+        let report = py.detach(|| self.inner.gc(grace)).map_err(gc_err)?;
+        Ok(GcReport::from_core(&report))
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
@@ -690,6 +760,7 @@ fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;
     m.add_class::<MutationStats>()?;
+    m.add_class::<GcReport>()?;
     m.add_class::<CompactOptions>()?;
     Ok(())
 }

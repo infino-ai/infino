@@ -1,7 +1,7 @@
 .PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
-        public-api public-api-update \
+        public-api public-api-update api-parity api-parity-update \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -12,6 +12,7 @@ RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+	$(MAKE) api-parity
 
 # Apply formatting, including the import-layout rules above.
 fmt:
@@ -31,6 +32,16 @@ public-api:
 
 public-api-update:
 	cargo public-api --simplified > public-api.txt
+
+# Binding-parity guard: every public operation method in public-api.txt must be
+# wrapped by BOTH the Node and Python bindings, or be listed as exempt in
+# api-parity.txt. Catches a new engine method — or a changed signature — that
+# never reaches the bindings. Pure Python 3; no toolchain needed.
+api-parity:
+	python3 scripts/check_api_parity.py
+
+api-parity-update:
+	python3 scripts/check_api_parity.py --update
 
 test:
 	cargo test --features test-helpers

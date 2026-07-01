@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
@@ -45,7 +46,7 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, InfinoError, Metric, OptimizeError,
+    BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric, OptimizeError,
     OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
 };
 
@@ -84,6 +85,16 @@ fn optimize_err(e: OptimizeError) -> Error {
         OptimizeError::NoStorage => Error::new(
             Status::InvalidArg,
             "optimize requires durable storage (not memory://)",
+        ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+fn gc_err(e: GcError) -> Error {
+    match e {
+        GcError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "gc requires durable storage (not memory://)",
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
@@ -233,6 +244,33 @@ impl From<infino::MutationStats> for MutationStats {
             matched: s.matched() as i64,
             n_tombstoned: s.n_tombstoned() as i64,
             n_not_found: s.n_not_found() as i64,
+        }
+    }
+}
+
+/// Counts from a `gc` sweep.
+#[napi(object)]
+pub struct GcReport {
+    /// Bytes reclaimed by deleting orphaned objects.
+    pub bytes_freed: i64,
+    /// Orphaned objects deleted.
+    pub objects_deleted: i64,
+    /// Objects kept because they are still referenced by the live set.
+    pub objects_skipped_live: i64,
+    /// Objects kept because they are younger than the grace period.
+    pub objects_skipped_too_new: i64,
+    /// Objects that failed to delete (left for the next sweep).
+    pub delete_errors: i64,
+}
+
+impl From<infino::GcReport> for GcReport {
+    fn from(r: infino::GcReport) -> Self {
+        Self {
+            bytes_freed: r.bytes_freed as i64,
+            objects_deleted: r.objects_deleted as i64,
+            objects_skipped_live: r.objects_skipped_live as i64,
+            objects_skipped_too_new: r.objects_skipped_too_new as i64,
+            delete_errors: r.delete_errors as i64,
         }
     }
 }
@@ -542,6 +580,15 @@ impl Table {
         batches_to_ipc(&batches)
     }
 
+    /// Count rows matching a BM25 keyword `query` over `column`, without
+    /// fetching them. `mode` is `"or"` (default) or `"and"`.
+    #[napi]
+    pub fn count(&self, column: String, query: String, mode: Option<String>) -> Result<i64> {
+        let mode = parse_mode(mode.as_deref())?;
+        let n = self.inner.count(&column, &query, mode).map_err(map_err)?;
+        Ok(n as i64)
+    }
+
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
     /// `vector_query` (a `Float32Array`, with optional `nprobe`) drive vector
@@ -627,6 +674,15 @@ impl Table {
         }
         let opts = InfinoOptimizeOptions::compact(s);
         self.inner.optimize(&opts).map_err(optimize_err)
+    }
+
+    /// Delete orphaned storage objects left by compaction or interrupted
+    /// writes. Only objects older than `graceSecs` (a safety window against
+    /// racing readers/writers) are removed. Requires durable storage.
+    #[napi]
+    pub fn gc(&self, grace_secs: f64) -> Result<GcReport> {
+        let grace = Duration::from_secs_f64(grace_secs.max(0.0));
+        self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
     }
 
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty

@@ -10,6 +10,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from infino._infino import (
     Connection,
+    GcReport,
     IndexSpec,
     MutationStats,
     OptimizeOptions,
@@ -28,5 +29,6 @@ __all__ = [
     "Table",
     "IndexSpec",
     "MutationStats",
+    "GcReport",
     "OptimizeOptions",
 ]

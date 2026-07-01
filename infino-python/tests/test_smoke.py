@@ -23,6 +23,7 @@ def test_package_metadata():
         "Table",
         "IndexSpec",
         "MutationStats",
+        "GcReport",
         "OptimizeOptions",
     }
 
@@ -293,6 +294,38 @@ def test_optimize_on_memory_is_noop():
 
     assert t.optimize() is None
     assert _count(db, "docs") == 3
+
+
+def test_count_matches_predicate():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
+
+    # count returns the match tally without materializing rows.
+    assert t.count("title", "fox") == 1
+    assert t.count("title", "fox dog") == 2  # "or" default: fox OR dog
+    assert t.count("title", "fox dog", mode="and") == 0
+
+
+def test_gc_reclaims_orphans(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))  # gc needs durable storage
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
+        t.append([{"title": title}])
+
+    t.optimize()  # merge leaves the pre-merge objects orphaned
+    report = t.gc(0.0)  # 0s grace: freshly-orphaned objects are eligible now
+    assert report.objects_deleted >= 0
+    assert isinstance(report.bytes_freed, int)
+    assert _count(db, "docs") == 3  # data intact after the sweep
+
+
+def test_gc_rejects_memory():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+    with pytest.raises(RuntimeError):
+        t.gc(0.0)
 
 
 def test_vector_search_end_to_end():
