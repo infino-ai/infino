@@ -813,6 +813,59 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///    cluster-index entries.
 /// Build one column's subsection from Sq8+ε maintenance rows. Reuses the same
 /// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
+/// Opt-in phase timers for the materialized (drain) IVF build, enabled by
+/// `INFINO_DRAIN_BUILD_TIMERS=1`. The per-cell build runs in parallel (rayon),
+/// so each phase accumulates into a shared atomic — the total is summed CPU
+/// across cells, not wall-clock, which is what tells us whether the build is
+/// compute-bound and where (train vs assign vs calibrate). The drain resets
+/// before its build loop and logs the totals after. Zero overhead when off (a
+/// cached env check gates the clock).
+pub(crate) mod build_phase_timers {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Instant,
+    };
+
+    pub static TRAIN_US: AtomicU64 = AtomicU64::new(0);
+    pub static ASSIGN_US: AtomicU64 = AtomicU64::new(0);
+    pub static CALIB_US: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("INFINO_DRAIN_BUILD_TIMERS")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+        })
+    }
+
+    /// Run `f`, adding its elapsed micros to `counter` when timing is enabled.
+    pub fn timed<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let out = f();
+        counter.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        out
+    }
+
+    pub fn reset() {
+        TRAIN_US.store(0, Ordering::Relaxed);
+        ASSIGN_US.store(0, Ordering::Relaxed);
+        CALIB_US.store(0, Ordering::Relaxed);
+    }
+
+    /// (train_ms, assign_ms, calibrate_ms), summed CPU across cells.
+    pub fn snapshot_ms() -> (f64, f64, f64) {
+        let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1000.0;
+        (ms(&TRAIN_US), ms(&ASSIGN_US), ms(&CALIB_US))
+    }
+}
+
 fn build_subsection_from_materialized(
     cfg: VectorConfig,
     mut rows: Vec<MaterializedIvfRow>,
@@ -825,7 +878,8 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
-    let (n_cent, centroids) = if let Some(global) = cfg.provided_centroids.as_ref() {
+    let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
+    if let Some(global) = cfg.provided_centroids.as_ref() {
         // Partition against the global cell centroids instead of training
         // local ones. Every incoming shard then shares cell ordinals, so the
         // drain splices cluster `c` → cell `c` with no re-clustering. Keep all
@@ -846,6 +900,7 @@ fn build_subsection_from_materialized(
         // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
         // on large cells. Only the sampled rows are decoded to fp32, so there is no
         // full-corpus fp32 buffer.
+        // Per-cell sub-build: sample points-per-centroid, bounded by the cell.
         let sample_size = partition_kmeans_sample_size(n_cent).min(n_docs);
         let mut sample = vec![0f32; sample_size * dim];
         for s in 0..sample_size {
@@ -861,7 +916,8 @@ fn build_subsection_from_materialized(
         }
         let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
         (n_cent, centroids)
-    };
+    }
+    });
 
     let mut summary_centroid = vec![0.0f32; dim];
     if !centroids.is_empty() {
@@ -883,25 +939,29 @@ fn build_subsection_from_materialized(
     let codec = cfg.rerank_codec;
     debug_assert!(matches!(codec, RerankCodec::Sq8ResidualEpsilon));
 
-    let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
-    for row in &rows {
-        let mut best_c = 0usize;
-        let mut best_score = f32::INFINITY;
-        for c in 0..n_cent {
-            let cv = &centroids[c * dim..(c + 1) * dim];
-            let score = metric_distance_by(
-                cfg.metric,
-                dim,
-                |d| encoded_component_at(&row.encoded, d),
-                |d| cv[d],
-            );
-            if score < best_score {
-                best_score = score;
-                best_c = c;
+    let buckets: Vec<Vec<&MaterializedIvfRow>> =
+        build_phase_timers::timed(&build_phase_timers::ASSIGN_US, || {
+            let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
+            for row in &rows {
+                let mut best_c = 0usize;
+                let mut best_score = f32::INFINITY;
+                for c in 0..n_cent {
+                    let cv = &centroids[c * dim..(c + 1) * dim];
+                    let score = metric_distance_by(
+                        cfg.metric,
+                        dim,
+                        |d| encoded_component_at(&row.encoded, d),
+                        |d| cv[d],
+                    );
+                    if score < best_score {
+                        best_score = score;
+                        best_c = c;
+                    }
+                }
+                buckets[best_c].push(row);
             }
-        }
-        buckets[best_c].push(row);
-    }
+            buckets
+        });
 
     let mut bucket_counts = vec![0u32; n_cent];
     let mut summary_radius_sq_max = 0.0f32;
@@ -926,24 +986,27 @@ fn build_subsection_from_materialized(
     // over `update_min_max`). This is O(rows · dim); the previous medoid-based
     // derivation was O(rows² · dim) (summed pairwise distances per cluster) and
     // single-threaded — it spun for minutes on a large post-routing cluster.
-    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = buckets
-        .iter()
-        .map(|bucket| {
-            if bucket.is_empty() {
-                return (vec![1.0f32; dim], vec![0.0f32; dim]);
-            }
-            let mut min = vec![f32::INFINITY; dim];
-            let mut max = vec![f32::NEG_INFINITY; dim];
-            let mut row_fp = vec![0.0f32; dim];
-            for row in bucket.iter() {
-                for (d, slot) in row_fp.iter_mut().enumerate() {
-                    *slot = encoded_component_at(&row.encoded, d);
-                }
-                update_min_max(&row_fp, &mut min, &mut max);
-            }
-            derive_sq8_quantizer_from_min_max(&min, &max)
-        })
-        .collect();
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> =
+        build_phase_timers::timed(&build_phase_timers::CALIB_US, || {
+            buckets
+                .iter()
+                .map(|bucket| {
+                    if bucket.is_empty() {
+                        return (vec![1.0f32; dim], vec![0.0f32; dim]);
+                    }
+                    let mut min = vec![f32::INFINITY; dim];
+                    let mut max = vec![f32::NEG_INFINITY; dim];
+                    let mut row_fp = vec![0.0f32; dim];
+                    for row in bucket.iter() {
+                        for (d, slot) in row_fp.iter_mut().enumerate() {
+                            *slot = encoded_component_at(&row.encoded, d);
+                        }
+                        update_min_max(&row_fp, &mut min, &mut max);
+                    }
+                    derive_sq8_quantizer_from_min_max(&min, &max)
+                })
+                .collect()
+        });
 
     let summary_radius_x100 = (summary_radius_sq_max.sqrt() * SUMMARY_RADIUS_SCALE)
         .max(0.0)

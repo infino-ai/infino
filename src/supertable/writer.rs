@@ -2336,6 +2336,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
 
+            crate::superfile::vector::builder::build_phase_timers::reset();
             let shards: Vec<(u32, ShardOutput, u32)> =
                 hidden_inner.options.writer_pool.install(|| {
                     by_cell
@@ -2382,6 +2383,22 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 batch_t0.elapsed().as_secs_f64() * 1e3 - t_assign,
                 n_cells,
             );
+            // Optional intra-build breakdown (INFINO_DRAIN_BUILD_TIMERS=1): summed
+            // CPU across the parallel per-cell builds, to see whether the build is
+            // train- / assign- / calibrate-bound (the SIMD/GPU decision).
+            if crate::superfile::vector::builder::build_phase_timers::enabled() {
+                let (train_ms, assign_ms, calib_ms) =
+                    crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
+                eprintln!(
+                    "[supertable drain] batch {}/{} build phases (summed CPU, {} cells): train {:.1}ms + assign {:.1}ms + calibrate {:.1}ms",
+                    batch_idx + 1,
+                    n_batches,
+                    n_cells,
+                    train_ms,
+                    assign_ms,
+                    calib_ms,
+                );
+            }
         }
 
         if prepared.is_empty() {
