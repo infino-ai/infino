@@ -157,7 +157,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] 
 # we pin our direct usage to 0.13 to match parquet — which is the
 # version with the conditional-put surface we need for the
 # manifest pointer's OCC + atomic-create semantics.
-object_store = { version = "0.13", features = ["aws", "azure"] }
+object_store = { version = "0.13", features = ["aws", "azure", "gcp"] }
 # Async-trait erasure for `StorageProvider` and the
 # `LazyByteSource` trait. Both need to be
 # usable through `Arc<dyn ...>` for cross-layer sharing, which
