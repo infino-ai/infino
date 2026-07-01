@@ -7,6 +7,7 @@ path. This mirrors the README "Open format" snippet and the
 """
 
 import glob
+from collections import Counter
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -25,21 +26,37 @@ def _onehot(i: int) -> list[float]:
 
 def _write_corpus(uri: str):
     db = infino.connect(uri)
-    schema = pa.schema([
-        pa.field("source", pa.large_utf8(), nullable=False),
-        pa.field("body", pa.large_utf8(), nullable=False),
-        pa.field("embedding", pa.list_(pa.float32(), DIM), nullable=False),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("source", pa.large_utf8(), nullable=False),
+            pa.field("body", pa.large_utf8(), nullable=False),
+            pa.field("embedding", pa.list_(pa.float32(), DIM), nullable=False),
+        ]
+    )
     docs = db.create_table(
         "docs",
         schema,
         infino.IndexSpec().fts("body").vector("embedding", DIM, 1, "cosine"),
     )
-    docs.append([
-        {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing.", "embedding": _onehot(0)},
-        {"source": "help-center", "body": "Refunds return to the original payment method.",         "embedding": _onehot(0)},
-        {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": _onehot(0)},
-    ])
+    docs.append(
+        [
+            {
+                "source": "help-center",
+                "body": "To cancel a subscription, open Settings then Billing.",
+                "embedding": _onehot(0),
+            },
+            {
+                "source": "help-center",
+                "body": "Refunds return to the original payment method.",
+                "embedding": _onehot(0),
+            },
+            {
+                "source": "blog",
+                "body": "Enable dark mode under Settings then Appearance.",
+                "embedding": _onehot(0),
+            },
+        ]
+    )
     return db, docs
 
 
@@ -90,9 +107,7 @@ def test_pyarrow_reads_superfile_as_parquet(tmp_path):
     # `inf.*` metadata keys are ignored by a standard reader.
     assert set(table.column_names) == STORED_COLUMNS
 
-    counts = dict(
-        table.select(["source"]).to_pandas().groupby("source").size().items()
-    )
+    counts = dict(Counter(table.column("source").to_pylist()))
     assert counts == {"help-center": 2, "blog": 1}
 
 
