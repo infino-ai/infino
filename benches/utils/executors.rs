@@ -681,7 +681,7 @@ pub mod vector {
     };
 
     /// Recall correctness gate (shared by both tiers).
-    pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
+    pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.98;
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;
     pub const N_CORRECTNESS_QUERIES: usize = 20;
@@ -689,7 +689,7 @@ pub mod vector {
     pub const N_CALIBRATION_QUERIES: usize = 100;
     pub const CALIBRATION_P50_ITERS: usize = 7;
     /// Recall targets reported (lowest-p50 point clearing each) + `default`.
-    pub const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
+    pub const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.98];
     /// (probe, refine) calibration grid — one shape for both tiers.
     pub const PROBES: &[usize] = &[1, 5, 10, 25, 50, 100, 200, 400, 800];
     pub const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
