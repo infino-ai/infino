@@ -239,6 +239,8 @@ pub enum StorageBackend {
     /// Azure Blob provider; `storage.bucket` names the container,
     /// rooted at `azure://storage.bucket/storage.prefix`.
     Azure,
+    /// GCS provider rooted at `gs://storage.bucket/storage.prefix`.
+    Gcs,
 }
 
 /// Config-side spelling for disk-cache cold-fetch mode. Kept
@@ -604,6 +606,23 @@ storage:
             Some("infino-azure-container")
         );
         assert_eq!(cfg.storage.prefix, "infino-real-azure-integration/example");
+    }
+
+    #[test]
+    fn storage_gcs_config_parses_bucket() {
+        let yaml = r#"
+storage:
+  backend: gcs
+  bucket: infino-gcs-bucket
+  prefix: tbl
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("parse config");
+        assert_eq!(cfg.storage.backend, StorageBackend::Gcs);
+        assert_eq!(cfg.storage.bucket.as_deref(), Some("infino-gcs-bucket"));
+        assert_eq!(cfg.storage.prefix, "tbl");
     }
 
     #[test]

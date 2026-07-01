@@ -53,7 +53,10 @@ use super::{
 use crate::{
     config::{Config, StorageBackend, StorageColdFetchMode},
     memory::ConnectionMemoryBudget,
-    storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
+    storage::{
+        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+        StorageProvider,
+    },
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
@@ -882,6 +885,16 @@ impl SupertableOptions {
                 })?;
                 Some(Arc::new(AzureStorageProvider::new_with_prefix(
                     container,
+                    &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
+                )?) as Arc<dyn StorageProvider>)
+            }
+            StorageBackend::Gcs => {
+                let bucket = cfg.storage.bucket.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=gcs requires storage.bucket".into())
+                })?;
+                Some(Arc::new(GcsStorageProvider::new_with_prefix(
+                    bucket,
                     &cfg.storage.prefix,
                     &cfg.storage.storage_options,
                 )?) as Arc<dyn StorageProvider>)

@@ -67,7 +67,9 @@ supertable:
 # `backend: s3` plus `bucket` / `prefix` to make
 # SupertableOptions::apply_config attach an S3StorageProvider.
 # `backend: azure` attaches an AzureStorageProvider, with `bucket`
-# naming the Azure container.
+# naming the Azure container. `backend: gcs` attaches a
+# GcsStorageProvider, with `bucket` naming the GCS bucket and
+# `storage_options` carrying `google_*` config keys.
 #
 # Env overrides:
 #   INFINO_STORAGE__BACKEND=s3
