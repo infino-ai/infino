@@ -604,15 +604,9 @@ impl SupertableReader {
         // ---- Global cross-superfile cluster selection.
         //
         // Each kept superfile's manifest summary carries its per-cluster
-        // (Sq8) centroids. Rank every (superfile, cluster) by centroid
-        // distance to the query and probe only the globally-closest
-        // clusters — so a query touches just the superfiles that own a
-        // near cluster, instead of running `nprobe` in every superfile.
-        // (A single per-superfile centroid can't do this: a time-ordered
-        // superfile is a broad mix, so its mean sits near the global
-        // centroid. Per-cluster centroids are fine-grained enough to
-        // rank.) A superfile whose summary has no cluster centroids falls
-        // back to a normal per-superfile `nprobe` probe — never dropped.
+        // Sq8+ε centroids. Rank every (superfile, cluster) by dequantizing
+        // each centroid to fp32 and scoring with [`distance`], then probe
+        // only the globally-closest clusters.
         let metric = manifest
             .options
             .vector_columns
@@ -623,11 +617,6 @@ impl SupertableReader {
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
-        // Folded Sq8-domain scoring (`ClusterCentroids::score_clusters_into`):
-        // Σq / ‖q‖² once per query, then one SIMD Sq8 dot per cluster over
-        // the contiguous code rows — no per-cluster dequantize, no scratch.
-        let sum_q: f32 = query.iter().sum();
-        let norm_q_sq: f32 = query.iter().map(|v| v * v).sum();
         for (si, entry) in superfiles.iter().enumerate() {
             // Filtered search: a superfile whose predicate matched no row
             // (absent from `allow`) is dropped here — it never scores a
@@ -638,7 +627,7 @@ impl SupertableReader {
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
                     vs.clusters
-                        .score_clusters_into(metric, query, sum_q, norm_q_sq, |c, score| {
+                        .score_clusters_into(metric, query, |c, score| {
                             scored.push((si, c, score));
                         });
                 }

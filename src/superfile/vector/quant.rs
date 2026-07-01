@@ -39,6 +39,7 @@
 
 use wide::f32x8;
 
+use crate::superfile::vector::distance::sum_f32;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::avx512_enabled;
 
@@ -163,7 +164,7 @@ impl BitQuantizer {
     /// [`estimate_dot_rotated_with_total`]: BitQuantizer::estimate_dot_rotated_with_total
     #[inline]
     pub fn estimate_dot_rotated(&self, q_rot: &[f32], code: &[u8]) -> f32 {
-        let q_total: f32 = q_rot.iter().sum();
+        let q_total: f32 = sum_f32(q_rot);
         self.estimate_dot_rotated_with_total(q_rot, code, q_total)
     }
 

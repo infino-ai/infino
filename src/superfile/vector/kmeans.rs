@@ -29,7 +29,7 @@
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::superfile::vector::distance::l2_sq;
+use crate::superfile::vector::distance::{add_f32_to_f64_acc, f64_acc_mean_into_f32, l2_sq};
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
 /// clustering PRNG stream distinct from the rotation stream, which is
@@ -126,9 +126,7 @@ pub fn kmeans_with_assignments(
                     c[cid] += 1;
                     let row = &vectors[d * dim..(d + 1) * dim];
                     let dst = &mut s[cid * dim..(cid + 1) * dim];
-                    for j in 0..dim {
-                        dst[j] += row[j] as f64;
-                    }
+                    add_f32_to_f64_acc(dst, row);
                 }
                 (s, c)
             })
@@ -152,9 +150,7 @@ pub fn kmeans_with_assignments(
                 let inv = 1.0 / counts[c] as f64;
                 let dst = &mut centroids[c * dim..(c + 1) * dim];
                 let src = &sums[c * dim..(c + 1) * dim];
-                for j in 0..dim {
-                    dst[j] = (src[j] * inv) as f32;
-                }
+                f64_acc_mean_into_f32(src, inv, dst);
             }
         }
     }

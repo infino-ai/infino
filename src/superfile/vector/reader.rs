@@ -41,8 +41,8 @@ use crate::superfile::{
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, distance_bytes,
-            distance_bytes_codec,
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, decode_f32_le_into,
+            distance_bytes, distance_bytes_codec, sum_f32,
         },
         ivf_merge::Sq8IvfMergeInput,
         quant::BitQuantizer,
@@ -1197,12 +1197,8 @@ impl VectorReader {
             .try_get_range_sync(col.subsection_range.clone())?;
         let off = col.summary_off;
         let dim = col.dim;
-        let centroid: Vec<f32> = (0..dim)
-            .map(|i| {
-                let s = off + i * 4;
-                f32::from_le_bytes([sub[s], sub[s + 1], sub[s + 2], sub[s + 3]])
-            })
-            .collect();
+        let mut centroid = vec![0f32; dim];
+        decode_f32_le_into(&sub[off..off + dim * 4], &mut centroid);
         Some((centroid, col.summary_radius))
     }
 
@@ -1223,18 +1219,10 @@ impl VectorReader {
         let stride = dim * 4;
 
         // Centroids: fp32, cluster-major, at `centroids_off`.
-        let mut centroids = Vec::with_capacity(n_cent * dim);
+        let mut centroids = vec![0f32; n_cent * dim];
         for c in 0..n_cent {
             let base = col.centroids_off + c * stride;
-            for d in 0..dim {
-                let s = base + d * 4;
-                centroids.push(f32::from_le_bytes([
-                    sub[s],
-                    sub[s + 1],
-                    sub[s + 2],
-                    sub[s + 3],
-                ]));
-            }
+            decode_f32_le_into(&sub[base..base + stride], &mut centroids[c * dim..(c + 1) * dim]);
         }
 
         // cluster_idx: `n_cent` × `(doc_off: u32, count: u32)`; we want
@@ -1577,7 +1565,7 @@ impl VectorReader {
                 let codes = sub[rowb..rowb + dim].to_vec();
                 let residuals = sub[rowb + dim..rowb + dim + dim].to_vec();
                 let norm_sq =
-                    store_norm.then(|| sq8_residual_norm_sq(dim, &sc, &of, &codes, &residuals));
+                    store_norm.then(|| sq8_residual_norm_sq(&sc, &of, &codes, &residuals));
                 let stable_id = stable_ids_rel
                     .map(|so| {
                         let p = so + (local_id as usize) * format::vec::STABLE_ID_BYTES;
@@ -2628,7 +2616,7 @@ fn score_cluster_codes_into_heap(
     out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
-    let q_total: f32 = q_rot.iter().sum();
+    let q_total: f32 = sum_f32(q_rot);
     for i in 0..cnt as usize {
         let did = u32::from_le_bytes([
             cluster_doc_ids[i * 4],

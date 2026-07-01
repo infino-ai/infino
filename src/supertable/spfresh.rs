@@ -17,16 +17,19 @@
 //!   7. Redrive reassigned rows through the incoming staging region; route
 //!      them into per-cell IVF superfiles (same path as commit ingest).
 //!
-//! Split/reassign stays on stored Sq8+ε bytes. Row assignment and k-means both
-//! score via [`distance_encoded_to_centroid`]; rows are re-spliced with
-//! [`encode_encoded_rows`], never decoded to fp32 corpora.
+//! Split/reassign stays on stored Sq8+ε bytes. Row assignment dequantizes
+//! manifest centroids and rows to fp32 before [`distance`]; rows are
+//! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
 use std::{cmp::Ordering, collections::HashMap, env, sync::OnceLock};
 
 use crate::{
     superfile::vector::{
-        cell_posting::{EncodedCellRow, manifest_centroid_components_from_row, medoid_index_by},
-        distance::{Metric, distance_encoded_to_centroid},
+        cell_posting::{
+            EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
+            medoid_index_by,
+        },
+        distance::{Metric, distance},
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -97,22 +100,18 @@ fn score_row_against_cell(
     row: &EncodedCellRow,
 ) -> f32 {
     let dim = clusters.dim as usize;
-    distance_encoded_to_centroid(
-        metric,
-        dim,
+    let mut row_fp = vec![0f32; dim];
+    dequantize_sq8_residual_into(
         &row.scale,
         &row.offset,
         &row.codes,
         &row.residuals,
-        row.norm_sq,
-        clusters.mins[cell],
-        clusters.scales[cell],
-        &clusters.codes[cell * dim..(cell + 1) * dim],
-    )
+        &mut row_fp,
+    );
+    distance(metric, &row_fp, clusters.centroid(cell))
 }
 
-/// Build a one-cluster [`ClusterCentroids`] prototype from a stored Sq8+ε row so
-/// row↔row distances reuse the same asymmetric kernel as query scoring.
+/// One-cluster [`ClusterCentroids`] prototype from a Sq8+ε row (split k-means seeds).
 fn centroid_prototype_from_row(
     template: &ClusterCentroids,
     row: &EncodedCellRow,
@@ -122,21 +121,23 @@ fn centroid_prototype_from_row(
     ClusterCentroids::from_fp32(1, template.dim, &fp32, vec![1])
 }
 
-fn distance_encoded_rows(
+fn fp32_distance_between_rows(
     metric: Metric,
-    template: &ClusterCentroids,
     a: &EncodedCellRow,
     b: &EncodedCellRow,
 ) -> f32 {
-    let proto = centroid_prototype_from_row(template, b);
-    score_row_against_cell(&proto, metric, 0, a)
+    let dim = a.scale.len();
+    let mut af = vec![0f32; dim];
+    let mut bf = vec![0f32; dim];
+    dequantize_sq8_residual_into(&a.scale, &a.offset, &a.codes, &a.residuals, &mut af);
+    dequantize_sq8_residual_into(&b.scale, &b.offset, &b.codes, &b.residuals, &mut bf);
+    distance(metric, &af, &bf)
 }
 
-/// Medoid index under the asymmetric Sq8+ε row↔row distance (discrete k-means
-/// centroid update). Shares the all-pairs min-sum loop with the symmetric
-/// variant via [`medoid_index_by`]; only the distance kernel differs.
-fn medoid_index(template: &ClusterCentroids, metric: Metric, shard: &[EncodedCellRow]) -> usize {
-    medoid_index_by(shard, |a, b| distance_encoded_rows(metric, template, a, b))
+/// Medoid index under fp32 dequant + [`distance`] row↔row (discrete k-means
+/// centroid update).
+fn medoid_index(metric: Metric, shard: &[EncodedCellRow]) -> usize {
+    medoid_index_by(shard, |a, b| fp32_distance_between_rows(metric, a, b))
 }
 
 /// 2-way Lloyd k-means on Sq8+ε overflow rows. Returns manifest centroid
@@ -193,8 +194,8 @@ pub(crate) fn plan_sq8_split(
         if shard0.is_empty() || shard1.is_empty() {
             break;
         }
-        let m0 = medoid_index(clusters, metric, &shard0);
-        let m1 = medoid_index(clusters, metric, &shard1);
+        let m0 = medoid_index(metric, &shard0);
+        let m1 = medoid_index(metric, &shard1);
         cent0 = centroid_prototype_from_row(clusters, &shard0[m0]);
         cent1 = centroid_prototype_from_row(clusters, &shard1[m1]);
     }
@@ -225,8 +226,8 @@ pub(crate) fn plan_sq8_split(
         shard1.retain(|r| r.stable_id != rows[seed0].stable_id);
     }
 
-    let m0 = medoid_index(clusters, metric, &shard0);
-    let m1 = medoid_index(clusters, metric, &shard1);
+    let m0 = medoid_index(metric, &shard0);
+    let m1 = medoid_index(metric, &shard1);
     (
         manifest_centroid_components_from_row(&shard0[m0], dim),
         manifest_centroid_components_from_row(&shard1[m1], dim),
@@ -265,7 +266,7 @@ pub(crate) fn insert_split_centroid(
 
     let mut fp32 = vec![0f32; new_n * dim];
     for c in 0..old_n {
-        base.dequantize_into(c, &mut fp32[c * dim..(c + 1) * dim]);
+        fp32[c * dim..(c + 1) * dim].copy_from_slice(base.centroid(c));
     }
     fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
     fp32[old_n * dim..new_n * dim].copy_from_slice(&sub_centroids[dim..2 * dim]);

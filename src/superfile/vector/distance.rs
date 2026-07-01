@@ -46,14 +46,11 @@ const F32_BYTES: usize = 4;
 
 /// Cosine distance is `COSINE_DISTANCE_BASE - dot` on unit vectors,
 /// so smaller means closer without re-normalizing at query time.
-/// `pub(crate)`: the manifest's folded Sq8 centroid scoring applies
-/// the same identity.
 pub(crate) const COSINE_DISTANCE_BASE: f32 = 1.0;
 
 /// Cross-term coefficient in the squared-L2 identity
 /// `‖q − x‖² = ‖q‖² − L2_CROSS_TERM_COEFF·(q·x) + ‖x‖²`, used by the
-/// Sq8 kernels that reconstruct L2 from a fused dot product (and by
-/// the manifest's folded Sq8 centroid scoring).
+/// Sq8 rerank kernels that reconstruct L2 from a fused dot product.
 pub(crate) const L2_CROSS_TERM_COEFF: f32 = 2.0;
 
 /// Distance metric for a vector index. Stored per-column in
@@ -108,6 +105,25 @@ pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_wide(a, b)
 }
 
+/// Euclidean (L2) distance — `sqrt` of [`l2_sq`]. Used by manifest
+/// centroid-envelope bounding-ball math where the metric is true L2
+/// (not L2²).
+#[inline]
+pub(crate) fn l2(a: &[f32], b: &[f32]) -> f32 {
+    l2_sq(a, b).sqrt()
+}
+
+/// Horizontal sum `Σ a[d]`. Dispatches AVX-512 → `wide::f32x8` like
+/// [`dot`]. Precompute once per query for RaBitQ's `q_total` term.
+#[inline]
+pub(crate) fn sum_f32(a: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+        return unsafe { sum_f32_avx512(a) };
+    }
+    sum_f32_wide(a)
+}
 
 /// Portable `wide::f32x8` (256-bit) dot product. The universal kernel
 /// the codebase has shipped since day one — runs on AVX2 / NEON /
@@ -160,6 +176,25 @@ fn l2_sq_wide(a: &[f32], b: &[f32]) -> f32 {
     for (x, y) in tail_a.iter().zip(tail_b.iter()) {
         let d = x - y;
         sum += d * d;
+    }
+    sum
+}
+
+/// Portable `wide::f32x8` horizontal sum. See [`dot_wide`].
+#[inline]
+fn sum_f32_wide(a: &[f32]) -> f32 {
+    let chunks = a.chunks_exact(F32X8_LANES);
+    let tail = chunks.remainder();
+    let mut acc = f32x8::ZERO;
+    for c in chunks {
+        let va = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(c).expect("chunks_exact(8) yields slices of length 8"),
+        );
+        acc += va;
+    }
+    let mut sum: f32 = acc.reduce_add();
+    for &x in tail {
+        sum += x;
     }
     sum
 }
@@ -233,6 +268,33 @@ unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
         while i < n {
             let d = a[i] - b[i];
             sum += d * d;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// AVX-512 16-lane horizontal sum. See [`dot_avx512`].
+///
+/// # Safety
+///
+/// Same contract as [`dot_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sum_f32_avx512(a: &[f32]) -> f32 {
+    let n = a.len();
+    // SAFETY: see `dot_avx512` — same bounds reasoning.
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= n {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i));
+            acc = _mm512_add_ps(va, acc);
+            i += AVX512_F32_LANES;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < n {
+            sum += a[i];
             i += 1;
         }
         sum
@@ -666,55 +728,6 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
     }
 }
 
-/// Asymmetric distance from one stored Sq8+ε row to a manifest Sq8 centroid.
-/// Folds per-row scale/offset and per-centroid min/scale without materializing
-/// fp32 vector buffers — for SPFresh maintenance assignment only (not query).
-pub(crate) fn distance_encoded_to_centroid(
-    metric: Metric,
-    dim: usize,
-    row_scale: &[f32],
-    row_offset: &[f32],
-    row_codes: &[u8],
-    row_residuals: &[u8],
-    row_norm_sq: Option<f32>,
-    cent_min: f32,
-    cent_scale: f32,
-    cent_codes: &[u8],
-) -> f32 {
-    debug_assert_eq!(row_scale.len(), dim);
-    debug_assert_eq!(row_offset.len(), dim);
-    debug_assert_eq!(row_codes.len(), dim);
-    debug_assert_eq!(row_residuals.len(), dim);
-    debug_assert_eq!(cent_codes.len(), dim);
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
-    let mut dot = 0.0f32;
-    let mut row_norm_sq_acc = 0.0f32;
-    let mut cent_norm_sq = 0.0f32;
-    for d in 0..dim {
-        let doc_d = row_offset[d]
-            + row_scale[d]
-                * (row_codes[d] as f32 + (i8::from_le_bytes([row_residuals[d]]) as f32) * inv_div);
-        let cent_d = cent_min + cent_scale * cent_codes[d] as f32;
-        dot += doc_d * cent_d;
-        row_norm_sq_acc += doc_d * doc_d;
-        cent_norm_sq += cent_d * cent_d;
-    }
-    let row_norm_sq = row_norm_sq.unwrap_or(row_norm_sq_acc);
-    match metric {
-        Metric::NegDot => -dot,
-        Metric::Cosine => {
-            let row_norm = row_norm_sq.sqrt();
-            let cent_norm = cent_norm_sq.sqrt();
-            if row_norm > 0.0 && cent_norm > 0.0 {
-                COSINE_DISTANCE_BASE - dot / (row_norm * cent_norm)
-            } else {
-                COSINE_DISTANCE_BASE - dot
-            }
-        }
-        Metric::L2Sq => row_norm_sq - L2_CROSS_TERM_COEFF * dot + cent_norm_sq,
-    }
-}
-
 /// Dot-product reduction for `Sq8Kernel::distance_at`:
 /// `Σ_d q_prime[d] * (code_bytes[d] as f32)` over the first `dim`
 /// dimensions. This is the `q_prime · code` half of the Sq8 distance
@@ -754,37 +767,6 @@ pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
         }
     }
     sq8_dot_wide(q_prime, code_bytes, dim)
-}
-
-/// Upper chunk length for [`u8_sum_sumsq`]'s u32 accumulators:
-/// `U8_SUMSQ_CHUNK · 255² < u32::MAX`, so a per-chunk Σcode² cannot
-/// overflow before it spills into the u64 total.
-const U8_SUMSQ_CHUNK: usize = 16_384;
-
-/// Σcode and Σcode² over one Sq8 code row, both as f32.
-///
-/// Exact integer accumulation: u32 lane math inside bounded chunks
-/// (u8-widening adds + `pmaddwd`-shaped squares that LLVM
-/// auto-vectorizes at the `x86-64-v3` baseline — 64-bit accumulators
-/// would defeat vectorization), spilled into u64 totals between
-/// chunks so no input length can overflow. Used by the manifest's
-/// folded Sq8 centroid scoring to reconstruct `‖centroid‖²` without
-/// dequantizing.
-pub(crate) fn u8_sum_sumsq(codes: &[u8]) -> (f32, f32) {
-    let mut sum: u64 = 0;
-    let mut sumsq: u64 = 0;
-    for chunk in codes.chunks(U8_SUMSQ_CHUNK) {
-        let mut s: u32 = 0;
-        let mut sq: u32 = 0;
-        for &b in chunk {
-            let v = b as u32;
-            s += v;
-            sq += v * v;
-        }
-        sum += u64::from(s);
-        sumsq += u64::from(sq);
-    }
-    (sum as f32, sumsq as f32)
 }
 
 /// Portable `wide::f32x8` (256-bit) Sq8 dot product. Same per-
@@ -916,6 +898,592 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
     }
 }
 
+/// Dequantize one Sq8+ε vector: `out[d] = offset[d] + scale[d]·(code[d] +
+/// residual[d]/SQ8_RESIDUAL_DIVISOR)`. Dispatches AVX-512 → AVX2 →
+/// `wide::f32x8` like [`dot`] and [`sq8_dot`].
+#[inline]
+pub(crate) fn dequantize_sq8_residual_into(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    out: &mut [f32],
+) {
+    let dim = out.len();
+    debug_assert_eq!(scale.len(), dim);
+    debug_assert_eq!(offset.len(), dim);
+    debug_assert_eq!(codes.len(), dim);
+    debug_assert_eq!(residuals.len(), dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            unsafe {
+                dequantize_sq8_residual_avx512(scale, offset, codes, residuals, out, dim);
+            }
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            unsafe {
+                dequantize_sq8_residual_avx2(scale, offset, codes, residuals, out, dim);
+            }
+            return;
+        }
+    }
+    dequantize_sq8_residual_wide(scale, offset, codes, residuals, out, dim);
+}
+
+#[inline]
+fn sq8_residual_component_scalar(
+    scale: f32,
+    offset: f32,
+    code: u8,
+    residual_byte: u8,
+) -> f32 {
+    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    offset + scale * (code as f32 + (i8::from_le_bytes([residual_byte]) as f32) * inv_div)
+}
+
+#[inline]
+fn dequantize_sq8_residual_wide(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    out: &mut [f32],
+    dim: usize,
+) {
+    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    let inv_v = f32x8::splat(inv_div);
+    let mut i = 0;
+    while i + F32X8_LANES <= dim {
+        let off = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES])
+                .expect("offset[i..i+8] len 8"),
+        );
+        let sc = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES])
+                .expect("scale[i..i+8] len 8"),
+        );
+        let mut code_bc = [0f32; F32X8_LANES];
+        let mut res_bc = [0f32; F32X8_LANES];
+        for j in 0..F32X8_LANES {
+            code_bc[j] = codes[i + j] as f32;
+            res_bc[j] = i8::from_le_bytes([residuals[i + j]]) as f32;
+        }
+        let codes_v = f32x8::from(code_bc);
+        let res_v = f32x8::from(res_bc);
+        let term = codes_v + res_v * inv_v;
+        let decoded = off + sc * term;
+        out[i..i + F32X8_LANES].copy_from_slice(&decoded.to_array());
+        i += F32X8_LANES;
+    }
+    while i < dim {
+        out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+        i += 1;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`. [`avx2_enabled`] guarantees
+/// this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dequantize_sq8_residual_avx2(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    out: &mut [f32],
+    dim: usize,
+) {
+    // SAFETY: each iteration reads/writes 8-element windows; `i + 8 <= dim`
+    // keeps all pointers in bounds. Unaligned loads/stores throughout.
+    unsafe {
+        let inv_div = _mm256_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let mut i = 0;
+        while i + F32X8_LANES <= dim {
+            let codes_u8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadl_epi64(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(res_u8));
+            let term = _mm256_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm256_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm256_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm256_fmadd_ps(sc, term, off);
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), decoded);
+            i += F32X8_LANES;
+        }
+        while i < dim {
+            out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`. [`avx512_enabled`]
+/// guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dequantize_sq8_residual_avx512(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    out: &mut [f32],
+    dim: usize,
+) {
+    // SAFETY: each iteration reads/writes 16-element windows; `i + 16 <= dim`
+    // keeps all pointers in bounds. Unaligned loads/stores throughout.
+    unsafe {
+        let inv_div = _mm512_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= dim {
+            let codes_u8 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadu_si128(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(res_u8));
+            let term = _mm512_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm512_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm512_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm512_fmadd_ps(sc, term, off);
+            _mm512_storeu_ps(out.as_mut_ptr().add(i), decoded);
+            i += AVX512_F32_LANES;
+        }
+        while i < dim {
+            out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            i += 1;
+        }
+    }
+}
+
+/// `||x||²` for one Sq8+ε vector without materializing fp32 storage.
+/// Dispatches AVX-512 → AVX2 → `wide::f32x8` like
+/// [`dequantize_sq8_residual_into`].
+#[inline]
+pub(crate) fn sq8_residual_norm_sq(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+) -> f32 {
+    let dim = scale.len();
+    debug_assert_eq!(offset.len(), dim);
+    debug_assert_eq!(codes.len(), dim);
+    debug_assert_eq!(residuals.len(), dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            return unsafe {
+                sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, dim)
+            };
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            return unsafe {
+                sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, dim)
+            };
+        }
+    }
+    sq8_residual_norm_sq_wide(scale, offset, codes, residuals, dim)
+}
+
+#[inline]
+fn sq8_residual_norm_sq_wide(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    dim: usize,
+) -> f32 {
+    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    let inv_v = f32x8::splat(inv_div);
+    let mut acc = f32x8::ZERO;
+    let mut i = 0;
+    while i + F32X8_LANES <= dim {
+        let off = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES])
+                .expect("offset[i..i+8] len 8"),
+        );
+        let sc = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES])
+                .expect("scale[i..i+8] len 8"),
+        );
+        let mut code_bc = [0f32; F32X8_LANES];
+        let mut res_bc = [0f32; F32X8_LANES];
+        for j in 0..F32X8_LANES {
+            code_bc[j] = codes[i + j] as f32;
+            res_bc[j] = i8::from_le_bytes([residuals[i + j]]) as f32;
+        }
+        let codes_v = f32x8::from(code_bc);
+        let res_v = f32x8::from(res_bc);
+        let term = codes_v + res_v * inv_v;
+        let decoded = off + sc * term;
+        acc += decoded * decoded;
+        i += F32X8_LANES;
+    }
+    let mut sum = acc.reduce_add();
+    while i < dim {
+        let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+        sum += v * v;
+        i += 1;
+    }
+    sum
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`. [`avx2_enabled`] guarantees
+/// this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq8_residual_norm_sq_avx2(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    dim: usize,
+) -> f32 {
+    // SAFETY: each iteration reads 8-element windows; `i + 8 <= dim` keeps
+    // all pointers in bounds.
+    unsafe {
+        let inv_div = _mm256_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + F32X8_LANES <= dim {
+            let codes_u8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadl_epi64(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(res_u8));
+            let term = _mm256_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm256_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm256_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm256_fmadd_ps(sc, term, off);
+            acc = _mm256_fmadd_ps(decoded, decoded, acc);
+            i += F32X8_LANES;
+        }
+        let mut sum = horizontal_sum_avx256(acc);
+        while i < dim {
+            let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`. [`avx512_enabled`]
+/// guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_residual_norm_sq_avx512(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    dim: usize,
+) -> f32 {
+    // SAFETY: each iteration reads 16-element windows; `i + 16 <= dim` keeps
+    // all pointers in bounds.
+    unsafe {
+        let inv_div = _mm512_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= dim {
+            let codes_u8 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadu_si128(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(res_u8));
+            let term = _mm512_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm512_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm512_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm512_fmadd_ps(sc, term, off);
+            acc = _mm512_fmadd_ps(decoded, decoded, acc);
+            i += AVX512_F32_LANES;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < dim {
+            let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// Decode little-endian f32 bytes into `out`. On little-endian hosts the
+/// layout matches native `f32`, so the hot path is unaligned SIMD load/store.
+#[inline]
+pub(crate) fn decode_f32_le_into(bytes: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out.len() * F32_BYTES);
+    if let Ok(decoded) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+        out.copy_from_slice(decoded);
+        return;
+    }
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            unsafe {
+                decode_f32_le_avx512(bytes, out, n);
+            }
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            unsafe {
+                decode_f32_le_avx2(bytes, out, n);
+            }
+            return;
+        }
+    }
+    decode_f32_le_wide(bytes, out, n);
+}
+
+#[inline]
+fn decode_f32_le_wide(bytes: &[u8], out: &mut [f32], n: usize) {
+    let mut i = 0;
+    while i + F32X8_LANES <= n {
+        let mut lane = [0f32; F32X8_LANES];
+        for (j, slot) in lane.iter_mut().enumerate() {
+            let b = (i + j) * F32_BYTES;
+            *slot = f32::from_le_bytes([
+                bytes[b],
+                bytes[b + 1],
+                bytes[b + 2],
+                bytes[b + 3],
+            ]);
+        }
+        out[i..i + F32X8_LANES].copy_from_slice(&lane);
+        i += F32X8_LANES;
+    }
+    while i < n {
+        let b = i * F32_BYTES;
+        out[i] = f32::from_le_bytes([
+            bytes[b],
+            bytes[b + 1],
+            bytes[b + 2],
+            bytes[b + 3],
+        ]);
+        i += 1;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_f32_le_avx2(bytes: &[u8], out: &mut [f32], n: usize) {
+    // SAFETY: `i + 8 <= n` and each f32 is 4 bytes ⇒ byte offset `i*4+32`
+    // stays inside `bytes`.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = out.as_mut_ptr();
+        let mut i = 0;
+        while i + F32X8_LANES <= n {
+            let v = _mm256_loadu_ps(src.add(i * F32_BYTES) as *const f32);
+            _mm256_storeu_ps(dst.add(i), v);
+            i += F32X8_LANES;
+        }
+        while i < n {
+            let b = i * F32_BYTES;
+            *dst.add(i) = f32::from_le_bytes([
+                *src.add(b),
+                *src.add(b + 1),
+                *src.add(b + 2),
+                *src.add(b + 3),
+            ]);
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn decode_f32_le_avx512(bytes: &[u8], out: &mut [f32], n: usize) {
+    // SAFETY: `i + 16 <= n` keeps the 64-byte load inside `bytes`.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = out.as_mut_ptr();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= n {
+            let v = _mm512_loadu_ps(src.add(i * F32_BYTES) as *const f32);
+            _mm512_storeu_ps(dst.add(i), v);
+            i += AVX512_F32_LANES;
+        }
+        while i < n {
+            let b = i * F32_BYTES;
+            *dst.add(i) = f32::from_le_bytes([
+                *src.add(b),
+                *src.add(b + 1),
+                *src.add(b + 2),
+                *src.add(b + 3),
+            ]);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn horizontal_sum_avx256(v: __m256) -> f32 {
+    // SAFETY: `_mm256_*` shuffle/add intrinsics only touch `v`.
+    unsafe {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        let sums2 = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(sums2)
+    }
+}
+
+/// Decode little-endian f32 bytes into a new vector.
+#[inline]
+pub(crate) fn decode_f32_le_vec(bytes: &[u8]) -> Vec<f32> {
+    debug_assert_eq!(bytes.len() % F32_BYTES, 0);
+    let mut out = vec![0f32; bytes.len() / F32_BYTES];
+    decode_f32_le_into(bytes, &mut out);
+    out
+}
+
+/// Add `row` into `acc` element-wise (`acc[d] += row[d] as f64`). Keeps
+/// f64 precision for k-means / centroid-merge accumulators while using
+/// AVX2/AVX-512 for the fp32 load + widen.
+#[inline]
+pub(crate) fn add_f32_to_f64_acc(acc: &mut [f64], row: &[f32]) {
+    debug_assert_eq!(acc.len(), row.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: gated on `avx2_enabled()`.
+        unsafe {
+            add_f32_to_f64_acc_avx2(acc, row);
+        }
+        return;
+    }
+    add_f32_to_f64_acc_scalar(acc, row);
+}
+
+/// Like [`add_f32_to_f64_acc`] but scales each lane by `weight` first.
+#[inline]
+pub(crate) fn add_weighted_f32_to_f64_acc(acc: &mut [f64], row: &[f32], weight: f64) {
+    debug_assert_eq!(acc.len(), row.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: gated on `avx2_enabled()`.
+        unsafe {
+            add_weighted_f32_to_f64_acc_avx2(acc, row, weight);
+        }
+        return;
+    }
+    for (a, &x) in acc.iter_mut().zip(row.iter()) {
+        *a += x as f64 * weight;
+    }
+}
+
+/// Write `out[d] = (acc[d] * inv) as f32` after a f64 reduction pass.
+#[inline]
+pub(crate) fn f64_acc_mean_into_f32(acc: &[f64], inv: f64, out: &mut [f32]) {
+    debug_assert_eq!(acc.len(), out.len());
+    for (o, &a) in out.iter_mut().zip(acc.iter()) {
+        *o = (a * inv) as f32;
+    }
+}
+
+/// Mean of `n` cluster-major fp32 vectors (`vectors.len() == n * dim`).
+#[inline]
+pub(crate) fn mean_f32_cluster_major(vectors: &[f32], dim: usize, n: usize) -> Vec<f32> {
+    debug_assert_eq!(vectors.len(), n * dim);
+    let mut acc = vec![0f64; dim];
+    for i in 0..n {
+        add_f32_to_f64_acc(&mut acc, &vectors[i * dim..(i + 1) * dim]);
+    }
+    let mut out = vec![0f32; dim];
+    if n > 0 {
+        f64_acc_mean_into_f32(&acc, 1.0 / n as f64, &mut out);
+    }
+    out
+}
+
+#[inline]
+fn add_f32_to_f64_acc_scalar(acc: &mut [f64], row: &[f32]) {
+    for (a, &x) in acc.iter_mut().zip(row.iter()) {
+        *a += x as f64;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_f32_to_f64_acc_avx2(acc: &mut [f64], row: &[f32]) {
+    // SAFETY: each iteration touches 8 f32 / 4 f64 lanes; `i + 8 <= len`
+    // keeps all pointers in bounds.
+    unsafe {
+        let mut i = 0;
+        let n = acc.len();
+        while i + F32X8_LANES <= n {
+            let vf = _mm256_loadu_ps(row.as_ptr().add(i));
+            let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(vf));
+            let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(vf, 1));
+            let alo = _mm256_loadu_pd(acc.as_mut_ptr().add(i));
+            let ahi = _mm256_loadu_pd(acc.as_mut_ptr().add(i + 4));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i), _mm256_add_pd(alo, lo));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i + 4), _mm256_add_pd(ahi, hi));
+            i += F32X8_LANES;
+        }
+        while i < n {
+            acc[i] += row[i] as f64;
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_weighted_f32_to_f64_acc_avx2(acc: &mut [f64], row: &[f32], weight: f64) {
+    // SAFETY: same bounds contract as [`add_f32_to_f64_acc_avx2`].
+    unsafe {
+        let w = _mm256_set1_pd(weight);
+        let mut i = 0;
+        let n = acc.len();
+        while i + F32X8_LANES <= n {
+            let vf = _mm256_loadu_ps(row.as_ptr().add(i));
+            let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(vf));
+            let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(vf, 1));
+            let wlo = _mm256_mul_pd(lo, w);
+            let whi = _mm256_mul_pd(hi, w);
+            let alo = _mm256_loadu_pd(acc.as_mut_ptr().add(i));
+            let ahi = _mm256_loadu_pd(acc.as_mut_ptr().add(i + 4));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i), _mm256_add_pd(alo, wlo));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i + 4), _mm256_add_pd(ahi, whi));
+            i += F32X8_LANES;
+        }
+        while i < n {
+            acc[i] += row[i] as f64 * weight;
+            i += 1;
+        }
+    }
+}
+
 /// In-place L2-normalize. Zero vectors stay zero (no division).
 ///
 /// Portable `wide::f32x8` SIMD: 8-lane FMA for the magnitude reduction
@@ -993,6 +1561,54 @@ mod tests {
         let v: Vec<f32> = (1..=16).map(|i| i as f32).collect();
         let want: f32 = (1..=16).map(|i| (i * i) as f32).sum();
         assert!(approx(dot(&v, &v), want, 1e-3));
+    }
+
+    #[test]
+    fn sum_f32_matches_scalar_reference() {
+        for len in [1, 7, 8, 15, 16, 17, 384] {
+            let v: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25 - 1.0).collect();
+            let expected: f32 = v.iter().sum();
+            assert!(
+                approx(sum_f32(&v), expected, 1e-4),
+                "len={len}: got {} expected {expected}",
+                sum_f32(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn sq8_residual_norm_sq_matches_dequant_dot_self() {
+        let dim = 17;
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.5 + 0.03 * i as f32).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| (i * 17 % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| ((i as i8).wrapping_mul(3)).to_le_bytes()[0])
+            .collect();
+        let mut decoded = vec![0f32; dim];
+        dequantize_sq8_residual_into(&scale, &offset, &codes, &residuals, &mut decoded);
+        let expected = dot(&decoded, &decoded);
+        assert!(approx(
+            sq8_residual_norm_sq(&scale, &offset, &codes, &residuals),
+            expected,
+            1e-4
+        ));
+    }
+
+    #[test]
+    fn decode_f32_le_into_round_trip() {
+        let values: Vec<f32> = (0..19).map(|i| i as f32 * 0.125 - 2.0).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![0f32; values.len()];
+        decode_f32_le_into(&bytes, &mut out);
+        assert_eq!(out, values);
+    }
+
+    #[test]
+    fn l2_matches_sqrt_l2_sq() {
+        let a: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..12).map(|i| (i as f32 + 1.0) * 0.07).collect();
+        assert!(approx(l2(&a, &b), l2_sq(&a, &b).sqrt(), 1e-5));
     }
 
     #[test]

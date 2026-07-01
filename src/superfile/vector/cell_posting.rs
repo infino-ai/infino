@@ -661,11 +661,19 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         out[dim..].copy_from_slice(&row.residuals);
         return store_norm.then(|| {
             row.norm_sq.unwrap_or_else(|| {
-                sq8_residual_norm_sq(dim, dst_scale, dst_offset, &row.codes, &row.residuals)
+                sq8_residual_norm_sq(dst_scale, dst_offset, &row.codes, &row.residuals)
             })
         });
     }
 
+    let mut row_fp = vec![0f32; dim];
+    dequantize_sq8_residual_into(
+        &row.scale,
+        &row.offset,
+        &row.codes,
+        &row.residuals,
+        &mut row_fp,
+    );
     let inv_scale: Vec<f32> = dst_scale.iter().map(|s| 1.0 / s).collect();
     let c2: Vec<f32> = dst_scale
         .iter()
@@ -675,7 +683,7 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
     let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let mut acc = 0.0f64;
     for d in 0..dim {
-        let v = encoded_component_at(row, d);
+        let v = row_fp[d];
         let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
         out[code_off + d] = q as u8;
         let base = q.mul_add(dst_scale[d], dst_offset[d]);
@@ -696,33 +704,9 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
     store_norm.then_some(acc as f32)
 }
 
-/// ||x||² for one Sq8+ε row, folded inline (no fp32 vector buffer).
-pub(crate) fn sq8_residual_norm_sq(
-    dim: usize,
-    scale: &[f32],
-    offset: &[f32],
-    codes: &[u8],
-    residuals: &[u8],
-) -> f32 {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
-    (0..dim)
-        .map(|d| {
-            let v = offset[d]
-                + scale[d]
-                    * (codes[d] as f32 + (i8::from_le_bytes([residuals[d]]) as f32) * inv_div);
-            v * v
-        })
-        .sum()
-}
-
-/// Fold one Sq8+ε component at `d` without materializing the full vector.
-#[inline]
-pub(crate) fn encoded_component_at(row: &EncodedCellRow, d: usize) -> f32 {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
-    row.offset[d]
-        + row.scale[d]
-            * (row.codes[d] as f32 + (i8::from_le_bytes([row.residuals[d]]) as f32) * inv_div)
-}
+pub(crate) use crate::superfile::vector::distance::{
+    dequantize_sq8_residual_into, sq8_residual_norm_sq,
+};
 
 /// Cap on the medoid all-pairs search. A medoid here is only a centroid *seed*
 /// (the split's discrete k-means update), so a representative sample suffices —
@@ -761,10 +745,11 @@ where
     best_idx
 }
 
-/// Sq8+ε row → `dim` fp32 components for manifest [`ClusterCentroids::from_fp32`]
-/// or IVF header centroids only (never a full-corpus decode).
+/// Sq8+ε row → `dim` fp32 components (manifest centroids, medoid seeds, etc.).
 pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
-    (0..dim).map(|d| encoded_component_at(row, d)).collect()
+    let mut out = vec![0f32; dim];
+    dequantize_sq8_residual_into(&row.scale, &row.offset, &row.codes, &row.residuals, &mut out);
+    out
 }
 
 

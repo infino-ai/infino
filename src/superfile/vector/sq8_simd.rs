@@ -36,6 +36,8 @@ use std::ptr::write_unaligned;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
+use crate::superfile::vector::distance::{SQ8_RESIDUAL_DIVISOR, dot};
+
 /// Maximum Sq8 code value. Sq8 quantizes each component to a single
 /// unsigned byte, so the encoder clamps the FMA result to
 /// `[0, SQ8_CODE_MAX]` before the truncating cast to `u8`.
@@ -291,6 +293,54 @@ pub(super) fn sq8_encode_row(row: &[f32], inv_scale: &[f32], c2: &[f32], dst: &m
         }
     }
     sq8_encode_row_wide(row, inv_scale, c2, dst);
+}
+
+/// Symmetric clamp bound for the Sq8+ε i8 residual leg (matches IVF builder).
+const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
+
+/// Encode one fp32 row into Sq8+ε `(codes, residuals)` at the cluster's
+/// `(scale, offset)`, using the precomputed code-leg `consts` (build once
+/// per cluster, not per row). The Sq8 code leg uses the SIMD
+/// [`sq8_encode_row`]; the residual leg captures quantization error at
+/// `scale[d] / SQ8_RESIDUAL_DIVISOR` steps and reconstructs the corrected
+/// component into `recon` in the same pass.
+///
+/// When `store_norm`, returns the residual-corrected `‖x‖²` via the SIMD
+/// [`dot`] helper over `recon` — the corrected vector is materialized by the
+/// residual pass itself, so there is no second decode of the just-written
+/// bytes (contrast a follow-up `sq8_residual_norm_sq`, which re-widens and
+/// re-reconstructs every dim).
+pub(super) fn encode_sq8_residual_row(
+    row: &[f32],
+    consts: &Sq8EncodeConsts,
+    scale: &[f32],
+    offset: &[f32],
+    codes: &mut [u8],
+    residuals: &mut [u8],
+    recon: &mut [f32],
+    store_norm: bool,
+) -> Option<f32> {
+    debug_assert_eq!(row.len(), scale.len());
+    debug_assert_eq!(row.len(), offset.len());
+    debug_assert_eq!(row.len(), codes.len());
+    debug_assert_eq!(row.len(), residuals.len());
+    debug_assert_eq!(row.len(), recon.len());
+    sq8_encode_row(row, &consts.inv_scale, &consts.c2, codes);
+    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    for d in 0..row.len() {
+        let base = (codes[d] as f32).mul_add(scale[d], offset[d]);
+        let step = scale[d] * inv_div;
+        let rq = if step > 0.0 {
+            ((row[d] - base) / step)
+                .round()
+                .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
+        } else {
+            0
+        };
+        residuals[d] = rq.to_le_bytes()[0];
+        recon[d] = base + (rq as f32) * step;
+    }
+    store_norm.then(|| dot(recon, recon))
 }
 
 /// Portable Sq8 encode. `wide::f32x8` handles the FMA + clamp in

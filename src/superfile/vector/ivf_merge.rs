@@ -26,7 +26,13 @@ use crate::superfile::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
-        distance::Metric,
+        distance::{
+            Metric,
+            add_weighted_f32_to_f64_acc,
+            decode_f32_le_into,
+            f64_acc_mean_into_f32,
+            mean_f32_cluster_major,
+        },
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry},
         rerank_codec::RerankCodec,
@@ -109,6 +115,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
     let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
 
     let mut out_centroids = vec![0.0f32; n_cent * dim];
+    let mut cent_buf = vec![0f32; dim];
     for c in 0..n_cent {
         let mut acc = vec![0.0f64; dim];
         let mut total = 0u64;
@@ -119,38 +126,15 @@ pub(crate) fn merge_sq8_ivf_subsections(
             }
             total += count as u64;
             let co = inp.centroids_off + c * dim * 4;
-            for (d, acc_d) in acc.iter_mut().enumerate().take(dim) {
-                let v = f32::from_le_bytes([
-                    inp.sub[co + d * 4],
-                    inp.sub[co + d * 4 + 1],
-                    inp.sub[co + d * 4 + 2],
-                    inp.sub[co + d * 4 + 3],
-                ]);
-                *acc_d += v as f64 * count as f64;
-            }
+            decode_f32_le_into(&inp.sub[co..co + dim * 4], &mut cent_buf);
+            add_weighted_f32_to_f64_acc(&mut acc, &cent_buf, count as f64);
         }
         if total > 0 {
-            let inv = 1.0 / (total as f64);
-            for d in 0..dim {
-                out_centroids[c * dim + d] = (acc[d] * inv) as f32;
-            }
+            f64_acc_mean_into_f32(&acc, 1.0 / total as f64, &mut out_centroids[c * dim..(c + 1) * dim]);
         }
     }
 
-    let mut summary_centroid = vec![0.0f32; dim];
-    if n_cent > 0 {
-        let mut acc = vec![0.0f64; dim];
-        for c in 0..n_cent {
-            let cv = &out_centroids[c * dim..(c + 1) * dim];
-            for (a, &x) in acc.iter_mut().zip(cv) {
-                *a += x as f64;
-            }
-        }
-        let inv = 1.0 / (n_cent as f64);
-        for (s, a) in summary_centroid.iter_mut().zip(&acc) {
-            *s = (*a * inv) as f32;
-        }
-    }
+    let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, n_cent);
 
     let summary_radius_x100 = parsed
         .iter()
@@ -298,7 +282,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
                                 .copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
                             store_norm.then(|| {
                                 sq8_residual_norm_sq(
-                                    dim,
                                     scale_c,
                                     offset_c,
                                     &inp.sub[rowb..rowb + dim],
@@ -408,32 +391,16 @@ pub(crate) fn splice_fragments_into_cell(
     let mut dst_offset = vec![0.0f32; out_n_cent * dim];
     for (k, (inp, c, _)) in fragments.iter().enumerate() {
         let co = inp.centroids_off + c * dim * 4;
-        for d in 0..dim {
-            out_centroids[k * dim + d] = f32::from_le_bytes([
-                inp.sub[co + d * 4],
-                inp.sub[co + d * 4 + 1],
-                inp.sub[co + d * 4 + 2],
-                inp.sub[co + d * 4 + 3],
-            ]);
-        }
+        decode_f32_le_into(
+            &inp.sub[co..co + dim * 4],
+            &mut out_centroids[k * dim..(k + 1) * dim],
+        );
         dst_scale[k * dim..(k + 1) * dim].copy_from_slice(&inp.scale[c * dim..c * dim + dim]);
         dst_offset[k * dim..(k + 1) * dim].copy_from_slice(&inp.offset[c * dim..c * dim + dim]);
     }
 
     // Summary centroid = mean of fragment centroids; radius = max over fragments.
-    let mut summary_centroid = vec![0.0f32; dim];
-    {
-        let mut acc = vec![0.0f64; dim];
-        for k in 0..out_n_cent {
-            for (d, a) in acc.iter_mut().enumerate() {
-                *a += out_centroids[k * dim + d] as f64;
-            }
-        }
-        let inv = 1.0 / out_n_cent as f64;
-        for (d, slot) in summary_centroid.iter_mut().enumerate() {
-            *slot = (acc[d] * inv) as f32;
-        }
-    }
+    let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, out_n_cent);
     let summary_radius_x100 = fragments
         .iter()
         .map(|(inp, _, _)| inp.summary_radius_x100)
@@ -520,7 +487,6 @@ pub(crate) fn splice_fragments_into_cell(
                 if store_norm {
                     if let Some(norms_off) = sq8_norms_block_off {
                         let n_sq = sq8_residual_norm_sq(
-                            dim,
                             scale_c,
                             offset_c,
                             &inp.sub[rowb..rowb + dim],
@@ -591,6 +557,7 @@ where
 
     // Route each non-empty (input, local cluster) by its centroid → dest cell(s).
     let mut cell_frags: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    let mut centroid_buf = vec![0f32; dim];
     for (ii, inp) in parsed.iter().enumerate() {
         for c in 0..inp.n_cent {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
@@ -598,17 +565,8 @@ where
                 continue;
             }
             let co = inp.centroids_off + c * dim * 4;
-            let centroid: Vec<f32> = (0..dim)
-                .map(|d| {
-                    f32::from_le_bytes([
-                        inp.sub[co + d * 4],
-                        inp.sub[co + d * 4 + 1],
-                        inp.sub[co + d * 4 + 2],
-                        inp.sub[co + d * 4 + 3],
-                    ])
-                })
-                .collect();
-            for cell in route_cluster(&centroid) {
+            decode_f32_le_into(&inp.sub[co..co + dim * 4], &mut centroid_buf);
+            for cell in route_cluster(&centroid_buf) {
                 cell_frags.entry(cell).or_default().push((ii, c));
             }
         }

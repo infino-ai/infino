@@ -33,10 +33,9 @@ use crate::superfile::{
     },
     vector::{
         cell_posting::{
-            MaterializedIvfRow, encoded_component_at,
-            materialize_sq8_residual_row_into_cluster_quant,
+            MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant,
         },
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, l2_sq},
+        distance::{Metric, dequantize_sq8_residual_into, l2_sq, mean_f32_cluster_major},
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
@@ -44,7 +43,7 @@ use crate::superfile::{
         reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
         rotation::RandomRotation,
         spill::{ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter},
-        sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max},
+        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
     },
 };
 
@@ -111,11 +110,6 @@ const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 /// byte, so the per-dim scale maps a cluster's value span onto
 /// `[0, SQ8_CODE_MAX]`.
 const SQ8_CODE_MAX: f32 = 255.0;
-
-/// Symmetric clamp bound for the Sq8ResidualEpsilon i8 leg. The residual is
-/// stored as a signed byte but clamped to ±127 (not i8::MIN) so the
-/// quantized magnitude stays symmetric about zero.
-const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
@@ -910,29 +904,20 @@ fn build_subsection_from_materialized(
                 s * n_docs / sample_size
             };
             let enc = &rows[idx].encoded;
-            for (d, slot) in sample[s * dim..(s + 1) * dim].iter_mut().enumerate() {
-                *slot = encoded_component_at(enc, d);
-            }
+            dequantize_sq8_residual_into(
+                &enc.scale,
+                &enc.offset,
+                &enc.codes,
+                &enc.residuals,
+                &mut sample[s * dim..(s + 1) * dim],
+            );
         }
         let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
         (n_cent, centroids)
     }
     });
 
-    let mut summary_centroid = vec![0.0f32; dim];
-    if !centroids.is_empty() {
-        let mut acc = vec![0.0f64; dim];
-        for c in 0..n_cent {
-            let cv = &centroids[c * dim..(c + 1) * dim];
-            for (a, &x) in acc.iter_mut().zip(cv) {
-                *a += x as f64;
-            }
-        }
-        let inv = 1.0 / (n_cent as f64);
-        for (s, a) in summary_centroid.iter_mut().zip(&acc) {
-            *s = (*a * inv) as f32;
-        }
-    }
+    let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
 
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
@@ -948,9 +933,13 @@ fn build_subsection_from_materialized(
             // inputs.
             let mut row_fp = vec![0f32; dim];
             for row in &rows {
-                for (d, slot) in row_fp.iter_mut().enumerate() {
-                    *slot = encoded_component_at(&row.encoded, d);
-                }
+                dequantize_sq8_residual_into(
+                    &row.encoded.scale,
+                    &row.encoded.offset,
+                    &row.encoded.codes,
+                    &row.encoded.residuals,
+                    &mut row_fp,
+                );
                 let mut best_c = 0usize;
                 let mut best = f32::INFINITY;
                 for c in 0..n_cent {
@@ -967,16 +956,18 @@ fn build_subsection_from_materialized(
 
     let mut bucket_counts = vec![0u32; n_cent];
     let mut summary_radius_sq_max = 0.0f32;
+    let mut row_fp = vec![0f32; dim];
     for (c, bucket) in buckets.iter().enumerate() {
         bucket_counts[c] = bucket.len() as u32;
         for row in bucket {
-            let r_sq = (0..dim)
-                .map(|d| {
-                    let v = encoded_component_at(&row.encoded, d);
-                    let diff = v - summary_centroid[d];
-                    diff * diff
-                })
-                .sum::<f32>();
+            dequantize_sq8_residual_into(
+                &row.encoded.scale,
+                &row.encoded.offset,
+                &row.encoded.codes,
+                &row.encoded.residuals,
+                &mut row_fp,
+            );
+            let r_sq = l2_sq(&row_fp, &summary_centroid);
             if r_sq > summary_radius_sq_max {
                 summary_radius_sq_max = r_sq;
             }
@@ -1000,9 +991,13 @@ fn build_subsection_from_materialized(
                     let mut max = vec![f32::NEG_INFINITY; dim];
                     let mut row_fp = vec![0.0f32; dim];
                     for row in bucket.iter() {
-                        for (d, slot) in row_fp.iter_mut().enumerate() {
-                            *slot = encoded_component_at(&row.encoded, d);
-                        }
+                        dequantize_sq8_residual_into(
+                            &row.encoded.scale,
+                            &row.encoded.offset,
+                            &row.encoded.codes,
+                            &row.encoded.residuals,
+                            &mut row_fp,
+                        );
                         update_min_max(&row_fp, &mut min, &mut max);
                     }
                     derive_sq8_quantizer_from_min_max(&min, &max)
@@ -1187,20 +1182,7 @@ fn build_subsection_streaming(
     // Summary centroid: mean of trained centroids. Cheap and only
     // depends on centroids, so compute now before pass 2 so we can
     // fold each row's distance into `summary_radius_sq_max` inline.
-    let mut summary_centroid = vec![0.0f32; dim];
-    if !centroids.is_empty() {
-        let mut acc = vec![0.0f64; dim];
-        for c in 0..n_cent {
-            let cv = &centroids[c * dim..(c + 1) * dim];
-            for (a, &x) in acc.iter_mut().zip(cv) {
-                *a += x as f64;
-            }
-        }
-        let inv = 1.0 / (n_cent as f64);
-        for (s, a) in summary_centroid.iter_mut().zip(&acc) {
-            *s = (*a * inv) as f32;
-        }
-    }
+    let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
 
     let rotation = RandomRotation::new(dim, cfg.rot_seed);
     let quant = BitQuantizer::new(dim);
@@ -1456,7 +1438,6 @@ fn build_subsection_streaming(
                 RerankCodec::Sq8ResidualEpsilon => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                     let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
-                    let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
                     encode_sq8_residual_cluster_simd(
                         cluster_rows,
                         dim,
@@ -1464,8 +1445,6 @@ fn build_subsection_streaming(
                         blk.first_row,
                         blk.rerank_base,
                         sq8_norms_block_off,
-                        &ec.inv_scale,
-                        &ec.c2,
                         scale_c,
                         offset_c,
                         bytes,
@@ -1510,46 +1489,30 @@ fn encode_sq8_residual_cluster_simd(
     cluster_doc_off: usize,
     full_chunk_base: usize,
     sq8_norms_block_off: Option<usize>,
-    inv_scale_c: &[f32],
-    c2_c: &[f32],
     scale_c: &[f32],
     offset_c: &[f32],
     bytes: &mut [u8],
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
-    let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let row_bytes = dim * 2;
+    // Code-leg quantizer constants are constant across the cluster — build
+    // once here, not once per row.
+    let consts = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
+    let store_norm = sq8_norms_block_off.is_some();
+    let mut recon = vec![0f32; dim];
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
         let pos = cluster_doc_off + i;
         let row_off = full_chunk_base + i * row_bytes;
-        let code_off = row_off;
-        let res_off = row_off + dim;
-        // Sq8 code leg (identical quantization to plain Sq8).
-        sq8_encode_row(src, inv_scale_c, c2_c, &mut bytes[code_off..code_off + dim]);
-        // Residual leg + (optional) residual-corrected norm.
-        let mut acc = 0.0f64;
-        for d in 0..dim {
-            let qc = bytes[code_off + d];
-            let base = (qc as f32) * scale_c[d] + offset_c[d];
-            let step = scale_c[d] / residual_divisor;
-            let rq = if step > 0.0 {
-                ((src[d] - base) / step)
-                    .round()
-                    .clamp(-SQ8_RESIDUAL_I8_CLAMP, SQ8_RESIDUAL_I8_CLAMP) as i8
-            } else {
-                0
-            };
-            bytes[res_off + d] = rq.to_le_bytes()[0];
-            if sq8_norms_block_off.is_some() {
-                let x = base + (rq as f32) * step;
-                acc += (x as f64) * (x as f64);
-            }
-        }
-        if let Some(norms_off) = sq8_norms_block_off {
+        let row_bytes_mut = &mut bytes[row_off..row_off + row_bytes];
+        let (code_slice, res_slice) = row_bytes_mut.split_at_mut(dim);
+        let norm = encode_sq8_residual_row(
+            src, &consts, scale_c, offset_c, code_slice, res_slice, &mut recon, store_norm,
+        );
+        if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm) {
             let n_off = norms_off + pos * 4;
-            bytes[n_off..n_off + 4].copy_from_slice(&(acc as f32).to_le_bytes());
+            bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
         }
     }
 }

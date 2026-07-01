@@ -591,9 +591,7 @@ fn per_cell_radii(
             continue;
         }
         let member = &vectors[doc_idx * vec_dim..(doc_idx + 1) * vec_dim];
-        let sum_m: f32 = member.iter().sum();
-        let norm_m_sq: f32 = member.iter().map(|v| v * v).sum();
-        let dist = clusters.score_one(metric, c, member, sum_m, norm_m_sq);
+        let dist = clusters.score_one(metric, c, member);
         if dist > radii[c] {
             radii[c] = dist;
         }
@@ -3712,9 +3710,7 @@ mod tests {
         assert_eq!(vs.clusters.dim as usize, dim);
         assert!(vs.clusters.n_cent >= 1);
         assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.mins.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.scales.len(), vs.clusters.n_cent as usize);
-        assert_eq!(vs.clusters.codes.len(), vs.clusters.n_cent as usize * dim);
+        assert_eq!(vs.clusters.centroids.len(), vs.clusters.n_cent as usize * dim);
         // Every indexed doc lands in exactly one cluster, so the
         // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();

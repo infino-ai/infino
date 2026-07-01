@@ -917,13 +917,11 @@ pub(crate) fn train_global_centroids(
             continue;
         }
         dim = cc.dim as usize;
-        let mut row = vec![0f32; dim];
         for c in 0..cc.n_cent as usize {
             if cc.counts[c] == 0 {
                 continue;
             }
-            cc.dequantize_into(c, &mut row);
-            all_centroids.extend_from_slice(&row);
+            all_centroids.extend_from_slice(cc.centroid(c));
         }
     }
     if all_centroids.is_empty() || dim == 0 {

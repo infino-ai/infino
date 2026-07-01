@@ -33,10 +33,13 @@ use std::{
     sync::Arc,
 };
 
-use crate::supertable::manifest::{
-    SuperfileEntry,
-    encoding::{encode_centroid_envelope, l2_distance},
-    list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
+use crate::{
+    superfile::vector::distance::{add_f32_to_f64_acc, f64_acc_mean_into_f32},
+    supertable::manifest::{
+        SuperfileEntry,
+        encoding::{encode_centroid_envelope, l2_distance},
+        list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
+    },
 };
 
 /// All four aggregate buckets for one [`ManifestListEntry`].
@@ -158,12 +161,11 @@ fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, Ve
         }
         let mut mean = vec![0.0_f64; first_dim];
         for (centroid, _) in &entries {
-            for (i, v) in centroid.iter().enumerate() {
-                mean[i] += *v as f64;
-            }
+            add_f32_to_f64_acc(&mut mean, centroid);
         }
         let n = entries.len() as f64;
-        let mean_f32: Vec<f32> = mean.into_iter().map(|x| (x / n) as f32).collect();
+        let mut mean_f32 = vec![0f32; first_dim];
+        f64_acc_mean_into_f32(&mean, 1.0 / n, &mut mean_f32);
 
         // envelope_radius = max(distance(seg_centroid, mean) +
         // seg_radius) over all superfiles. Distance = L2 — works
