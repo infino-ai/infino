@@ -110,9 +110,6 @@ docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
 docs.bm25Search("title", "quick fox", 10);                  // OR by default
 docs.bm25Search("title", "quick fox", 10, { mode: "and" }); // require all terms
 
-// Prefix-expanded BM25 — "qui" matches "quick", "quirk", …
-docs.bm25SearchPrefix("title", "qui", 10);
-
 // Unranked matching (score is 0): every row containing the term(s),
 // or an exact whole-value match.
 docs.tokenMatch("title", "fox");

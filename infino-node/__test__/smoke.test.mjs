@@ -114,24 +114,6 @@ test("query_sql with a hybrid_search TVF returns rows from a sync host (#170)", 
   assert.ok(rows.length >= 1);
 });
 
-test("bm25SearchPrefix expands a prefix and matches the SQL TVF", () => {
-  const db = connect("memory://");
-  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
-  docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
-
-  // "qui" expands to "quick" → the fox row only.
-  const hits = docs.bm25SearchPrefix("title", "qui", 10, { projection: ["_id", "score"] });
-  assert.equal(hits.length, 1);
-  assert.equal(typeof hits[0]._id, "bigint");
-
-  // Direct call and the SQL TVF agree on the row count.
-  const viaSql = db.querySql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)");
-  assert.equal(viaSql.length, hits.length);
-
-  // An unmatched prefix returns nothing.
-  assert.equal(docs.bm25SearchPrefix("title", "zzz", 10).length, 0);
-});
-
 test("hybridSearch fuses BM25 and vector retrieval", () => {
   const db = connect("memory://");
   const dim = 16;

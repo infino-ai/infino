@@ -460,28 +460,6 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
-    /// Prefix-expanded BM25 search over one FTS column: `prefix` matches
-    /// every indexed term it begins, scored as one BM25 query. Returns a
-    /// pyarrow `Table` like `bm25_search`; `projection` follows the same
-    /// rules.
-    #[pyo3(signature = (column, prefix, k, projection=None))]
-    fn bm25_search_prefix<'py>(
-        &self,
-        py: Python<'py>,
-        column: &str,
-        prefix: &str,
-        k: usize,
-        projection: Option<Vec<String>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let batches = py
-            .detach(|| {
-                let names = projection_refs(&projection);
-                self.inner.bm25_search_prefix(column, prefix, k, names.as_deref())
-            })
-            .map_err(py_err)?;
-        batches_to_pyarrow_table(py, batches)
-    }
-
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
     /// `vector_column` / `vector_query` (with optional `nprobe`) drive

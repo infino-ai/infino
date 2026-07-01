@@ -74,13 +74,6 @@ class Table:
         value: str,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
-    def bm25_search_prefix(
-        self,
-        column: str,
-        prefix: str,
-        k: int,
-        projection: Sequence[str] | None = ...,
-    ) -> ArrowTable: ...
     def hybrid_search(
         self,
         text_column: str,

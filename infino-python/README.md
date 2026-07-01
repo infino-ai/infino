@@ -82,9 +82,6 @@ docs.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
 docs.bm25_search("title", "quick fox", k=10)               # OR by default
 docs.bm25_search("title", "quick fox", k=10, mode="and")   # require all terms
 
-# Prefix-expanded BM25 — "qui" matches "quick", "quirk", …
-docs.bm25_search_prefix("title", "qui", k=10)
-
 # Unranked matching (score is 0.0): every row containing the term(s),
 # or an exact whole-value match.
 docs.token_match("title", "fox")
@@ -184,11 +181,12 @@ db.query_sql("""
 """)
 ```
 
-Every table function has a direct `Table` method equivalent
-(`bm25_search`, `bm25_search_prefix`, `vector_search`, `hybrid_search`,
-`token_match`, `exact_match`); the SQL forms drop the optional arguments
-the methods expose — SQL `vector_search` and `hybrid_search` take no
-`nprobe` (or filter), so use the `Table` methods when you need those.
+Most table functions have a direct `Table` method equivalent
+(`bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
+`exact_match`); `bm25_search_prefix` is available only in SQL. The direct
+methods also expose optional arguments the SQL forms omit — SQL
+`vector_search` and `hybrid_search` take no `nprobe` (or filter), so use
+the `Table` methods when you need those.
 
 ## Projections
 
@@ -325,7 +323,6 @@ db = infino.connect(
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
-  - `bm25_search_prefix(column, prefix, k, projection=None) -> pyarrow.Table`
   - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
   - `hybrid_search(text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`

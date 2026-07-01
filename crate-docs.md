@@ -104,8 +104,8 @@ The public surface is a small connection-and-table API:
   `azure_*` keys), never read from the environment.
 - `Connection` — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
 - `Supertable` (the table handle) — `append`, `update`, `delete`, `schema`, and the
-  search methods `bm25_search`, `bm25_search_prefix`, `vector_search`, `hybrid_search`,
-  `token_match`, and `exact_match` (each returns Arrow rows as `Vec<RecordBatch>`).
+  search methods `bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
+  and `exact_match` (each returns Arrow rows as `Vec<RecordBatch>`).
 - Supporting types — `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`,
   `ConnectOptions`, `MutationStats`, and the `InfinoError` enum.
 

@@ -75,11 +75,6 @@ export interface Bm25SearchOptions {
   projection?: string[];
   arrow?: boolean;
 }
-export interface Bm25SearchPrefixOptions {
-  /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
-  projection?: string[];
-  arrow?: boolean;
-}
 /** Text-predicate filter for `vectorSearch` (a pushdown pre-filter, not a
  * post-filter): kNN ranks only among rows whose FTS-indexed `column` matches
  * `query`. */
@@ -297,14 +292,6 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
     const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.projection);
-    return decode(buf, opts.arrow);
-  }
-
-  /** Prefix-expanded BM25 search; rows as records (or an Arrow `Table`). */
-  bm25SearchPrefix(column: string, prefix: string, k: number, opts: Bm25SearchPrefixOptions & { arrow: true }): arrow.Table;
-  bm25SearchPrefix(column: string, prefix: string, k: number, opts?: Bm25SearchPrefixOptions): RowRecord[];
-  bm25SearchPrefix(column: string, prefix: string, k: number, opts: Bm25SearchPrefixOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.bm25SearchPrefix(column, prefix, k, opts.projection);
     return decode(buf, opts.arrow);
   }
 

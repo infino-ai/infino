@@ -542,27 +542,6 @@ impl Table {
         batches_to_ipc(&batches)
     }
 
-    /// Prefix-expanded BM25 search over one FTS column: `prefix` matches every
-    /// indexed term it begins, scored as one BM25 query. Returns Arrow rows
-    /// like [`Table::bm25_search`]; `projection` selects columns.
-    #[napi]
-    pub fn bm25_search_prefix(
-        &self,
-        column: String,
-        prefix: String,
-        k: u32,
-        projection: Option<Vec<String>>,
-    ) -> Result<Buffer> {
-        let proj: Option<Vec<&str>> = projection
-            .as_ref()
-            .map(|v| v.iter().map(String::as_str).collect());
-        let batches = self
-            .inner
-            .bm25_search_prefix(&column, &prefix, k as usize, proj.as_deref())
-            .map_err(map_err)?;
-        batches_to_ipc(&batches)
-    }
-
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
     /// `vector_query` (a `Float32Array`, with optional `nprobe`) drive vector

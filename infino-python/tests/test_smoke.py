@@ -377,28 +377,6 @@ def test_filtered_vector_search():
         )
 
 
-def test_bm25_search_prefix_matches_sql_tvf():
-    db = infino.connect("memory://")
-    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
-    t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
-
-    # "qui" expands to "quick" → the fox row only.
-    hits = t.bm25_search_prefix("title", "qui", 10)
-    assert hits.num_rows == 1
-    assert "_id" in hits.column_names and "score" in hits.column_names
-
-    # Projection materializes the named scalar column.
-    projected = t.bm25_search_prefix("title", "qui", 10, projection=["_id", "title", "score"])
-    assert projected.column_names == ["_id", "title", "score"]
-
-    # Direct call and the SQL table function agree on the `_id` set.
-    via_sql = db.query_sql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)")
-    assert set(hits["_id"].to_pylist()) == set(via_sql["_id"].to_pylist())
-
-    # An unmatched prefix returns no rows.
-    assert t.bm25_search_prefix("title", "zzz", 10).num_rows == 0
-
-
 def test_hybrid_search_fuses_text_and_vector():
     db = infino.connect("memory://")
     dim = 16

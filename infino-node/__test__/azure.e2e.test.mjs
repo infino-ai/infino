@@ -110,18 +110,6 @@ test("vector search", { skip }, () => {
   });
 });
 
-test("bm25SearchPrefix", { skip }, () => {
-  withDb((db) => {
-    const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
-    docs.append([{ title: "the quick brown fox" }, { title: "a lazy dog" }]);
-
-    // "qui" expands to "quick" → the fox row; direct call and SQL TVF agree.
-    assert.equal(docs.bm25SearchPrefix("title", "qui", 10).length, 1);
-    const tvf = db.querySql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)");
-    assert.equal(tvf.length, 1);
-  });
-});
-
 test("hybridSearch", { skip }, () => {
   withDb((db) => {
     const docs = db.createTable(

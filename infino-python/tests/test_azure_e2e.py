@@ -133,16 +133,6 @@ def test_vector_search(db: infino.Connection) -> None:
     assert "_id" in hits.column_names and "score" in hits.column_names
 
 
-def test_bm25_search_prefix(db: infino.Connection) -> None:
-    table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
-    table.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
-
-    # "qui" expands to "quick" → the fox row; direct call and SQL TVF agree.
-    assert table.bm25_search_prefix("title", "qui", 10).num_rows == 1
-    tvf = db.query_sql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)")
-    assert tvf.num_rows == 1
-
-
 def test_hybrid_search(db: infino.Connection) -> None:
     schema = pa.schema([
         pa.field("title", pa.large_utf8(), nullable=False),
