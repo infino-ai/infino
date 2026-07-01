@@ -103,7 +103,7 @@ The public surface is a small connection-and-table API:
   passed via `ConnectOptions::with_storage_option` (object_store's `aws_*` /
   `azure_*` keys), never read from the environment.
 - `Connection` — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`,
-  `rotate_credentials` (swap a rotated static key into a live connection, no reconnect).
+  `update_storage_options` (merge new storage options into a live connection, no reconnect).
 - `Supertable` (the table handle) — `append`, `update`, `delete`, `schema`, and the
   search methods `bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
   and `exact_match` (each returns Arrow rows as `Vec<RecordBatch>`).

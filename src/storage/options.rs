@@ -41,8 +41,8 @@ where
     Ok(builder)
 }
 
-/// Options minus the credential keys (per `is_cred`), so a rotating provider's
-/// credentials aren't shadowed by a static key in `with_config`.
+/// Options minus the credential keys (per `is_cred`), so the credential
+/// provider isn't shadowed by a static key in `with_config`.
 pub(crate) fn non_credential_options(
     opts: &StorageOptions,
     is_cred: impl Fn(&str) -> bool,
