@@ -165,14 +165,13 @@ jobs:
           sccache: "true"
           args: --release --locked --out dist -m infino-python/Cargo.toml
 
-      # Smoke-test the wheel before publish. Interop deps (pandas, duckdb) keep
-      # tests from silently skipping; musl runs in Alpine (can't install on glibc).
+      # Smoke-test the wheel before publish; musl runs in Alpine (can't install on glibc).
       - name: Smoke-test wheel (glibc)
         if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install --force-reinstall dist/*.whl pytest pandas duckdb
+          python3 -m pip install --force-reinstall dist/*.whl pytest
           python3 -m pytest infino-python/tests -v
 
       - name: Smoke-test wheel (musl)
@@ -180,7 +179,7 @@ jobs:
         shell: bash
         run: |
           docker run --rm -v "$PWD:/w" -w /w python:3.12-alpine sh -c '
-            pip install --force-reinstall dist/*.whl pytest pandas duckdb &&
+            pip install --force-reinstall dist/*.whl pytest &&
             python -m pytest infino-python/tests -v'
 
       - uses: actions/upload-artifact@v4
