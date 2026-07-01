@@ -82,6 +82,28 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
     target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
 }
 
+/// K-means training sample for a **per-partition sub-build** (the drain's
+/// per-cell IVF build): purely *points per centroid* (`mult × n_cent`), floored
+/// at one `mult` for tiny `n_cent` and sharing the upper cap; the caller bounds
+/// it by the row count (`.min(n_docs)`).
+///
+/// Unlike [`default_kmeans_sample_size`] there is no absolute representativeness
+/// floor — that floor suits the global build over the whole corpus, whereas a
+/// per-cell sub-build trains a few sub-centroids over one cell, so the sample
+/// need only scale with the sub-cluster count. `mult` is overridable via
+/// `INFINO_KMEANS_PTS_PER_CENTROID`.
+pub fn partition_kmeans_sample_size(n_cent: usize) -> usize {
+    static PTS_PER_CENTROID: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let mult = *PTS_PER_CENTROID.get_or_init(|| {
+        std::env::var("INFINO_KMEANS_PTS_PER_CENTROID")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(KMEANS_SAMPLE_NCENT_MULT)
+    });
+    mult.saturating_mul(n_cent).clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
+}
+
 /// Online reservoir for f32 vector samples.
 ///
 /// One instance per logical vector index in `VectorBuilder`. Holds at

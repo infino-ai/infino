@@ -41,7 +41,7 @@ use crate::superfile::{
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
         rerank_codec::RerankCodec,
-        reservoir::{Reservoir, default_kmeans_sample_size},
+        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
         rotation::RandomRotation,
         spill::{ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter},
         sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max},
@@ -846,7 +846,7 @@ fn build_subsection_from_materialized(
         // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
         // on large cells. Only the sampled rows are decoded to fp32, so there is no
         // full-corpus fp32 buffer.
-        let sample_size = default_kmeans_sample_size(n_cent).min(n_docs);
+        let sample_size = partition_kmeans_sample_size(n_cent).min(n_docs);
         let mut sample = vec![0f32; sample_size * dim];
         for s in 0..sample_size {
             let idx = if sample_size == n_docs {
