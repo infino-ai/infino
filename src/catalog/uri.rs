@@ -21,6 +21,8 @@ pub(crate) enum Backend {
     S3 { bucket: String, prefix: String },
     /// Azure blob container with a logical key prefix.
     Azure { container: String, prefix: String },
+    /// GCS bucket with a logical key prefix.
+    Gcs { bucket: String, prefix: String },
     /// In-process, non-persistent catalog (`memory://`).
     Memory,
 }
@@ -41,6 +43,10 @@ impl Backend {
                 container: container.clone(),
                 prefix: join_prefix(prefix, segment),
             },
+            Backend::Gcs { bucket, prefix } => Backend::Gcs {
+                bucket: bucket.clone(),
+                prefix: join_prefix(prefix, segment),
+            },
             Backend::Memory => Backend::Memory,
         }
     }
@@ -59,8 +65,9 @@ fn join_prefix(prefix: &str, segment: &str) -> String {
 
 /// Parse a catalog URI into its backend. Recognized schemes:
 /// `memory://` (in-process), `s3://bucket/prefix`,
-/// `az://container/prefix` (also `azure://`), `file://path`, and a bare
-/// path (`./data`, `/abs/path`) → local filesystem.
+/// `az://container/prefix` (also `azure://`), `gs://bucket/prefix`
+/// (also `gcs://`), `file://path`, and a bare path
+/// (`./data`, `/abs/path`) → local filesystem.
 pub(crate) fn parse_uri(uri: &str) -> Result<Backend, InfinoError> {
     if uri == "memory://" || uri == "memory:" || uri == "memory" {
         return Ok(Backend::Memory);
@@ -85,6 +92,18 @@ pub(crate) fn parse_uri(uri: &str) -> Result<Backend, InfinoError> {
             )));
         }
         return Ok(Backend::Azure { container, prefix });
+    }
+    if let Some(rest) = uri
+        .strip_prefix("gs://")
+        .or_else(|| uri.strip_prefix("gcs://"))
+    {
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        if bucket.is_empty() {
+            return Err(InfinoError::Backend(format!(
+                "gcs URI missing bucket: {uri}"
+            )));
+        }
+        return Ok(Backend::Gcs { bucket, prefix });
     }
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(Backend::LocalFs {
@@ -152,5 +171,37 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme() {
         assert!(parse_uri("gdrive://bucket/x").is_err());
+    }
+
+    #[test]
+    fn parses_gcs_bucket_and_prefix() {
+        match parse_uri("gs://my-bucket/some/prefix").expect("parse") {
+            Backend::Gcs { bucket, prefix } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix, "some/prefix");
+            }
+            other => panic!("expected Gcs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_gcs_alias_scheme() {
+        assert!(matches!(
+            parse_uri("gcs://b/p").expect("parse"),
+            Backend::Gcs { .. }
+        ));
+    }
+
+    #[test]
+    fn gcs_join_appends_table_segment() {
+        match parse_uri("gs://b/root").expect("parse").join("users") {
+            Backend::Gcs { prefix, .. } => assert_eq!(prefix, "root/users"),
+            other => panic!("expected Gcs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_gcs_uri_without_bucket() {
+        assert!(parse_uri("gs://").is_err());
     }
 }
