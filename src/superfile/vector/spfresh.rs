@@ -640,12 +640,13 @@ fn fine_centroid_count_for_target(n_rows: usize, dim: usize, target_bytes: usize
     n_rows.div_ceil(per_run).clamp(1, n_rows)
 }
 
-/// Train fine centroids over one coarse cell's `rows` and set each row's
-/// `cluster` to its fine-centroid id (`0..k_fine`). Hard assignment (eps=0) —
-/// boundary replication over the global fine set is layered on separately by the
-/// drain via [`assign_replicas`]. Fine centroids are trained per coarse cell, so
-/// ids are cell-local; the manifest keys runs by the owning coarse cell.
-pub(crate) fn assign_fine_clusters(rows: &mut [MaterializedIvfRow], dim: usize) {
+/// Train fine centroids over one coarse cell's `rows`, set each row's `cluster`
+/// to its (within-cell) fine-centroid id (`0..k_fine`), and return the trained
+/// fine centroids (`k_fine * dim` fp32). This is the eps=0 base assignment; the
+/// drain layers boundary replication on top via [`assign_replicas`] over the
+/// union of all cells' returned centroids. Fine centroids are trained per coarse
+/// cell (ids cell-local); the manifest keys runs by the owning coarse cell.
+pub(crate) fn assign_fine_clusters(rows: &mut [MaterializedIvfRow], dim: usize) -> Vec<f32> {
     assign_fine_clusters_for_target(rows, dim, TARGET_RUN_BYTES)
 }
 
@@ -653,29 +654,50 @@ fn assign_fine_clusters_for_target(
     rows: &mut [MaterializedIvfRow],
     dim: usize,
     target_bytes: usize,
-) {
-    let k_fine = fine_centroid_count_for_target(rows.len(), dim, target_bytes);
-    if k_fine <= 1 {
-        for row in rows.iter_mut() {
-            row.cluster = 0;
-        }
-        return;
+) -> Vec<f32> {
+    if rows.is_empty() {
+        return Vec::new();
     }
+    let k_fine = fine_centroid_count_for_target(rows.len(), dim, target_bytes);
     let mut fp32 = vec![0f32; rows.len() * dim];
     for (i, row) in rows.iter().enumerate() {
-        dequantize_sq8_residual_into(
-            &row.encoded.scale,
-            &row.encoded.offset,
-            &row.encoded.codes,
-            &row.encoded.residuals,
-            &mut fp32[i * dim..(i + 1) * dim],
-        );
+        dequantize_row_into(row, dim, &mut fp32[i * dim..(i + 1) * dim]);
     }
-    let (_, assignments) =
+    // k_fine == 1 yields the cell mean and all-zero assignments — the single-run
+    // case, identical to the previous hard "everything to cluster 0" behavior.
+    let (centroids, assignments) =
         kmeans_with_assignments(&fp32, dim, k_fine, FINE_KMEANS_ITERS, FINE_KMEANS_SEED);
     for (row, cluster) in rows.iter_mut().zip(assignments) {
         row.cluster = cluster;
     }
+    centroids
+}
+
+/// Dequantize one materialized row's Sq8+eps payload to fp32 `out` (`dim`).
+fn dequantize_row_into(row: &MaterializedIvfRow, _dim: usize, out: &mut [f32]) {
+    dequantize_sq8_residual_into(
+        &row.encoded.scale,
+        &row.encoded.offset,
+        &row.encoded.codes,
+        &row.encoded.residuals,
+        out,
+    );
+}
+
+/// Replica fine-centroid ids for one row over a flat global fine-centroid set
+/// (`global_centroids` = `n * dim` fp32), via [`assign_replicas`] on the
+/// dequantized row. Returns indices into that global set. The drain maps each
+/// index back to an owning coarse cell + cell-local fine id.
+pub(crate) fn fine_replicas_for_row(
+    metric: Metric,
+    dim: usize,
+    global_centroids: &[f32],
+    row: &MaterializedIvfRow,
+    eps: f32,
+) -> Vec<u32> {
+    let mut fp32 = vec![0f32; dim];
+    dequantize_row_into(row, dim, &mut fp32);
+    assign_replicas(metric, &fp32, dim, global_centroids, eps)
 }
 
 fn encode_materialized_run(

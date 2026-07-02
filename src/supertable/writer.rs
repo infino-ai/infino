@@ -123,7 +123,10 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
-            spfresh::{HiddenIndexLayout, assign_fine_clusters, hidden_index_layout},
+            spfresh::{
+                HiddenIndexLayout, assign_fine_clusters, fine_replicas_for_row,
+                hidden_index_layout, replication_eps,
+            },
         },
     },
     supertable::{
@@ -2531,17 +2534,29 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
             crate::superfile::vector::builder::build_phase_timers::reset();
             let vec_dim = running_clusters.dim as usize;
+            // SPFresh: partition each coarse cell's rows into ~2 MB fine-centroid
+            // runs, then (eps>0) replicate each row into additional fine centroids
+            // across the global fine set so boundary rows sit in every cell a
+            // query might route to. IVF keeps one run per cell (untouched).
+            if hidden_vector_layout == VectorLayout::Spfresh {
+                let mut entries: Vec<(u32, Vec<MaterializedIvfRow>)> = by_cell.drain().collect();
+                let centroids: Vec<Vec<f32>> = hidden_inner.options.writer_pool.install(|| {
+                    entries
+                        .par_iter_mut()
+                        .map(|(_, rows)| assign_fine_clusters(rows, vec_dim))
+                        .collect()
+                });
+                let entries =
+                    apply_fine_replication(entries, &centroids, vec_dim, metric, replication_eps());
+                by_cell = entries.into_iter().collect();
+            }
             let shards: Vec<(u32, ShardOutput, u32)> =
                 hidden_inner.options.writer_pool.install(|| {
                     by_cell
                         .into_par_iter()
                         .filter(|(_, rows)| !rows.is_empty())
                         .map(|(cell_id, mut rows)| {
-                            // SPFresh: partition this coarse cell's rows into
-                            // ~2 MB fine-centroid runs (the run key becomes the
-                            // fine cluster id). IVF keeps one run per cell.
                             if hidden_vector_layout == VectorLayout::Spfresh {
-                                assign_fine_clusters(&mut rows, vec_dim);
                                 rows.sort_by_key(|r| (r.cluster, r.stable_id));
                             } else {
                                 rows.sort_by_key(|r| r.stable_id);
@@ -2832,6 +2847,75 @@ fn build_one_shard_from_merged(
         id_max,
         scalar_stats,
     })
+}
+
+/// Global SPFresh boundary replication over the per-coarse-cell fine centroids.
+///
+/// `entries` is `(coarse_cell, rows)` with each row's `cluster` already set to
+/// its within-cell fine id (the eps=0 base assignment). `centroids[i]` holds
+/// cell `entries[i]`'s fine centroids (`k_fine * dim` fp32). When `eps > 0`, each
+/// row is additionally placed into every fine centroid within the `(1+eps)`
+/// closure over the *global* fine set (RNG-pruned by [`assign_replicas`]),
+/// including centroids owned by other coarse cells — so a boundary row lands in
+/// each cell a query might route to. Base placements are left untouched; only
+/// cross-placement replicas are added (deduped at query time by `stable_id`).
+///
+/// `eps <= 0` returns `entries` unchanged (hard assignment, no replication).
+fn apply_fine_replication(
+    mut entries: Vec<(u32, Vec<MaterializedIvfRow>)>,
+    centroids: &[Vec<f32>],
+    dim: usize,
+    metric: Metric,
+    eps: f32,
+) -> Vec<(u32, Vec<MaterializedIvfRow>)> {
+    if eps <= 0.0 {
+        return entries;
+    }
+    // Flatten every cell's fine centroids into one global set, remembering which
+    // coarse cell + cell-local fine id each global index maps back to.
+    let mut global_centroids: Vec<f32> = Vec::new();
+    let mut global_map: Vec<(u32, u32)> = Vec::new();
+    for ((cell, _), cents) in entries.iter().zip(centroids.iter()) {
+        let k = if dim == 0 { 0 } else { cents.len() / dim };
+        for fine in 0..k {
+            global_centroids.extend_from_slice(&cents[fine * dim..(fine + 1) * dim]);
+            global_map.push((*cell, fine as u32));
+        }
+    }
+    if global_map.is_empty() {
+        return entries;
+    }
+    // For each row, add a clone into every replica fine centroid that is not its
+    // own base placement.
+    let mut additions: Vec<(u32, MaterializedIvfRow)> = Vec::new();
+    for (cell, rows) in entries.iter() {
+        for row in rows.iter() {
+            for gi in fine_replicas_for_row(metric, dim, &global_centroids, row, eps) {
+                let (replica_cell, replica_fine) = global_map[gi as usize];
+                if replica_cell == *cell && replica_fine == row.cluster {
+                    continue;
+                }
+                let mut clone = row.clone();
+                clone.cluster = replica_fine;
+                additions.push((replica_cell, clone));
+            }
+        }
+    }
+    let mut cell_pos: HashMap<u32, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (cell, _))| (*cell, i))
+        .collect();
+    for (replica_cell, row) in additions {
+        match cell_pos.get(&replica_cell) {
+            Some(&i) => entries[i].1.push(row),
+            None => {
+                cell_pos.insert(replica_cell, entries.len());
+                entries.push((replica_cell, vec![row]));
+            }
+        }
+    }
+    entries
 }
 
 /// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
@@ -4011,6 +4095,62 @@ mod tests {
         remap_materialized_stable_ids(&mut rows, &[10, 20]).expect("remap");
         assert_eq!(rows[0].stable_id, 20);
         assert_eq!(rows[0].encoded.stable_id, 20);
+    }
+
+    fn replication_row(stable_id: i128, code0: u8) -> MaterializedIvfRow {
+        const DIM: usize = 2;
+        MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster: 0,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::from(vec![1.0f32; DIM]),
+                offset: Arc::from(vec![0.0f32; DIM]),
+                codes: vec![code0, 0],
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        }
+    }
+
+    #[test]
+    fn apply_fine_replication_replicates_boundary_row_across_cells() {
+        // Cell 0 centroid (0,0), cell 1 centroid (10,0). The cell-0 row sits at
+        // (5,0) — equidistant to both — so eps>0 replicates it into cell 1. The
+        // cell-1 row at (10,0) is interior and must not replicate.
+        let entries = vec![
+            (0u32, vec![replication_row(100, 5)]),
+            (1u32, vec![replication_row(200, 10)]),
+        ];
+        let centroids = vec![vec![0.0f32, 0.0], vec![10.0f32, 0.0]];
+        let out = apply_fine_replication(entries, &centroids, 2, Metric::L2Sq, 0.1);
+
+        let cell0 = &out.iter().find(|(c, _)| *c == 0).expect("cell 0").1;
+        let cell1 = &out.iter().find(|(c, _)| *c == 1).expect("cell 1").1;
+        assert!(cell0.iter().any(|r| r.stable_id == 100));
+        assert!(
+            cell1.iter().any(|r| r.stable_id == 100),
+            "boundary row must replicate into the adjacent cell"
+        );
+        assert!(
+            !cell0.iter().any(|r| r.stable_id == 200),
+            "interior row must not replicate"
+        );
+        assert_eq!(cell1.len(), 2);
+    }
+
+    #[test]
+    fn apply_fine_replication_eps_zero_is_noop() {
+        let entries = vec![
+            (0u32, vec![replication_row(100, 5)]),
+            (1u32, vec![replication_row(200, 10)]),
+        ];
+        let centroids = vec![vec![0.0f32, 0.0], vec![10.0f32, 0.0]];
+        let out = apply_fine_replication(entries, &centroids, 2, Metric::L2Sq, 0.0);
+        let total: usize = out.iter().map(|(_, rows)| rows.len()).sum();
+        assert_eq!(total, 2, "eps=0 must not add replicas");
     }
 
     #[test]
