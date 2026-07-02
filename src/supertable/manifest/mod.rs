@@ -75,7 +75,6 @@ use crate::{
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
-            partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
     },
@@ -86,6 +85,13 @@ use crate::{
 /// keeps commit latency low while compressing the Avro-encoded
 /// manifest well. (Valid range is 1..=22.)
 pub const MANIFEST_ZSTD_LEVEL: i32 = 3;
+
+/// Part-grouping key for the single table-level part lineage. Manifest parts
+/// are size-bucketed (at `target_superfiles_per_part`), not sharded by
+/// partition: the partition tag lives on each `SuperfileEntry` for routing and
+/// zone-map pruning, so it no longer dictates part boundaries. Empty = the
+/// "flat / no partition" key the part pruner already understands.
+const TABLE_LEVEL_PART_KEY: &[u8] = &[];
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -723,13 +729,16 @@ impl ManifestSnapshot {
         let opts = self.get_opts();
         let strategy = self.get_partition_strategy();
 
-        // 2. Group new entries by partition_key (the on-disk
-        //    encoding the list + parts carry).
+        // 2. Group all entries into ONE table-level part lineage
+        //    (keyed by TABLE_LEVEL_PART_KEY), size-bucketed at
+        //    target_superfiles_per_part. The partition tag stays on each
+        //    SuperfileEntry (routing + zone-map input); it no longer
+        //    dictates part boundaries, so a query prunes parts by their
+        //    aggregates and filters the surviving entries by tag in memory.
         let mut new_by_partition: BTreeMap<Vec<u8>, Vec<Arc<SuperfileEntry>>> = BTreeMap::new();
         for entry in new_entries {
-            let pk = assign_partition(entry, &strategy)?;
             new_by_partition
-                .entry(encode_partition_key(&pk))
+                .entry(TABLE_LEVEL_PART_KEY.to_vec())
                 .or_default()
                 .push(Arc::clone(entry));
         }
@@ -737,9 +746,8 @@ impl ManifestSnapshot {
         let mut removals_by_partition: BTreeMap<Vec<u8>, Vec<Arc<SuperfileEntry>>> =
             BTreeMap::new();
         for entry in entries_to_remove {
-            let pk = assign_partition(entry, &strategy)?;
             removals_by_partition
-                .entry(encode_partition_key(&pk))
+                .entry(TABLE_LEVEL_PART_KEY.to_vec())
                 .or_default()
                 .push(Arc::clone(entry));
         }
@@ -750,10 +758,15 @@ impl ManifestSnapshot {
         //    most recent entry per partition is a candidate for
         //    rewrite; older entries for the same partition (from
         //    a prior part-split) carry over unchanged.
+        // Every existing part belongs to the single table-level lineage now
+        // (ignore each part's stored partition_key), so "latest" is simply the
+        // last part in list order; new entries append to it, earlier parts
+        // carry over. This also absorbs any pre-existing per-partition parts
+        // into the one lineage over subsequent commits.
         let mut latest_index_for_partition: HashMap<Vec<u8>, usize> = HashMap::new();
         let list_entries = self.get_all_list_entries();
-        for (i, entry) in list_entries.iter().enumerate() {
-            latest_index_for_partition.insert(entry.partition_key.clone(), i);
+        for (i, _entry) in list_entries.iter().enumerate() {
+            latest_index_for_partition.insert(TABLE_LEVEL_PART_KEY.to_vec(), i);
         }
         // The output list entries — built incrementally as we
         // walk existing entries + emit new ones for cold
@@ -766,14 +779,14 @@ impl ManifestSnapshot {
 
         for (i, entry) in list_entries.iter().enumerate() {
             let is_latest_for_partition = latest_index_for_partition
-                .get(&entry.partition_key)
+                .get(TABLE_LEVEL_PART_KEY)
                 .copied()
                 == Some(i);
-            let touched = new_by_partition.contains_key(&entry.partition_key);
+            let touched = new_by_partition.contains_key(TABLE_LEVEL_PART_KEY);
 
             if is_latest_for_partition && touched {
                 let new_for_pk = new_by_partition
-                    .remove(&entry.partition_key)
+                    .remove(TABLE_LEVEL_PART_KEY)
                     .expect("touched implies present");
 
                 let combined_n = entry.n_superfiles as usize + new_for_pk.len();
@@ -785,7 +798,7 @@ impl ManifestSnapshot {
                         opts.clone(),
                         vec![],
                         new_for_pk,
-                        entry.partition_key.clone(),
+                        TABLE_LEVEL_PART_KEY.to_vec(),
                         None,
                     );
                     out_list_entries.push(fresh_entry);
@@ -799,7 +812,7 @@ impl ManifestSnapshot {
                         opts.clone(),
                         existing_part.superfiles.clone(),
                         new_for_pk,
-                        entry.partition_key.clone(),
+                        TABLE_LEVEL_PART_KEY.to_vec(),
                         Some(entry),
                     );
                     out_list_entries.push(rebuilt_entry);
@@ -808,7 +821,7 @@ impl ManifestSnapshot {
                         encoded: rebuilt_encoded,
                     });
                 }
-                handled_partitions.insert(entry.partition_key.clone());
+                handled_partitions.insert(TABLE_LEVEL_PART_KEY.to_vec());
             } else {
                 // Carry over: either an older entry for a
                 // touched partition (handled when we hit the
@@ -840,9 +853,10 @@ impl ManifestSnapshot {
 
         let mut out_list_entries_after_removal = Vec::new();
         for entry in out_list_entries {
-            let Some(removals) = removals_by_partition.get(&entry.partition_key) else {
-                // If this entry belongs to a partition which has no removals, we can keep it as-is.
-                // This will also not need any change to parts_to_write.
+            let Some(removals) = removals_by_partition.get(TABLE_LEVEL_PART_KEY) else {
+                // No removals this commit — keep every part as-is (no change to
+                // parts_to_write). Parts with no matching id are left untouched
+                // below (the filtered length equals the original).
                 out_list_entries_after_removal.push(entry);
                 continue;
             };
@@ -882,7 +896,7 @@ impl ManifestSnapshot {
                 opts.clone(),
                 vec![],
                 final_superfile_entries,
-                entry.partition_key,
+                TABLE_LEVEL_PART_KEY.to_vec(),
                 None,
             );
 
@@ -2758,7 +2772,8 @@ mod tests {
 
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].partition_key, pk);
+        // A freshly created part is keyed by the empty table-level part key.
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 1);
         assert_eq!(parts[0].part.superfiles.len(), 1);
         assert_eq!(parts[0].part.superfiles[0].n_docs, 100);
@@ -2766,7 +2781,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_fresh_start_multiple_cold_partitions_should_create_entries() {
-        // With Hash strategy (n_buckets=1), all entries map to the same partition.
+        // Multiple new entries in a single commit all land in one table-level
+        // part (well under the default target), keyed by the empty part key.
         let opts = make_opts();
         let old_manifest = empty_manifest(&opts);
         let pk = hash_bucket_0_pk();
@@ -2783,7 +2799,7 @@ mod tests {
 
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].partition_key, pk);
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 2);
         assert_eq!(parts[0].part.superfiles.len(), 2);
         let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
@@ -2799,7 +2815,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_add_to_existing_partition_rewrites_part() {
-        // Adding a new entry to an existing single-part partition rewrites that part.
+        // Adding a new entry to the single existing part rewrites it in place.
         let opts = make_opts();
         let pk_untouched = hash_bucket_0_pk();
 
@@ -2874,8 +2890,8 @@ mod tests {
         // Should have 1 new part (the rewritten one)
         assert_eq!(parts.len(), 1);
 
-        // Entry should be for the same partition
-        assert_eq!(list_entries[0].partition_key, pk_untouched);
+        // A rewritten part is keyed by the empty table-level part key.
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 2);
 
         // Part should have combined superfiles
@@ -2886,17 +2902,14 @@ mod tests {
 
     #[tokio::test]
     async fn update_leaves_unchanged_parts_untouched() {
-        // Start with three parts, two superfiles each:
-        //   - part_a_old, part_a_latest  → partition A (pk_a)
-        //   - part_b                     → partition B (pk_b)
-        // The latest part for A has room for one more superfile
-        // (target = 3, so 2 + 1 = 3 stays within target → rewrite, no
-        // split). We then commit a single new superfile into partition
-        // A. After update ONLY the latest A part should change; the
-        // frozen older A part and the entire B partition must carry
-        // over byte-for-byte — same part_id, uri, and content_hash —
-        // and must NOT be re-emitted into `parts_to_write` (no
-        // re-encode, no PUT).
+        // Start with three parts, two superfiles each, forming one table-level
+        // lineage in list order: [part_0, part_1, part_2]. New entries append to
+        // the LAST part (the latest), which here has room for one more superfile
+        // (target = 3, so 2 + 1 = 3 stays within target → rewrite, no split). We
+        // commit a single new superfile. After update ONLY the last part
+        // changes; the two earlier parts must carry over byte-for-byte — same
+        // part_id, uri, and content_hash — and must NOT be re-emitted into
+        // `parts_to_write` (no re-encode, no PUT).
         const SUPERFILES_PER_PART: u64 = 2;
         const TARGET_SUPERFILES_PER_PART: u64 = 3;
 
@@ -2935,7 +2948,7 @@ mod tests {
 
         let (part_a_old, pw_a_old) =
             two_superfile_part(storage.as_ref(), &pk_a, 0, [100, 110]).await;
-        let (part_a_latest, pw_a_latest) =
+        let (_part_a_latest, pw_a_latest) =
             two_superfile_part(storage.as_ref(), &pk_a, 0, [120, 130]).await;
         let (part_b, pw_b) = two_superfile_part(storage.as_ref(), &pk_b, 1, [200, 210]).await;
 
@@ -2956,9 +2969,8 @@ mod tests {
             }
         };
 
-        // List order: [A_old, A_latest, B]. A_latest is the latest
-        // entry for partition A (the rewrite candidate); A_old is the
-        // frozen older entry; B is an untouched partition.
+        // List order: [part_0, part_1, part_2]. The last part is the latest
+        // (the rewrite candidate); the two earlier parts carry over unchanged.
         let list = Manifest {
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
@@ -2979,12 +2991,12 @@ mod tests {
         };
         let loader = ManifestPartLoader::new(storage, &list);
 
-        // Only the latest A part is needed in-cache for the rewrite to
+        // Only the latest (last) part is needed in-cache for the rewrite to
         // load + combine; the loader serves the rest from storage.
         let parts_map = DashMap::new();
         parts_map.insert(
-            part_a_latest.part_id,
-            Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
+            part_b.part_id,
+            Arc::new(OnceCell::new_with(Some(Arc::new(part_b.clone())))),
         );
         let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
@@ -3002,8 +3014,8 @@ mod tests {
             loader: Some(Arc::new(loader)),
         });
 
-        // Commit one new superfile into partition A. Keep `new_entry`
-        // around — the second phase below removes it again.
+        // Commit one new superfile. Keep `new_entry` around — the second
+        // phase below removes it again.
         let new_entry = make_superfile_entry_hinted(140, pk_a.clone(), 0);
         let (new_manifest, parts_to_write) = old_manifest
             .update(from_ref(&new_entry), &[])
@@ -3011,14 +3023,14 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // Three list entries remain (A_old carried over, A_latest
-        // rewritten in place, B carried over), and only ONE part is
-        // re-emitted for writing — the rewritten latest-A part.
+        // Three list entries remain (part_0 carried over, part_1 carried over,
+        // part_2 rewritten in place), and only ONE part is re-emitted for
+        // writing — the rewritten last part.
         assert_eq!(list_entries.len(), 3, "list entry count");
         assert_eq!(
             parts_to_write.len(),
             1,
-            "only the rewritten latest-A part should be re-emitted; \
+            "only the rewritten last part should be re-emitted; \
              unchanged parts must not be re-encoded/PUT",
         );
 
@@ -3031,52 +3043,55 @@ mod tests {
                 .unwrap_or_else(|| panic!("entry for part {part_id:?} missing after update"))
         };
 
-        let a_old_after = find(pw_a_old.part_id);
-        assert_eq!(a_old_after.uri, pw_a_old.uri, "frozen older A part uri");
+        // part_0 carries over unchanged, keeping its original partition_key.
+        let part0_after = find(pw_a_old.part_id);
+        assert_eq!(part0_after.uri, pw_a_old.uri, "carried-over part_0 uri");
         assert_eq!(
-            a_old_after.content_hash, pw_a_old.content_hash,
-            "frozen older A part content_hash",
+            part0_after.content_hash, pw_a_old.content_hash,
+            "carried-over part_0 content_hash",
         );
-        assert_eq!(a_old_after.n_superfiles, SUPERFILES_PER_PART);
+        assert_eq!(part0_after.partition_key, pk_a);
+        assert_eq!(part0_after.n_superfiles, SUPERFILES_PER_PART);
 
-        let b_after = find(pw_b.part_id);
-        assert_eq!(b_after.uri, pw_b.uri, "untouched B part uri");
+        // part_1 carries over unchanged too.
+        let part1_after = find(pw_a_latest.part_id);
+        assert_eq!(part1_after.uri, pw_a_latest.uri, "carried-over part_1 uri");
         assert_eq!(
-            b_after.content_hash, pw_b.content_hash,
-            "untouched B part content_hash",
+            part1_after.content_hash, pw_a_latest.content_hash,
+            "carried-over part_1 content_hash",
         );
-        assert_eq!(b_after.n_superfiles, SUPERFILES_PER_PART);
+        assert_eq!(part1_after.n_superfiles, SUPERFILES_PER_PART);
 
-        // The one re-emitted part is the rewritten latest-A part: it now
-        // holds the original two superfiles plus the new one.
+        // The one re-emitted part is the rewritten last part: it now holds the
+        // original two superfiles plus the new one, keyed by the empty
+        // table-level part key.
         assert_eq!(
             parts_to_write[0].part.superfiles.len(),
             (SUPERFILES_PER_PART + 1) as usize,
-            "rewritten latest-A part should hold its 2 superfiles + the new one",
+            "rewritten last part should hold its 2 superfiles + the new one",
         );
-        // And the original latest-A part_id is gone from the list (it was
+        // And the original last part_id is gone from the list (it was
         // rewritten, not carried over).
         assert!(
-            !list_entries
-                .iter()
-                .any(|e| e.part_id == pw_a_latest.part_id),
-            "the rewritten latest-A part is replaced, so its old part_id must not survive",
+            !list_entries.iter().any(|e| e.part_id == pw_b.part_id),
+            "the rewritten last part is replaced, so its old part_id must not survive",
         );
+        // The rewritten (last) entry is keyed by the empty table-level part key.
+        let rewritten_after = list_entries
+            .iter()
+            .find(|e| e.partition_key == TABLE_LEVEL_PART_KEY)
+            .expect("rewritten last entry present after the add");
+        assert_eq!(rewritten_after.n_superfiles, SUPERFILES_PER_PART + 1);
 
         // ---- Second phase: remove the superfile we just added --------
         //
-        // The new superfile lives in the rewritten latest-A part. Remove
-        // it. Only that part should change. The frozen older A part
-        // (`A_old`) never held the removed superfile, and partition B is
-        // untouched entirely — both must carry over byte-for-byte.
+        // The new superfile lives in the rewritten last part. Remove it. Only
+        // that part should change. The two earlier parts never held the removed
+        // superfile — both must carry over byte-for-byte.
         //
-        // Capture the rewritten latest-A part's identity (the part the
-        // removal will legitimately rebuild).
-        let latest_a_v1_part_id = list_entries
-            .iter()
-            .find(|e| e.partition_key == pk_a && e.part_id != pw_a_old.part_id)
-            .expect("rewritten latest-A entry present after the add")
-            .part_id;
+        // Capture the rewritten last part's identity (the part the removal will
+        // legitimately rebuild).
+        let rewritten_v1_part_id = rewritten_after.part_id;
 
         let (after_removal, removal_parts) = new_manifest
             .update(&[], from_ref(&new_entry))
@@ -3086,51 +3101,40 @@ mod tests {
 
         assert_eq!(entries_after.len(), 3, "list entry count after removal");
 
-        // The part we removed from MUST change: its v1 part_id is gone,
-        // and it now holds two superfiles again.
+        // The part we removed from MUST change: its v1 part_id is gone.
         assert!(
             !entries_after
                 .iter()
-                .any(|e| e.part_id == latest_a_v1_part_id),
+                .any(|e| e.part_id == rewritten_v1_part_id),
             "the part we removed a superfile from must be rebuilt (new part_id)",
         );
 
-        // Partition B is untouched by the removal — same part identity.
-        let b_after_removal = entries_after
-            .iter()
-            .find(|e| e.part_id == pw_b.part_id)
-            .expect("untouched B part must survive the removal unchanged");
-        assert_eq!(b_after_removal.uri, pw_b.uri, "B uri after removal");
-        assert_eq!(
-            b_after_removal.content_hash, pw_b.content_hash,
-            "B content_hash after removal",
-        );
-
-        // The frozen older A part did NOT contain the removed superfile,
-        // so it too must stay byte-for-byte identical. (Hunch: the
-        // removal path rebuilds EVERY entry in the affected partition —
-        // not just the part that held the removed superfile — so `A_old`
-        // is churned and this assertion currently fails.)
-        assert!(
-            entries_after.iter().any(|e| e.part_id == pw_a_old.part_id),
-            "frozen older A part holds none of the removed superfile and must stay \
-             unchanged, but the removal rebuilt it under a new part_id; entries now: {:?}",
-            entries_after
-                .iter()
-                .map(|e| (e.part_id, e.partition_key.clone(), e.n_superfiles))
-                .collect::<Vec<_>>(),
-        );
-        let a_old_after_removal = entries_after
+        // part_0 held none of the removed superfile — same part identity.
+        let part0_after_removal = entries_after
             .iter()
             .find(|e| e.part_id == pw_a_old.part_id)
-            .expect("frozen older A part must survive the removal unchanged");
+            .expect("part_0 must survive the removal unchanged");
         assert_eq!(
-            a_old_after_removal.uri, pw_a_old.uri,
-            "frozen older A part uri after removal",
+            part0_after_removal.uri, pw_a_old.uri,
+            "part_0 uri after removal",
         );
         assert_eq!(
-            a_old_after_removal.content_hash, pw_a_old.content_hash,
-            "frozen older A part content_hash after removal",
+            part0_after_removal.content_hash, pw_a_old.content_hash,
+            "part_0 content_hash after removal",
+        );
+
+        // part_1 held none of the removed superfile — same part identity.
+        let part1_after_removal = entries_after
+            .iter()
+            .find(|e| e.part_id == pw_a_latest.part_id)
+            .expect("part_1 must survive the removal unchanged");
+        assert_eq!(
+            part1_after_removal.uri, pw_a_latest.uri,
+            "part_1 uri after removal",
+        );
+        assert_eq!(
+            part1_after_removal.content_hash, pw_a_latest.content_hash,
+            "part_1 content_hash after removal",
         );
 
         // Only the part that actually lost a superfile should be
@@ -3223,8 +3227,8 @@ mod tests {
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
 
-        // Entry should be for same partition
-        assert_eq!(list_entries[0].partition_key, pk);
+        // A rewritten part is keyed by the empty table-level part key.
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 3);
 
         // Part should have all 3 superfiles combined
@@ -3316,9 +3320,11 @@ mod tests {
         assert_eq!(list_entries.len(), 2);
         assert_eq!(parts.len(), 1);
 
-        // Both entries should be for same partition
+        // First entry is the carried-over existing part (keeps its original
+        // partition_key); the fresh split part is keyed by the empty
+        // table-level part key.
         assert_eq!(list_entries[0].partition_key, pk);
-        assert_eq!(list_entries[1].partition_key, pk);
+        assert_eq!(list_entries[1].partition_key, TABLE_LEVEL_PART_KEY);
 
         // First entry (old) should still have original superfiles
         assert_eq!(list_entries[0].n_superfiles, 2);
@@ -3459,9 +3465,10 @@ mod tests {
         assert_eq!(list_entries.len(), 2);
         assert_eq!(parts.len(), 1);
 
-        // Both should be for same partition
+        // The carried-over older part keeps its original partition_key; the
+        // rewritten latest part is keyed by the empty table-level part key.
         assert_eq!(list_entries[0].partition_key, pk);
-        assert_eq!(list_entries[1].partition_key, pk);
+        assert_eq!(list_entries[1].partition_key, TABLE_LEVEL_PART_KEY);
 
         // First entry should carry over the old one unchanged
         assert_eq!(list_entries[0].n_superfiles, 1);
@@ -3481,8 +3488,11 @@ mod tests {
 
     #[tokio::test]
     async fn update_two_partitions_both_touched() {
-        // Two distinct partitions each have one existing superfile; a new
-        // entry is added to both. Both should be rewritten independently.
+        // Two existing parts hold superfiles tagged with different partition
+        // hints. New entries carrying both hints are added in one commit. Parts
+        // are a single table-level lineage now, so the new entries all append to
+        // the LAST existing part (the latest); the earlier part carries over
+        // unchanged. Each superfile keeps its own partition_hint/partition_key.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
@@ -3585,32 +3595,44 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // Both partitions are rewritten: 2 list entries, 2 new parts
+        // Single lineage: the earlier part carries over, the latest part is
+        // rewritten with both new entries appended. 2 list entries, 1 new part.
         assert_eq!(list_entries.len(), 2);
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 1);
 
-        // Order preserved: partition A first, then B
+        // [0] The earlier part carries over unchanged — original part_id and
+        // partition_key preserved, still its single original superfile.
+        assert_eq!(list_entries[0].part_id, pw_a.part_id);
         assert_eq!(list_entries[0].partition_key, pk_a);
-        assert_eq!(list_entries[1].partition_key, pk_b);
+        assert_eq!(list_entries[0].n_superfiles, 1);
+        assert_eq!(list_entries[0].content_hash, pw_a.content_hash);
 
-        // Partition A: 1 existing + 1 new = 2 superfiles, 150 docs
-        assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].part.superfiles.len(), 2);
-        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
-        assert_eq!(docs_a, 150);
+        // [1] The latest part is rewritten: its 1 existing superfile + both new
+        // ones = 3 superfiles. It is keyed by the empty table-level part key.
+        assert_eq!(list_entries[1].partition_key, TABLE_LEVEL_PART_KEY);
+        assert_eq!(list_entries[1].n_superfiles, 3);
+        assert_eq!(parts[0].part.superfiles.len(), 3);
+        let total_docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(total_docs, 330); // 200 (existing B) + 50 + 80
 
-        // Partition B: 1 existing + 1 new = 2 superfiles, 280 docs
-        assert_eq!(list_entries[1].n_superfiles, 2);
-        assert_eq!(parts[1].part.superfiles.len(), 2);
-        let docs_b: u64 = parts[1].part.superfiles.iter().map(|s| s.n_docs).sum();
-        assert_eq!(docs_b, 280);
+        // Each new superfile kept its own partition_hint (the routing tag is
+        // independent of the part's table-level grouping key).
+        let hints: Vec<_> = parts[0]
+            .part
+            .superfiles
+            .iter()
+            .map(|s| s.partition_hint)
+            .collect();
+        assert!(hints.contains(&Some(0)), "hint-0 new entry preserved");
+        assert!(hints.contains(&Some(1)), "hint-1 new entry preserved");
     }
 
     #[tokio::test]
     async fn update_two_partitions_one_touched_exact_carry_over() {
-        // Partition A is touched (gets a new entry); partition B is not.
-        // Verifies that B's list entry carries over with the exact URI and
-        // content_hash that were written — no re-encode, no PUT.
+        // One new entry is committed. Parts are a single table-level lineage, so
+        // it appends to the LAST existing part (the latest), which is rewritten;
+        // the earlier part carries over with the exact URI and content_hash that
+        // were written — no re-encode, no PUT.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 3;
@@ -3711,30 +3733,35 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // 2 list entries (A rewritten, B carried over), 1 new part (A only)
+        // 2 list entries (earlier part carried over, latest rewritten), 1 new part
         assert_eq!(list_entries.len(), 2);
         assert_eq!(parts.len(), 1);
 
-        // Partition A: rewritten with 2 superfiles, 150 docs
+        // [0] Earlier part: exact carry-over — part_id and content_hash unchanged,
+        // original partition_key preserved.
+        assert_eq!(list_entries[0].part_id, pw_a.part_id);
         assert_eq!(list_entries[0].partition_key, pk_a);
-        assert_eq!(list_entries[0].n_superfiles, 2);
-        assert_eq!(parts[0].part.superfiles.len(), 2);
-        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
-        assert_eq!(docs_a, 150);
+        assert_eq!(list_entries[0].n_superfiles, 1);
+        assert_eq!(list_entries[0].content_hash, pw_a.content_hash);
 
-        // Partition B: exact carry-over — URI and content_hash unchanged
-        assert_eq!(list_entries[1].partition_key, pk_b);
-        assert_eq!(list_entries[1].n_superfiles, 1);
-        assert_eq!(list_entries[1].uri, pw_b.uri);
-        assert_eq!(list_entries[1].content_hash, pw_b.content_hash);
+        // [1] Latest part: rewritten with its existing superfile + the new one =
+        // 2 superfiles, 250 docs. Keyed by the empty table-level part key.
+        assert_eq!(list_entries[1].partition_key, TABLE_LEVEL_PART_KEY);
+        assert_eq!(list_entries[1].n_superfiles, 2);
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(docs, 250); // 200 (existing B) + 50 (new)
     }
 
     #[tokio::test]
     async fn update_two_partitions_each_with_prior_split() {
-        // Each partition already has two parts from a prior split: an older
-        // frozen part and a latest mutable part. Adding one new entry to each
-        // partition should rewrite only the latest part for each, carrying
-        // the older parts over unchanged.
+        // Four existing parts from prior splits, in one table-level lineage:
+        // [p0, p1, p2, p3]. Two new entries (different partition hints) are
+        // committed. They append to the LAST part (p3, the latest); p3 already
+        // holds 1 superfile so 1 + 2 = 3 exceeds the target of 2 — a split. The
+        // split keeps p3 as-is and emits a fresh part holding just the 2 new
+        // entries. p0..p2 carry over unchanged. Each superfile keeps its own
+        // partition_hint.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
@@ -3888,36 +3915,99 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // 4 list entries: [a_old, a_rewritten, b_old, b_rewritten]
-        assert_eq!(list_entries.len(), 4);
-        // 2 new parts: one rewrite per partition
-        assert_eq!(parts.len(), 2);
+        // 5 list entries: the 4 existing parts all carry over, plus 1 fresh
+        // split part holding the 2 new entries.
+        assert_eq!(list_entries.len(), 5);
+        // 1 new part: the fresh split.
+        assert_eq!(parts.len(), 1);
 
-        // [0] Partition A old: carried over exactly — URI and content_hash unchanged
+        // [0..=3] The four existing parts carry over unchanged — original
+        // part_ids and partition_keys preserved, one superfile each.
+        assert_eq!(list_entries[0].part_id, pw_a_old.part_id);
         assert_eq!(list_entries[0].partition_key, pk_a);
-        assert_eq!(list_entries[0].n_superfiles, 1);
         assert_eq!(list_entries[0].uri, pw_a_old.uri);
         assert_eq!(list_entries[0].content_hash, pw_a_old.content_hash);
 
-        // [1] Partition A latest: rewritten with 1 existing + 1 new = 2 superfiles, 225 docs
+        assert_eq!(list_entries[1].part_id, pw_a_latest.part_id);
         assert_eq!(list_entries[1].partition_key, pk_a);
-        assert_eq!(list_entries[1].n_superfiles, 2);
-        assert_eq!(parts[0].part.superfiles.len(), 2);
-        let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
-        assert_eq!(docs_a, 225); // 150 + 75
 
-        // [2] Partition B old: carried over exactly — URI and content_hash unchanged
+        assert_eq!(list_entries[2].part_id, pw_b_old.part_id);
         assert_eq!(list_entries[2].partition_key, pk_b);
-        assert_eq!(list_entries[2].n_superfiles, 1);
         assert_eq!(list_entries[2].uri, pw_b_old.uri);
         assert_eq!(list_entries[2].content_hash, pw_b_old.content_hash);
 
-        // [3] Partition B latest: rewritten with 1 existing + 1 new = 2 superfiles, 340 docs
+        assert_eq!(list_entries[3].part_id, pw_b_latest.part_id);
         assert_eq!(list_entries[3].partition_key, pk_b);
-        assert_eq!(list_entries[3].n_superfiles, 2);
-        assert_eq!(parts[1].part.superfiles.len(), 2);
-        let docs_b: u64 = parts[1].part.superfiles.iter().map(|s| s.n_docs).sum();
-        assert_eq!(docs_b, 340); // 250 + 90
+
+        for e in &list_entries[0..4] {
+            assert_eq!(e.n_superfiles, 1);
+        }
+
+        // [4] Fresh split part: the 2 new entries, keyed by the empty
+        // table-level part key. 165 docs (75 + 90).
+        assert_eq!(list_entries[4].partition_key, TABLE_LEVEL_PART_KEY);
+        assert_eq!(list_entries[4].n_superfiles, 2);
+        assert_eq!(parts[0].part.superfiles.len(), 2);
+        let docs: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
+        assert_eq!(docs, 165); // 75 (hint 0) + 90 (hint 1)
+
+        // The new superfiles kept their own partition hints.
+        let hints: Vec<_> = parts[0]
+            .part
+            .superfiles
+            .iter()
+            .map(|s| s.partition_hint)
+            .collect();
+        assert!(hints.contains(&Some(0)), "hint-0 new entry preserved");
+        assert!(hints.contains(&Some(1)), "hint-1 new entry preserved");
+    }
+
+    #[tokio::test]
+    async fn update_multiple_partitions_land_in_one_lineage() {
+        // A single commit of several new superfiles carrying DIFFERENT
+        // partition hints (well under the target) produces ONE table-level part
+        // with an empty partition_key holding ALL of them. Each superfile keeps
+        // its own partition_hint — the routing tag is independent of the part's
+        // table-level grouping key.
+        let mut base_opts =
+            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+        base_opts.target_superfiles_per_part = 8;
+        let opts = Arc::new(base_opts);
+
+        let old_manifest = empty_manifest(&opts);
+
+        let hints = [0u32, 1, 2, 3];
+        let new_entries: Vec<_> = hints
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| make_superfile_entry_hinted(100 + i as u64, hash2_pk(h), h))
+            .collect();
+
+        let (new_manifest, parts) = old_manifest
+            .update(&new_entries, &[])
+            .await
+            .expect("update");
+        let list_entries = new_manifest.get_all_list_entries();
+
+        // One part, keyed by the empty table-level part key, holding all four.
+        assert_eq!(list_entries.len(), 1);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
+        assert_eq!(list_entries[0].n_superfiles, hints.len() as u64);
+        assert_eq!(parts[0].part.superfiles.len(), hints.len());
+
+        // Every original superfile is present, and each kept its own
+        // partition_hint (and its per-entry partition_key tag).
+        for (&h, expected) in hints.iter().zip(new_entries.iter()) {
+            let landed = parts[0]
+                .part
+                .superfiles
+                .iter()
+                .find(|s| s.superfile_id == expected.superfile_id)
+                .unwrap_or_else(|| panic!("superfile with hint {h} landed in the part"));
+            assert_eq!(landed.partition_hint, Some(h), "partition_hint preserved");
+            assert_eq!(landed.partition_key, hash2_pk(h), "partition_key preserved");
+        }
     }
 
     // ---- removal tests ---------------------------------------------------
@@ -3991,10 +4081,11 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // Part rewritten with 1 superfile; no cold entries
+        // Part rewritten with 1 superfile; no cold entries. A rewritten part is
+        // keyed by the empty table-level part key.
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].partition_key, pk);
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 1);
         assert_eq!(parts[0].part.superfiles.len(), 1);
         assert_eq!(
@@ -4085,7 +4176,7 @@ mod tests {
         // Net result: 1 list entry, 1 part — sf_keep + sf_new, sf_remove absent
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].partition_key, pk);
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 2);
         assert_eq!(parts[0].part.superfiles.len(), 2);
 
@@ -4105,9 +4196,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_remove_from_one_partition_other_carried_over_exactly() {
-        // Two partitions: remove a superfile from partition A, leave partition B alone.
-        // Verifies partition B's list entry is carried over with the exact URI and
-        // content_hash — no re-encode, no PUT — while partition A is rewritten.
+        // Two parts. The removed superfile lives only in the first part. Removals
+        // are checked against every part: the first part matches and is
+        // rewritten; the second holds no matching id and carries over with the
+        // exact URI and content_hash — no re-encode, no PUT.
         let opts = make_opts();
         let pk_a = hash2_pk(0);
         let pk_b = hash2_pk(1);
@@ -4202,12 +4294,13 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // 2 list entries, 1 new part (only partition A was rewritten)
+        // 2 list entries, 1 new part (only the first part was rewritten)
         assert_eq!(list_entries.len(), 2);
         assert_eq!(parts.len(), 1);
 
-        // Partition A: rewritten with 1 surviving superfile
-        assert_eq!(list_entries[0].partition_key, pk_a);
+        // First part: rewritten with 1 surviving superfile. A rewritten part is
+        // keyed by the empty table-level part key.
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 1);
         assert_eq!(parts[0].part.superfiles.len(), 1);
         assert_eq!(
@@ -4217,7 +4310,8 @@ mod tests {
         let docs_a: u64 = parts[0].part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(docs_a, 100);
 
-        // Partition B: exact carry-over — URI and content_hash unchanged
+        // Second part: exact carry-over — original partition_key, URI and
+        // content_hash unchanged.
         assert_eq!(list_entries[1].partition_key, pk_b);
         assert_eq!(list_entries[1].n_superfiles, 1);
         assert_eq!(list_entries[1].uri, pw_b.uri);
@@ -4226,17 +4320,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_remove_from_latest_part_in_split_partition() {
-        // Partition A has two parts from a prior split: part_a_old (frozen, 1 sf)
-        // and part_a_latest (mutable, 2 sfs). We remove sf_a_latest_remove,
-        // which lives in the SECOND (latest) part.
-        //
-        // Bug: the removal loop calls removals_by_partition.remove(&partition_key)
-        // for each entry in out_list_entries. When part_a_old is processed first,
-        // the key [0,0,0,0] is consumed from the map. When part_a_latest is
-        // processed second, remove() returns None and the entry carries over
-        // unchanged — sf_a_latest_remove is never removed. As a side effect,
-        // part_a_old is unnecessarily rewritten (its URI changes even though its
-        // contents did not).
+        // Two parts from a prior split: part_a_old (1 sf) and part_a_latest
+        // (2 sfs). We remove sf_a_latest_remove, which lives in the SECOND
+        // (latest) part. The removal set is checked against every part:
+        // part_a_old holds no matching id and carries over unchanged, while
+        // part_a_latest matches and is rewritten with only its surviving
+        // superfile.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
@@ -4342,14 +4431,14 @@ mod tests {
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 2);
-        // Both parts in the split are rewritten: any part in a partition with a
-        // pending removal is rewritten regardless of whether the removal matched
-        // anything in it.
+        // Only the part that actually held the removed superfile is rewritten;
+        // the other carries over untouched.
         assert_eq!(parts_to_write.len(), 1);
 
-        // Both list entries are for the same partition
+        // [0] part_a_old carried over — keeps its original partition_key.
+        // [1] part_a_latest rewritten — keyed by the empty table-level part key.
         assert_eq!(list_entries[0].partition_key, pk);
-        assert_eq!(list_entries[1].partition_key, pk);
+        assert_eq!(list_entries[1].partition_key, TABLE_LEVEL_PART_KEY);
 
         // sf_a_old survives (in one of the output parts)
         // sf_a_latest_keep survives (in one of the output parts)
@@ -4443,10 +4532,11 @@ mod tests {
             .expect("update");
         let list_entries = new_manifest.get_all_list_entries();
 
-        // Both superfiles removed: list entry remains with n_superfiles=0
+        // Both superfiles removed: list entry remains with n_superfiles=0. A
+        // rewritten part is keyed by the empty table-level part key.
         assert_eq!(list_entries.len(), 1);
         assert_eq!(parts.len(), 1);
-        assert_eq!(list_entries[0].partition_key, pk);
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[0].n_superfiles, 0);
         assert_eq!(parts[0].part.superfiles.len(), 0);
     }
@@ -4533,14 +4623,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_remove_from_older_frozen_part_in_split_partition() {
-        // Partition A has two parts from a prior split: part_a_old (frozen, 2
-        // sfs: sf_a_old_keep + sf_a_old_remove) and part_a_latest (mutable, 1
-        // sf). We remove sf_a_old_remove, which lives in the FIRST (older,
-        // frozen) part.
-        //
-        // Because the fix applies the removal set to every part in the partition,
-        // both parts are rewritten. sf_a_old_remove is absent from the output;
-        // sf_a_old_keep and sf_a_latest survive.
+        // Two parts from a prior split: part_a_old (2 sfs: sf_a_old_keep +
+        // sf_a_old_remove) and part_a_latest (1 sf). We remove sf_a_old_remove,
+        // which lives in the FIRST (older) part. The removal set is checked
+        // against every part: part_a_old matches and is rewritten without the
+        // removed superfile; part_a_latest holds no matching id and carries over
+        // unchanged. sf_a_old_keep and sf_a_latest survive.
         let mut base_opts =
             SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
         base_opts.target_superfiles_per_part = 2;
@@ -4646,11 +4734,13 @@ mod tests {
         let list_entries = new_manifest.get_all_list_entries();
 
         assert_eq!(list_entries.len(), 2);
-        // Both parts rewritten: the fix applies the removal set to every part in
-        // the partition, so the latest is also rewritten (no match, same content)
+        // Only the part that held the removed superfile is rewritten; the other
+        // carries over untouched.
         assert_eq!(parts_to_write.len(), 1);
 
-        assert_eq!(list_entries[0].partition_key, pk);
+        // [0] part_a_old rewritten — keyed by the empty table-level part key.
+        // [1] part_a_latest carried over — keeps its original partition_key.
+        assert_eq!(list_entries[0].partition_key, TABLE_LEVEL_PART_KEY);
         assert_eq!(list_entries[1].partition_key, pk);
 
         // sf_a_old_keep and sf_a_latest survive; sf_a_old_remove is absent
