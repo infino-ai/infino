@@ -10,7 +10,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    mem,
+    mem, slice,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -37,14 +37,16 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        manifest::list::PartitionStrategy,
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, split_overflow_cell_after_compaction, try_commit_attempt,
+            PreparedSuperfile, ShardOutput, backoff_delay, build_one_shard_from_materialized,
+            finalize_compaction_commit, prepare_superfile, refresh_spfresh_routing,
+            split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -329,29 +331,54 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats) = {
-            let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
-                reader.vec().and_then(|v| {
-                    v.vector_columns_config()
-                        .next()
-                        .map(|c| c.rerank_codec == RerankCodec::Sq8ResidualEpsilon)
-                })
-            });
-            if sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
-            } else {
-                SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
-            }
-        };
-        let merged_bytes = Bytes::from(merged_bytes);
+        let spfresh_merge = readers_with_tombstones
+            .first()
+            .is_some_and(|(reader, _)| reader.spfresh_vec().is_some());
 
-        let shard = ShardOutput::new_with_params(
-            merged_bytes,
-            superfile_stats.n_docs,
-            superfile_stats.id_min,
-            superfile_stats.id_max,
-            superfile_stats.scalar_stats,
-        );
+        let shard = if spfresh_merge {
+            let mut rows = Vec::new();
+            for (reader, bitmap) in &readers_with_tombstones {
+                let spfresh = reader.spfresh_vec().ok_or_else(|| {
+                    BuildError::Store("SPFresh compaction input missing vector blob".into())
+                })?;
+                let mut input_rows = spfresh
+                    .materialized_rows()
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                if let Some(bitmap) = bitmap {
+                    input_rows.retain(|row| !bitmap.contains(row.local_doc_id));
+                }
+                rows.extend(input_rows);
+            }
+            rows.sort_by_key(|row| row.stable_id);
+            for (local_doc_id, row) in rows.iter_mut().enumerate() {
+                row.local_doc_id = local_doc_id as u32;
+            }
+            build_one_shard_from_materialized(&rows, &manifest.options, VectorLayout::Spfresh)?
+        } else {
+            let (merged_bytes, superfile_stats) = {
+                let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
+                    reader.vec().and_then(|v| {
+                        v.vector_columns_config()
+                            .next()
+                            .map(|c| c.rerank_codec == RerankCodec::Sq8ResidualEpsilon)
+                    })
+                });
+                if sq8_merge == Some(true) {
+                    SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
+                } else {
+                    SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
+                }
+            };
+            let merged_bytes = Bytes::from(merged_bytes);
+
+            ShardOutput::new_with_params(
+                merged_bytes,
+                superfile_stats.n_docs,
+                superfile_stats.id_min,
+                superfile_stats.id_max,
+                superfile_stats.scalar_stats,
+            )
+        };
 
         let prepared_superfile = prepare_superfile(self.inner().as_ref(), shard)?;
 
@@ -472,6 +499,7 @@ impl Supertable {
         let mut pending_storage_writes = vec![
             merged_segment
                 .bytes_for_storage
+                .clone()
                 .ok_or(CompactionError::EmptyMergedSuperfile)?,
         ];
 
@@ -500,10 +528,33 @@ impl Supertable {
 
             let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
+            let current_for_commit = if is_hidden_vector_index_table(&inner.options)
+                && new_entries[0].vector_layout == VectorLayout::Spfresh
+            {
+                match current.get_partition_strategy() {
+                    PartitionStrategy::VectorCell {
+                        clusters, column, ..
+                    } => {
+                        let routing = refresh_spfresh_routing(
+                            current.get_spfresh_routing(),
+                            &column,
+                            clusters.n_cent,
+                            &entries_to_remove,
+                            slice::from_ref(&merged_segment),
+                        )
+                        .map_err(|e| CompactionError::Build(e.to_string()))?;
+                        Arc::new(current.with_spfresh_routing(routing))
+                    }
+                    _ => current,
+                }
+            } else {
+                current
+            };
+
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
-                current,
+                current_for_commit,
                 &new_entries,
                 &entries_to_remove,
                 &mut pending_storage_writes,
@@ -560,14 +611,20 @@ impl Supertable {
 mod tests {
     use std::{collections::HashSet, mem, str, sync::Arc};
 
-    use arrow_array::LargeStringArray;
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
     use tokio::task;
 
     use super::*;
     use crate::{
         BoolMode, Supertable,
+        superfile::{
+            builder::VectorConfig,
+            vector::{distance::Metric, layout::VectorLayout},
+        },
         supertable::{
+            SupertableOptions,
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
@@ -592,6 +649,17 @@ mod tests {
     fn default_cfg() -> CompactionSettings {
         CompactionSettings::default() // 1 GiB target, 80% floor
     }
+
+    /// Vector dimension used by focused SPFresh compaction tests.
+    const SPFRESH_TEST_DIM: usize = 16;
+    /// Rows per input superfile in the SPFresh merge regression.
+    const SPFRESH_TEST_ROWS_PER_INPUT: usize = 16;
+    /// Number of input superfiles merged by the SPFresh merge regression.
+    const SPFRESH_TEST_INPUTS: usize = 2;
+    /// Small centroid count that still gives each one-hot direction a stable bucket.
+    const SPFRESH_TEST_N_CENT: usize = 4;
+    /// Fixed test rotation seed for deterministic vector builder output.
+    const SPFRESH_TEST_ROT_SEED: u64 = 7;
 
     #[test]
     fn empty_input_yields_no_jobs() {
@@ -1158,6 +1226,72 @@ mod tests {
             .expect("create supertable")
     }
 
+    fn fixed_list_f32(dim: usize) -> DataType {
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+        )
+    }
+
+    fn spfresh_options(dir: &TempDir, dim: usize) -> SupertableOptions {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            fixed_list_f32(dim),
+            false,
+        )]));
+        SupertableOptions::new(
+            schema,
+            Vec::new(),
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: SPFRESH_TEST_N_CENT,
+                rot_seed: SPFRESH_TEST_ROT_SEED,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            }],
+            None,
+        )
+        .expect("valid vector options")
+        .with_storage(storage)
+        .with_vector_layout(VectorLayout::Spfresh)
+    }
+
+    fn build_vector_batch(start: u64, n: usize, dim: usize, schema: Arc<Schema>) -> RecordBatch {
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            let global = (start as usize) + i;
+            for d in 0..dim {
+                flat.push(if d == global % dim { 1.0 } else { 0.0 });
+            }
+        }
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from(flat);
+        let fsl = FixedSizeListArray::try_new(
+            item_field,
+            dim as i32,
+            Arc::new(values) as Arc<dyn Array>,
+            None,
+        )
+        .expect("fixed-size-list vectors");
+        RecordBatch::try_new(schema, vec![Arc::new(fsl)]).expect("vector batch")
+    }
+
+    fn commit_vectors(st: &Supertable, start: u64, n: usize, dim: usize) {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            start,
+            n,
+            dim,
+            st.options().schema.clone(),
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
     /// Compact config designed to trigger on tiny test superfiles.
     /// target = 1 MiB, fill floor = 1 % → min_output_bytes ≈ 10 KiB.
     /// Individual files must be < 10 KiB to be candidates; their
@@ -1174,6 +1308,37 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(titles)).expect("append");
         w.commit().expect("commit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_preserves_spfresh_vector_blob() {
+        let dir = TempDir::new().expect("tempdir");
+        let dim = SPFRESH_TEST_DIM;
+        let st = Supertable::create(spfresh_options(&dir, dim)).expect("create supertable");
+        commit_vectors(&st, 0, SPFRESH_TEST_ROWS_PER_INPUT, dim);
+        commit_vectors(
+            &st,
+            SPFRESH_TEST_ROWS_PER_INPUT as u64,
+            SPFRESH_TEST_ROWS_PER_INPUT,
+            dim,
+        );
+
+        let inputs = st.reader().manifest().superfiles.to_vec();
+        let merged = st.merge_superfiles(&inputs).await.expect("merge");
+        let reader = merged
+            .open_reader()
+            .expect("merged bytes present")
+            .expect("open merged superfile");
+
+        assert!(reader.vec().is_none());
+        let spfresh = reader.spfresh_vec().expect("merged SPFresh blob");
+        assert_eq!(
+            spfresh.n_rows(),
+            (SPFRESH_TEST_ROWS_PER_INPUT * SPFRESH_TEST_INPUTS) as u32
+        );
+        assert!(!spfresh.runs().is_empty());
+        let rows_in_runs: u32 = spfresh.runs().iter().map(|run| run.row_count).sum();
+        assert_eq!(rows_in_runs, spfresh.n_rows());
     }
 
     #[tokio::test(flavor = "multi_thread")]

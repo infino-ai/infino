@@ -49,7 +49,7 @@
 
 use std::{
     cmp,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fmt, io,
     marker::PhantomData,
     mem,
@@ -1764,21 +1764,28 @@ fn empty_cell_tree(cell_id: u32) -> CellTree {
     }
 }
 
-fn extend_spfresh_routing(
+pub(in crate::supertable) fn refresh_spfresh_routing(
     existing: Option<SpfreshRoutingIndex>,
     column: &str,
     n_cells: u32,
+    entries_to_remove: &[Arc<SuperfileEntry>],
     prepared: &[PreparedSuperfile],
 ) -> Result<SpfreshRoutingIndex, BuildError> {
+    let removed: HashSet<String> = entries_to_remove
+        .iter()
+        .map(|entry| entry.uri.0.to_string())
+        .collect();
     let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
     if let Some(existing) = existing
         && existing.column == column
     {
-        for cell in existing.cells {
+        for mut cell in existing.cells {
             let cell_id = cell.cell_id as usize;
             while cell_id >= cells.len() {
                 cells.push(empty_cell_tree(cells.len() as u32));
             }
+            cell.leaves
+                .retain(|leaf| !removed.contains(&leaf.superfile_uri));
             cells[cell_id] = cell;
         }
     }
@@ -1823,6 +1830,15 @@ fn extend_spfresh_routing(
         column: column.into(),
         cells,
     })
+}
+
+fn extend_spfresh_routing(
+    existing: Option<SpfreshRoutingIndex>,
+    column: &str,
+    n_cells: u32,
+    prepared: &[PreparedSuperfile],
+) -> Result<SpfreshRoutingIndex, BuildError> {
+    refresh_spfresh_routing(existing, column, n_cells, &[], prepared)
 }
 
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
@@ -2805,10 +2821,10 @@ fn build_one_shard_from_merged(
 
 /// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
 /// into the normal vector builder — no fp32 corpus decode.
-fn build_one_shard_from_materialized(
+pub(in crate::supertable) fn build_one_shard_from_materialized(
     rows: &[MaterializedIvfRow],
     options: &SupertableOptions,
-    vector_layout: crate::superfile::vector::layout::VectorLayout,
+    vector_layout: VectorLayout,
 ) -> Result<ShardOutput, BuildError> {
     let id_array = Decimal128Array::from_iter_values(rows.iter().map(|r| r.stable_id))
         .with_precision_and_scale(
@@ -3987,6 +4003,8 @@ mod tests {
         const DIM: usize = 16;
         const ROWS: usize = 4;
         const CELL_ID: u32 = 3;
+        const OLD_RUN_BYTE_OFFSET: u64 = 11;
+        const OLD_RUN_BYTE_LEN: u64 = 22;
 
         let scale: Arc<[f32]> = Arc::from(vec![1.0; DIM]);
         let offset: Arc<[f32]> = Arc::from(vec![0.0; DIM]);
@@ -4032,15 +4050,61 @@ mod tests {
             vector_layout: VectorLayout::Spfresh,
             subsection_offsets: Some(offsets),
         });
+        let old_uri = SuperfileUri::new_v4();
+        let old_entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: old_uri.0,
+            uri: old_uri,
+            n_docs: ROWS as u64,
+            id_min: 0,
+            id_max: ROWS as i128,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: Some(CELL_ID),
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        });
         let prep = PreparedSuperfile {
             entry,
             bytes_for_store: Some((uri, shard.bytes)),
             bytes_for_storage: None,
             bytes_for_cache: None,
         };
+        let mut existing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            cells: vec![
+                empty_cell_tree(0),
+                empty_cell_tree(1),
+                empty_cell_tree(2),
+                {
+                    let mut cell = empty_cell_tree(CELL_ID);
+                    cell.leaves.push(RunRef {
+                        superfile_uri: old_uri.0.to_string(),
+                        cell_id: CELL_ID,
+                        run_id: 0,
+                        byte_range: (OLD_RUN_BYTE_OFFSET, OLD_RUN_BYTE_LEN),
+                        row_count: ROWS as u32,
+                    });
+                    cell
+                },
+            ],
+        };
+        while existing.cells.len() < GLOBAL_VECTOR_CELL_COUNT {
+            existing
+                .cells
+                .push(empty_cell_tree(existing.cells.len() as u32));
+        }
 
-        let routing = extend_spfresh_routing(None, "emb", GLOBAL_VECTOR_CELL_COUNT as u32, &[prep])
-            .expect("routing");
+        let routing = refresh_spfresh_routing(
+            Some(existing),
+            "emb",
+            GLOBAL_VECTOR_CELL_COUNT as u32,
+            &[old_entry],
+            &[prep],
+        )
+        .expect("routing");
         let cell = routing
             .cells
             .iter()
@@ -4048,6 +4112,7 @@ mod tests {
             .expect("cell");
         assert_eq!(cell.leaves.len(), 1);
         assert_eq!(cell.leaves[0].cell_id, CELL_ID);
+        assert_eq!(cell.leaves[0].superfile_uri, uri.0.to_string());
         assert_eq!(cell.leaves[0].run_id, 0);
         assert_eq!(cell.leaves[0].row_count, ROWS as u32);
         assert!(cell.leaves[0].byte_range.1 > 0);
