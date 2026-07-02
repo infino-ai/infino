@@ -512,9 +512,18 @@ impl Connection {
                 .sql(&sql)
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))?;
-            df.collect()
+            // Preserve the output schema so a zero-row result is a well-formed
+            // empty batch rather than a schema-less Vec.
+            let output_schema: SchemaRef = df.schema().inner().clone();
+            let batches = df
+                .collect()
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()))
+                .map_err(|e| InfinoError::Query(e.to_string()))?;
+            if batches.is_empty() {
+                Ok(vec![RecordBatch::new_empty(output_schema)])
+            } else {
+                Ok(batches)
+            }
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
@@ -966,6 +975,35 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    #[test]
+    fn query_sql_zero_row_result_carries_projected_schema() {
+        // A WHERE predicate that matches nothing must return a batch with the projected schema
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+
+        let batches = conn
+            .query_sql("SELECT title FROM docs WHERE title = 'no_match'")
+            .expect("zero-row query must not error");
+        assert!(
+            !batches.is_empty(),
+            "must contain at least one (empty) batch"
+        );
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "no rows should match");
+        assert!(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == "title"),
+            "projected schema must include 'title'"
+        );
     }
 
     #[test]
