@@ -158,7 +158,7 @@ pub struct SpfreshRoutingIndex {
 pub struct CellTree {
     pub cell_id: u32,
     pub nodes: Vec<CellTreeNode>,
-    pub leaves: Vec<RunRef>,
+    pub leaves: Vec<ClusterRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,16 +169,31 @@ pub struct CellTreeNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunRef {
-    pub superfile_uri: String,
+pub struct ClusterRef {
     /// Coarse outer `VectorCell` that owns this run's superfile.
     pub cell_id: u32,
     /// Fine centroid id this run holds (index into the resident centroid blob
     /// for `cell_id`). Query scores fine centroids and selects runs by this id.
     pub cluster_id: u32,
+    /// Live physical fragments for this fine centroid. Drain appends deltas;
+    /// compaction rewrites them into a base. Query probes the centroid once and
+    /// fetches every live fragment listed here.
+    pub fragments: Vec<RunFragment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFragmentKind {
+    Base,
+    Delta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFragment {
+    pub superfile_uri: String,
     pub run_id: u32,
     pub byte_range: (u64, u64),
     pub row_count: u32,
+    pub kind: RunFragmentKind,
 }
 
 /// Normalized set of drained user commit-versions, stored **only on the hidden
@@ -943,7 +958,7 @@ struct SpfreshRoutingIndexDto {
 struct CellTreeDto {
     cell_id: u32,
     nodes: Vec<CellTreeNodeDto>,
-    leaves: Vec<RunRefDto>,
+    leaves: Vec<ClusterRefDto>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -954,14 +969,27 @@ struct CellTreeNodeDto {
 }
 
 #[derive(Serialize, Deserialize)]
-struct RunRefDto {
-    superfile_uri: String,
+struct ClusterRefDto {
     cell_id: u32,
     #[serde(default)]
     cluster_id: u32,
+    fragments: Vec<RunFragmentDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunFragmentDto {
+    superfile_uri: String,
     run_id: u32,
     byte_range: (u64, u64),
     row_count: u32,
+    kind: RunFragmentKindDto,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RunFragmentKindDto {
+    Base,
+    Delta,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1363,13 +1391,20 @@ fn spfresh_routing_to_dto(index: &SpfreshRoutingIndex) -> SpfreshRoutingIndexDto
                 leaves: cell
                     .leaves
                     .iter()
-                    .map(|run| RunRefDto {
-                        superfile_uri: run.superfile_uri.clone(),
-                        cell_id: run.cell_id,
-                        cluster_id: run.cluster_id,
-                        run_id: run.run_id,
-                        byte_range: run.byte_range,
-                        row_count: run.row_count,
+                    .map(|leaf| ClusterRefDto {
+                        cell_id: leaf.cell_id,
+                        cluster_id: leaf.cluster_id,
+                        fragments: leaf
+                            .fragments
+                            .iter()
+                            .map(|fragment| RunFragmentDto {
+                                superfile_uri: fragment.superfile_uri.clone(),
+                                run_id: fragment.run_id,
+                                byte_range: fragment.byte_range,
+                                row_count: fragment.row_count,
+                                kind: fragment_kind_to_dto(fragment.kind),
+                            })
+                            .collect(),
                     })
                     .collect(),
             })
@@ -1396,13 +1431,20 @@ fn spfresh_routing_from_dto(
             leaves: cell
                 .leaves
                 .into_iter()
-                .map(|run| RunRef {
-                    superfile_uri: run.superfile_uri,
-                    cell_id: run.cell_id,
-                    cluster_id: run.cluster_id,
-                    run_id: run.run_id,
-                    byte_range: run.byte_range,
-                    row_count: run.row_count,
+                .map(|leaf| ClusterRef {
+                    cell_id: leaf.cell_id,
+                    cluster_id: leaf.cluster_id,
+                    fragments: leaf
+                        .fragments
+                        .into_iter()
+                        .map(|fragment| RunFragment {
+                            superfile_uri: fragment.superfile_uri,
+                            run_id: fragment.run_id,
+                            byte_range: fragment.byte_range,
+                            row_count: fragment.row_count,
+                            kind: fragment_kind_from_dto(fragment.kind),
+                        })
+                        .collect(),
                 })
                 .collect(),
         });
@@ -1417,6 +1459,20 @@ fn spfresh_routing_from_dto(
             .transpose()?,
         cells,
     })
+}
+
+fn fragment_kind_to_dto(kind: RunFragmentKind) -> RunFragmentKindDto {
+    match kind {
+        RunFragmentKind::Base => RunFragmentKindDto::Base,
+        RunFragmentKind::Delta => RunFragmentKindDto::Delta,
+    }
+}
+
+fn fragment_kind_from_dto(kind: RunFragmentKindDto) -> RunFragmentKind {
+    match kind {
+        RunFragmentKindDto::Base => RunFragmentKind::Base,
+        RunFragmentKindDto::Delta => RunFragmentKind::Delta,
+    }
 }
 
 fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
@@ -2336,14 +2392,27 @@ mod tests {
                         left: 0,
                         right: 1,
                     }],
-                    leaves: vec![RunRef {
-                        superfile_uri: "superfiles/00000000-0000-0000-0000-000000000001.parquet"
-                            .into(),
+                    leaves: vec![ClusterRef {
                         cell_id: 0,
                         cluster_id: 3,
-                        run_id: 7,
-                        byte_range: (128, 4096),
-                        row_count: 64,
+                        fragments: vec![
+                            RunFragment {
+                                superfile_uri:
+                                    "superfiles/00000000-0000-0000-0000-000000000001.parquet".into(),
+                                run_id: 7,
+                                byte_range: (128, 4096),
+                                row_count: 64,
+                                kind: RunFragmentKind::Base,
+                            },
+                            RunFragment {
+                                superfile_uri:
+                                    "superfiles/00000000-0000-0000-0000-000000000002.parquet".into(),
+                                run_id: 9,
+                                byte_range: (8192, 2048),
+                                row_count: 32,
+                                kind: RunFragmentKind::Delta,
+                            },
+                        ],
                     }],
                 },
                 CellTree {

@@ -227,40 +227,47 @@ where
     .await
 }
 
-/// Fan-out for the hidden vector-index path. Identical to [`fanout`] — runs
-/// the kernel, tags hits, and piggybacks the hidden→user `_id` resolve — but
-/// does NOT prefetch or apply per-cell tombstone sidecars. The hidden cells'
-/// sidecars are never populated (user deletes are recorded in the resident
-/// deleted-set instead), so the prefetch wave fetched only empty objects on
-/// the cold critical path and the post-score filter was a no-op. Deletes are
-/// dropped by the caller against the resident deleted-set, keyed by the
-/// `stable_id` resolved here.
-pub(crate) async fn fanout_untombstoned<P, K, Fut>(
+/// Fan-out variant for kernels that already return tagged [`SuperfileHit`]s.
+/// Used by vector paths that can carry an inline stable `_id` directly from the
+/// scorer (SPFresh run bodies), while preserving the hidden-index fallback that
+/// resolves missing stable IDs from resident bytes for IVF hits.
+pub(crate) async fn fanout_hits<P, K, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
+    prefetch_tombstones: bool,
     kernel: K,
 ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
 where
     P: Send + 'static,
-    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+    K: Fn(Arc<SuperfileReader>, Arc<SuperfileEntry>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>> + Send + 'static,
 {
     let should_tag_stable_ids = is_hidden_vector_index_table(&reader.manifest().options);
     fanout_with(
         reader,
         units,
-        false,
-        move |r, entry, _tombstone_cache, _now, params| {
+        prefetch_tombstones,
+        move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
             async move {
                 let reader_for_ids = Arc::clone(&r);
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                if should_tag_stable_ids && !tagged.is_empty() {
-                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
+                let mut tagged = kernel(r, Arc::clone(&entry), params).await?;
+                if prefetch_tombstones {
+                    apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                }
+                if should_tag_stable_ids && tagged.iter().any(|hit| hit.stable_id.is_none()) {
+                    let unresolved: Vec<usize> = tagged
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, hit)| hit.stable_id.is_none().then_some(idx))
+                        .collect();
+                    let locals: Vec<u32> = unresolved
+                        .iter()
+                        .map(|&idx| tagged[idx].local_doc_id)
+                        .collect();
                     if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
-                        for (h, id) in tagged.iter_mut().zip(ids) {
-                            h.stable_id = Some(id);
+                        for (&idx, id) in unresolved.iter().zip(ids) {
+                            tagged[idx].stable_id = Some(id);
                         }
                     }
                 }

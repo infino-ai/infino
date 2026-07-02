@@ -30,8 +30,9 @@ low-nprobe recall work are being restored:
 ## What to KEEP (correct, do not churn)
 
 - Per-cell routing-tree manifest scaffolding: `SpfreshRoutingIndex`, `CellTree`,
-  `CellTreeNode`, `RunRef` in `src/supertable/manifest/list.rs`, and
-  `with_spfresh_routing` / `get_spfresh_routing` in
+  `CellTreeNode`, `ClusterRef`, `RunFragment` in
+  `src/supertable/manifest/list.rs`, and `with_spfresh_routing` /
+  `get_spfresh_routing` in
   `src/supertable/manifest/mod.rs`. Two-level routing (outer `VectorCell` ->
   per-cell tree -> runs) is the intended shape.
 - Superfile envelope, `SubsectionOffsets`, reader-cache/open path, MVCC commit
@@ -99,7 +100,7 @@ the hidden index's `SupertableInner` (the `vector_index_table`'s inner), as a
 field like `resident_centroids: ArcSwap<ResidentCentroids>`, where
 `ResidentCentroids` is a decoded `Arc<[f32]>` of `K_fine * dim` plus a small
 index (outer cell -> its fine-centroid id range; fine id -> offset).
-`CellTreeNode`/`RunRef.cluster_id` index into that array.
+hidden `ClusterRef.cluster_id` values index into that array.
 
 This is the **same residency** the coarse 64-cell grid already has — it rides
 `ManifestList.global_vector_index.grid`, and the manifest is resident in
@@ -123,8 +124,8 @@ working set).
   Rides the manifest cheaply.
 - **Centroid blob (large, rewritten on centroid change):** the fine-centroid
   fp32 vectors, loaded resident on open.
-- `CellTreeNode` drops inline centroid bytes in favor of an index into the
-  resident centroid blob.
+- Hidden `ClusterRef.cluster_id` uses the resident centroid blob; user
+  `CellTreeNode` values keep inline centroid bytes for the tail/filter path.
 
 ### 4. Object packs many runs
 
@@ -184,9 +185,9 @@ already is) and rides the manifest parts.
 ### Hidden supertable: fragments in the manifest, centroids in the resident blob
 
 The **hidden** manifest carries only the per-cell trees + per-fine-centroid
-fragment table + `CellTreeNode` indices into the resident centroid blob — **not**
-inline centroids. Hidden `K_fine` is corpus-scale, so its centroids can never
-ride per-commit manifest JSON; they live in the resident blob (section 3).
+fragment table + `ClusterRef.cluster_id` indices into the resident centroid blob
+— **not** inline centroids. Hidden `K_fine` is corpus-scale, so its centroids can
+never ride per-commit manifest JSON; they live in the resident blob (section 3).
 
 So: user -> tree (with centroids) in the manifest; hidden -> fragments +
 centroid-blob index in the manifest, centroids resident from the blob.
@@ -277,17 +278,19 @@ Ordered so each builds/tests green behind `INFINO_HIDDEN_INDEX=spfresh`
    centroid. Wire commit's `fp32_rows_to_runs` to fine-cluster + `assign_replicas`;
    runs now ~2 MB and replicated. **(done for hidden drain + user commit)**
 3. Manifest per-centroid base+delta fragment model on the existing cell trees;
-   DTO roundtrip tests. **(partial: `RunRef` leaves exist; fragment/base+delta
-   pending; user trees carry inline centroids; hidden routing now carries a
+   DTO roundtrip tests. **(done: `ClusterRef` leaves carry live
+   `RunFragment`s; user trees carry inline centroids; hidden routing carries a
    centroid-blob pointer/hash)**
 4. Drain -> LIRE flush: replica-set assignment, append delta runs, pack many
    runs per superfile, record fragments. **(done)**
 5. Query: dedup-by-stable_id-min before top-k; fetch all live fragments of
-   probed centroids. **(dedup done; manifest-centroid run selection done for
-   user trees; resident-centroid run selection done for hidden trees; direct
-   fragment range fetch pending)**
+   probed centroids. **(dedup done; manifest-centroid selection done for user
+   trees; resident-centroid selection done for hidden trees; direct selected-run
+   range fetch now expands every base/delta fragment under the selected
+   centroid)**
 6. Compaction -> LIRE merge/split/reassign with local re-replication and
-   fragment rewrite. **(merge/dedup/re-replicate done; split/fragment-rewrite
+   fragment rewrite. **(merge/dedup/re-replicate done; merged outputs and split
+   neighborhoods rewrite selected fragments through MVCC; split tuning still
    pending)**
 7. **Close-the-loop (this plan's focus):**
    - fine-cluster user superfiles at commit + write their tree into the user
@@ -315,7 +318,7 @@ Avoid these unless explicitly referring to the old, discarded flat plan:
 fine), `radius`/`radii`/`radius-aware`, "delete `VectorCell`", "single-level
 global OPANN", "hidden objects are headerless raw blobs".
 
-Prefer: `CellTree`, `RunRef`, `ClusterRef`, `VectorLayout::Spfresh`, "global
+Prefer: `CellTree`, `ClusterRef`, `RunFragment`, `VectorLayout::Spfresh`, "global
 cells + per-cell trees", "same superfile format, new vector blob".
 
 Naming: consider renaming `Spfresh` to a name that does not claim the algorithm

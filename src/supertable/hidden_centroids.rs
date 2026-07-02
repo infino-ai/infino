@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    storage::StorageProvider,
+    storage::{StorageError, StorageProvider},
     superfile::vector::distance::{decode_f32_le_vec, encode_f32_le_vec},
     supertable::manifest::{Manifest, part::ContentHash},
 };
@@ -60,6 +60,20 @@ pub(crate) enum HiddenCentroidsError {
 
 pub(crate) fn storage_path(hash: &ContentHash) -> String {
     format!("spfresh-centroids/centroids-{}.bin", hash.to_hex())
+}
+
+pub(crate) async fn store_centroids(
+    storage: &dyn StorageProvider,
+    dim: usize,
+    centroids: &[f32],
+) -> Result<(String, ContentHash), HiddenCentroidsError> {
+    let bytes = encode_centroids(dim, centroids)?;
+    let hash = ContentHash::of(&bytes);
+    let uri = storage_path(&hash);
+    match storage.put_atomic(&uri, Bytes::from(bytes)).await {
+        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok((uri, hash)),
+        Err(e) => Err(HiddenCentroidsError::Storage(e.to_string())),
+    }
 }
 
 pub(crate) fn encode_centroids(

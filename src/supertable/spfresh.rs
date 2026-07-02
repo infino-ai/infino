@@ -248,6 +248,28 @@ pub(crate) fn nearest_cell_encoded(
     best
 }
 
+/// Assign an encoded row to its nearest cell among a bounded maintenance set.
+pub(crate) fn nearest_cell_encoded_in(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    cells: &[u32],
+    row: &EncodedCellRow,
+) -> Option<u32> {
+    let mut best = None;
+    let mut best_score = f32::INFINITY;
+    for &cell in cells {
+        if cell >= clusters.n_cent {
+            continue;
+        }
+        let score = score_row_against_cell(clusters, metric, cell as usize, row);
+        if score < best_score {
+            best_score = score;
+            best = Some(cell);
+        }
+    }
+    best
+}
+
 /// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.
 pub(crate) fn insert_split_centroid(
     base: &ClusterCentroids,
@@ -361,6 +383,28 @@ mod tests {
     fn reassign_neighborhood_includes_neighbors_and_new_cell() {
         let ids = reassign_neighborhood(3, 8, 8);
         assert_eq!(ids, vec![2, 3, 4, 8]);
+    }
+
+    #[test]
+    fn nearest_cell_encoded_in_stays_inside_candidates() {
+        let clusters =
+            ClusterCentroids::from_fp32(3, 2, &[0.0, 0.0, 10.0, 0.0, 20.0, 0.0], vec![1; 3]);
+        let row = synth_rows(2, 1, 20.0).remove(0);
+
+        assert_eq!(
+            nearest_cell_encoded(&clusters, Metric::L2Sq, &row),
+            2,
+            "unbounded nearest should prefer the actual closest cell"
+        );
+        assert_eq!(
+            nearest_cell_encoded_in(&clusters, Metric::L2Sq, &[0, 1], &row),
+            Some(1),
+            "bounded maintenance reassignment must not leave the rewritten neighborhood"
+        );
+        assert_eq!(
+            nearest_cell_encoded_in(&clusters, Metric::L2Sq, &[99], &row),
+            None
+        );
     }
 
     #[test]

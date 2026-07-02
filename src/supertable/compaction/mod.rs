@@ -40,10 +40,8 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        hidden_centroids::{
-            ResidentCentroids, encode_centroids, storage_path as centroid_storage_path,
-        },
-        manifest::{list::PartitionStrategy, part::ContentHash},
+        hidden_centroids::{ResidentCentroids, store_centroids},
+        manifest::list::{PartitionStrategy, RunFragmentKind},
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
@@ -563,7 +561,7 @@ impl Supertable {
 
             // Hidden-index compaction reroutes the merged cell through the same
             // resident-centroid routing the drain uses (one authority), so a
-            // merged cell's `RunRef.cluster_id`s index the resident centroid
+            // merged cell's `ClusterRef.cluster_id`s index the resident centroid
             // blob exactly like freshly-drained cells — never a within-blob id.
             let mut resident_to_swap: Option<ResidentCentroids> = None;
             let current_for_commit = if is_hidden_vector_index_table(&inner.options)
@@ -589,17 +587,17 @@ impl Supertable {
                             dim,
                             &entries_to_remove,
                             slice::from_ref(&merged_segment),
+                            RunFragmentKind::Base,
                         )
                         .map_err(|e| CompactionError::Build(e.to_string()))?;
                         if !resident.is_empty() {
-                            let bytes = encode_centroids(resident.dim, resident.centroids.as_ref())
-                                .map_err(|e| CompactionError::Build(e.to_string()))?;
-                            let hash = ContentHash::of(&bytes);
-                            let uri = centroid_storage_path(&hash);
-                            storage
-                                .put_atomic(&uri, Bytes::from(bytes))
-                                .await
-                                .map_err(|e| CompactionError::Build(e.to_string()))?;
+                            let (uri, hash) = store_centroids(
+                                storage.as_ref(),
+                                resident.dim,
+                                resident.centroids.as_ref(),
+                            )
+                            .await
+                            .map_err(|e| CompactionError::Build(e.to_string()))?;
                             routing.centroid_blob_uri = Some(uri);
                             routing.centroid_blob_content_hash = Some(hash);
                             resident_to_swap = Some(resident);

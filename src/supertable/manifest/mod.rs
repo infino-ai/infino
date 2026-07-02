@@ -2964,13 +2964,16 @@ mod tests {
                     left: 0,
                     right: 1,
                 }],
-                leaves: vec![list::RunRef {
-                    superfile_uri: "superfiles/a.parquet".into(),
+                leaves: vec![list::ClusterRef {
                     cell_id: 0,
                     cluster_id: 5,
-                    run_id: 2,
-                    byte_range: (64, 128),
-                    row_count: 16,
+                    fragments: vec![list::RunFragment {
+                        superfile_uri: "superfiles/a.parquet".into(),
+                        run_id: 2,
+                        byte_range: (64, 128),
+                        row_count: 16,
+                        kind: list::RunFragmentKind::Base,
+                    }],
                 }],
             }],
         };

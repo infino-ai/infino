@@ -12,6 +12,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     env,
+    io::Error as IoError,
     ops::Range,
     sync::{Arc, OnceLock},
 };
@@ -23,6 +24,7 @@ use crate::superfile::{
     BuildError, ReadError,
     error::VectorError,
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
+    lazy_source::{LazyByteSource, LazyByteSourceError, Source},
     vector::{
         builder::{VectorConfig, derive_sq8_quantizer_from_min_max},
         cell_posting::{
@@ -150,12 +152,35 @@ pub(crate) struct SpfreshRun {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct SpfreshRunProbe {
+    pub(crate) run_id: usize,
+    pub(crate) body_range: Option<Range<usize>>,
+    pub(crate) row_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SpfreshSearchHit {
+    pub(crate) local_doc_id: u32,
+    pub(crate) stable_id: i128,
+    pub(crate) score: f32,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct SpfreshBlobReader {
-    bytes: Bytes,
+    source: Source,
     dim: usize,
     metric: Metric,
     runs: Vec<SpfreshRun>,
     n_rows: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpfreshHeader {
+    dim: usize,
+    metric: Metric,
+    run_count: usize,
+    n_rows: u32,
+    directory_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -256,67 +281,41 @@ impl SpfreshBlobBuilder {
 
 impl SpfreshBlobReader {
     pub(crate) fn open(bytes: Bytes) -> Result<Self, VectorError> {
-        if bytes.len() < HEADER_BYTES {
-            return Err(malformed("SPFresh blob header truncated"));
-        }
-        let actual = &bytes[..MAGIC.len()];
-        if actual != MAGIC {
-            return Err(VectorError::Read(ReadError::BadMagic {
-                section: "vector/spfresh",
-                expected: MAGIC,
-                actual: actual.to_vec(),
-            }));
-        }
-        let mut offset = MAGIC.len();
-        let dim = read_u32_at(&bytes, offset, "dim")? as usize;
-        offset += U32_BYTES;
-        let metric = metric_from_id(bytes[offset])?;
-        offset += METRIC_BYTES + HEADER_RESERVED_BYTES;
-        let run_count = read_u32_at(&bytes, offset, "run_count")? as usize;
-        offset += U32_BYTES;
-        let n_rows = read_u32_at(&bytes, offset, "row_count")?;
-        let directory_bytes = run_count
-            .checked_mul(RUN_DIR_ENTRY_BYTES)
-            .ok_or_else(|| malformed("SPFresh run directory overflow"))?;
-        let directory_end = HEADER_BYTES
-            .checked_add(directory_bytes)
-            .ok_or_else(|| malformed("SPFresh run directory overflow"))?;
-        if bytes.len() < directory_end {
-            return Err(malformed("SPFresh run directory truncated"));
-        }
-        let mut runs = Vec::with_capacity(run_count);
-        for run_idx in 0..run_count {
-            let entry = HEADER_BYTES + run_idx * RUN_DIR_ENTRY_BYTES;
-            let cluster_id = read_u32_at(&bytes, entry + RUN_CLUSTER_ID_OFF, "cluster_id")?;
-            let row_count = read_u32_at(&bytes, entry + RUN_ROW_COUNT_OFF, "row_count")?;
-            let body_offset =
-                read_u64_at(&bytes, entry + RUN_BODY_OFFSET_OFF, "body_offset")? as usize;
-            let body_length =
-                read_u64_at(&bytes, entry + RUN_BODY_LENGTH_OFF, "body_length")? as usize;
-            let body_end = body_offset
-                .checked_add(body_length)
-                .ok_or_else(|| malformed("SPFresh run body overflow"))?;
-            if body_offset < directory_end || body_end > bytes.len() {
-                return Err(malformed("SPFresh run body out of bounds"));
-            }
-            let expected = run_body_len(dim, metric, row_count as usize);
-            if body_length != expected {
-                return Err(malformed(format!(
-                    "SPFresh run body has {body_length} bytes, expected {expected}"
-                )));
-            }
-            runs.push(SpfreshRun {
-                cluster_id,
-                row_count,
-                body_range: body_offset..body_end,
-            });
-        }
+        Self::open_with_source(Source::InMemory(bytes))
+    }
+
+    pub(crate) async fn open_lazy(source: Arc<dyn LazyByteSource>) -> Result<Self, VectorError> {
+        let source = Source::Lazy(source);
+        let header_bytes = source
+            .range_async(0..HEADER_BYTES)
+            .await
+            .map_err(lazy_source_error)?;
+        let header = parse_header(&header_bytes)?;
+        let directory_bytes = source
+            .range_async(HEADER_BYTES..header.directory_end)
+            .await
+            .map_err(lazy_source_error)?;
+        let runs = parse_runs(&directory_bytes, header, source.len())?;
         Ok(Self {
-            bytes,
-            dim,
-            metric,
+            source,
+            dim: header.dim,
+            metric: header.metric,
             runs,
-            n_rows,
+            n_rows: header.n_rows,
+        })
+    }
+
+    fn open_with_source(source: Source) -> Result<Self, VectorError> {
+        let header_bytes = fetch_sync(&source, 0..HEADER_BYTES, "header")?;
+        let header = parse_header(&header_bytes)?;
+        let directory_bytes = fetch_sync(&source, HEADER_BYTES..header.directory_end, "directory")?;
+        let runs = parse_runs(&directory_bytes, header, source.len())?;
+        Ok(Self {
+            source,
+            dim: header.dim,
+            metric: header.metric,
+            runs,
+            n_rows: header.n_rows,
         })
     }
 
@@ -345,7 +344,8 @@ impl SpfreshBlobReader {
 
     #[cfg(test)]
     pub(crate) fn run_bytes(&self, run_idx: usize) -> Option<Bytes> {
-        self.run_range(run_idx).map(|range| self.bytes.slice(range))
+        self.run_range(run_idx)
+            .and_then(|range| self.source.get_range(range).ok())
     }
 
     #[cfg(test)]
@@ -367,6 +367,7 @@ impl SpfreshBlobReader {
         self.search_runs_filtered(run_ids, query, k, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn search_runs_filtered(
         &self,
         run_ids: &[usize],
@@ -375,6 +376,44 @@ impl SpfreshBlobReader {
         allow: Option<&RoaringBitmap>,
         deny: Option<&RoaringBitmap>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
+        Ok(self
+            .search_runs_filtered_with_stable_ids(run_ids, query, k, allow, deny)?
+            .into_iter()
+            .map(|hit| (hit.local_doc_id, hit.score))
+            .collect())
+    }
+
+    #[cfg(test)]
+    fn search_runs_filtered_with_stable_ids(
+        &self,
+        run_ids: &[usize],
+        query: &[f32],
+        k: usize,
+        allow: Option<&RoaringBitmap>,
+        deny: Option<&RoaringBitmap>,
+    ) -> Result<Vec<SpfreshSearchHit>, VectorError> {
+        let probes: Vec<SpfreshRunProbe> = run_ids
+            .iter()
+            .map(|&run_id| {
+                let row_count = self.runs.get(run_id).map_or(0, |run| run.row_count);
+                SpfreshRunProbe {
+                    run_id,
+                    body_range: None,
+                    row_count,
+                }
+            })
+            .collect();
+        self.search_run_probes_filtered_with_stable_ids(&probes, query, k, allow, deny)
+    }
+
+    pub(crate) async fn search_run_probes_filtered_with_stable_ids_async(
+        &self,
+        probes: &[SpfreshRunProbe],
+        query: &[f32],
+        k: usize,
+        allow: Option<&RoaringBitmap>,
+        deny: Option<&RoaringBitmap>,
+    ) -> Result<Vec<SpfreshSearchHit>, VectorError> {
         if query.len() != self.dim {
             return Err(VectorError::DimensionMismatch {
                 expected: self.dim,
@@ -384,18 +423,23 @@ impl SpfreshBlobReader {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let selected = self.selected_run_bodies(probes)?;
+        let ranges: Vec<Range<usize>> = selected
+            .iter()
+            .map(|(range, _row_count)| range.clone())
+            .collect();
+        let bodies = self
+            .source
+            .get_ranges_parallel_async(&ranges)
+            .await
+            .map_err(lazy_source_error)?;
         let mut heap = BinaryHeap::<WorstHit>::new();
-        for &run_id in run_ids {
-            let run = self
-                .runs
-                .get(run_id)
-                .ok_or_else(|| malformed(format!("SPFresh run {run_id} out of range")))?;
-            let body = self.bytes.slice(run.body_range.clone());
+        for (body, (_range, row_count)) in bodies.into_iter().zip(selected) {
             score_run_body(
                 &body,
                 self.dim,
                 self.metric,
-                run.row_count as usize,
+                row_count,
                 query,
                 k,
                 allow,
@@ -403,9 +447,93 @@ impl SpfreshBlobReader {
                 &mut heap,
             )?;
         }
-        let mut out: Vec<(u32, f32)> = heap.into_iter().map(|hit| hit.0).collect();
-        out.sort_by(|a, b| cmp_f32(a.1, b.1));
+        let mut out: Vec<SpfreshSearchHit> = heap.into_iter().map(|hit| hit.0).collect();
+        out.sort_by(|a, b| cmp_f32(a.score, b.score));
         Ok(out)
+    }
+
+    #[cfg(test)]
+    fn search_run_probes_filtered_with_stable_ids(
+        &self,
+        probes: &[SpfreshRunProbe],
+        query: &[f32],
+        k: usize,
+        allow: Option<&RoaringBitmap>,
+        deny: Option<&RoaringBitmap>,
+    ) -> Result<Vec<SpfreshSearchHit>, VectorError> {
+        if query.len() != self.dim {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let selected = self.selected_run_bodies(probes)?;
+        let ranges: Vec<Range<usize>> = selected
+            .iter()
+            .map(|(range, _row_count)| range.clone())
+            .collect();
+        let bodies = self
+            .source
+            .get_ranges_parallel(&ranges)
+            .map_err(lazy_source_error)?;
+        let mut heap = BinaryHeap::<WorstHit>::new();
+        for (body, (_range, row_count)) in bodies.into_iter().zip(selected) {
+            score_run_body(
+                &body,
+                self.dim,
+                self.metric,
+                row_count,
+                query,
+                k,
+                allow,
+                deny,
+                &mut heap,
+            )?;
+        }
+        let mut out: Vec<SpfreshSearchHit> = heap.into_iter().map(|hit| hit.0).collect();
+        out.sort_by(|a, b| cmp_f32(a.score, b.score));
+        Ok(out)
+    }
+
+    fn selected_run_bodies(
+        &self,
+        probes: &[SpfreshRunProbe],
+    ) -> Result<Vec<(Range<usize>, usize)>, VectorError> {
+        let mut selected = Vec::with_capacity(probes.len());
+        for probe in probes {
+            let run = self
+                .runs
+                .get(probe.run_id)
+                .ok_or_else(|| malformed(format!("SPFresh run {} out of range", probe.run_id)))?;
+            let row_count = if probe.body_range.is_some() {
+                probe.row_count
+            } else {
+                run.row_count
+            } as usize;
+            let range = probe
+                .body_range
+                .clone()
+                .unwrap_or_else(|| run.body_range.clone());
+            let expected = run_body_len(self.dim, self.metric, row_count);
+            if range.len() != expected {
+                return Err(malformed(format!(
+                    "SPFresh run {} range has {} bytes, expected {expected}",
+                    probe.run_id,
+                    range.len()
+                )));
+            }
+            if range.end > self.source.len() {
+                return Err(malformed(format!(
+                    "SPFresh run {} range out of bounds",
+                    probe.run_id
+                )));
+            }
+            selected.push((range, row_count));
+        }
+        Ok(selected)
     }
 
     pub(crate) fn stable_ids_for_locals(&self, locals: &[u32]) -> Result<Vec<i128>, VectorError> {
@@ -428,7 +556,10 @@ impl SpfreshBlobReader {
     pub(crate) fn materialized_rows(&self) -> Result<Vec<MaterializedIvfRow>, VectorError> {
         let mut out = Vec::with_capacity(self.n_rows as usize);
         for run in &self.runs {
-            let body = self.bytes.slice(run.body_range.clone());
+            let body = self
+                .source
+                .get_range(run.body_range.clone())
+                .map_err(lazy_source_error)?;
             decode_run_body_materialized(
                 &body,
                 self.dim,
@@ -639,6 +770,83 @@ pub(crate) fn assign_replicas(
 /// stay at or under the target).
 fn run_row_stride(dim: usize) -> usize {
     dim * ROW_BYTES_PER_DIM + U32_BYTES + I128_BYTES + F32_BYTES
+}
+
+fn parse_header(header: &[u8]) -> Result<SpfreshHeader, VectorError> {
+    if header.len() < HEADER_BYTES {
+        return Err(malformed("SPFresh blob header truncated"));
+    }
+    let actual = &header[..MAGIC.len()];
+    if actual != MAGIC {
+        return Err(VectorError::Read(ReadError::BadMagic {
+            section: "vector/spfresh",
+            expected: MAGIC,
+            actual: actual.to_vec(),
+        }));
+    }
+    let mut offset = MAGIC.len();
+    let dim = read_u32_at(header, offset, "dim")? as usize;
+    offset += U32_BYTES;
+    let metric = metric_from_id(header[offset])?;
+    offset += METRIC_BYTES + HEADER_RESERVED_BYTES;
+    let run_count = read_u32_at(header, offset, "run_count")? as usize;
+    offset += U32_BYTES;
+    let n_rows = read_u32_at(header, offset, "row_count")?;
+    let directory_bytes = run_count
+        .checked_mul(RUN_DIR_ENTRY_BYTES)
+        .ok_or_else(|| malformed("SPFresh run directory overflow"))?;
+    let directory_end = HEADER_BYTES
+        .checked_add(directory_bytes)
+        .ok_or_else(|| malformed("SPFresh run directory overflow"))?;
+    Ok(SpfreshHeader {
+        dim,
+        metric,
+        run_count,
+        n_rows,
+        directory_end,
+    })
+}
+
+fn parse_runs(
+    directory: &[u8],
+    header: SpfreshHeader,
+    source_len: usize,
+) -> Result<Vec<SpfreshRun>, VectorError> {
+    let expected_directory_len = header
+        .directory_end
+        .checked_sub(HEADER_BYTES)
+        .ok_or_else(|| malformed("SPFresh run directory underflow"))?;
+    if directory.len() < expected_directory_len {
+        return Err(malformed("SPFresh run directory truncated"));
+    }
+    let mut runs = Vec::with_capacity(header.run_count);
+    for run_idx in 0..header.run_count {
+        let entry = run_idx * RUN_DIR_ENTRY_BYTES;
+        let cluster_id = read_u32_at(directory, entry + RUN_CLUSTER_ID_OFF, "cluster_id")?;
+        let row_count = read_u32_at(directory, entry + RUN_ROW_COUNT_OFF, "row_count")?;
+        let body_offset =
+            read_u64_at(directory, entry + RUN_BODY_OFFSET_OFF, "body_offset")? as usize;
+        let body_length =
+            read_u64_at(directory, entry + RUN_BODY_LENGTH_OFF, "body_length")? as usize;
+        let body_end = body_offset
+            .checked_add(body_length)
+            .ok_or_else(|| malformed("SPFresh run body overflow"))?;
+        if body_offset < header.directory_end || body_end > source_len {
+            return Err(malformed("SPFresh run body out of bounds"));
+        }
+        let expected = run_body_len(header.dim, header.metric, row_count as usize);
+        if body_length != expected {
+            return Err(malformed(format!(
+                "SPFresh run body has {body_length} bytes, expected {expected}"
+            )));
+        }
+        runs.push(SpfreshRun {
+            cluster_id,
+            row_count,
+            body_range: body_offset..body_end,
+        });
+    }
+    Ok(runs)
 }
 
 /// Number of fine centroids (~2 MB runs) for `n_rows`, derived from the run-size
@@ -973,21 +1181,27 @@ fn score_run_body(
     for row in 0..row_count {
         let row_base = layout.rows_start + row * dim * ROW_BYTES_PER_DIM;
         let id_base = layout.ids_start + row * U32_BYTES;
+        let stable_id_base = layout.stable_ids_start + row * I128_BYTES;
         let local_id = read_u32_at(body, id_base, "local_id")?;
         if allow.is_some_and(|bitmap| !bitmap.contains(local_id))
             || deny.is_some_and(|bitmap| bitmap.contains(local_id))
         {
             continue;
         }
+        let stable_id = read_i128_at(body, stable_id_base, "stable_id")?;
         let codes = &body[row_base..row_base + dim];
         let residuals = &body[row_base + dim..row_base + dim + dim];
         let norm = norms.as_ref().map(|values| values[row]);
         let dist = kernel.distance_with_norm(codes, residuals, norm);
-        let hit = WorstHit((local_id, dist));
+        let hit = WorstHit(SpfreshSearchHit {
+            local_doc_id: local_id,
+            stable_id,
+            score: dist,
+        });
         if heap.len() < k {
             heap.push(hit);
         } else if let Some(worst) = heap.peek()
-            && cmp_f32(hit.0.1, worst.0.1).is_lt()
+            && cmp_f32(hit.0.score, worst.0.score).is_lt()
         {
             heap.pop();
             heap.push(hit);
@@ -1099,6 +1313,18 @@ fn read_i128_at(body: &[u8], offset: usize, field: &str) -> Result<i128, VectorE
     Ok(i128::from_le_bytes(arr))
 }
 
+fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
+    let start = range.start;
+    let end = range.end;
+    source
+        .try_get_range_sync(range)
+        .ok_or_else(|| malformed(format!("SPFresh {what} range {start}..{end} unavailable")))
+}
+
+fn lazy_source_error(error: LazyByteSourceError) -> VectorError {
+    VectorError::Read(ReadError::Io(IoError::other(error.to_string())))
+}
+
 fn metric_id(metric: Metric) -> u8 {
     match metric {
         Metric::L2Sq => METRIC_ID_L2SQ as u8,
@@ -1125,13 +1351,13 @@ fn malformed(message: impl Into<String>) -> VectorError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct WorstHit((u32, f32));
+struct WorstHit(SpfreshSearchHit);
 
 impl Eq for WorstHit {}
 
 impl Ord for WorstHit {
     fn cmp(&self, other: &Self) -> Ordering {
-        cmp_f32(self.0.1, other.0.1)
+        cmp_f32(self.0.score, other.0.score)
     }
 }
 
@@ -1147,28 +1373,82 @@ fn cmp_f32(a: f32, b: f32) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        ops::Range,
+        sync::{Arc, Mutex},
+    };
 
+    use async_trait::async_trait;
     use bytes::Bytes;
 
     use super::{
-        ColumnState, HiddenIndexLayout, RunInput, SpfreshBlobReader,
+        ColumnState, HiddenIndexLayout, RunInput, SpfreshBlobReader, SpfreshRunProbe,
         assign_fine_clusters_for_target, assign_replicas, encode_materialized_runs,
         fine_centroid_count_for_target, fp32_rows_to_runs_for_target, parse_hidden_index_layout,
         run_row_stride,
     };
-    use crate::superfile::vector::{
-        builder::VectorConfig,
-        cell_posting::{EncodedCellRow, MaterializedIvfRow},
-        distance::Metric,
-        layout::VectorLayout,
-        rerank_codec::RerankCodec,
+    use crate::superfile::{
+        lazy_source::{LazyByteSource, LazyByteSourceError},
+        vector::{
+            builder::VectorConfig,
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            distance::Metric,
+            layout::VectorLayout,
+            rerank_codec::RerankCodec,
+        },
     };
 
     /// Three well-separated centroids on a line, `dim = 2`.
     const LINE_CENTROIDS_3: [f32; 6] = [0.0, 0.0, 10.0, 0.0, 20.0, 0.0];
     /// Two well-separated centroids on a line, `dim = 2`.
     const LINE_CENTROIDS_2: [f32; 4] = [0.0, 0.0, 10.0, 0.0];
+
+    #[derive(Debug)]
+    struct RecordingSource {
+        bytes: Bytes,
+        requests: Mutex<Vec<Range<u64>>>,
+    }
+
+    impl RecordingSource {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn clear_requests(&self) {
+            self.requests.lock().expect("requests lock").clear();
+        }
+
+        fn requests(&self) -> Vec<Range<u64>> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(start..start + len);
+            if start.saturating_add(len) > self.size() {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: self.size(),
+                });
+            }
+            let start = start as usize;
+            let end = start + len as usize;
+            Ok(self.bytes.slice(start..end))
+        }
+    }
 
     #[test]
     fn assign_replicas_hard_assignment_at_eps_zero() {
@@ -1410,6 +1690,53 @@ mod tests {
             .search_runs(&[0], &query, 3)
             .expect("search selected run");
         assert_eq!(hits[0].0, 5);
+    }
+
+    #[tokio::test]
+    async fn lazy_selected_run_search_fetches_only_selected_body_and_stable_id() {
+        let dim = 16usize;
+        let run_a = RunInput {
+            cluster_id: 1,
+            rows: materialized_rows(dim, 0, 3, 0),
+        };
+        let run_b = RunInput {
+            cluster_id: 2,
+            rows: materialized_rows(dim, 10, 2, 10),
+        };
+        let blob = Bytes::from(
+            encode_materialized_runs(Metric::L2Sq, dim, &[run_a, run_b]).expect("encode"),
+        );
+        let source = Arc::new(RecordingSource::new(blob));
+        let lazy_source: Arc<dyn LazyByteSource> = source.clone();
+        let reader = SpfreshBlobReader::open_lazy(lazy_source)
+            .await
+            .expect("lazy open");
+        let selected_range = reader.run_range(1).expect("selected range");
+        source.clear_requests();
+
+        let mut query = vec![0.0f32; dim];
+        query[0] = 10.1;
+        let hits = reader
+            .search_run_probes_filtered_with_stable_ids_async(
+                &[SpfreshRunProbe {
+                    run_id: 1,
+                    body_range: Some(selected_range.clone()),
+                    row_count: reader.runs()[1].row_count,
+                }],
+                &query,
+                1,
+                None,
+                None,
+            )
+            .await
+            .expect("selected search");
+
+        assert_eq!(
+            source.requests(),
+            vec![selected_range.start as u64..selected_range.end as u64]
+        );
+        assert_eq!(hits[0].local_doc_id, 10);
+        assert_eq!(hits[0].stable_id, 10);
     }
 
     fn materialized_rows(

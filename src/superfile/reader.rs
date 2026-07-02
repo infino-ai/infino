@@ -283,11 +283,9 @@ impl SuperfileReader {
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
             if matches!(vec_layout, VectorLayout::Spfresh) {
-                let blob = source
-                    .range(off, len)
-                    .await
-                    .map_err(|e| ReadError::Io(std::io::Error::other(e.to_string())))?;
-                return Ok((None, Some(SpfreshBlobReader::open(blob)?)));
+                let sub: Arc<dyn LazyByteSource> =
+                    Arc::new(LazySubSource::new(Arc::clone(&source), off, len));
+                return Ok((None, Some(SpfreshBlobReader::open_lazy(sub).await?)));
             }
             let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
             let sub: Arc<dyn LazyByteSource> =

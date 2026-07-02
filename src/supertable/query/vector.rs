@@ -70,6 +70,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
     future::Future,
+    ops::Range,
     sync::Arc,
     time::Instant,
 };
@@ -93,8 +94,11 @@ use crate::{
     superfile::{
         SuperfileReader,
         fts::reader::BoolMode,
-        vector::distance::{Metric, decode_f32_le_vec, distance},
-        vector::layout::VectorLayout,
+        vector::{
+            distance::{Metric, decode_f32_le_vec, distance},
+            layout::VectorLayout,
+            spfresh::{SpfreshRunProbe, SpfreshSearchHit},
+        },
     },
     supertable::{
         error::QueryError,
@@ -128,7 +132,7 @@ pub struct VectorFilter<'a> {
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
-    SpfreshRuns(Option<Vec<usize>>),
+    SpfreshRuns(Option<Vec<SpfreshRunProbe>>),
 }
 
 /// Apply query-time diagnostic overrides to the persisted cell-routing params.
@@ -201,7 +205,7 @@ fn truncate_to_inner_budget<T>(
     }
 }
 
-fn spfresh_run_ids_by_superfile(
+fn spfresh_run_probes_by_superfile(
     routing: Option<SpfreshRoutingIndex>,
     column: &str,
     superfiles: &[Arc<SuperfileEntry>],
@@ -209,26 +213,29 @@ fn spfresh_run_ids_by_superfile(
     query: &[f32],
     nprobe: usize,
     resident_centroids: Option<&ResidentCentroids>,
-) -> HashMap<SuperfileUri, Vec<usize>> {
+) -> HashMap<SuperfileUri, Vec<SpfreshRunProbe>> {
     let Some(routing) = routing else {
         return HashMap::new();
     };
     if routing.column != column {
         return HashMap::new();
     }
-    let by_uri: HashMap<String, SuperfileUri> = superfiles
+    let by_uri: HashMap<String, Arc<SuperfileEntry>> = superfiles
         .iter()
-        .map(|entry| (entry.uri.0.to_string(), entry.uri))
+        .map(|entry| (entry.uri.0.to_string(), Arc::clone(entry)))
         .collect();
-    // Score every routed run's fine centroid: user trees carry it inline in the
+    // Score every routed fine centroid: user trees carry it inline in the
     // `CellTreeNode`; hidden trees carry it in the resident centroid blob indexed
-    // by `RunRef.cluster_id`. There is exactly one home per tree kind.
-    let mut scored: Vec<(SuperfileUri, usize, f32)> = Vec::new();
+    // by `ClusterRef.cluster_id`. A selected centroid may point to a base plus
+    // delta fragments; every live fragment is fetched and scored.
+    struct ScoredSpfreshLeaf {
+        fragments: Vec<(SuperfileUri, SpfreshRunProbe)>,
+        score: f32,
+    }
+
+    let mut scored: Vec<ScoredSpfreshLeaf> = Vec::new();
     for cell in routing.cells {
         for (leaf_idx, leaf) in cell.leaves.into_iter().enumerate() {
-            let Some(uri) = by_uri.get(&leaf.superfile_uri).copied() else {
-                continue;
-            };
             let centroid = match cell.nodes.get(leaf_idx) {
                 Some(node) => decode_manifest_centroid(&node.centroid, query.len()),
                 None => resident_centroids
@@ -238,32 +245,107 @@ fn spfresh_run_ids_by_superfile(
             let Some(centroid) = centroid else {
                 continue;
             };
-            scored.push((
-                uri,
-                leaf.run_id as usize,
-                distance(metric, query, &centroid),
-            ));
+            let score = distance(metric, query, &centroid);
+            let mut fragments = Vec::with_capacity(leaf.fragments.len());
+            for fragment in leaf.fragments {
+                let Some(entry) = by_uri.get(&fragment.superfile_uri) else {
+                    continue;
+                };
+                let body_range = manifest_run_body_range(entry, fragment.byte_range);
+                fragments.push((
+                    entry.uri,
+                    SpfreshRunProbe {
+                        run_id: fragment.run_id as usize,
+                        body_range,
+                        row_count: fragment.row_count,
+                    },
+                ));
+            }
+            if !fragments.is_empty() {
+                scored.push(ScoredSpfreshLeaf { fragments, score });
+            }
         }
     }
 
-    let mut out: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
+    let mut out: HashMap<SuperfileUri, Vec<SpfreshRunProbe>> = HashMap::new();
     if !scored.is_empty() {
         let selected_superfiles = {
-            let mut uris: Vec<SuperfileUri> = scored.iter().map(|(uri, _, _)| *uri).collect();
+            let mut uris: Vec<SuperfileUri> = scored
+                .iter()
+                .flat_map(|leaf| leaf.fragments.iter().map(|(uri, _)| *uri))
+                .collect();
             uris.sort_unstable();
             uris.dedup();
             uris.len()
         };
-        truncate_to_inner_budget(&mut scored, nprobe, selected_superfiles, |e| e.2);
-        for (uri, run_id, _) in scored {
-            out.entry(uri).or_default().push(run_id);
+        truncate_to_inner_budget(&mut scored, nprobe, selected_superfiles, |e| e.score);
+        for leaf in scored {
+            for (uri, probe) in leaf.fragments {
+                out.entry(uri).or_default().push(probe);
+            }
         }
     }
-    for run_ids in out.values_mut() {
-        run_ids.sort_unstable();
-        run_ids.dedup();
+    for probes in out.values_mut() {
+        probes.sort_unstable_by_key(|probe| {
+            (
+                probe.run_id,
+                probe
+                    .body_range
+                    .as_ref()
+                    .map(|range| range.start)
+                    .unwrap_or(0),
+                probe
+                    .body_range
+                    .as_ref()
+                    .map(|range| range.end)
+                    .unwrap_or(0),
+            )
+        });
+        probes.dedup_by_key(|probe| {
+            (
+                probe.run_id,
+                probe
+                    .body_range
+                    .as_ref()
+                    .map(|range| range.start)
+                    .unwrap_or(0),
+                probe
+                    .body_range
+                    .as_ref()
+                    .map(|range| range.end)
+                    .unwrap_or(0),
+            )
+        });
     }
     out
+}
+
+fn manifest_run_body_range(entry: &SuperfileEntry, byte_range: (u64, u64)) -> Option<Range<usize>> {
+    let (vec_offset, vec_len) = entry.subsection_offsets.as_ref()?.vec?;
+    let (abs_start, len) = byte_range;
+    let abs_end = abs_start.checked_add(len)?;
+    let vec_end = vec_offset.checked_add(vec_len)?;
+    if abs_start < vec_offset || abs_end > vec_end {
+        return None;
+    }
+    let rel_start = usize::try_from(abs_start - vec_offset).ok()?;
+    let rel_len = usize::try_from(len).ok()?;
+    let rel_end = rel_start.checked_add(rel_len)?;
+    Some(rel_start..rel_end)
+}
+
+fn spfresh_hits_with_entry(
+    entry: &SuperfileEntry,
+    hits: Vec<SpfreshSearchHit>,
+) -> Vec<SuperfileHit> {
+    hits.into_iter()
+        .map(|hit| SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id: hit.local_doc_id,
+            score: hit.score,
+            stable_id: Some(hit.stable_id),
+        })
+        .collect()
 }
 
 fn decode_manifest_centroid(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
@@ -742,7 +824,7 @@ impl SupertableReader {
         let resident_spfresh_centroids = self.resident_spfresh_centroids();
         let resident_spfresh_centroids =
             (!resident_spfresh_centroids.is_empty()).then_some(resident_spfresh_centroids);
-        let spfresh_runs = spfresh_run_ids_by_superfile(
+        let spfresh_runs = spfresh_run_probes_by_superfile(
             manifest.get_spfresh_routing(),
             column,
             &superfiles,
@@ -848,6 +930,7 @@ impl SupertableReader {
         let deleted_for_kernel = hidden_deleted.clone();
         let kernel =
             move |reader: Arc<SuperfileReader>,
+                  entry: Arc<SuperfileEntry>,
                   (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
@@ -881,31 +964,51 @@ impl SupertableReader {
                     };
                     let deny = deny.map(Arc::new);
                     let res = match probe {
-                        Probe::Clusters(ids) => reader
-                            .vector_search_clusters_filtered(
-                                &column, &query, k, &ids, options, bitmap, deny,
-                            )
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string())),
-                        Probe::Nprobe => reader
-                            .vector_hits_filtered_async(&column, &query, k, options, bitmap, deny)
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string())),
+                        Probe::Clusters(ids) => {
+                            let hits = reader
+                                .vector_search_clusters_filtered(
+                                    &column, &query, k, &ids, options, bitmap, deny,
+                                )
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                            Ok(dispatch::tag_hits(&entry, hits))
+                        }
+                        Probe::Nprobe => {
+                            let hits = reader
+                                .vector_hits_filtered_async(
+                                    &column, &query, k, options, bitmap, deny,
+                                )
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                            Ok(dispatch::tag_hits(&entry, hits))
+                        }
                         Probe::SpfreshRuns(run_ids) => {
                             let spfresh = reader.spfresh_vec().ok_or_else(|| {
                                 QueryError::Parquet("SPFresh vector blob missing".into())
                             })?;
-                            let run_ids =
-                                run_ids.unwrap_or_else(|| (0..spfresh.runs().len()).collect());
-                            spfresh
-                                .search_runs_filtered(
-                                    &run_ids,
+                            let probes = run_ids.unwrap_or_else(|| {
+                                spfresh
+                                    .runs()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(run_id, run)| SpfreshRunProbe {
+                                        run_id,
+                                        body_range: None,
+                                        row_count: run.row_count,
+                                    })
+                                    .collect()
+                            });
+                            let hits = spfresh
+                                .search_run_probes_filtered_with_stable_ids_async(
+                                    &probes,
                                     &query,
                                     k,
                                     bitmap.as_deref(),
                                     deny.as_deref(),
                                 )
-                                .map_err(|e| QueryError::Parquet(e.to_string()))
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                            Ok(spfresh_hits_with_entry(&entry, hits))
                         }
                     };
                     res
@@ -923,17 +1026,13 @@ impl SupertableReader {
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(if use_untombstoned {
-                    dispatch::fanout_untombstoned(self, wave, kernel.clone()).await?
-                } else {
-                    dispatch::fanout(self, wave, kernel.clone()).await?
-                });
+                collected.extend(
+                    dispatch::fanout_hits(self, wave, !use_untombstoned, kernel.clone()).await?,
+                );
             }
             collected
-        } else if use_untombstoned {
-            dispatch::fanout_untombstoned(self, units, kernel).await?
         } else {
-            dispatch::fanout(self, units, kernel).await?
+            dispatch::fanout_hits(self, units, !use_untombstoned, kernel).await?
         };
 
         let mut hits = top_k_ascending(per_superfile, k);
@@ -1626,7 +1725,10 @@ mod tests {
             Supertable, SupertableOptions,
             error::QueryError,
             hidden_centroids::ResidentCentroids,
-            manifest::list::{CellTree, CellTreeNode, RunRef, SpfreshRoutingIndex},
+            manifest::list::{
+                CellTree, CellTreeNode, ClusterRef, RunFragment, RunFragmentKind,
+                SpfreshRoutingIndex,
+            },
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -1924,27 +2026,33 @@ mod tests {
                     },
                 ],
                 leaves: vec![
-                    RunRef {
-                        superfile_uri: id.to_string(),
+                    ClusterRef {
                         cell_id: 2,
                         cluster_id: 0,
-                        run_id: 3,
-                        byte_range: (10, 20),
-                        row_count: 4,
+                        fragments: vec![RunFragment {
+                            superfile_uri: id.to_string(),
+                            run_id: 3,
+                            byte_range: (10, 20),
+                            row_count: 4,
+                            kind: RunFragmentKind::Base,
+                        }],
                     },
-                    RunRef {
-                        superfile_uri: id.to_string(),
+                    ClusterRef {
                         cell_id: 2,
                         cluster_id: 1,
-                        run_id: 1,
-                        byte_range: (30, 20),
-                        row_count: 4,
+                        fragments: vec![RunFragment {
+                            superfile_uri: id.to_string(),
+                            run_id: 1,
+                            byte_range: (30, 20),
+                            row_count: 4,
+                            kind: RunFragmentKind::Base,
+                        }],
                     },
                 ],
             }],
         };
 
-        let selected = super::spfresh_run_ids_by_superfile(
+        let selected = super::spfresh_run_probes_by_superfile(
             Some(routing),
             "emb",
             &[entry.clone()],
@@ -1953,7 +2061,11 @@ mod tests {
             1,
             None,
         );
-        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize]));
+        let probes = selected.get(&entry.uri).expect("selected probes");
+        assert_eq!(
+            probes.iter().map(|probe| probe.run_id).collect::<Vec<_>>(),
+            vec![1usize]
+        );
     }
 
     #[test]
@@ -1982,21 +2094,36 @@ mod tests {
                 cell_id: 2,
                 nodes: Vec::new(),
                 leaves: vec![
-                    RunRef {
-                        superfile_uri: id.to_string(),
+                    ClusterRef {
                         cell_id: 2,
                         cluster_id: 0,
-                        run_id: 3,
-                        byte_range: (10, 20),
-                        row_count: 4,
+                        fragments: vec![RunFragment {
+                            superfile_uri: id.to_string(),
+                            run_id: 3,
+                            byte_range: (10, 20),
+                            row_count: 4,
+                            kind: RunFragmentKind::Delta,
+                        }],
                     },
-                    RunRef {
-                        superfile_uri: id.to_string(),
+                    ClusterRef {
                         cell_id: 2,
                         cluster_id: 1,
-                        run_id: 1,
-                        byte_range: (30, 20),
-                        row_count: 4,
+                        fragments: vec![
+                            RunFragment {
+                                superfile_uri: id.to_string(),
+                                run_id: 1,
+                                byte_range: (30, 20),
+                                row_count: 4,
+                                kind: RunFragmentKind::Base,
+                            },
+                            RunFragment {
+                                superfile_uri: id.to_string(),
+                                run_id: 2,
+                                byte_range: (50, 20),
+                                row_count: 4,
+                                kind: RunFragmentKind::Delta,
+                            },
+                        ],
                     },
                 ],
             }],
@@ -2006,7 +2133,7 @@ mod tests {
             centroids: Arc::from(vec![0.0f32, 100.0]),
         };
 
-        let selected = super::spfresh_run_ids_by_superfile(
+        let selected = super::spfresh_run_probes_by_superfile(
             Some(routing),
             "emb",
             &[entry.clone()],
@@ -2015,7 +2142,11 @@ mod tests {
             1,
             Some(&resident),
         );
-        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize]));
+        let probes = selected.get(&entry.uri).expect("selected probes");
+        assert_eq!(
+            probes.iter().map(|probe| probe.run_id).collect::<Vec<_>>(),
+            vec![1usize, 2usize]
+        );
     }
 
     #[test]
