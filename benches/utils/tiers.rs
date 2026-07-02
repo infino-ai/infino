@@ -7,8 +7,9 @@
 //! - **Cold**: fresh disk cache per iteration → object-store range GETs.
 //!
 //! Backend is chosen explicitly by `INFINO_BENCH_STORE` (`s3s_fs` default |
-//! `s3` | `azure`) — never inferred from which credential is set. `s3` reads
-//! `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`.
+//! `s3` | `azure` | `gcs`) — never inferred from which credential is set. `s3`
+//! reads `INFINO_REAL_S3_BUCKET`, `azure` reads `INFINO_REAL_AZURE_CONTAINER`,
+//! `gcs` reads `INFINO_REAL_GCS_BUCKET`.
 
 use std::{
     net::SocketAddr,
@@ -22,7 +23,7 @@ use infino::{
         SuperfileUri, Supertable, SupertableOptions,
         manifest::SubsectionOffsets,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
-        storage::{AzureStorageProvider, S3StorageProvider, StorageProvider},
+        storage::{AzureStorageProvider, GcsStorageProvider, S3StorageProvider, StorageProvider},
     },
 };
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
@@ -30,7 +31,9 @@ use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, runtime::Runtime};
 
-use crate::storage_options::{azure_storage_options_from_env, s3_storage_options_from_env};
+use crate::storage_options::{
+    azure_storage_options_from_env, gcs_storage_options_from_env, s3_storage_options_from_env,
+};
 
 const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
@@ -88,7 +91,7 @@ pub fn search_group_name(family: &str, tier: Tier, storage_label: Option<&str>) 
 pub struct StorageFixture {
     pub storage: Arc<dyn StorageProvider>,
     pub storage_label: &'static str,
-    /// `true` for a real remote backend (S3 or Azure), `false` for the
+    /// `true` for a real remote backend (S3, Azure, or GCS), `false` for the
     /// in-process s3s-fs emulator.
     pub remote: bool,
     /// Remote prefix to delete when the run finishes (`None` for the
@@ -116,7 +119,7 @@ pub struct PrefixCleanup {
     label: &'static str,
 }
 
-/// Delete every object under a bench prefix on its (S3 or Azure) backend.
+/// Delete every object under a bench prefix on its (S3, Azure, or GCS) backend.
 pub fn cleanup_prefix(cleanup: &PrefixCleanup) {
     let root = Arc::clone(&cleanup.root);
     let prefix = cleanup.prefix.clone();
@@ -213,14 +216,24 @@ fn azure_prefix_root(default: &str) -> String {
     std::env::var("INFINO_REAL_AZURE_PREFIX").unwrap_or_else(|_| default.to_string())
 }
 
+fn gcs_bucket_env() -> Option<String> {
+    std::env::var("INFINO_REAL_GCS_BUCKET")
+        .or_else(|_| std::env::var("INFINO_TEST_REAL_GCS_BUCKET"))
+        .ok()
+}
+
+fn gcs_prefix_root(default: &str) -> String {
+    std::env::var("INFINO_REAL_GCS_PREFIX").unwrap_or_else(|_| default.to_string())
+}
+
 /// Whether to retain the run's unique prefix instead of deleting it.
 fn keep_table() -> bool {
     std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some()
 }
 
 /// The object-store backend a run targets, chosen explicitly by
-/// `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure`) — never inferred
-/// from which credential happens to be set.
+/// `INFINO_BENCH_STORE` (`s3s_fs` default | `s3` | `azure` | `gcs`) — never
+/// inferred from which credential happens to be set.
 #[derive(Debug, PartialEq, Eq)]
 enum Backend {
     /// In-process s3s-fs emulator (no creds, no network).
@@ -229,12 +242,19 @@ enum Backend {
     S3 { bucket: String },
     /// Real Azure Blob.
     Azure { container: String },
+    /// Real Google Cloud Storage.
+    Gcs { bucket: String },
 }
 
 impl Backend {
     fn from_env() -> Result<Self, String> {
         let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
-        Self::parse(&store, real_s3_bucket_env(), azure_container_env())
+        Self::parse(
+            &store,
+            real_s3_bucket_env(),
+            azure_container_env(),
+            gcs_bucket_env(),
+        )
     }
 
     /// Pure resolution: real backends require their location env. Split out
@@ -243,6 +263,7 @@ impl Backend {
         store: &str,
         s3_bucket: Option<String>,
         azure_container: Option<String>,
+        gcs_bucket: Option<String>,
     ) -> Result<Self, String> {
         match store {
             "s3s_fs" => Ok(Self::S3sFs),
@@ -254,8 +275,13 @@ impl Backend {
                 .ok_or_else(|| {
                     "INFINO_BENCH_STORE=azure requires INFINO_REAL_AZURE_CONTAINER".to_string()
                 }),
+            "gcs" => gcs_bucket
+                .map(|bucket| Self::Gcs { bucket })
+                .ok_or_else(|| {
+                    "INFINO_BENCH_STORE=gcs requires INFINO_REAL_GCS_BUCKET".to_string()
+                }),
             other => Err(format!(
-                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure)"
+                "unknown INFINO_BENCH_STORE={other} (want s3s_fs|s3|azure|gcs)"
             )),
         }
     }
@@ -265,6 +291,7 @@ impl Backend {
             Self::S3sFs => "s3s_fs",
             Self::S3 { .. } => "s3",
             Self::Azure { .. } => "azure",
+            Self::Gcs { .. } => "gcs",
         }
     }
 
@@ -274,6 +301,7 @@ impl Backend {
             Self::S3sFs => default.to_string(),
             Self::S3 { .. } => real_s3_prefix_root(default),
             Self::Azure { .. } => azure_prefix_root(default),
+            Self::Gcs { .. } => gcs_prefix_root(default),
         }
     }
 
@@ -293,6 +321,14 @@ impl Backend {
                     &azure_storage_options_from_env(),
                 )
                 .expect("real Azure provider"),
+            )),
+            Self::Gcs { bucket } => Some(Arc::new(
+                GcsStorageProvider::new_with_prefix(
+                    bucket,
+                    prefix,
+                    &gcs_storage_options_from_env(),
+                )
+                .expect("real GCS provider"),
             )),
         }
     }
@@ -355,7 +391,7 @@ async fn spawn_s3s_fs(s3s_bucket: &str) -> (SocketAddr, TempDir) {
     (addr, fs_root)
 }
 
-/// Build the fixture for a real backend (S3 or Azure): a unique prefix, a
+/// Build the fixture for a real backend (S3, Azure, or GCS): a unique prefix, a
 /// prefix-scoped provider, and — unless `INFINO_BENCH_KEEP_TABLE` — a cleanup
 /// over that prefix on the bucket/container root.
 fn remote_fixture(backend: Backend, prefix_default: &str) -> StorageFixture {
@@ -424,15 +460,16 @@ async fn backing_store(s3s_bucket: &str, prefix_default: &str) -> StorageFixture
 /// pre-flight ([`supertable_backend_check`]) and this fixture agree.
 pub const SUPERTABLE_REQUIRES_REAL_OBJECT_STORE: &str = "\
 the supertable object-store bench requires a real object store. Set \
-INFINO_BENCH_STORE=s3 (+ INFINO_REAL_S3_BUCKET + AWS creds) or =azure (+ \
-INFINO_REAL_AZURE_CONTAINER + AZURE_STORAGE_ACCOUNT_NAME/_KEY). The s3s-fs \
+INFINO_BENCH_STORE=s3 (+ INFINO_REAL_S3_BUCKET + AWS creds), =azure (+ \
+INFINO_REAL_AZURE_CONTAINER + AZURE_STORAGE_ACCOUNT_NAME/_KEY), or =gcs (+ \
+INFINO_REAL_GCS_BUCKET + GOOGLE_APPLICATION_CREDENTIALS). The s3s-fs \
 emulator is not usable here: it does not implement conditional If-Match PUTs, \
 which the supertable's multi-commit OCC requires, so every commit after the \
 first would lose the CAS.";
 
 /// Supertable-shaped backing store (multi-superfile, multi-commit benches).
 ///
-/// **Real object store only** (S3 or Azure). The supertable build commits
+/// **Real object store only** (S3, Azure, or GCS). The supertable build commits
 /// many times, so its OCC pointer update rides on the conditional `If-Match`
 /// PUT. The in-process `s3s-fs` emulator does not implement those (every
 /// commit after the first loses the CAS), so this fixture rejects it and
@@ -724,43 +761,62 @@ mod tests {
 
     #[test]
     fn parse_defaults_to_s3s_fs() {
-        assert_eq!(Backend::parse("s3s_fs", None, None), Ok(Backend::S3sFs));
+        assert_eq!(
+            Backend::parse("s3s_fs", None, None, None),
+            Ok(Backend::S3sFs)
+        );
     }
 
     #[test]
     fn parse_s3_needs_bucket() {
         assert_eq!(
-            Backend::parse("s3", Some("bkt".into()), None),
+            Backend::parse("s3", Some("bkt".into()), None, None),
             Ok(Backend::S3 {
                 bucket: "bkt".into()
             })
         );
-        assert!(Backend::parse("s3", None, None).is_err());
+        assert!(Backend::parse("s3", None, None, None).is_err());
     }
 
     #[test]
     fn parse_azure_needs_container() {
         assert_eq!(
-            Backend::parse("azure", None, Some("c".into())),
+            Backend::parse("azure", None, Some("c".into()), None),
             Ok(Backend::Azure {
                 container: "c".into()
             })
         );
-        assert!(Backend::parse("azure", None, None).is_err());
+        assert!(Backend::parse("azure", None, None, None).is_err());
+    }
+
+    #[test]
+    fn parse_gcs_needs_bucket() {
+        assert_eq!(
+            Backend::parse("gcs", None, None, Some("bkt".into())),
+            Ok(Backend::Gcs {
+                bucket: "bkt".into()
+            })
+        );
+        assert!(Backend::parse("gcs", None, None, None).is_err());
     }
 
     #[test]
     fn parse_does_not_infer_from_creds() {
         // Creds present but store=s3s_fs → still the emulator.
         assert_eq!(
-            Backend::parse("s3s_fs", Some("bkt".into()), Some("c".into())),
+            Backend::parse(
+                "s3s_fs",
+                Some("bkt".into()),
+                Some("c".into()),
+                Some("g".into())
+            ),
             Ok(Backend::S3sFs)
         );
     }
 
     #[test]
     fn parse_rejects_unknown_store() {
-        assert!(Backend::parse("gcs", None, None).is_err());
+        assert!(Backend::parse("r2", None, None, None).is_err());
     }
 
     #[test]
@@ -774,5 +830,6 @@ mod tests {
             .label(),
             "azure"
         );
+        assert_eq!(Backend::Gcs { bucket: "b".into() }.label(), "gcs");
     }
 }

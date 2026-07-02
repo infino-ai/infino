@@ -37,3 +37,13 @@ pub fn azure_storage_options_from_env() -> HashMap<String, String> {
         ("AZURE_STORAGE_ACCOUNT_KEY", "azure_storage_account_key"),
     ])
 }
+
+/// Standard GCS credential options from the environment.
+/// `GOOGLE_APPLICATION_CREDENTIALS` (a service-account key path) maps to
+/// object_store's `google_service_account`.
+pub fn gcs_storage_options_from_env() -> HashMap<String, String> {
+    storage_options_from_env(&[
+        ("GOOGLE_APPLICATION_CREDENTIALS", "google_service_account"),
+        ("GOOGLE_SERVICE_ACCOUNT_KEY", "google_service_account_key"),
+    ])
+}

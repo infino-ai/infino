@@ -89,6 +89,7 @@ which credentials happen to be set:
 | _unset_ / `s3s_fs` | in-process s3s-fs emulator | — |
 | `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
 | `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
+| `gcs` | real Google Cloud Storage | `INFINO_REAL_GCS_BUCKET` + `GOOGLE_APPLICATION_CREDENTIALS` (service-account key path) |
 
 ```sh
 # Superfile cold tiers: any backend (s3s-fs is the zero-setup default).
