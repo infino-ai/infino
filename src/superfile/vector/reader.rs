@@ -1590,31 +1590,45 @@ impl VectorReader {
             .iter()
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
-        let survivor_only_rerank_fetch = true;
-        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
-        {
-            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                let mut fetched = self
-                    .source
-                    .get_ranges_parallel_async(&[range])
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                fetched.pop()
+        let (cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
+            if let Some(prefix_blocks) = prefix_blocks_sync {
+                // Warm: prefixes resident. Keep the survivor-only rerank
+                // split — the survivor `full[]` rows resolve sync/zero-copy
+                // below (no round-trip), so there is nothing to coalesce and
+                // we avoid touching the unneeded rerank bytes.
+                let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                    let mut fetched = self
+                        .source
+                        .get_ranges_parallel_async(&[range])
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    fetched.pop()
+                } else {
+                    None
+                };
+                (prefix_blocks, meta_bytes, true)
             } else {
-                None
+                // Cold: fetch the **full** per-cluster blocks
+                // (`[codes][doc_ids][full]`) + Sq8 meta in one coalesced batch, so
+                // the survivor rerank rows arrive *with* the codes — collapsing the
+                // dependent rerank round-trip into this wave. Cold latency is
+                // RTT/wave-bound, so trading a few extra rerank bytes for one fewer
+                // serial round-trip on object storage is a win.
+                // `survivor_only_rerank_fetch = false` tells `build_shortlist` the
+                // rerank rows are in-block (no second fetch).
+                let cluster_full_ranges: Vec<Range<usize>> = cluster_meta
+                    .iter()
+                    .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
+                    .collect();
+                let (blocks, meta) = get_cluster_ranges_coalesced_with_extra_async(
+                    &self.source,
+                    &cluster_full_ranges,
+                    lazy_sq8_meta_range,
+                )
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                (blocks, meta, false)
             };
-            (prefix_blocks, meta_bytes)
-        } else {
-            // Cold: codes+doc_ids prefixes (coalesced) + Sq8 meta in one
-            // concurrent batch on the caller's runtime.
-            get_cluster_ranges_coalesced_with_extra_async(
-                &self.source,
-                &cluster_prefix_ranges,
-                lazy_sq8_meta_range,
-            )
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?
-        };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
         // Shared pure-CPU shortlist + candidate-build stage (see
