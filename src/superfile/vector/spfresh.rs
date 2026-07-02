@@ -32,6 +32,7 @@ use crate::superfile::{
             Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel, dequantize_sq8_residual_into,
             distance,
         },
+        kmeans::kmeans_with_assignments,
         layout::VectorLayout,
     },
 };
@@ -47,11 +48,13 @@ const F32_BYTES: usize = 4;
 const METRIC_BYTES: usize = 1;
 const HEADER_RESERVED_BYTES: usize = 3;
 const ROW_BYTES_PER_DIM: usize = 2;
-const RUN_DIR_ENTRY_BYTES: usize = 28;
+const RUN_DIR_ENTRY_BYTES: usize = 24;
 const HEADER_BYTES: usize =
     MAGIC.len() + U32_BYTES + METRIC_BYTES + HEADER_RESERVED_BYTES + U32_BYTES + U32_BYTES;
-const RUN_CELL_ID_OFF: usize = 0;
-const RUN_CLUSTER_ID_OFF: usize = RUN_CELL_ID_OFF + U32_BYTES;
+// A run's identity is its fine centroid (`cluster_id`); the coarse VectorCell is
+// a superfile-level property (partition_hint / manifest cell tree), not stamped
+// per run.
+const RUN_CLUSTER_ID_OFF: usize = 0;
 const RUN_ROW_COUNT_OFF: usize = RUN_CLUSTER_ID_OFF + U32_BYTES;
 const RUN_BODY_OFFSET_OFF: usize = RUN_ROW_COUNT_OFF + U32_BYTES;
 const RUN_BODY_LENGTH_OFF: usize = RUN_BODY_OFFSET_OFF + U64_BYTES;
@@ -68,6 +71,17 @@ pub(crate) const REPLICATION_EPS_ENV: &str = "INFINO_REPLICATION_EPS";
 /// pruning normally keeps the count well below this; the cap only guards
 /// pathological dense regions where many centroids fall inside the closure.
 const REPLICA_CAP: usize = 8;
+
+/// Target byte size of one cluster run — the load-bearing ~2 MB invariant that
+/// keeps a single probe one cheap range GET regardless of corpus size. The fine
+/// centroid count is derived from this target, never fixed.
+const TARGET_RUN_BYTES: usize = 2 * 1024 * 1024;
+
+/// Lloyd iterations when training fine centroids for one coarse cell at drain.
+const FINE_KMEANS_ITERS: usize = 8;
+
+/// Deterministic seed for fine-centroid training so a re-drain is reproducible.
+const FINE_KMEANS_SEED: u64 = 0x5F1E_A17E;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HiddenIndexLayout {
@@ -124,14 +138,12 @@ pub(crate) struct SpfreshBlobBuilder {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunInput {
-    pub(crate) cell_id: u32,
     pub(crate) cluster_id: u32,
     pub(crate) rows: Vec<MaterializedIvfRow>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SpfreshRun {
-    pub(crate) cell_id: u32,
     pub(crate) cluster_id: u32,
     pub(crate) row_count: u32,
     body_range: Range<usize>,
@@ -148,7 +160,6 @@ pub(crate) struct SpfreshBlobReader {
 
 #[derive(Debug, Clone)]
 struct EncodedRun {
-    cell_id: u32,
     cluster_id: u32,
     row_count: u32,
     body: Vec<u8>,
@@ -156,7 +167,6 @@ struct EncodedRun {
 
 #[derive(Debug, Clone)]
 struct Fp32RunInput {
-    cell_id: u32,
     cluster_id: u32,
     local_ids: Vec<u32>,
     stable_ids: Vec<i128>,
@@ -277,7 +287,6 @@ impl SpfreshBlobReader {
         let mut runs = Vec::with_capacity(run_count);
         for run_idx in 0..run_count {
             let entry = HEADER_BYTES + run_idx * RUN_DIR_ENTRY_BYTES;
-            let cell_id = read_u32_at(&bytes, entry + RUN_CELL_ID_OFF, "cell_id")?;
             let cluster_id = read_u32_at(&bytes, entry + RUN_CLUSTER_ID_OFF, "cluster_id")?;
             let row_count = read_u32_at(&bytes, entry + RUN_ROW_COUNT_OFF, "row_count")?;
             let body_offset =
@@ -297,7 +306,6 @@ impl SpfreshBlobReader {
                 )));
             }
             runs.push(SpfreshRun {
-                cell_id,
                 cluster_id,
                 row_count,
                 body_range: body_offset..body_end,
@@ -341,11 +349,11 @@ impl SpfreshBlobReader {
     }
 
     #[cfg(test)]
-    pub(crate) fn runs_for_cell(&self, cell_id: u32) -> Vec<usize> {
+    pub(crate) fn runs_for_cluster(&self, cluster_id: u32) -> Vec<usize> {
         self.runs
             .iter()
             .enumerate()
-            .filter_map(|(idx, run)| (run.cell_id == cell_id).then_some(idx))
+            .filter_map(|(idx, run)| (run.cluster_id == cluster_id).then_some(idx))
             .collect()
     }
 
@@ -474,7 +482,6 @@ fn encode_blob(metric: Metric, dim: usize, runs: &[EncodedRun]) -> Result<Vec<u8
     out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
     out.extend_from_slice(&row_count.to_le_bytes());
     for run in runs {
-        out.extend_from_slice(&run.cell_id.to_le_bytes());
         out.extend_from_slice(&run.cluster_id.to_le_bytes());
         out.extend_from_slice(&run.row_count.to_le_bytes());
         out.extend_from_slice(&(body_offset as u64).to_le_bytes());
@@ -497,7 +504,6 @@ fn materialized_rows_to_runs(rows: Vec<MaterializedIvfRow>) -> Vec<RunInput> {
     groups
         .into_iter()
         .map(|(cluster, rows)| RunInput {
-            cell_id: cluster,
             cluster_id: cluster,
             rows,
         })
@@ -520,7 +526,6 @@ fn fp32_rows_to_runs(col: &ColumnState) -> Vec<Fp32RunInput> {
         };
         for cell in cells {
             let entry = grouped.entry(cell).or_insert_with(|| Fp32RunInput {
-                cell_id: cell,
                 cluster_id: cell,
                 local_ids: Vec::new(),
                 stable_ids: Vec::new(),
@@ -532,7 +537,7 @@ fn fp32_rows_to_runs(col: &ColumnState) -> Vec<Fp32RunInput> {
         }
     }
     let mut runs: Vec<Fp32RunInput> = grouped.into_values().collect();
-    runs.sort_by_key(|run| (run.cell_id, run.cluster_id));
+    runs.sort_by_key(|run| run.cluster_id);
     runs
 }
 
@@ -617,6 +622,62 @@ pub(crate) fn assign_replicas(
     kept
 }
 
+/// Per-row byte cost inside a run body: Sq8 codes + residuals, the local id, the
+/// stable id, and a norm word (present for L2/Cosine; counted always so runs
+/// stay at or under the target).
+fn run_row_stride(dim: usize) -> usize {
+    dim * ROW_BYTES_PER_DIM + U32_BYTES + I128_BYTES + F32_BYTES
+}
+
+/// Number of fine centroids (~2 MB runs) for `n_rows`, derived from the run-size
+/// invariant rather than a fixed constant. Always `>= 1` and never exceeds
+/// `n_rows`.
+fn fine_centroid_count_for_target(n_rows: usize, dim: usize, target_bytes: usize) -> usize {
+    if n_rows <= 1 {
+        return 1;
+    }
+    let per_run = (target_bytes / run_row_stride(dim)).max(1);
+    n_rows.div_ceil(per_run).clamp(1, n_rows)
+}
+
+/// Train fine centroids over one coarse cell's `rows` and set each row's
+/// `cluster` to its fine-centroid id (`0..k_fine`). Hard assignment (eps=0) —
+/// boundary replication over the global fine set is layered on separately by the
+/// drain via [`assign_replicas`]. Fine centroids are trained per coarse cell, so
+/// ids are cell-local; the manifest keys runs by the owning coarse cell.
+pub(crate) fn assign_fine_clusters(rows: &mut [MaterializedIvfRow], dim: usize) {
+    assign_fine_clusters_for_target(rows, dim, TARGET_RUN_BYTES)
+}
+
+fn assign_fine_clusters_for_target(
+    rows: &mut [MaterializedIvfRow],
+    dim: usize,
+    target_bytes: usize,
+) {
+    let k_fine = fine_centroid_count_for_target(rows.len(), dim, target_bytes);
+    if k_fine <= 1 {
+        for row in rows.iter_mut() {
+            row.cluster = 0;
+        }
+        return;
+    }
+    let mut fp32 = vec![0f32; rows.len() * dim];
+    for (i, row) in rows.iter().enumerate() {
+        dequantize_sq8_residual_into(
+            &row.encoded.scale,
+            &row.encoded.offset,
+            &row.encoded.codes,
+            &row.encoded.residuals,
+            &mut fp32[i * dim..(i + 1) * dim],
+        );
+    }
+    let (_, assignments) =
+        kmeans_with_assignments(&fp32, dim, k_fine, FINE_KMEANS_ITERS, FINE_KMEANS_SEED);
+    for (row, cluster) in rows.iter_mut().zip(assignments) {
+        row.cluster = cluster;
+    }
+}
+
 fn encode_materialized_run(
     metric: Metric,
     dim: usize,
@@ -646,7 +707,6 @@ fn encode_materialized_run(
         }
     }
     Ok(EncodedRun {
-        cell_id: run.cell_id,
         cluster_id: run.cluster_id,
         row_count: row_count as u32,
         body: encode_run_body(
@@ -706,7 +766,6 @@ fn encode_fp32_run(
         }
     }
     Ok(EncodedRun {
-        cell_id: run.cell_id,
         cluster_id: run.cluster_id,
         row_count: row_count as u32,
         body: encode_run_body(
@@ -1039,7 +1098,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        HiddenIndexLayout, RunInput, SpfreshBlobReader, assign_replicas, encode_materialized_runs,
+        HiddenIndexLayout, RunInput, SpfreshBlobReader, assign_fine_clusters_for_target,
+        assign_replicas, encode_materialized_runs, fine_centroid_count_for_target,
         parse_hidden_index_layout,
     };
     use crate::superfile::vector::{
@@ -1110,6 +1170,44 @@ mod tests {
     }
 
     #[test]
+    fn fine_centroid_count_scales_with_rows() {
+        // dim=16 -> run_row_stride = 16*2 + 4 + 16 + 4 = 56 bytes/row; a 5600
+        // byte target holds 100 rows per run, so K grows with the row count.
+        assert_eq!(fine_centroid_count_for_target(1000, 16, 5600), 10);
+        assert_eq!(fine_centroid_count_for_target(50, 16, 5600), 1);
+        assert_eq!(fine_centroid_count_for_target(0, 16, 5600), 1);
+        assert_eq!(fine_centroid_count_for_target(1, 16, 5600), 1);
+        // Tiny target: per-run clamps to >=1 row and K never exceeds n_rows.
+        assert_eq!(fine_centroid_count_for_target(5, 16, 56), 5);
+    }
+
+    #[test]
+    fn assign_fine_clusters_single_run_for_small_input() {
+        let mut rows = materialized_rows(16, 0, 4, 0);
+        // Large target -> one run; every row lands in fine cluster 0.
+        assign_fine_clusters_for_target(&mut rows, 16, 1 << 20);
+        assert!(rows.iter().all(|r| r.cluster == 0));
+    }
+
+    #[test]
+    fn assign_fine_clusters_splits_separated_rows() {
+        // Two tight groups on dim 0 (values ~0 and ~100). A small target forces
+        // k_fine=2; k-means separates them into distinct fine clusters.
+        let mut rows = materialized_rows(16, 0, 2, 0);
+        rows.extend(materialized_rows(16, 100, 2, 100));
+        // 4 rows, 56 B/row, target 112 -> 2 rows/run -> k_fine=2.
+        assign_fine_clusters_for_target(&mut rows, 16, 112);
+        let low = rows[0].cluster;
+        let high = rows[2].cluster;
+        assert_ne!(
+            low, high,
+            "separated groups must get distinct fine clusters"
+        );
+        assert_eq!(rows[1].cluster, low);
+        assert_eq!(rows[3].cluster, high);
+    }
+
+    #[test]
     fn parses_layout_names() {
         assert_eq!(
             parse_hidden_index_layout("nested"),
@@ -1143,7 +1241,6 @@ mod tests {
             Metric::L2Sq,
             dim,
             &[RunInput {
-                cell_id: 7,
                 cluster_id: 11,
                 rows,
             }],
@@ -1154,7 +1251,6 @@ mod tests {
         assert_eq!(reader.metric(), Metric::L2Sq);
         assert_eq!(reader.n_rows(), 4);
         assert_eq!(reader.runs().len(), 1);
-        assert_eq!(reader.runs()[0].cell_id, 7);
         assert_eq!(reader.runs()[0].cluster_id, 11);
     }
 
@@ -1166,7 +1262,6 @@ mod tests {
             Metric::L2Sq,
             dim,
             &[RunInput {
-                cell_id: 5,
                 cluster_id: 5,
                 rows: rows.clone(),
             }],
@@ -1192,12 +1287,10 @@ mod tests {
     fn selected_run_fetch_uses_contiguous_body_range() {
         let dim = 16usize;
         let run_a = RunInput {
-            cell_id: 1,
             cluster_id: 1,
             rows: materialized_rows(dim, 0, 3, 0),
         };
         let run_b = RunInput {
-            cell_id: 2,
             cluster_id: 2,
             rows: materialized_rows(dim, 10, 2, 10),
         };
@@ -1207,7 +1300,7 @@ mod tests {
         let second = reader.run_range(1).expect("second range");
         assert!(first.end <= second.start);
         assert_eq!(reader.run_bytes(1).expect("run bytes").len(), second.len());
-        assert_eq!(reader.runs_for_cell(2), vec![1]);
+        assert_eq!(reader.runs_for_cluster(2), vec![1]);
     }
 
     #[test]
@@ -1218,7 +1311,6 @@ mod tests {
             Metric::L2Sq,
             dim,
             &[RunInput {
-                cell_id: 0,
                 cluster_id: 0,
                 rows,
             }],

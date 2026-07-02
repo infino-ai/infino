@@ -123,7 +123,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
-            spfresh::{HiddenIndexLayout, hidden_index_layout},
+            spfresh::{HiddenIndexLayout, assign_fine_clusters, hidden_index_layout},
         },
     },
     supertable::{
@@ -1797,6 +1797,11 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
                 "SPFresh hidden superfile missing vector subsection offsets".into(),
             ));
         };
+        // Group runs under the superfile's COARSE outer VectorCell
+        // (`partition_hint`), not the blob's internal run id. Fine-centroid runs
+        // carry a fine cluster id inside the blob, but outer routing and the
+        // per-cell tree are keyed by the coarse cell that owns the superfile.
+        let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
         let bytes = prep
             .bytes_for_store
             .as_ref()
@@ -1808,17 +1813,17 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
         let spfresh = reader.spfresh_vec().ok_or_else(|| {
             BuildError::Store("hidden superfile missing SPFresh vector blob".into())
         })?;
+        let cid = coarse_cell as usize;
+        while cid >= cells.len() {
+            cells.push(empty_cell_tree(cells.len() as u32));
+        }
         for (run_id, run) in spfresh.runs().iter().enumerate() {
             let range = spfresh
                 .run_range(run_id)
                 .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
-            let cell_id = run.cell_id as usize;
-            while cell_id >= cells.len() {
-                cells.push(empty_cell_tree(cells.len() as u32));
-            }
-            cells[cell_id].leaves.push(RunRef {
+            cells[cid].leaves.push(RunRef {
                 superfile_uri: prep.entry.uri.0.to_string(),
-                cell_id: run.cell_id,
+                cell_id: coarse_cell,
                 run_id: run_id as u32,
                 byte_range: (vec_offset + range.start as u64, range.len() as u64),
                 row_count: run.row_count,
@@ -2524,13 +2529,22 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
 
             crate::superfile::vector::builder::build_phase_timers::reset();
+            let vec_dim = running_clusters.dim as usize;
             let shards: Vec<(u32, ShardOutput, u32)> =
                 hidden_inner.options.writer_pool.install(|| {
                     by_cell
                         .into_par_iter()
                         .filter(|(_, rows)| !rows.is_empty())
                         .map(|(cell_id, mut rows)| {
-                            rows.sort_by_key(|r| r.stable_id);
+                            // SPFresh: partition this coarse cell's rows into
+                            // ~2 MB fine-centroid runs (the run key becomes the
+                            // fine cluster id). IVF keeps one run per cell.
+                            if hidden_vector_layout == VectorLayout::Spfresh {
+                                assign_fine_clusters(&mut rows, vec_dim);
+                                rows.sort_by_key(|r| (r.cluster, r.stable_id));
+                            } else {
+                                rows.sort_by_key(|r| r.stable_id);
+                            }
                             for (local, row) in rows.iter_mut().enumerate() {
                                 row.local_doc_id = local as u32;
                             }
@@ -3969,7 +3983,7 @@ mod tests {
             spfresh
                 .runs()
                 .iter()
-                .all(|run| run.cell_id < GLOBAL_VECTOR_CELL_COUNT as u32)
+                .all(|run| run.cluster_id < GLOBAL_VECTOR_CELL_COUNT as u32)
         );
     }
 
