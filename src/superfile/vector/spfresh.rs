@@ -13,7 +13,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     env,
     ops::Range,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use bytes::Bytes;
@@ -366,6 +366,22 @@ impl SpfreshBlobReader {
         }
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|hit| hit.0).collect();
         out.sort_by(|a, b| cmp_f32(a.1, b.1));
+        Ok(out)
+    }
+
+    pub(crate) fn materialized_rows(&self) -> Result<Vec<MaterializedIvfRow>, VectorError> {
+        let mut out = Vec::with_capacity(self.n_rows as usize);
+        for run in &self.runs {
+            let body = self.bytes.slice(run.body_range.clone());
+            decode_run_body_materialized(
+                &body,
+                self.dim,
+                self.metric,
+                run.cluster_id,
+                run.row_count as usize,
+                &mut out,
+            )?;
+        }
         Ok(out)
     }
 }
@@ -732,6 +748,52 @@ fn score_run_body(
     Ok(())
 }
 
+fn decode_run_body_materialized(
+    body: &[u8],
+    dim: usize,
+    metric: Metric,
+    cluster_id: u32,
+    row_count: usize,
+    out: &mut Vec<MaterializedIvfRow>,
+) -> Result<(), VectorError> {
+    let scale: Arc<[f32]> = read_f32_vec(body, 0, dim)?.into();
+    let offset: Arc<[f32]> = read_f32_vec(body, dim * F32_BYTES, dim)?.into();
+    let rows_start = dim * F32_BYTES * 2;
+    let rows_len = row_count * dim * ROW_BYTES_PER_DIM;
+    let ids_start = rows_start + rows_len;
+    let stable_ids_start = ids_start + row_count * U32_BYTES;
+    let norms_start = stable_ids_start + row_count * I128_BYTES;
+    let norms = if stores_norms(metric) {
+        Some(read_f32_vec(body, norms_start, row_count)?)
+    } else {
+        None
+    };
+    for row in 0..row_count {
+        let row_base = rows_start + row * dim * ROW_BYTES_PER_DIM;
+        let id_base = ids_start + row * U32_BYTES;
+        let stable_id_base = stable_ids_start + row * I128_BYTES;
+        let local_doc_id = read_u32_at(body, id_base, "local_id")?;
+        let stable_id = read_i128_at(body, stable_id_base, "stable_id")?;
+        let codes = body[row_base..row_base + dim].to_vec();
+        let residuals = body[row_base + dim..row_base + dim + dim].to_vec();
+        out.push(MaterializedIvfRow {
+            local_doc_id,
+            stable_id,
+            cluster: cluster_id,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::clone(&scale),
+                offset: Arc::clone(&offset),
+                codes,
+                residuals,
+                norm_sq: norms.as_ref().map(|values| values[row]),
+            },
+        });
+    }
+    Ok(())
+}
+
 fn run_body_len(dim: usize, metric: Metric, row_count: usize) -> usize {
     let quantizer_bytes = dim * F32_BYTES * 2;
     let row_bytes = row_count * dim * ROW_BYTES_PER_DIM;
@@ -787,6 +849,19 @@ fn read_u64_at(body: &[u8], offset: usize, field: &str) -> Result<u64, VectorErr
         .try_into()
         .map_err(|_| malformed(format!("SPFresh {field} slice")))?;
     Ok(u64::from_le_bytes(arr))
+}
+
+fn read_i128_at(body: &[u8], offset: usize, field: &str) -> Result<i128, VectorError> {
+    let end = offset
+        .checked_add(I128_BYTES)
+        .ok_or_else(|| malformed(format!("SPFresh {field} offset overflow")))?;
+    if end > body.len() {
+        return Err(malformed(format!("SPFresh {field} truncated")));
+    }
+    let arr: [u8; I128_BYTES] = body[offset..end]
+        .try_into()
+        .map_err(|_| malformed(format!("SPFresh {field} slice")))?;
+    Ok(i128::from_le_bytes(arr))
 }
 
 fn metric_id(metric: Metric) -> u8 {
@@ -898,6 +973,36 @@ mod tests {
         assert_eq!(reader.runs().len(), 1);
         assert_eq!(reader.runs()[0].cell_id, 7);
         assert_eq!(reader.runs()[0].cluster_id, 11);
+    }
+
+    #[test]
+    fn materialized_rows_round_trip_from_blob() {
+        let dim = 16usize;
+        let rows = materialized_rows(dim, 3, 4, 200);
+        let blob = encode_materialized_runs(
+            Metric::L2Sq,
+            dim,
+            &[RunInput {
+                cell_id: 5,
+                cluster_id: 5,
+                rows: rows.clone(),
+            }],
+        )
+        .expect("encode");
+        let reader = SpfreshBlobReader::open(Bytes::from(blob)).expect("open");
+        let decoded = reader.materialized_rows().expect("materialize");
+        assert_eq!(decoded.len(), rows.len());
+        for (actual, expected) in decoded.iter().zip(rows.iter()) {
+            assert_eq!(actual.local_doc_id, expected.local_doc_id);
+            assert_eq!(actual.stable_id, expected.stable_id);
+            assert_eq!(actual.cluster, 5);
+            assert_eq!(actual.encoded.stable_id, expected.stable_id);
+            assert_eq!(actual.encoded.codes.len(), dim);
+            assert_eq!(actual.encoded.residuals.len(), dim);
+            assert_eq!(actual.encoded.scale.len(), dim);
+            assert_eq!(actual.encoded.offset.len(), dim);
+            assert!(actual.encoded.norm_sq.is_some());
+        }
     }
 
     #[test]

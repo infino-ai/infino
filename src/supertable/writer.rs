@@ -133,7 +133,7 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::PartitionStrategy,
+            list::{CellTree, PartitionStrategy, RunRef, SpfreshRoutingIndex},
             part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
@@ -375,6 +375,26 @@ async fn materialized_ivf_rows_in_doc_order(
             })
         })
         .collect())
+}
+
+fn remap_materialized_stable_ids(
+    rows: &mut [MaterializedIvfRow],
+    stable_ids_by_local: &[i128],
+) -> Result<(), BuildError> {
+    for row in rows {
+        let stable_id = stable_ids_by_local
+            .get(row.local_doc_id as usize)
+            .copied()
+            .ok_or_else(|| {
+                BuildError::Store(format!(
+                    "materialized local id {} missing stable id",
+                    row.local_doc_id
+                ))
+            })?;
+        row.stable_id = stable_id;
+        row.encoded.stable_id = stable_id;
+    }
+    Ok(())
 }
 
 /// Split buffered rows into per-cell shards based on nearest centroid.
@@ -1736,6 +1756,75 @@ impl PreparedSuperfile {
     }
 }
 
+fn empty_cell_tree(cell_id: u32) -> CellTree {
+    CellTree {
+        cell_id,
+        nodes: Vec::new(),
+        leaves: Vec::new(),
+    }
+}
+
+fn extend_spfresh_routing(
+    existing: Option<SpfreshRoutingIndex>,
+    column: &str,
+    n_cells: u32,
+    prepared: &[PreparedSuperfile],
+) -> Result<SpfreshRoutingIndex, BuildError> {
+    let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
+    if let Some(existing) = existing
+        && existing.column == column
+    {
+        for cell in existing.cells {
+            let cell_id = cell.cell_id as usize;
+            while cell_id >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
+            }
+            cells[cell_id] = cell;
+        }
+    }
+
+    for prep in prepared {
+        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
+        else {
+            return Err(BuildError::Store(
+                "SPFresh hidden superfile missing vector subsection offsets".into(),
+            ));
+        };
+        let bytes = prep
+            .bytes_for_store
+            .as_ref()
+            .or(prep.bytes_for_storage.as_ref())
+            .or(prep.bytes_for_cache.as_ref())
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or_else(|| BuildError::Store("SPFresh prepared superfile missing bytes".into()))?;
+        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
+        let spfresh = reader.spfresh_vec().ok_or_else(|| {
+            BuildError::Store("hidden superfile missing SPFresh vector blob".into())
+        })?;
+        for (run_id, run) in spfresh.runs().iter().enumerate() {
+            let range = spfresh
+                .run_range(run_id)
+                .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
+            let cell_id = run.cell_id as usize;
+            while cell_id >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
+            }
+            cells[cell_id].leaves.push(RunRef {
+                superfile_uri: prep.entry.uri.0.to_string(),
+                cell_id: run.cell_id,
+                run_id: run_id as u32,
+                byte_range: (vec_offset + range.start as u64, range.len() as u64),
+                row_count: run.row_count,
+            });
+        }
+    }
+
+    Ok(SpfreshRoutingIndex {
+        column: column.into(),
+        cells,
+    })
+}
+
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
@@ -2197,7 +2286,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // assign-skip: SPFresh and the legacy global-centroid bench path both make
     // cluster c == cell c, so group by the row's own cluster ordinal instead
     // of the O(n·n_cent) per-row nearest-cell scoring.
-    let assign_skip = user_superfiles_use_global_centroids(hidden_inner.options.vector_layout);
+    let hidden_vector_layout = hidden_inner.options.vector_layout;
+    let assign_skip = user_superfiles_use_global_centroids(hidden_vector_layout);
     let column_name = column.clone();
 
     let drain_t0 = std::time::Instant::now();
@@ -2300,7 +2390,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let mut prepared: Vec<PreparedSuperfile> = Vec::new();
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
 
-        if mode == "splice" {
+        if mode == "splice" && hidden_vector_layout == VectorLayout::Ivf {
             let column_name_ref = column_name.as_str();
             let stable_ids_per_input: Vec<Vec<i128>> =
                 readers.iter().map(|(_, ids)| ids.clone()).collect();
@@ -2368,16 +2458,24 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 stream::iter(readers.iter().map(|(reader, stable_ids)| {
                     let column_for_mat = column_for_mat.clone();
                     async move {
-                        let vec_reader = reader.vec().ok_or_else(|| {
-                            BuildError::Store("user superfile missing vector index".into())
-                        })?;
-                        materialized_ivf_rows_in_doc_order(
-                            vec_reader,
-                            &column_for_mat,
-                            stable_ids,
-                            None,
-                        )
-                        .await
+                        if let Some(vec_reader) = reader.vec() {
+                            materialized_ivf_rows_in_doc_order(
+                                vec_reader,
+                                &column_for_mat,
+                                stable_ids,
+                                None,
+                            )
+                            .await
+                        } else {
+                            let spfresh = reader.spfresh_vec().ok_or_else(|| {
+                                BuildError::Store("user superfile missing vector index".into())
+                            })?;
+                            let mut rows = spfresh
+                                .materialized_rows()
+                                .map_err(|e| BuildError::Store(e.to_string()))?;
+                            remap_materialized_stable_ids(&mut rows, stable_ids)?;
+                            Ok(rows)
+                        }
                     }
                 }))
                 .buffered(commit_write_concurrency())
@@ -2424,7 +2522,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             let shard = build_one_shard_from_materialized(
                                 &rows,
                                 &hidden_inner.options,
-                                VectorLayout::Ivf,
+                                hidden_vector_layout,
                             )?;
                             Ok::<_, BuildError>((cell_id, shard, added))
                         })
@@ -2485,6 +2583,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         if prepared.is_empty() {
             continue;
         }
+        let spfresh_routing = if hidden_vector_layout == VectorLayout::Spfresh {
+            Some(extend_spfresh_routing(
+                hidden_inner.manifest.load_full().get_spfresh_routing(),
+                &column,
+                running_clusters.n_cent,
+                &prepared,
+            )?)
+        } else {
+            None
+        };
         // Publish this batch's cell superfiles (append — no removals; the user
         // superfiles stay as the durable source). In the SAME hidden commit,
         // advance the derived grid (counts/radii) AND mark this batch's user
@@ -2515,17 +2623,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // `batch_min` here instead of 0.)
         let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
         new_drained.insert_range(lo.min(batch_max), batch_max);
-        hidden_inner.manifest.store(Arc::new(
-            hidden_inner
-                .manifest
-                .load()
-                .with_partition_strategy(PartitionStrategy::VectorCell {
-                    column: column.clone(),
-                    clusters: running_clusters.clone(),
-                    routing,
-                })
-                .with_drained_ranges(new_drained),
-        ));
+        let mut precommit_manifest = hidden_inner
+            .manifest
+            .load()
+            .with_partition_strategy(PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: running_clusters.clone(),
+                routing,
+            })
+            .with_drained_ranges(new_drained);
+        if let Some(routing_index) = spfresh_routing {
+            precommit_manifest = precommit_manifest.with_spfresh_routing(routing_index);
+        }
+        hidden_inner.manifest.store(Arc::new(precommit_manifest));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
         // Cheap write-side readout: wall + bytes across the publish (cell-file
         // PUTs + manifest CAS). A single timer, no per-put provider hooks — enough
@@ -3496,7 +3606,11 @@ mod tests {
         superfile::{
             builder::{FtsConfig, VectorConfig},
             fts::reader::BoolMode,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{
+                cell_posting::{EncodedCellRow, MaterializedIvfRow},
+                distance::Metric,
+                rerank_codec::RerankCodec,
+            },
         },
         supertable::{
             SupertableOptions,
@@ -3739,6 +3853,28 @@ mod tests {
         .with_writer_pool(pool)
     }
 
+    fn options_vector_only(dim: usize) -> SupertableOptions {
+        SupertableOptions::new(
+            Arc::new(Schema::new(vec![Field::new(
+                "emb",
+                fixed_list_f32(dim),
+                false,
+            )])),
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
+            }],
+            None,
+        )
+        .expect("valid options")
+    }
+
     #[test]
     fn superfile_entry_carries_vector_summary() {
         let dim = 16;
@@ -3819,6 +3955,102 @@ mod tests {
                 .iter()
                 .all(|run| run.cell_id < GLOBAL_VECTOR_CELL_COUNT as u32)
         );
+    }
+
+    #[test]
+    fn materialized_stable_id_remap_uses_scalar_ids() {
+        const DIM: usize = 4;
+
+        let scale: Arc<[f32]> = Arc::from(vec![1.0; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0; DIM]);
+        let mut rows = vec![MaterializedIvfRow {
+            local_doc_id: 1,
+            stable_id: 1,
+            cluster: 0,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id: 1,
+                scale,
+                offset,
+                codes: vec![0u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        }];
+        remap_materialized_stable_ids(&mut rows, &[10, 20]).expect("remap");
+        assert_eq!(rows[0].stable_id, 20);
+        assert_eq!(rows[0].encoded.stable_id, 20);
+    }
+
+    #[test]
+    fn spfresh_routing_appends_run_refs_from_prepared_blob() {
+        const DIM: usize = 16;
+        const ROWS: usize = 4;
+        const CELL_ID: u32 = 3;
+
+        let scale: Arc<[f32]> = Arc::from(vec![1.0; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0; DIM]);
+        let rows: Vec<MaterializedIvfRow> = (0..ROWS)
+            .map(|idx| {
+                let stable_id = 100 + idx as i128;
+                MaterializedIvfRow {
+                    local_doc_id: idx as u32,
+                    stable_id,
+                    cluster: CELL_ID,
+                    rabitq_code: Vec::new(),
+                    encoded: EncodedCellRow {
+                        stable_id,
+                        scale: Arc::clone(&scale),
+                        offset: Arc::clone(&offset),
+                        codes: vec![idx as u8; DIM],
+                        residuals: vec![0u8; DIM],
+                        norm_sq: Some(idx as f32),
+                    },
+                }
+            })
+            .collect();
+        let shard = build_one_shard_from_materialized(
+            &rows,
+            &options_vector_only(DIM),
+            VectorLayout::Spfresh,
+        )
+        .expect("build shard");
+        let offsets = build_subsection_offsets(&shard.bytes).expect("subsection offsets");
+        let uri = SuperfileUri::new_v4();
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uri.0,
+            uri,
+            n_docs: shard.n_docs,
+            id_min: shard.id_min,
+            id_max: shard.id_max,
+            scalar_stats: shard.scalar_stats,
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: Some(CELL_ID),
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: Some(offsets),
+        });
+        let prep = PreparedSuperfile {
+            entry,
+            bytes_for_store: Some((uri, shard.bytes)),
+            bytes_for_storage: None,
+            bytes_for_cache: None,
+        };
+
+        let routing = extend_spfresh_routing(None, "emb", GLOBAL_VECTOR_CELL_COUNT as u32, &[prep])
+            .expect("routing");
+        let cell = routing
+            .cells
+            .iter()
+            .find(|cell| cell.cell_id == CELL_ID)
+            .expect("cell");
+        assert_eq!(cell.leaves.len(), 1);
+        assert_eq!(cell.leaves[0].cell_id, CELL_ID);
+        assert_eq!(cell.leaves[0].run_id, 0);
+        assert_eq!(cell.leaves[0].row_count, ROWS as u32);
+        assert!(cell.leaves[0].byte_range.1 > 0);
     }
 
     #[test]
