@@ -76,6 +76,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
+use futures::try_join;
 use roaring::RoaringBitmap;
 
 use super::{
@@ -204,6 +205,23 @@ fn spfresh_run_ids_by_superfile(
         run_ids.dedup();
     }
     out
+}
+
+async fn undrained_user_superfiles(
+    manifest: &Manifest,
+    hidden_manifest: &Manifest,
+    column: &str,
+    query: &[f32],
+) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+    let drained = hidden_manifest.get_drained_ranges();
+    let candidates = manifest
+        .get_pruned_superfiles_for_vector(column, query)
+        .await
+        .map_err(QueryError::ManifestLoad)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|entry| !drained.contains(entry.birth_version))
+        .collect())
 }
 
 /// Split hits into those already on the user table vs hidden-index hits
@@ -1262,13 +1280,27 @@ impl SupertableReader {
                         }
                     }
                 };
-                if !selected.is_empty() {
-                    // Already top-k ascending (same as the user-table path
-                    // below) — no second `top_k_ascending` pass needed.
-                    return vit_reader
-                        .fanout_vector_clusters(&selected, column, query, k, options)
-                        .await;
-                }
+                let user_tail =
+                    undrained_user_superfiles(self.manifest(), vit_manifest, column, query).await?;
+                let hidden_fut = async {
+                    if selected.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        vit_reader
+                            .fanout_vector_clusters(&selected, column, query, k, options)
+                            .await
+                    }
+                };
+                let user_tail_fut = async {
+                    if user_tail.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        self.fanout_vector_clusters(&user_tail, column, query, k, options)
+                            .await
+                    }
+                };
+                let (hidden_hits, user_tail_hits) = try_join!(hidden_fut, user_tail_fut)?;
+                return Ok(top_k_ascending(vec![hidden_hits, user_tail_hits], k));
             }
         }
         self.vector_search_user_table_async(column, query, k, options)
@@ -1492,7 +1524,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, SuperfileBuilder, VectorConfig},
-            vector::{distance::Metric, layout::VectorLayout},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -1532,6 +1564,13 @@ mod tests {
     }
 
     fn options_one_superfile_per_commit(dim: usize) -> SupertableOptions {
+        options_one_superfile_per_commit_with_codec(dim, RerankCodec::Fp32)
+    }
+
+    fn options_one_superfile_per_commit_with_codec(
+        dim: usize,
+        rerank_codec: RerankCodec,
+    ) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -1549,7 +1588,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec,
                 provided_centroids: None,
             }],
             Some(tok()),
@@ -2136,6 +2175,75 @@ mod tests {
         assert!(
             rows >= 1,
             "row-returning vector_search must resolve user rows"
+        );
+    }
+
+    #[test]
+    fn vector_search_merges_hidden_hits_with_undrained_user_tail() {
+        /// Test vector dimension, matching the one-hot fixture shape.
+        const TEST_DIM: usize = 16;
+        /// Rows per committed test superfile.
+        const ROWS_PER_BATCH: usize = 16;
+        /// Full probe count for the four-centroid test fixture.
+        const TEST_NPROBE: usize = 4;
+        /// One expected hit from hidden plus one from the undrained user tail.
+        const EXPECTED_BRANCH_HITS: usize = 2;
+
+        let dim = TEST_DIM;
+        let schema = schema_with_vector(dim);
+        let opts =
+            options_one_superfile_per_commit_with_codec(dim, RerankCodec::Sq8ResidualEpsilon);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let opts = opts.with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(0, ROWS_PER_BATCH, dim, schema.clone()))
+                .expect("append drained batch");
+            w.commit().expect("commit drained batch");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain first batch");
+
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(
+                ROWS_PER_BATCH as u64,
+                ROWS_PER_BATCH,
+                dim,
+                schema,
+            ))
+            .expect("append undrained batch");
+            w.commit().expect("commit undrained batch");
+        }
+
+        let user_manifest = st.reader().manifest().clone();
+        let user_uris: Vec<_> = user_manifest.superfiles.iter().map(|e| e.uri).collect();
+        assert_eq!(user_uris.len(), EXPECTED_BRANCH_HITS);
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                EXPECTED_BRANCH_HITS,
+                VectorSearchOptions::new().with_nprobe(TEST_NPROBE),
+                None,
+            )
+            .expect("query");
+        let hit_uris: HashSet<_> = hits.iter().map(|hit| hit.superfile).collect();
+
+        assert!(
+            hit_uris.contains(&user_uris[0]),
+            "expected remapped hit from drained hidden index"
+        );
+        assert!(
+            hit_uris.contains(&user_uris[1]),
+            "expected direct hit from undrained user-table tail"
         );
     }
 }
