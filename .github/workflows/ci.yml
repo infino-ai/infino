@@ -267,35 +267,41 @@ jobs:
     runs-on: ubuntu-latest
     environment: ci
     outputs:
-      present: ${{ steps.check.outputs.present }}
+      azure: ${{ steps.check.outputs.azure }}
+      gcs: ${{ steps.check.outputs.gcs }}
+      any: ${{ steps.check.outputs.any }}
     steps:
       - id: check
         run: |
-          if [ -n "${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_AZURE_CONTAINER }}" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+          azure=false; gcs=false
+          if [ -n "${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_AZURE_CONTAINER }}" ]; then azure=true; fi
+          if [ -n "${{ secrets.GCP_SA_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_GCS_BUCKET }}" ]; then gcs=true; fi
+          any=false; if [ "$azure" = true ] || [ "$gcs" = true ]; then any=true; fi
+          { echo "azure=$azure"; echo "gcs=$gcs"; echo "any=$any"; } >> "$GITHUB_OUTPUT"
 
-  # Engine end-to-end against a real object store (Azure Blob is the backend
-  # CI has credentials for): the Python and Node bindings run the full
-  # storage_options + connect-probe path over the wire. Non-required, and
-  # skipped when secrets are absent (fork PRs) so a transient outage never
-  # blocks a merge; the bindings' smoke suites are the deterministic gate.
+  # Engine end-to-end against real object stores: the Python and Node bindings
+  # run the full storage_options + connect-probe path over the wire, one step
+  # per backend (Azure, GCS). Bindings are built once and reused. Each backend
+  # step runs only when its secrets are present, so a fork PR (no secrets) or a
+  # single-backend outage never blocks a merge; the bindings' smoke suites are
+  # the deterministic gate.
   object-store-e2e:
-    name: Object store e2e (real Azure Blob)
+    name: Object store e2e
     needs: object-store-e2e-guard
-    if: needs.object-store-e2e-guard.outputs.present == 'true'
+    if: needs.object-store-e2e-guard.outputs.any == 'true'
     runs-on: ubuntu-latest
     environment: ci
     timeout-minutes: 30
     env:
       RUSTFLAGS: ""
       INFINO_TEST_REAL_AZURE: "1"
+      INFINO_TEST_REAL_GCS: "1"
       AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
       AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
       AZURE_STORAGE_CONTAINER_NAME: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
-      # Run-scoped so cleanup can't touch a parallel run's blobs.
+      INFINO_REAL_GCS_BUCKET: ${{ secrets.INFINO_REAL_GCS_BUCKET }}
+      GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SA_KEY }}
+      # Run-scoped so cleanup can't touch a parallel run's objects.
       INFINO_E2E_PREFIX: e2e/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
@@ -317,24 +323,43 @@ jobs:
         with:
           node-version: "20"
       - uses: Swatinem/rust-cache@v2
-      - name: Python bindings e2e
+      # Build both bindings once; every backend step below reuses them.
+      - name: Build Python binding
         run: |
           python3 -m pip install --upgrade uv
           uv venv /tmp/uv-object-store-e2e
           source /tmp/uv-object-store-e2e/bin/activate
           uv pip install maturin pytest pyarrow
           maturin develop --manifest-path infino-python/Cargo.toml
-          python -m pytest infino-python/tests/test_azure_e2e.py -v
-      - name: Node bindings e2e
+      - name: Build Node binding
+        working-directory: infino-node
         run: |
-          cd infino-node
           npm install
           npm run build:debug
-          node --test __test__/azure.e2e.test.mjs
-      # Clears this run's blobs, incl. the catalog object drop_table leaves.
-      # Best-effort: a hiccup must not fail the job.
-      - name: Clean up e2e blobs
-        if: always()
+      # --- Azure ---
+      - name: Azure · Python
+        if: needs.object-store-e2e-guard.outputs.azure == 'true'
+        run: |
+          source /tmp/uv-object-store-e2e/bin/activate
+          python -m pytest infino-python/tests/test_azure_e2e.py -v
+      - name: Azure · Node
+        if: needs.object-store-e2e-guard.outputs.azure == 'true'
+        working-directory: infino-node
+        run: node --test __test__/azure.e2e.test.mjs
+      # --- GCS ---
+      - name: GCS · Python
+        if: needs.object-store-e2e-guard.outputs.gcs == 'true'
+        run: |
+          source /tmp/uv-object-store-e2e/bin/activate
+          python -m pytest infino-python/tests/test_gcs_e2e.py -v
+      - name: GCS · Node
+        if: needs.object-store-e2e-guard.outputs.gcs == 'true'
+        working-directory: infino-node
+        run: node --test __test__/gcs.e2e.test.mjs
+      # Per-backend cleanup of this run's prefix, incl. the catalog object
+      # drop_table leaves. Best-effort: a hiccup must not fail the job.
+      - name: Clean up Azure blobs
+        if: always() && needs.object-store-e2e-guard.outputs.azure == 'true'
         continue-on-error: true
         run: |
           az storage blob delete-batch \
@@ -342,3 +367,11 @@ jobs:
             --account-key "$AZURE_STORAGE_ACCOUNT_KEY" \
             --source "$AZURE_STORAGE_CONTAINER_NAME" \
             --pattern "$INFINO_E2E_PREFIX/*"
+      - name: Clean up GCS objects
+        if: always() && needs.object-store-e2e-guard.outputs.gcs == 'true'
+        continue-on-error: true
+        run: |
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_KEY" > /tmp/gcs-key.json
+          gcloud auth activate-service-account --key-file=/tmp/gcs-key.json
+          gcloud storage rm -r "gs://$INFINO_REAL_GCS_BUCKET/$INFINO_E2E_PREFIX/" || true
+          rm -f /tmp/gcs-key.json
