@@ -148,6 +148,22 @@ test("bad credentials fail at connect", { skip }, () => {
   );
 });
 
+test("credential update takes effect", { skip }, () => {
+  // A wrong key merged into a live connection makes the next write fail (the
+  // swap reached the open table — no reconnect); updating back restores it.
+  withDb((db) => {
+    const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));
+    docs.append([{ title: "before" }]);
+
+    db.updateStorageOptions({ ...storageOptions(), azure_storage_account_key: "d3Jvbmcta2V5" });
+    assert.throws(() => docs.append([{ title: "during bad key" }]));
+
+    db.updateStorageOptions(storageOptions());
+    docs.append([{ title: "after" }]);
+    assert.equal(Number(db.querySql("SELECT COUNT(*) AS n FROM docs")[0].n), 2);
+  });
+});
+
 test("drop purge removes the table", { skip }, () => {
   withDb((db) => {
     const docs = db.createTable("docs", { title: "large_utf8" }, new IndexSpec().fts("title"));

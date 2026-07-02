@@ -296,6 +296,11 @@ there instead of on the first query. For an S3-compatible endpoint (MinIO /
 R2 / Ceph), set `aws_endpoint` (with `aws_allow_http: "true"` for plain
 HTTP) alongside the credentials.
 
+When a static key rotates, merge the new keys into a live connection without
+reconnecting: `db.update_storage_options({...})`. Credential keys take effect
+on the next request for the connection and its open tables; other keys
+(endpoint/region) apply to tables opened afterwards.
+
 ### Local disk cache
 
 For object-storage-backed catalogs, a local disk cache keeps hot data on
@@ -334,6 +339,7 @@ db = infino.connect(
     table-valued functions `bm25_search`, `bm25_search_prefix`,
     `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
     (each takes the table name first)
+  - `update_storage_options(storage_options)` — merge new storage options into a live connection, no reconnect
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`

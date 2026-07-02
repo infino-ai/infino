@@ -764,6 +764,7 @@ async fn compact_real_azure_two_jobs_results_preserved() {
         &container,
         "",
         &super::azure_helpers::azure_storage_options_from_env(),
+        None,
     )
     .expect("real Azure cleanup provider");
     let all_keys = cleanup_storage

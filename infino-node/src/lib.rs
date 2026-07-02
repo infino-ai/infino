@@ -438,6 +438,17 @@ impl Connection {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;
         batches_to_ipc(&batches)
     }
+
+    /// Merge `storageOptions` (object_store `aws_*` / `azure_*` keys) into
+    /// this live connection — no reconnect. Credential keys take effect on
+    /// open tables immediately; other keys apply to tables opened afterwards.
+    /// Throws for non-object-store backends (`memory://`, local fs).
+    #[napi]
+    pub fn update_storage_options(&self, storage_options: HashMap<String, String>) -> Result<()> {
+        self.inner
+            .update_storage_options(storage_options)
+            .map_err(map_err)
+    }
 }
 
 /// A single-table handle.

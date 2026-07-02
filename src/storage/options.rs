@@ -40,3 +40,15 @@ where
     }
     Ok(builder)
 }
+
+/// Options minus the credential keys (per `is_cred`), so the credential
+/// provider isn't shadowed by a static key in `with_config`.
+pub(crate) fn non_credential_options(
+    opts: &StorageOptions,
+    is_cred: impl Fn(&str) -> bool,
+) -> StorageOptions {
+    opts.iter()
+        .filter(|(key, _)| !is_cred(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}

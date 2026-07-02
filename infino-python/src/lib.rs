@@ -242,6 +242,19 @@ impl Connection {
         let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
+
+    /// Merge `storage_options` (object_store `aws_*` / `azure_*` keys) into
+    /// this live connection — no reconnect. Credential keys take effect on
+    /// open tables immediately; other keys apply to tables opened afterwards.
+    /// Raises for non-object-store backends (`memory://`, local fs).
+    fn update_storage_options(
+        &self,
+        py: Python<'_>,
+        storage_options: HashMap<String, String>,
+    ) -> PyResult<()> {
+        py.detach(|| self.inner.update_storage_options(storage_options))
+            .map_err(py_err)
+    }
 }
 
 /// Row counts returned by `update` / `delete`.

@@ -283,14 +283,20 @@ impl Backend {
         match self {
             Self::S3sFs => None,
             Self::S3 { bucket } => Some(Arc::new(
-                S3StorageProvider::new_with_prefix(bucket, prefix, &s3_storage_options_from_env())
-                    .expect("real S3 provider"),
+                S3StorageProvider::new_with_prefix(
+                    bucket,
+                    prefix,
+                    &s3_storage_options_from_env(),
+                    None,
+                )
+                .expect("real S3 provider"),
             )),
             Self::Azure { container } => Some(Arc::new(
                 AzureStorageProvider::new_with_prefix(
                     container,
                     prefix,
                     &azure_storage_options_from_env(),
+                    None,
                 )
                 .expect("real Azure provider"),
             )),

@@ -103,6 +103,13 @@ def test_connect_rejects_unknown_storage_option():
         infino.connect("s3://bucket/prefix", storage_options={"not_a_real_key": "x"})
 
 
+def test_update_storage_options_errors_on_non_object_store():
+    # memory:// has no storage options to update.
+    db = infino.connect("memory://")
+    with pytest.raises(RuntimeError):
+        db.update_storage_options({"aws_access_key_id": "x"})
+
+
 def test_connect_does_not_probe_by_default():
     # Default (validate off): connecting to a bogus bucket builds the
     # handle without touching the backend.

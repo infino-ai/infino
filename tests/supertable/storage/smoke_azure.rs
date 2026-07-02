@@ -504,6 +504,7 @@ async fn supertable_real_azure_round_trip() {
         &container,
         &prefix,
         &super::azure_helpers::azure_storage_options_from_env(),
+        None,
     )
     .expect("real Azure cleanup provider from env");
     if let Ok(keys) = &result {
@@ -661,6 +662,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
                 &container,
                 &prefix,
                 &super::azure_helpers::azure_storage_options_from_env(),
+                None,
             )
             .map_err(|e| format!("azure provider: {e}"))?,
         );
@@ -796,6 +798,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
         &container,
         &prefix,
         &super::azure_helpers::azure_storage_options_from_env(),
+        None,
     )
     .expect("real Azure cleanup provider");
     match &result {

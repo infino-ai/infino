@@ -202,6 +202,12 @@ test("connect does not probe by default", () => {
   connect("s3://no-such-bucket-xyzzy/prefix");
 });
 
+test("updateStorageOptions on non-object-store throws", () => {
+  // memory:// has no storage options to update.
+  const db = connect("memory://");
+  assert.throws(() => db.updateStorageOptions({ aws_access_key_id: "x" }));
+});
+
 test("vector search end-to-end", () => {
   const db = connect("memory://");
   const dim = 16; // infino requires vector dim in [16, 4096]

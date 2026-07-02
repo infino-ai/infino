@@ -289,6 +289,11 @@ on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph), set
 `aws_endpoint` (with `aws_allow_http: "true"` for plain HTTP) alongside the
 credentials.
 
+When a static key rotates, merge the new keys into a live connection without
+reconnecting: `db.updateStorageOptions({...})`. Credential keys take effect on
+the next request for the connection and its open tables; other keys
+(endpoint/region) apply to tables opened afterwards.
+
 ### Local disk cache
 
 For object-storage-backed catalogs, a local disk cache keeps hot data on fast
@@ -324,7 +329,8 @@ const db = connect("s3://bucket/prefix", {
 - `Connection`
   - `createTable(name, schema, IndexSpec)` / `openTable(name)` /
     `dropTable(name, purge?)` (`purge = true` also deletes the data) /
-    `listTables()` / `querySql(sql, { arrow? })`.
+    `listTables()` / `querySql(sql, { arrow? })` /
+    `updateStorageOptions(storageOptions)` (merge new storage options into a live connection, no reconnect).
 - `Table`
   - `append(data)` — one `append` is one commit.
   - `bm25Search(col, q, k, { mode?, projection?, arrow? })` — ranked BM25.

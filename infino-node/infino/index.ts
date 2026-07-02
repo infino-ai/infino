@@ -410,6 +410,16 @@ export class Connection {
   querySql(sql: string, opts: QueryOptions = {}): RowRecord[] | arrow.Table {
     return decode(this.inner.querySql(sql), opts.arrow);
   }
+
+  /**
+   * Merge `storageOptions` (object_store `aws_*` / `azure_*` keys) into this
+   * live connection — no reconnect. Credential keys take effect on open tables
+   * immediately; other keys apply to tables opened afterwards. Throws for
+   * non-object-store backends (`memory://`, local fs).
+   */
+  updateStorageOptions(storageOptions: Record<string, string>): void {
+    this.inner.updateStorageOptions(storageOptions);
+  }
 }
 
 /** Open (or create) a catalog rooted at `uri`. */

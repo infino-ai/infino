@@ -30,11 +30,16 @@ use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectStore,
     ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
+    aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredentialProvider, S3ConditionalPut},
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    ObjectMeta, StorageError, StorageOptions, StorageProvider,
+    credentials::is_s3_credential_key,
+    options::{apply, non_credential_options},
+    retry,
+};
 
 /// Config key written by [`S3StorageProvider::new_with_endpoint`] to point
 /// at a custom endpoint. Detection accepts any object_store alias (see
@@ -69,7 +74,7 @@ impl S3StorageProvider {
     /// identity). Infino never reads AWS credentials from the process
     /// environment; pass them through [`Self::new_with_prefix`] otherwise.
     pub fn new(bucket: impl Into<String>) -> Result<Self, StorageError> {
-        Self::new_with_prefix(bucket, "", &StorageOptions::new())
+        Self::new_with_prefix(bucket, "", &StorageOptions::new(), None)
     }
 
     /// S3 provider scoped to `prefix` inside `bucket`, configured from
@@ -77,10 +82,15 @@ impl S3StorageProvider {
     /// `aws_*` strings). A custom `aws_endpoint` switches to path-style +
     /// default client options; the tuned connection pool is AWS-only (it
     /// destabilizes local s3s-fs / MinIO endpoints).
+    ///
+    /// When `creds` is set, credentials come from that provider and the
+    /// credential keys in `opts` are ignored (so a static key can't shadow
+    /// it); other options still apply.
     pub fn new_with_prefix(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         opts: &StorageOptions,
+        creds: Option<AwsCredentialProvider>,
     ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let uri = format!("s3://{bucket}");
@@ -94,10 +104,22 @@ impl S3StorageProvider {
         } else {
             builder.with_client_options(tuned_client_options())
         };
+
         // Caller options last so they win (e.g. `aws_allow_http=true`).
-        let builder = apply::<AmazonS3ConfigKey, _>(builder, opts, &uri, |b, key, value| {
-            b.with_config(key, value)
-        })?;
+        let builder = match creds {
+            Some(provider) => {
+                let config = non_credential_options(opts, is_s3_credential_key);
+                apply::<AmazonS3ConfigKey, _>(
+                    builder.with_credentials(provider),
+                    &config,
+                    &uri,
+                    |b, key, value| b.with_config(key, value),
+                )?
+            }
+            None => apply::<AmazonS3ConfigKey, _>(builder, opts, &uri, |b, key, value| {
+                b.with_config(key, value)
+            })?,
+        };
 
         let store = builder.build().map_err(|e| StorageError::Permanent {
             uri,
@@ -139,7 +161,7 @@ impl S3StorageProvider {
             ("aws_region".to_string(), region.into()),
             ("aws_allow_http".to_string(), "true".to_string()),
         ]);
-        Self::new_with_prefix(bucket, prefix, &opts)
+        Self::new_with_prefix(bucket, prefix, &opts, None)
     }
 
     /// Wrap an already-constructed `AmazonS3` — for advanced
@@ -654,7 +676,7 @@ mod tests {
     #[test]
     fn rejects_unknown_storage_option_key() {
         let opts = StorageOptions::from([("not_a_real_key".to_string(), "x".to_string())]);
-        let err = S3StorageProvider::new_with_prefix("b", "", &opts).expect_err("bad key");
+        let err = S3StorageProvider::new_with_prefix("b", "", &opts, None).expect_err("bad key");
         assert!(matches!(err, StorageError::Permanent { .. }));
     }
 
@@ -662,7 +684,7 @@ mod tests {
     fn rejects_cross_backend_azure_key() {
         let opts =
             StorageOptions::from([("azure_storage_account_name".to_string(), "acct".to_string())]);
-        assert!(S3StorageProvider::new_with_prefix("b", "", &opts).is_err());
+        assert!(S3StorageProvider::new_with_prefix("b", "", &opts, None).is_err());
     }
 
     #[test]

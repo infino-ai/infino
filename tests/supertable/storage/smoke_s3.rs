@@ -541,7 +541,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
     }
     .await;
     let cleanup_storage =
-        S3StorageProvider::new_with_prefix(&bucket, &prefix, &s3_storage_options_from_env())
+        S3StorageProvider::new_with_prefix(&bucket, &prefix, &s3_storage_options_from_env(), None)
             .expect("real S3 cleanup provider from AWS env");
     if let Ok(keys) = &result {
         for key in keys {

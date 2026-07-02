@@ -303,6 +303,20 @@ rather than on the first query. The same options exist in the config file
 (`storage.storage_options`) and both bindings (`storage_options` +
 `validate`).
 
+When a static key rotates, merge the new keys into a live connection without a
+reconnect. Credential keys take effect on the next request for the connection
+and all its open tables; other keys (endpoint/region) apply to tables opened
+afterwards.
+
+```rust
+db.update_storage_options(HashMap::from([
+    ("aws_secret_access_key".to_string(), new_secret),
+]))?;
+```
+
+The bindings expose the same call: Python `db.update_storage_options({...})`,
+Node `db.updateStorageOptions({...})`.
+
 ## Architecture
 
 Three docs cover the design, from the high-level tour down to the
