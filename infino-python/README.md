@@ -14,8 +14,9 @@ table composes many such files with snapshot-isolated reads, append-only
 writes, and atomic commits. It runs in your process — there is no daemon,
 no cluster, and no managed service to operate.
 
-Apache Arrow is the interchange: schemas and batches cross the boundary
-as `pyarrow` objects, and every search returns a `pyarrow.Table`.
+Use it for **RAG**, **agent memory**, **hybrid search**, and **semantic
+search**: an embedded **vector database**, **full-text (BM25)** search
+engine, and **SQL** query engine in one library.
 
 ## Installation
 
@@ -43,334 +44,63 @@ import pyarrow as pa
 # "memory://" is ephemeral and handy for tests.
 db = infino.connect("./data")
 
+# Tiny stand-in for your embedding model so this runs as-is — a 16-dim
+# one-hot by topic. Real embeddings are dense and higher-dimensional.
+def embed(topic):
+    v = [0.0] * 16
+    v[topic] = 1.0
+    return v
+
 # Declare a schema and which columns to index. An "_id" column is added
 # automatically — you don't define it.
-schema = pa.schema([pa.field("title", pa.large_utf8(), nullable=False)])
-docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
+schema = pa.schema([
+    pa.field("source", pa.large_utf8(), nullable=False),
+    pa.field("body", pa.large_utf8(), nullable=False),
+    pa.field("embedding", pa.list_(pa.float32(), 16), nullable=False),
+])
+docs = db.create_table(
+    "docs", schema, infino.IndexSpec().fts("body").vector("embedding", 16, 1, "cosine")
+)
 
 # Append rows. One append is one atomic commit.
-docs.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing.", "embedding": embed(0)},
+    {"source": "help-center", "body": "Refunds return to the original payment method.",         "embedding": embed(0)},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance.",        "embedding": embed(1)},
+])
 
-# Full-text search. Returns a pyarrow.Table of (_id, score).
-hits = docs.bm25_search("title", "fox", k=10)
-print(hits.column_names)        # ['_id', 'score']
+# Retrieve context to ground an agent's next answer — keyword, vector,
+# hybrid (BM25 + vector fused in one pass), or SQL. Each returns a pyarrow.Table.
+keyword  = docs.bm25_search("body", "cancel subscription", k=5)                           # BM25
+semantic = docs.vector_search("embedding", embed(0), k=5)                                 # vector kNN
+hybrid   = docs.hybrid_search("body", "cancel subscription", "embedding", embed(0), k=5)  # fused
+billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")             # SQL filter
 ```
 
-## Core concepts
+## Documentation
 
-- **Connection** — a handle to a catalog (a set of tables under one URI).
-  Open it with `infino.connect(uri)`.
-- **Table** — an append-only, snapshot-isolated collection of rows. Each
-  table carries an auto-generated `_id` column.
-- **IndexSpec** — declares which columns are full-text (BM25) and which
-  are vector indexed. Columns without an index are still stored,
-  filterable in SQL, and returnable via projection.
-- **Commits** — every `append`, `update`, and `delete` is a single atomic
-  commit. Readers see a consistent snapshot and are never torn by a
-  concurrent write. Batch rows into one `append` rather than calling it
-  per row — each call writes a file and commits.
-- **Arrow everywhere** — searches return `pyarrow.Table`; `append` and
-  `update` accept Arrow, pandas, or `list[dict]`.
+Full docs, guides, and the API reference live at **[docs.infino.ai](https://docs.infino.ai)**:
 
-## Full-text search
-
-```python
-docs = db.create_table("docs", schema, infino.IndexSpec().fts("title"))
-docs.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
-
-# Ranked BM25 — higher score is a better match.
-docs.bm25_search("title", "quick fox", k=10)               # OR by default
-docs.bm25_search("title", "quick fox", k=10, mode="and")   # require all terms
-
-# Unranked matching (score is 0.0): every row containing the term(s),
-# or an exact whole-value match.
-docs.token_match("title", "fox")
-docs.exact_match("title", "the quick brown fox")
-
-# Count matches without materializing any rows.
-docs.count("title", "fox")                                 # OR by default
-docs.count("title", "quick fox", mode="and")               # require all terms
-```
-
-## Vector search
-
-Vector columns are `fixed_size_list<float32, dim>` with `dim` in
-`[16, 4096]`. The distance metric is fixed when you declare the index
-(`"cosine"`, `"l2sq"`, or `"negdot"`); for vector results a smaller score
-is nearer.
-
-```python
-dim = 384
-schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), dim), nullable=False)])
-spec = infino.IndexSpec().vector("emb", dim, n_cent=256, metric="cosine")
-vecs = db.create_table("vecs", schema, spec)
-
-vecs.append(pa.record_batch([pa.array(embeddings, type=pa.list_(pa.float32(), dim))],
-                            names=["emb"]))
-
-vecs.vector_search("emb", query_vector, k=10)              # query_vector: list[float]
-vecs.vector_search("emb", query_vector, k=10, nprobe=32)   # probe more partitions
-```
-
-To restrict the kNN to rows matching a text predicate, pass `filter_column`
-and `filter_query` together (the column must be FTS-indexed) — a pushdown
-pre-filter, so results are the nearest *matching* rows, not a post-filter over
-the global top-k. `filter_mode` is `"or"` (default) or `"and"`:
-
-```python
-vecs.vector_search("emb", query_vector, k=10,
-                   filter_column="body", filter_query="cancel subscription")
-```
-
-## Hybrid search
-
-`hybrid_search` runs BM25 and vector kNN over the same table and fuses the
-two rankings with reciprocal-rank fusion — a higher `score` is a better
-blended match. The table needs both an FTS column and a vector column:
-
-```python
-docs = db.create_table(
-    "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, n_cent=256, metric="cosine")
-)
-
-docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10)
-# mode (BM25 boolean mode) and nprobe (vector probes) are optional:
-docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10,
-                   mode="and", nprobe=32)
-```
-
-## SQL
-
-Run SQL across the catalog's tables for analytics and filtering. Results
-come back as a `pyarrow.Table`.
-
-```python
-db.query_sql("SELECT COUNT(*) AS n FROM docs")
-db.query_sql("SELECT title FROM docs WHERE title = 'a lazy dog'")
-```
-
-### Search inside SQL
-
-Search is also exposed as table-valued functions, so a ranked retrieval is
-a relation you can join, filter, and aggregate over. Each takes the table
-name as its first argument and yields `_id`, any scalar columns, and a
-trailing `score`:
-
-| Function                                                        | Returns                                  |
-| --------------------------------------------------------------- | ---------------------------------------- |
-| `bm25_search(table, column, query, k)`                          | Ranked BM25 (higher score is better)     |
-| `bm25_search_prefix(table, column, prefix, k)`                  | BM25 with the last term prefix-expanded  |
-| `vector_search(table, column, query_vector, k)`                 | kNN (smaller score is nearer)            |
-| `hybrid_search(table, text_col, query, vec_col, query_vector, k)` | BM25 + vector fused with RRF (higher is better) |
-| `token_match(table, column, query)`                             | Unranked term match (`score` is `0.0`)   |
-| `exact_match(table, column, value)`                             | Unranked exact-value match               |
-
-A query vector is written as a comma-separated string or a SQL array
-literal; build it from a Python list with `",".join(map(str, vec))`.
-
-```python
-# Hybrid search: lexical + vector, fused by reciprocal-rank fusion.
-qv = ",".join(map(str, query_vector))
-db.query_sql(f"""
-    SELECT _id, score
-    FROM hybrid_search('docs', 'title', 'quick fox', 'emb', '{qv}', 10)
-    ORDER BY score DESC
-""")
-
-# Compose retrieval with relational filtering and the catalog's other tables.
-db.query_sql("""
-    SELECT s._id, s.score
-    FROM bm25_search('docs', 'title', 'fox', 50) AS s
-    WHERE s._id IN (SELECT _id FROM docs WHERE title <> 'a lazy dog')
-""")
-```
-
-Most table functions have a direct `Table` method equivalent
-(`bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
-`exact_match`); `bm25_search_prefix` is available only in SQL. The direct
-methods also expose optional arguments the SQL forms omit — SQL
-`vector_search` and `hybrid_search` take no `nprobe` (or filter), so use
-the `Table` methods when you need those.
-
-## Projections
-
-By default a search returns just `_id` and `score` — no row data is
-decoded. Name the columns you want to materialize:
-
-```python
-docs.bm25_search("title", "fox", k=10)                          # _id + score only
-docs.bm25_search("title", "fox", k=10, projection=["_id", "title", "score"])
-vecs.vector_search("emb", query_vector, k=10, projection=["_id", "emb", "score"])
-```
-
-The SQL table-valued functions differ: they decode every scalar column by
-default (`_id`, all scalars, trailing `score`). To return only `_id` and
-`score`, select those columns explicitly in the query.
-
-## Updates and deletes
-
-Mutations require durable storage (a local path or object store, not
-`memory://`). The predicate is a SQL boolean expression — the same thing
-you would write after `WHERE` — evaluated against the table's columns.
-
-```python
-docs.append([{"title": "draft post"}, {"title": "spam"}])
-
-# Delete every row matching the predicate.
-docs.delete("title = 'spam'")
-
-# Replace matched rows 1:1 with new rows (same input shapes as append).
-stats = docs.update("title = 'draft post'", [{"title": "published post"}])
-print(stats.matched, stats.n_tombstoned, stats.n_not_found)
-```
-
-`update` is a one-to-one replacement: the number of rows the predicate
-matches must equal the number of rows you supply, otherwise it raises.
-Both methods return a `MutationStats` with `matched`, `n_tombstoned`, and
-`n_not_found`.
-
-## Optimization
-
-Many small appends produce many small files. `optimize` merges small or
-underfilled files into larger ones, which keeps reads efficient.
-
-```python
-docs.optimize()                                             # engine defaults
-docs.optimize(infino.OptimizeOptions(target_superfile_size_mb=256,
-                                     min_fill_percent=50))
-```
-
-Compaction and interrupted writes can leave behind storage objects that
-are no longer referenced. `gc` deletes them, reclaiming space. It only
-removes objects older than a grace window (in seconds) so it never races
-a concurrent reader or writer; requires durable storage.
-
-```python
-report = docs.gc(3600.0)                                    # older than 1 hour
-print(report.bytes_freed, report.objects_deleted)
-```
-
-## Storage backends
-
-`connect` selects the backend from the URI:
-
-| URI                      | Backend                                  |
-| ------------------------ | ---------------------------------------- |
-| `./data`, `/abs/path`    | Local filesystem                         |
-| `s3://bucket/prefix`     | Amazon S3 / S3-compatible object storage |
-| `az://container/prefix`  | Azure Blob Storage                       |
-| `memory://`              | In-process, ephemeral (testing)          |
-
-Credentials are passed as `storage_options`, keyed by the standard
-`object_store` config strings (`aws_*` / `azure_*` — same names the AWS
-and Azure SDKs use). Omit them to use ambient cloud identity (IAM
-instance role / managed identity). Infino reads no credentials from the
-environment.
-
-```python
-# S3
-db = infino.connect("s3://bucket/prefix", storage_options={
-    "aws_access_key_id": "…",
-    "aws_secret_access_key": "…",
-    "aws_region": "us-east-1",
-})
-
-# Azure
-db = infino.connect("az://container/prefix", storage_options={
-    "azure_storage_account_name": "…",
-    "azure_storage_account_key": "…",
-})
-```
-
-Common keys:
-
-| Backend | Keys |
-| ------- | ---- |
-| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
-| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
-
-The full set is whatever `object_store` accepts for the backend; an
-unknown key is rejected at `connect`. Pass `validate=True` to probe the
-backend at `connect`, so wrong credentials or an unreachable bucket fail
-there instead of on the first query. For an S3-compatible endpoint (MinIO /
-R2 / Ceph), set `aws_endpoint` (with `aws_allow_http: "true"` for plain
-HTTP) alongside the credentials.
-
-### Local disk cache
-
-For object-storage-backed catalogs, a local disk cache keeps hot data on
-fast local storage. `cold_fetch_mode` controls how cache misses are
-served: `"hybrid_with_prefetch"`, `"range_only"`, or
-`"lazy_foreground_with_background_fill"`.
-
-```python
-db = infino.connect(
-    "s3://bucket/prefix",
-    cache_dir="/mnt/nvme/infino-cache",
-    cache_budget_bytes=64 * 1024**3,
-    cold_fetch_mode="lazy_foreground_with_background_fill",
-)
-```
-
-## Schema and type requirements
-
-- Full-text columns must be Arrow `large_utf8`.
-- Vector columns must be `fixed_size_list<float32, dim>` with `dim` in
-  `[16, 4096]`.
-- The `_id` column is generated by the engine; do not declare it.
-- `append` and `update` accept a `pyarrow.RecordBatch` or `Table`, a
-  pandas `DataFrame`, or a `list[dict]`, coerced to Arrow against the
-  table's declared schema.
-
-## API reference
-
-- `infino.connect(uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None, validate=None) -> Connection`
-- `Connection`
-  - `create_table(name, schema, index_spec) -> Table`
-  - `open_table(name) -> Table`
-  - `drop_table(name, purge=False)` — `purge=True` also deletes the data
-  - `list_tables() -> list[str]`
-  - `query_sql(sql) -> pyarrow.Table` — also exposes the search
-    table-valued functions `bm25_search`, `bm25_search_prefix`,
-    `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
-    (each takes the table name first)
-- `Table`
-  - `append(data)`
-  - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
-  - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
-  - `hybrid_search(text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None) -> pyarrow.Table`
-  - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
-  - `exact_match(column, value, projection=None) -> pyarrow.Table`
-  - `count(column, query, mode="or") -> int` — match tally, no rows fetched
-  - `delete(predicate) -> MutationStats`
-  - `update(predicate, new_rows) -> MutationStats`
-  - `optimize(settings=None)`
-  - `gc(grace_secs) -> GcReport` — delete orphaned storage objects older than the grace window
-  - `schema() -> pyarrow.Schema`
-- `IndexSpec().fts(column).vector(column, dim, n_cent, metric)`
-- `OptimizeOptions(max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None)`
-- `MutationStats` — returned by `delete` / `update`; read-only attributes `matched`, `n_tombstoned`, `n_not_found`
-- `GcReport` — returned by `gc`; read-only attributes `bytes_freed`, `objects_deleted`, `objects_skipped_live`, `objects_skipped_too_new`, `delete_errors`
+- [Quickstart](https://docs.infino.ai/quickstart) — install to first query
+- [Core concepts](https://docs.infino.ai/core-concepts) — superfiles, commits, and indexes
+- Guides — [Tables & indexing](https://docs.infino.ai/guides/tables) ·
+  [Search: BM25, vector, hybrid](https://docs.infino.ai/guides/search) ·
+  [Embeddings](https://docs.infino.ai/guides/embeddings) ·
+  [Storage & credentials](https://docs.infino.ai/guides/storage)
+- [SQL reference](https://docs.infino.ai/sql-reference) — query tables and the search table-valued functions
+- [API reference](https://docs.infino.ai/api-reference) — the full Python surface, generated from the package
+- [Integrations](https://docs.infino.ai/integrations) — LangChain, CrewAI, Vercel AI SDK, MCP
 
 ## Building from source
 
-The bindings are built with [maturin](https://www.maturin.rs/). Building
-requires a Rust toolchain and access to crates.io.
+The bindings are built with [maturin](https://www.maturin.rs/) and require a
+Rust toolchain.
 
 ```sh
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin pytest pyarrow
 maturin develop          # compile the extension and install it into the venv
 pytest tests/
-```
-
-Or with [uv](https://docs.astral.sh/uv/):
-
-```sh
-uv venv && source .venv/bin/activate
-uv pip install maturin pytest pyarrow
-maturin develop          # compile the extension and install it into the venv
-uv run pytest tests/
 ```
 
 ## License
