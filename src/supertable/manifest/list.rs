@@ -167,7 +167,11 @@ pub struct CellTreeNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRef {
     pub superfile_uri: String,
+    /// Coarse outer `VectorCell` that owns this run's superfile.
     pub cell_id: u32,
+    /// Fine centroid id this run holds (index into the resident centroid blob
+    /// for `cell_id`). Query scores fine centroids and selects runs by this id.
+    pub cluster_id: u32,
     pub run_id: u32,
     pub byte_range: (u64, u64),
     pub row_count: u32,
@@ -945,6 +949,8 @@ struct CellTreeNodeDto {
 struct RunRefDto {
     superfile_uri: String,
     cell_id: u32,
+    #[serde(default)]
+    cluster_id: u32,
     run_id: u32,
     byte_range: (u64, u64),
     row_count: u32,
@@ -1350,6 +1356,7 @@ fn spfresh_routing_to_dto(index: &SpfreshRoutingIndex) -> SpfreshRoutingIndexDto
                     .map(|run| RunRefDto {
                         superfile_uri: run.superfile_uri.clone(),
                         cell_id: run.cell_id,
+                        cluster_id: run.cluster_id,
                         run_id: run.run_id,
                         byte_range: run.byte_range,
                         row_count: run.row_count,
@@ -1382,6 +1389,7 @@ fn spfresh_routing_from_dto(
                 .map(|run| RunRef {
                     superfile_uri: run.superfile_uri,
                     cell_id: run.cell_id,
+                    cluster_id: run.cluster_id,
                     run_id: run.run_id,
                     byte_range: run.byte_range,
                     row_count: run.row_count,
@@ -2314,6 +2322,7 @@ mod tests {
                         superfile_uri: "superfiles/00000000-0000-0000-0000-000000000001.parquet"
                             .into(),
                         cell_id: 0,
+                        cluster_id: 3,
                         run_id: 7,
                         byte_range: (128, 4096),
                         row_count: 64,

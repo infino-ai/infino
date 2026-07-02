@@ -2957,6 +2957,7 @@ mod tests {
                 leaves: vec![list::RunRef {
                     superfile_uri: "superfiles/a.parquet".into(),
                     cell_id: 0,
+                    cluster_id: 5,
                     run_id: 2,
                     byte_range: (64, 128),
                     row_count: 16,

@@ -1824,6 +1824,7 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
             cells[cid].leaves.push(RunRef {
                 superfile_uri: prep.entry.uri.0.to_string(),
                 cell_id: coarse_cell,
+                cluster_id: run.cluster_id,
                 run_id: run_id as u32,
                 byte_range: (vec_offset + range.start as u64, range.len() as u64),
                 row_count: run.row_count,
@@ -4097,6 +4098,7 @@ mod tests {
                     cell.leaves.push(RunRef {
                         superfile_uri: old_uri.0.to_string(),
                         cell_id: CELL_ID,
+                        cluster_id: 0,
                         run_id: 0,
                         byte_range: (OLD_RUN_BYTE_OFFSET, OLD_RUN_BYTE_LEN),
                         row_count: ROWS as u32,
