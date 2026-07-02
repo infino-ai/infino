@@ -2861,7 +2861,7 @@ fn build_one_shard_from_merged(
 /// cross-placement replicas are added (deduped at query time by `stable_id`).
 ///
 /// `eps <= 0` returns `entries` unchanged (hard assignment, no replication).
-fn apply_fine_replication(
+pub(in crate::supertable) fn apply_fine_replication(
     mut entries: Vec<(u32, Vec<MaterializedIvfRow>)>,
     centroids: &[Vec<f32>],
     dim: usize,
@@ -2916,6 +2916,43 @@ fn apply_fine_replication(
         }
     }
     entries
+}
+
+/// Drop replica copies of the same row, keeping one canonical copy per
+/// `stable_id`. Boundary replication stores a row in several runs; a compaction
+/// that merges those runs must collapse them before re-clustering so duplicates
+/// don't pile up, then re-replication re-adds the boundary copies cleanly.
+fn dedup_materialized_by_stable_id(rows: &mut Vec<MaterializedIvfRow>) {
+    let mut seen: HashSet<i128> = HashSet::with_capacity(rows.len());
+    rows.retain(|row| seen.insert(row.stable_id));
+}
+
+/// Rebuild one coarse cell's SPFresh shard from merged input rows (LIRE
+/// merge/split): dedup replicas by `stable_id`, retrain the cell's fine
+/// centroids over the union (which re-sizes runs toward the ~2 MB target — the
+/// implicit split), re-replicate within-cell boundaries at `eps`, then build the
+/// shard. Cross-cell replicas live in other cells' superfiles and are untouched
+/// by a single cell's compaction.
+pub(in crate::supertable) fn rebuild_spfresh_shard_from_merged(
+    mut rows: Vec<MaterializedIvfRow>,
+    coarse_cell: u32,
+    options: &SupertableOptions,
+    dim: usize,
+    metric: Metric,
+    eps: f32,
+) -> Result<ShardOutput, BuildError> {
+    dedup_materialized_by_stable_id(&mut rows);
+    let centroids = assign_fine_clusters(&mut rows, dim);
+    let entries = apply_fine_replication(vec![(coarse_cell, rows)], &[centroids], dim, metric, eps);
+    let mut rows: Vec<MaterializedIvfRow> = entries
+        .into_iter()
+        .flat_map(|(_, cell_rows)| cell_rows)
+        .collect();
+    rows.sort_by_key(|row| (row.cluster, row.stable_id));
+    for (local, row) in rows.iter_mut().enumerate() {
+        row.local_doc_id = local as u32;
+    }
+    build_one_shard_from_materialized(&rows, options, VectorLayout::Spfresh)
 }
 
 /// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
@@ -4139,6 +4176,53 @@ mod tests {
             "interior row must not replicate"
         );
         assert_eq!(cell1.len(), 2);
+    }
+
+    #[test]
+    fn dedup_materialized_by_stable_id_keeps_one_per_id() {
+        let mut rows = vec![
+            replication_row(100, 5),
+            replication_row(100, 5),
+            replication_row(200, 10),
+        ];
+        dedup_materialized_by_stable_id(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.stable_id == 100));
+        assert!(rows.iter().any(|r| r.stable_id == 200));
+    }
+
+    #[test]
+    fn rebuild_spfresh_shard_dedups_replicas() {
+        // Replica copies (duplicate stable_ids) from prior maintenance must
+        // collapse to one canonical row per id when a cell is rebuilt.
+        const DIM: usize = 16;
+        let mk = |stable_id: i128| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster: 0,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::from(vec![1.0f32; DIM]),
+                offset: Arc::from(vec![0.0f32; DIM]),
+                codes: vec![1u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        };
+        let rows = vec![mk(100), mk(200), mk(100), mk(300), mk(200)];
+        let shard = rebuild_spfresh_shard_from_merged(
+            rows,
+            0,
+            &options_vector_only(DIM),
+            DIM,
+            Metric::Cosine,
+            0.0,
+        )
+        .expect("rebuild");
+        let reader = SuperfileReader::open(shard.bytes).expect("open merged shard");
+        let spfresh = reader.spfresh_vec().expect("spfresh blob");
+        assert_eq!(spfresh.n_rows(), 3, "3 distinct stable_ids survive dedup");
     }
 
     #[test]

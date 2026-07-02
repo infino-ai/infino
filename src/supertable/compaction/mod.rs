@@ -31,7 +31,10 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
-        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
+        vector::{
+            distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec,
+            spfresh::replication_eps,
+        },
     },
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
@@ -45,8 +48,8 @@ use crate::{
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, build_one_shard_from_materialized,
-            finalize_compaction_commit, prepare_superfile, refresh_spfresh_routing,
-            split_overflow_cell_after_compaction, try_commit_attempt,
+            finalize_compaction_commit, prepare_superfile, rebuild_spfresh_shard_from_merged,
+            refresh_spfresh_routing, split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -349,11 +352,37 @@ impl Supertable {
                 }
                 rows.extend(input_rows);
             }
-            rows.sort_by_key(|row| row.stable_id);
-            for (local_doc_id, row) in rows.iter_mut().enumerate() {
-                row.local_doc_id = local_doc_id as u32;
+            if is_hidden_vector_index_table(&self.inner().options) {
+                // Hidden index: blob stable ids are the real user `_id`s, so LIRE
+                // merge applies — dedup replicas, retrain the cell's fine
+                // centroids over the union (re-sizes runs toward ~2 MB, the
+                // implicit split), and re-replicate within-cell boundaries.
+                // Cross-cell replicas live in other cells and are untouched here.
+                let vec_col = manifest.options.vector_columns.first();
+                let dim = vec_col.map(|c| c.dim).unwrap_or(0);
+                let metric = vec_col.map(|c| c.metric).unwrap_or(Metric::L2Sq);
+                let coarse_cell = superfiles
+                    .first()
+                    .and_then(|entry| entry.partition_hint)
+                    .unwrap_or(0);
+                rebuild_spfresh_shard_from_merged(
+                    rows,
+                    coarse_cell,
+                    &manifest.options,
+                    dim,
+                    metric,
+                    replication_eps(),
+                )?
+            } else {
+                // User table: SPFresh blob stable ids are local (drain remaps them
+                // to real `_id`s), so dedup-by-stable-id would collapse distinct
+                // rows. Keep the plain rebuild, preserving every row.
+                rows.sort_by_key(|row| row.stable_id);
+                for (local_doc_id, row) in rows.iter_mut().enumerate() {
+                    row.local_doc_id = local_doc_id as u32;
+                }
+                build_one_shard_from_materialized(&rows, &manifest.options, VectorLayout::Spfresh)?
             }
-            build_one_shard_from_materialized(&rows, &manifest.options, VectorLayout::Spfresh)?
         } else {
             let (merged_bytes, superfile_stats) = {
                 let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
