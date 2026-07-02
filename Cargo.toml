@@ -33,6 +33,12 @@ exclude = [
 # binaries.
 autobenches = false
 
+# docs.rs renders the default-feature surface (the public API); the internal
+# `test-helpers` modules stay off it. `--cfg docsrs` turns on the availability
+# annotations rustdoc emits under that cfg.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
 # Declare an explicit workspace so the bench-utils crate is a
 # first-class member rather than only a dev-dependency path
 # package. Without this, `infino` (root) dev-depends on

@@ -1,7 +1,7 @@
 .PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
-        public-api public-api-update api-parity api-parity-update \
+        public-api public-api-update api-parity api-parity-update doc-check \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -13,6 +13,7 @@ check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
 	$(MAKE) api-parity
+	$(MAKE) doc-check
 
 # Apply formatting, including the import-layout rules above.
 fmt:
@@ -42,6 +43,13 @@ api-parity:
 
 api-parity-update:
 	python3 scripts/check_api_parity.py --update
+
+# Doc-surface gate. Every public item on the default (docs.rs) surface must be
+# documented, and every intra-doc link must resolve. Uses default features so
+# the internal `test-helpers` modules stay out of scope — this is exactly the
+# page docs.rs renders. Keeps the reference fully populated and navigable.
+doc-check:
+	RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --lib
 
 test:
 	cargo test --features test-helpers

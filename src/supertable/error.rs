@@ -261,29 +261,44 @@ pub enum OpenError {
 /// Errors raised by [`crate::supertable::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {
+    /// No durable storage backend is configured (e.g. `memory://`); optimize
+    /// needs one.
     #[error("optimize requires a storage backend")]
     NoStorage,
+    /// A superfile selected for compaction was absent from the manifest
+    /// snapshot.
     #[error("superfile {0} not found in manifest snapshot")]
     SuperfileNotFound(uuid::Uuid),
+    /// Compaction produced an empty merged superfile.
     #[error("empty merged superfile")]
     EmptyMergedSuperfile,
+    /// The tombstone sidecar for a superfile was already sealed by another
+    /// compaction.
     #[error(
         "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
     )]
     SidecarConflict {
+        /// The superfile whose sidecar conflicted.
         superfile_id: uuid::Uuid,
+        /// The compaction that had already sealed the sidecar.
         existing_compaction_id: uuid::Uuid,
     },
+    /// Sealing the compaction output failed.
     #[error("seal failed: {0}")]
     Seal(String),
+    /// Building a merged superfile failed.
     #[error("failed to build superfile: {0}")]
     Build(String),
+    /// Committing the compaction to the manifest failed.
     #[error("failed to commit: {0}")]
     Commit(String),
+    /// Refreshing the in-memory manifest after the commit failed.
     #[error("post-commit manifest refresh failed: {0}")]
     Refresh(String),
+    /// Another optimize is already running on this handle.
     #[error("optimize already in progress on this handle")]
     AlreadyRunning,
+    /// The post-compaction garbage-collection step failed.
     #[error("gc failed during optimize: {0}")]
     Gc(#[from] GcError),
 }
@@ -363,9 +378,12 @@ pub(crate) enum CompactionError {
 /// Errors raised by [`crate::supertable::Supertable::gc`].
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
+    /// No durable storage backend is configured (e.g. `memory://`); gc needs
+    /// one.
     #[error("gc requires a storage backend")]
     NoStorage,
 
+    /// A storage operation failed while listing or deleting objects.
     #[error("storage error during gc: {0}")]
     Storage(#[from] crate::storage::StorageError),
 }

@@ -1233,20 +1233,26 @@ impl VectorSearchOptions {
     /// Filtered default `nprobe` (internal; applied when the query carries a filter).
     pub(crate) const FILTERED_DEFAULT_NPROBE: usize = 8;
 
+    /// Default options — engine-default `nprobe` and rerank multiplier.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set the number of IVF partitions to probe. Higher improves recall at
+    /// the cost of more work.
     pub fn with_nprobe(mut self, n: usize) -> Self {
         self.nprobe = Some(n);
         self
     }
 
+    /// Set the over-fetch multiplier for the exact-rerank stage. Higher
+    /// improves recall at the cost of more work.
     pub fn with_rerank_mult(mut self, n: usize) -> Self {
         self.rerank_mult = Some(n.max(1));
         self
     }
 
+    /// The configured rerank multiplier, if one was set.
     pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
     }

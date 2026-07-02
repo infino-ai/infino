@@ -215,6 +215,7 @@ pub struct OptimizeOptions {
 }
 
 impl OptimizeOptions {
+    /// Options for a compaction-only optimize with the given settings.
     pub fn compact(settings: CompactionSettings) -> Self {
         Self {
             compaction: settings,

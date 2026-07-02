@@ -80,6 +80,11 @@ docs.append(&RecordBatch::try_new(
 // Retrieve context to ground the agent's next answer:
 let keyword = docs.bm25_search("body", "cancel subscription", 5, BoolMode::Or, None)?;
 let semantic = docs.vector_search("embedding", &embed(0), 5, VectorSearchOptions::new(), None, None)?;
+// hybrid: BM25 + vector, fused with reciprocal-rank fusion:
+let hybrid = docs.hybrid_search(
+    "body", "cancel subscription", BoolMode::Or,
+    "embedding", &embed(0), VectorSearchOptions::new(), 5, None,
+)?;
 // vector kNN, restricted to rows whose body matches a keyword (pushdown filter):
 let filtered = docs.vector_search(
     "embedding", &embed(0), 5, VectorSearchOptions::new(),
@@ -88,29 +93,54 @@ let filtered = docs.vector_search(
 let billing = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")?;
 assert_eq!(keyword.iter().map(|b| b.num_rows()).sum::<usize>(), 1);   // BM25
 assert!(semantic.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);   // vector kNN
+assert!(hybrid.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);     // hybrid (BM25 + vector)
 assert_eq!(filtered.iter().map(|b| b.num_rows()).sum::<usize>(), 1);  // vector + keyword filter
 assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL filter
 # Ok(())
 # }
 ```
 
-## API overview
+## Operations
 
-The public surface is a small connection-and-table API:
+The public surface is a small connection-and-table API. Everything except the
+two entry-point functions is a method on one of two handles, so the operations
+live on the [`Connection`] and [`Supertable`] pages:
 
-- `connect` / `connect_with` open a `Connection`. The backend follows the URI
-  scheme (`s3://`, `az://`, `file://`, bare path, `memory://`); credentials are
-  passed via `ConnectOptions::with_storage_option` (object_store's `aws_*` /
-  `azure_*` keys), never read from the environment.
-- `Connection` — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
-- `Supertable` (the table handle) — `append`, `update`, `delete`, `schema`, and the
-  search methods `bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
-  and `exact_match` (each returns Arrow rows as `Vec<RecordBatch>`).
-- Supporting types — `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`,
-  `ConnectOptions`, `MutationStats`, and the `InfinoError` enum.
+- [`connect`] / [`connect_with`] open a [`Connection`]. The backend follows the
+  URI scheme (`s3://`, `az://`, `file://`, bare path, `memory://`); credentials
+  are passed via [`ConnectOptions::with_storage_option`] (object_store's `aws_*`
+  / `azure_*` keys), never read from the environment.
+- [`Connection`] — the catalog: [`create_table`](Connection::create_table),
+  [`open_table`](Connection::open_table), [`drop_table`](Connection::drop_table),
+  [`list_tables`](Connection::list_tables), and
+  [`query_sql`](Connection::query_sql).
+- [`Supertable`] — a single table:
+  - **Search** — [`bm25_search`](Supertable::bm25_search),
+    [`vector_search`](Supertable::vector_search),
+    [`hybrid_search`](Supertable::hybrid_search),
+    [`token_match`](Supertable::token_match),
+    [`exact_match`](Supertable::exact_match), and
+    [`count`](Supertable::count). Each search returns Arrow rows as
+    `Vec<RecordBatch>`.
+  - **Write** — [`append`](Supertable::append),
+    [`update`](Supertable::update), [`delete`](Supertable::delete).
+  - **Maintain** — [`optimize`](Supertable::optimize),
+    [`gc`](Supertable::gc), and [`schema`](Supertable::schema).
+
+Supporting types: [`IndexSpec`], [`Metric`], [`BoolMode`],
+[`VectorSearchOptions`], [`VectorFilter`], [`ConnectOptions`], [`MutationStats`],
+[`GcReport`], and the [`InfinoError`], [`OptimizeError`], and [`GcError`] error
+enums.
+
+## Cargo features
+
+- `default` — enables the bundled [mimalloc](https://github.com/microsoft/mimalloc)
+  global allocator. Disable with `default-features = false` if your process
+  already installs a global allocator.
 
 ## Other languages
 
 infino also ships **Python** (`pip install infino`) and **Node.js**
-(`npm install @infino-ai/infino`) bindings. For multi-language guides and
-examples, see the [project repository](https://github.com/infino-ai/infino).
+(`npm install @infino-ai/infino`) bindings. For concepts, guides, and
+multi-language examples, see the full documentation at
+[docs.infino.ai](https://docs.infino.ai).

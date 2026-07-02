@@ -6,6 +6,10 @@
 // runs as a `cargo test --doc` doctest so it can't drift from the API. The
 // Python/Node guides live in their own bindings and on the docs site.
 #![doc = include_str!("../crate-docs.md")]
+#![doc(
+    html_logo_url = "https://docs.infino.ai/logo/infino-logo.png",
+    html_favicon_url = "https://docs.infino.ai/favicon.png"
+)]
 // `coverage_nightly` is set by `cargo +nightly llvm-cov`. Under it we opt
 // into `#[coverage(off)]` annotations on stable-uncoverable error paths
 // (OOM handlers, overflow guards). On stable the feature flag is inert
