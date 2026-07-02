@@ -22,7 +22,7 @@ mod uri;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -45,7 +45,7 @@ use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::ConnectionMemoryBudget,
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_query_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -123,7 +123,6 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
-            query_runtime: OnceLock::new(),
         }),
     })
 }
@@ -143,26 +142,6 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
-    /// Runtime for the table-free `query_sql` fallback — search TVFs name
-    /// their table in an argument, not a `FROM` relation, so no supertable
-    /// runtime is in scope. See [`build_query_runtime`] for why it must be
-    /// multi-thread.
-    query_runtime: OnceLock<Arc<Runtime>>,
-}
-
-impl Drop for ConnectionInner {
-    /// `query_sql` builds `query_runtime` eagerly, and the sync API may be
-    /// called from inside the caller's own runtime — so dropping the last
-    /// `Connection` there must not trip tokio's "cannot drop a runtime from
-    /// within an async context" guard. `shutdown_background` consumes it
-    /// without blocking; `try_unwrap` shuts down only on the last owner.
-    fn drop(&mut self) {
-        if let Some(rt) = self.query_runtime.take()
-            && let Ok(rt) = Arc::try_unwrap(rt)
-        {
-            rt.shutdown_background();
-        }
-    }
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -533,14 +512,9 @@ impl Connection {
         }
     }
 
-    /// Runtime for the table-free `query_sql` fallback (see
-    /// [`ConnectionInner::query_runtime`]).
+    /// Runtime for the table-free `query_sql` fallback.
     fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(
-            self.inner
-                .query_runtime
-                .get_or_init(|| build_query_runtime("catalog-query")),
-        )
+        shared_query_runtime()
     }
 }
 

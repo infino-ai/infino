@@ -38,7 +38,12 @@
 //!
 //! [`utils::vector_split::split_vectors`]: super::utils::vector_split::split_vectors
 
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -51,7 +56,7 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode},
+    config::{Config, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,
     storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
     superfile::{
@@ -88,6 +93,39 @@ fn default_writer_thread_count() -> usize {
 /// across non-pruned superfiles saturates this pool.
 fn default_reader_thread_count() -> usize {
     num_cpus::get().max(1)
+}
+
+/// Process-wide reader pool, shared by every supertable that doesn't
+/// inject its own (via [`SupertableOptions::with_reader_pool`] or a
+/// `Fixed` count in [`Config`]) — M open tables cost N reader threads,
+/// not M×N.
+static SHARED_READER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+
+/// Process-wide writer pool; same sharing contract at half the cores.
+static SHARED_WRITER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+
+fn shared_reader_pool() -> Arc<ThreadPool> {
+    Arc::clone(SHARED_READER_POOL.get_or_init(|| {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(default_reader_thread_count())
+                .thread_name(|i| format!("supertable-reader-{i}"))
+                .build()
+                .expect("invariant: rayon pool build only fails on thread-spawn failure"),
+        )
+    }))
+}
+
+fn shared_writer_pool() -> Arc<ThreadPool> {
+    Arc::clone(SHARED_WRITER_POOL.get_or_init(|| {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(default_writer_thread_count())
+                .thread_name(|i| format!("supertable-writer-{i}"))
+                .build()
+                .expect("invariant: rayon pool build only fails on thread-spawn failure"),
+        )
+    }))
 }
 
 /// Default name of the supertable-injected primary-key column.
@@ -506,22 +544,9 @@ impl SupertableOptions {
             return Err(BuildError::MissingTokenizer);
         }
 
-        // 6. Build default thread pools + store.
-        let reader_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(default_reader_thread_count())
-                .thread_name(|i| format!("supertable-reader-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
-        let writer_threads = default_writer_thread_count();
-        let writer_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(writer_threads)
-                .thread_name(|i| format!("supertable-writer-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
+        // 6. Shared thread pools + a fresh store.
+        let reader_pool = shared_reader_pool();
+        let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
         Ok(Self {
@@ -808,29 +833,28 @@ impl SupertableOptions {
     /// a user-schema field — same check as
     /// [`Self::with_id_column`].
     pub fn apply_config(mut self, cfg: &Config) -> Result<Self, BuildError> {
-        let reader_n = cfg
-            .supertable
-            .reader_threads
-            .resolve_or_default(default_reader_thread_count());
-        let writer_n = cfg
-            .supertable
-            .writer_threads
-            .resolve_or_default(default_writer_thread_count());
-
-        self.reader_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(reader_n)
-                .thread_name(|i| format!("supertable-reader-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
-        self.writer_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(writer_n)
-                .thread_name(|i| format!("supertable-writer-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
+        // `Auto` keeps the shared pool; `Fixed` builds a dedicated one
+        // (the config analogue of `with_reader_pool` / `with_writer_pool`).
+        self.reader_pool = match cfg.supertable.reader_threads {
+            ThreadCount::Auto => shared_reader_pool(),
+            ThreadCount::Fixed(n) => Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(n.max(1))
+                    .thread_name(|i| format!("supertable-reader-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
+            ),
+        };
+        self.writer_pool = match cfg.supertable.writer_threads {
+            ThreadCount::Auto => shared_writer_pool(),
+            ThreadCount::Fixed(n) => Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(n.max(1))
+                    .thread_name(|i| format!("supertable-writer-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
+            ),
+        };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         // The `config.yaml` source for the connection budget; the connect path

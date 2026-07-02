@@ -19,7 +19,7 @@ use std::{
     fmt,
     future::Future,
     io,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,7 @@ use super::{
     options::SupertableOptions,
 };
 use crate::{
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, build_query_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_query_runtime},
     storage::StorageError,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
@@ -104,14 +104,6 @@ pub(super) struct SupertableInner {
     /// supertable, constructed fresh on `create()` /
     /// `open()` with a 40-bit random worker_id.
     pub(super) id_generator: Mutex<IdGenerator>,
-    /// Lazily-initialized tokio Runtime that drives DataFusion
-    /// plans for `query_sql`. Tokio is single-worker here — it
-    /// runs the async I/O state machine, not CPU-bound work
-    /// (that lives on `options.reader_pool`). One Runtime per
-    /// supertable, shared across all SQL queries; allocated on
-    /// first use rather than at `create()` so supertables that
-    /// never run SQL don't pay the runtime cost.
-    pub(super) query_runtime: OnceLock<Arc<Runtime>>,
     /// Cached `SessionContext` for `query_sql`, keyed on the
     /// manifest `Arc` it was built against. Building one is
     /// ~1.5 ms (default optimizer rules + 3 TVF re-registrations
@@ -148,45 +140,12 @@ pub(super) struct SupertableInner {
     pub(super) last_pointer_check: Mutex<Option<Instant>>,
 }
 
-impl Drop for SupertableInner {
-    /// Tear down the lazily-built query runtime without tripping
-    /// tokio's "cannot drop a runtime from within an async context"
-    /// guard.
-    ///
-    /// The public API is sync, but it explicitly supports being
-    /// called from inside a caller's own multi-thread runtime (the
-    /// sync→async bridge uses `block_in_place` there). In that mode a
-    /// sync query lazily builds the owned `query_runtime`. If the
-    /// caller then drops their last `Supertable` handle while still
-    /// inside their runtime, the default `Arc<Runtime>` drop would
-    /// panic. `shutdown_background` consumes the runtime without
-    /// blocking, so it is safe from any context. The `try_unwrap`
-    /// guard ensures we only shut it down when this is the last
-    /// owner; otherwise an outstanding transient clone (never the
-    /// last reference) just decrements normally.
-    fn drop(&mut self) {
-        if let Some(rt) = self.query_runtime.take()
-            && let Ok(rt) = Arc::try_unwrap(rt)
-        {
-            rt.shutdown_background();
-        }
-    }
-}
-
 impl SupertableInner {
-    /// Get (or lazily build) the runtime that drives the public sync
-    /// API's async kernels when the caller is not already on a Tokio
-    /// runtime (queries, SQL, writer commits). Sized to the host's
-    /// parallelism: the cold read path fans a query out across every
-    /// superfile via `tokio::spawn` + `spawn_blocking` (range GETs,
-    /// CRC verification, zstd decode), so a single worker would
-    /// serialize that fan-out and inflate cold latency. One worker per
-    /// CPU lets those overlap, matching what an async caller gets.
+    /// Runtime driving the sync API's async kernels when the caller
+    /// isn't already on a tokio runtime. Process-wide — see
+    /// [`shared_query_runtime`].
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
-        Arc::clone(
-            self.query_runtime
-                .get_or_init(|| build_query_runtime("supertable-query")),
-        )
+        shared_query_runtime()
     }
 }
 
@@ -255,7 +214,6 @@ impl Supertable {
             writer_outstanding: AtomicBool::new(false),
             compaction_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            query_runtime: OnceLock::new(),
             sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,
@@ -355,7 +313,6 @@ impl Supertable {
             writer_outstanding: AtomicBool::new(false),
             compaction_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
-            query_runtime: OnceLock::new(),
             sql_session_cache: Mutex::new(None),
             tombstone_cache,
             handle_id,

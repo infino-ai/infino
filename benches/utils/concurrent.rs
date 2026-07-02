@@ -7,28 +7,17 @@
 //! - **baseline**: N readers per table firing queries in a tight loop, no writers.
 //! - **contention**: same readers + 1 writer per table committing continuously.
 //!
-//! **Multi-tenant**: all `TENANTS` tables are created up front and stay open
-//! for the whole run, so every table's reader pool, writer pool, and lazy
-//! query runtime exist simultaneously — the process-level thread inventory
-//! grows with the tenant count exactly as it does in a multi-tenant server.
-//! Both phases drive load on **all tables at once**; latencies are aggregated
-//! across tables per modality. Peak OS thread count is sampled per phase and
-//! reported alongside the latency table — the headline metric for pool /
-//! runtime consolidation work.
+//! All `TENANTS` tables are built up front and stay open, with default pool
+//! construction, so the process thread inventory grows with the tenant count
+//! exactly as in a multi-tenant server. Both phases load **all tables at
+//! once**; latencies aggregate across tables per modality, and peak OS
+//! thread count is sampled per phase — the headline metric for pool /
+//! runtime consolidation.
 //!
-//! Tables use **default pool construction** (no `with_reader_pool` /
-//! `with_writer_pool` overrides): what a production caller gets is what this
-//! harness measures.
-//!
-//! **Duration-based** (not iteration-based): each condition runs for a fixed
-//! wall-clock window (default 15 s; 3 s warmup discarded). Every query that
-//! completes during the measurement window is recorded. This guarantees
-//! sustained overlap between readers and writers — the failure mode of
-//! iteration-based benches is that readers finish in milliseconds before the
-//! writer commits even once.
-//!
-//! Runs on a `multi_thread` tokio runtime so `bridge_sync_to_async` takes
-//! the `block_in_place` path — the same code path as axum/SaaS production.
+//! Duration-based, not iteration-based: each condition runs a fixed
+//! wall-clock window (default 15 s, 3 s warmup discarded) so readers and
+//! writers genuinely overlap. Runs on a `multi_thread` tokio runtime so
+//! `bridge_sync_to_async` takes the `block_in_place` path, as in production.
 //!
 //! Knobs (env vars):
 //!   INFINO_BENCH_CONCURRENT_DOCS      corpus size per table (default 200_000)
@@ -88,8 +77,8 @@ const TOP_K: usize = 10;
 const WRITER_BATCH: usize = 1_024;
 const CORPUS_CHUNKS: usize = 8;
 const FALLBACK_SIM_WORKERS: usize = 4;
-/// OS-thread-count poll cadence. Pools and runtimes are built lazily and
-/// live for whole phases, so 200 ms comfortably catches the peak.
+/// Thread-count poll cadence — pools live for whole phases, so 200 ms
+/// catches the peak.
 const THREAD_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -134,9 +123,8 @@ fn run_baseline() -> bool {
 
 // ─── OS thread count ──────────────────────────────────────────────────────────
 
-/// Current OS thread count of this process. Linux reads procfs; macOS
-/// counts `ps -M` rows (one per thread, one header line). `None` when
-/// neither source is available.
+/// Current OS thread count of this process (procfs on Linux, `ps -M`
+/// on macOS).
 fn current_thread_count() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -159,8 +147,7 @@ fn current_thread_count() -> Option<usize> {
     None
 }
 
-/// Background sampler recording the peak OS thread count over a phase.
-/// Same shape as `rss::PeakSampler`, but for threads and cross-platform.
+/// Background sampler recording peak OS thread count over a phase.
 struct ThreadSampler {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<usize>,
@@ -250,8 +237,8 @@ fn build_batch(start: usize, n: usize) -> RecordBatch {
     .expect("RecordBatch shape matches concurrent_schema")
 }
 
-// Default pool construction, deliberately: per-table pool/runtime growth is
-// part of what this harness measures.
+// Default pool construction — per-table pool/runtime growth is part of
+// what this harness measures.
 fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
     SupertableOptions::new(
         concurrent_schema(),
@@ -409,9 +396,8 @@ struct PhaseResult {
     per_table_n: Vec<(usize, usize)>,
 }
 
-// Drives load on ALL tables simultaneously: n_readers fts + n_readers vec
-// tasks per table, plus one writer per table when `with_writer`. Latencies
-// aggregate across tables; per-table counts are kept for fairness logging.
+// Drives n_readers fts + n_readers vec tasks per table on all tables at
+// once, plus one writer per table when `with_writer`.
 fn run_phase(
     tables: &[Supertable],
     n_readers: usize,
@@ -437,7 +423,7 @@ fn run_phase(
         Vec::new()
     };
 
-    // Per-table reader task groups so per-table counts survive aggregation.
+    // Grouped per table so per-table counts survive aggregation.
     let fts_readers: Vec<Vec<_>> = tables
         .iter()
         .map(|st| {
@@ -539,8 +525,7 @@ pub fn run() {
         warmup.as_secs_f64(),
     );
 
-    // All tables built up front and kept alive — every table's pools and
-    // lazy runtime coexist, as in a multi-tenant server process.
+    // All tables built up front and kept alive, as in a multi-tenant server.
     let fixtures: Vec<Fixture> = (0..tenants)
         .map(|t| {
             eprintln!("[concurrent] building table {t}...");
@@ -662,9 +647,7 @@ pub fn run() {
         );
     }
 
-    // OS thread inventory — the consolidation headline. Idle = pools built
-    // by table creation; per-phase peaks add lazy runtimes + block_in_place
-    // replacement workers.
+    // OS thread inventory — the consolidation headline.
     let mut thread_rows: Vec<Vec<Cell>> = vec![vec![
         text("idle after build".to_string()),
         metric(

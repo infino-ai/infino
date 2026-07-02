@@ -31,7 +31,11 @@
 //! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
 //! actix, etc.).
 
-use std::{future::Future, sync::Arc, thread};
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+    thread,
+};
 
 use tokio::{runtime, task::block_in_place};
 
@@ -98,6 +102,16 @@ where
     }
 }
 
+/// Process-wide query runtime, shared by every `Connection` and
+/// `Supertable` so open handles add zero tokio workers. Never shut
+/// down — the static keeps a reference until process exit, so handle
+/// drops from inside a caller's async context have nothing to tear down.
+static SHARED_QUERY_RUNTIME: OnceLock<Arc<runtime::Runtime>> = OnceLock::new();
+
+pub(crate) fn shared_query_runtime() -> Arc<runtime::Runtime> {
+    Arc::clone(SHARED_QUERY_RUNTIME.get_or_init(|| build_query_runtime("infino-query")))
+}
+
 /// Shared multi-thread runtime for driving the sync query API's async I/O.
 ///
 /// Multi-thread is required, not just preferred: the bridges above take the
@@ -105,7 +119,7 @@ where
 /// `block_in_place` panics on a `current_thread` runtime. Workers scale to
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
-pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
+fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
     const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
     let workers = thread::available_parallelism()
         .map(|n| n.get())
