@@ -1300,7 +1300,13 @@ impl SupertableReader {
                     }
                 };
                 let (hidden_hits, user_tail_hits) = try_join!(hidden_fut, user_tail_fut)?;
-                return Ok(top_k_ascending(vec![hidden_hits, user_tail_hits], k));
+                // Boundary replication puts the same row (stable_id) in several
+                // runs, so it can be fetched more than once with slightly
+                // different per-run quantization. Collapse to one hit per
+                // stable_id keeping the min (closest) distance before top-k.
+                let mut merged = hidden_hits;
+                merged.extend(user_tail_hits);
+                return Ok(top_k_ascending(vec![dedup_hits_by_stable_id(merged)], k));
             }
         }
         self.vector_search_user_table_async(column, query, k, options)
@@ -1408,6 +1414,35 @@ fn subtract_tombstones(
         }
     }
     Ok(())
+}
+
+/// Collapse hits that resolve to the same `stable_id` down to a single hit,
+/// keeping the one with the minimum (closest) distance. Boundary replication
+/// stores a row in several runs, so the same `stable_id` can be fetched more
+/// than once with slightly different per-run quantization; the query must return
+/// it once. Hits without a resolved `stable_id` (e.g. user-table hits identified
+/// by `(superfile, local_doc_id)`) pass through unchanged, since replication
+/// only duplicates rows that carry a piggybacked `stable_id`.
+fn dedup_hits_by_stable_id(hits: Vec<SuperfileHit>) -> Vec<SuperfileHit> {
+    let mut best_index: HashMap<i128, usize> = HashMap::new();
+    let mut out: Vec<SuperfileHit> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        match hit.stable_id {
+            Some(id) => match best_index.get(&id) {
+                Some(&idx) => {
+                    if hit.score < out[idx].score {
+                        out[idx] = hit;
+                    }
+                }
+                None => {
+                    best_index.insert(id, out.len());
+                    out.push(hit);
+                }
+            },
+            None => out.push(hit),
+        }
+    }
+    out
 }
 
 /// Merge per-superfile hits and return the top-k by *ascending*
@@ -2246,6 +2281,44 @@ mod tests {
         assert!(
             hit_uris.contains(&user_uris[1]),
             "expected direct hit from undrained user-table tail"
+        );
+    }
+
+    #[test]
+    fn dedup_hits_by_stable_id_keeps_min_score_per_id() {
+        let a = SuperfileUri::new_v4();
+        let b = SuperfileUri::new_v4();
+        let hit = |superfile, local_doc_id, score, stable_id| SuperfileHit {
+            superfile,
+            local_doc_id,
+            score,
+            stable_id,
+        };
+        // stable_id 100 appears twice (a replicated row in two runs) -> keep the
+        // closer (min-score) copy; 200 appears once; a hit with no stable_id
+        // (user-table identity) passes through untouched.
+        let deduped = super::dedup_hits_by_stable_id(vec![
+            hit(a, 0, 0.9, Some(100)),
+            hit(b, 5, 0.4, Some(100)),
+            hit(a, 1, 0.7, Some(200)),
+            hit(a, 2, 0.2, None),
+        ]);
+        assert_eq!(deduped.len(), 3);
+        let s100 = deduped
+            .iter()
+            .find(|h| h.stable_id == Some(100))
+            .expect("stable_id 100 present")
+            .score;
+        assert_eq!(s100, 0.4);
+        assert!(
+            deduped
+                .iter()
+                .any(|h| h.stable_id == Some(200) && h.score == 0.7)
+        );
+        assert!(
+            deduped
+                .iter()
+                .any(|h| h.stable_id.is_none() && h.score == 0.2)
         );
     }
 }
