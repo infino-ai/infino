@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 use tracing::{debug, warn};
 
 use super::{
-    error::{BuildError, OpenError},
+    error::{BuildError, CommitError, OpenError},
     manifest::ManifestSnapshot,
     options::SupertableOptions,
 };
@@ -245,13 +245,50 @@ impl Supertable {
         }
 
         let options = Arc::new(options);
-        let initial = ManifestSnapshot::empty(options.clone());
+        // Build the initial in-memory manifest. A durable table also *persists*
+        // it here — its list plus the pointer at `manifest_id 0` — so the
+        // freshly created table is openable right away: before any append,
+        // after a reopen, and from another process. `open` requires a pointer,
+        // and this doesn't shift the id sequence (the first append still
+        // commits `manifest_id 1`). An in-memory table keeps the lighter
+        // in-process-only empty snapshot, with nothing to persist.
+        let initial: Arc<ManifestSnapshot> = if let Some(storage) = options.storage.clone() {
+            let materialized = Arc::new(ManifestSnapshot::materialized_empty(options.clone()));
+            let write_result = {
+                let manifest = Arc::clone(&materialized);
+                let storage = Arc::clone(&storage);
+                // `expected_prev_etag = None` is the initial-commit shape: no
+                // prior pointer to fence on.
+                bridge_sync_to_async(
+                    async move { manifest.write(storage.as_ref(), None, &[]).await },
+                )
+            };
+            match write_result {
+                Ok(()) => materialized,
+                // Lost the initial-pointer race to a concurrent creator on the
+                // same storage: adopt their committed manifest rather than
+                // failing. This matches `create`'s create-or-open contract — a
+                // pointer that appeared between our probe and our write is the
+                // same as "pointer already present" (which the probe above
+                // routes to `open`).
+                Err(CommitError::WriteContentionExhausted) => {
+                    let storage = Arc::clone(&storage);
+                    let options = options.clone();
+                    bridge_sync_to_async(async move {
+                        ManifestSnapshot::load(None, storage, Some(options)).await
+                    })?
+                }
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            Arc::new(ManifestSnapshot::empty(options.clone()))
+        };
         let tombstone_cache = build_tombstone_cache(&options);
         let id_generator = IdGenerator::new();
         let handle_id = SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
             options,
-            manifest: ArcSwap::new(Arc::new(initial)),
+            manifest: ArcSwap::new(initial),
             writer_outstanding: AtomicBool::new(false),
             compaction_outstanding: AtomicBool::new(false),
             id_generator: Mutex::new(id_generator),
@@ -296,17 +333,16 @@ impl Supertable {
     /// `Supertable` is ready to serve queries from the
     /// snapshot at the pointer's `manifest_id`.
     ///
-    /// A genuinely absent pointer is **not** an error: it means
-    /// nothing has been committed yet, so open returns an empty
-    /// supertable (`manifest_id == 0`). Uncommitted data is
-    /// invisible by design, so "no pointer" and "empty table" are
-    /// the same observable state. A *corrupt* pointer is a distinct
-    /// error (`ManifestLoadError::PointerParse`) and still fails, so
-    /// corruption is never silently swallowed.
+    /// A genuinely absent pointer is a [`ManifestLoadError::PointerNotFound`]
+    /// error, not an empty table: `create` persists the initial pointer, so
+    /// a registered table always has one, and a missing pointer is the
+    /// open-or-create trigger (or a lost pointer) — surfaced, never masked
+    /// as a silently-empty table.
     ///
     /// Errors:
-    /// - [`OpenError::ManifestLoadError`] for manifest load failures
-    ///   *other than* a missing pointer (parse / corruption / fetch).
+    /// - [`OpenError::ManifestLoadError`] for manifest load failures,
+    ///   including a missing pointer (`PointerNotFound`), parse, corruption,
+    ///   or fetch.
     /// - [`OpenError::Build`] if `options.storage` is `None`
     ///   (open requires a storage backend).
     /// - [`OpenError::Storage`], [`OpenError::ManifestListParse`],

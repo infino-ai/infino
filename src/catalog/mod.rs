@@ -734,6 +734,46 @@ mod tests {
         ));
     }
 
+    /// Regression: on durable storage, `open_table` on a table that was
+    /// created but never appended to must succeed and yield an empty,
+    /// usable table. `create` leaves no pointer file until the first commit,
+    /// so a fresh `open` — any reconnect (another process, a restart) before
+    /// the first append — must treat the missing pointer as an empty table
+    /// rather than failing. Previously it surfaced a "manifest load error",
+    /// and the create handle only worked because it never went through `open`.
+    #[test]
+    fn durable_open_before_first_append_yields_empty_usable_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        // Create, but do NOT append through the returned handle.
+        let _created = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        // Open fresh — the reconnect path. This must not error.
+        let opened = conn
+            .open_table("docs")
+            .expect("open_table before first append");
+
+        // Starts empty.
+        let before = opened
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .expect("bm25_search on empty table");
+        assert_eq!(n_rows(&before), 0, "freshly opened table starts empty");
+
+        // Fully usable: the first commit lands through the reopened handle,
+        // then the query round-trips.
+        opened
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append via reopened handle");
+        let hits = opened
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .expect("bm25_search after append");
+        assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
+    }
+
     #[test]
     fn connection_memory_budget_is_measured_by_default() {
         let conn = connect("memory://").expect("connect");
