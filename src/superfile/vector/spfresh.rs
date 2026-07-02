@@ -511,19 +511,31 @@ fn materialized_rows_to_runs(rows: Vec<MaterializedIvfRow>) -> Vec<RunInput> {
 }
 
 fn fp32_rows_to_runs(col: &ColumnState) -> Vec<Fp32RunInput> {
+    fp32_rows_to_runs_for_target(col, TARGET_RUN_BYTES)
+}
+
+fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<Fp32RunInput> {
     let dim = col.config.dim;
     let n_rows = col.ids.len();
+    if n_rows == 0 {
+        return Vec::new();
+    }
     let eps = replication_eps();
+    let k_fine = fine_centroid_count_for_target(n_rows, dim, target_bytes);
+    let (centroids, _) = kmeans_with_assignments(
+        &col.vectors,
+        dim,
+        k_fine,
+        FINE_KMEANS_ITERS,
+        FINE_KMEANS_SEED,
+    );
     let mut grouped: HashMap<u32, Fp32RunInput> = HashMap::new();
     for row_idx in 0..n_rows {
         let vector = &col.vectors[row_idx * dim..(row_idx + 1) * dim];
-        // Shared replica assignment: `assign_replicas` returns the single
-        // nearest centroid at the default eps=0 (hard assignment) and a boundary
-        // replica set once eps>0. With no provided centroids there is one run.
-        let cells = match col.config.provided_centroids.as_ref() {
-            Some(centroids) => assign_replicas(col.config.metric, vector, dim, centroids, eps),
-            None => vec![0],
-        };
+        // User superfiles train their own fine-centroid runs at the same ~2 MiB
+        // target as hidden maintenance. The coarse global cell grid is only the
+        // outer router; it must not become the run key.
+        let cells = assign_replicas(col.config.metric, vector, dim, &centroids, eps);
         for cell in cells {
             let entry = grouped.entry(cell).or_insert_with(|| Fp32RunInput {
                 cluster_id: cell,
@@ -1120,14 +1132,17 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        HiddenIndexLayout, RunInput, SpfreshBlobReader, assign_fine_clusters_for_target,
-        assign_replicas, encode_materialized_runs, fine_centroid_count_for_target,
-        parse_hidden_index_layout,
+        ColumnState, HiddenIndexLayout, RunInput, SpfreshBlobReader,
+        assign_fine_clusters_for_target, assign_replicas, encode_materialized_runs,
+        fine_centroid_count_for_target, fp32_rows_to_runs_for_target, parse_hidden_index_layout,
+        run_row_stride,
     };
     use crate::superfile::vector::{
+        builder::VectorConfig,
         cell_posting::{EncodedCellRow, MaterializedIvfRow},
         distance::Metric,
         layout::VectorLayout,
+        rerank_codec::RerankCodec,
     };
 
     /// Three well-separated centroids on a line, `dim = 2`.
@@ -1201,6 +1216,36 @@ mod tests {
         assert_eq!(fine_centroid_count_for_target(1, 16, 5600), 1);
         // Tiny target: per-run clamps to >=1 row and K never exceeds n_rows.
         assert_eq!(fine_centroid_count_for_target(5, 16, 56), 5);
+    }
+
+    #[test]
+    fn fp32_commit_rows_train_fine_runs_from_target_size() {
+        let config = VectorConfig {
+            column: "emb".into(),
+            dim: 2,
+            n_cent: 2,
+            rot_seed: 0,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
+        };
+        let col = ColumnState {
+            config,
+            ids: vec![0, 1, 2, 3],
+            vectors: vec![
+                0.0, 0.0, //
+                0.1, 0.0, //
+                100.0, 0.0, //
+                100.1, 0.0,
+            ],
+            materialized_rows: None,
+            next_local_id: 4,
+        };
+        let runs = fp32_rows_to_runs_for_target(&col, run_row_stride(2) * 2);
+        assert_eq!(runs.len(), 2);
+        let mut row_counts: Vec<usize> = runs.iter().map(|run| run.local_ids.len()).collect();
+        row_counts.sort_unstable();
+        assert_eq!(row_counts, vec![2, 2]);
     }
 
     #[test]

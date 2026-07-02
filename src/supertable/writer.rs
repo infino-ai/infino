@@ -117,7 +117,9 @@ use crate::{
         },
         reader::vector_layout_from_kv,
         vector::{
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            cell_posting::{
+                EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row,
+            },
             distance::Metric,
             ivf_merge::{MergedIvfSubsection, route_clusters_into_cells},
             kmeans::kmeans_with_assignments,
@@ -136,7 +138,7 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::{CellTree, PartitionStrategy, RunRef, SpfreshRoutingIndex},
+            list::{CellTree, CellTreeNode, PartitionStrategy, RunRef, SpfreshRoutingIndex},
             part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
@@ -189,8 +191,8 @@ fn user_superfile_vector_layout_for_hidden(
 }
 
 fn user_superfiles_use_global_centroids(vector_layout: VectorLayout) -> bool {
-    matches!(vector_layout, VectorLayout::Spfresh)
-        || env::var(USER_CENTROIDS_ENV)
+    vector_layout != VectorLayout::Spfresh
+        && env::var(USER_CENTROIDS_ENV)
             .map(|value| value == USER_CENTROIDS_GLOBAL_VALUE)
             .unwrap_or(false)
 }
@@ -1318,8 +1320,8 @@ impl SupertableWriter {
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
         let user_vector_layout = user_superfile_vector_layout(user_options.vector_layout);
-        // SPFresh user superfiles are cluster-aligned to the global VectorCell
-        // grid; the older bench knob keeps the same alignment available for IVF.
+        // SPFresh user superfiles train per-superfile fine runs. The older bench
+        // knob keeps global-cell alignment available for IVF only.
         let user_global_centroids: Option<Arc<[f32]>> =
             if user_superfiles_use_global_centroids(user_vector_layout) {
                 self.inner
@@ -1767,6 +1769,122 @@ fn empty_cell_tree(cell_id: u32) -> CellTree {
     }
 }
 
+fn prepared_superfile_bytes(prep: &PreparedSuperfile) -> Result<Bytes, BuildError> {
+    prep.bytes_for_store
+        .as_ref()
+        .or(prep.bytes_for_storage.as_ref())
+        .or(prep.bytes_for_cache.as_ref())
+        .map(|(_, bytes)| bytes.clone())
+        .ok_or_else(|| BuildError::Store("SPFresh prepared superfile missing bytes".into()))
+}
+
+fn encode_f32_centroid(centroid: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(centroid.len() * mem::size_of::<f32>());
+    for value in centroid {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn mean_run_centroid(rows: &[MaterializedIvfRow], cluster_id: u32, dim: usize) -> Option<Vec<f32>> {
+    let mut centroid = vec![0.0f32; dim];
+    let mut count = 0usize;
+    for row in rows.iter().filter(|row| row.cluster == cluster_id) {
+        let components = manifest_centroid_components_from_row(&row.encoded, dim);
+        for (dst, src) in centroid.iter_mut().zip(components) {
+            *dst += src;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let inv = 1.0 / count as f32;
+    for value in &mut centroid {
+        *value *= inv;
+    }
+    Some(centroid)
+}
+
+fn append_user_spfresh_routing(
+    existing: Option<SpfreshRoutingIndex>,
+    column: &str,
+    global_grid: &ClusterCentroids,
+    metric: Metric,
+    prepared: &[PreparedSuperfile],
+) -> Result<Option<SpfreshRoutingIndex>, BuildError> {
+    if global_grid.n_cent == 0 || global_grid.dim == 0 {
+        return Ok(None);
+    }
+    let mut cells: Vec<CellTree> = (0..global_grid.n_cent).map(empty_cell_tree).collect();
+    if let Some(existing) = existing
+        && existing.column == column
+    {
+        for mut cell in existing.cells {
+            let cell_id = cell.cell_id as usize;
+            while cell_id >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
+            }
+            cells[cell_id].nodes.append(&mut cell.nodes);
+            cells[cell_id].leaves.append(&mut cell.leaves);
+        }
+    }
+
+    let mut appended = false;
+    for prep in prepared
+        .iter()
+        .filter(|prep| prep.entry.vector_layout == VectorLayout::Spfresh)
+    {
+        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
+        else {
+            return Err(BuildError::Store(
+                "SPFresh user superfile missing vector subsection offsets".into(),
+            ));
+        };
+        let bytes = prepared_superfile_bytes(prep)?;
+        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
+        let spfresh = reader.spfresh_vec().ok_or_else(|| {
+            BuildError::Store("user superfile missing SPFresh vector blob".into())
+        })?;
+        let rows = spfresh
+            .materialized_rows()
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        for (run_id, run) in spfresh.runs().iter().enumerate() {
+            let Some(centroid) = mean_run_centroid(&rows, run.cluster_id, global_grid.dim as usize)
+            else {
+                continue;
+            };
+            let cell_id = global_grid.nearest_cell(metric, &centroid);
+            let cid = cell_id as usize;
+            while cid >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
+            }
+            let range = spfresh
+                .run_range(run_id)
+                .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
+            cells[cid].nodes.push(CellTreeNode {
+                centroid: encode_f32_centroid(&centroid),
+                left: 0,
+                right: 0,
+            });
+            cells[cid].leaves.push(RunRef {
+                superfile_uri: prep.entry.uri.0.to_string(),
+                cell_id,
+                cluster_id: run.cluster_id,
+                run_id: run_id as u32,
+                byte_range: (vec_offset + range.start as u64, range.len() as u64),
+                row_count: run.row_count,
+            });
+            appended = true;
+        }
+    }
+
+    Ok(appended.then(|| SpfreshRoutingIndex {
+        column: column.into(),
+        cells,
+    }))
+}
+
 pub(in crate::supertable) fn refresh_spfresh_routing(
     existing: Option<SpfreshRoutingIndex>,
     column: &str,
@@ -1805,13 +1923,7 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
         // carry a fine cluster id inside the blob, but outer routing and the
         // per-cell tree are keyed by the coarse cell that owns the superfile.
         let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
-        let bytes = prep
-            .bytes_for_store
-            .as_ref()
-            .or(prep.bytes_for_storage.as_ref())
-            .or(prep.bytes_for_cache.as_ref())
-            .map(|(_, bytes)| bytes.clone())
-            .ok_or_else(|| BuildError::Store("SPFresh prepared superfile missing bytes".into()))?;
+        let bytes = prepared_superfile_bytes(prep)?;
         let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
         let spfresh = reader.spfresh_vec().ok_or_else(|| {
             BuildError::Store("hidden superfile missing SPFresh vector blob".into())
@@ -2036,6 +2148,7 @@ struct SuperfilePublishBatch {
     to_remove: Vec<Arc<SuperfileEntry>>,
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
+    spfresh_routing: Option<SpfreshRoutingIndex>,
 }
 
 fn collect_prepared_superfiles(
@@ -2066,6 +2179,7 @@ fn collect_prepared_superfiles(
         to_remove: Vec::new(),
         pending_storage_writes,
         pending_cache_inserts,
+        spfresh_routing: None,
     })
 }
 
@@ -2091,7 +2205,37 @@ fn prepare_user_superfile_batch_in_scope(
                 Err(e) => Some(Err(e)),
             })
             .collect::<Result<Vec<_>, _>>()?;
-    collect_prepared_superfiles(inner, prepared)
+    let spfresh_routing = if prepared
+        .iter()
+        .any(|prep| prep.entry.vector_layout == VectorLayout::Spfresh)
+    {
+        let manifest = inner.manifest.load_full();
+        manifest
+            .get_global_vector_index()
+            .map(|global| {
+                let metric = inner
+                    .options
+                    .vector_columns
+                    .iter()
+                    .find(|vc| vc.column == global.column)
+                    .map(|vc| vc.metric)
+                    .unwrap_or(Metric::L2Sq);
+                append_user_spfresh_routing(
+                    manifest.get_spfresh_routing(),
+                    &global.column,
+                    &global.grid,
+                    metric,
+                    &prepared,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let mut batch = collect_prepared_superfiles(inner, prepared)?;
+    batch.spfresh_routing = spfresh_routing;
+    Ok(batch)
 }
 
 fn prepare_user_superfile_batch(
@@ -2111,6 +2255,11 @@ async fn persist_superfile_publish_batch_async(
 ) -> Result<(), BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(());
+    }
+    if let Some(routing) = batch.spfresh_routing.clone() {
+        inner.manifest.store(Arc::new(
+            inner.manifest.load().with_spfresh_routing(routing),
+        ));
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
         let new_manifest = persist_commit_async(
@@ -2161,11 +2310,10 @@ fn maint_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// No-staging drain: splice each user-table vector superfile's cluster `c`
-/// (the user superfiles are global-aligned, so cluster `c` == cell `c`) into
-/// fresh cell superfiles in the hidden index table. Reads from `user_inner`,
+/// No-staging drain: read undrained user-table vector superfiles and append
+/// fresh per-cell superfiles in the hidden index table. Reads from `user_inner`,
 /// writes cells to `hidden_inner`; user superfiles are the durable source and
-/// are NOT removed. No dual-write, no staging copy, no decode/re-k-means.
+/// are NOT removed. No dual-write and no separate incoming staging copy.
 ///
 /// Processes user superfiles in BOUNDED BATCHES (`drain_batch_superfiles`) so
 /// working-set RAM stays O(batch); each batch appends one superfile per touched
@@ -2173,7 +2321,9 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 /// the hidden manifest's `drained_ranges`, and advances `drained_ranges`
 /// atomically with each batch's cell commit — so re-running (or running
 /// periodically) drains only newly-ingested commits, never duplicating cells.
-/// Pre-drain queries see an empty hidden index (0 results) until this runs.
+/// Pre-drain queries search the still-undrained user superfile tail directly;
+/// once a commit's `birth_version` is recorded here, queries can skip that user
+/// tail and read the hidden cell copy instead.
 fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
     env::var(DRAIN_BATCH_SUPERFILES_ENV)
         .ok()
@@ -2308,9 +2458,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     //   `splice` — route each superfile's LOCAL clusters to their nearest global
     //     cell, keep them verbatim as multi-cluster fragments (no re-cluster).
     let mode = env::var(DRAIN_CONSOLIDATE_ENV).unwrap_or_else(|_| DRAIN_CONSOLIDATE_DEFAULT.into());
-    // assign-skip: SPFresh and the legacy global-centroid bench path both make
-    // cluster c == cell c, so group by the row's own cluster ordinal instead
-    // of the O(n·n_cent) per-row nearest-cell scoring.
+    // assign-skip: only the legacy global-centroid bench path makes cluster
+    // c == cell c. SPFresh user superfiles use per-superfile fine run ids, so
+    // they must be routed back to coarse cells by distance during drain.
     let hidden_vector_layout = hidden_inner.options.vector_layout;
     let assign_skip = user_superfiles_use_global_centroids(hidden_vector_layout);
     let column_name = column.clone();
@@ -4073,7 +4223,7 @@ mod tests {
             user_superfile_vector_layout_for_hidden(VectorLayout::Ivf, HiddenIndexLayout::Spfresh),
             VectorLayout::Spfresh
         );
-        assert!(user_superfiles_use_global_centroids(VectorLayout::Spfresh));
+        assert!(!user_superfiles_use_global_centroids(VectorLayout::Spfresh));
     }
 
     #[test]
@@ -4101,11 +4251,43 @@ mod tests {
         assert_eq!(spfresh.dim(), DIM);
         assert_eq!(spfresh.n_rows() as usize, ROWS);
         assert!(!spfresh.runs().is_empty());
+    }
+
+    #[test]
+    fn spfresh_user_commit_stamps_manifest_routing_when_hidden_index_exists() {
+        const DIM: usize = 16;
+        const ROWS: usize = 80;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            options_with_vector(DIM)
+                .with_vector_layout(VectorLayout::Spfresh)
+                .with_storage(storage),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, ROWS, DIM)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        let sf_reader = st.options().store.reader(&seg.uri).expect("reader");
+        let spfresh = sf_reader.spfresh_vec().expect("SPFresh vector reader");
+        let routing = r
+            .manifest()
+            .get_spfresh_routing()
+            .expect("user SPFresh routing stamped");
+        let route_refs: usize = routing.cells.iter().map(|cell| cell.leaves.len()).sum();
+        let route_nodes: usize = routing.cells.iter().map(|cell| cell.nodes.len()).sum();
+        assert_eq!(route_refs, spfresh.runs().len());
+        assert_eq!(route_nodes, spfresh.runs().len());
         assert!(
-            spfresh
-                .runs()
+            routing
+                .cells
                 .iter()
-                .all(|run| run.cluster_id < GLOBAL_VECTOR_CELL_COUNT as u32)
+                .all(|cell| cell.nodes.len() == cell.leaves.len())
         );
     }
 

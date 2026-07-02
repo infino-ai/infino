@@ -44,7 +44,7 @@ use crate::{
     superfile::SuperfileReader,
     supertable::{
         error::QueryError,
-        handle::SupertableReader,
+        handle::{SupertableReader, is_hidden_vector_index_table},
         manifest::SuperfileEntry,
         query::superfile_reader::superfile_reader,
         reader_cache::{DiskCacheStore, SuperfileReaderCache},
@@ -195,6 +195,7 @@ where
     K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
 {
+    let should_tag_stable_ids = is_hidden_vector_index_table(&reader.manifest().options);
     fanout_with(
         reader,
         units,
@@ -211,7 +212,7 @@ where
                 // on cold, resident on warm). INCOMING staging superfiles:
                 // scalar `_id` column via sync `take_by_local_doc_ids` on
                 // resident bytes — both skip the trailing remap GET.
-                if !tagged.is_empty() {
+                if should_tag_stable_ids && !tagged.is_empty() {
                     let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
                     if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
                         for (h, id) in tagged.iter_mut().zip(ids) {
@@ -244,6 +245,7 @@ where
     K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
 {
+    let should_tag_stable_ids = is_hidden_vector_index_table(&reader.manifest().options);
     fanout_with(
         reader,
         units,
@@ -254,7 +256,7 @@ where
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
-                if !tagged.is_empty() {
+                if should_tag_stable_ids && !tagged.is_empty() {
                     let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
                     if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
                         for (h, id) in tagged.iter_mut().zip(ids) {

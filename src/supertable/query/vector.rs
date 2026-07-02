@@ -91,7 +91,9 @@ pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     storage::StorageProvider,
     superfile::{
-        SuperfileReader, fts::reader::BoolMode, vector::distance::Metric,
+        SuperfileReader,
+        fts::reader::BoolMode,
+        vector::distance::{Metric, distance},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -105,6 +107,9 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Size of one little-endian fp32 component in manifest-encoded centroids.
+const F32_BYTES: usize = 4;
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -174,6 +179,9 @@ fn spfresh_run_ids_by_superfile(
     routing: Option<SpfreshRoutingIndex>,
     column: &str,
     superfiles: &[Arc<SuperfileEntry>],
+    metric: Metric,
+    query: &[f32],
+    nprobe: usize,
 ) -> HashMap<SuperfileUri, Vec<usize>> {
     let Some(routing) = routing else {
         return HashMap::new();
@@ -185,19 +193,57 @@ fn spfresh_run_ids_by_superfile(
         .iter()
         .map(|entry| entry.uri.0.to_string())
         .collect();
-    let mut out: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
+    let by_uri: HashMap<String, SuperfileUri> = superfiles
+        .iter()
+        .map(|entry| (entry.uri.0.to_string(), entry.uri))
+        .collect();
+    let mut scored: Vec<(SuperfileUri, usize, f32)> = Vec::new();
+    let mut fallback: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for cell in routing.cells {
-        for leaf in cell.leaves {
+        for (leaf_idx, leaf) in cell.leaves.into_iter().enumerate() {
             if !selected.contains(&leaf.superfile_uri) {
                 continue;
             }
-            let Some(entry) = superfiles
-                .iter()
-                .find(|entry| entry.uri.0.to_string() == leaf.superfile_uri)
-            else {
+            let Some(uri) = by_uri.get(&leaf.superfile_uri).copied() else {
                 continue;
             };
-            out.entry(entry.uri).or_default().push(leaf.run_id as usize);
+            let run_id = leaf.run_id as usize;
+            match cell
+                .nodes
+                .get(leaf_idx)
+                .and_then(|node| decode_manifest_centroid(&node.centroid, query.len()))
+            {
+                Some(centroid) => scored.push((uri, run_id, distance(metric, query, &centroid))),
+                None => fallback.entry(uri).or_default().push(run_id),
+            }
+        }
+    }
+
+    let mut out = fallback;
+    if !scored.is_empty() {
+        let selected_superfiles = {
+            let mut uris: Vec<SuperfileUri> = scored.iter().map(|(uri, _, _)| *uri).collect();
+            uris.sort_unstable();
+            uris.dedup();
+            uris.len()
+        };
+        let budget = std::env::var("INFINO_INNER_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|b| b.max(1))
+            .unwrap_or_else(|| {
+                nprobe
+                    .saturating_mul(selected_superfiles.max(1))
+                    .max(nprobe)
+            });
+        if scored.len() > budget {
+            scored.select_nth_unstable_by(budget, |a, b| {
+                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+            });
+            scored.truncate(budget);
+        }
+        for (uri, run_id, _) in scored {
+            out.entry(uri).or_default().push(run_id);
         }
     }
     for run_ids in out.values_mut() {
@@ -205,6 +251,18 @@ fn spfresh_run_ids_by_superfile(
         run_ids.dedup();
     }
     out
+}
+
+fn decode_manifest_centroid(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
+    if bytes.len() != dim.checked_mul(F32_BYTES)? {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dim);
+    for chunk in bytes.chunks_exact(F32_BYTES) {
+        let arr: [u8; F32_BYTES] = chunk.try_into().ok()?;
+        out.push(f32::from_le_bytes(arr));
+    }
+    Some(out)
 }
 
 async fn undrained_user_superfiles(
@@ -676,8 +734,14 @@ impl SupertableReader {
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
             .unwrap_or(Metric::L2Sq);
-        let spfresh_runs =
-            spfresh_run_ids_by_superfile(manifest.get_spfresh_routing(), column, &superfiles);
+        let spfresh_runs = spfresh_run_ids_by_superfile(
+            manifest.get_spfresh_routing(),
+            column,
+            &superfiles,
+            metric,
+            query,
+            nprobe,
+        );
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
@@ -1252,10 +1316,10 @@ impl SupertableReader {
                             routing_with_env_overrides(routing),
                         );
                         // No-staging model: the hidden index is built by draining
-                        // the user superfiles into cells, so there is no separate
-                        // "incoming" staging region to scan. Pre-drain the hidden
-                        // index is empty (0 results) — accepted for now; the
-                        // watermark/incremental path comes post-1M.
+                        // user superfiles into cells, so there is no separate
+                        // "incoming" staging region to scan. Undrained user
+                        // superfiles are searched alongside the hidden cells
+                        // below, keyed by the hidden manifest's drained watermark.
                         if vit_manifest.superfiles.is_empty() {
                             vit_manifest
                                 .superfiles_for_routed_cells(&routed)
@@ -1564,7 +1628,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::list::{CellTree, RunRef, SpfreshRoutingIndex},
+            manifest::list::{CellTree, CellTreeNode, RunRef, SpfreshRoutingIndex},
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -1864,8 +1928,86 @@ mod tests {
             }],
         };
 
-        let selected = super::spfresh_run_ids_by_superfile(Some(routing), "emb", &[entry.clone()]);
+        let selected = super::spfresh_run_ids_by_superfile(
+            Some(routing),
+            "emb",
+            &[entry.clone()],
+            Metric::L2Sq,
+            &[0.0],
+            1,
+        );
         assert_eq!(selected.get(&entry.uri), Some(&vec![1usize, 3]));
+    }
+
+    #[test]
+    fn spfresh_routing_scores_manifest_centroids_to_select_runs() {
+        let id = Uuid::from_u128(0x5678);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 8,
+            id_min: 0,
+            id_max: 7,
+            scalar_stats: std::collections::HashMap::new(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: Some(2),
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        });
+        let centroid_bytes = |x: f32| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&x.to_le_bytes());
+            out
+        };
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            cells: vec![CellTree {
+                cell_id: 2,
+                nodes: vec![
+                    CellTreeNode {
+                        centroid: centroid_bytes(0.0),
+                        left: 0,
+                        right: 0,
+                    },
+                    CellTreeNode {
+                        centroid: centroid_bytes(100.0),
+                        left: 0,
+                        right: 0,
+                    },
+                ],
+                leaves: vec![
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        cluster_id: 0,
+                        run_id: 3,
+                        byte_range: (10, 20),
+                        row_count: 4,
+                    },
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        cluster_id: 1,
+                        run_id: 1,
+                        byte_range: (30, 20),
+                        row_count: 4,
+                    },
+                ],
+            }],
+        };
+
+        let selected = super::spfresh_run_ids_by_superfile(
+            Some(routing),
+            "emb",
+            &[entry.clone()],
+            Metric::L2Sq,
+            &[99.0],
+            1,
+        );
+        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize]));
     }
 
     #[test]
