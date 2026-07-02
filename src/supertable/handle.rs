@@ -42,7 +42,7 @@ use crate::{
     superfile::vector::kmeans::kmeans,
     superfile::vector::spfresh::hidden_index_layout,
     supertable::{
-        ManifestLoadError, SuperfileUri, SupertableStats,
+        ManifestLoadError, SuperfileUri, SupertableStats, hidden_centroids,
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -144,6 +144,9 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
+    /// Hidden SPFresh fine centroids loaded from the manifest-owned side blob.
+    /// Empty on user tables and on legacy/IVF hidden manifests.
+    pub(super) resident_spfresh_centroids: ArcSwap<hidden_centroids::ResidentCentroids>,
     /// Last time the read path checked the storage manifest pointer
     /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
     /// until the first check (so the first query always refreshes).
@@ -376,12 +379,21 @@ impl Supertable {
             .clone();
 
         let current = self.inner.manifest.load_full();
-        let manifest = match Manifest::load(Some(current), storage, None).await {
+        let manifest = match Manifest::load(Some(current), Arc::clone(&storage), None).await {
             Ok(manifest) => manifest,
             Err(ManifestLoadError::PointerNotFound) => return Ok(false),
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
             Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };
+        if is_hidden_vector_index_table(&self.inner.options) {
+            let resident =
+                hidden_centroids::load_resident_centroids(manifest.as_ref(), storage.as_ref())
+                    .await
+                    .map_err(|e| OpenError::Build(BuildError::Store(e.to_string())))?;
+            self.inner
+                .resident_spfresh_centroids
+                .store(Arc::new(resident));
+        }
         self.inner.manifest.store(manifest);
         Ok(true)
     }
@@ -1049,6 +1061,18 @@ async fn build_handle(
     let tombstone_cache = build_tombstone_cache(&options);
     let id_generator = crate::supertable::utils::idgen::IdGenerator::new();
     let handle_id = crate::supertable::wal::state_doc::SupertableHandleId(id_generator.next_id());
+    let resident_spfresh_centroids = if is_hidden_vector_index_table(&options) {
+        match options.storage.as_ref() {
+            Some(storage) => {
+                hidden_centroids::load_resident_centroids(manifest.as_ref(), storage.as_ref())
+                    .await
+                    .map_err(|e| OpenError::Build(BuildError::Store(e.to_string())))?
+            }
+            None => hidden_centroids::ResidentCentroids::default(),
+        }
+    } else {
+        hidden_centroids::ResidentCentroids::default()
+    };
     let inner = Arc::new(SupertableInner {
         options,
         manifest: ArcSwap::new(manifest),
@@ -1060,6 +1084,7 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
+        resident_spfresh_centroids: ArcSwap::new(Arc::new(resident_spfresh_centroids)),
         last_pointer_check: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
@@ -1268,6 +1293,10 @@ impl SupertableReader {
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
+    }
+
+    pub(crate) fn resident_spfresh_centroids(&self) -> Arc<hidden_centroids::ResidentCentroids> {
+        self.inner.resident_spfresh_centroids.load_full()
     }
 }
 

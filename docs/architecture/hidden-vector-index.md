@@ -278,20 +278,22 @@ Ordered so each builds/tests green behind `INFINO_HIDDEN_INDEX=spfresh`
    runs now ~2 MB and replicated. **(done for hidden drain + user commit)**
 3. Manifest per-centroid base+delta fragment model on the existing cell trees;
    DTO roundtrip tests. **(partial: `RunRef` leaves exist; fragment/base+delta
-   and centroid-blob index pending; user trees now carry inline centroids)**
+   pending; user trees carry inline centroids; hidden routing now carries a
+   centroid-blob pointer/hash)**
 4. Drain -> LIRE flush: replica-set assignment, append delta runs, pack many
    runs per superfile, record fragments. **(done)**
 5. Query: dedup-by-stable_id-min before top-k; fetch all live fragments of
    probed centroids. **(dedup done; manifest-centroid run selection done for
-   user trees; hidden resident centroid blob / fragment fetch pending)**
+   user trees; resident-centroid run selection done for hidden trees; direct
+   fragment range fetch pending)**
 6. Compaction -> LIRE merge/split/reassign with local re-replication and
    fragment rewrite. **(merge/dedup/re-replicate done; split/fragment-rewrite
    pending)**
 7. **Close-the-loop (this plan's focus):**
    - fine-cluster user superfiles at commit + write their tree into the user
      manifest;
-   - resident centroid blob for hidden: write on drain/compaction, load on open,
-     `ArcSwap` on change; `CellTreeNode` -> index into it;
+   - resident centroid blob for hidden: write on drain, load on open/refresh,
+     `ArcSwap` on change; compaction rewrite still pending;
    - query scores fine centroids (user tail from manifest, hidden from resident
      blob) and range-fetches only selected runs;
    - keep user trees for filtered search; drain stays a `drained_ranges` handoff.

@@ -134,11 +134,17 @@ use crate::{
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
         error::ManifestError,
-        hidden_deleted::{self, encode_deleted_ids, storage_path},
+        hidden_centroids::{
+            ResidentCentroids, encode_centroids, storage_path as centroid_storage_path,
+        },
+        hidden_deleted::{self, encode_deleted_ids, storage_path as deleted_ids_storage_path},
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::{CellTree, CellTreeNode, PartitionStrategy, RunRef, SpfreshRoutingIndex},
+            list::{
+                CellTree, CellTreeNode, LEGACY_SPFRESH_CLUSTER_ID, PartitionStrategy, RunRef,
+                SpfreshRoutingIndex,
+            },
             part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
@@ -1881,6 +1887,8 @@ fn append_user_spfresh_routing(
 
     Ok(appended.then(|| SpfreshRoutingIndex {
         column: column.into(),
+        centroid_blob_uri: None,
+        centroid_blob_content_hash: None,
         cells,
     }))
 }
@@ -1896,6 +1904,12 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
         .iter()
         .map(|entry| entry.uri.0.to_string())
         .collect();
+    let centroid_blob_uri = existing
+        .as_ref()
+        .and_then(|routing| routing.centroid_blob_uri.clone());
+    let centroid_blob_content_hash = existing
+        .as_ref()
+        .and_then(|routing| routing.centroid_blob_content_hash);
     let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
     if let Some(existing) = existing
         && existing.column == column
@@ -1949,17 +1963,99 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
 
     Ok(SpfreshRoutingIndex {
         column: column.into(),
+        centroid_blob_uri,
+        centroid_blob_content_hash,
         cells,
     })
 }
 
-fn extend_spfresh_routing(
+fn extend_hidden_spfresh_routing(
     existing: Option<SpfreshRoutingIndex>,
+    existing_centroids: &ResidentCentroids,
     column: &str,
     n_cells: u32,
+    dim: usize,
     prepared: &[PreparedSuperfile],
-) -> Result<SpfreshRoutingIndex, BuildError> {
-    refresh_spfresh_routing(existing, column, n_cells, &[], prepared)
+) -> Result<(SpfreshRoutingIndex, ResidentCentroids), BuildError> {
+    let mut centroids = if existing_centroids.dim == dim {
+        existing_centroids.centroids.to_vec()
+    } else {
+        Vec::new()
+    };
+    let can_preserve_existing_ids = !centroids.is_empty();
+    let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
+    if let Some(existing) = existing
+        && existing.column == column
+    {
+        for mut cell in existing.cells {
+            let cell_id = cell.cell_id as usize;
+            while cell_id >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
+            }
+            if !can_preserve_existing_ids {
+                for leaf in &mut cell.leaves {
+                    leaf.cluster_id = LEGACY_SPFRESH_CLUSTER_ID;
+                }
+            }
+            cell.nodes.clear();
+            cells[cell_id] = cell;
+        }
+    }
+
+    for prep in prepared {
+        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
+        else {
+            return Err(BuildError::Store(
+                "SPFresh hidden superfile missing vector subsection offsets".into(),
+            ));
+        };
+        let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
+        let bytes = prepared_superfile_bytes(prep)?;
+        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
+        let spfresh = reader.spfresh_vec().ok_or_else(|| {
+            BuildError::Store("hidden superfile missing SPFresh vector blob".into())
+        })?;
+        let rows = spfresh
+            .materialized_rows()
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let cid = coarse_cell as usize;
+        while cid >= cells.len() {
+            cells.push(empty_cell_tree(cells.len() as u32));
+        }
+        for (run_id, run) in spfresh.runs().iter().enumerate() {
+            let Some(centroid) = mean_run_centroid(&rows, run.cluster_id, dim) else {
+                continue;
+            };
+            let centroid_id = u32::try_from(centroids.len() / dim)
+                .map_err(|_| BuildError::Store("SPFresh hidden centroid id overflow".into()))?;
+            centroids.extend_from_slice(&centroid);
+            let range = spfresh
+                .run_range(run_id)
+                .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
+            cells[cid].leaves.push(RunRef {
+                superfile_uri: prep.entry.uri.0.to_string(),
+                cell_id: coarse_cell,
+                cluster_id: centroid_id,
+                run_id: run_id as u32,
+                byte_range: (vec_offset + range.start as u64, range.len() as u64),
+                row_count: run.row_count,
+            });
+        }
+    }
+
+    let resident = ResidentCentroids {
+        dim,
+        centroids: Arc::from(centroids),
+    };
+    Ok((
+        SpfreshRoutingIndex {
+            column: column.into(),
+            centroid_blob_uri: None,
+            centroid_blob_content_hash: None,
+            cells,
+        },
+        resident,
+    ))
 }
 
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
@@ -2780,10 +2876,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             continue;
         }
         let spfresh_routing = if hidden_vector_layout == VectorLayout::Spfresh {
-            Some(extend_spfresh_routing(
+            let resident = hidden_inner.resident_spfresh_centroids.load_full();
+            Some(extend_hidden_spfresh_routing(
                 hidden_inner.manifest.load_full().get_spfresh_routing(),
+                &resident,
                 &column,
                 running_clusters.n_cent,
+                running_clusters.dim as usize,
                 &prepared,
             )?)
         } else {
@@ -2828,7 +2927,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 routing,
             })
             .with_drained_ranges(new_drained);
-        if let Some(routing_index) = spfresh_routing {
+        let mut resident_to_swap: Option<ResidentCentroids> = None;
+        if let Some((mut routing_index, resident)) = spfresh_routing {
+            if !resident.is_empty() {
+                let bytes = encode_centroids(resident.dim, resident.centroids.as_ref())
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                let hash = ContentHash::of(&bytes);
+                let uri = centroid_storage_path(&hash);
+                storage
+                    .put_atomic(&uri, Bytes::from(bytes))
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                routing_index.centroid_blob_uri = Some(uri);
+                routing_index.centroid_blob_content_hash = Some(hash);
+                resident_to_swap = Some(resident);
+            }
             precommit_manifest = precommit_manifest.with_spfresh_routing(routing_index);
         }
         hidden_inner.manifest.store(Arc::new(precommit_manifest));
@@ -2855,6 +2968,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        if let Some(resident) = resident_to_swap {
+            hidden_inner
+                .resident_spfresh_centroids
+                .store(Arc::new(resident));
+        }
         if crate::storage::io_counters::timeline_enabled() {
             let ms = publish_t0.elapsed().as_secs_f64() * 1e3;
             let mib = publish_bytes as f64 / (1u64 << 20) as f64;
@@ -3362,7 +3480,7 @@ async fn record_hidden_deleted_ids(
         }
         let bytes = encode_deleted_ids(&ids);
         let hash = ContentHash::of(&bytes);
-        let uri = storage_path(&hash);
+        let uri = deleted_ids_storage_path(&hash);
         storage
             .put_atomic(&uri, Bytes::from(bytes))
             .await
@@ -3732,6 +3850,15 @@ async fn refresh_inner_state_async(
             ));
         }
     };
+    if crate::supertable::handle::is_hidden_vector_index_table(&inner.options) {
+        let resident = crate::supertable::hidden_centroids::load_resident_centroids(
+            manifest.as_ref(),
+            storage.as_ref(),
+        )
+        .await
+        .map_err(|e| SupertableCommitError::Build(BuildError::Store(e.to_string())))?;
+        inner.resident_spfresh_centroids.store(Arc::new(resident));
+    }
     inner.manifest.store(manifest);
     Ok(())
 }
@@ -4495,6 +4622,8 @@ mod tests {
         };
         let mut existing = SpfreshRoutingIndex {
             column: "emb".into(),
+            centroid_blob_uri: None,
+            centroid_blob_content_hash: None,
             cells: vec![
                 empty_cell_tree(0),
                 empty_cell_tree(1),

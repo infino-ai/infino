@@ -742,6 +742,14 @@ impl Manifest {
         ))
     }
 
+    pub(crate) fn spfresh_centroid_blob(&self) -> Option<(String, part::ContentHash)> {
+        let routing = self.get_spfresh_routing()?;
+        Some((
+            routing.centroid_blob_uri?,
+            routing.centroid_blob_content_hash?,
+        ))
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// blob reference. Bumps `manifest_id` like a normal commit without
     /// touching superfiles or parts.
@@ -2947,6 +2955,8 @@ mod tests {
     fn spfresh_routing_getter_and_stamper_roundtrip() {
         let routing = list::SpfreshRoutingIndex {
             column: "emb".into(),
+            centroid_blob_uri: None,
+            centroid_blob_content_hash: None,
             cells: vec![list::CellTree {
                 cell_id: 0,
                 nodes: vec![list::CellTreeNode {

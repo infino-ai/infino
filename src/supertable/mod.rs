@@ -28,6 +28,7 @@ pub(crate) mod compaction;
 pub mod error;
 pub(crate) mod gc;
 pub mod handle;
+pub(crate) mod hidden_centroids;
 pub(crate) mod hidden_deleted;
 pub mod lazy_source;
 pub mod manifest;

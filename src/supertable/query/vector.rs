@@ -99,10 +99,14 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
+        hidden_centroids::ResidentCentroids,
         hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
-            list::{CellRoutingParams, PartitionStrategy, SpfreshRoutingIndex},
+            list::{
+                CellRoutingParams, LEGACY_SPFRESH_CLUSTER_ID, PartitionStrategy,
+                SpfreshRoutingIndex,
+            },
         },
         tombstones::SidecarCache,
     },
@@ -182,6 +186,7 @@ fn spfresh_run_ids_by_superfile(
     metric: Metric,
     query: &[f32],
     nprobe: usize,
+    resident_centroids: Option<&ResidentCentroids>,
 ) -> HashMap<SuperfileUri, Vec<usize>> {
     let Some(routing) = routing else {
         return HashMap::new();
@@ -214,7 +219,15 @@ fn spfresh_run_ids_by_superfile(
                 .and_then(|node| decode_manifest_centroid(&node.centroid, query.len()))
             {
                 Some(centroid) => scored.push((uri, run_id, distance(metric, query, &centroid))),
-                None => fallback.entry(uri).or_default().push(run_id),
+                None => match resident_centroids
+                    .filter(|_| leaf.cluster_id != LEGACY_SPFRESH_CLUSTER_ID)
+                    .and_then(|centroids| centroids.centroid(leaf.cluster_id))
+                {
+                    Some(centroid) => {
+                        scored.push((uri, run_id, distance(metric, query, centroid)));
+                    }
+                    None => fallback.entry(uri).or_default().push(run_id),
+                },
             }
         }
     }
@@ -734,6 +747,9 @@ impl SupertableReader {
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
             .unwrap_or(Metric::L2Sq);
+        let resident_spfresh_centroids = self.resident_spfresh_centroids();
+        let resident_spfresh_centroids =
+            (!resident_spfresh_centroids.is_empty()).then_some(resident_spfresh_centroids);
         let spfresh_runs = spfresh_run_ids_by_superfile(
             manifest.get_spfresh_routing(),
             column,
@@ -741,6 +757,7 @@ impl SupertableReader {
             metric,
             query,
             nprobe,
+            resident_spfresh_centroids.as_deref(),
         );
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
@@ -1628,6 +1645,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
+            hidden_centroids::ResidentCentroids,
             manifest::list::{CellTree, CellTreeNode, RunRef, SpfreshRoutingIndex},
         },
         test_helpers::default_tokenizer as tok,
@@ -1904,6 +1922,8 @@ mod tests {
         });
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
+            centroid_blob_uri: None,
+            centroid_blob_content_hash: None,
             cells: vec![CellTree {
                 cell_id: 2,
                 nodes: Vec::new(),
@@ -1935,6 +1955,7 @@ mod tests {
             Metric::L2Sq,
             &[0.0],
             1,
+            None,
         );
         assert_eq!(selected.get(&entry.uri), Some(&vec![1usize, 3]));
     }
@@ -1964,6 +1985,8 @@ mod tests {
         };
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
+            centroid_blob_uri: None,
+            centroid_blob_content_hash: None,
             cells: vec![CellTree {
                 cell_id: 2,
                 nodes: vec![
@@ -2006,6 +2029,69 @@ mod tests {
             Metric::L2Sq,
             &[99.0],
             1,
+            None,
+        );
+        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize]));
+    }
+
+    #[test]
+    fn spfresh_routing_scores_resident_centroids_to_select_hidden_runs() {
+        let id = Uuid::from_u128(0x9abc);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 8,
+            id_min: 0,
+            id_max: 7,
+            scalar_stats: std::collections::HashMap::new(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: Some(2),
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        });
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: Some("spfresh-centroids/centroids-test.bin".into()),
+            centroid_blob_content_hash: None,
+            cells: vec![CellTree {
+                cell_id: 2,
+                nodes: Vec::new(),
+                leaves: vec![
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        cluster_id: 0,
+                        run_id: 3,
+                        byte_range: (10, 20),
+                        row_count: 4,
+                    },
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        cluster_id: 1,
+                        run_id: 1,
+                        byte_range: (30, 20),
+                        row_count: 4,
+                    },
+                ],
+            }],
+        };
+        let resident = ResidentCentroids {
+            dim: 1,
+            centroids: Arc::from(vec![0.0f32, 100.0]),
+        };
+
+        let selected = super::spfresh_run_ids_by_superfile(
+            Some(routing),
+            "emb",
+            &[entry.clone()],
+            Metric::L2Sq,
+            &[99.0],
+            1,
+            Some(&resident),
         );
         assert_eq!(selected.get(&entry.uri), Some(&vec![1usize]));
     }
