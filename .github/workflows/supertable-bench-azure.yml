@@ -136,6 +136,9 @@ env:
   VM: bench-vm-${{ github.run_id }}${{ inputs.name_suffix }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
+  # Keepalive so a dead-but-unclosed SSH session fails in ~60s instead of
+  # hanging until the job timeout (ServerAliveInterval × CountMax).
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
   # Set "false" to suppress PR comments (summary-only).
   POST_PR_COMMENT: "true"
 
@@ -247,7 +250,7 @@ jobs:
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            if ssh $SSH_OPTS -o ConnectTimeout=5 \
                  "${ADMIN}@${VM_IP}" true 2>/dev/null; then
               echo "SSH up after ${i} tries"; exit 0
             fi
@@ -256,12 +259,14 @@ jobs:
           echo "::error::SSH never came up"; exit 1
 
       - name: Clone repo + toolchain + sccache (on VM)
+        # Fail fast if provisioning stalls — well under the job budget.
+        timeout-minutes: 12
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           # Single-quoted heredoc: the body is literal; only the
           # ssh-line assignments reach the VM as env.
-          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "GH_TOKEN='${{ github.token }}' \
              REPO='${{ github.repository }}' \
              REF='${{ inputs.ref }}' \
@@ -270,7 +275,8 @@ jobs:
           set -euo pipefail
 
           if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            curl --proto '=https' --tlsv1.2 -sSf \
+              --retry 5 --retry-connrefused --retry-delay 2 https://sh.rustup.rs \
               | sh -s -- -y --default-toolchain stable --profile minimal
           fi
 
@@ -294,7 +300,8 @@ jobs:
           # Prebuilt sccache (static musl, glibc-agnostic).
           if ! command -v sccache >/dev/null 2>&1; then
             TARBALL="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
-            curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}.tar.gz" \
+            curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 \
+              "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}.tar.gz" \
               | tar -xz
             sudo install "${TARBALL}/sccache" /usr/local/bin/sccache
           fi
@@ -312,7 +319,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
@@ -369,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
@@ -397,7 +404,7 @@ jobs:
           # diffs them against the PR arm's metrics (collected later).
           mkdir -p baseline
           for j in $REPORTS; do
-            scp -o StrictHostKeyChecking=no \
+            scp $SSH_OPTS \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "baseline/${j}.json" \
               2>/dev/null && echo "baseline staged: $j" \
               || echo "::warning::no main-arm metrics for $j — PR arm renders (new)"
@@ -407,7 +414,7 @@ jobs:
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
-          ssh -o StrictHostKeyChecking=no "${ADMIN}@${VM_IP}" \
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
             "AZURE_STORAGE_ACCOUNT_NAME='${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}' \
              AZURE_STORAGE_ACCOUNT_KEY='${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}' \
              INFINO_REAL_AZURE_CONTAINER='${{ secrets.INFINO_REAL_AZURE_CONTAINER }}' \
@@ -543,7 +550,7 @@ jobs:
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           mkdir -p current
           for j in $REPORTS; do
-            scp -o StrictHostKeyChecking=no \
+            scp $SSH_OPTS \
               "${ADMIN}@${VM_IP}:infino-src/target/infino-bench/${j}.json" "current/${j}.json" \
               2>/dev/null && echo "collected: $j" \
               || echo "no metrics for $j — skipping"
