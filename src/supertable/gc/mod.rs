@@ -6,6 +6,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use tracing::{debug, warn};
+
 use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
@@ -70,13 +72,20 @@ impl Supertable {
                         report.objects_deleted += 1;
                         report.bytes_freed += meta.size;
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        warn!(object = %key, error = %e, "gc: failed to delete orphan object");
                         report.delete_errors += 1;
                     }
                 }
             }
         }
 
+        debug!(
+            deleted = report.objects_deleted,
+            bytes_freed = report.bytes_freed,
+            delete_errors = report.delete_errors,
+            "gc sweep complete"
+        );
         Ok(report)
     }
 }

@@ -81,6 +81,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
+use tracing::debug;
 use uuid::Uuid;
 
 pub use crate::superfile::fts::reader::BoolMode;
@@ -986,6 +987,7 @@ impl Supertable {
         mode: BoolMode,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(column, k, mode = ?mode, "bm25_search");
         self.reader()
             .bm25_search(column, query, k, mode, projection)
             .map_err(InfinoError::from)
@@ -1004,6 +1006,7 @@ impl Supertable {
         mode: BoolMode,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(column, mode = ?mode, "token_match");
         let reader = self.reader();
         let hits = reader
             .token_match(column, query, mode)
@@ -1030,6 +1033,7 @@ impl Supertable {
         value: &str,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(column, "exact_match");
         let reader = self.reader();
         let hits = reader
             .exact_match(column, value)

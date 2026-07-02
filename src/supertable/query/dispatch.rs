@@ -36,6 +36,7 @@ use std::{future::Future, sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
+use tracing::trace;
 use uuid::Uuid;
 
 use super::SuperfileHit;
@@ -201,6 +202,7 @@ where
     if units.is_empty() {
         return Ok(Vec::new());
     }
+    trace!(units = units.len(), "fanning query out across superfiles");
     let manifest = reader.manifest();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);

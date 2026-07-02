@@ -70,6 +70,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
+use tracing::debug;
 
 use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::resolve_hits_named};
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -792,6 +793,7 @@ impl Supertable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+        debug!(column, k, dim = query.len(), "vector_search");
         self.reader()
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)

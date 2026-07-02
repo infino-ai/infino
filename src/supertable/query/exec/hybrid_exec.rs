@@ -62,6 +62,7 @@ use datafusion::{
     },
 };
 use futures::{future, stream};
+use tracing::debug;
 
 use super::{
     common::{
@@ -178,6 +179,7 @@ impl Supertable {
         k: usize,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(text_col, vec_col, k, "hybrid_search");
         let reader = self.reader();
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)

@@ -28,6 +28,7 @@ use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
 use tokio::runtime::Runtime;
+use tracing::{debug, warn};
 
 use super::{
     error::{BuildError, OpenError},
@@ -270,8 +271,12 @@ impl Supertable {
         if st.inner.options.storage.is_some() {
             // Best-effort: a sweep failure here doesn't fail handle
             // construction; the next sweep gets another shot.
-            let _ = st.run_recovery_sweep_once_blocking();
-            let _ = bridge_sync_to_async(async { st.run_gc_sweep_once().await.map_err(|_| ()) });
+            if let Err(e) = st.run_recovery_sweep_once_blocking() {
+                warn!(error = %e, "open-time recovery sweep failed (best-effort)");
+            }
+            if let Err(e) = bridge_sync_to_async(async { st.run_gc_sweep_once().await }) {
+                warn!(error = %e, "open-time gc sweep failed (best-effort)");
+            }
         }
         Ok(st)
     }
@@ -357,6 +362,10 @@ impl Supertable {
             last_pointer_check: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
+        debug!(
+            manifest_id = inner.manifest.load().manifest_id,
+            "opened supertable"
+        );
         let st = Self { inner };
         // Open-time recovery sweep — drives every Intent /
         // Appended WAL discovered in `wal/mutations/` to
@@ -364,12 +373,16 @@ impl Supertable {
         // to drive). Best-effort: a sweep failure doesn't fail
         // `open` because the supertable is still functional —
         // the next sweep gets another shot.
-        let _ = st.run_recovery_sweep_once().await;
+        if let Err(e) = st.run_recovery_sweep_once().await {
+            warn!(error = %e, "open-time recovery sweep failed (best-effort)");
+        }
         // GC sweep follows recovery on the same LIST: reaps
         // Complete WALs past `T_wal_grace` and orphan arrow
         // sidecars past `T_sidecar_grace`. Best-effort; same
         // sweep budget.
-        let _ = st.run_gc_sweep_once().await;
+        if let Err(e) = st.run_gc_sweep_once().await {
+            warn!(error = %e, "open-time gc sweep failed (best-effort)");
+        }
         Ok(st)
     }
 
@@ -412,6 +425,10 @@ impl Supertable {
             Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };
         self.inner.manifest.store(manifest);
+        debug!(
+            manifest_id = self.inner.manifest.load().manifest_id,
+            "refreshed manifest"
+        );
         Ok(true)
     }
 
@@ -462,7 +479,9 @@ impl Supertable {
         match self.inner.options.read_consistency {
             Consistency::Snapshot => {}
             Consistency::Strong => {
-                let _ = bridge_sync_to_async(self.refresh());
+                if let Err(e) = bridge_sync_to_async(self.refresh()) {
+                    debug!(error = %e, "strong-consistency refresh failed; serving current snapshot");
+                }
             }
             Consistency::BoundedStaleness(window) => {
                 // Decide whether a check is due under the lock, stamp
@@ -481,8 +500,8 @@ impl Supertable {
                     }
                     due
                 };
-                if due {
-                    let _ = bridge_sync_to_async(self.refresh());
+                if due && let Err(e) = bridge_sync_to_async(self.refresh()) {
+                    debug!(error = %e, "bounded-staleness refresh failed; serving current snapshot");
                 }
             }
         }

@@ -38,6 +38,7 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 use tokio::runtime::Runtime;
+use tracing::{debug, info};
 use uri::{Backend, parse_uri};
 
 use crate::{
@@ -115,6 +116,7 @@ pub fn connect_with(
             .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
     );
 
+    debug!(backend = ?backend, validate = options.validate, "catalog connected");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
             backend,
@@ -214,6 +216,7 @@ impl Connection {
                     return Err(InfinoError::AlreadyExists(name.to_string()));
                 }
                 map.insert(name.to_string(), handle.clone());
+                info!(table = name, backend = "memory", "created table");
                 Ok(handle)
             }
             CatalogStore::Storage(root) => {
@@ -271,14 +274,15 @@ impl Connection {
                 // catalog OCC below decides the single name winner.
                 let handle = Supertable::create(opts)?;
 
-                let name = name.to_string();
+                let name_owned = name.to_string();
                 bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
-                    if body.tables.contains_key(&name) {
-                        return Err(InfinoError::AlreadyExists(name.clone()));
+                    if body.tables.contains_key(&name_owned) {
+                        return Err(InfinoError::AlreadyExists(name_owned.clone()));
                     }
-                    body.tables.insert(name.clone(), entry.clone());
+                    body.tables.insert(name_owned.clone(), entry.clone());
                     Ok(())
                 }))?;
+                info!(table = name, location = %location, "created table");
                 Ok(handle)
             }
         }
@@ -299,6 +303,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+        debug!(table = name, "opening table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -381,6 +386,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn drop_table(&self, name: &str, purge: bool) -> Result<(), InfinoError> {
+        info!(table = name, purge, "dropping table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -468,6 +474,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        debug!(sql, "running sql query");
         let ctx = SessionContext::new();
 
         // Resolve the relations the query names and register each that is a

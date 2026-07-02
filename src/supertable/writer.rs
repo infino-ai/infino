@@ -67,6 +67,7 @@ use datafusion::prelude::Expr;
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::{runtime::Handle, task::block_in_place, time::sleep};
+use tracing::{debug, error};
 
 use super::{
     build::fanout_shards,
@@ -725,6 +726,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingUpdateEntry> =
                         updates_to_run.split_off(update_cursor + 1);
                     self.pending_updates = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: update failed mid-flush"
+                    );
                     // Don't lose the not-yet-attempted deletes
                     // either — they stay where they were on
                     // self.pending_deletes (we hadn't taken
@@ -754,6 +761,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingDeleteEntry> =
                         deletes_to_run.split_off(delete_cursor + 1);
                     self.pending_deletes = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: delete failed mid-flush"
+                    );
                     return Err(CommitError::PartialCommit {
                         committed_wal_ids,
                         committed: outcomes.len(),
@@ -965,6 +978,11 @@ impl SupertableWriter {
             build_one_shard(slice.as_slice(), &self.inner.options)
         })?;
 
+        debug!(
+            rows = total_rows,
+            superfiles = outputs.len(),
+            "published appended superfiles"
+        );
         publish_superfiles(&self.inner, outputs)?;
         Ok(())
     }

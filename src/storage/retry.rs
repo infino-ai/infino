@@ -11,6 +11,7 @@ use std::{error::Error, future::Future, ops::Range, time::Duration};
 use bytes::{Bytes, BytesMut};
 use object_store::RetryConfig;
 use tokio::time;
+use tracing::warn;
 
 use super::StorageError;
 
@@ -78,6 +79,7 @@ where
         match op().await {
             Ok(v) => return Ok(v),
             Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+                warn!(attempt, error = %e, "transient object-store error; re-issuing");
                 time::sleep(backoff(attempt)).await;
                 attempt += 1;
             }
@@ -114,6 +116,7 @@ where
         let chunk = match fetch(cursor..range.end).await {
             Ok(c) => c,
             Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+                warn!(uri, attempt, error = %e, "transient range GET error; re-issuing tail");
                 time::sleep(backoff(attempt)).await;
                 attempt += 1;
                 continue;
