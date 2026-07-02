@@ -90,7 +90,8 @@ which credentials happen to be set:
 | `gcs` | real Google Cloud Storage | `INFINO_REAL_GCS_BUCKET` + `GOOGLE_APPLICATION_CREDENTIALS` (service-account key path) |
 
 ```sh
-# Superfile cold tiers: any backend (RustFS is the zero-setup default).
+# Superfile cold tiers: any backend (RustFS is the default local backend;
+# first run may auto-download the release binary).
 cargo bench -- superfile fts cold
 
 # Supertable benches: RustFS (default), real S3, or Azure.

@@ -6,23 +6,36 @@
 //! Spawns a child `rustfs` process with bench-generated TLS credentials,
 //! waits for `/health`, creates the target bucket, and builds an HTTPS
 //! `S3StorageProvider` that trusts the bench-local CA.
+//!
+//! ## Session model (tests and benches)
+//!
+//! [`session`] starts one RustFS daemon per process on **first use** (`OnceLock`);
+//! the child is intentionally leaked so it outlives individual fixtures. Tests
+//! should open storage via [`open_test_fixture`] — no explicit session create or
+//! teardown. Buckets are isolated per fixture; they are not deleted on drop (the
+//! process exit tears down the daemon). For explicit bucket cleanup tests, use
+//! [`RustFsSession::open_unique_bucket`] and [`release_lease`].
+//!
+//! Auto-downloaded binaries are cached under `target/infino-bench/rustfs/` with a
+//! `rustfs.version` stamp. When the stamp is older than 24 hours, it is compared
+//! to [`DEFAULT_RUSTFS_VERSION`] (or `INFINO_RUSTFS_VERSION`); a mismatch removes
+//! the stale binary and fetches the pinned release.
 
 use std::{
-    io::Cursor,
+    io::{Cursor, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
-use object_store::{
-    Certificate, ClientOptions,
-    aws::{AmazonS3Builder, S3ConditionalPut},
-};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SerialNumber};
+use reqwest::header::CONTENT_LENGTH;
 use tempfile::TempDir;
+
+use crate::rss::fmt_bytes;
 
 /// Default pinned RustFS release for auto-download.
 const DEFAULT_RUSTFS_VERSION: &str = "1.0.0-alpha.90";
@@ -48,6 +61,20 @@ const EPHEMERAL_PORT_MAX: u16 = 65_535;
 const RUSTFS_SHA256SUMS_ASSET: &str = "SHA256SUMS";
 /// Maximum list-and-delete passes while emptying a leased bucket before DeleteBucket.
 const BUCKET_EMPTY_MAX_PASSES: u32 = 10;
+/// Poll interval while waiting for a background RustFS binary download.
+const BINARY_PREFETCH_POLL_MS: u64 = 50;
+/// Re-check the pinned RustFS version against `rustfs.version` only after this
+/// interval. Fresh stamps skip the string compare (and any re-download) to avoid
+/// network I/O on every test run.
+const RUSTFS_CACHE_VERSION_RECHECK_SECS: u64 = 24 * 60 * 60;
+
+enum BinaryPrefetchState {
+    Idle,
+    Running,
+    Ready(Result<PathBuf, String>),
+}
+
+static BINARY_PREFETCH: Mutex<BinaryPrefetchState> = Mutex::new(BinaryPrefetchState::Idle);
 
 struct S3SignParams<'a> {
     method: &'a str,
@@ -106,6 +133,114 @@ fn terminate_child_impl(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// When set, skip RustFS-backed wire/integration tests (offline hosts, unsupported
+/// platforms without `INFINO_RUSTFS_BIN`, etc.).
+pub fn rustfs_tests_disabled() -> bool {
+    std::env::var_os("INFINO_TEST_DISABLE_RUSTFS").is_some()
+}
+
+/// Whether this host can auto-download a RustFS release binary.
+pub fn rustfs_auto_download_supported() -> bool {
+    release_asset_name(&rustfs_version()).is_ok()
+}
+
+/// Whether RustFS wire tests should run on this host (not disabled and binary is
+/// available or can be fetched).
+pub fn rustfs_tests_runnable() -> bool {
+    if rustfs_tests_disabled() {
+        return false;
+    }
+    if std::env::var("INFINO_RUSTFS_BIN").is_ok() {
+        return true;
+    }
+    if rustfs_cache_valid() {
+        return true;
+    }
+    if which_rustfs_on_path().is_some() {
+        return true;
+    }
+    rustfs_auto_download_supported()
+}
+
+fn rustfs_cache_valid() -> bool {
+    rustfs_cache_usable().is_some()
+}
+
+fn rustfs_binary_located_sync() -> Option<PathBuf> {
+    rustfs_cache_usable().or_else(which_rustfs_on_path)
+}
+
+/// Use the auto-downloaded cache when the binary exists and the version stamp is
+/// fresh, or when the stamp is older but still matches the pinned release.
+fn rustfs_cache_usable() -> Option<PathBuf> {
+    let cached = rustfs_cache_binary_path();
+    if !cached.is_file() {
+        return None;
+    }
+    if read_rustfs_cache_version().is_none() {
+        log_rustfs_progress(
+            "[rustfs] cached binary has no version stamp — removing and re-downloading",
+        );
+        clear_rustfs_cache();
+        return None;
+    }
+    if rustfs_version_stamp_within_recheck_window() {
+        return Some(cached);
+    }
+    let have = read_rustfs_cache_version().expect("version stamp checked above");
+    let want = rustfs_version();
+    if have == want {
+        return Some(cached);
+    }
+    log_rustfs_progress(&format!(
+        "[rustfs] cached binary is {have}, want {want} — removing stale cache"
+    ));
+    clear_rustfs_cache();
+    None
+}
+
+fn download_rustfs_binary_sync() -> Result<PathBuf, String> {
+    let cached = rustfs_cache_binary_path();
+    download_rustfs_binary(&cached)?;
+    Ok(cached)
+}
+
+/// Start locating or downloading the RustFS binary on a background thread.
+///
+/// No-op when tests are disabled or the binary is already on disk / `PATH`.
+/// [`ensure_rustfs_binary`] waits for an in-flight prefetch before blocking itself.
+pub fn prefetch_rustfs_binary() {
+    if rustfs_tests_disabled() || rustfs_binary_located_sync().is_some() {
+        return;
+    }
+    let mut state = BINARY_PREFETCH.lock().expect("rustfs binary prefetch lock");
+    match *state {
+        BinaryPrefetchState::Idle => {
+            *state = BinaryPrefetchState::Running;
+            std::thread::spawn(|| {
+                let result = download_rustfs_binary_sync();
+                *BINARY_PREFETCH.lock().expect("rustfs binary prefetch lock") =
+                    BinaryPrefetchState::Ready(result);
+            });
+        }
+        BinaryPrefetchState::Running | BinaryPrefetchState::Ready(_) => {}
+    }
+}
+
+fn wait_for_binary_prefetch() -> Result<PathBuf, String> {
+    loop {
+        let state = BINARY_PREFETCH.lock().expect("rustfs binary prefetch lock");
+        match &*state {
+            BinaryPrefetchState::Idle => return download_rustfs_binary_sync(),
+            BinaryPrefetchState::Running => {
+                drop(state);
+                std::thread::sleep(Duration::from_millis(BINARY_PREFETCH_POLL_MS));
+            }
+            BinaryPrefetchState::Ready(result) => return result.clone(),
+        }
+    }
+}
+
 /// Locate or download the `rustfs` binary.
 pub fn ensure_rustfs_binary() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("INFINO_RUSTFS_BIN") {
@@ -118,18 +253,11 @@ pub fn ensure_rustfs_binary() -> Result<PathBuf, String> {
             path.display()
         ));
     }
-
-    let cached = rustfs_cache_binary_path();
-    if cached.is_file() {
-        return Ok(cached);
-    }
-
-    if let Some(path) = which_rustfs_on_path() {
+    if let Some(path) = rustfs_binary_located_sync() {
         return Ok(path);
     }
-
-    download_rustfs_binary(&cached)?;
-    Ok(cached)
+    prefetch_rustfs_binary();
+    wait_for_binary_prefetch()
 }
 
 /// Spawn RustFS on a random loopback port with HTTPS enabled (no bucket yet).
@@ -196,7 +324,10 @@ fn spawn_rustfs_daemon() -> Result<RustFsHandle, String> {
     ))
 }
 
-/// Spawn a dedicated RustFS child and create `bucket` (standalone fixture for tests).
+/// Spawn a dedicated RustFS child and create `bucket` (legacy standalone fixture).
+///
+/// Prefer [`open_test_fixture`] for tests — it uses the lazy shared [`session`].
+#[deprecated(note = "use open_test_fixture(); session() is lazy-loaded on first use")]
 pub fn spawn_rustfs(bucket: &str) -> Result<RustFsHandle, String> {
     let mut handle = spawn_rustfs_daemon()?;
     provision_bucket(
@@ -219,9 +350,32 @@ pub struct RustFsSession {
     ca_pem: Vec<u8>,
 }
 
+impl RustFsSession {
+    /// HTTPS endpoint (`https://127.0.0.1:<port>`) for the shared session daemon.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Access key the daemon accepts for SigV4.
+    pub fn access_key(&self) -> &str {
+        &self.access_key
+    }
+
+    /// Secret key paired with [`Self::access_key`].
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    /// Bench-local CA PEM used to trust the daemon's TLS certificate.
+    pub fn ca_pem(&self) -> &[u8] {
+        &self.ca_pem
+    }
+}
+
 static RUSTFS_SESSION: OnceLock<Arc<RustFsSession>> = OnceLock::new();
 
-/// One RustFS daemon per process; the child outlives individual bench fixtures.
+/// One RustFS daemon per process; lazy-loaded on first call. The child outlives
+/// all fixtures (see [`open_test_fixture`]).
 pub fn session() -> Arc<RustFsSession> {
     Arc::clone(RUSTFS_SESSION.get_or_init(|| {
         let handle = spawn_rustfs_daemon().expect("rustfs session daemon");
@@ -314,6 +468,78 @@ impl RustFsSession {
     pub fn open_unique_bucket(self: &Arc<Self>, prefix: &str) -> Result<RustFsBucketLease, String> {
         self.open_bucket(&unique_rustfs_bucket_name(), prefix, true)
     }
+
+    /// Unique bucket for tests: same as [`open_unique_bucket`] but leaves the
+    /// bucket on the daemon when the lease drops (no blocking cleanup).
+    pub fn open_test_bucket(self: &Arc<Self>, prefix: &str) -> Result<RustFsBucketLease, String> {
+        self.open_bucket(&unique_rustfs_bucket_name(), prefix, false)
+    }
+}
+
+/// Storage + bucket lease for a RustFS-backed test.
+///
+/// Open with [`open_test_fixture`]. The shared session daemon is started lazily on
+/// first use. Dropping this fixture does not tear down the daemon or delete the
+/// bucket (safe from async tests).
+pub struct RustFsTestFixture {
+    pub storage: Arc<dyn StorageProvider>,
+    pub bucket: String,
+}
+
+/// Returns `true` when RustFS tests should run on this host.
+pub fn begin_rustfs_test(test_name: &str) -> bool {
+    prefetch_rustfs_binary();
+    if rustfs_tests_disabled() {
+        eprintln!("{test_name}: skipped (INFINO_TEST_DISABLE_RUSTFS is set)");
+        return false;
+    }
+    if !rustfs_tests_runnable() {
+        eprintln!("{test_name}: skipped (RustFS binary unavailable on this platform)");
+        return false;
+    }
+    true
+}
+
+/// Open an isolated bucket on the lazy shared session (blocking).
+pub fn open_test_fixture(prefix: &str) -> Result<RustFsTestFixture, String> {
+    prefetch_rustfs_binary();
+    let lease = session().open_test_bucket(prefix)?;
+    let bucket = lease.bucket.clone();
+    let storage = Arc::clone(&lease.storage);
+    drop(lease);
+    Ok(RustFsTestFixture { storage, bucket })
+}
+
+/// [`open_test_fixture`] on a blocking thread (for async tests).
+pub async fn open_test_fixture_async(prefix: &str) -> Result<RustFsTestFixture, String> {
+    let prefix = prefix.to_string();
+    tokio::task::spawn_blocking(move || open_test_fixture(&prefix))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
+
+/// Drop a cleanup lease on a blocking thread (bucket empty + delete).
+pub async fn release_lease(lease: RustFsBucketLease) {
+    tokio::task::spawn_blocking(move || drop(lease))
+        .await
+        .expect("spawn_blocking join for lease release");
+}
+
+/// Isolated [`S3StorageProvider`] on the shared session for wire tests that need
+/// the concrete type (same bucket path as [`open_test_fixture`]).
+pub fn open_wire_test_provider() -> Result<S3StorageProvider, String> {
+    let fixture = open_test_fixture("")?;
+    let session = session();
+    S3StorageProvider::new_with_endpoint_and_prefix(
+        session.endpoint(),
+        &fixture.bucket,
+        session.access_key(),
+        session.secret_key(),
+        RUSTFS_REGION,
+        "",
+        Some(session.ca_pem()),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn keep_rustfs_bucket() -> bool {
@@ -632,22 +858,17 @@ fn build_rustfs_provider(
     secret_key: &str,
     ca_pem: &[u8],
 ) -> Result<Arc<dyn StorageProvider>, String> {
-    let cert = Certificate::from_pem(ca_pem).map_err(|e| e.to_string())?;
-    let client_options = ClientOptions::new().with_root_certificate(cert);
-    let store = AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_bucket_name(bucket)
-        .with_access_key_id(access_key)
-        .with_secret_access_key(secret_key)
-        .with_region(RUSTFS_REGION)
-        .with_virtual_hosted_style_request(false)
-        .with_conditional_put(S3ConditionalPut::ETagMatch)
-        .with_client_options(client_options)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(Arc::new(S3StorageProvider::from_object_store_with_prefix(
-        bucket, store, prefix,
-    )))
+    let provider = S3StorageProvider::new_with_endpoint_and_prefix(
+        endpoint,
+        bucket,
+        access_key,
+        secret_key,
+        RUSTFS_REGION,
+        prefix,
+        Some(ca_pem),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Arc::new(provider))
 }
 
 fn rustfs_credentials() -> (String, String) {
@@ -682,6 +903,54 @@ fn rustfs_cache_binary_path() -> PathBuf {
     rustfs_cache_dir().join("rustfs")
 }
 
+fn rustfs_cache_version_path() -> PathBuf {
+    rustfs_cache_dir().join("rustfs.version")
+}
+
+fn read_rustfs_cache_version() -> Option<String> {
+    std::fs::read_to_string(rustfs_cache_version_path())
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|version| !version.is_empty())
+}
+
+fn write_rustfs_cache_version(version: &str) -> Result<(), String> {
+    std::fs::create_dir_all(rustfs_cache_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(rustfs_cache_version_path(), format!("{version}\n")).map_err(|e| e.to_string())
+}
+
+/// True when `rustfs.version` was written recently enough to skip a version-string
+/// compare (and any re-download) until the recheck window elapses.
+fn rustfs_version_stamp_within_recheck_window() -> bool {
+    let path = rustfs_cache_version_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let stamp = version_stamp_system_time(&meta);
+    let Ok(age) = SystemTime::now().duration_since(stamp) else {
+        return false;
+    };
+    age <= Duration::from_secs(RUSTFS_CACHE_VERSION_RECHECK_SECS)
+}
+
+#[cfg(unix)]
+fn version_stamp_system_time(meta: &std::fs::Metadata) -> SystemTime {
+    use std::os::unix::fs::MetadataExt;
+    SystemTime::UNIX_EPOCH + Duration::from_secs(meta.ctime() as u64)
+}
+
+#[cfg(not(unix))]
+fn version_stamp_system_time(meta: &std::fs::Metadata) -> SystemTime {
+    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Drop the auto-downloaded binary and its version stamp (not `INFINO_RUSTFS_BIN` / PATH).
+fn clear_rustfs_cache() {
+    let _ = std::fs::remove_file(rustfs_cache_binary_path());
+    let _ = std::fs::remove_file(rustfs_cache_version_path());
+    let _ = std::fs::remove_file(rustfs_cache_binary_path().with_extension("tmp"));
+}
+
 fn rustfs_version() -> String {
     std::env::var("INFINO_RUSTFS_VERSION").unwrap_or_else(|_| DEFAULT_RUSTFS_VERSION.into())
 }
@@ -695,12 +964,38 @@ fn which_rustfs_on_path() -> Option<PathBuf> {
     })
 }
 
+/// Progress for long RustFS setup (binary download). Uses `/dev/tty` when
+/// available so lines are visible during `cargo test`, which captures stderr.
+fn log_rustfs_progress(line: &str) {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = writeln!(tty, "{line}");
+            return;
+        }
+    }
+    eprintln!("{line}");
+}
+
 fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     let version = rustfs_version();
     let asset = release_asset_name(&version)?;
     let release_base = format!("https://github.com/rustfs/rustfs/releases/download/{version}");
     let url = format!("{release_base}/{asset}");
-    eprintln!("[rustfs] downloading {url} ...");
+
+    log_rustfs_progress("[rustfs] cold start: downloading RustFS binary for tests and benches");
+    log_rustfs_progress("(To disable RustFS S3 tests: set INFINO_TEST_DISABLE_RUSTFS=1)");
+    log_rustfs_progress(&format!("[rustfs]   URL: {url}"));
+    match github_head_content_length(&url) {
+        Some(len) => log_rustfs_progress(&format!(
+            "[rustfs]   size: {} (Content-Length)",
+            fmt_bytes(len)
+        )),
+        None => log_rustfs_progress(
+            "[rustfs]   size: unknown (Content-Length unavailable; download may take a few minutes)",
+        ),
+    }
 
     std::fs::create_dir_all(
         dest.parent()
@@ -709,6 +1004,10 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let zip_bytes = github_bytes(&url)?;
+    log_rustfs_progress(&format!(
+        "[rustfs]   downloaded {} zip archive",
+        fmt_bytes(zip_bytes.len() as u64)
+    ));
     verify_release_sha256(&zip_bytes, &release_base, &asset)?;
 
     let reader = Cursor::new(zip_bytes);
@@ -740,17 +1039,38 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("rustfs binary not found inside {asset}"));
     }
-    eprintln!("[rustfs] installed binary at {}", dest.display());
+    let installed_len = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
+    log_rustfs_progress(&format!(
+        "[rustfs] installed binary at {} ({})",
+        dest.display(),
+        fmt_bytes(installed_len)
+    ));
+    write_rustfs_cache_version(&version)?;
     Ok(())
+}
+
+fn github_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// `Content-Length` from a release asset URL, when GitHub exposes it on HEAD.
+fn github_head_content_length(url: &str) -> Option<u64> {
+    let client = github_http_client().ok()?;
+    let response = client.head(url).send().ok()?.error_for_status().ok()?;
+    response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
 }
 
 /// Fetch a public GitHub release asset over HTTPS (system trust roots).
 ///
 /// Follows redirects (3xx). Only 2xx responses return a body; 4xx/5xx fail fast.
 fn github_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = github_http_client()?;
     let response = client
         .get(url)
         .send()
@@ -762,7 +1082,9 @@ fn github_bytes(url: &str) -> Result<Vec<u8>, String> {
 
 fn verify_release_sha256(zip_bytes: &[u8], release_base: &str, asset: &str) -> Result<(), String> {
     let sums_url = format!("{release_base}/{RUSTFS_SHA256SUMS_ASSET}");
-    eprintln!("[rustfs] verifying {asset} against {RUSTFS_SHA256SUMS_ASSET} ...");
+    log_rustfs_progress(&format!(
+        "[rustfs] verifying {asset} against {RUSTFS_SHA256SUMS_ASSET} ..."
+    ));
     let sums_text = String::from_utf8(github_bytes(&sums_url)?)
         .map_err(|e| format!("{RUSTFS_SHA256SUMS_ASSET} is not valid UTF-8: {e}"))?;
     let expected = parse_sha256_sums_entry(&sums_text, asset)?;

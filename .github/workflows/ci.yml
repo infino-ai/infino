@@ -46,10 +46,8 @@ jobs:
             cargo install cargo-llvm-cov --locked
           fi
       - run: make ci
-      # Local S3 wire-protocol regression (RustFS HTTPS daemon). Serial so
-      # parallel tests do not race the first binary download/spawn.
-      - name: RustFS storage smoke tests
-        run: INFINO_TEST_RUSTFS=1 cargo test --test supertable storage::smoke_rustfs -- --test-threads=1
+      - name: RustFS storage wire + smoke tests
+        run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
 
   public-api:
     name: Public API surface

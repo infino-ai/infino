@@ -3,19 +3,13 @@
 
 //! Supertable smoke through a local RustFS HTTPS daemon.
 //!
-//! Spawns RustFS via [`infino_bench_utils::rustfs_server`], points
-//! `S3StorageProvider` at it, and runs storage + supertable commit
-//! probes including conditional `If-Match` PUTs and search TVFs via
-//! `query_sql`.
+//! Uses the lazy shared [`rustfs_server::session`] via [`rustfs_server::open_test_fixture`].
+//! The daemon starts on first S3 use; tests do not create or tear down the session.
 //!
 //! ## Gating
 //!
-//! `INFINO_TEST_RUSTFS=1` — spawning RustFS downloads or locates a
-//! ~95 MiB binary on first run, so the default `cargo test` skips it.
-//!
-//! ```text
-//! INFINO_TEST_RUSTFS=1 cargo test --test supertable storage::smoke_rustfs
-//! ```
+//! Runs by default. Set `INFINO_TEST_DISABLE_RUSTFS=1` to skip on offline hosts or
+//! platforms without auto-download (`INFINO_RUSTFS_BIN` overrides).
 
 #![deny(clippy::unwrap_used)]
 
@@ -36,7 +30,6 @@ use infino::{
 use infino_bench_utils::rustfs_server;
 use tempfile::TempDir;
 
-const TEST_BUCKET: &str = "infino-rustfs-smoke";
 /// Vector index shape for the RustFS TVF smoke fixture.
 const VECTOR_N_CENT: usize = 4;
 const VECTOR_ROT_SEED: u64 = 17;
@@ -46,26 +39,15 @@ const BM25_TOP_K: usize = 10;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_smoke_via_rustfs_https() {
-    if std::env::var("INFINO_TEST_RUSTFS").is_err() {
-        eprintln!(
-            "supertable_smoke_via_rustfs_https: skipped (set INFINO_TEST_RUSTFS=1 to enable)"
-        );
+    if !rustfs_server::begin_rustfs_test("supertable_smoke_via_rustfs_https") {
         return;
     }
 
-    let handle = tokio::task::spawn_blocking(|| rustfs_server::spawn_rustfs(TEST_BUCKET))
+    let fixture = rustfs_server::open_test_fixture_async("")
         .await
-        .expect("spawn_blocking join")
-        .expect("spawn rustfs");
-    eprintln!(
-        "[rustfs-smoke] spawned on {} bucket={TEST_BUCKET}",
-        handle.endpoint
-    );
+        .expect("open test fixture");
+    let storage = Arc::clone(&fixture.storage);
 
-    let storage: Arc<dyn StorageProvider> =
-        rustfs_server::rustfs_s3_provider(&handle, "").expect("rustfs provider");
-
-    // Probe round-trip before the writer path.
     let probe_bytes = Bytes::from_static(b"hello-rustfs-smoke");
     storage
         .put_atomic("probe/hello.txt", probe_bytes.clone())
@@ -74,7 +56,6 @@ async fn supertable_smoke_via_rustfs_https() {
     let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
     assert_eq!(got, probe_bytes, "probe round-trip mismatch");
 
-    // Conditional PUT: success with matching etag, failure with stale etag.
     storage
         .put_atomic("probe/cas.txt", Bytes::from_static(b"v1"))
         .await
@@ -95,7 +76,6 @@ async fn supertable_smoke_via_rustfs_https() {
         "expected PreconditionFailed, got {err:?}"
     );
 
-    // Multi-commit supertable path (OCC pointer uses If-Match under the hood).
     {
         let producer =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -115,60 +95,123 @@ async fn supertable_smoke_via_rustfs_https() {
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(consumer.reader().n_docs_total(), 3);
 
-    eprintln!("[rustfs-smoke] smoke done");
+    eprintln!("[rustfs-smoke] smoke done bucket={}", fixture.bucket);
 }
 
-/// Regression: [`IngestResult`](infino_bench_utils::ingest::supertable::IngestResult) must
-/// retain the RustFS child through warm/cold search. Dropping the handle while the storage
-/// `Arc` is still live reproduces the connection-refused failure seen before the keepalive fix.
+/// Bucket lease with cleanup (same path as `tiers.rs` / `cargo bench`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rustfs_keepalive_survives_fixture_drop() {
-    if std::env::var("INFINO_TEST_RUSTFS").is_err() {
-        eprintln!(
-            "rustfs_keepalive_survives_fixture_drop: skipped (set INFINO_TEST_RUSTFS=1 to enable)"
+async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
+    if !rustfs_server::begin_rustfs_test(
+        "rustfs_session_unique_bucket_lease_matches_bench_lifecycle",
+    ) {
+        return;
+    }
+
+    const PROBE_KEY: &str = "probe/session-lease.txt";
+    let probe_bytes = Bytes::from_static(b"session-lease-probe");
+
+    let bucket_name = {
+        let lease = tokio::task::spawn_blocking(|| {
+            rustfs_server::session()
+                .open_unique_bucket("")
+                .expect("open_unique_bucket on shared session")
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        eprintln!("[rustfs-session-smoke] leased bucket={}", lease.bucket);
+
+        let bucket_name = lease.bucket.clone();
+        lease
+            .storage
+            .put_atomic(PROBE_KEY, probe_bytes.clone())
+            .await
+            .expect("probe put_atomic via session lease");
+        let (got, _) = lease
+            .storage
+            .get(PROBE_KEY)
+            .await
+            .expect("probe get via session lease");
+        assert_eq!(
+            got, probe_bytes,
+            "session lease storage round-trip mismatch"
         );
+
+        rustfs_server::release_lease(lease).await;
+        bucket_name
+    };
+
+    let second_bucket = {
+        let lease = tokio::task::spawn_blocking(|| {
+            rustfs_server::session()
+                .open_unique_bucket("")
+                .expect("second open_unique_bucket after first lease dropped")
+        })
+        .await
+        .expect("spawn_blocking join");
+        assert_ne!(
+            lease.bucket, bucket_name,
+            "each open_unique_bucket call must allocate a fresh bucket name"
+        );
+        lease
+            .storage
+            .put_atomic("probe/second-lease.txt", Bytes::from_static(b"ok"))
+            .await
+            .expect("second lease must reach the shared session daemon");
+        let name = lease.bucket.clone();
+        rustfs_server::release_lease(lease).await;
+        name
+    };
+    let _ = second_bucket;
+
+    let recreated = tokio::task::spawn_blocking(move || {
+        rustfs_server::session()
+            .open_bucket(&bucket_name, "", true)
+            .expect("recreate bucket after lease cleanup")
+    })
+    .await
+    .expect("spawn_blocking join");
+    let err = recreated
+        .storage
+        .get(PROBE_KEY)
+        .await
+        .expect_err("cleaned-up bucket must not retain the probe object");
+    assert!(
+        matches!(err, StorageError::NotFound { .. }),
+        "expected NotFound after lease cleanup; got {err:?}"
+    );
+    rustfs_server::release_lease(recreated).await;
+
+    eprintln!("[rustfs-session-smoke] session lease + cleanup OK");
+}
+
+/// The shared session daemon must outlive an individual test fixture drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rustfs_session_survives_test_fixture_drop() {
+    if !rustfs_server::begin_rustfs_test("rustfs_session_survives_test_fixture_drop") {
         return;
     }
 
     const PROBE_KEY: &str = "probe/keepalive.txt";
     let probe_bytes = Bytes::from_static(b"keepalive-probe");
 
-    struct IngestLike {
-        storage: Arc<dyn StorageProvider>,
-        _keepalive: rustfs_server::RustFsHandle,
-    }
-
-    let fixture = {
-        let handle = tokio::task::spawn_blocking(|| rustfs_server::spawn_rustfs(TEST_BUCKET))
+    let storage = {
+        let fixture = rustfs_server::open_test_fixture_async("")
             .await
-            .expect("spawn_blocking join")
-            .expect("spawn rustfs");
-        let storage = rustfs_server::rustfs_s3_provider(&handle, "").expect("rustfs provider");
-        storage
+            .expect("open test fixture");
+        fixture
+            .storage
             .put_atomic(PROBE_KEY, probe_bytes.clone())
             .await
             .expect("probe put_atomic");
-        IngestLike {
-            storage,
-            _keepalive: handle,
-        }
+        Arc::clone(&fixture.storage)
     };
 
-    let storage = Arc::clone(&fixture.storage);
     let (got, _) = storage
         .get(PROBE_KEY)
         .await
-        .expect("get with keepalive held");
-    assert_eq!(
-        got, probe_bytes,
-        "storage must stay reachable while handle lives"
-    );
-
-    drop(fixture);
-    assert!(
-        storage.get(PROBE_KEY).await.is_err(),
-        "dropping the RustFS handle must tear down the daemon"
-    );
+        .expect("session daemon must stay up after fixture drop");
+    assert_eq!(got, probe_bytes);
 }
 
 fn make_cache(
@@ -249,32 +292,20 @@ fn rustfs_vector_batch(dim: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(vectors)]).expect("batch")
 }
 
-/// Search TVFs (`bm25_search`, `vector_search`, `hybrid_search`) through
-/// `query_sql` against a RustFS-backed supertable with disk cache cold-fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_tvfs_through_query_sql_via_rustfs() {
-    if std::env::var("INFINO_TEST_RUSTFS").is_err() {
-        eprintln!(
-            "supertable_tvfs_through_query_sql_via_rustfs: skipped \
-             (set INFINO_TEST_RUSTFS=1 to enable)"
-        );
+    if !rustfs_server::begin_rustfs_test("supertable_tvfs_through_query_sql_via_rustfs") {
         return;
     }
 
-    const TVF_BUCKET: &str = "infino-rustfs-smoke-tvf";
-    let _handle = tokio::task::spawn_blocking(|| rustfs_server::spawn_rustfs(TVF_BUCKET))
+    let fixture = rustfs_server::open_test_fixture_async("")
         .await
-        .expect("spawn_blocking join")
-        .expect("spawn rustfs for TVF smoke");
+        .expect("open test fixture for TVF smoke");
     let dim = EMB_DIM;
     assert!(dim > 0, "embedding dimension must be positive");
-    eprintln!(
-        "[rustfs-smoke-tvf] spawned on {} bucket={TVF_BUCKET}",
-        _handle.endpoint
-    );
+    eprintln!("[rustfs-smoke-tvf] bucket={}", fixture.bucket);
 
-    let storage: Arc<dyn StorageProvider> =
-        rustfs_server::rustfs_s3_provider(&_handle, "").expect("rustfs TVF provider");
+    let storage = Arc::clone(&fixture.storage);
 
     {
         let producer =

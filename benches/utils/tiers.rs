@@ -26,9 +26,11 @@ use infino::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use crate::rustfs_server::{self, RustFsBucketLease};
-use crate::storage_options::{
-    azure_storage_options_from_env, gcs_storage_options_from_env, s3_storage_options_from_env,
+use crate::{
+    rustfs_server::{self, RustFsBucketLease},
+    storage_options::{
+        azure_storage_options_from_env, gcs_storage_options_from_env, s3_storage_options_from_env,
+    },
 };
 
 /// Bytes in one gibibyte, for GiB-denominated cache budgets.

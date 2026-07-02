@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{
-    ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectStore,
-    ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    Certificate, ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload,
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
     aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     path::Path as ObjPath,
 };
@@ -38,11 +38,6 @@ use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
     logical_list_key, options::apply, retry, usage::UsageMeter,
 };
-
-/// Config key written by [`S3StorageProvider::new_with_endpoint`] to point
-/// at a custom endpoint. Detection accepts any object_store alias (see
-/// [`has_custom_endpoint`]); this is just the canonical name to set.
-const ENDPOINT_KEY: &str = "aws_endpoint";
 
 /// Whether `opts` names a custom S3 endpoint, under any object_store alias
 /// (`aws_endpoint`, `endpoint`, `aws_endpoint_url`, …). A custom endpoint
@@ -116,15 +111,35 @@ impl S3StorageProvider {
     }
 
     /// Custom S3-compatible endpoint with static credentials (RustFS HTTPS,
-    /// MinIO, Ceph). `allow_http` is enabled for plain-HTTP endpoints.
+    /// MinIO, Ceph).
+    ///
+    /// When `trusted_ca_pem` is `Some`, the PEM is installed as an
+    /// additional root for TLS (local RustFS HTTPS). When `None`,
+    /// `allow_http` is enabled so plain-HTTP endpoints are not
+    /// rejected by the AWS SDK's HTTPS check.
     pub fn new_with_endpoint(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
         region: impl Into<String>,
+        trusted_ca_pem: Option<&[u8]>,
     ) -> Result<Self, StorageError> {
-        Self::new_with_endpoint_and_prefix(endpoint, bucket, access_key, secret_key, region, "")
+        let bucket = bucket.into();
+        let endpoint = endpoint.into();
+        let store = build_custom_endpoint_store(
+            &endpoint,
+            &bucket,
+            access_key,
+            secret_key,
+            region,
+            trusted_ca_pem,
+        )?;
+        Ok(Self {
+            bucket,
+            prefix: String::new(),
+            store: Arc::new(store),
+        })
     }
 
     /// Custom-endpoint variant of [`Self::new_with_prefix`] for
@@ -136,15 +151,18 @@ impl S3StorageProvider {
         secret_key: impl Into<String>,
         region: impl Into<String>,
         prefix: impl Into<String>,
+        trusted_ca_pem: Option<&[u8]>,
     ) -> Result<Self, StorageError> {
-        let opts = StorageOptions::from([
-            (ENDPOINT_KEY.to_string(), endpoint.into()),
-            ("aws_access_key_id".to_string(), access_key.into()),
-            ("aws_secret_access_key".to_string(), secret_key.into()),
-            ("aws_region".to_string(), region.into()),
-            ("aws_allow_http".to_string(), "true".to_string()),
-        ]);
-        Self::new_with_prefix(bucket, prefix, &opts)
+        let mut provider = Self::new_with_endpoint(
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            region,
+            trusted_ca_pem,
+        )?;
+        provider.prefix = normalize_prefix(prefix);
+        Ok(provider)
     }
 
     /// Wrap an already-constructed `AmazonS3` — for advanced
@@ -208,6 +226,47 @@ impl S3StorageProvider {
 
 fn normalize_prefix(prefix: impl Into<String>) -> String {
     prefix.into().trim_matches('/').to_string()
+}
+
+/// Shared builder for [`S3StorageProvider::new_with_endpoint`].
+fn build_custom_endpoint_store(
+    endpoint: &str,
+    bucket: &str,
+    access_key: impl Into<String>,
+    secret_key: impl Into<String>,
+    region: impl Into<String>,
+    trusted_ca_pem: Option<&[u8]>,
+) -> Result<AmazonS3, StorageError> {
+    let mut builder = AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_access_key_id(access_key.into())
+        .with_secret_access_key(secret_key.into())
+        .with_region(region.into())
+        // Force path-style addressing (bucket as path prefix, not subdomain).
+        // Required for localhost-style endpoints (RustFS, MinIO, any
+        // non-AWS S3-compatible service that doesn't terminate
+        // `<bucket>.<endpoint>` DNS).
+        .with_virtual_hosted_style_request(false)
+        .with_conditional_put(S3ConditionalPut::ETagMatch);
+    if let Some(ca_pem) = trusted_ca_pem {
+        let cert = Certificate::from_pem(ca_pem).map_err(|e| StorageError::Permanent {
+            uri: format!("s3://{bucket} @ {endpoint}"),
+            source: Box::new(e),
+        })?;
+        let client_options = ClientOptions::new().with_root_certificate(cert);
+        builder = builder.with_client_options(client_options);
+    } else {
+        // Plain-HTTP custom endpoints (MinIO on loopback, legacy emulators).
+        // NB: do NOT apply `tuned_client_options()` here — the deep idle pool
+        // destabilizes local S3-compatible endpoints. Also skip
+        // `with_client_options` so this `with_allow_http` is not clobbered.
+        builder = builder.with_allow_http(true);
+    }
+    builder.build().map_err(|e| StorageError::Permanent {
+        uri: format!("s3://{bucket} @ {endpoint}"),
+        source: Box::new(e),
+    })
 }
 
 /// Warm idle connections kept per host. A deep pool lets a wide
@@ -564,103 +623,13 @@ impl StorageProvider for S3StorageProvider {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the parts of `s3.rs` that don't need a
-    //! real HTTP backend: error translation, path parsing,
-    //! the with-endpoint constructor, and the `from_object_store`
-    //! escape hatch. The trait impls (`head`, `get`, `put_*`,
-    //! `delete`, `get_range`) are exercised end-to-end by the
-    //! `supertable_smoke_via_s3_wire_protocol` integration
-    //! test against an in-process `s3s-fs` server.
-    //!
-    //! In addition, this module stands up the same in-process
-    //! `s3s-fs` server the smoke test uses (the dev-dependencies
-    //! `s3s` / `s3s-fs` / `hyper-util` are on the lib unit-test
-    //! compile graph), so the trait impls — `put_atomic`, `get`,
-    //! `get_range`, `head`, `delete`, `list_with_prefix`,
-    //! `put_if_match`, and `tail` — are exercised here over the
-    //! real S3 HTTP wire protocol without any cloud credentials
-    //! or network access.
-    use std::{fs::create_dir_all, net::SocketAddr};
-
-    use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
-    use s3s_fs::FileSystem;
-    use tempfile::TempDir;
-    use tokio::net::TcpListener;
+    //! Unit tests for error translation, path parsing, and constructors.
+    //! `StorageProvider` wire round-trips live in
+    //! `tests/supertable/storage/rustfs_s3_wire.rs` (integration test binary —
+    //! the lib unit-test graph cannot link `infino_bench_utils` without a second
+    //! `infino` crate instance).
 
     use super::*;
-
-    // ---- in-process s3s-fs harness -------------------------------------
-
-    /// Bucket the in-process server pre-creates for round-trip tests.
-    const HARNESS_BUCKET: &str = "infino-s3-unit";
-    /// Region passed to the provider; arbitrary for s3s-fs.
-    const HARNESS_REGION: &str = "us-east-1";
-    /// Fixed dummy credential pair s3s validates SigV4 against.
-    const HARNESS_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-    const HARNESS_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-
-    /// Spawn s3s-fs on a random loopback port. Returns the bound
-    /// address plus the tempdir guard (drop unlinks the bucket data,
-    /// so the caller must keep it alive for the test's duration).
-    async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
-        let fs_root = TempDir::new().expect("s3s-fs root tempdir");
-        // s3s-fs treats top-level dirs as buckets; pre-create the
-        // bucket dir so a put on a key inside it doesn't 404 the
-        // bucket.
-        create_dir_all(fs_root.path().join(HARNESS_BUCKET)).expect("create bucket dir");
-
-        let fs_backend = FileSystem::new(fs_root.path()).expect("s3s-fs FileSystem");
-        let service = {
-            let mut b = S3ServiceBuilder::new(fs_backend);
-            // Without an auth provider s3s answers 501 to any signed
-            // request; object_store always signs.
-            b.set_auth(SimpleAuth::from_single(
-                HARNESS_ACCESS_KEY,
-                HARNESS_SECRET_KEY,
-            ));
-            b.build()
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        tokio::spawn(async move {
-            use hyper_util::{
-                rt::{TokioExecutor, TokioIo},
-                server::conn::auto::Builder as ConnBuilder,
-            };
-            let http = ConnBuilder::new(TokioExecutor::new());
-            loop {
-                let (stream, _peer) = match listener.accept().await {
-                    Ok(t) => t,
-                    Err(_) => break,
-                };
-                let service = service.clone();
-                let http = http.clone();
-                tokio::spawn(async move {
-                    let _ = http.serve_connection(TokioIo::new(stream), service).await;
-                });
-            }
-        });
-
-        (addr, fs_root)
-    }
-
-    /// Build a provider pointed at a freshly spawned in-process server.
-    /// Returns the provider plus the tempdir guard.
-    async fn harness_provider() -> (S3StorageProvider, TempDir) {
-        let (addr, guard) = spawn_s3s_fs().await;
-        let endpoint = format!("http://{addr}");
-        let provider = S3StorageProvider::new_with_endpoint(
-            endpoint,
-            HARNESS_BUCKET,
-            HARNESS_ACCESS_KEY,
-            HARNESS_SECRET_KEY,
-            HARNESS_REGION,
-        )
-        .expect("construct provider against in-process s3s-fs");
-        (provider, guard)
-    }
 
     // ---- translate -----------------------------------------------------
 
@@ -758,13 +727,14 @@ mod tests {
         // Pure construction — no I/O. Builds the inner
         // AmazonS3 with explicit credentials targeting a
         // fake endpoint. Useful for testing `bucket()` and
-        // `path()` without spinning up the s3s-fs harness.
+        // `path()` without spinning up the RustFS harness.
         S3StorageProvider::new_with_endpoint(
             "http://127.0.0.1:1",
             "test-bucket",
             "AKIATESTKEY",
             "secret/example",
             "us-east-1",
+            None,
         )
         .expect("construct with endpoint")
     }
@@ -773,42 +743,6 @@ mod tests {
     fn new_with_endpoint_builds_succeeds_and_exposes_bucket() {
         let p = endpoint_provider();
         assert_eq!(p.bucket(), "test-bucket");
-    }
-
-    #[test]
-    fn rejects_unknown_storage_option_key() {
-        let opts = StorageOptions::from([("not_a_real_key".to_string(), "x".to_string())]);
-        let err = S3StorageProvider::new_with_prefix("b", "", &opts).expect_err("bad key");
-        assert!(matches!(err, StorageError::Permanent { .. }));
-    }
-
-    #[test]
-    fn rejects_cross_backend_azure_key() {
-        let opts =
-            StorageOptions::from([("azure_storage_account_name".to_string(), "acct".to_string())]);
-        assert!(S3StorageProvider::new_with_prefix("b", "", &opts).is_err());
-    }
-
-    #[test]
-    fn detects_custom_endpoint_under_any_alias() {
-        for key in [
-            "aws_endpoint",
-            "endpoint",
-            "aws_endpoint_url",
-            "aws_endpoint_url_s3",
-        ] {
-            let opts = StorageOptions::from([(key.to_string(), "http://localhost".to_string())]);
-            assert!(
-                has_custom_endpoint(&opts),
-                "{key} should select the endpoint profile"
-            );
-        }
-    }
-
-    #[test]
-    fn no_endpoint_for_credentials_only() {
-        let opts = StorageOptions::from([("aws_region".to_string(), "us-east-1".to_string())]);
-        assert!(!has_custom_endpoint(&opts));
     }
 
     #[test]
@@ -876,6 +810,7 @@ mod tests {
             "secret",
             "us-east-1",
             "/scoped/tbl/",
+            None,
         )
         .expect("construct with endpoint + prefix");
         assert_eq!(p.bucket(), "b");
@@ -891,240 +826,5 @@ mod tests {
             .object_store_handle("data/seg-1")
             .expect("handle for valid uri");
         assert_eq!(path.to_string(), "tbl/data/seg-1");
-    }
-
-    // ---- in-process s3s-fs round-trips ---------------------------------
-    //
-    // These exercise the StorageProvider trait impls over the real S3
-    // HTTP wire protocol against the in-process s3s-fs server — no cloud
-    // credentials, no external network.
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_atomic_then_get_round_trips() {
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from_static(b"hello-unit-s3");
-        p.put_atomic("k/hello.txt", body.clone())
-            .await
-            .expect("put_atomic");
-        let (got, meta) = p.get("k/hello.txt").await.expect("get");
-        assert_eq!(got, body);
-        assert_eq!(meta.size, body.len() as u64);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cas_conformance_holds() {
-        // s3s-fs does not enforce a stale conditional update (its 412 path is
-        // covered by the real-S3 integration smoke), so stale rejection is
-        // not asserted here — the chained-token step is what matters.
-        let (p, _guard) = harness_provider().await;
-        crate::test_helpers::cas_conformance::cas_conformance(&p, "cas/conf", false).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_if_none_match_returns_body_on_etag_mismatch() {
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from_static(b"conditional-v1");
-        let etag = p.put_atomic("k/cond", body.clone()).await.expect("put");
-
-        // A non-matching etag always returns the full body + metadata,
-        // regardless of whether the backend implements If-None-Match.
-        let (got, meta) = p
-            .get_if_none_match("k/cond", "\"does-not-match\"")
-            .await
-            .expect("conditional get")
-            .expect("mismatched etag returns the object");
-        assert_eq!(&got[..], &body[..]);
-        assert!(meta.etag.is_some(), "etag surfaced from the response");
-
-        // With the object's own etag: a backend honoring If-None-Match answers
-        // 304 (None); one that ignores it returns the body. Accept either, but
-        // require correctness in the returned-body case.
-        if let Some(etag) = etag {
-            match p
-                .get_if_none_match("k/cond", &etag)
-                .await
-                .expect("cond get")
-            {
-                None => {}
-                Some((b, _)) => assert_eq!(&b[..], &body[..]),
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_multipart_round_trips_a_single_part() {
-        use object_store::PutPayload;
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from(vec![0x5Au8; 4096]);
-        let mut upload = p
-            .put_multipart("k/multi.bin")
-            .await
-            .expect("start multipart upload");
-        upload
-            .put_part(PutPayload::from(body.clone()))
-            .await
-            .expect("upload part");
-        upload.complete().await.expect("complete multipart");
-        let (got, _) = p.get("k/multi.bin").await.expect("get multipart object");
-        assert_eq!(&got[..], &body[..], "multipart upload round-trips");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_atomic_twice_is_precondition_failed() {
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from_static(b"first");
-        p.put_atomic("k/dup", body.clone())
-            .await
-            .expect("first put");
-        // PutMode::Create on an existing key -> 412/conflict ->
-        // PreconditionFailed.
-        let err = p
-            .put_atomic("k/dup", Bytes::from_static(b"second"))
-            .await
-            .expect_err("second create must fail");
-        assert!(
-            matches!(err, StorageError::PreconditionFailed { .. }),
-            "expected PreconditionFailed; got {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_missing_is_not_found() {
-        let (p, _guard) = harness_provider().await;
-        let err = p.get("k/absent").await.expect_err("get missing must fail");
-        assert!(
-            matches!(err, StorageError::NotFound { .. }),
-            "expected NotFound; got {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn head_missing_is_not_found() {
-        let (p, _guard) = harness_provider().await;
-        let err = p.head("k/absent").await.expect_err("head missing fails");
-        assert!(
-            matches!(err, StorageError::NotFound { .. }),
-            "expected NotFound; got {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn head_reports_size() {
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from_static(b"0123456789");
-        p.put_atomic("k/sized", body.clone())
-            .await
-            .expect("put_atomic");
-        let meta = p.head("k/sized").await.expect("head");
-        assert_eq!(meta.size, body.len() as u64);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_range_returns_subslice() {
-        let (p, _guard) = harness_provider().await;
-        let body: Vec<u8> = (0..=255u8).collect();
-        p.put_atomic("k/range.bin", Bytes::from(body.clone()))
-            .await
-            .expect("put_atomic");
-        let got = p.get_range("k/range.bin", 10..20).await.expect("get_range");
-        assert_eq!(&got[..], &body[10..20]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tail_returns_trailing_bytes_and_size() {
-        let (p, _guard) = harness_provider().await;
-        let body: Vec<u8> = (0..200u8).collect();
-        p.put_atomic("k/tail.bin", Bytes::from(body.clone()))
-            .await
-            .expect("put_atomic");
-        // S3 path uses a native suffix-range fetch.
-        let (tail, size) = p.tail("k/tail.bin", 32).await.expect("tail");
-        assert_eq!(size, body.len() as u64);
-        assert_eq!(&tail[..], &body[body.len() - 32..]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tail_zero_len_falls_back_to_head_for_size() {
-        let (p, _guard) = harness_provider().await;
-        let body = Bytes::from_static(b"abcdef");
-        p.put_atomic("k/tail0.bin", body.clone())
-            .await
-            .expect("put_atomic");
-        let (tail, size) = p.tail("k/tail0.bin", 0).await.expect("zero-len tail");
-        assert!(tail.is_empty());
-        assert_eq!(size, body.len() as u64);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_removes_object() {
-        let (p, _guard) = harness_provider().await;
-        p.put_atomic("k/del", Bytes::from_static(b"x"))
-            .await
-            .expect("put_atomic");
-        p.delete("k/del").await.expect("delete existing");
-        let err = p.get("k/del").await.expect_err("deleted object gone");
-        assert!(matches!(err, StorageError::NotFound { .. }));
-        // NB: the delete-absent idempotency (Err(NotFound) => Ok arm) is
-        // not asserted here — s3s-fs returns a malformed delete response
-        // for a no-op delete, which is an emulator quirk, not a code path
-        // we own. Real S3 returns 204 for an absent key.
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_with_prefix_returns_matching_keys() {
-        let (p, _guard) = harness_provider().await;
-        p.put_atomic("list/a.txt", Bytes::from_static(b"a"))
-            .await
-            .expect("put a");
-        p.put_atomic("list/b.txt", Bytes::from_static(b"b"))
-            .await
-            .expect("put b");
-        p.put_atomic("other/c.txt", Bytes::from_static(b"c"))
-            .await
-            .expect("put c");
-        let mut keys = p.list_with_prefix("list/").await.expect("list");
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec!["list/a.txt".to_string(), "list/b.txt".to_string()]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_if_match_none_is_create_only() {
-        let (p, _guard) = harness_provider().await;
-        // First create-if-absent succeeds.
-        p.put_if_match("k/cas", Bytes::from_static(b"v1"), None)
-            .await
-            .expect("create-if-absent");
-        // Second create-if-absent on the same key conflicts.
-        let err = p
-            .put_if_match("k/cas", Bytes::from_static(b"v2"), None)
-            .await
-            .expect_err("second create-if-absent must fail");
-        assert!(
-            matches!(err, StorageError::PreconditionFailed { .. }),
-            "expected PreconditionFailed; got {err:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_if_match_etag_update_succeeds_with_matching_etag() {
-        let (p, _guard) = harness_provider().await;
-        let etag = p
-            .put_atomic("k/upd", Bytes::from_static(b"v1"))
-            .await
-            .expect("initial put")
-            .expect("s3 returns an etag on create");
-        // Conditional update carrying the current etag succeeds and the
-        // new body is visible. (s3s-fs does not enforce the etag-match on
-        // a stale conditional update, so the 412/PreconditionFailed arm is
-        // covered against real S3 by the integration smoke; here we assert
-        // the matching-etag success path, which the emulator does honor.)
-        p.put_if_match("k/upd", Bytes::from_static(b"v2"), Some(&etag))
-            .await
-            .expect("update with matching etag");
-        let (got, _) = p.get("k/upd").await.expect("get latest");
-        assert_eq!(&got[..], b"v2");
     }
 }

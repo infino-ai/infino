@@ -182,6 +182,19 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
 
     eprintln!("[real-s3] bucket={bucket} prefix={prefix}");
 
+    let storage_opts = s3_storage_options_from_env();
+    if !storage_opts.contains_key("aws_access_key_id") {
+        eprintln!(
+            "supertable_real_s3_lazy_vector_and_fts_round_trip: skipped \
+             (missing AWS_ACCESS_KEY_ID in environment)"
+        );
+        return;
+    }
+    eprintln!(
+        "[real-s3] storage_options keys: {:?}",
+        storage_opts.keys().collect::<Vec<_>>()
+    );
+
     let cache_dir = TempDir::new().expect("real S3 cache tempdir");
     let cfg = real_s3_config(&bucket, &prefix, cache_dir.path());
     let result = async {
@@ -190,9 +203,9 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
             let producer = Supertable::create(
                 real_s3_options(dim)
                     .apply_config(&cfg)
-                    .map_err(|e| format!("apply S3 config to producer options: {e}"))?,
+                    .map_err(|e| format!("apply S3 config to producer options: {e:?}"))?,
             )
-            .map_err(|e| format!("create unified supertable on real S3: {e}"))?;
+            .map_err(|e| format!("create unified supertable on real S3: {e:?}"))?;
             let mut writer = producer
                 .writer()
                 .map_err(|e| format!("real S3 producer writer: {e}"))?;
@@ -310,5 +323,8 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         let _ = cleanup_storage.delete("_supertable/current").await;
     }
     eprintln!("[real-s3] cleanup OK; deleted keys under prefix={prefix}");
+    if let Err(ref err) = result {
+        eprintln!("[real-s3] error detail: {err}");
+    }
     result.expect("real S3 integration failed");
 }
