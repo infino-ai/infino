@@ -63,11 +63,18 @@ const RUN_BODY_LENGTH_OFF: usize = RUN_BODY_OFFSET_OFF + U64_BYTES;
 const SQ8_CODE_MAX: f32 = 255.0;
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
-/// Environment override for the SPANN (1+eps) replication closure radius. `0.0`
-/// (the default) means hard assignment — each vector is written to its single
-/// nearest centroid, preserving pre-replication behavior. Positive values widen
-/// the closure so boundary vectors replicate into several nearby centroids.
+/// Environment override for the SPANN (1+eps) replication closure radius.
+/// Positive values widen the closure so boundary vectors replicate into several
+/// nearby centroids; `0.0` forces hard assignment (single nearest centroid).
+/// Overrides [`DEFAULT_REPLICATION_EPS`].
 pub(crate) const REPLICATION_EPS_ENV: &str = "INFINO_REPLICATION_EPS";
+
+/// Default SPANN closure radius. Non-zero so replicated `(1+eps)` assignment —
+/// the recall mechanism of the whole SPFresh design — is on by default: boundary
+/// vectors land in `>= 2` runs, interior vectors in exactly one. RNG pruning
+/// (see [`assign_replicas`]) keeps the replica count bounded, so write
+/// amplification stays modest. Tunable via [`REPLICATION_EPS_ENV`].
+const DEFAULT_REPLICATION_EPS: f32 = 0.1;
 
 /// Upper bound on replicas per vector, mirroring SPANN's closure cap. RNG
 /// pruning normally keeps the count well below this; the cap only guards
@@ -128,6 +135,7 @@ fn parse_hidden_index_layout(value: &str) -> Option<HiddenIndexLayout> {
 struct ColumnState {
     config: VectorConfig,
     ids: Vec<u32>,
+    stable_ids: Vec<i128>,
     vectors: Vec<f32>,
     materialized_rows: Option<Vec<MaterializedIvfRow>>,
     next_local_id: u32,
@@ -222,6 +230,7 @@ impl SpfreshBlobBuilder {
         self.columns.push(ColumnState {
             config,
             ids: Vec::new(),
+            stable_ids: Vec::new(),
             vectors: Vec::new(),
             materialized_rows: None,
             next_local_id: 0,
@@ -229,7 +238,12 @@ impl SpfreshBlobBuilder {
         Ok(())
     }
 
-    pub(crate) fn add(&mut self, col_id: u32, vector: &[f32]) -> Result<(), BuildError> {
+    pub(crate) fn add_with_stable_id(
+        &mut self,
+        col_id: u32,
+        vector: &[f32],
+        stable_id: i128,
+    ) -> Result<(), BuildError> {
         let col = self
             .columns
             .get_mut(col_id as usize)
@@ -242,6 +256,7 @@ impl SpfreshBlobBuilder {
             });
         }
         col.ids.push(col.next_local_id);
+        col.stable_ids.push(stable_id);
         col.next_local_id += 1;
         col.vectors.extend_from_slice(vector);
         Ok(())
@@ -642,7 +657,76 @@ fn materialized_rows_to_runs(rows: Vec<MaterializedIvfRow>) -> Vec<RunInput> {
 }
 
 fn fp32_rows_to_runs(col: &ColumnState) -> Vec<Fp32RunInput> {
+    if let Some(grid) = col
+        .config
+        .provided_centroids
+        .as_deref()
+        .filter(|grid| col.config.dim > 0 && grid.len() % col.config.dim == 0)
+    {
+        return fp32_rows_to_user_grid_runs(col, grid);
+    }
     fp32_rows_to_runs_for_target(col, TARGET_RUN_BYTES)
+}
+
+fn fp32_rows_to_user_grid_runs(col: &ColumnState, outer_grid: &[f32]) -> Vec<Fp32RunInput> {
+    let dim = col.config.dim;
+    let n_rows = col.ids.len();
+    let n_outer = outer_grid.len() / dim;
+    if n_rows == 0 || n_outer == 0 {
+        return Vec::new();
+    }
+
+    let mut by_outer: Vec<Vec<usize>> = vec![Vec::new(); n_outer];
+    for row_idx in 0..n_rows {
+        let vector = &col.vectors[row_idx * dim..(row_idx + 1) * dim];
+        let outer = assign_replicas(col.config.metric, vector, dim, outer_grid, 0.0)
+            .first()
+            .copied()
+            .unwrap_or(0) as usize;
+        by_outer[outer].push(row_idx);
+    }
+
+    let target = col.config.n_cent.max(n_outer).min(n_rows).max(1);
+    let cluster_counts = user_grid_cluster_counts(&by_outer, target);
+    let mut centroids = Vec::new();
+    for (rows, &k) in by_outer.iter().zip(cluster_counts.iter()) {
+        if rows.is_empty() || k == 0 {
+            continue;
+        }
+        let mut vectors = Vec::with_capacity(rows.len() * dim);
+        for &row_idx in rows {
+            vectors.extend_from_slice(&col.vectors[row_idx * dim..(row_idx + 1) * dim]);
+        }
+        let (cell_centroids, _) =
+            kmeans_with_assignments(&vectors, dim, k, FINE_KMEANS_ITERS, FINE_KMEANS_SEED);
+        centroids.extend_from_slice(&cell_centroids);
+    }
+    fp32_rows_to_runs_with_centroids(col, &centroids)
+}
+
+fn user_grid_cluster_counts(groups: &[Vec<usize>], target: usize) -> Vec<usize> {
+    let mut counts: Vec<usize> = groups
+        .iter()
+        .map(|rows| usize::from(!rows.is_empty()))
+        .collect();
+    let mut total: usize = counts.iter().sum();
+    if total == 0 {
+        return counts;
+    }
+    let target = target.max(total);
+    while total < target {
+        let Some((idx, _)) = groups
+            .iter()
+            .enumerate()
+            .filter(|(idx, rows)| counts[*idx] < rows.len())
+            .max_by_key(|(idx, rows)| rows.len().saturating_sub(counts[*idx]))
+        else {
+            break;
+        };
+        counts[idx] += 1;
+        total += 1;
+    }
+    counts
 }
 
 fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<Fp32RunInput> {
@@ -651,7 +735,6 @@ fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<F
     if n_rows == 0 {
         return Vec::new();
     }
-    let eps = replication_eps();
     let k_fine = fine_centroid_count_for_target(n_rows, dim, target_bytes);
     let (centroids, _) = kmeans_with_assignments(
         &col.vectors,
@@ -660,12 +743,19 @@ fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<F
         FINE_KMEANS_ITERS,
         FINE_KMEANS_SEED,
     );
+    fp32_rows_to_runs_with_centroids(col, &centroids)
+}
+
+fn fp32_rows_to_runs_with_centroids(col: &ColumnState, centroids: &[f32]) -> Vec<Fp32RunInput> {
+    let dim = col.config.dim;
+    let n_rows = col.ids.len();
+    if n_rows == 0 || centroids.is_empty() {
+        return Vec::new();
+    }
+    let eps = replication_eps();
     let mut grouped: HashMap<u32, Fp32RunInput> = HashMap::new();
     for row_idx in 0..n_rows {
         let vector = &col.vectors[row_idx * dim..(row_idx + 1) * dim];
-        // User superfiles train their own fine-centroid runs at the same ~2 MiB
-        // target as hidden maintenance. The coarse global cell grid is only the
-        // outer router; it must not become the run key.
         let cells = assign_replicas(col.config.metric, vector, dim, &centroids, eps);
         for cell in cells {
             let entry = grouped.entry(cell).or_insert_with(|| Fp32RunInput {
@@ -675,7 +765,7 @@ fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<F
                 vectors: Vec::new(),
             });
             entry.local_ids.push(col.ids[row_idx]);
-            entry.stable_ids.push(i128::from(col.ids[row_idx]));
+            entry.stable_ids.push(col.stable_ids[row_idx]);
             entry.vectors.extend_from_slice(vector);
         }
     }
@@ -684,8 +774,8 @@ fn fp32_rows_to_runs_for_target(col: &ColumnState, target_bytes: usize) -> Vec<F
     runs
 }
 
-/// Replication closure radius, read once from [`REPLICATION_EPS_ENV`]. Default
-/// `0.0` (hard assignment) until the replication rollout raises it.
+/// Replication closure radius, read once from [`REPLICATION_EPS_ENV`], falling
+/// back to [`DEFAULT_REPLICATION_EPS`] (replication on) when unset.
 pub(crate) fn replication_eps() -> f32 {
     static EPS: OnceLock<f32> = OnceLock::new();
     *EPS.get_or_init(|| {
@@ -693,7 +783,7 @@ pub(crate) fn replication_eps() -> f32 {
             .ok()
             .and_then(|value| value.trim().parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(DEFAULT_REPLICATION_EPS)
     })
 }
 
@@ -1384,8 +1474,8 @@ mod tests {
     use super::{
         ColumnState, HiddenIndexLayout, RunInput, SpfreshBlobReader, SpfreshRunProbe,
         assign_fine_clusters_for_target, assign_replicas, encode_materialized_runs,
-        fine_centroid_count_for_target, fp32_rows_to_runs_for_target, parse_hidden_index_layout,
-        run_row_stride,
+        fine_centroid_count_for_target, fp32_rows_to_runs, fp32_rows_to_runs_for_target,
+        parse_hidden_index_layout, run_row_stride,
     };
     use crate::superfile::{
         lazy_source::{LazyByteSource, LazyByteSourceError},
@@ -1532,6 +1622,7 @@ mod tests {
         let col = ColumnState {
             config,
             ids: vec![0, 1, 2, 3],
+            stable_ids: vec![10, 11, 12, 13],
             vectors: vec![
                 0.0, 0.0, //
                 0.1, 0.0, //
@@ -1546,6 +1637,39 @@ mod tests {
         let mut row_counts: Vec<usize> = runs.iter().map(|run| run.local_ids.len()).collect();
         row_counts.sort_unstable();
         assert_eq!(row_counts, vec![2, 2]);
+    }
+
+    #[test]
+    fn fp32_user_grid_rows_train_runs_within_outer_cells() {
+        let config = VectorConfig {
+            column: "emb".into(),
+            dim: 2,
+            n_cent: 2,
+            rot_seed: 0,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
+            provided_centroids: Some(Arc::<[f32]>::from(vec![0.0, 0.0, 100.0, 0.0])),
+        };
+        let col = ColumnState {
+            config,
+            ids: vec![0, 1, 2, 3],
+            stable_ids: vec![10, 11, 12, 13],
+            vectors: vec![
+                0.0, 0.0, //
+                0.2, 0.0, //
+                100.0, 0.0, //
+                100.2, 0.0,
+            ],
+            materialized_rows: None,
+            next_local_id: 4,
+        };
+
+        let runs = fp32_rows_to_runs(&col);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].local_ids, vec![0, 1]);
+        assert_eq!(runs[0].stable_ids, vec![10, 11]);
+        assert_eq!(runs[1].local_ids, vec![2, 3]);
+        assert_eq!(runs[1].stable_ids, vec![12, 13]);
     }
 
     #[test]

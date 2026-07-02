@@ -457,6 +457,19 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             text(usd(req_usd)),
             metric(req_usd, usd(req_usd), Better::Lower),
         ]);
+        meter_rows.push(vec![
+            text("Cold S3 GET waves"),
+            text(format!(
+                "{} waves, max {} concurrent GETs",
+                store.get_waves, store.max_concurrent_gets
+            )),
+            text("one cold open + search"),
+            metric(
+                store.get_waves as f64,
+                store.get_waves.to_string(),
+                Better::Lower,
+            ),
+        ]);
     } else if c.cold.is_some() {
         meter_rows.push(vec![
             text("Cold S3 HEAD/GET"),

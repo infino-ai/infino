@@ -81,7 +81,7 @@
 //! format is forward-compatible without a file rewrite.
 use std::{collections::HashSet, fmt, sync::Arc};
 
-use arrow_array::{Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
@@ -403,6 +403,8 @@ pub struct SuperfileBuilder {
     opts: BuilderOptions,
     /// Cached column indices for FTS columns, parallel to `opts.fts_columns`.
     fts_col_idxs: Vec<usize>,
+    /// Cached schema index for the injected `_id` column.
+    id_col_idx: usize,
     /// Accumulated input batches. Drained at `finish()`.
     batches: Vec<RecordBatch>,
     /// FtsBuilder accumulating tokens across every `add_batch`.
@@ -534,6 +536,7 @@ impl SuperfileBuilder {
         Ok(Self {
             opts,
             fts_col_idxs,
+            id_col_idx: id_idx,
             batches: Vec::new(),
             fts_builder,
             vec_builder,
@@ -625,11 +628,20 @@ impl SuperfileBuilder {
                 }
             }
         } else if let Some(sb) = self.spfresh_builder.as_mut() {
+            let ids = batch
+                .column(self.id_col_idx)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("schema validated as Decimal128(38, 0)");
             for (i, vc) in self.opts.vector_columns.iter().enumerate() {
                 let dim = vc.dim;
                 for row in 0..(n_rows as usize) {
                     let start = row * dim;
-                    sb.add(i as u32, &vectors[i][start..start + dim])?;
+                    sb.add_with_stable_id(
+                        i as u32,
+                        &vectors[i][start..start + dim],
+                        ids.value(row),
+                    )?;
                 }
             }
         }

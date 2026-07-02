@@ -1324,19 +1324,22 @@ impl SupertableWriter {
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
         let user_vector_layout = user_superfile_vector_layout(user_options.vector_layout);
-        // SPFresh user superfiles train per-superfile fine runs. The older bench
-        // knob keeps global-cell alignment available for IVF only.
-        let user_global_centroids: Option<Arc<[f32]>> =
-            if user_superfiles_use_global_centroids(user_vector_layout) {
-                self.inner
-                    .manifest
-                    .load()
-                    .get_global_vector_index()
-                    .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
-                    .map(|g| g.grid.to_fp32().into())
-            } else {
-                None
-            };
+        // SPFresh user superfiles organize their inline routing trees under the
+        // user manifest's global 64-cell grid. IVF keeps the older global-centroid
+        // bench knob.
+        let user_global_centroids: Option<Arc<[f32]>> = if user_vector_layout
+            == VectorLayout::Spfresh
+            || user_superfiles_use_global_centroids(user_vector_layout)
+        {
+            self.inner
+                .manifest
+                .load()
+                .get_global_vector_index()
+                .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
+                .map(|g| g.grid.to_fp32().into())
+        } else {
+            None
+        };
 
         // Phase B: user-only build + publish. No hidden incoming build/publish;
         // the hidden cell index is drained later straight from these user
@@ -1929,7 +1932,6 @@ fn append_user_spfresh_routing(
     Ok(appended.then(|| SpfreshRoutingIndex {
         column: column.into(),
         centroid_blob_uri: None,
-        centroid_blob_content_hash: None,
         cells,
     }))
 }
@@ -2023,7 +2025,6 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
         SpfreshRoutingIndex {
             column: column.into(),
             centroid_blob_uri: None,
-            centroid_blob_content_hash: None,
             cells,
         },
         resident,
@@ -2908,12 +2909,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let mut resident_to_swap: Option<ResidentCentroids> = None;
         if let Some((mut routing_index, resident)) = spfresh_routing {
             if !resident.is_empty() {
-                let (uri, hash) =
+                let uri =
                     store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
                         .await
                         .map_err(|e| BuildError::Store(e.to_string()))?;
                 routing_index.centroid_blob_uri = Some(uri);
-                routing_index.centroid_blob_content_hash = Some(hash);
                 resident_to_swap = Some(resident);
             }
             precommit_manifest = precommit_manifest.with_spfresh_routing(routing_index);
@@ -3426,12 +3426,10 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
             &prepared_for_routing,
             RunFragmentKind::Base,
         )?;
-        let (uri, hash) =
-            store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+        let uri = store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
         spfresh_routing.centroid_blob_uri = Some(uri);
-        spfresh_routing.centroid_blob_content_hash = Some(hash);
 
         let current_for_commit = Arc::new(
             current
@@ -4544,7 +4542,10 @@ mod tests {
     }
 
     fn replication_row(stable_id: i128, code0: u8) -> MaterializedIvfRow {
-        const DIM: usize = 16;
+        // 2-dim fixture: the row reconstructs to `(code0, 0)` so the boundary
+        // geometry in the caller holds. Every Sq8+ε field must be `dim`-length
+        // or `dequantize_row_into` asserts on the length mismatch.
+        const DIM: usize = 2;
         MaterializedIvfRow {
             local_doc_id: 0,
             stable_id,
@@ -4723,7 +4724,6 @@ mod tests {
         let mut existing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: None,
-            centroid_blob_content_hash: None,
             cells: vec![
                 empty_cell_tree(0),
                 empty_cell_tree(1),
@@ -4907,7 +4907,6 @@ mod tests {
         let mut existing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: None,
-            centroid_blob_content_hash: None,
             cells: (0..clusters.n_cent).map(empty_cell_tree).collect(),
         };
         for (idx, old_entry) in old_entries.iter().enumerate() {

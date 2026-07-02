@@ -6,11 +6,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::vector::distance::{decode_f32_le_vec, encode_f32_le_vec},
-    supertable::manifest::{Manifest, part::ContentHash},
+    supertable::manifest::Manifest,
 };
 
 /// Magic prefix on a hidden SPFresh fine-centroid blob.
@@ -54,24 +55,21 @@ pub(crate) enum HiddenCentroidsError {
     DimMismatch,
     #[error("storage: {0}")]
     Storage(String),
-    #[error("content hash mismatch")]
-    HashMismatch,
 }
 
-pub(crate) fn storage_path(hash: &ContentHash) -> String {
-    format!("spfresh-centroids/centroids-{}.bin", hash.to_hex())
+pub(crate) fn storage_path(id: Uuid) -> String {
+    format!("spfresh-centroids/centroids-{id}.bin")
 }
 
 pub(crate) async fn store_centroids(
     storage: &dyn StorageProvider,
     dim: usize,
     centroids: &[f32],
-) -> Result<(String, ContentHash), HiddenCentroidsError> {
+) -> Result<String, HiddenCentroidsError> {
     let bytes = encode_centroids(dim, centroids)?;
-    let hash = ContentHash::of(&bytes);
-    let uri = storage_path(&hash);
+    let uri = storage_path(Uuid::new_v4());
     match storage.put_atomic(&uri, Bytes::from(bytes)).await {
-        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok((uri, hash)),
+        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(uri),
         Err(e) => Err(HiddenCentroidsError::Storage(e.to_string())),
     }
 }
@@ -130,26 +128,14 @@ pub(crate) async fn load_resident_centroids(
     manifest: &Manifest,
     storage: &dyn StorageProvider,
 ) -> Result<ResidentCentroids, HiddenCentroidsError> {
-    let Some((path, expected)) = manifest.spfresh_centroid_blob() else {
+    let Some(path) = manifest.spfresh_centroid_blob() else {
         return Ok(ResidentCentroids::default());
     };
-    let bytes = fetch_and_verify(storage, &path, &expected).await?;
-    decode_centroids(&bytes)
-}
-
-async fn fetch_and_verify(
-    storage: &dyn StorageProvider,
-    path: &str,
-    expected: &ContentHash,
-) -> Result<Bytes, HiddenCentroidsError> {
     let (bytes, _) = storage
-        .get(path)
+        .get(&path)
         .await
         .map_err(|e| HiddenCentroidsError::Storage(e.to_string()))?;
-    if ContentHash::of(bytes.as_ref()) != *expected {
-        return Err(HiddenCentroidsError::HashMismatch);
-    }
-    Ok(bytes)
+    decode_centroids(&bytes)
 }
 
 #[cfg(test)]

@@ -148,7 +148,6 @@ pub struct SpfreshRoutingIndex {
     /// Optional side blob containing hidden fine-centroid fp32 vectors. `None`
     /// for user-table routing, where centroids are inline in `CellTreeNode`.
     pub centroid_blob_uri: Option<String>,
-    pub centroid_blob_content_hash: Option<ContentHash>,
     /// One entry per global `VectorCell`; cells without SPFresh runs keep an
     /// empty tree so cell ids remain positional and stable.
     pub cells: Vec<CellTree>,
@@ -949,8 +948,6 @@ struct SpfreshRoutingIndexDto {
     column: String,
     #[serde(default)]
     centroid_blob_uri: Option<String>,
-    #[serde(default)]
-    centroid_blob_content_hash: Option<String>,
     cells: Vec<CellTreeDto>,
 }
 
@@ -1373,7 +1370,6 @@ fn spfresh_routing_to_dto(index: &SpfreshRoutingIndex) -> SpfreshRoutingIndexDto
     SpfreshRoutingIndexDto {
         column: index.column.clone(),
         centroid_blob_uri: index.centroid_blob_uri.clone(),
-        centroid_blob_content_hash: index.centroid_blob_content_hash.as_ref().map(encode_hash),
         cells: index
             .cells
             .iter()
@@ -1452,11 +1448,6 @@ fn spfresh_routing_from_dto(
     Ok(SpfreshRoutingIndex {
         column: dto.column,
         centroid_blob_uri: dto.centroid_blob_uri,
-        centroid_blob_content_hash: dto
-            .centroid_blob_content_hash
-            .as_deref()
-            .map(decode_hash)
-            .transpose()?,
         cells,
     })
 }
@@ -2383,7 +2374,6 @@ mod tests {
         list.spfresh_routing = Some(SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: Some("spfresh-centroids/centroids-test.bin".into()),
-            centroid_blob_content_hash: Some(ContentHash([7u8; BLAKE3_DIGEST_BYTES])),
             cells: vec![
                 CellTree {
                     cell_id: 0,

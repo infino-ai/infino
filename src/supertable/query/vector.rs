@@ -213,6 +213,7 @@ fn spfresh_run_probes_by_superfile(
     query: &[f32],
     nprobe: usize,
     resident_centroids: Option<&ResidentCentroids>,
+    routed_cells: Option<&[u32]>,
 ) -> HashMap<SuperfileUri, Vec<SpfreshRunProbe>> {
     let Some(routing) = routing else {
         return HashMap::new();
@@ -234,7 +235,14 @@ fn spfresh_run_probes_by_superfile(
     }
 
     let mut scored: Vec<ScoredSpfreshLeaf> = Vec::new();
+    let routed_cells: Option<HashSet<u32>> =
+        routed_cells.map(|cells| cells.iter().copied().collect());
     for cell in routing.cells {
+        if let Some(routed_cells) = routed_cells.as_ref()
+            && !routed_cells.contains(&cell.cell_id)
+        {
+            continue;
+        }
         for (leaf_idx, leaf) in cell.leaves.into_iter().enumerate() {
             let centroid = match cell.nodes.get(leaf_idx) {
                 Some(node) => decode_manifest_centroid(&node.centroid, query.len()),
@@ -767,6 +775,19 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.fanout_vector_clusters_in_cells(superfiles, column, query, k, options, None)
+            .await
+    }
+
+    async fn fanout_vector_clusters_in_cells(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        routed_cells: Option<&[u32]>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -790,6 +811,7 @@ impl SupertableReader {
             options,
             None,
             hidden_deleted,
+            routed_cells,
         )
         .await
     }
@@ -803,6 +825,7 @@ impl SupertableReader {
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
         hidden_deleted: Option<Arc<Vec<i128>>>,
+        routed_cells: Option<&[u32]>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let filtered = allow.is_some();
         let (nprobe, _) = options.resolve(filtered);
@@ -832,6 +855,7 @@ impl SupertableReader {
             query,
             nprobe,
             resident_spfresh_centroids.as_deref(),
+            routed_cells,
         );
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
@@ -1124,8 +1148,17 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
-            .await
+        self.vector_fanout_over_superfiles(
+            superfiles,
+            column,
+            query,
+            k,
+            options,
+            Some(allow),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Vector centroid prune intersected with a manifest-only survival set.
@@ -1223,8 +1256,17 @@ impl SupertableReader {
         if allow.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
-            .await
+        self.vector_fanout_over_superfiles(
+            superfiles,
+            column,
+            query,
+            k,
+            options,
+            Some(allow),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
@@ -1284,8 +1326,17 @@ impl SupertableReader {
             .into_iter()
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect();
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow), None)
-            .await
+        self.vector_fanout_over_superfiles(
+            superfiles,
+            column,
+            query,
+            k,
+            options,
+            Some(allow),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Resolve a [`CandidatePlan`] to a per-superfile allow-set of matching
@@ -1401,7 +1452,7 @@ impl SupertableReader {
                     .find(|vc| vc.column == column)
                     .map(|vc| vc.metric)
                     .unwrap_or(Metric::L2Sq);
-                let selected = match vit_manifest.get_partition_strategy() {
+                let (selected, routed_cells) = match vit_manifest.get_partition_strategy() {
                     PartitionStrategy::VectorCell {
                         clusters, routing, ..
                     } => {
@@ -1416,17 +1467,18 @@ impl SupertableReader {
                         // "incoming" staging region to scan. Undrained user
                         // superfiles are searched alongside the hidden cells
                         // below, keyed by the hidden manifest's drained watermark.
-                        if vit_manifest.superfiles.is_empty() {
+                        let selected = if vit_manifest.superfiles.is_empty() {
                             vit_manifest
                                 .superfiles_for_routed_cells(&routed)
                                 .await
                                 .map_err(|e| QueryError::Execute(e.to_string()))?
                         } else {
                             filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
-                        }
+                        };
+                        (selected, Some(routed))
                     }
                     _ => {
-                        if vit_manifest.superfiles.is_empty() {
+                        let selected = if vit_manifest.superfiles.is_empty() {
                             let part_ids: Vec<_> = vit_manifest
                                 .get_all_list_entries()
                                 .iter()
@@ -1437,7 +1489,8 @@ impl SupertableReader {
                                 .map_err(|e| QueryError::Execute(e.to_string()))?
                         } else {
                             vit_manifest.superfiles.to_vec()
-                        }
+                        };
+                        (selected, None)
                     }
                 };
                 let user_tail =
@@ -1447,7 +1500,14 @@ impl SupertableReader {
                         Ok(Vec::new())
                     } else {
                         vit_reader
-                            .fanout_vector_clusters(&selected, column, query, k, options)
+                            .fanout_vector_clusters_in_cells(
+                                &selected,
+                                column,
+                                query,
+                                k,
+                                options,
+                                routed_cells.as_deref(),
+                            )
                             .await
                     }
                 };
@@ -1455,8 +1515,15 @@ impl SupertableReader {
                     if user_tail.is_empty() {
                         Ok(Vec::new())
                     } else {
-                        self.fanout_vector_clusters(&user_tail, column, query, k, options)
-                            .await
+                        self.fanout_vector_clusters_in_cells(
+                            &user_tail,
+                            column,
+                            query,
+                            k,
+                            options,
+                            routed_cells.as_deref(),
+                        )
+                        .await
                     }
                 };
                 let (hidden_hits, user_tail_hits) = try_join!(hidden_fut, user_tail_fut)?;
@@ -2010,7 +2077,6 @@ mod tests {
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: None,
-            centroid_blob_content_hash: None,
             cells: vec![CellTree {
                 cell_id: 2,
                 nodes: vec![
@@ -2053,12 +2119,13 @@ mod tests {
         };
 
         let selected = super::spfresh_run_probes_by_superfile(
-            Some(routing),
+            Some(routing.clone()),
             "emb",
             &[entry.clone()],
             Metric::L2Sq,
             &[99.0],
             1,
+            None,
             None,
         );
         let probes = selected.get(&entry.uri).expect("selected probes");
@@ -2066,6 +2133,18 @@ mod tests {
             probes.iter().map(|probe| probe.run_id).collect::<Vec<_>>(),
             vec![1usize]
         );
+
+        let filtered_out = super::spfresh_run_probes_by_superfile(
+            Some(routing),
+            "emb",
+            &[entry.clone()],
+            Metric::L2Sq,
+            &[99.0],
+            1,
+            None,
+            Some(&[3]),
+        );
+        assert!(filtered_out.is_empty());
     }
 
     #[test]
@@ -2089,7 +2168,6 @@ mod tests {
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: Some("spfresh-centroids/centroids-test.bin".into()),
-            centroid_blob_content_hash: None,
             cells: vec![CellTree {
                 cell_id: 2,
                 nodes: Vec::new(),
@@ -2141,6 +2219,7 @@ mod tests {
             &[99.0],
             1,
             Some(&resident),
+            None,
         );
         let probes = selected.get(&entry.uri).expect("selected probes");
         assert_eq!(

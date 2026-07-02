@@ -591,7 +591,7 @@ impl Supertable {
                         )
                         .map_err(|e| CompactionError::Build(e.to_string()))?;
                         if !resident.is_empty() {
-                            let (uri, hash) = store_centroids(
+                            let uri = store_centroids(
                                 storage.as_ref(),
                                 resident.dim,
                                 resident.centroids.as_ref(),
@@ -599,7 +599,6 @@ impl Supertable {
                             .await
                             .map_err(|e| CompactionError::Build(e.to_string()))?;
                             routing.centroid_blob_uri = Some(uri);
-                            routing.centroid_blob_content_hash = Some(hash);
                             resident_to_swap = Some(resident);
                         }
                         Arc::new(current.with_spfresh_routing(routing))

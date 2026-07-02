@@ -340,7 +340,7 @@ fn emit_cost_warm(
     cold: Option<&[cost::ColdQuery]>,
     cold_store: Option<storage_meter::ObjectStoreMeter>,
 ) {
-    if warm.is_empty() && cold.is_none() {
+    if warm.is_empty() && cold.is_none() && cold_store.is_none() {
         return;
     }
     let resident = rss::current_anon_rss_bytes().unwrap_or(0);
@@ -853,6 +853,28 @@ pub mod vector {
         }
     }
 
+    fn measure_vector_cold_store(
+        built: &supertable::IngestResult,
+        query: &[f32],
+        nprobe: usize,
+        rerank: usize,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        built.cleanup.as_ref()?;
+        let meter = storage_meter::wrap(Arc::clone(&built.storage));
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        let _ = consumer.topk_global(supertable::VEC_COLUMN, query, TOP_K, nprobe, rerank);
+        drop(consumer);
+        drop(cache_dir);
+        Some(meter.snapshot())
+    }
+
     /// Drain hidden incoming IVF into per-cell superfiles via the existing
     /// SPFresh maintenance hook (same call integration tests use).
     fn drain_hidden_incoming(consumer: &Supertable) {
@@ -1114,7 +1136,14 @@ pub mod vector {
                     LEGACY_NOTE,
                 )
             };
-            if phases.warm {
+            if phases.warm || phases.cold {
+                let cold_store = if phases.cold {
+                    q_correct
+                        .first()
+                        .and_then(|query| measure_vector_cold_store(&built, query, nprobe, rerank))
+                } else {
+                    None
+                };
                 emit_cost_warm(
                     &mut report,
                     "bench/vector/supertable/cost",
@@ -1128,7 +1157,7 @@ pub mod vector {
                     n_docs,
                     &cost::warm_from_vector(&recall_rows),
                     None,
-                    None,
+                    cold_store,
                 );
             }
             // Filtered vector recall + latency mirrors the superfile tier:
