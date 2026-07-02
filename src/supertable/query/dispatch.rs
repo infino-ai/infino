@@ -153,6 +153,9 @@ fn stable_ids_for_tagged_hits(reader: &SuperfileReader, locals: &[u32]) -> Optio
             return Some(ids);
         }
     }
+    if let Some(spfresh) = reader.spfresh_vec() {
+        return spfresh.stable_ids_for_locals(locals).ok();
+    }
     if reader.parquet_bytes().is_none() {
         return None;
     }

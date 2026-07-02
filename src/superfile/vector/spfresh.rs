@@ -17,6 +17,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use roaring::RoaringBitmap;
 
 use crate::superfile::{
     BuildError, ReadError,
@@ -300,14 +301,17 @@ impl SpfreshBlobReader {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn dim(&self) -> usize {
         self.dim
     }
 
+    #[cfg(test)]
     pub(crate) fn metric(&self) -> Metric {
         self.metric
     }
 
+    #[cfg(test)]
     pub(crate) fn n_rows(&self) -> u32 {
         self.n_rows
     }
@@ -320,10 +324,12 @@ impl SpfreshBlobReader {
         self.runs.get(run_idx).map(|run| run.body_range.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn run_bytes(&self, run_idx: usize) -> Option<Bytes> {
         self.run_range(run_idx).map(|range| self.bytes.slice(range))
     }
 
+    #[cfg(test)]
     pub(crate) fn runs_for_cell(&self, cell_id: u32) -> Vec<usize> {
         self.runs
             .iter()
@@ -332,11 +338,23 @@ impl SpfreshBlobReader {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn search_runs(
         &self,
         run_ids: &[usize],
         query: &[f32],
         k: usize,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        self.search_runs_filtered(run_ids, query, k, None, None)
+    }
+
+    pub(crate) fn search_runs_filtered(
+        &self,
+        run_ids: &[usize],
+        query: &[f32],
+        k: usize,
+        allow: Option<&RoaringBitmap>,
+        deny: Option<&RoaringBitmap>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         if query.len() != self.dim {
             return Err(VectorError::DimensionMismatch {
@@ -361,11 +379,30 @@ impl SpfreshBlobReader {
                 run.row_count as usize,
                 query,
                 k,
+                allow,
+                deny,
                 &mut heap,
             )?;
         }
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|hit| hit.0).collect();
         out.sort_by(|a, b| cmp_f32(a.1, b.1));
+        Ok(out)
+    }
+
+    pub(crate) fn stable_ids_for_locals(&self, locals: &[u32]) -> Result<Vec<i128>, VectorError> {
+        if locals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(locals.len());
+        let rows = self.materialized_rows()?;
+        for local in locals {
+            let stable_id = rows
+                .iter()
+                .find(|row| row.local_doc_id == *local)
+                .map(|row| row.stable_id)
+                .ok_or_else(|| malformed(format!("SPFresh local id {local} missing")))?;
+            out.push(stable_id);
+        }
         Ok(out)
     }
 
@@ -705,6 +742,8 @@ fn score_run_body(
     row_count: usize,
     query: &[f32],
     k: usize,
+    allow: Option<&RoaringBitmap>,
+    deny: Option<&RoaringBitmap>,
     heap: &mut BinaryHeap<WorstHit>,
 ) -> Result<(), VectorError> {
     let scale = read_f32_vec(body, 0, dim)?;
@@ -731,6 +770,11 @@ fn score_run_body(
         let row_base = rows_start + row * dim * ROW_BYTES_PER_DIM;
         let id_base = ids_start + row * U32_BYTES;
         let local_id = read_u32_at(body, id_base, "local_id")?;
+        if allow.is_some_and(|bitmap| !bitmap.contains(local_id))
+            || deny.is_some_and(|bitmap| bitmap.contains(local_id))
+        {
+            continue;
+        }
         let codes = &body[row_base..row_base + dim];
         let residuals = &body[row_base + dim..row_base + dim + dim];
         let norm = norms.as_ref().map(|values| values[row]);

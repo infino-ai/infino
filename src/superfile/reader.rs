@@ -275,16 +275,20 @@ impl SuperfileReader {
         let vec_layout = vector_layout_from_kv(&kv_map);
         let vec_fut = async {
             if !vec_present {
-                return Ok::<_, ReadError>(None);
+                return Ok::<_, ReadError>((None, None));
             }
-            if matches!(
-                vec_layout,
-                VectorLayout::CellPosting | VectorLayout::Spfresh
-            ) {
-                return Ok(None);
+            if matches!(vec_layout, VectorLayout::CellPosting) {
+                return Ok((None, None));
             }
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+            if matches!(vec_layout, VectorLayout::Spfresh) {
+                let blob = source
+                    .range(off, len)
+                    .await
+                    .map_err(|e| ReadError::Io(std::io::Error::other(e.to_string())))?;
+                return Ok((None, Some(SpfreshBlobReader::open(blob)?)));
+            }
             let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
             let sub: Arc<dyn LazyByteSource> =
                 Arc::new(LazySubSource::new(Arc::clone(&source), off, len));
@@ -294,7 +298,7 @@ impl SuperfileReader {
                 vector_reader::OpenOptions::for_object_store(),
             )
             .await?;
-            Ok(Some(reader))
+            Ok((Some(reader), None))
         };
 
         let fts_fut = async {
@@ -312,7 +316,7 @@ impl SuperfileReader {
             Ok(Some(reader))
         };
 
-        let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
+        let ((vec, spfresh_vec), fts) = futures::try_join!(vec_fut, fts_fut)?;
 
         Ok(Self {
             bytes: None,
@@ -324,7 +328,7 @@ impl SuperfileReader {
             n_docs,
             fts,
             vec,
-            spfresh_vec: None,
+            spfresh_vec,
         })
     }
 

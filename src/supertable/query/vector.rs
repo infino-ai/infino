@@ -89,14 +89,17 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     storage::StorageProvider,
-    superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
+    superfile::{
+        SuperfileReader, fts::reader::BoolMode, vector::distance::Metric,
+        vector::layout::VectorLayout,
+    },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
         hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
-            list::{CellRoutingParams, PartitionStrategy},
+            list::{CellRoutingParams, PartitionStrategy, SpfreshRoutingIndex},
         },
         tombstones::SidecarCache,
     },
@@ -118,6 +121,7 @@ pub struct VectorFilter<'a> {
 enum Probe {
     Clusters(Vec<u32>),
     Nprobe,
+    SpfreshRuns(Option<Vec<usize>>),
 }
 
 /// Apply query-time diagnostic overrides to the persisted cell-routing params.
@@ -163,6 +167,43 @@ fn filter_superfiles_by_cells(
         })
         .cloned()
         .collect()
+}
+
+fn spfresh_run_ids_by_superfile(
+    routing: Option<SpfreshRoutingIndex>,
+    column: &str,
+    superfiles: &[Arc<SuperfileEntry>],
+) -> HashMap<SuperfileUri, Vec<usize>> {
+    let Some(routing) = routing else {
+        return HashMap::new();
+    };
+    if routing.column != column {
+        return HashMap::new();
+    }
+    let selected: HashSet<String> = superfiles
+        .iter()
+        .map(|entry| entry.uri.0.to_string())
+        .collect();
+    let mut out: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
+    for cell in routing.cells {
+        for leaf in cell.leaves {
+            if !selected.contains(&leaf.superfile_uri) {
+                continue;
+            }
+            let Some(entry) = superfiles
+                .iter()
+                .find(|entry| entry.uri.0.to_string() == leaf.superfile_uri)
+            else {
+                continue;
+            };
+            out.entry(entry.uri).or_default().push(leaf.run_id as usize);
+        }
+    }
+    for run_ids in out.values_mut() {
+        run_ids.sort_unstable();
+        run_ids.dedup();
+    }
+    out
 }
 
 /// Split hits into those already on the user table vs hidden-index hits
@@ -355,6 +396,11 @@ async fn read_ids_for_locals(
             {
                 return Ok(ids);
             }
+        }
+        if let Some(spfresh) = reader.spfresh_vec() {
+            return spfresh
+                .stable_ids_for_locals(local_ids)
+                .map_err(|e| QueryError::Execute(e.to_string()));
         }
     }
     if reader.parquet_bytes().is_some() {
@@ -612,6 +658,8 @@ impl SupertableReader {
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
             .unwrap_or(Metric::L2Sq);
+        let spfresh_runs =
+            spfresh_run_ids_by_superfile(manifest.get_spfresh_routing(), column, &superfiles);
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         let mut fallback: Vec<usize> = Vec::new();
@@ -620,6 +668,9 @@ impl SupertableReader {
             // (absent from `allow`) is dropped here — it never scores a
             // cluster, never enters the fan-out, and issues zero GETs.
             if allow.as_ref().is_some_and(|m| !m.contains_key(&entry.uri)) {
+                continue;
+            }
+            if entry.vector_layout == VectorLayout::Spfresh {
                 continue;
             }
             match entry.vector_summary.get(column) {
@@ -684,7 +735,9 @@ impl SupertableReader {
         // guards keeps the lookup on the path where presence is invariant.
         let mut units: Vec<(Arc<SuperfileEntry>, (Probe, Option<Arc<RoaringBitmap>>))> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
-            let probe = if let Some(ids) = per_seg.remove(&si) {
+            let probe = if entry.vector_layout == VectorLayout::Spfresh {
+                Probe::SpfreshRuns(spfresh_runs.get(&entry.uri).cloned())
+            } else if let Some(ids) = per_seg.remove(&si) {
                 Probe::Clusters(ids)
             } else if fallback.contains(&si) {
                 Probe::Nprobe
@@ -727,29 +780,56 @@ impl SupertableReader {
                                 .inline_deleted_locals(deleted.as_slice())
                                 .await
                                 .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                            None => None,
+                            None => {
+                                if let Some(spfresh) = reader.spfresh_vec() {
+                                    let rows = spfresh
+                                        .materialized_rows()
+                                        .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                                    let mut bitmap = RoaringBitmap::new();
+                                    for row in rows {
+                                        if deleted.binary_search(&row.stable_id).is_ok() {
+                                            bitmap.insert(row.local_doc_id);
+                                        }
+                                    }
+                                    Some(bitmap)
+                                } else {
+                                    None
+                                }
+                            }
                         }
                     } else {
                         None
                     };
                     let deny = deny.map(Arc::new);
                     let res = match probe {
-                        Probe::Clusters(ids) => {
-                            reader
-                                .vector_search_clusters_filtered(
-                                    &column, &query, k, &ids, options, bitmap, deny,
+                        Probe::Clusters(ids) => reader
+                            .vector_search_clusters_filtered(
+                                &column, &query, k, &ids, options, bitmap, deny,
+                            )
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string())),
+                        Probe::Nprobe => reader
+                            .vector_hits_filtered_async(&column, &query, k, options, bitmap, deny)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string())),
+                        Probe::SpfreshRuns(run_ids) => {
+                            let spfresh = reader.spfresh_vec().ok_or_else(|| {
+                                QueryError::Parquet("SPFresh vector blob missing".into())
+                            })?;
+                            let run_ids =
+                                run_ids.unwrap_or_else(|| (0..spfresh.runs().len()).collect());
+                            spfresh
+                                .search_runs_filtered(
+                                    &run_ids,
+                                    &query,
+                                    k,
+                                    bitmap.as_deref(),
+                                    deny.as_deref(),
                                 )
-                                .await
-                        }
-                        Probe::Nprobe => {
-                            reader
-                                .vector_hits_filtered_async(
-                                    &column, &query, k, options, bitmap, deny,
-                                )
-                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))
                         }
                     };
-                    res.map_err(|e| QueryError::Parquet(e.to_string()))
+                    res
                 }
             };
         // Filtered search holds a per-superfile RoaringBitmap while the
@@ -1412,9 +1492,13 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, SuperfileBuilder, VectorConfig},
-            vector::distance::Metric,
+            vector::{distance::Metric, layout::VectorLayout},
         },
-        supertable::{Supertable, SupertableOptions, error::QueryError},
+        supertable::{
+            Supertable, SupertableOptions,
+            error::QueryError,
+            manifest::list::{CellTree, RunRef, SpfreshRoutingIndex},
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -1638,6 +1722,74 @@ mod tests {
             .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
             .expect("query");
         assert_eq!(hits.len(), 7);
+    }
+
+    #[test]
+    fn spfresh_user_table_vector_search_queries_runs() {
+        let dim = 16;
+        let opts = options_one_superfile_per_commit(dim).with_vector_layout(VectorLayout::Spfresh);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_vector_batch(0, 16, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
+            .expect("query");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].local_doc_id, 0);
+        assert!(hits[0].score <= hits[1].score);
+    }
+
+    #[test]
+    fn spfresh_routing_selects_run_ids_for_selected_superfiles() {
+        let id = Uuid::from_u128(0x1234);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 8,
+            id_min: 0,
+            id_max: 7,
+            scalar_stats: std::collections::HashMap::new(),
+            fts_summary: std::collections::HashMap::new(),
+            vector_summary: std::collections::HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: Some(2),
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        });
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            cells: vec![CellTree {
+                cell_id: 2,
+                nodes: Vec::new(),
+                leaves: vec![
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        run_id: 3,
+                        byte_range: (10, 20),
+                        row_count: 4,
+                    },
+                    RunRef {
+                        superfile_uri: id.to_string(),
+                        cell_id: 2,
+                        run_id: 1,
+                        byte_range: (30, 20),
+                        row_count: 4,
+                    },
+                ],
+            }],
+        };
+
+        let selected = super::spfresh_run_ids_by_superfile(Some(routing), "emb", &[entry.clone()]);
+        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize, 3]));
     }
 
     #[test]
