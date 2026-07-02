@@ -50,7 +50,7 @@
 use std::{
     cmp,
     collections::HashMap,
-    fmt, io,
+    env, fmt, io,
     marker::PhantomData,
     mem,
     sync::{Arc, atomic::Ordering},
@@ -123,6 +123,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
+            spfresh::{HiddenIndexLayout, hidden_index_layout},
         },
     },
     supertable::{
@@ -140,6 +141,14 @@ use crate::{
         reader_cache::DiskCacheStore,
     },
 };
+
+/// Legacy bench knob that asks user superfiles to share the global cell grid.
+const USER_CENTROIDS_ENV: &str = "INFINO_USER_CENTROIDS";
+const USER_CENTROIDS_GLOBAL_VALUE: &str = "global";
+const DRAIN_CONSOLIDATE_ENV: &str = "INFINO_DRAIN_CONSOLIDATE";
+const DRAIN_CONSOLIDATE_DEFAULT: &str = "kmeans";
+const DRAIN_BATCH_SUPERFILES_ENV: &str = "INFINO_DRAIN_BATCH_SUPERFILES";
+const DRAIN_READ_CONCURRENCY_ENV: &str = "INFINO_DRAIN_READ_CONCURRENCY";
 
 pub struct SupertableWriter {
     inner: Arc<SupertableInner>,
@@ -160,6 +169,27 @@ pub struct SupertableWriter {
     /// `wal_id`; `commit()` builds the WAL state doc and drives
     /// the tombstone phase.
     pending_deletes: Vec<PendingDeleteEntry>,
+}
+
+fn user_superfile_vector_layout(default_layout: VectorLayout) -> VectorLayout {
+    user_superfile_vector_layout_for_hidden(default_layout, hidden_index_layout())
+}
+
+fn user_superfile_vector_layout_for_hidden(
+    default_layout: VectorLayout,
+    hidden_layout: HiddenIndexLayout,
+) -> VectorLayout {
+    match hidden_layout {
+        HiddenIndexLayout::Nested => default_layout,
+        HiddenIndexLayout::Spfresh => VectorLayout::Spfresh,
+    }
+}
+
+fn user_superfiles_use_global_centroids(vector_layout: VectorLayout) -> bool {
+    matches!(vector_layout, VectorLayout::Spfresh)
+        || env::var(USER_CENTROIDS_ENV)
+            .map(|value| value == USER_CENTROIDS_GLOBAL_VALUE)
+            .unwrap_or(false)
 }
 
 /// One buffered update. Resources here are all reserved at the
@@ -1264,16 +1294,11 @@ impl SupertableWriter {
         // Parallel publish: user + hidden manifest/storage commits overlap.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
-        // A/B knob (`INFINO_USER_CENTROIDS=global`): build user superfiles
-        // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
-        // k-means — so the splice/kmeans drain routes cluster c → cell c
-        // doc-correctly. The grid is read from THIS table's manifest (bootstrapped
-        // above, Phase A). Default `local` is unchanged.
-        let user_global_centroids: Option<std::sync::Arc<[f32]>> =
-            if std::env::var("INFINO_USER_CENTROIDS")
-                .map(|v| v == "global")
-                .unwrap_or(false)
-            {
+        let user_vector_layout = user_superfile_vector_layout(user_options.vector_layout);
+        // SPFresh user superfiles are cluster-aligned to the global VectorCell
+        // grid; the older bench knob keeps the same alignment available for IVF.
+        let user_global_centroids: Option<Arc<[f32]>> =
+            if user_superfiles_use_global_centroids(user_vector_layout) {
                 self.inner
                     .manifest
                     .load()
@@ -1291,7 +1316,7 @@ impl SupertableWriter {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_options,
-                user_options.vector_layout,
+                user_vector_layout,
                 user_global_centroids.clone(),
             )
         })?;
@@ -2036,7 +2061,7 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 /// periodically) drains only newly-ingested commits, never duplicating cells.
 /// Pre-drain queries see an empty hidden index (0 results) until this runs.
 fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
-    std::env::var("INFINO_DRAIN_BATCH_SUPERFILES")
+    env::var(DRAIN_BATCH_SUPERFILES_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(opts.drain_batch_superfiles)
@@ -2168,13 +2193,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     //     nearest global cell, re-cluster per cell → few clean clusters per cell.
     //   `splice` — route each superfile's LOCAL clusters to their nearest global
     //     cell, keep them verbatim as multi-cluster fragments (no re-cluster).
-    let mode = std::env::var("INFINO_DRAIN_CONSOLIDATE").unwrap_or_else(|_| "kmeans".into());
-    // assign-skip: with global-aligned user superfiles (`INFINO_USER_CENTROIDS=
-    // global`) cluster c == cell c, so group by the row's own cluster ordinal
-    // instead of the O(n·n_cent) per-row nearest-cell scoring.
-    let assign_skip = std::env::var("INFINO_USER_CENTROIDS")
-        .map(|v| v == "global")
-        .unwrap_or(false);
+    let mode = env::var(DRAIN_CONSOLIDATE_ENV).unwrap_or_else(|_| DRAIN_CONSOLIDATE_DEFAULT.into());
+    // assign-skip: SPFresh and the legacy global-centroid bench path both make
+    // cluster c == cell c, so group by the row's own cluster ordinal instead
+    // of the O(n·n_cent) per-row nearest-cell scoring.
+    let assign_skip = user_superfiles_use_global_centroids(hidden_inner.options.vector_layout);
     let column_name = column.clone();
 
     let drain_t0 = std::time::Instant::now();
@@ -3085,7 +3108,7 @@ const DRAIN_READ_CONCURRENCY_CAP: usize = 64;
 /// still fan out, and capped at [`DRAIN_READ_CONCURRENCY_CAP`]. Overridable
 /// (unclamped) with `INFINO_DRAIN_READ_CONCURRENCY`.
 fn drain_read_concurrency() -> usize {
-    if let Some(n) = std::env::var("INFINO_DRAIN_READ_CONCURRENCY")
+    if let Some(n) = env::var(DRAIN_READ_CONCURRENCY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -3475,7 +3498,11 @@ mod tests {
             fts::reader::BoolMode,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{SupertableOptions, handle::Supertable, storage::LocalFsStorageProvider},
+        supertable::{
+            SupertableOptions,
+            handle::{GLOBAL_VECTOR_CELL_COUNT, Supertable},
+            storage::LocalFsStorageProvider,
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -3746,6 +3773,52 @@ mod tests {
         // per-cluster counts sum to the superfile's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();
         assert_eq!(total, seg.n_docs);
+    }
+
+    #[test]
+    fn spfresh_hidden_layout_selects_spfresh_user_layout() {
+        assert_eq!(
+            user_superfile_vector_layout_for_hidden(VectorLayout::Ivf, HiddenIndexLayout::Nested),
+            VectorLayout::Ivf
+        );
+        assert_eq!(
+            user_superfile_vector_layout_for_hidden(VectorLayout::Ivf, HiddenIndexLayout::Spfresh),
+            VectorLayout::Spfresh
+        );
+        assert!(user_superfiles_use_global_centroids(VectorLayout::Spfresh));
+    }
+
+    #[test]
+    fn spfresh_user_layout_preserves_ids_and_scalar_stats() {
+        const DIM: usize = 16;
+        const ROWS: usize = 80;
+
+        let st =
+            Supertable::create(options_with_vector(DIM).with_vector_layout(VectorLayout::Spfresh))
+                .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, ROWS, DIM)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        assert_eq!(seg.vector_layout, VectorLayout::Spfresh);
+        assert_eq!(seg.n_docs, ROWS as u64);
+        assert!(seg.id_min > 0);
+        assert!(seg.id_max > seg.id_min);
+        assert!(seg.scalar_stats.contains_key("title"));
+
+        let sf_reader = st.options().store.reader(&seg.uri).expect("reader");
+        let spfresh = sf_reader.spfresh_vec().expect("SPFresh vector reader");
+        assert_eq!(spfresh.dim(), DIM);
+        assert_eq!(spfresh.n_rows() as usize, ROWS);
+        assert!(!spfresh.runs().is_empty());
+        assert!(
+            spfresh
+                .runs()
+                .iter()
+                .all(|run| run.cell_id < GLOBAL_VECTOR_CELL_COUNT as u32)
+        );
     }
 
     #[test]
