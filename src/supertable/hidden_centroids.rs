@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::{
     storage::StorageProvider,
+    superfile::vector::distance::{decode_f32_le_vec, encode_f32_le_vec},
     supertable::manifest::{Manifest, part::ContentHash},
 };
 
@@ -74,9 +75,7 @@ pub(crate) fn encode_centroids(
     out.push(CENTROIDS_VERSION);
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.extend_from_slice(&(n_cent as u32).to_le_bytes());
-    for value in centroids {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
+    out.extend_from_slice(&encode_f32_le_vec(centroids));
     Ok(out)
 }
 
@@ -107,17 +106,9 @@ pub(crate) fn decode_centroids(bytes: &[u8]) -> Result<ResidentCentroids, Hidden
     if dim == 0 || body.len() != n_cent * dim * F32_BYTES {
         return Err(HiddenCentroidsError::DimMismatch);
     }
-    let mut centroids = Vec::with_capacity(n_cent * dim);
-    for chunk in body.chunks_exact(F32_BYTES) {
-        centroids.push(f32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| HiddenCentroidsError::Truncated)?,
-        ));
-    }
     Ok(ResidentCentroids {
         dim,
-        centroids: Arc::from(centroids),
+        centroids: Arc::from(decode_f32_le_vec(body)),
     })
 }
 

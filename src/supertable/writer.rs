@@ -120,7 +120,7 @@ use crate::{
             cell_posting::{
                 EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row,
             },
-            distance::Metric,
+            distance::{Metric, encode_f32_le_vec},
             ivf_merge::{MergedIvfSubsection, route_clusters_into_cells},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -141,10 +141,7 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::{
-                CellTree, CellTreeNode, LEGACY_SPFRESH_CLUSTER_ID, PartitionStrategy, RunRef,
-                SpfreshRoutingIndex,
-            },
+            list::{CellTree, CellTreeNode, PartitionStrategy, RunRef, SpfreshRoutingIndex},
             part::{self as part_mod, ContentHash, PartId},
             partition::{assign_partition, encode_partition_key},
         },
@@ -1784,12 +1781,34 @@ fn prepared_superfile_bytes(prep: &PreparedSuperfile) -> Result<Bytes, BuildErro
         .ok_or_else(|| BuildError::Store("SPFresh prepared superfile missing bytes".into()))
 }
 
-fn encode_f32_centroid(centroid: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(centroid.len() * mem::size_of::<f32>());
-    for value in centroid {
-        out.extend_from_slice(&value.to_le_bytes());
+/// Open a prepared SPFresh superfile for routing: resolve its absolute
+/// vector-subsection offset and open a reader whose SPFresh blob is present.
+/// The single open path shared by every routing builder so the
+/// offset-lookup + open + blob-presence checks can't drift between them.
+fn open_prepared_spfresh(prep: &PreparedSuperfile) -> Result<(u64, SuperfileReader), BuildError> {
+    let (vec_offset, _) = prep
+        .entry
+        .subsection_offsets
+        .as_ref()
+        .and_then(|o| o.vec)
+        .ok_or_else(|| {
+            BuildError::Store("SPFresh superfile missing vector subsection offsets".into())
+        })?;
+    let bytes = prepared_superfile_bytes(prep)?;
+    let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
+    if reader.spfresh_vec().is_none() {
+        return Err(BuildError::Store(
+            "superfile missing SPFresh vector blob".into(),
+        ));
     }
-    out
+    Ok((vec_offset, reader))
+}
+
+/// Absolute `(offset, length)` of a run body inside its owning superfile: the
+/// blob-local run range shifted by the superfile's vector-subsection offset.
+/// Shared by every routing builder so the range math is written once.
+fn spfresh_run_byte_range(vec_offset: u64, run_start: usize, run_len: usize) -> (u64, u64) {
+    (vec_offset + run_start as u64, run_len as u64)
 }
 
 fn mean_run_centroid(rows: &[MaterializedIvfRow], cluster_id: u32, dim: usize) -> Option<Vec<f32>> {
@@ -1841,17 +1860,10 @@ fn append_user_spfresh_routing(
         .iter()
         .filter(|prep| prep.entry.vector_layout == VectorLayout::Spfresh)
     {
-        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
-        else {
-            return Err(BuildError::Store(
-                "SPFresh user superfile missing vector subsection offsets".into(),
-            ));
-        };
-        let bytes = prepared_superfile_bytes(prep)?;
-        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
-        let spfresh = reader.spfresh_vec().ok_or_else(|| {
-            BuildError::Store("user superfile missing SPFresh vector blob".into())
-        })?;
+        let (vec_offset, reader) = open_prepared_spfresh(prep)?;
+        let spfresh = reader
+            .spfresh_vec()
+            .expect("open_prepared_spfresh guarantees a SPFresh blob");
         let rows = spfresh
             .materialized_rows()
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -1869,7 +1881,7 @@ fn append_user_spfresh_routing(
                 .run_range(run_id)
                 .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
             cells[cid].nodes.push(CellTreeNode {
-                centroid: encode_f32_centroid(&centroid),
+                centroid: encode_f32_le_vec(&centroid),
                 left: 0,
                 right: 0,
             });
@@ -1878,7 +1890,7 @@ fn append_user_spfresh_routing(
                 cell_id,
                 cluster_id: run.cluster_id,
                 run_id: run_id as u32,
-                byte_range: (vec_offset + range.start as u64, range.len() as u64),
+                byte_range: spfresh_run_byte_range(vec_offset, range.start, range.len()),
                 row_count: run.row_count,
             });
             appended = true;
@@ -1893,23 +1905,31 @@ fn append_user_spfresh_routing(
     }))
 }
 
-pub(in crate::supertable) fn refresh_spfresh_routing(
+/// Rebuild the hidden-index SPFresh routing after a drain flush or a compaction
+/// merge. Carried leaves for `entries_to_remove` are dropped; every `prepared`
+/// superfile's runs are appended with `cluster_id` set to an index into the
+/// returned [`ResidentCentroids`] (the fine centroid the query scores against).
+///
+/// This is the single hidden routing authority — both drain (no removals) and
+/// compaction (merged inputs removed) go through it so hidden `cluster_id`
+/// semantics (resident-centroid index) can't drift between the two paths.
+pub(in crate::supertable) fn extend_hidden_spfresh_routing(
     existing: Option<SpfreshRoutingIndex>,
+    existing_centroids: &ResidentCentroids,
     column: &str,
     n_cells: u32,
+    dim: usize,
     entries_to_remove: &[Arc<SuperfileEntry>],
     prepared: &[PreparedSuperfile],
-) -> Result<SpfreshRoutingIndex, BuildError> {
+) -> Result<(SpfreshRoutingIndex, ResidentCentroids), BuildError> {
     let removed: HashSet<String> = entries_to_remove
         .iter()
         .map(|entry| entry.uri.0.to_string())
         .collect();
-    let centroid_blob_uri = existing
-        .as_ref()
-        .and_then(|routing| routing.centroid_blob_uri.clone());
-    let centroid_blob_content_hash = existing
-        .as_ref()
-        .and_then(|routing| routing.centroid_blob_content_hash);
+    // Carry the prior resident centroids forward so existing leaves keep their
+    // (stable) resident indices; new runs append after them. Empty on the first
+    // drain, when there are no existing leaves to preserve.
+    let mut centroids = existing_centroids.centroids.to_vec();
     let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
     if let Some(existing) = existing
         && existing.column == column
@@ -1921,100 +1941,17 @@ pub(in crate::supertable) fn refresh_spfresh_routing(
             }
             cell.leaves
                 .retain(|leaf| !removed.contains(&leaf.superfile_uri));
-            cells[cell_id] = cell;
-        }
-    }
-
-    for prep in prepared {
-        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
-        else {
-            return Err(BuildError::Store(
-                "SPFresh hidden superfile missing vector subsection offsets".into(),
-            ));
-        };
-        // Group runs under the superfile's COARSE outer VectorCell
-        // (`partition_hint`), not the blob's internal run id. Fine-centroid runs
-        // carry a fine cluster id inside the blob, but outer routing and the
-        // per-cell tree are keyed by the coarse cell that owns the superfile.
-        let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
-        let bytes = prepared_superfile_bytes(prep)?;
-        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
-        let spfresh = reader.spfresh_vec().ok_or_else(|| {
-            BuildError::Store("hidden superfile missing SPFresh vector blob".into())
-        })?;
-        let cid = coarse_cell as usize;
-        while cid >= cells.len() {
-            cells.push(empty_cell_tree(cells.len() as u32));
-        }
-        for (run_id, run) in spfresh.runs().iter().enumerate() {
-            let range = spfresh
-                .run_range(run_id)
-                .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
-            cells[cid].leaves.push(RunRef {
-                superfile_uri: prep.entry.uri.0.to_string(),
-                cell_id: coarse_cell,
-                cluster_id: run.cluster_id,
-                run_id: run_id as u32,
-                byte_range: (vec_offset + range.start as u64, range.len() as u64),
-                row_count: run.row_count,
-            });
-        }
-    }
-
-    Ok(SpfreshRoutingIndex {
-        column: column.into(),
-        centroid_blob_uri,
-        centroid_blob_content_hash,
-        cells,
-    })
-}
-
-fn extend_hidden_spfresh_routing(
-    existing: Option<SpfreshRoutingIndex>,
-    existing_centroids: &ResidentCentroids,
-    column: &str,
-    n_cells: u32,
-    dim: usize,
-    prepared: &[PreparedSuperfile],
-) -> Result<(SpfreshRoutingIndex, ResidentCentroids), BuildError> {
-    let mut centroids = if existing_centroids.dim == dim {
-        existing_centroids.centroids.to_vec()
-    } else {
-        Vec::new()
-    };
-    let can_preserve_existing_ids = !centroids.is_empty();
-    let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
-    if let Some(existing) = existing
-        && existing.column == column
-    {
-        for mut cell in existing.cells {
-            let cell_id = cell.cell_id as usize;
-            while cell_id >= cells.len() {
-                cells.push(empty_cell_tree(cells.len() as u32));
-            }
-            if !can_preserve_existing_ids {
-                for leaf in &mut cell.leaves {
-                    leaf.cluster_id = LEGACY_SPFRESH_CLUSTER_ID;
-                }
-            }
             cell.nodes.clear();
             cells[cell_id] = cell;
         }
     }
 
     for prep in prepared {
-        let Some((vec_offset, _)) = prep.entry.subsection_offsets.as_ref().and_then(|o| o.vec)
-        else {
-            return Err(BuildError::Store(
-                "SPFresh hidden superfile missing vector subsection offsets".into(),
-            ));
-        };
         let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
-        let bytes = prepared_superfile_bytes(prep)?;
-        let reader = SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?;
-        let spfresh = reader.spfresh_vec().ok_or_else(|| {
-            BuildError::Store("hidden superfile missing SPFresh vector blob".into())
-        })?;
+        let (vec_offset, reader) = open_prepared_spfresh(prep)?;
+        let spfresh = reader
+            .spfresh_vec()
+            .expect("open_prepared_spfresh guarantees a SPFresh blob");
         let rows = spfresh
             .materialized_rows()
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -2037,7 +1974,7 @@ fn extend_hidden_spfresh_routing(
                 cell_id: coarse_cell,
                 cluster_id: centroid_id,
                 run_id: run_id as u32,
-                byte_range: (vec_offset + range.start as u64, range.len() as u64),
+                byte_range: spfresh_run_byte_range(vec_offset, range.start, range.len()),
                 row_count: run.row_count,
             });
         }
@@ -2877,12 +2814,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let spfresh_routing = if hidden_vector_layout == VectorLayout::Spfresh {
             let resident = hidden_inner.resident_spfresh_centroids.load_full();
+            let no_removals: [Arc<SuperfileEntry>; 0] = [];
             Some(extend_hidden_spfresh_routing(
                 hidden_inner.manifest.load_full().get_spfresh_routing(),
                 &resident,
                 &column,
                 running_clusters.n_cent,
                 running_clusters.dim as usize,
+                &no_removals,
                 &prepared,
             )?)
         } else {
@@ -4648,10 +4587,12 @@ mod tests {
                 .push(empty_cell_tree(existing.cells.len() as u32));
         }
 
-        let routing = refresh_spfresh_routing(
+        let (routing, resident) = extend_hidden_spfresh_routing(
             Some(existing),
+            &ResidentCentroids::default(),
             "emb",
             GLOBAL_VECTOR_CELL_COUNT as u32,
+            DIM,
             &[old_entry],
             &[prep],
         )
@@ -4667,6 +4608,9 @@ mod tests {
         assert_eq!(cell.leaves[0].run_id, 0);
         assert_eq!(cell.leaves[0].row_count, ROWS as u32);
         assert!(cell.leaves[0].byte_range.1 > 0);
+        // The appended leaf's cluster_id indexes the resident centroid blob.
+        assert_eq!(resident.dim, DIM);
+        assert!(resident.centroid(cell.leaves[0].cluster_id).is_some());
     }
 
     #[test]

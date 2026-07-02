@@ -93,7 +93,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         fts::reader::BoolMode,
-        vector::distance::{Metric, distance},
+        vector::distance::{Metric, decode_f32_le_vec, distance},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -103,10 +103,7 @@ use crate::{
         hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
-            list::{
-                CellRoutingParams, LEGACY_SPFRESH_CLUSTER_ID, PartitionStrategy,
-                SpfreshRoutingIndex,
-            },
+            list::{CellRoutingParams, PartitionStrategy, SpfreshRoutingIndex},
         },
         tombstones::SidecarCache,
     },
@@ -179,6 +176,31 @@ fn filter_superfiles_by_cells(
         .collect()
 }
 
+/// Truncate `scored` to the inner probe budget, keeping the lowest-scoring
+/// (nearest) entries. Budget is `INFINO_INNER_BUDGET` when set, else
+/// `nprobe * n_eligible` floored at `nprobe`. Shared by the SPFresh run selector
+/// and the IVF cluster fan-out so the budget policy is defined in one place.
+fn truncate_to_inner_budget<T>(
+    scored: &mut Vec<T>,
+    nprobe: usize,
+    n_eligible: usize,
+    score_of: impl Fn(&T) -> f32,
+) {
+    let budget = std::env::var("INFINO_INNER_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|b| b.max(1))
+        .unwrap_or_else(|| nprobe.saturating_mul(n_eligible.max(1)).max(nprobe));
+    if scored.len() > budget {
+        scored.select_nth_unstable_by(budget, |a, b| {
+            score_of(a)
+                .partial_cmp(&score_of(b))
+                .unwrap_or(Ordering::Equal)
+        });
+        scored.truncate(budget);
+    }
+}
+
 fn spfresh_run_ids_by_superfile(
     routing: Option<SpfreshRoutingIndex>,
     column: &str,
@@ -194,45 +216,37 @@ fn spfresh_run_ids_by_superfile(
     if routing.column != column {
         return HashMap::new();
     }
-    let selected: HashSet<String> = superfiles
-        .iter()
-        .map(|entry| entry.uri.0.to_string())
-        .collect();
     let by_uri: HashMap<String, SuperfileUri> = superfiles
         .iter()
         .map(|entry| (entry.uri.0.to_string(), entry.uri))
         .collect();
+    // Score every routed run's fine centroid: user trees carry it inline in the
+    // `CellTreeNode`; hidden trees carry it in the resident centroid blob indexed
+    // by `RunRef.cluster_id`. There is exactly one home per tree kind.
     let mut scored: Vec<(SuperfileUri, usize, f32)> = Vec::new();
-    let mut fallback: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     for cell in routing.cells {
         for (leaf_idx, leaf) in cell.leaves.into_iter().enumerate() {
-            if !selected.contains(&leaf.superfile_uri) {
-                continue;
-            }
             let Some(uri) = by_uri.get(&leaf.superfile_uri).copied() else {
                 continue;
             };
-            let run_id = leaf.run_id as usize;
-            match cell
-                .nodes
-                .get(leaf_idx)
-                .and_then(|node| decode_manifest_centroid(&node.centroid, query.len()))
-            {
-                Some(centroid) => scored.push((uri, run_id, distance(metric, query, &centroid))),
-                None => match resident_centroids
-                    .filter(|_| leaf.cluster_id != LEGACY_SPFRESH_CLUSTER_ID)
+            let centroid = match cell.nodes.get(leaf_idx) {
+                Some(node) => decode_manifest_centroid(&node.centroid, query.len()),
+                None => resident_centroids
                     .and_then(|centroids| centroids.centroid(leaf.cluster_id))
-                {
-                    Some(centroid) => {
-                        scored.push((uri, run_id, distance(metric, query, centroid)));
-                    }
-                    None => fallback.entry(uri).or_default().push(run_id),
-                },
-            }
+                    .map(<[f32]>::to_vec),
+            };
+            let Some(centroid) = centroid else {
+                continue;
+            };
+            scored.push((
+                uri,
+                leaf.run_id as usize,
+                distance(metric, query, &centroid),
+            ));
         }
     }
 
-    let mut out = fallback;
+    let mut out: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
     if !scored.is_empty() {
         let selected_superfiles = {
             let mut uris: Vec<SuperfileUri> = scored.iter().map(|(uri, _, _)| *uri).collect();
@@ -240,21 +254,7 @@ fn spfresh_run_ids_by_superfile(
             uris.dedup();
             uris.len()
         };
-        let budget = std::env::var("INFINO_INNER_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|b| b.max(1))
-            .unwrap_or_else(|| {
-                nprobe
-                    .saturating_mul(selected_superfiles.max(1))
-                    .max(nprobe)
-            });
-        if scored.len() > budget {
-            scored.select_nth_unstable_by(budget, |a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
-            });
-            scored.truncate(budget);
-        }
+        truncate_to_inner_budget(&mut scored, nprobe, selected_superfiles, |e| e.2);
         for (uri, run_id, _) in scored {
             out.entry(uri).or_default().push(run_id);
         }
@@ -267,15 +267,7 @@ fn spfresh_run_ids_by_superfile(
 }
 
 fn decode_manifest_centroid(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
-    if bytes.len() != dim.checked_mul(F32_BYTES)? {
-        return None;
-    }
-    let mut out = Vec::with_capacity(dim);
-    for chunk in bytes.chunks_exact(F32_BYTES) {
-        let arr: [u8; F32_BYTES] = chunk.try_into().ok()?;
-        out.push(f32::from_le_bytes(arr));
-    }
-    Some(out)
+    (bytes.len() == dim.checked_mul(F32_BYTES)?).then(|| decode_f32_le_vec(bytes))
 }
 
 async fn undrained_user_superfiles(
@@ -796,23 +788,11 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // Inner fragment budget. Default = `nprobe × eligible superfiles` (couples
-        // the inner cluster count to the cell-selection nprobe). `INFINO_INNER_BUDGET`
-        // OVERRIDES it with an absolute cluster count, decoupling the inner probe
-        // from the top-level cell count — so a splice index (many fragments/cell)
-        // can probe enough fragments within the few selected cells to compare
-        // recall against the kmeans index at a fixed cell selection.
-        let budget = std::env::var("INFINO_INNER_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|b| b.max(1))
-            .unwrap_or_else(|| nprobe.saturating_mul(n_eligible.max(1)).max(nprobe));
-        if scored.len() > budget {
-            scored.select_nth_unstable_by(budget, |a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
-            });
-            scored.truncate(budget);
-        }
+        // Inner fragment budget: `nprobe × eligible superfiles`, or the
+        // `INFINO_INNER_BUDGET` override (an absolute cluster count that
+        // decouples the inner probe from the cell-selection nprobe so a
+        // many-fragments-per-cell index can be swept for recall).
+        truncate_to_inner_budget(&mut scored, nprobe, n_eligible, |e| e.2);
         let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
         for (si, c, _) in scored {
             per_seg.entry(si).or_default().push(c);
@@ -1900,64 +1880,6 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].local_doc_id, 0);
         assert!(hits[0].score <= hits[1].score);
-    }
-
-    #[test]
-    fn spfresh_routing_selects_run_ids_for_selected_superfiles() {
-        let id = Uuid::from_u128(0x1234);
-        let entry = Arc::new(SuperfileEntry {
-            birth_version: 0,
-            superfile_id: id,
-            uri: SuperfileUri(id),
-            n_docs: 8,
-            id_min: 0,
-            id_max: 7,
-            scalar_stats: std::collections::HashMap::new(),
-            fts_summary: std::collections::HashMap::new(),
-            vector_summary: std::collections::HashMap::new(),
-            partition_key: Vec::new(),
-            partition_hint: Some(2),
-            vector_layout: VectorLayout::Spfresh,
-            subsection_offsets: None,
-        });
-        let routing = SpfreshRoutingIndex {
-            column: "emb".into(),
-            centroid_blob_uri: None,
-            centroid_blob_content_hash: None,
-            cells: vec![CellTree {
-                cell_id: 2,
-                nodes: Vec::new(),
-                leaves: vec![
-                    RunRef {
-                        superfile_uri: id.to_string(),
-                        cell_id: 2,
-                        cluster_id: 0,
-                        run_id: 3,
-                        byte_range: (10, 20),
-                        row_count: 4,
-                    },
-                    RunRef {
-                        superfile_uri: id.to_string(),
-                        cell_id: 2,
-                        cluster_id: 1,
-                        run_id: 1,
-                        byte_range: (30, 20),
-                        row_count: 4,
-                    },
-                ],
-            }],
-        };
-
-        let selected = super::spfresh_run_ids_by_superfile(
-            Some(routing),
-            "emb",
-            &[entry.clone()],
-            Metric::L2Sq,
-            &[0.0],
-            1,
-            None,
-        );
-        assert_eq!(selected.get(&entry.uri), Some(&vec![1usize, 3]));
     }
 
     #[test]

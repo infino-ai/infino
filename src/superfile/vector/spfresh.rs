@@ -906,6 +906,43 @@ fn encode_run_body(
     Ok(out)
 }
 
+/// Byte offsets of the sub-regions inside one run body. A run body is laid out
+/// as `scale | offset | rows | local_ids | stable_ids | norms?`; every reader
+/// (`score_run_body`, `decode_run_body_materialized`) and the size computation
+/// (`run_body_len`) derives its offsets here so the layout is written once.
+struct RunBodyLayout {
+    offset_start: usize,
+    rows_start: usize,
+    ids_start: usize,
+    stable_ids_start: usize,
+    norms_start: usize,
+    total: usize,
+}
+
+impl RunBodyLayout {
+    fn new(dim: usize, metric: Metric, row_count: usize) -> Self {
+        let offset_start = dim * F32_BYTES;
+        let rows_start = offset_start + dim * F32_BYTES;
+        let ids_start = rows_start + row_count * dim * ROW_BYTES_PER_DIM;
+        let stable_ids_start = ids_start + row_count * U32_BYTES;
+        let norms_start = stable_ids_start + row_count * I128_BYTES;
+        let total = norms_start
+            + if stores_norms(metric) {
+                row_count * F32_BYTES
+            } else {
+                0
+            };
+        Self {
+            offset_start,
+            rows_start,
+            ids_start,
+            stable_ids_start,
+            norms_start,
+            total,
+        }
+    }
+}
+
 fn score_run_body(
     body: &[u8],
     dim: usize,
@@ -917,15 +954,11 @@ fn score_run_body(
     deny: Option<&RoaringBitmap>,
     heap: &mut BinaryHeap<WorstHit>,
 ) -> Result<(), VectorError> {
+    let layout = RunBodyLayout::new(dim, metric, row_count);
     let scale = read_f32_vec(body, 0, dim)?;
-    let offset = read_f32_vec(body, dim * F32_BYTES, dim)?;
-    let rows_start = dim * F32_BYTES * 2;
-    let rows_len = row_count * dim * ROW_BYTES_PER_DIM;
-    let ids_start = rows_start + rows_len;
-    let stable_ids_start = ids_start + row_count * U32_BYTES;
-    let norms_start = stable_ids_start + row_count * I128_BYTES;
+    let offset = read_f32_vec(body, layout.offset_start, dim)?;
     let norms = if stores_norms(metric) {
-        Some(read_f32_vec(body, norms_start, row_count)?)
+        Some(read_f32_vec(body, layout.norms_start, row_count)?)
     } else {
         None
     };
@@ -938,8 +971,8 @@ fn score_run_body(
         norms.as_deref(),
     );
     for row in 0..row_count {
-        let row_base = rows_start + row * dim * ROW_BYTES_PER_DIM;
-        let id_base = ids_start + row * U32_BYTES;
+        let row_base = layout.rows_start + row * dim * ROW_BYTES_PER_DIM;
+        let id_base = layout.ids_start + row * U32_BYTES;
         let local_id = read_u32_at(body, id_base, "local_id")?;
         if allow.is_some_and(|bitmap| !bitmap.contains(local_id))
             || deny.is_some_and(|bitmap| bitmap.contains(local_id))
@@ -971,22 +1004,18 @@ fn decode_run_body_materialized(
     row_count: usize,
     out: &mut Vec<MaterializedIvfRow>,
 ) -> Result<(), VectorError> {
+    let layout = RunBodyLayout::new(dim, metric, row_count);
     let scale: Arc<[f32]> = read_f32_vec(body, 0, dim)?.into();
-    let offset: Arc<[f32]> = read_f32_vec(body, dim * F32_BYTES, dim)?.into();
-    let rows_start = dim * F32_BYTES * 2;
-    let rows_len = row_count * dim * ROW_BYTES_PER_DIM;
-    let ids_start = rows_start + rows_len;
-    let stable_ids_start = ids_start + row_count * U32_BYTES;
-    let norms_start = stable_ids_start + row_count * I128_BYTES;
+    let offset: Arc<[f32]> = read_f32_vec(body, layout.offset_start, dim)?.into();
     let norms = if stores_norms(metric) {
-        Some(read_f32_vec(body, norms_start, row_count)?)
+        Some(read_f32_vec(body, layout.norms_start, row_count)?)
     } else {
         None
     };
     for row in 0..row_count {
-        let row_base = rows_start + row * dim * ROW_BYTES_PER_DIM;
-        let id_base = ids_start + row * U32_BYTES;
-        let stable_id_base = stable_ids_start + row * I128_BYTES;
+        let row_base = layout.rows_start + row * dim * ROW_BYTES_PER_DIM;
+        let id_base = layout.ids_start + row * U32_BYTES;
+        let stable_id_base = layout.stable_ids_start + row * I128_BYTES;
         let local_doc_id = read_u32_at(body, id_base, "local_id")?;
         let stable_id = read_i128_at(body, stable_id_base, "stable_id")?;
         let codes = body[row_base..row_base + dim].to_vec();
@@ -1010,16 +1039,7 @@ fn decode_run_body_materialized(
 }
 
 fn run_body_len(dim: usize, metric: Metric, row_count: usize) -> usize {
-    let quantizer_bytes = dim * F32_BYTES * 2;
-    let row_bytes = row_count * dim * ROW_BYTES_PER_DIM;
-    let local_id_bytes = row_count * U32_BYTES;
-    let stable_id_bytes = row_count * I128_BYTES;
-    let norm_bytes = if stores_norms(metric) {
-        row_count * F32_BYTES
-    } else {
-        0
-    };
-    quantizer_bytes + row_bytes + local_id_bytes + stable_id_bytes + norm_bytes
+    RunBodyLayout::new(dim, metric, row_count).total
 }
 
 fn read_f32_vec(body: &[u8], offset: usize, count: usize) -> Result<Vec<f32>, VectorError> {

@@ -40,7 +40,10 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        manifest::list::PartitionStrategy,
+        hidden_centroids::{
+            ResidentCentroids, encode_centroids, storage_path as centroid_storage_path,
+        },
+        manifest::{list::PartitionStrategy, part::ContentHash},
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
@@ -48,8 +51,9 @@ use crate::{
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, build_one_shard_from_materialized,
-            finalize_compaction_commit, prepare_superfile, rebuild_spfresh_shard_from_merged,
-            refresh_spfresh_routing, split_overflow_cell_after_compaction, try_commit_attempt,
+            extend_hidden_spfresh_routing, finalize_compaction_commit, prepare_superfile,
+            rebuild_spfresh_shard_from_merged, split_overflow_cell_after_compaction,
+            try_commit_attempt,
         },
     },
 };
@@ -557,6 +561,11 @@ impl Supertable {
 
             let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
 
+            // Hidden-index compaction reroutes the merged cell through the same
+            // resident-centroid routing the drain uses (one authority), so a
+            // merged cell's `RunRef.cluster_id`s index the resident centroid
+            // blob exactly like freshly-drained cells — never a within-blob id.
+            let mut resident_to_swap: Option<ResidentCentroids> = None;
             let current_for_commit = if is_hidden_vector_index_table(&inner.options)
                 && new_entries[0].vector_layout == VectorLayout::Spfresh
             {
@@ -564,14 +573,37 @@ impl Supertable {
                     PartitionStrategy::VectorCell {
                         clusters, column, ..
                     } => {
-                        let routing = refresh_spfresh_routing(
+                        let dim = inner
+                            .options
+                            .vector_columns
+                            .iter()
+                            .find(|vc| vc.column == column)
+                            .map(|vc| vc.dim)
+                            .unwrap_or(0);
+                        let existing_resident = inner.resident_spfresh_centroids.load_full();
+                        let (mut routing, resident) = extend_hidden_spfresh_routing(
                             current.get_spfresh_routing(),
+                            &existing_resident,
                             &column,
                             clusters.n_cent,
+                            dim,
                             &entries_to_remove,
                             slice::from_ref(&merged_segment),
                         )
                         .map_err(|e| CompactionError::Build(e.to_string()))?;
+                        if !resident.is_empty() {
+                            let bytes = encode_centroids(resident.dim, resident.centroids.as_ref())
+                                .map_err(|e| CompactionError::Build(e.to_string()))?;
+                            let hash = ContentHash::of(&bytes);
+                            let uri = centroid_storage_path(&hash);
+                            storage
+                                .put_atomic(&uri, Bytes::from(bytes))
+                                .await
+                                .map_err(|e| CompactionError::Build(e.to_string()))?;
+                            routing.centroid_blob_uri = Some(uri);
+                            routing.centroid_blob_content_hash = Some(hash);
+                            resident_to_swap = Some(resident);
+                        }
                         Arc::new(current.with_spfresh_routing(routing))
                     }
                     _ => current,
@@ -593,6 +625,9 @@ impl Supertable {
             {
                 Ok(new_manifest) => {
                     inner.manifest.store(Arc::new(new_manifest));
+                    if let Some(resident) = resident_to_swap {
+                        inner.resident_spfresh_centroids.store(Arc::new(resident));
+                    }
                     let pending_cache_inserts = merged_segment
                         .bytes_for_cache
                         .into_iter()

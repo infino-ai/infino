@@ -1342,6 +1342,18 @@ pub(crate) fn decode_f32_le_vec(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
+/// Encode f32 values as little-endian bytes — the inverse of
+/// [`decode_f32_le_vec`]. The single owner of fp32 → LE-byte serialization for
+/// centroid payloads (manifest cell-tree nodes, resident centroid blobs).
+#[inline]
+pub(crate) fn encode_f32_le_vec(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * F32_BYTES);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
 /// Add `row` into `acc` element-wise (`acc[d] += row[d] as f64`). Keeps
 /// f64 precision for k-means / centroid-merge accumulators while using
 /// AVX2/AVX-512 for the fp32 load + widen.

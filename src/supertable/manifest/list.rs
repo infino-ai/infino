@@ -48,10 +48,6 @@ use crate::supertable::manifest::{
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
 
-/// RunRef cluster id used for legacy SPFresh leaves whose fine centroid is not
-/// available in the resident centroid blob. Query must fallback-scan these runs.
-pub const LEGACY_SPFRESH_CLUSTER_ID: u32 = u32::MAX;
-
 /// Default nearest cells always probed by the hidden VectorCell index — the
 /// recall floor before the radius-aware threshold widens the probe set.
 const DEFAULT_CELL_NPROBE_MIN: usize = 4;
