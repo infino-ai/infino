@@ -121,13 +121,17 @@ fn two_successive_commits_both_publish() {
         "two commits ⇒ pointer at manifest_id=2"
     );
 
-    // Both manifest versions persist (immutable per id).
+    // Each manifest version persists (immutable per id): the empty manifest
+    // published by `create` (id 0) plus the two commits (ids 1 + 2).
     let manifest_dir = dir.path().join("manifest");
     let n_manifests = std::fs::read_dir(&manifest_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .count();
-    assert_eq!(n_manifests, 2, "two manifest files (manifest_id 1 + 2)");
+    assert_eq!(
+        n_manifests, 3,
+        "three manifest files (manifest_id 0 + 1 + 2)"
+    );
 
     // Manifest part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
@@ -279,11 +283,19 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     w.commit().expect("empty commit"); // no buffer → no-op
     drop(w);
 
-    // Pointer doesn't exist yet (no real commit happened).
-    let pointer = futures::executor::block_on(read_pointer(&*storage)).expect("read");
-    assert!(pointer.is_none(), "empty commit must not publish a pointer");
+    // `create` publishes the initial empty manifest, so the pointer already
+    // exists at manifest_id=0. The empty commit above is a no-op: it must
+    // neither advance the id nor republish.
+    let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
+        .expect("read")
+        .expect("create publishes the initial empty-manifest pointer");
+    assert_eq!(
+        pointer.get_manifest_id(),
+        0,
+        "empty commit must not advance the manifest_id past create's id 0"
+    );
 
-    // Now do a real commit; pointer appears at manifest_id=1.
+    // Now do a real commit; pointer advances to manifest_id=1.
     let mut w = st.writer().expect("w");
     w.append(&build_title_batch(&["only", "real"]))
         .expect("append");

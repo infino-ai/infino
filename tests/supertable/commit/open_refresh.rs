@@ -76,20 +76,21 @@ fn open_sees_writes_made_by_a_different_handle() {
 }
 
 #[test]
-fn open_on_fresh_tempdir_yields_empty_table() {
-    // No pointer exists on a fresh directory. Nothing has been
-    // committed, and uncommitted data is invisible by design, so
-    // "no pointer" is the same observable state as "empty table":
-    // open succeeds and serves an empty manifest (`manifest_id ==
-    // 0`) rather than erroring. (A *corrupt* pointer is a distinct
-    // error and still fails — see the content-hash test below.)
+fn open_on_fresh_tempdir_returns_pointer_not_found() {
+    // The open-or-create trigger: a fresh directory has no pointer, and
+    // `create` (not raw `open`) is what persists the initial one. A raw
+    // `open` on a never-created directory must surface a typed error the
+    // caller can pattern-match on for fallback to `Supertable::create`,
+    // not silently serve an empty table.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect("fresh dir opens as an empty table");
-    assert_eq!(st.manifest_id(), 0, "empty table starts at manifest_id 0");
-    assert_eq!(st.reader().n_superfiles(), 0, "no committed superfiles");
+    let err = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect_err("fresh dir has no pointer");
+    assert!(
+        matches!(err, OpenError::ManifestLoadError(_)),
+        "expected a manifest-load error on a fresh dir, got {err:?}"
+    );
 }
 
 #[test]

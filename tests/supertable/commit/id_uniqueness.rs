@@ -123,6 +123,14 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     const N_HANDLES: usize = 4;
     const ROWS_PER_HANDLE: u64 = 100;
 
+    // Create the table once up front, then have the concurrent handles below
+    // open it. `create` now materializes and publishes the initial empty
+    // manifest, so the realistic shape is one creator followed by many
+    // concurrent writers opening the same table — not several handles racing
+    // to materialize the same manifest at the same location.
+    let _ = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
     // Each handle appends a small batch and commits. The
     // commits race on the storage's manifest pointer; OCC
     // retry inside `persist_commit` serializes them in some
@@ -133,8 +141,8 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     for handle_idx in 0..N_HANDLES {
         let storage = Arc::clone(&storage);
         tasks.push(tokio::task::spawn_blocking(move || {
-            let st = Supertable::create(default_supertable_options().with_storage(storage))
-                .expect("create");
+            let st =
+                Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
             let mut w = st.writer().expect("writer");
             let titles: Vec<String> = (0..ROWS_PER_HANDLE)
                 .map(|i| format!("h{handle_idx}_doc{i}"))

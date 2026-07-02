@@ -89,10 +89,12 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
         n_commits,
         "one superfile per commit before compact"
     );
+    // One manifest per commit, plus the empty manifest `create` published
+    // (manifest_id 0) before the first append.
     assert_eq!(
         count_dir(&manifest_dir),
-        n_commits,
-        "one manifest per commit before compact"
+        n_commits + 1,
+        "one manifest per commit, plus create's empty manifest, before compact"
     );
 
     let r = st.reader();
