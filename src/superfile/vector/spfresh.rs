@@ -58,6 +58,17 @@ const RUN_BODY_LENGTH_OFF: usize = RUN_BODY_OFFSET_OFF + U64_BYTES;
 const SQ8_CODE_MAX: f32 = 255.0;
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 
+/// Environment override for the SPANN (1+eps) replication closure radius. `0.0`
+/// (the default) means hard assignment — each vector is written to its single
+/// nearest centroid, preserving pre-replication behavior. Positive values widen
+/// the closure so boundary vectors replicate into several nearby centroids.
+pub(crate) const REPLICATION_EPS_ENV: &str = "INFINO_REPLICATION_EPS";
+
+/// Upper bound on replicas per vector, mirroring SPANN's closure cap. RNG
+/// pruning normally keeps the count well below this; the cap only guards
+/// pathological dense regions where many centroids fall inside the closure.
+const REPLICA_CAP: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HiddenIndexLayout {
     /// Current nested hidden-index layout: global `VectorCell` routing with IVF
@@ -496,47 +507,114 @@ fn materialized_rows_to_runs(rows: Vec<MaterializedIvfRow>) -> Vec<RunInput> {
 fn fp32_rows_to_runs(col: &ColumnState) -> Vec<Fp32RunInput> {
     let dim = col.config.dim;
     let n_rows = col.ids.len();
+    let eps = replication_eps();
     let mut grouped: HashMap<u32, Fp32RunInput> = HashMap::new();
     for row_idx in 0..n_rows {
         let vector = &col.vectors[row_idx * dim..(row_idx + 1) * dim];
-        let cluster = col
-            .config
-            .provided_centroids
-            .as_ref()
-            .map(|centroids| nearest_centroid(col.config.metric, vector, dim, centroids))
-            .unwrap_or(0);
-        let entry = grouped.entry(cluster).or_insert_with(|| Fp32RunInput {
-            cell_id: cluster,
-            cluster_id: cluster,
-            local_ids: Vec::new(),
-            stable_ids: Vec::new(),
-            vectors: Vec::new(),
-        });
-        entry.local_ids.push(col.ids[row_idx]);
-        entry.stable_ids.push(i128::from(col.ids[row_idx]));
-        entry.vectors.extend_from_slice(vector);
+        // Shared replica assignment: `assign_replicas` returns the single
+        // nearest centroid at the default eps=0 (hard assignment) and a boundary
+        // replica set once eps>0. With no provided centroids there is one run.
+        let cells = match col.config.provided_centroids.as_ref() {
+            Some(centroids) => assign_replicas(col.config.metric, vector, dim, centroids, eps),
+            None => vec![0],
+        };
+        for cell in cells {
+            let entry = grouped.entry(cell).or_insert_with(|| Fp32RunInput {
+                cell_id: cell,
+                cluster_id: cell,
+                local_ids: Vec::new(),
+                stable_ids: Vec::new(),
+                vectors: Vec::new(),
+            });
+            entry.local_ids.push(col.ids[row_idx]);
+            entry.stable_ids.push(i128::from(col.ids[row_idx]));
+            entry.vectors.extend_from_slice(vector);
+        }
     }
     let mut runs: Vec<Fp32RunInput> = grouped.into_values().collect();
     runs.sort_by_key(|run| (run.cell_id, run.cluster_id));
     runs
 }
 
-fn nearest_centroid(metric: Metric, vector: &[f32], dim: usize, centroids: &[f32]) -> u32 {
+/// Replication closure radius, read once from [`REPLICATION_EPS_ENV`]. Default
+/// `0.0` (hard assignment) until the replication rollout raises it.
+pub(crate) fn replication_eps() -> f32 {
+    static EPS: OnceLock<f32> = OnceLock::new();
+    *EPS.get_or_init(|| {
+        env::var(REPLICATION_EPS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Replica set for one vector: SPANN-style (1+eps) closure with RNG pruning over
+/// the global fine-centroid set. Returns the fine-centroid ids the vector must
+/// be written to, nearest first. Interior points return exactly one id; boundary
+/// points return several (bounded by RNG pruning and [`REPLICA_CAP`]).
+///
+/// This is the single assignment authority shared by every path that writes
+/// vector rows (commit, drain, compaction) so a row's replica set is identical
+/// wherever it is written. Computing the closure over the *global* centroid set
+/// (not per outer cell) is deliberate: a boundary vector replicates into
+/// centroids owned by different outer `VectorCell`s, so the coarse router stays a
+/// cost-only pre-filter and recall lives entirely in this closure.
+pub(crate) fn assign_replicas(
+    metric: Metric,
+    vector: &[f32],
+    dim: usize,
+    centroids: &[f32],
+    eps: f32,
+) -> Vec<u32> {
     let n_cent = centroids.len() / dim;
-    let mut best = 0u32;
-    let mut best_score = f32::INFINITY;
-    for centroid in 0..n_cent {
-        let score = distance(
-            metric,
-            vector,
-            &centroids[centroid * dim..(centroid + 1) * dim],
-        );
-        if score < best_score {
-            best_score = score;
-            best = centroid as u32;
+    if n_cent == 0 {
+        return Vec::new();
+    }
+    let centroid = |c: usize| &centroids[c * dim..(c + 1) * dim];
+
+    let mut dists: Vec<(u32, f32)> = Vec::with_capacity(n_cent);
+    let mut nearest_id = 0u32;
+    let mut nearest_d = f32::INFINITY;
+    for c in 0..n_cent {
+        let d = distance(metric, vector, centroid(c));
+        if d < nearest_d {
+            nearest_d = d;
+            nearest_id = c as u32;
+        }
+        dists.push((c as u32, d));
+    }
+
+    // eps <= 0: hard assignment — identical to a plain nearest-centroid argmin.
+    if eps <= 0.0 {
+        return vec![nearest_id];
+    }
+
+    // (1+eps) closure. `nearest_d + eps*|nearest_d|` equals `(1+eps)*nearest_d`
+    // for the non-negative distances (L2Sq, Cosine) and widens in the correct
+    // direction for signed NegDot scores, where a bare `(1+eps)*` multiply would
+    // move the threshold the wrong way.
+    let threshold = nearest_d + eps * nearest_d.abs();
+    let mut candidates: Vec<(u32, f32)> =
+        dists.into_iter().filter(|(_, d)| *d <= threshold).collect();
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+    // RNG prune: keep a candidate only if no already-kept centroid is closer to
+    // it than the vector is. A kept centroid nearer than the vector already
+    // covers that region, so the replica would add no coverage.
+    let mut kept: Vec<u32> = Vec::new();
+    for (c, d_c) in candidates {
+        if kept.len() >= REPLICA_CAP {
+            break;
+        }
+        let dominated = kept
+            .iter()
+            .any(|&k| distance(metric, centroid(k as usize), centroid(c as usize)) < d_c);
+        if !dominated {
+            kept.push(c);
         }
     }
-    best
+    kept
 }
 
 fn encode_materialized_run(
@@ -961,7 +1039,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        HiddenIndexLayout, RunInput, SpfreshBlobReader, encode_materialized_runs,
+        HiddenIndexLayout, RunInput, SpfreshBlobReader, assign_replicas, encode_materialized_runs,
         parse_hidden_index_layout,
     };
     use crate::superfile::vector::{
@@ -969,6 +1047,67 @@ mod tests {
         distance::Metric,
         layout::VectorLayout,
     };
+
+    /// Three well-separated centroids on a line, `dim = 2`.
+    const LINE_CENTROIDS_3: [f32; 6] = [0.0, 0.0, 10.0, 0.0, 20.0, 0.0];
+    /// Two well-separated centroids on a line, `dim = 2`.
+    const LINE_CENTROIDS_2: [f32; 4] = [0.0, 0.0, 10.0, 0.0];
+
+    #[test]
+    fn assign_replicas_hard_assignment_at_eps_zero() {
+        // Default eps=0 must reproduce plain nearest-centroid (single home).
+        let v = [1.0, 0.0];
+        let out = assign_replicas(Metric::L2Sq, &v, 2, &LINE_CENTROIDS_3, 0.0);
+        assert_eq!(out, vec![0]);
+    }
+
+    #[test]
+    fn assign_replicas_interior_point_returns_single_centroid() {
+        // v is clearly closest to c0; a modest closure still selects only c0.
+        let v = [4.0, 0.0];
+        let out = assign_replicas(Metric::L2Sq, &v, 2, &LINE_CENTROIDS_3, 0.1);
+        assert_eq!(out, vec![0]);
+    }
+
+    #[test]
+    fn assign_replicas_boundary_point_replicates_across_far_centroids() {
+        // Near-equidistant between two far-apart centroids: neither covers the
+        // other, so RNG keeps both replicas.
+        let v = [5.0, 0.1];
+        let out = assign_replicas(Metric::L2Sq, &v, 2, &LINE_CENTROIDS_2, 0.1);
+        assert_eq!(out, vec![0, 1]);
+    }
+
+    #[test]
+    fn assign_replicas_eps_widens_candidate_set() {
+        // Same point, two eps values: small eps keeps only the nearest, large
+        // eps admits the far (uncovered) centroid as a boundary replica.
+        let v = [4.0, 0.0];
+        assert_eq!(
+            assign_replicas(Metric::L2Sq, &v, 2, &LINE_CENTROIDS_2, 0.1),
+            vec![0]
+        );
+        assert_eq!(
+            assign_replicas(Metric::L2Sq, &v, 2, &LINE_CENTROIDS_2, 1.5),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn assign_replicas_rng_prunes_covered_centroid() {
+        // Collinear centroids, point above the middle one. The nearer middle
+        // centroid covers both outer centroids, so RNG keeps only the middle.
+        let centroids = [0.0, 0.0, 1.0, 0.0, 2.0, 0.0];
+        let v = [1.0, 3.0];
+        let out = assign_replicas(Metric::L2Sq, &v, 2, &centroids, 0.3);
+        assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn assign_replicas_empty_centroids_is_empty() {
+        let out = assign_replicas(Metric::L2Sq, &[1.0, 2.0], 2, &[], 0.5);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn parses_layout_names() {
