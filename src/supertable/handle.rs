@@ -859,10 +859,13 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
-/// Eager-load every part of a hidden vector-index manifest entry whose part
-/// count is at or below this — the hidden index's per-cell superfiles are small
-/// and almost always touched together, so the lazy-open round-trips don't pay off.
-const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 128;
+/// Eager-load every part of a hidden vector-index manifest whose part count is
+/// at or below this. Set high enough to keep the whole cell manifest eager: the
+/// grid shards one part per cell, and lazy open resolves the routed cells' parts
+/// one at a time (serial), so cold search cost would otherwise grow with cell
+/// count. Eager instead loads all parts once at open, in parallel, and the query
+/// prunes cells in memory — reading only the routed cells' data.
+const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 1_000_000;
 
 /// Hidden vector-index compaction: target packed per-cell superfile size. Smaller
 /// than the user table's default — cell superfiles are many and individually small.
