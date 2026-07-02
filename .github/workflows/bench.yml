@@ -39,6 +39,8 @@ on:
 
 jobs:
   bench:
+    # Skip on forks (no Azure secrets); fork PRs into upstream still run.
+    if: github.repository == 'infino-ai/infino'
     strategy:
       fail-fast: false # one member failing must not cancel the other
       matrix:
