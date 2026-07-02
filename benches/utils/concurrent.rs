@@ -4,13 +4,26 @@
 //! Concurrent ingest + query contention harness.
 //!
 //! Measures sustained reader latency and throughput under two conditions:
-//! - **baseline**: N readers firing queries in a tight loop, no writer.
-//! - **contention**: same N readers + 1 writer committing continuously.
+//! - **baseline**: N readers per table firing queries in a tight loop, no writers.
+//! - **contention**: same readers + 1 writer per table committing continuously.
+//!
+//! **Multi-tenant**: all `TENANTS` tables are created up front and stay open
+//! for the whole run, so every table's reader pool, writer pool, and lazy
+//! query runtime exist simultaneously — the process-level thread inventory
+//! grows with the tenant count exactly as it does in a multi-tenant server.
+//! Both phases drive load on **all tables at once**; latencies are aggregated
+//! across tables per modality. Peak OS thread count is sampled per phase and
+//! reported alongside the latency table — the headline metric for pool /
+//! runtime consolidation work.
+//!
+//! Tables use **default pool construction** (no `with_reader_pool` /
+//! `with_writer_pool` overrides): what a production caller gets is what this
+//! harness measures.
 //!
 //! **Duration-based** (not iteration-based): each condition runs for a fixed
 //! wall-clock window (default 15 s; 3 s warmup discarded). Every query that
 //! completes during the measurement window is recorded. This guarantees
-//! sustained overlap between readers and the writer — the failure mode of
+//! sustained overlap between readers and writers — the failure mode of
 //! iteration-based benches is that readers finish in milliseconds before the
 //! writer commits even once.
 //!
@@ -18,11 +31,12 @@
 //! the `block_in_place` path — the same code path as axum/SaaS production.
 //!
 //! Knobs (env vars):
-//!   INFINO_BENCH_CONCURRENT_DOCS      corpus size (default 200_000)
-//!   INFINO_BENCH_CONCURRENT_READERS   concurrent reader tasks (default 8)
-//!   INFINO_BENCH_CONCURRENT_TENANTS   tables open simultaneously (default 1)
+//!   INFINO_BENCH_CONCURRENT_DOCS      corpus size per table (default 200_000)
+//!   INFINO_BENCH_CONCURRENT_READERS   reader tasks per modality per table (default 8)
+//!   INFINO_BENCH_CONCURRENT_TENANTS   tables open + loaded simultaneously (default 1)
 //!   INFINO_BENCH_CONCURRENT_DURATION  measurement window in seconds (default 15)
 //!   INFINO_BENCH_CONCURRENT_WARMUP    warmup seconds to discard (default 3)
+//!   INFINO_BENCH_CONCURRENT_BASELINE  set to 0 to skip the no-writer phase
 //!
 //! Invoked as `cargo bench -- concurrent`.
 
@@ -32,6 +46,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -73,6 +88,9 @@ const TOP_K: usize = 10;
 const WRITER_BATCH: usize = 1_024;
 const CORPUS_CHUNKS: usize = 8;
 const FALLBACK_SIM_WORKERS: usize = 4;
+/// OS-thread-count poll cadence. Pools and runtimes are built lazily and
+/// live for whole phases, so 200 ms comfortably catches the peak.
+const THREAD_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -112,6 +130,66 @@ fn run_baseline() -> bool {
     std::env::var("INFINO_BENCH_CONCURRENT_BASELINE")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+// ─── OS thread count ──────────────────────────────────────────────────────────
+
+/// Current OS thread count of this process. Linux reads procfs; macOS
+/// counts `ps -M` rows (one per thread, one header line). `None` when
+/// neither source is available.
+fn current_thread_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        return s
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|rest| rest.trim().parse().ok());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-M", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        let rows = String::from_utf8_lossy(&out.stdout).lines().count();
+        return (rows > 1).then(|| rows - 1);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Background sampler recording the peak OS thread count over a phase.
+/// Same shape as `rss::PeakSampler`, but for threads and cross-platform.
+struct ThreadSampler {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<usize>,
+}
+
+impl ThreadSampler {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("thread-sampler".into())
+            .spawn(move || {
+                let mut peak = current_thread_count().unwrap_or(0);
+                while !stop_t.load(Ordering::Relaxed) {
+                    if let Some(n) = current_thread_count() {
+                        peak = peak.max(n);
+                    }
+                    thread::sleep(THREAD_SAMPLE_INTERVAL);
+                }
+                peak
+            })
+            .expect("spawn thread-sampler");
+        Self { stop, handle }
+    }
+
+    fn stop(self) -> usize {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().expect("thread-sampler join")
+    }
 }
 
 // ─── Runtime ──────────────────────────────────────────────────────────────────
@@ -172,13 +250,9 @@ fn build_batch(start: usize, n: usize) -> RecordBatch {
     .expect("RecordBatch shape matches concurrent_schema")
 }
 
+// Default pool construction, deliberately: per-table pool/runtime growth is
+// part of what this harness measures.
 fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOptions {
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .expect("rayon pool"),
-    );
     SupertableOptions::new(
         concurrent_schema(),
         vec![FtsConfig {
@@ -195,7 +269,6 @@ fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOpti
         Some(default_tokenizer()),
     )
     .expect("SupertableOptions with FTS + vector")
-    .with_writer_pool(pool)
     .with_storage(storage)
 }
 
@@ -294,7 +367,8 @@ async fn writer_loop(st: Supertable, stop: Arc<AtomicBool>) -> usize {
     commits
 }
 
-// Vector reader loop: exercises the global-pool escape at vector/reader.rs:2052,2280.
+// Vector reader loop: rides the supertable fan-out, so its shortlist+rerank
+// CPU lands on each table's reader_pool.
 async fn vector_reader_loop(
     st: Supertable,
     stop: Arc<AtomicBool>,
@@ -327,11 +401,19 @@ async fn vector_reader_loop(
 struct PhaseResult {
     fts: PhaseStat,
     vec: PhaseStat,
+    /// Total commits across all tables' writers.
     commits: usize,
+    /// Peak OS thread count observed during the phase (0 if unavailable).
+    peak_threads: usize,
+    /// Per-table query counts (fts, vec) — fairness check across tenants.
+    per_table_n: Vec<(usize, usize)>,
 }
 
+// Drives load on ALL tables simultaneously: n_readers fts + n_readers vec
+// tasks per table, plus one writer per table when `with_writer`. Latencies
+// aggregate across tables; per-table counts are kept for fairness logging.
 fn run_phase(
-    st: &Supertable,
+    tables: &[Supertable],
     n_readers: usize,
     with_writer: bool,
     total: Duration,
@@ -340,28 +422,47 @@ fn run_phase(
     let rt = build_sim_runtime();
     let stop = Arc::new(AtomicBool::new(false));
     let phase_start = Instant::now();
+    let threads = ThreadSampler::start();
 
-    let writer = if with_writer {
-        let st_w = st.clone();
-        let stop_w = Arc::clone(&stop);
-        Some(rt.spawn(async move { writer_loop(st_w, stop_w).await }))
+    let writers: Vec<_> = if with_writer {
+        tables
+            .iter()
+            .map(|st| {
+                let st_w = st.clone();
+                let stop_w = Arc::clone(&stop);
+                rt.spawn(async move { writer_loop(st_w, stop_w).await })
+            })
+            .collect()
     } else {
-        None
+        Vec::new()
     };
 
-    let fts_readers: Vec<_> = (0..n_readers)
-        .map(|_| {
-            let st_r = st.clone();
-            let stop_r = Arc::clone(&stop);
-            rt.spawn(async move { reader_loop(st_r, stop_r, phase_start, warmup).await })
+    // Per-table reader task groups so per-table counts survive aggregation.
+    let fts_readers: Vec<Vec<_>> = tables
+        .iter()
+        .map(|st| {
+            (0..n_readers)
+                .map(|_| {
+                    let st_r = st.clone();
+                    let stop_r = Arc::clone(&stop);
+                    rt.spawn(async move { reader_loop(st_r, stop_r, phase_start, warmup).await })
+                })
+                .collect()
         })
         .collect();
 
-    let vec_readers: Vec<_> = (0..n_readers)
-        .map(|_| {
-            let st_r = st.clone();
-            let stop_r = Arc::clone(&stop);
-            rt.spawn(async move { vector_reader_loop(st_r, stop_r, phase_start, warmup).await })
+    let vec_readers: Vec<Vec<_>> = tables
+        .iter()
+        .map(|st| {
+            (0..n_readers)
+                .map(|_| {
+                    let st_r = st.clone();
+                    let stop_r = Arc::clone(&stop);
+                    rt.spawn(
+                        async move { vector_reader_loop(st_r, stop_r, phase_start, warmup).await },
+                    )
+                })
+                .collect()
         })
         .collect();
 
@@ -369,30 +470,54 @@ fn run_phase(
     std::thread::sleep(total);
     stop.store(true, Ordering::Relaxed);
 
-    let (fts_all, vec_all): (Vec<Duration>, Vec<Duration>) = rt.block_on(async {
-        let fts = join_all(fts_readers)
+    let (fts_by_table, vec_by_table): (Vec<Vec<Duration>>, Vec<Vec<Duration>>) =
+        rt.block_on(async {
+            let mut fts = Vec::with_capacity(fts_readers.len());
+            for group in fts_readers {
+                let lats: Vec<Duration> = join_all(group)
+                    .await
+                    .into_iter()
+                    .flat_map(|r| r.expect("fts reader task"))
+                    .collect();
+                fts.push(lats);
+            }
+            let mut vec_l = Vec::with_capacity(vec_readers.len());
+            for group in vec_readers {
+                let lats: Vec<Duration> = join_all(group)
+                    .await
+                    .into_iter()
+                    .flat_map(|r| r.expect("vec reader task"))
+                    .collect();
+                vec_l.push(lats);
+            }
+            (fts, vec_l)
+        });
+
+    let commits: usize = rt.block_on(async {
+        join_all(writers)
             .await
             .into_iter()
-            .flat_map(|r| r.expect("fts reader task"))
-            .collect();
-        let vec = join_all(vec_readers)
-            .await
-            .into_iter()
-            .flat_map(|r| r.expect("vec reader task"))
-            .collect();
-        (fts, vec)
+            .map(|r| r.expect("writer task"))
+            .sum()
     });
 
-    let commits = match writer {
-        Some(w) => rt.block_on(w).expect("writer task"),
-        None => 0,
-    };
+    let peak_threads = threads.stop();
+
+    let per_table_n: Vec<(usize, usize)> = fts_by_table
+        .iter()
+        .zip(&vec_by_table)
+        .map(|(f, v)| (f.len(), v.len()))
+        .collect();
+    let fts_all: Vec<Duration> = fts_by_table.into_iter().flatten().collect();
+    let vec_all: Vec<Duration> = vec_by_table.into_iter().flatten().collect();
 
     let measure_secs = (total - warmup).as_secs_f64();
     PhaseResult {
         fts: stat_from(fts_all, measure_secs),
         vec: stat_from(vec_all, measure_secs),
         commits,
+        peak_threads,
+        per_table_n,
     }
 }
 
@@ -408,152 +533,208 @@ pub fn run() {
     let measure_secs = (dur - warmup).as_secs_f64();
 
     eprintln!(
-        "[concurrent] {tenants} table(s), {docs} docs/{CORPUS_CHUNKS} superfiles, \
-         {readers} reader tasks, {:.0}s window ({:.0}s warmup discarded)",
+        "[concurrent] {tenants} table(s), {docs} docs/{CORPUS_CHUNKS} superfiles each, \
+         {readers} fts + {readers} vec readers per table, {:.0}s window ({:.0}s warmup discarded)",
         dur.as_secs_f64(),
         warmup.as_secs_f64(),
     );
+
+    // All tables built up front and kept alive — every table's pools and
+    // lazy runtime coexist, as in a multi-tenant server process.
+    let fixtures: Vec<Fixture> = (0..tenants)
+        .map(|t| {
+            eprintln!("[concurrent] building table {t}...");
+            build_fixture(docs)
+        })
+        .collect();
+    let tables: Vec<Supertable> = fixtures.iter().map(|f| f.st.clone()).collect();
+
+    let idle_threads = current_thread_count().unwrap_or(0);
+    eprintln!("[concurrent] {idle_threads} OS threads after build, before load");
 
     let mut report = Report::load("concurrent");
     let mut rows: Vec<Vec<Cell>> = Vec::new();
 
     let with_baseline = run_baseline();
 
-    for tenant in 0..tenants {
-        let fixture = build_fixture(docs);
+    let base = if with_baseline {
+        eprintln!("[concurrent] baseline: readers on all {tenants} table(s), no writers...");
+        Some(run_phase(&tables, readers, false, dur, warmup))
+    } else {
+        eprintln!("[concurrent] skipping baseline (INFINO_BENCH_CONCURRENT_BASELINE=0)");
+        None
+    };
 
-        let base = if with_baseline {
-            eprintln!(
-                "[concurrent] table {tenant}: baseline ({readers} fts+vec readers, no writer)..."
-            );
-            Some(run_phase(&fixture.st, readers, false, dur, warmup))
-        } else {
-            eprintln!(
-                "[concurrent] table {tenant}: skipping baseline (INFINO_BENCH_CONCURRENT_BASELINE=0)"
-            );
-            None
-        };
+    eprintln!("[concurrent] contention: readers + 1 writer per table on all {tenants} table(s)...");
+    let contend = run_phase(&tables, readers, true, dur, warmup);
+    let commits = contend.commits;
 
-        eprintln!("[concurrent] table {tenant}: contention ({readers} fts+vec readers + 1w)...");
-        let contend = run_phase(&fixture.st, readers, true, dur, warmup);
-        let commits = contend.commits;
+    for (t, (f_n, v_n)) in contend.per_table_n.iter().enumerate() {
+        eprintln!(
+            "[concurrent] contention table {t}: {:.0} fts q/s, {:.0} vec q/s",
+            *f_n as f64 / measure_secs,
+            *v_n as f64 / measure_secs,
+        );
+    }
 
-        let label = if tenants == 1 {
-            "single table".to_string()
-        } else {
-            format!("table {tenant}")
-        };
+    let label = if tenants == 1 {
+        "single table".to_string()
+    } else {
+        format!("{tenants} tables agg")
+    };
 
-        // Emit one row per modality (FTS, vector) per condition (baseline, contention).
-        #[allow(clippy::type_complexity)]
-        let modalities: &[(&str, fn(&PhaseResult) -> &PhaseStat)] =
-            &[("fts", |r| &r.fts), ("vec", |r| &r.vec)];
+    // Emit one row per modality (FTS, vector) per condition (baseline, contention).
+    #[allow(clippy::type_complexity)]
+    let modalities: &[(&str, fn(&PhaseResult) -> &PhaseStat)] =
+        &[("fts", |r| &r.fts), ("vec", |r| &r.vec)];
 
-        for (modality, stat_fn) in modalities {
-            let contend_stat = stat_fn(&contend);
+    for (modality, stat_fn) in modalities {
+        let contend_stat = stat_fn(&contend);
 
-            if let Some(ref b) = base {
-                let base_stat = stat_fn(b);
-                let base_p50 = base_stat.p50.as_nanos() as f64;
-                let base_p95 = base_stat.p95.as_nanos() as f64;
-                let base_p99 = base_stat.p99.as_nanos() as f64;
-                rows.push(vec![
-                    text(format!("{label} / {modality}")),
-                    text("baseline".to_string()),
-                    metric(base_p50, fmt_time(base_p50), Better::Lower),
-                    metric(base_p95, fmt_time(base_p95), Better::Lower),
-                    metric(base_p99, fmt_time(base_p99), Better::Lower),
-                    metric(
-                        base_stat.qps,
-                        format!("{:.0} q/s", base_stat.qps),
-                        Better::Higher,
-                    ),
-                    text(format!("{}", base_stat.n)),
-                ]);
-            }
-
-            let p99_delta_pct = base.as_ref().map(|b| {
-                let base_stat = stat_fn(b);
-                if base_stat.p99 > Duration::ZERO {
-                    100.0 * (contend_stat.p99.as_secs_f64() - base_stat.p99.as_secs_f64())
-                        / base_stat.p99.as_secs_f64()
-                } else {
-                    0.0
-                }
-            });
-            let qps_delta_pct = base.as_ref().map(|b| {
-                let base_stat = stat_fn(b);
-                if base_stat.qps > 0.0 {
-                    100.0 * (contend_stat.qps - base_stat.qps) / base_stat.qps
-                } else {
-                    0.0
-                }
-            });
-
-            let cp50 = contend_stat.p50.as_nanos() as f64;
-            let cp95 = contend_stat.p95.as_nanos() as f64;
-            let cp99 = contend_stat.p99.as_nanos() as f64;
-            let n_note = match p99_delta_pct {
-                Some(d) => format!("{} / {} commits (p99 {:+.1}%)", contend_stat.n, commits, d),
-                None => format!("{} / {} commits", contend_stat.n, commits),
-            };
-            let qps_label = match qps_delta_pct {
-                Some(d) => format!("{:.0} q/s ({:+.1}%)", contend_stat.qps, d),
-                None => format!("{:.0} q/s", contend_stat.qps),
-            };
+        if let Some(ref b) = base {
+            let base_stat = stat_fn(b);
+            let base_p50 = base_stat.p50.as_nanos() as f64;
+            let base_p95 = base_stat.p95.as_nanos() as f64;
+            let base_p99 = base_stat.p99.as_nanos() as f64;
             rows.push(vec![
                 text(format!("{label} / {modality}")),
-                text(format!("{readers}r+1w")),
-                metric(cp50, fmt_time(cp50), Better::Lower),
-                metric(cp95, fmt_time(cp95), Better::Lower),
-                metric(cp99, fmt_time(cp99), Better::Lower),
-                metric(contend_stat.qps, qps_label, Better::Higher),
-                text(n_note),
+                text("baseline".to_string()),
+                metric(base_p50, fmt_time(base_p50), Better::Lower),
+                metric(base_p95, fmt_time(base_p95), Better::Lower),
+                metric(base_p99, fmt_time(base_p99), Better::Lower),
+                metric(
+                    base_stat.qps,
+                    format!("{:.0} q/s", base_stat.qps),
+                    Better::Higher,
+                ),
+                text(format!("{}", base_stat.n)),
             ]);
-
-            eprintln!(
-                "[concurrent] table {tenant} / {modality}: baseline {:.0} q/s | contention {:.0} q/s | p99 {} | writer {:.1} commits/s",
-                base.as_ref().map(|b| stat_fn(b).qps).unwrap_or(0.0),
-                contend_stat.qps,
-                match p99_delta_pct {
-                    Some(d) => format!("{:+.1}%", d),
-                    None => "—".into(),
-                },
-                commits as f64 / measure_secs,
-            );
         }
+
+        let p99_delta_pct = base.as_ref().map(|b| {
+            let base_stat = stat_fn(b);
+            if base_stat.p99 > Duration::ZERO {
+                100.0 * (contend_stat.p99.as_secs_f64() - base_stat.p99.as_secs_f64())
+                    / base_stat.p99.as_secs_f64()
+            } else {
+                0.0
+            }
+        });
+        let qps_delta_pct = base.as_ref().map(|b| {
+            let base_stat = stat_fn(b);
+            if base_stat.qps > 0.0 {
+                100.0 * (contend_stat.qps - base_stat.qps) / base_stat.qps
+            } else {
+                0.0
+            }
+        });
+
+        let cp50 = contend_stat.p50.as_nanos() as f64;
+        let cp95 = contend_stat.p95.as_nanos() as f64;
+        let cp99 = contend_stat.p99.as_nanos() as f64;
+        let n_note = match p99_delta_pct {
+            Some(d) => format!("{} / {} commits (p99 {:+.1}%)", contend_stat.n, commits, d),
+            None => format!("{} / {} commits", contend_stat.n, commits),
+        };
+        let qps_label = match qps_delta_pct {
+            Some(d) => format!("{:.0} q/s ({:+.1}%)", contend_stat.qps, d),
+            None => format!("{:.0} q/s", contend_stat.qps),
+        };
+        rows.push(vec![
+            text(format!("{label} / {modality}")),
+            text(format!("{readers}r+1w")),
+            metric(cp50, fmt_time(cp50), Better::Lower),
+            metric(cp95, fmt_time(cp95), Better::Lower),
+            metric(cp99, fmt_time(cp99), Better::Lower),
+            metric(contend_stat.qps, qps_label, Better::Higher),
+            text(n_note),
+        ]);
+
+        eprintln!(
+            "[concurrent] {label} / {modality}: baseline {:.0} q/s | contention {:.0} q/s | p99 {} | writers {:.1} commits/s",
+            base.as_ref().map(|b| stat_fn(b).qps).unwrap_or(0.0),
+            contend_stat.qps,
+            match p99_delta_pct {
+                Some(d) => format!("{:+.1}%", d),
+                None => "—".into(),
+            },
+            commits as f64 / measure_secs,
+        );
     }
+
+    // OS thread inventory — the consolidation headline. Idle = pools built
+    // by table creation; per-phase peaks add lazy runtimes + block_in_place
+    // replacement workers.
+    let mut thread_rows: Vec<Vec<Cell>> = vec![vec![
+        text("idle after build".to_string()),
+        metric(
+            idle_threads as f64,
+            format!("{idle_threads}"),
+            Better::Lower,
+        ),
+    ]];
+    if let Some(ref b) = base {
+        thread_rows.push(vec![
+            text("baseline peak".to_string()),
+            metric(
+                b.peak_threads as f64,
+                format!("{}", b.peak_threads),
+                Better::Lower,
+            ),
+        ]);
+    }
+    thread_rows.push(vec![
+        text("contention peak".to_string()),
+        metric(
+            contend.peak_threads as f64,
+            format!("{}", contend.peak_threads),
+            Better::Lower,
+        ),
+    ]);
+    eprintln!(
+        "[concurrent] OS threads: idle {idle_threads} | baseline peak {} | contention peak {}",
+        base.as_ref().map(|b| b.peak_threads).unwrap_or(0),
+        contend.peak_threads,
+    );
 
     report.emit(&Section {
         anchor: "bench/concurrent/contention".into(),
         title: format!(
-            "Concurrent ingest+query — {tenants} table(s), {docs} docs, {readers} fts+vec readers, {:.0}s window",
+            "Concurrent ingest+query — {tenants} table(s), {docs} docs each, {readers} fts+vec readers/table, {:.0}s window",
             dur.as_secs_f64()
         ),
         note: format!(
-            "Duration-based ({:.0}s total, {:.0}s warmup discarded). \
-             Each reader group fires FTS (bm25_search) and vector (vector_search dim={VEC_DIM}) queries in tight loops; \
-             writer commits {WRITER_BATCH}-row batches continuously. \
+            "Duration-based ({:.0}s total, {:.0}s warmup discarded). All tables open and \
+             loaded simultaneously with default pool construction; latencies aggregate across tables. \
+             Each table gets {readers} FTS (bm25_search) + {readers} vector (vector_search dim={VEC_DIM}) \
+             reader tasks in tight loops; each writer commits {WRITER_BATCH}-row batches continuously. \
              Runs on multi_thread tokio runtime (bridge_sync_to_async → block_in_place). \
-             Vector queries exercise the global-pool escape at superfile/vector/reader.rs:2052,2280. \
-             QPS delta and p99 delta measure contention overhead vs baseline. \
+             QPS delta and p99 delta measure contention overhead vs baseline; the OS-thread table \
+             tracks per-table pool/runtime growth. \
              INFINO_BENCH_CONCURRENT_DOCS/READERS/TENANTS/DURATION/WARMUP to adjust. Δ vs previous run.",
             dur.as_secs_f64(),
             warmup.as_secs_f64(),
         ),
-        blocks: vec![Block {
-            subtitle: String::new(),
-            headers: vec![
-                "Table".into(),
-                "Condition".into(),
-                "p50".into(),
-                "p95".into(),
-                "p99".into(),
-                "q/s".into(),
-                "n / commits".into(),
-            ],
-            rows,
-        }],
+        blocks: vec![
+            Block {
+                subtitle: String::new(),
+                headers: vec![
+                    "Table".into(),
+                    "Condition".into(),
+                    "p50".into(),
+                    "p95".into(),
+                    "p99".into(),
+                    "q/s".into(),
+                    "n / commits".into(),
+                ],
+                rows,
+            },
+            Block {
+                subtitle: "OS threads".into(),
+                headers: vec!["Phase".into(), "peak".into()],
+                rows: thread_rows,
+            },
+        ],
     });
     report.save();
 }
