@@ -52,6 +52,7 @@ use crate::{
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, VectorReader},
+            spfresh::SpfreshBlobReader,
         },
     },
     supertable::query::provider::tombstone_access_plan,
@@ -127,6 +128,7 @@ pub struct SuperfileReader {
     n_docs: u64,
     fts: Option<FtsReader>,
     vec: Option<VectorReader>,
+    spfresh_vec: Option<SpfreshBlobReader>,
 }
 
 impl fmt::Debug for SuperfileReader {
@@ -136,6 +138,7 @@ impl fmt::Debug for SuperfileReader {
             .field("n_docs", &self.n_docs)
             .field("has_fts", &self.fts.is_some())
             .field("has_vec", &self.vec.is_some())
+            .field("has_spfresh_vec", &self.spfresh_vec.is_some())
             .field("bytes_len", &self.bytes.as_ref().map(|b| b.len()))
             .finish()
     }
@@ -274,7 +277,10 @@ impl SuperfileReader {
             if !vec_present {
                 return Ok::<_, ReadError>(None);
             }
-            if vec_layout == VectorLayout::CellPosting {
+            if matches!(
+                vec_layout,
+                VectorLayout::CellPosting | VectorLayout::Spfresh
+            ) {
                 return Ok(None);
             }
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
@@ -318,6 +324,7 @@ impl SuperfileReader {
             n_docs,
             fts,
             vec,
+            spfresh_vec: None,
         })
     }
 
@@ -393,23 +400,31 @@ impl SuperfileReader {
             None
         };
 
-        // 5. Vector path mirrors FTS (cell posting blobs are scanned separately).
+        // 5. Vector path mirrors FTS. Cell-posting blobs are scanned separately;
+        // SPFresh blobs are parsed into their own reader until P5 wires query
+        // fanout through the run directory.
         let vec_layout = vector_layout_from_kv(&kv_map);
+        let mut spfresh_vec = None;
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
-            if vec_layout == VectorLayout::CellPosting {
-                None
-            } else {
-                let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
-                let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
-                let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-                let blob = slice_or_err(&bytes, off, len, "vector")?;
-                Some(VectorReader::open_with(
-                    blob,
-                    cols_json,
-                    vector_reader::OpenOptions {
-                        verify_crc: opts.verify_crc,
-                    },
-                )?)
+            let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+            let blob = slice_or_err(&bytes, off, len, "vector")?;
+            match vec_layout {
+                VectorLayout::CellPosting => None,
+                VectorLayout::Spfresh => {
+                    spfresh_vec = Some(SpfreshBlobReader::open(blob)?);
+                    None
+                }
+                VectorLayout::Ivf => {
+                    let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
+                    Some(VectorReader::open_with(
+                        blob,
+                        cols_json,
+                        vector_reader::OpenOptions {
+                            verify_crc: opts.verify_crc,
+                        },
+                    )?)
+                }
             }
         } else if any_present(&kv_map, kv::VEC_KEYS) {
             return Err(ReadError::MalformedKv(
@@ -429,6 +444,7 @@ impl SuperfileReader {
             n_docs,
             fts,
             vec,
+            spfresh_vec,
         })
     }
 
@@ -479,6 +495,10 @@ impl SuperfileReader {
     /// Underlying vector reader. `None` if this superfile has no vector index.
     pub fn vec(&self) -> Option<&VectorReader> {
         self.vec.as_ref()
+    }
+
+    pub(crate) fn spfresh_vec(&self) -> Option<&SpfreshBlobReader> {
+        self.spfresh_vec.as_ref()
     }
 
     /// Pass-through to the raw Parquet bytes — the superfile is a

@@ -1225,6 +1225,29 @@ mod tests {
     }
 
     #[test]
+    fn vector_layout_spfresh_roundtrip_through_part() {
+        let id = Uuid::new_v4();
+        let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        });
+        let part = fresh_part(vec![seg]);
+        let decoded = decode(&encode(&part, 3)).expect("decode");
+        assert_eq!(decoded.superfiles[0].vector_layout, VectorLayout::Spfresh);
+    }
+
+    #[test]
     fn subsection_offsets_absent_subsections_roundtrip() {
         // vec / fts None, empty range lists, empty open_blob — hits
         // the SUBSECTION_FLAG_ABSENT branches and empty-list decode.

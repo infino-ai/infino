@@ -107,6 +107,7 @@ use crate::superfile::{
         layout::VectorLayout,
         reader::{ColumnReader, VectorReader},
         rerank_codec::RerankCodec,
+        spfresh::SpfreshBlobBuilder,
     },
 };
 
@@ -411,6 +412,7 @@ pub struct SuperfileBuilder {
     /// `None` if `opts.vector_columns` is empty.
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
+    spfresh_builder: Option<SpfreshBlobBuilder>,
     /// Running local doc-id counter, increments with every row in
     /// every `add_batch`.
     next_local_doc_id: u32,
@@ -500,20 +502,33 @@ impl SuperfileBuilder {
             Some(fb)
         };
 
-        let (vec_builder, cell_posting_builder) = if opts.vector_columns.is_empty() {
-            (None, None)
-        } else if opts.vector_layout == VectorLayout::CellPosting {
-            let mut cb = CellPostingBuilder::new();
-            for vc in &opts.vector_columns {
-                cb.register_column(vc.clone())?;
-            }
-            (None, Some(cb))
+        let (vec_builder, cell_posting_builder, spfresh_builder) = if opts.vector_columns.is_empty()
+        {
+            (None, None, None)
         } else {
-            let mut vb = VectorBuilder::new();
-            for vc in &opts.vector_columns {
-                vb.register_column(vc.clone())?;
+            match opts.vector_layout {
+                VectorLayout::Ivf => {
+                    let mut vb = VectorBuilder::new();
+                    for vc in &opts.vector_columns {
+                        vb.register_column(vc.clone())?;
+                    }
+                    (Some(vb), None, None)
+                }
+                VectorLayout::CellPosting => {
+                    let mut cb = CellPostingBuilder::new();
+                    for vc in &opts.vector_columns {
+                        cb.register_column(vc.clone())?;
+                    }
+                    (None, Some(cb), None)
+                }
+                VectorLayout::Spfresh => {
+                    let mut sb = SpfreshBlobBuilder::new();
+                    for vc in &opts.vector_columns {
+                        sb.register_column(vc.clone())?;
+                    }
+                    (None, None, Some(sb))
+                }
             }
-            (Some(vb), None)
         };
 
         Ok(Self {
@@ -523,6 +538,7 @@ impl SuperfileBuilder {
             fts_builder,
             vec_builder,
             cell_posting_builder,
+            spfresh_builder,
             next_local_doc_id: 0,
         })
     }
@@ -608,6 +624,14 @@ impl SuperfileBuilder {
                     cb.add(i as u32, &vectors[i][start..start + dim])?;
                 }
             }
+        } else if let Some(sb) = self.spfresh_builder.as_mut() {
+            for (i, vc) in self.opts.vector_columns.iter().enumerate() {
+                let dim = vc.dim;
+                for row in 0..(n_rows as usize) {
+                    let start = row * dim;
+                    sb.add(i as u32, &vectors[i][start..start + dim])?;
+                }
+            }
         }
 
         self.next_local_doc_id += n_rows;
@@ -631,12 +655,15 @@ impl SuperfileBuilder {
         &mut self,
         rows: Vec<MaterializedIvfRow>,
     ) -> Result<(), BuildError> {
-        let vb = self
-            .vec_builder
-            .as_mut()
-            .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
-        vb.load_materialized_rows(0, rows)?;
-        Ok(())
+        if let Some(vb) = self.vec_builder.as_mut() {
+            vb.load_materialized_rows(0, rows)?;
+            return Ok(());
+        }
+        if let Some(sb) = self.spfresh_builder.as_mut() {
+            sb.load_materialized_rows(0, rows)?;
+            return Ok(());
+        }
+        Err(BuildError::VectorSchemaMismatch("no vector builder".into()))
     }
 
     /// Inject a byte-spliced IVF subsection for compaction merge.
@@ -830,6 +857,7 @@ impl SuperfileBuilder {
         let fts_builder = self.fts_builder.take();
         let vec_builder = self.vec_builder.take();
         let cell_posting_builder = self.cell_posting_builder.take();
+        let spfresh_builder = self.spfresh_builder.take();
 
         // Assemble inf.* KV metadata (cheap; do it before the parallel
         // section so the splice has it ready).
@@ -885,14 +913,24 @@ impl SuperfileBuilder {
                 &id_page_limit,
             )
         };
-        let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
-            let (fts_blob, vec_blob) =
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
+        let vector_index_present = vec_builder.is_some() || spfresh_builder.is_some();
+        let (body, fts_blob, vec_blob) = if vector_index_present {
+            let (fts_blob, vec_blob) = finish_index_blobs(
+                fts_builder,
+                vec_builder,
+                cell_posting_builder,
+                spfresh_builder,
+            )?;
             let body = encode_body()?;
             (body, fts_blob, vec_blob)
         } else {
             let (body_res, blobs_res) = rayon::join(encode_body, || {
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)
+                finish_index_blobs(
+                    fts_builder,
+                    vec_builder,
+                    cell_posting_builder,
+                    spfresh_builder,
+                )
             });
             let body = body_res?;
             let (fts_blob, vec_blob) = blobs_res?;
@@ -912,19 +950,27 @@ fn finish_index_blobs(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
+    spfresh_builder: Option<SpfreshBlobBuilder>,
 ) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
-    match (fts_builder, vec_builder, cell_posting_builder) {
-        (Some(fb), Some(vb), None) => {
+    match (
+        fts_builder,
+        vec_builder,
+        cell_posting_builder,
+        spfresh_builder,
+    ) {
+        (Some(fb), Some(vb), None, None) => {
             let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
             Ok((fts?, vec?))
         }
-        (Some(fb), None, Some(cb)) => Ok((fb.finish()?, cb.finish()?)),
-        (Some(fb), None, None) => Ok((fb.finish()?, Vec::new())),
-        (None, Some(vb), None) => Ok((Vec::new(), vb.finish()?)),
-        (None, None, Some(cb)) => Ok((Vec::new(), cb.finish()?)),
-        (None, None, None) => Ok((Vec::new(), Vec::new())),
+        (Some(fb), None, Some(cb), None) => Ok((fb.finish()?, cb.finish()?)),
+        (Some(fb), None, None, Some(sb)) => Ok((fb.finish()?, sb.finish()?)),
+        (Some(fb), None, None, None) => Ok((fb.finish()?, Vec::new())),
+        (None, Some(vb), None, None) => Ok((Vec::new(), vb.finish()?)),
+        (None, None, Some(cb), None) => Ok((Vec::new(), cb.finish()?)),
+        (None, None, None, Some(sb)) => Ok((Vec::new(), sb.finish()?)),
+        (None, None, None, None) => Ok((Vec::new(), Vec::new())),
         _ => Err(BuildError::VectorSchemaMismatch(
-            "mixed ivf and cell_posting builders".into(),
+            "mixed vector blob builders".into(),
         )),
     }
 }
@@ -1364,6 +1410,35 @@ mod tests {
         assert!(kv.contains_key("inf.vec.length"));
         assert!(kv.contains_key("inf.vec.columns"));
         assert!(!kv.contains_key("inf.fts.offset"));
+    }
+
+    #[test]
+    fn finish_with_spfresh_vector_layout_emits_layout_and_opens() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+            None,
+        )
+        .with_vector_layout(VectorLayout::Spfresh);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut vectors: Vec<f32> = vec![0.0; 32];
+        vectors[0] = 1.0;
+        vectors[16 + 1] = 1.0;
+        b.add_batch(&batch, &[vectors.as_slice()])
+            .expect("add_batch");
+        let bytes = b.finish().expect("finish builder");
+        let kv = read_kv_metadata(&bytes).expect("read kv metadata");
+        assert_eq!(
+            kv.get("inf.vec.layout").map(String::as_str),
+            Some(VectorLayout::KV_VALUE_SPFRESH)
+        );
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        assert!(reader.vec().is_none());
+        assert!(reader.spfresh_vec().is_some());
     }
 
     #[test]

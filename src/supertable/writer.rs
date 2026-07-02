@@ -1462,16 +1462,12 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     // Derive the layout from the `kvs` already parsed above rather than
     // re-reading the footer via `read_vector_layout_from_bytes`.
     let layout = vector_layout_from_kv(&kvs);
-    if layout == VectorLayout::CellPosting {
-        // Cell-posting hidden superfiles are read in bulk (a full-cell scan of
-        // the contiguous vec blob) and served resident from the disk cache.
-        // Staging their bytes into the manifest `open_blob` would replicate the
-        // entire vector index into the manifest — its size would grow with the
-        // whole dataset (memory + cold-load GET cost), since the open overlay
-        // captures each superfile's vec blob *and* parquet tail. Skip the
-        // inline overlay entirely; the vec subsection is fetched on demand
-        // (and cached) via `fetch_cell_posting_blob`. Offsets are still carried
-        // so that fetch knows where to read.
+    if matches!(layout, VectorLayout::CellPosting | VectorLayout::Spfresh) {
+        // Cell-posting and SPFresh hidden superfiles read the vector blob data
+        // by explicit ranges rather than through VectorReader's IVF open path.
+        // Staging those bytes into the manifest `open_blob` would replicate the
+        // whole vector index into manifest parts. Keep offsets for on-demand
+        // fetches, but leave the open overlay empty.
         return Some(SubsectionOffsets {
             total_size,
             vec,
