@@ -99,8 +99,13 @@ fn default_strategy_is_ingestion_time_with_one_day_granularity() {
         list_entries[0].n_superfiles, 3,
         "after 3 single-superfile commits the part should hold 3 superfiles"
     );
-    // partition_key is the 8-byte LE encoding of the bucket (seconds/86400).
-    assert_eq!(list_entries[0].partition_key.len(), 8);
+    // The partition lives on each superfile entry: an 8-byte LE encoding of
+    // the bucket (seconds/86400).
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 3, "3 committed superfiles");
+    for sf in superfiles {
+        assert_eq!(sf.partition_key.len(), 8);
+    }
 }
 
 #[test]
@@ -166,10 +171,18 @@ fn target_superfiles_per_partition_triggers_part_split() {
          got {} entries",
         list_entries.len()
     );
-    assert_eq!(
-        list_entries[0].partition_key, list_entries[1].partition_key,
-        "both entries should share the same partition_key (same partition, split into 2 parts)"
-    );
+    // The partition lives on each superfile entry. All superfiles were routed
+    // to the same partition (same day), so they share one partition_key even
+    // though the part was split into two entries.
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 3, "3 committed superfiles across 2 parts");
+    let first_key = &superfiles[0].partition_key;
+    for sf in superfiles {
+        assert_eq!(
+            &sf.partition_key, first_key,
+            "all superfiles should share the same partition_key (same partition, split into 2 parts)"
+        );
+    }
     let total_superfiles: u64 = list_entries.iter().map(|p| p.n_superfiles).sum();
     assert_eq!(total_superfiles, 3);
 }
@@ -301,10 +314,13 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
         1,
         "single-bucket commit produces one part"
     );
-    // TimeRange partition_key is 8 bytes LE bucket index.
-    assert_eq!(list_entries[0].partition_key.len(), PARTITION_KEY_BYTES);
+    // TimeRange partition_key lives on the superfile entry: 8 bytes LE bucket
+    // index.
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 1, "single-bucket commit → one superfile");
+    assert_eq!(superfiles[0].partition_key.len(), PARTITION_KEY_BYTES);
     let bucket = u64::from_le_bytes(
-        list_entries[0]
+        superfiles[0]
             .partition_key
             .as_slice()
             .try_into()

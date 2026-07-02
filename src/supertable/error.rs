@@ -191,6 +191,13 @@ pub enum ManifestError {
     /// possible value hashes to bucket 0.
     #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
+    /// A superfile entry reached `update()` already carrying a
+    /// `partition_key`. Entries must arrive unstamped: the key is
+    /// derived from the strategy at commit time. A non-empty key means
+    /// an earlier stage already stamped it, and committing would
+    /// silently overwrite that assignment.
+    #[error("superfile entry already partitioned: {detail}")]
+    EntryAlreadyPartitioned { detail: String },
     /// Manifest load error
     #[error("manifest load error: {0}")]
     ManifestLoadError(#[from] ManifestLoadError),

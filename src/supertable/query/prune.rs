@@ -317,7 +317,6 @@ mod tests {
             size_bytes_compressed: 1,
             size_bytes_uncompressed: 1,
             content_hash: ContentHash([seed; 32]),
-            partition_key: Vec::new(),
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,

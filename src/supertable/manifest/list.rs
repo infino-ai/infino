@@ -139,11 +139,6 @@ pub struct ManifestPartEntry {
     pub size_bytes_compressed: u64,
     pub size_bytes_uncompressed: u64,
     pub content_hash: ContentHash,
-    /// The partition's encoded key (8-byte LE u64 for
-    /// `TimeRange`, etc.). Filled by the writer from
-    /// `PartitionStrategy::assign`; empty when no real
-    /// partition strategy is configured (single-bucket Hash).
-    pub partition_key: Vec<u8>,
     /// Aggregate id range across this part's superfiles. `i128`
     /// matches the supertable-injected `_id` column type
     /// (`Decimal128(38, 0)`); signed-int comparison gives
@@ -796,8 +791,7 @@ struct ManifestPartEntryDto {
     n_superfiles: u64,
     size_bytes_compressed: u64,
     size_bytes_uncompressed: u64,
-    content_hash: String,  // "blake3:<hex>"
-    partition_key: String, // base64
+    content_hash: String, // "blake3:<hex>"
     // i128 stringified as decimal — JSON numbers are bounded
     // to f64 precision (~53 bits) so we can't round-trip a
     // 128-bit value as a JSON number without loss. Decimal
@@ -922,7 +916,6 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         size_bytes_compressed: e.size_bytes_compressed,
         size_bytes_uncompressed: e.size_bytes_uncompressed,
         content_hash: encode_hash(&e.content_hash),
-        partition_key: encode_b64(&e.partition_key),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg,
         fts_summary_agg: e
@@ -967,7 +960,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
     let part_id =
         PartId(Uuid::parse_str(&d.part_id).map_err(|e| ListParseError::BadPartId(e.to_string()))?);
     let content_hash = decode_hash(&d.content_hash)?;
-    let partition_key = decode_b64(&d.partition_key, "partition_key")?;
     let mut scalar_stats_agg = HashMap::new();
     for (k, v) in d.scalar_stats_agg {
         let min = decode_length1_array(&decode_b64(&v.min, "scalar_stats_agg.min")?).map_err(
@@ -1057,7 +1049,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
         size_bytes_compressed: d.size_bytes_compressed,
         size_bytes_uncompressed: d.size_bytes_uncompressed,
         content_hash,
-        partition_key,
         id_range: {
             let lo =
                 d.id_range.0.parse::<i128>().map_err(|_| {
@@ -1731,7 +1722,6 @@ mod tests {
             size_bytes_compressed: 10_485_760,
             size_bytes_uncompressed: 26_214_400,
             content_hash: ContentHash([seed; 32]),
-            partition_key: vec![seed, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
@@ -1780,7 +1770,6 @@ mod tests {
             "size_bytes_uncompressed"
         );
         assert_eq!(a.content_hash, b.content_hash, "content_hash");
-        assert_eq!(a.partition_key, b.partition_key, "partition_key");
         assert_eq!(a.id_range, b.id_range, "id_range");
         assert_eq!(a.scalar_stats_agg, b.scalar_stats_agg, "scalar_stats_agg");
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");

@@ -198,7 +198,6 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         size_bytes_compressed: size_compressed,
         size_bytes_uncompressed: size_uncompressed,
         content_hash: hash,
-        partition_key: Vec::new(),
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),
