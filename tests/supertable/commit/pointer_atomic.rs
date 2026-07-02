@@ -167,6 +167,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
     ManifestList {
         drained_ranges: Default::default(),
         global_vector_index: None,
+        spfresh_routing: None,
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),

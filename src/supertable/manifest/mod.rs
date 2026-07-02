@@ -216,6 +216,8 @@ pub struct Manifest {
     /// it back via [`Manifest::get_drained_ranges`] to persist it. Hidden
     /// manifest only.
     stamped_drained_ranges: Option<list::DrainedVersionRanges>,
+    /// Stamped SPFresh routing trees before the hidden manifest list lands.
+    stamped_spfresh_routing: Option<list::SpfreshRoutingIndex>,
 }
 
 impl fmt::Debug for Manifest {
@@ -267,6 +269,7 @@ impl Manifest {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_spfresh_routing: None,
             }
         } else {
             Self {
@@ -277,6 +280,7 @@ impl Manifest {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_spfresh_routing: None,
             }
         }
     }
@@ -300,6 +304,7 @@ impl Manifest {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         }
     }
 
@@ -318,6 +323,7 @@ impl Manifest {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         }
     }
 
@@ -367,6 +373,13 @@ impl Manifest {
             .as_ref()
             .map(|l| l.drained_ranges.clone())
             .unwrap_or_default()
+    }
+
+    pub fn get_spfresh_routing(&self) -> Option<list::SpfreshRoutingIndex> {
+        if let Some(routing) = &self.stamped_spfresh_routing {
+            return Some(routing.clone());
+        }
+        self.list.as_ref().and_then(|l| l.spfresh_routing.clone())
     }
 
     pub fn get_num_parts(&self) -> usize {
@@ -570,6 +583,7 @@ impl Manifest {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         };
 
         Ok(Arc::new(new_manifest))
@@ -716,6 +730,7 @@ impl Manifest {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_spfresh_routing: self.stamped_spfresh_routing.clone(),
         }
     }
 
@@ -755,6 +770,7 @@ impl Manifest {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_spfresh_routing: self.stamped_spfresh_routing.clone(),
         }
     }
 
@@ -783,6 +799,7 @@ impl Manifest {
             stamped_partition_strategy: Some(strategy),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_spfresh_routing: self.stamped_spfresh_routing.clone(),
         }
     }
 
@@ -809,6 +826,7 @@ impl Manifest {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: Some(index),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_spfresh_routing: self.stamped_spfresh_routing.clone(),
         }
     }
 
@@ -836,6 +854,33 @@ impl Manifest {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
+            stamped_spfresh_routing: self.stamped_spfresh_routing.clone(),
+        }
+    }
+
+    pub fn with_spfresh_routing(&self, routing: list::SpfreshRoutingIndex) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.spfresh_routing = Some(routing.clone());
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.get_next_manifest_id(),
+                options: self.superfile_list.options.clone(),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_spfresh_routing: Some(routing),
         }
     }
 
@@ -1193,6 +1238,7 @@ impl Manifest {
             partition_strategy: strategy,
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
             global_vector_index: self.get_global_vector_index(),
+            spfresh_routing: self.get_spfresh_routing(),
             deleted_user_ids_uri: self
                 .list
                 .as_ref()
@@ -1255,6 +1301,7 @@ impl Manifest {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -2615,6 +2662,7 @@ mod tests {
             ManifestList {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
+                spfresh_routing: None,
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2655,6 +2703,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_spfresh_routing: None,
             }
         }
 
@@ -2850,6 +2899,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2886,10 +2936,55 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
         assert!(dbg.contains("has_list: true"), "{dbg}");
+    }
+
+    #[test]
+    fn spfresh_routing_getter_and_stamper_roundtrip() {
+        let routing = list::SpfreshRoutingIndex {
+            column: "emb".into(),
+            cells: vec![list::CellTree {
+                cell_id: 0,
+                nodes: vec![list::CellTreeNode {
+                    centroid: vec![1, 2, 3, 4],
+                    left: 0,
+                    right: 1,
+                }],
+                leaves: vec![list::RunRef {
+                    superfile_uri: "superfiles/a.parquet".into(),
+                    cell_id: 0,
+                    run_id: 2,
+                    byte_range: (64, 128),
+                    row_count: 16,
+                }],
+            }],
+        };
+
+        let stamped = Manifest::empty(opts()).with_spfresh_routing(routing.clone());
+        assert_eq!(stamped.get_spfresh_routing(), Some(routing.clone()));
+
+        let with_list = Manifest {
+            superfile_list: SuperfileList::empty(opts()),
+            list: Some(list_with_parts(0)),
+            parts: DashMap::new(),
+            loader: None,
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
+        }
+        .with_spfresh_routing(routing.clone());
+        assert_eq!(
+            with_list
+                .list
+                .as_ref()
+                .and_then(|list| list.spfresh_routing.clone()),
+            Some(routing)
+        );
     }
 
     #[test]
@@ -3006,6 +3101,7 @@ mod tests {
             list: Some(ManifestList {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
+                spfresh_routing: None,
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -3027,6 +3123,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         })
     }
 
@@ -3107,6 +3204,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3155,6 +3253,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -3260,6 +3359,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3307,6 +3407,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Commit one new superfile into partition A. Keep `new_entry`
@@ -3475,6 +3576,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3523,6 +3625,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -3576,6 +3679,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3624,6 +3728,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -3716,6 +3821,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3779,6 +3885,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Add one new entry for the partition
@@ -3851,6 +3958,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3917,6 +4025,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let new_entries = vec![
@@ -3988,6 +4097,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4054,6 +4164,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // Only touch partition A
@@ -4146,6 +4257,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4238,6 +4350,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let new_entries = vec![
@@ -4308,6 +4421,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4355,6 +4469,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4405,6 +4520,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4452,6 +4568,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let sf_new = make_superfile_entry(75, pk.clone());
@@ -4518,6 +4635,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4584,6 +4702,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4662,6 +4781,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4732,6 +4852,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -4796,6 +4917,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4843,6 +4965,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -4884,6 +5007,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4931,6 +5055,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -4993,6 +5118,7 @@ mod tests {
         let list = ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -5063,6 +5189,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -5123,6 +5250,7 @@ mod tests {
         ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -5150,6 +5278,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_spfresh_routing: None,
         }
     }
 

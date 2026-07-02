@@ -118,6 +118,10 @@ pub struct ManifestList {
     /// search on the hidden index (zero per-cell tombstone GETs).
     pub deleted_user_ids_uri: Option<String>,
     pub deleted_user_ids_content_hash: Option<ContentHash>,
+    /// Manifest-owned SPFresh routing state for the hidden vector index.
+    /// Separate from `global_vector_index`: the global grid chooses outer
+    /// cells, while these per-cell trees choose cell-local runs.
+    pub spfresh_routing: Option<SpfreshRoutingIndex>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -136,6 +140,37 @@ pub struct GlobalVectorIndex {
     /// Immutable global cell centroids, trained at first commit. Cell `c` of
     /// the hidden index corresponds to centroid `c` here.
     pub grid: super::ClusterCentroids,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpfreshRoutingIndex {
+    pub column: String,
+    /// One entry per global `VectorCell`; cells without SPFresh runs keep an
+    /// empty tree so cell ids remain positional and stable.
+    pub cells: Vec<CellTree>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellTree {
+    pub cell_id: u32,
+    pub nodes: Vec<CellTreeNode>,
+    pub leaves: Vec<RunRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellTreeNode {
+    pub centroid: Vec<u8>,
+    pub left: u32,
+    pub right: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRef {
+    pub superfile_uri: String,
+    pub cell_id: u32,
+    pub run_id: u32,
+    pub byte_range: (u64, u64),
+    pub row_count: u32,
 }
 
 /// Normalized set of drained user commit-versions, stored **only on the hidden
@@ -874,6 +909,8 @@ struct ManifestListDto {
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
     #[serde(default)]
+    spfresh_routing: Option<SpfreshRoutingIndexDto>,
+    #[serde(default)]
     drained_ranges: Vec<(u64, u64)>,
     parts: Vec<ManifestPartEntryDto>,
 }
@@ -882,6 +919,35 @@ struct ManifestListDto {
 struct GlobalVectorIndexDto {
     column: String,
     grid_b64: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SpfreshRoutingIndexDto {
+    column: String,
+    cells: Vec<CellTreeDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CellTreeDto {
+    cell_id: u32,
+    nodes: Vec<CellTreeNodeDto>,
+    leaves: Vec<RunRefDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CellTreeNodeDto {
+    centroid_b64: String,
+    left: u32,
+    right: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunRefDto {
+    superfile_uri: String,
+    cell_id: u32,
+    run_id: u32,
+    byte_range: (u64, u64),
+    row_count: u32,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1261,6 +1327,74 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
     })
 }
 
+fn spfresh_routing_to_dto(index: &SpfreshRoutingIndex) -> SpfreshRoutingIndexDto {
+    SpfreshRoutingIndexDto {
+        column: index.column.clone(),
+        cells: index
+            .cells
+            .iter()
+            .map(|cell| CellTreeDto {
+                cell_id: cell.cell_id,
+                nodes: cell
+                    .nodes
+                    .iter()
+                    .map(|node| CellTreeNodeDto {
+                        centroid_b64: encode_b64(&node.centroid),
+                        left: node.left,
+                        right: node.right,
+                    })
+                    .collect(),
+                leaves: cell
+                    .leaves
+                    .iter()
+                    .map(|run| RunRefDto {
+                        superfile_uri: run.superfile_uri.clone(),
+                        cell_id: run.cell_id,
+                        run_id: run.run_id,
+                        byte_range: run.byte_range,
+                        row_count: run.row_count,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn spfresh_routing_from_dto(
+    dto: SpfreshRoutingIndexDto,
+) -> Result<SpfreshRoutingIndex, ListParseError> {
+    let mut cells = Vec::with_capacity(dto.cells.len());
+    for cell in dto.cells {
+        let mut nodes = Vec::with_capacity(cell.nodes.len());
+        for node in cell.nodes {
+            nodes.push(CellTreeNode {
+                centroid: decode_b64(&node.centroid_b64, "spfresh_routing.cells.nodes.centroid")?,
+                left: node.left,
+                right: node.right,
+            });
+        }
+        cells.push(CellTree {
+            cell_id: cell.cell_id,
+            nodes,
+            leaves: cell
+                .leaves
+                .into_iter()
+                .map(|run| RunRef {
+                    superfile_uri: run.superfile_uri,
+                    cell_id: run.cell_id,
+                    run_id: run.run_id,
+                    byte_range: run.byte_range,
+                    row_count: run.row_count,
+                })
+                .collect(),
+        });
+    }
+    Ok(SpfreshRoutingIndex {
+        column: dto.column,
+        cells,
+    })
+}
+
 fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
     match s {
         PartitionStrategy::TimeRange {
@@ -1368,6 +1502,7 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
                 column: g.column.clone(),
                 grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
             }),
+        spfresh_routing: l.spfresh_routing.as_ref().map(spfresh_routing_to_dto),
         drained_ranges: l.drained_ranges.intervals().to_vec(),
         deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
         deleted_user_ids_content_hash: l.deleted_user_ids_content_hash.as_ref().map(encode_hash),
@@ -1415,6 +1550,10 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
                     grid,
                 })
             })
+            .transpose()?,
+        spfresh_routing: d
+            .spfresh_routing
+            .map(spfresh_routing_from_dto)
             .transpose()?,
         drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges),
         deleted_user_ids_uri: d.deleted_user_ids_uri,
@@ -1898,6 +2037,7 @@ mod tests {
         ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2054,6 +2194,7 @@ mod tests {
         assert_eq!(a.fts_columns, b.fts_columns);
         assert_eq!(a.vector_columns, b.vector_columns);
         assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
+        assert_eq!(a.spfresh_routing, b.spfresh_routing);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
         for (a_e, b_e) in a.parts.iter().zip(b.parts.iter()) {
@@ -2154,6 +2295,41 @@ mod tests {
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         // Absent by default (back-compat: old manifests without the field).
         assert!(empty_list().global_vector_index.is_none());
+    }
+
+    #[test]
+    fn spfresh_routing_roundtrip() {
+        let mut list = empty_list();
+        list.spfresh_routing = Some(SpfreshRoutingIndex {
+            column: "emb".into(),
+            cells: vec![
+                CellTree {
+                    cell_id: 0,
+                    nodes: vec![CellTreeNode {
+                        centroid: vec![1, 2, 3],
+                        left: 0,
+                        right: 1,
+                    }],
+                    leaves: vec![RunRef {
+                        superfile_uri: "superfiles/00000000-0000-0000-0000-000000000001.parquet"
+                            .into(),
+                        cell_id: 0,
+                        run_id: 7,
+                        byte_range: (128, 4096),
+                        row_count: 64,
+                    }],
+                },
+                CellTree {
+                    cell_id: 1,
+                    nodes: Vec::new(),
+                    leaves: Vec::new(),
+                },
+            ],
+        });
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.spfresh_routing, list.spfresh_routing);
+        assert!(empty_list().spfresh_routing.is_none());
     }
 
     #[test]

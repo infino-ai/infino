@@ -344,6 +344,7 @@ mod tests {
         ManifestList {
             drained_ranges: Default::default(),
             global_vector_index: None,
+            spfresh_routing: None,
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
