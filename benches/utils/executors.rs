@@ -728,6 +728,23 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)>;
+
+        /// Time the PUBLIC `vector_search` path (routing + rerank + stable
+        /// `_id` resolution + Arrow materialization) — the surface a real
+        /// caller uses. Returns p50 nanoseconds, or `None` for readers that
+        /// only expose `topk_global` (superfile tier, cold guards). Used to
+        /// quantify the `_id`-resolution cost that the `topk_global` /
+        /// `vector_hits` latency excludes.
+        fn full_search_p50_ns(
+            &self,
+            _column: &str,
+            _query: &[f32],
+            _k: usize,
+            _nprobe: usize,
+            _rerank: usize,
+        ) -> Option<f64> {
+            None
+        }
     }
 
     impl VectorRead for SuperfileReader {
@@ -793,6 +810,35 @@ pub mod vector {
                     (offsets[seg_idx] + h.local_doc_id, h.score)
                 })
                 .collect()
+        }
+
+        fn full_search_p50_ns(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            nprobe: usize,
+            rerank: usize,
+        ) -> Option<f64> {
+            // The public `vector_search` a real caller uses: routing + rerank
+            // + stable `_id` resolution + Arrow materialization (projection =
+            // None → `_id` + score). `topk_global` stops at (superfile,
+            // local_doc_id); this measures the id-resolution cost that path
+            // excludes, so the reported warm p50 can be stated honestly.
+            let reader = self.reader();
+            let _ = reader
+                .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
+                .expect("supertable vector_search");
+            let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
+            for _ in 0..CALIBRATION_P50_ITERS {
+                let t0 = Instant::now();
+                let batches = reader
+                    .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
+                    .expect("supertable vector_search");
+                samples.push(t0.elapsed());
+                black_box(batches);
+            }
+            Some(p50(&mut samples).as_secs_f64() * NS_PER_SEC)
         }
     }
 
@@ -1354,6 +1400,24 @@ pub mod vector {
                 )
             }),
         });
+
+        // Quantify the `_id`-resolution cost the `topk_global` (`vector_hits`)
+        // p50 excludes: time the public `vector_search` path once at the
+        // default config and log the delta vs the just-measured `vector_hits`
+        // warm p50. `None` for tiers that only expose `topk_global`.
+        if include_warm
+            && let (Some(full_p50), Some(hits_p50)) = (
+                warm_reader.full_search_p50_ns(column, q0, k, default_nprobe, default_rerank),
+                rows.last().and_then(|r| r.warm.as_ref()).map(|w| w.p50_ns),
+            )
+        {
+            eprintln!(
+                "[{log_prefix}] public vector_search (_id-resolved) p50 = {} vs vector_hits p50 = {} (id-resolve delta = {})",
+                fmt_time(full_p50),
+                fmt_time(hits_p50),
+                fmt_time((full_p50 - hits_p50).max(0.0)),
+            );
+        }
 
         emit_recall_table(
             report,
