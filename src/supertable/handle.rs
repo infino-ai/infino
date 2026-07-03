@@ -862,14 +862,14 @@ impl Supertable {
 /// Default number of global vector-index cells for routed search.
 pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 
-/// Reserved VectorCell partition id for the hidden index's "incoming" append
-/// region. Each hidden commit writes one IVF superfile under this sentinel
-/// partition holding that whole batch (all cells mixed, unsorted). Queries
-/// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles; background SPFresh maintenance later routes incoming into the
-/// per-cell IVF superfiles and deletes it. `u32::MAX` is out of the
-/// valid cell range `0..n_cent`, so it never collides with a real cell.
-pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
+/// Reserved VectorCell partition id for hidden superfiles that pack many
+/// coarse cells' fine-centroid runs into one object (the drain's delta output
+/// and fragment-fold compaction output). Such a file belongs to no single
+/// cell, so it cannot carry a per-cell hint; routing reaches its runs through
+/// `ClusterRef` fragments, and cell-routed candidate selection must always
+/// include this partition. `u32::MAX` is out of the valid cell range
+/// `0..n_cent`, so it never collides with a real cell.
+pub(crate) const PACKED_VECTOR_CELLS: u32 = u32::MAX;
 
 /// Lloyd iterations when folding per-superfile cluster centroids into the
 /// global cell grid at open/create time.

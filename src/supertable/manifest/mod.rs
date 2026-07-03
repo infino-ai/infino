@@ -38,6 +38,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    iter::once,
     ops::Deref,
     sync::Arc,
 };
@@ -66,6 +67,7 @@ use crate::{
     supertable::{
         CommitError,
         error::ManifestError,
+        handle::PACKED_VECTOR_CELLS,
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
@@ -956,8 +958,11 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for cell in routed_cells {
-            let pk = encode_partition_key(&PartitionKey::VectorCell(*cell));
+        // Packed superfiles (drain delta / fold outputs) span coarse cells and
+        // live under the reserved PACKED_VECTOR_CELLS partition; any routed-cell
+        // read must include them alongside the per-cell partitions.
+        for cell in routed_cells.iter().copied().chain(once(PACKED_VECTOR_CELLS)) {
+            let pk = encode_partition_key(&PartitionKey::VectorCell(cell));
             for sf in self.superfiles_for_partition_key(&pk).await? {
                 if seen.insert(sf.superfile_id) {
                     out.push(sf);

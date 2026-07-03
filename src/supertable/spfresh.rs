@@ -7,15 +7,18 @@
 //! derived, cell-ordered acceleration layer maintained with SPFresh/LIRE-style
 //! logical updates expressed as append/MVCC physical swaps:
 //!
-//!   1. Assign incoming vectors to nearest manifest centroids with zero GETs.
-//!   2. For each touched cell only: append one delta superfile (no GETs).
-//!   3. Compaction merges multiple small IVF superfiles per cell toward one packed
-//!      base via the standard `merge_superfiles` path.
+//!   1. Drain assigns undrained user rows to the existing live fine-centroid
+//!      catalog (replicated via `assign_replicas`) with zero GETs.
+//!   2. Append delta fragments under the owning `ClusterRef`s (no retraining).
+//!   3. Compaction merges base+delta fragments toward packed bases via the
+//!      standard `merge_superfiles` path, preserving fine-centroid identity.
 //!   4. Locally refresh touched cell centroids and member radii.
 //!   5. Split overflow cells (Sq8+ε k-means, N→N+1 centroids).
-//!   6. Reassign vectors in the split neighborhood (P−1, P, P₂, P+1).
-//!   7. Redrive reassigned rows through the incoming staging region; route
-//!      them into per-cell IVF superfiles (same path as commit ingest).
+//!   6. Reassign vectors in the split neighborhood, selected geometrically by
+//!      replica-closure overlap ([`reassign_neighborhood`]) — never numeric
+//!      cell-id adjacency.
+//!   7. Rewrite the affected neighborhood's superfiles and swap routing +
+//!      resident centroids in one MVCC commit.
 //!
 //! Split/reassign stays on stored Sq8+ε bytes. Row assignment dequantizes
 //! manifest centroids and rows to fp32 before [`distance`]; rows are

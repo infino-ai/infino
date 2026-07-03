@@ -857,8 +857,9 @@ pub(crate) fn assign_replicas(
 
 /// Per-row byte cost inside a run body: Sq8 codes + residuals, the local id, the
 /// stable id, and a norm word (present for L2/Cosine; counted always so runs
-/// stay at or under the target).
-fn run_row_stride(dim: usize) -> usize {
+/// stay at or under the target). `pub(crate)` so the drain can size packed
+/// multi-cell superfiles from the same stride the run target uses.
+pub(crate) fn run_row_stride(dim: usize) -> usize {
     dim * ROW_BYTES_PER_DIM + U32_BYTES + I128_BYTES + F32_BYTES
 }
 

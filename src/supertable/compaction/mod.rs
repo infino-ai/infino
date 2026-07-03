@@ -9,7 +9,7 @@
 //! re-compacted.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     mem, slice,
     sync::{
         Arc,
@@ -36,9 +36,15 @@ use crate::{
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
-        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        hidden_centroids::{ResidentCentroids, store_centroids},
-        manifest::list::{PartitionStrategy, RunFragmentKind},
+        handle::{
+            PACKED_VECTOR_CELLS, hidden_vector_index_compaction_settings,
+            is_hidden_vector_index_table,
+        },
+        hidden_centroids::ResidentCentroids,
+        manifest::{
+            list::{PartitionStrategy, RunFragmentKind, SpfreshRoutingIndex},
+            partition::{PartitionKey, encode_partition_key},
+        },
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
@@ -48,7 +54,7 @@ use crate::{
             PreparedSuperfile, ShardOutput, backoff_delay, build_one_shard_from_materialized,
             compact_spfresh_shard_preserving_clusters, extend_hidden_spfresh_routing,
             finalize_compaction_commit, prepare_superfile, split_overflow_cell_after_compaction,
-            try_commit_attempt,
+            store_or_reuse_centroid_blob, try_commit_attempt,
         },
     },
 };
@@ -62,6 +68,17 @@ impl Drop for CompactionSlot<'_> {
 }
 
 const MIB: u64 = 1024 * 1024;
+
+/// LIRE fold trigger: a fine centroid (routing leaf) carrying more live
+/// fragments than this is folded — its base + delta fragments k-way merged
+/// toward one base — by a fragment-fold compaction job. Bounds per-probe
+/// range-GET fan-out (a probed centroid fetches every live fragment) at the
+/// cost of ~1/F write amplification per fold.
+const MAX_FRAGMENTS_PER_CENTROID: usize = 4;
+
+/// Cap on fragment-fold jobs planned per compaction pass (worst cells first),
+/// so one pass stays bounded regardless of fold backlog.
+const MAX_SPFRESH_FOLD_JOBS_PER_PASS: usize = 4;
 
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +168,107 @@ fn pack_partition(
         pending.push(s);
     }
     pending.emit(key, min_output_bytes, jobs);
+}
+
+/// Plan fragment-fold jobs for the hidden SPFresh index: pick the worst coarse
+/// cells by per-leaf fragment count (a leaf = one fine centroid) and emit one
+/// whole-file merge job per cell covering every superfile holding any of that
+/// cell's fragments. The preserve-clusters merge k-way folds each leaf's
+/// base+delta fragments into one run; runs of *other* cells living in a
+/// consumed packed file ride along and are re-pointed by cluster id, so no
+/// fragment is orphaned. Outputs land in the reserved [`PACKED_VECTOR_CELLS`]
+/// partition (they span cells).
+///
+/// Jobs never overlap each other or `already_planned` (an input superfile can
+/// be sealed by only one compaction), and worst cells come first, so a bounded
+/// pass folds where read amplification is highest.
+fn select_spfresh_fold_jobs(
+    routing: &SpfreshRoutingIndex,
+    superfiles: &[Arc<SuperfileEntry>],
+    stats: &[SuperfileStats],
+    already_planned: &[CompactionJob],
+) -> Vec<CompactionJob> {
+    let id_by_uri: HashMap<String, Uuid> = superfiles
+        .iter()
+        .map(|e| (e.uri.0.to_string(), e.superfile_id))
+        .collect();
+    let stats_by_id: HashMap<Uuid, &SuperfileStats> =
+        stats.iter().map(|s| (s.superfile_id, s)).collect();
+    let mut claimed: HashSet<Uuid> = already_planned
+        .iter()
+        .flat_map(|job| job.inputs.iter().copied())
+        .collect();
+
+    // Rank cells by their worst leaf's fragment count, then total fragments.
+    let mut overloaded: Vec<(u32, usize, usize)> = routing
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            let worst = cell
+                .leaves
+                .iter()
+                .map(|leaf| leaf.fragments.len())
+                .max()
+                .unwrap_or(0);
+            let total: usize = cell.leaves.iter().map(|leaf| leaf.fragments.len()).sum();
+            (worst > MAX_FRAGMENTS_PER_CENTROID).then_some((cell.cell_id, worst, total))
+        })
+        .collect();
+    overloaded.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+
+    let mut jobs = Vec::new();
+    for (cell_id, _, _) in overloaded {
+        if jobs.len() >= MAX_SPFRESH_FOLD_JOBS_PER_PASS {
+            break;
+        }
+        let Some(cell) = routing.cells.iter().find(|c| c.cell_id == cell_id) else {
+            continue;
+        };
+        let mut inputs: Vec<Uuid> = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut blocked = false;
+        for leaf in &cell.leaves {
+            for fragment in &leaf.fragments {
+                let Some(&id) = id_by_uri.get(&fragment.superfile_uri) else {
+                    // Fragment points at a superfile outside the flat view
+                    // (lazy manifest) — skip this cell rather than fold blind.
+                    blocked = true;
+                    break;
+                };
+                if !seen.insert(id) {
+                    continue;
+                }
+                let sealed = stats_by_id
+                    .get(&id)
+                    .is_some_and(|s| s.sealed_by_other);
+                if sealed || claimed.contains(&id) {
+                    blocked = true;
+                    break;
+                }
+                inputs.push(id);
+            }
+            if blocked {
+                break;
+            }
+        }
+        // One input can't fold (nothing to merge with); overlapping or sealed
+        // inputs wait for the next pass.
+        if blocked || inputs.len() < 2 {
+            continue;
+        }
+        let estimated_output_bytes = inputs
+            .iter()
+            .filter_map(|id| stats_by_id.get(id))
+            .map(|s| s.live_bytes())
+            .sum();
+        claimed.extend(inputs.iter().copied());
+        jobs.push(CompactionJob {
+            partition_key: encode_partition_key(&PartitionKey::VectorCell(PACKED_VECTOR_CELLS)),
+            inputs,
+            estimated_output_bytes,
+        });
+    }
+    jobs
 }
 
 #[derive(Default)]
@@ -276,7 +394,19 @@ impl Supertable {
             })
             .collect();
 
-        let jobs = select(&stats, cfg);
+        let mut jobs = select(&stats, cfg);
+        // Hidden SPFresh index: fold overloaded fine centroids' base+delta
+        // fragments (LIRE merge) in addition to the size-driven packing above.
+        if is_hidden_vector_index_table(&inner.options)
+            && let Some(routing) = manifest.get_spfresh_routing()
+        {
+            jobs.extend(select_spfresh_fold_jobs(
+                &routing,
+                manifest.get_all_superfiles(),
+                &stats,
+                &jobs,
+            ));
+        }
 
         for job in jobs {
             table.run_compaction_job(job).await?;
@@ -484,7 +614,17 @@ impl Supertable {
         };
 
         let partition_key = job.partition_key.clone();
-        let partition_hint = inputs.first().and_then(|e| e.partition_hint);
+        // Inputs from one cell keep that cell's hint. Mixed-cell inputs (a
+        // fragment-fold job consuming packed delta files alongside a cell's
+        // base) produce a packed multi-cell output: it belongs to no single
+        // cell, so it carries the reserved PACKED_VECTOR_CELLS hint and is
+        // never a per-cell split candidate.
+        let first_hint = inputs.first().and_then(|e| e.partition_hint);
+        let partition_hint = if inputs.iter().all(|e| e.partition_hint == first_hint) {
+            first_hint
+        } else {
+            Some(PACKED_VECTOR_CELLS)
+        };
         let merged_old = merged_segment.entry.as_ref();
         let merged_entry = Arc::new(SuperfileEntry {
             // Carry the OLDEST input's birth_version so a merge of
@@ -572,17 +712,21 @@ impl Supertable {
                             true,
                         )
                         .map_err(|e| CompactionError::Build(e.to_string()))?;
-                        if !resident.is_empty() {
-                            let uri = store_centroids(
-                                storage.as_ref(),
-                                resident.dim,
-                                resident.centroids.as_ref(),
-                            )
-                            .await
-                            .map_err(|e| CompactionError::Build(e.to_string()))?;
-                            routing.centroid_blob_uri = Some(uri);
-                            resident_to_swap = Some(resident);
-                        }
+                        // A pure physical merge keeps the centroid set intact —
+                        // reuse the existing blob (no PUT, no resident swap).
+                        let existing_uri = current
+                            .get_spfresh_routing()
+                            .and_then(|r| r.centroid_blob_uri);
+                        let (uri, to_swap) = store_or_reuse_centroid_blob(
+                            storage.as_ref(),
+                            existing_uri,
+                            &existing_resident,
+                            resident,
+                        )
+                        .await
+                        .map_err(|e| CompactionError::Build(e.to_string()))?;
+                        routing.centroid_blob_uri = uri;
+                        resident_to_swap = to_swap;
                         Arc::new(current.with_spfresh_routing(routing))
                     }
                     _ => current,
@@ -621,6 +765,7 @@ impl Supertable {
                     .await;
                     if is_hidden_vector_index_table(&inner.options)
                         && let Some(cell_id) = partition_hint
+                        && cell_id != PACKED_VECTOR_CELLS
                         && let Err(e) = split_overflow_cell_after_compaction(
                             Arc::clone(inner),
                             &new_entries[0],
@@ -669,6 +814,7 @@ mod tests {
         supertable::{
             SupertableOptions,
             error::CompactionError,
+            manifest::list::{CellTree, ClusterRef, RunFragment},
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
@@ -707,6 +853,180 @@ mod tests {
     #[test]
     fn empty_input_yields_no_jobs() {
         assert!(select(&[], &default_cfg()).is_empty());
+    }
+
+    // ---- SPFresh fragment-fold planning --------------------------------
+
+    /// Rows per synthetic fold fragment (arbitrary, nonzero).
+    const FOLD_FRAGMENT_ROWS: u32 = 8;
+
+    fn fold_entry(id: u128) -> Arc<SuperfileEntry> {
+        let uri = SuperfileUri(Uuid::from_u128(id));
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uri.0,
+            uri,
+            n_docs: FOLD_FRAGMENT_ROWS as u64,
+            id_min: 0,
+            id_max: FOLD_FRAGMENT_ROWS as i128,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: None,
+        })
+    }
+
+    fn fold_fragment(entry: &SuperfileEntry, run_id: u32, kind: RunFragmentKind) -> RunFragment {
+        RunFragment {
+            superfile_uri: entry.uri.0.to_string(),
+            run_id,
+            byte_range: (0, 64),
+            row_count: FOLD_FRAGMENT_ROWS,
+            kind,
+        }
+    }
+
+    fn fold_leaf(cell_id: u32, cluster_id: u32, fragments: Vec<RunFragment>) -> ClusterRef {
+        ClusterRef {
+            cell_id,
+            cluster_id,
+            fragments,
+        }
+    }
+
+    fn fold_stats(entries: &[Arc<SuperfileEntry>]) -> Vec<SuperfileStats> {
+        entries
+            .iter()
+            .map(|e| SuperfileStats {
+                superfile_id: e.superfile_id,
+                partition_key: e.partition_key.clone(),
+                size_bytes: mib(1),
+                n_docs: e.n_docs,
+                tombstoned_docs: 0,
+                sealed_by_other: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fold_jobs_target_overloaded_cell_files() {
+        // Cell 0's leaf carries base + 4 deltas (> MAX_FRAGMENTS_PER_CENTROID);
+        // cell 1's leaf is under the trigger. One job over exactly cell 0's
+        // fragment files, landing in the PACKED_VECTOR_CELLS partition.
+        let entries: Vec<Arc<SuperfileEntry>> = (1..=7).map(fold_entry).collect();
+        let overloaded: Vec<RunFragment> = (0..5)
+            .map(|i| {
+                let kind = if i == 0 {
+                    RunFragmentKind::Base
+                } else {
+                    RunFragmentKind::Delta
+                };
+                fold_fragment(&entries[i], i as u32, kind)
+            })
+            .collect();
+        let quiet = vec![
+            fold_fragment(&entries[5], 0, RunFragmentKind::Base),
+            fold_fragment(&entries[6], 1, RunFragmentKind::Delta),
+        ];
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: None,
+            cells: vec![
+                CellTree {
+                    cell_id: 0,
+                    nodes: Vec::new(),
+                    leaves: vec![fold_leaf(0, 0, overloaded)],
+                },
+                CellTree {
+                    cell_id: 1,
+                    nodes: Vec::new(),
+                    leaves: vec![fold_leaf(1, 1, quiet)],
+                },
+            ],
+        };
+        let stats = fold_stats(&entries);
+
+        let jobs = select_spfresh_fold_jobs(&routing, &entries, &stats, &[]);
+        assert_eq!(jobs.len(), 1, "only the overloaded cell folds");
+        let want: HashSet<Uuid> = entries[..5].iter().map(|e| e.superfile_id).collect();
+        let got: HashSet<Uuid> = jobs[0].inputs.iter().copied().collect();
+        assert_eq!(got, want, "job consumes exactly the cell's fragment files");
+        assert_eq!(
+            jobs[0].partition_key,
+            encode_partition_key(&PartitionKey::VectorCell(PACKED_VECTOR_CELLS)),
+            "fold output spans cells, so it lands in the packed partition"
+        );
+        assert_eq!(jobs[0].estimated_output_bytes, 5 * mib(1));
+    }
+
+    #[test]
+    fn fold_jobs_rank_worst_first_and_never_overlap() {
+        // Cell 1's worst leaf (6 fragments) outranks cell 0's (5). They share
+        // file 5, so after cell 1 claims it, cell 0's job is skipped this pass
+        // (an input can be sealed by only one compaction).
+        let entries: Vec<Arc<SuperfileEntry>> = (1..=10).map(fold_entry).collect();
+        let cell0: Vec<RunFragment> = (0..5)
+            .map(|i| fold_fragment(&entries[i], i as u32, RunFragmentKind::Delta))
+            .collect();
+        let cell1: Vec<RunFragment> = (4..10)
+            .map(|i| fold_fragment(&entries[i], i as u32, RunFragmentKind::Delta))
+            .collect();
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: None,
+            cells: vec![
+                CellTree {
+                    cell_id: 0,
+                    nodes: Vec::new(),
+                    leaves: vec![fold_leaf(0, 0, cell0)],
+                },
+                CellTree {
+                    cell_id: 1,
+                    nodes: Vec::new(),
+                    leaves: vec![fold_leaf(1, 1, cell1)],
+                },
+            ],
+        };
+        let stats = fold_stats(&entries);
+
+        let jobs = select_spfresh_fold_jobs(&routing, &entries, &stats, &[]);
+        assert_eq!(jobs.len(), 1, "overlapping cell waits for the next pass");
+        let want: HashSet<Uuid> = entries[4..10].iter().map(|e| e.superfile_id).collect();
+        let got: HashSet<Uuid> = jobs[0].inputs.iter().copied().collect();
+        assert_eq!(got, want, "the worst cell wins the shared file");
+    }
+
+    #[test]
+    fn fold_jobs_respect_seals_and_planned_jobs() {
+        let entries: Vec<Arc<SuperfileEntry>> = (1..=5).map(fold_entry).collect();
+        let fragments: Vec<RunFragment> = (0..5)
+            .map(|i| fold_fragment(&entries[i], i as u32, RunFragmentKind::Delta))
+            .collect();
+        let routing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: None,
+            cells: vec![CellTree {
+                cell_id: 0,
+                nodes: Vec::new(),
+                leaves: vec![fold_leaf(0, 0, fragments)],
+            }],
+        };
+        // A sealed input blocks the fold.
+        let mut stats = fold_stats(&entries);
+        stats[2].sealed_by_other = true;
+        assert!(select_spfresh_fold_jobs(&routing, &entries, &stats, &[]).is_empty());
+
+        // An input claimed by an already-planned (size-based) job blocks too.
+        let stats = fold_stats(&entries);
+        let planned = vec![CompactionJob {
+            partition_key: Vec::new(),
+            inputs: vec![entries[1].superfile_id],
+            estimated_output_bytes: 0,
+        }];
+        assert!(select_spfresh_fold_jobs(&routing, &entries, &stats, &planned).is_empty());
     }
 
     #[test]

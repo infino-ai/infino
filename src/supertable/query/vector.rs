@@ -102,7 +102,9 @@ use crate::{
     },
     supertable::{
         error::QueryError,
-        handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
+        handle::{
+            PACKED_VECTOR_CELLS, Supertable, SupertableReader, is_hidden_vector_index_table,
+        },
         hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
@@ -159,7 +161,11 @@ fn filter_superfiles_by_cells(
     if routed_cells.is_empty() {
         return superfiles.to_vec();
     }
-    let routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
+    // Packed superfiles span coarse cells (drain delta / fold outputs under the
+    // reserved PACKED_VECTOR_CELLS partition), so cell routing can never
+    // exclude them; their runs are still selected per-fragment.
+    let mut routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
+    routed_keys.insert(PACKED_VECTOR_CELLS.to_le_bytes());
     superfiles
         .iter()
         .filter(|sf| {
@@ -2043,6 +2049,43 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].local_doc_id, 0);
         assert!(hits[0].score <= hits[1].score);
+    }
+
+    #[test]
+    fn cell_filter_keeps_packed_multi_cell_superfiles() {
+        // A packed superfile (reserved PACKED_VECTOR_CELLS partition) spans
+        // coarse cells, so routed-cell filtering must never drop it; per-cell
+        // files still filter by their own hint.
+        let entry = |id: u128, hint: Option<u32>| {
+            Arc::new(SuperfileEntry {
+                birth_version: 0,
+                superfile_id: Uuid::from_u128(id),
+                uri: SuperfileUri(Uuid::from_u128(id)),
+                n_docs: 1,
+                id_min: 0,
+                id_max: 1,
+                scalar_stats: std::collections::HashMap::new(),
+                fts_summary: std::collections::HashMap::new(),
+                vector_summary: std::collections::HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: hint,
+                vector_layout: VectorLayout::Spfresh,
+                subsection_offsets: None,
+            })
+        };
+        let routed_cell = entry(1, Some(3));
+        let other_cell = entry(2, Some(7));
+        let packed = entry(3, Some(super::PACKED_VECTOR_CELLS));
+        let kept = super::filter_superfiles_by_cells(
+            &[routed_cell.clone(), other_cell, packed.clone()],
+            &[3],
+        );
+        let kept_ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+        assert_eq!(
+            kept_ids,
+            vec![routed_cell.superfile_id, packed.superfile_id],
+            "routed cell and packed file survive; the other cell is pruned"
+        );
     }
 
     #[test]

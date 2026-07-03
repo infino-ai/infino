@@ -75,7 +75,10 @@ use tokio::time::sleep;
 use super::{
     build::fanout_shards,
     error::BuildError,
-    handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
+    handle::{
+        GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, PACKED_VECTOR_CELLS, Supertable,
+        SupertableInner, hidden_vector_index_compaction_settings,
+    },
     manifest::{
         FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri,
         VectorSummary, bloom::BloomBuilder,
@@ -127,7 +130,7 @@ use crate::{
             reader::VectorReader,
             spfresh::{
                 HiddenIndexLayout, assign_fine_clusters, fine_replicas_for_row,
-                hidden_index_layout, replication_eps,
+                hidden_index_layout, replication_eps, run_row_stride,
             },
         },
     },
@@ -1972,6 +1975,14 @@ fn append_user_spfresh_routing(
 /// This is the single hidden routing authority — both drain (no removals) and
 /// compaction (merged inputs removed) go through it so hidden `cluster_id`
 /// semantics (resident-centroid index) can't drift between the two paths.
+///
+/// Hidden fine-cluster ids are **global** (resident-blob indices), so a
+/// prepared run naming an existing cluster is matched to its leaf by cluster
+/// id alone; the owning coarse cell comes from the prior routing. That is what
+/// lets one prepared superfile pack many cells' runs (the
+/// [`PACKED_VECTOR_CELLS`] partition) — only runs minting genuinely new
+/// centroids (bootstrap, split rewrite) fall back to the file's per-cell
+/// `partition_hint` for cell attribution.
 pub(in crate::supertable) fn extend_hidden_spfresh_routing(
     existing: Option<SpfreshRoutingIndex>,
     existing_centroids: &ResidentCentroids,
@@ -1991,7 +2002,13 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
     // are remapped so removed leaves do not leave dead fp32 slots resident forever.
     let mut centroids = Vec::new();
     let mut old_to_new: HashMap<u32, u32> = HashMap::new();
-    let mut leaf_pos_by_old: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
+    // Live carried leaves by OLD (pre-remap) cluster id — globally unique for
+    // hidden routing, so no cell qualifier is needed to find a run's leaf.
+    let mut leaf_pos_by_old_cluster: HashMap<u32, (usize, usize)> = HashMap::new();
+    // Every old cluster id's owning coarse cell (captured before empty leaves
+    // are dropped), so a preserve-mode reconstruction of a fully-removed leaf
+    // still lands in its original cell even from a packed multi-cell file.
+    let mut cell_of_old_cluster: HashMap<u32, u32> = HashMap::new();
     let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
     if let Some(existing) = existing
         && existing.column == column
@@ -2002,6 +2019,9 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
                 cells.push(empty_cell_tree(cells.len() as u32));
             }
             for mut leaf in cell.leaves {
+                cell_of_old_cluster
+                    .entry(leaf.cluster_id)
+                    .or_insert(cell.cell_id);
                 leaf.fragments
                     .retain(|fragment| !removed.contains(&fragment.superfile_uri));
                 if leaf.fragments.is_empty() {
@@ -2024,13 +2044,13 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
                 leaf.cluster_id = new_cluster_id;
                 let leaf_idx = cells[cell_id].leaves.len();
                 cells[cell_id].leaves.push(leaf);
-                leaf_pos_by_old.insert((cell.cell_id, old_cluster_id), (cell_id, leaf_idx));
+                leaf_pos_by_old_cluster.insert(old_cluster_id, (cell_id, leaf_idx));
             }
         }
     }
 
     for prep in prepared {
-        let coarse_cell = prep.entry.partition_hint.unwrap_or(0);
+        let hint_cell = prep.entry.partition_hint.unwrap_or(0);
         let (vec_offset, reader) = open_prepared_spfresh(prep)?;
         let spfresh = reader
             .spfresh_vec()
@@ -2038,10 +2058,6 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
         let rows = spfresh
             .materialized_rows()
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        let cid = coarse_cell as usize;
-        while cid >= cells.len() {
-            cells.push(empty_cell_tree(cells.len() as u32));
-        }
         for (run_id, run) in spfresh.runs().iter().enumerate() {
             let range = spfresh
                 .run_range(run_id)
@@ -2054,8 +2070,7 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
                 fragment_kind,
             )?;
             if (fragment_kind == RunFragmentKind::Delta || preserve_existing_centroids)
-                && let Some(&(cell_idx, leaf_idx)) =
-                    leaf_pos_by_old.get(&(coarse_cell, run.cluster_id))
+                && let Some(&(cell_idx, leaf_idx)) = leaf_pos_by_old_cluster.get(&run.cluster_id)
             {
                 cells[cell_idx].leaves[leaf_idx].fragments.push(fragment);
                 continue;
@@ -2063,6 +2078,14 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
             if preserve_existing_centroids
                 && let Some(centroid) = existing_centroids.centroid(run.cluster_id)
             {
+                let coarse_cell = cell_of_old_cluster
+                    .get(&run.cluster_id)
+                    .copied()
+                    .unwrap_or(hint_cell);
+                let cid = coarse_cell as usize;
+                while cid >= cells.len() {
+                    cells.push(empty_cell_tree(cells.len() as u32));
+                }
                 let centroid_id = if let Some(&new_id) = old_to_new.get(&run.cluster_id) {
                     new_id
                 } else {
@@ -2077,8 +2100,14 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
                 cells[cid]
                     .leaves
                     .push(spfresh_leaf(coarse_cell, centroid_id, fragment));
-                leaf_pos_by_old.insert((coarse_cell, run.cluster_id), (cid, leaf_idx));
+                leaf_pos_by_old_cluster.insert(run.cluster_id, (cid, leaf_idx));
                 continue;
+            }
+            // Genuinely new fine centroid (bootstrap / split rewrite): those
+            // paths emit per-cell files, so the hint names the owning cell.
+            let cid = hint_cell as usize;
+            while cid >= cells.len() {
+                cells.push(empty_cell_tree(cells.len() as u32));
             }
             let Some(centroid) = mean_run_centroid(&rows, run.cluster_id, dim) else {
                 continue;
@@ -2086,11 +2115,9 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
             let centroid_id = u32::try_from(centroids.len() / dim)
                 .map_err(|_| BuildError::Store("SPFresh hidden centroid id overflow".into()))?;
             centroids.extend_from_slice(&centroid);
-            let leaf_idx = cells[cid].leaves.len();
             cells[cid]
                 .leaves
-                .push(spfresh_leaf(coarse_cell, centroid_id, fragment));
-            leaf_pos_by_old.insert((coarse_cell, run.cluster_id), (cid, leaf_idx));
+                .push(spfresh_leaf(hint_cell, centroid_id, fragment));
         }
     }
 
@@ -2106,6 +2133,34 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
         },
         resident,
     ))
+}
+
+/// Store the rebuilt resident centroid blob, or reuse the current blob when
+/// the centroid set is byte-identical — the delta-only drain case (fragments
+/// appended under existing fine centroids, nothing retrained). Reuse skips the
+/// blob PUT (the manifest keeps pointing at the same uri) and skips the
+/// resident swap (the existing `Arc` stays, so caches keyed on blob identity
+/// stay warm). Returns the uri to stamp into the routing plus the resident set
+/// to swap after commit (`None` = reused, don't swap).
+pub(in crate::supertable) async fn store_or_reuse_centroid_blob(
+    storage: &dyn StorageProvider,
+    existing_uri: Option<String>,
+    existing: &ResidentCentroids,
+    rebuilt: ResidentCentroids,
+) -> Result<(Option<String>, Option<ResidentCentroids>), BuildError> {
+    if rebuilt.is_empty() {
+        return Ok((None, None));
+    }
+    if let Some(uri) = existing_uri
+        && existing.dim == rebuilt.dim
+        && existing.centroids[..] == rebuilt.centroids[..]
+    {
+        return Ok((Some(uri), None));
+    }
+    let uri = store_centroids(storage, rebuilt.dim, rebuilt.centroids.as_ref())
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    Ok((Some(uri), Some(rebuilt)))
 }
 
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
@@ -3028,14 +3083,23 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .with_drained_ranges(new_drained);
         let mut resident_to_swap: Option<ResidentCentroids> = None;
         if let Some((mut routing_index, resident)) = spfresh_routing {
-            if !resident.is_empty() {
-                let uri =
-                    store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
-                routing_index.centroid_blob_uri = Some(uri);
-                resident_to_swap = Some(resident);
-            }
+            // Delta-only drains rebuild an identical centroid set — reuse the
+            // existing blob (no PUT) and keep the resident Arc (no swap).
+            let existing_uri = hidden_inner
+                .manifest
+                .load()
+                .get_spfresh_routing()
+                .and_then(|r| r.centroid_blob_uri);
+            let existing_resident = hidden_inner.resident_spfresh_centroids.load_full();
+            let (uri, to_swap) = store_or_reuse_centroid_blob(
+                storage.as_ref(),
+                existing_uri,
+                &existing_resident,
+                resident,
+            )
+            .await?;
+            routing_index.centroid_blob_uri = uri;
+            resident_to_swap = to_swap;
             precommit_manifest = precommit_manifest.with_spfresh_routing(routing_index);
         }
         hidden_inner.manifest.store(Arc::new(precommit_manifest));
@@ -3333,7 +3397,10 @@ fn build_spfresh_delta_shards_for_existing_centroids(
     for item in catalog {
         global_centroids.extend_from_slice(&item.centroid);
     }
-    let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+    // Route every row (plus replicas) to existing fine centroids; cluster ids
+    // are the global resident-blob indices, so files need no per-cell identity.
+    let mut routed_rows: Vec<MaterializedIvfRow> = Vec::new();
+    let mut cell_added: HashMap<u32, u32> = HashMap::new();
     for row in rows {
         for replica in fine_replicas_for_row(metric, vec_dim, &global_centroids, &row, eps) {
             let Some(target) = catalog.get(replica as usize) else {
@@ -3341,37 +3408,49 @@ fn build_spfresh_delta_shards_for_existing_centroids(
             };
             let mut routed = row.clone();
             routed.cluster = target.cluster_id;
-            by_cell.entry(target.cell_id).or_default().push(routed);
+            *cell_added.entry(target.cell_id).or_insert(0) += 1;
+            routed_rows.push(routed);
         }
     }
-    let shards: Vec<(u32, ShardOutput, u32)> = by_cell
-        .into_par_iter()
-        .filter(|(_, rows)| !rows.is_empty())
-        .map(|(cell_id, mut rows)| {
-            rows.sort_by_key(|row| (row.cluster, row.stable_id));
+    if routed_rows.is_empty() {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+    // Pack many cells' delta runs into few size-bounded superfiles instead of
+    // one object per touched coarse cell: sort by (cluster, stable) so each
+    // file's runs stay contiguous, then chunk at the hidden superfile size
+    // target. Object count per drain batch tracks batch bytes, not cell count.
+    routed_rows.sort_by_key(|row| (row.cluster, row.stable_id));
+    let target_bytes = hidden_vector_index_compaction_settings()
+        .target_superfile_size_mb
+        .saturating_mul(1024 * 1024) as usize;
+    let rows_per_file = (target_bytes / run_row_stride(vec_dim)).max(1);
+    let shards: Vec<ShardOutput> = routed_rows
+        .par_chunks(rows_per_file)
+        .map(|chunk| {
+            let mut rows = chunk.to_vec();
             for (local, row) in rows.iter_mut().enumerate() {
                 row.local_doc_id = local as u32;
             }
-            let added = rows.len() as u32;
-            let shard =
-                build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Spfresh)?;
-            Ok::<_, BuildError>((cell_id, shard, added))
+            build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Spfresh)
         })
         .collect::<Result<Vec<_>, BuildError>>()?;
 
     let mut prepared = Vec::with_capacity(shards.len());
-    let mut cell_updates = HashMap::with_capacity(shards.len());
-    for (cell_id, shard, added) in shards {
+    for shard in shards {
         let prep = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-        let entry = finish_superfile_entry(inner, prep.entry, Some(cell_id))?;
-        let base = base_counts.get(cell_id as usize).copied().unwrap_or(0);
-        cell_updates.insert(cell_id, base.saturating_add(added));
+        let entry = finish_superfile_entry(inner, prep.entry, Some(PACKED_VECTOR_CELLS))?;
         prepared.push(PreparedSuperfile {
             entry,
             bytes_for_store: prep.bytes_for_store,
             bytes_for_storage: prep.bytes_for_storage,
             bytes_for_cache: prep.bytes_for_cache,
         });
+    }
+
+    let mut cell_updates = HashMap::with_capacity(cell_added.len());
+    for (cell_id, added) in cell_added {
+        let base = base_counts.get(cell_id as usize).copied().unwrap_or(0);
+        cell_updates.insert(cell_id, base.saturating_add(added));
     }
 
     Ok((prepared, cell_updates))
@@ -3634,10 +3713,17 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
             RunFragmentKind::Base,
             false,
         )?;
-        let uri = store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-        spfresh_routing.centroid_blob_uri = Some(uri);
+        let existing_uri = current
+            .get_spfresh_routing()
+            .and_then(|r| r.centroid_blob_uri);
+        let (uri, resident_to_swap) = store_or_reuse_centroid_blob(
+            storage.as_ref(),
+            existing_uri,
+            &existing_resident,
+            resident,
+        )
+        .await?;
+        spfresh_routing.centroid_blob_uri = uri;
 
         let current_for_commit = Arc::new(
             current
@@ -3661,7 +3747,9 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         {
             Ok(new_manifest) => {
                 inner.manifest.store(Arc::new(new_manifest));
-                inner.resident_spfresh_centroids.store(Arc::new(resident));
+                if let Some(resident) = resident_to_swap {
+                    inner.resident_spfresh_centroids.store(Arc::new(resident));
+                }
                 if let Some(cache) = inner.options.disk_cache.as_ref() {
                     warm_cache_inserts(cache, pending_cache_inserts).await;
                 }
@@ -4334,6 +4422,8 @@ mod tests {
     };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
+
+    use tokio::runtime::Builder as TokioRuntimeBuilder;
 
     use super::*;
     use crate::{
@@ -5187,6 +5277,272 @@ mod tests {
         assert_eq!(routing.cells[1].leaves[0].cluster_id, 0);
         assert_eq!(resident.centroids.len(), DIM);
         assert_eq!(resident.centroid(0).expect("centroid")[0], 42.0);
+    }
+
+    #[test]
+    fn spfresh_packed_delta_file_repoints_fragments_by_global_cluster_id() {
+        // One prepared superfile under the PACKED_VECTOR_CELLS partition packs
+        // delta runs for fine centroids living in two different coarse cells.
+        // The routing rebuild must locate each run's leaf by its global cluster
+        // id (never the file's hint) and append the fragment under the right
+        // cell — with no new leaves and no new centroids.
+        const DIM: usize = 16;
+        const CELL_A: u32 = 2;
+        const CELL_B: u32 = 5;
+        const CLUSTER_A: u32 = 0;
+        const CLUSTER_B: u32 = 3;
+
+        let row = |stable_id: i128, cluster: u32| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::from(vec![1.0f32; DIM]),
+                offset: Arc::from(vec![0.0f32; DIM]),
+                codes: vec![0u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        };
+        let mut rows = vec![
+            row(100, CLUSTER_A),
+            row(101, CLUSTER_A),
+            row(200, CLUSTER_B),
+            row(201, CLUSTER_B),
+        ];
+        for (local, r) in rows.iter_mut().enumerate() {
+            r.local_doc_id = local as u32;
+        }
+        let shard = build_one_shard_from_materialized(
+            &rows,
+            &options_vector_only(DIM),
+            VectorLayout::Spfresh,
+        )
+        .expect("build packed shard");
+        let offsets = build_subsection_offsets(&shard.bytes).expect("subsection offsets");
+        let uri = SuperfileUri::new_v4();
+        let entry = test_spfresh_entry(uri, shard.n_docs, Some(PACKED_VECTOR_CELLS), Some(offsets));
+        let prep = PreparedSuperfile {
+            entry,
+            bytes_for_store: Some((uri, shard.bytes)),
+            bytes_for_storage: None,
+            bytes_for_cache: None,
+        };
+
+        let old_uri = SuperfileUri::new_v4();
+        let mut existing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: Some("spfresh-centroids/centroids-old.bin".into()),
+            cells: (0..GLOBAL_VECTOR_CELL_COUNT as u32)
+                .map(empty_cell_tree)
+                .collect(),
+        };
+        let base_fragment = |run_id: u32| RunFragment {
+            superfile_uri: old_uri.0.to_string(),
+            run_id,
+            byte_range: (11, 22),
+            row_count: 2,
+            kind: RunFragmentKind::Base,
+        };
+        existing.cells[CELL_A as usize].leaves.push(ClusterRef {
+            cell_id: CELL_A,
+            cluster_id: CLUSTER_A,
+            fragments: vec![base_fragment(0)],
+        });
+        existing.cells[CELL_B as usize].leaves.push(ClusterRef {
+            cell_id: CELL_B,
+            cluster_id: CLUSTER_B,
+            fragments: vec![base_fragment(1)],
+        });
+        // Resident blob with 4 centroids; only clusters 0 and 3 are live.
+        let mut centroids = vec![0.0f32; 4 * DIM];
+        for c in 0..4 {
+            centroids[c * DIM] = c as f32 * 10.0;
+        }
+        let resident = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(centroids),
+        };
+
+        let (routing, resident) = extend_hidden_spfresh_routing(
+            Some(existing),
+            &resident,
+            "emb",
+            GLOBAL_VECTOR_CELL_COUNT as u32,
+            DIM,
+            &[],
+            &[prep],
+            RunFragmentKind::Delta,
+            false,
+        )
+        .expect("routing");
+
+        let cell_a = &routing.cells[CELL_A as usize];
+        let cell_b = &routing.cells[CELL_B as usize];
+        assert_eq!(cell_a.leaves.len(), 1, "no new leaf in cell A");
+        assert_eq!(cell_b.leaves.len(), 1, "no new leaf in cell B");
+        for (cell, marker) in [(cell_a, 0.0f32), (cell_b, 30.0f32)] {
+            let leaf = &cell.leaves[0];
+            assert_eq!(leaf.fragments.len(), 2, "delta appended under the leaf");
+            assert_eq!(leaf.fragments[1].kind, RunFragmentKind::Delta);
+            assert_eq!(
+                leaf.fragments[1].superfile_uri,
+                uri.0.to_string(),
+                "delta fragment points at the packed file"
+            );
+            // The leaf still resolves to its original fine centroid.
+            let centroid = resident.centroid(leaf.cluster_id).expect("live centroid");
+            assert_eq!(centroid[0], marker);
+        }
+        // Live-set compaction: only the two referenced centroids survive.
+        assert_eq!(resident.centroids.len(), 2 * DIM);
+    }
+
+    #[test]
+    fn spfresh_delta_drain_packs_cells_into_one_superfile() {
+        // Steady-state drain routes rows to existing fine centroids in two
+        // different coarse cells; the output must be ONE packed superfile under
+        // PACKED_VECTOR_CELLS (not one object per touched cell), with per-cell
+        // counts still accounted.
+        const DIM: usize = 16;
+        let st = Supertable::create(options_vector_only(DIM)).expect("create");
+        let inner = st.inner();
+
+        let row = |stable_id: i128, code0: u8| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster: 0,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::from(vec![1.0f32; DIM]),
+                offset: Arc::from(vec![0.0f32; DIM]),
+                codes: {
+                    let mut codes = vec![0u8; DIM];
+                    codes[0] = code0;
+                    codes
+                },
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        };
+        let rows: Vec<MaterializedIvfRow> = vec![
+            row(100, 0),
+            row(101, 0),
+            row(200, 200),
+            row(201, 200),
+        ];
+        let centroid = |first: f32| {
+            let mut c = vec![0.0f32; DIM];
+            c[0] = first;
+            c
+        };
+        let catalog = vec![
+            LiveFineCentroid {
+                cell_id: 2,
+                cluster_id: 0,
+                centroid: centroid(0.0),
+            },
+            LiveFineCentroid {
+                cell_id: 5,
+                cluster_id: 1,
+                centroid: centroid(200.0),
+            },
+        ];
+
+        let (prepared, cell_updates) = build_spfresh_delta_shards_for_existing_centroids(
+            inner,
+            rows,
+            &catalog,
+            DIM,
+            Metric::L2Sq,
+            0.0,
+            &[0; 8],
+        )
+        .expect("delta shards");
+
+        assert_eq!(
+            prepared.len(),
+            1,
+            "two touched cells must pack into one superfile"
+        );
+        assert_eq!(
+            prepared[0].entry.partition_hint,
+            Some(PACKED_VECTOR_CELLS),
+            "packed file carries the reserved multi-cell partition"
+        );
+        assert_eq!(cell_updates.get(&2), Some(&2));
+        assert_eq!(cell_updates.get(&5), Some(&2));
+
+        let (_, reader) = open_prepared_spfresh(&prepared[0]).expect("open packed");
+        let spfresh = reader.spfresh_vec().expect("spfresh blob");
+        let clusters: Vec<u32> = spfresh.runs().iter().map(|run| run.cluster_id).collect();
+        assert_eq!(
+            clusters,
+            vec![0, 1],
+            "packed file carries both cells' fine-centroid runs"
+        );
+    }
+
+    #[test]
+    fn centroid_blob_reused_when_set_unchanged() {
+        // Delta-only maintenance rebuilds an identical centroid set: the blob
+        // must be reused (same uri, no swap). A changed set stores a new blob.
+        const DIM: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let rt = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let set = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(vec![1.0f32; 2 * DIM]),
+        };
+        let same = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(vec![1.0f32; 2 * DIM]),
+        };
+        let changed = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(vec![2.0f32; 2 * DIM]),
+        };
+
+        let (uri, swap) = rt
+            .block_on(store_or_reuse_centroid_blob(
+                &storage,
+                Some("spfresh-centroids/existing.bin".into()),
+                &set,
+                same,
+            ))
+            .expect("reuse");
+        assert_eq!(uri.as_deref(), Some("spfresh-centroids/existing.bin"));
+        assert!(swap.is_none(), "unchanged set must not swap the resident");
+
+        let (uri, swap) = rt
+            .block_on(store_or_reuse_centroid_blob(
+                &storage,
+                Some("spfresh-centroids/existing.bin".into()),
+                &set,
+                changed,
+            ))
+            .expect("store");
+        assert_ne!(uri.as_deref(), Some("spfresh-centroids/existing.bin"));
+        assert!(uri.is_some(), "changed set stores a new blob");
+        assert!(swap.is_some(), "changed set swaps the resident");
+
+        let (uri, swap) = rt
+            .block_on(store_or_reuse_centroid_blob(
+                &storage,
+                None,
+                &set,
+                ResidentCentroids::default(),
+            ))
+            .expect("empty");
+        assert!(uri.is_none() && swap.is_none(), "empty set is a no-op");
     }
 
     #[test]
