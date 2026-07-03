@@ -7,6 +7,10 @@ name: ClickBench (Azure)
 # released engine, not this repo's working tree. It ingests an N-partition
 # subset of the hits dataset into infino, runs the 43-query cold/hot sweep, and
 # publishes the results to the Actions run summary. The VM is always torn down.
+#
+# The binary is built on the VM by default; `prebuilt` instead builds it on the
+# runner (Swatinem/rust-cache) and scp's it in — faster repeat runs, less VM
+# billing, but the runner glibc/arch must match the VM.
 
 on:
   workflow_dispatch:
@@ -51,6 +55,11 @@ on:
         required: false
         default: "120"
         type: string
+      prebuilt:
+        description: "Advanced: build the binary on the runner (rust-cache) + scp to the VM. Off = build on VM."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   id-token: write   # Azure OIDC federated login
@@ -77,6 +86,26 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # --- prebuilt mode: build the harness binary on the runner (cached),
+      #     scp'd to the VM later. Built before provisioning so a build failure
+      #     never leaves a VM billing. Runner glibc/arch must match the VM
+      #     (ubuntu-latest 24.04 / x86_64 == Ubuntu2404 / D-series). ---
+      - name: Checkout harness (runner, prebuilt)
+        if: ${{ inputs.prebuilt }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.clickbench_repo }}
+          ref: ${{ inputs.clickbench_ref }}
+          path: cb
+      - name: Rust cache (prebuilt)
+        if: ${{ inputs.prebuilt }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cb/infino/bench
+      - name: Build binary (runner, prebuilt)
+        if: ${{ inputs.prebuilt }}
+        run: cargo build --release --manifest-path cb/infino/bench/Cargo.toml
 
       - name: Provision ephemeral VM
         id: provision
@@ -131,40 +160,60 @@ jobs:
           done
           echo "::error::SSH never came up"; exit 1
 
-      - name: Build harness + ingest + sweep (on VM)
+      - name: Clone harness (on VM)
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
+            "CB_REPO='${{ inputs.clickbench_repo }}' CB_REF='${{ inputs.clickbench_ref }}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git wget curl ca-certificates
+          rm -rf "$HOME/ClickBench"
+          git clone --depth 1 --branch "$CB_REF" \
+            "https://github.com/${CB_REPO}.git" "$HOME/ClickBench"
+          REMOTE
+
+      # Prebuilt mode: ship the runner-built binary into the crate's release
+      # dir so ./install short-circuits (uses it instead of building).
+      - name: Copy prebuilt binary to VM
+        if: ${{ inputs.prebuilt }}
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          DEST="ClickBench/infino/bench/target/release"
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" "mkdir -p '$DEST'"
+          scp $SSH_OPTS cb/infino/bench/target/release/clickbench-infino \
+            "${ADMIN}@${VM_IP}:${DEST}/clickbench-infino"
+
+      - name: Ingest + sweep (on VM)
         id: run
         run: |
           set -euo pipefail
           VM_IP="${{ steps.provision.outputs.vm_ip }}"
           ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
-            "CB_REPO='${{ inputs.clickbench_repo }}' \
-             CB_REF='${{ inputs.clickbench_ref }}' \
+            "PREBUILT='${{ inputs.prebuilt }}' \
              PARTS='${{ inputs.partitions }}' \
              ROWS='${{ inputs.rows }}' \
              TARGET_SF_MB='${{ inputs.target_sf_mb }}' \
              bash -s" <<'REMOTE' 2>&1 | tee /tmp/clickbench.log
           set -euo pipefail
-
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential pkg-config libssl-dev git curl
-
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf \
-              --retry 5 --retry-connrefused --retry-delay 2 https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal
-          fi
-          source "$HOME/.cargo/env"
-
-          # Harness lives in the ClickBench repo (public). Needs lib/ (shared
-          # driver) + the infino/ system dir.
-          rm -rf "$HOME/ClickBench"
-          git clone --depth 1 --branch "$CB_REF" \
-            "https://github.com/${CB_REPO}.git" "$HOME/ClickBench"
           cd "$HOME/ClickBench/infino"
 
-          echo "===== BUILD ====="
-          ./install                      # cargo build --release (infino from crates.io)
+          # VM builds only when no prebuilt binary was copied in.
+          if [ "$PREBUILT" != "true" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              build-essential pkg-config libssl-dev
+            if ! command -v cargo >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf \
+                --retry 5 --retry-connrefused --retry-delay 2 https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal
+            fi
+            source "$HOME/.cargo/env"
+          fi
+
+          echo "===== BUILD/INSTALL ====="
+          ./install                      # prebuilt: no-op; else cargo build --release
           RESOLVED="$(grep -A1 '^name = "infino"' bench/Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)"
           echo "infino crate: ${RESOLVED}"
 
