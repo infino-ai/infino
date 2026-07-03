@@ -56,9 +56,9 @@ on:
         default: "120"
         type: string
       prebuilt:
-        description: "Advanced: build the binary on the runner (rust-cache) + scp to the VM. Off = build on VM."
+        description: "Build on runner (rust-cache) + scp to VM; off = build on VM."
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
