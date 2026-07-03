@@ -12,22 +12,22 @@ on:
   workflow_dispatch:
     inputs:
       rows:
-        description: "Rows to ingest (plain integer; empty = all downloaded = full ~100M dataset)."
+        description: "Rows to ingest; empty = all (~100M)."
         required: false
         default: ""
         type: string
       partitions:
-        description: "How many hits_N.parquet partitions to download (~1M rows each; 100 = full dataset)."
+        description: "Partitions to download (~1M rows each; 100 = full)."
         required: false
         default: "100"
         type: string
       target_sf_mb:
-        description: "infino compacted superfile target size (MiB). 256 balances scan on 8 cores."
+        description: "Compacted superfile target (MiB)."
         required: false
         default: "256"
         type: string
       vm_size:
-        description: "Azure VM size. 16 vCPU / 64 GB suits the full 100M (data ~20 GB fits RAM; 16 cores for scan)."
+        description: "Azure VM size."
         required: false
         default: "Standard_D16s_v7"
         type: string
@@ -37,17 +37,17 @@ on:
         default: "eastus"
         type: string
       clickbench_repo:
-        description: "Repo holding the infino ClickBench harness."
+        description: "Harness repo."
         required: false
         default: "infino-ai/ClickBench"
         type: string
       clickbench_ref:
-        description: "Branch/ref of the harness repo to run."
+        description: "Harness ref."
         required: false
         default: "add-infino"
         type: string
       timeout_minutes:
-        description: "Hard auto-stop; the VM is torn down when hit. Full 100M download+load+sweep needs headroom."
+        description: "Hard auto-stop (min); VM torn down when hit."
         required: false
         default: "120"
         type: string
