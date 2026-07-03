@@ -65,6 +65,11 @@ permissions:
   id-token: write   # Azure OIDC federated login
   contents: read
 
+# Serialize dispatches; never cancel a run mid-flight (that would leak a VM).
+concurrency:
+  group: clickbench-azure
+  cancel-in-progress: false
+
 env:
   # Pre-existing RG the bench service principal is scoped to (Contributor on
   # this RG only). Per-run resources are created inside it; the RG is never
@@ -87,10 +92,8 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # --- prebuilt mode: build the harness binary on the runner (cached),
-      #     scp'd to the VM later. Built before provisioning so a build failure
-      #     never leaves a VM billing. Runner glibc/arch must match the VM
-      #     (ubuntu-latest 24.04 / x86_64 == Ubuntu2404 / D-series). ---
+      # Prebuilt: build on the runner (cached) before provisioning, so a build
+      # failure never leaves a VM billing. Runner glibc/arch must match the VM.
       - name: Checkout harness (runner, prebuilt)
         if: ${{ inputs.prebuilt }}
         uses: actions/checkout@v4
@@ -214,12 +217,13 @@ jobs:
 
           echo "===== BUILD/INSTALL ====="
           ./install                      # prebuilt: no-op; else cargo build --release
+          ./check                        # fail fast; also verifies a prebuilt binary execs on this VM
           RESOLVED="$(grep -A1 '^name = "infino"' bench/Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)"
           echo "infino crate: ${RESOLVED}"
 
           echo "===== DOWNLOAD (${PARTS} partitions) ====="
           END=$((PARTS - 1))
-          seq 0 "$END" | xargs -P"$PARTS" -I{} \
+          seq 0 "$END" | xargs -P"$(( PARTS < 16 ? PARTS : 16 ))" -I{} \
             wget -q --continue \
             "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet"
 
