@@ -1,0 +1,241 @@
+name: ClickBench (Azure)
+
+# Manually-triggered ClickBench run on a per-run ephemeral Azure VM.
+#
+# The benchmark harness lives in the ClickBench repo (its `infino/` system
+# dir); it depends on the *published* `infino` crate, so this job measures the
+# released engine, not this repo's working tree. It ingests an N-partition
+# subset of the hits dataset into infino, runs the 43-query cold/hot sweep, and
+# publishes the results to the Actions run summary. The VM is always torn down.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows to ingest (plain integer; empty = all downloaded = full ~100M dataset)."
+        required: false
+        default: ""
+        type: string
+      partitions:
+        description: "How many hits_N.parquet partitions to download (~1M rows each; 100 = full dataset)."
+        required: false
+        default: "100"
+        type: string
+      target_sf_mb:
+        description: "infino compacted superfile target size (MiB). 256 balances scan on 8 cores."
+        required: false
+        default: "256"
+        type: string
+      vm_size:
+        description: "Azure VM size."
+        required: false
+        default: "Standard_D8s_v7"
+        type: string
+      location:
+        description: "VM region."
+        required: false
+        default: "eastus"
+        type: string
+      clickbench_repo:
+        description: "Repo holding the infino ClickBench harness."
+        required: false
+        default: "infino-ai/ClickBench"
+        type: string
+      clickbench_ref:
+        description: "Branch/ref of the harness repo to run."
+        required: false
+        default: "add-infino"
+        type: string
+      timeout_minutes:
+        description: "Hard auto-stop; the VM is torn down when hit. Full 100M download+load+sweep needs headroom."
+        required: false
+        default: "120"
+        type: string
+
+permissions:
+  id-token: write   # Azure OIDC federated login
+  contents: read
+
+env:
+  # Pre-existing RG the bench service principal is scoped to (Contributor on
+  # this RG only). Per-run resources are created inside it; the RG is never
+  # created or deleted here.
+  RG: rg-infino-bench
+  VM: clickbench-vm-${{ github.run_id }}
+  ADMIN: azureuser
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+jobs:
+  clickbench:
+    runs-on: ubuntu-latest
+    environment: ci
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision ephemeral VM
+        id: provision
+        run: |
+          set -euo pipefail
+          # delete-after lets the shared bench janitor reclaim this if teardown
+          # is skipped (run cancelled / runner lost).
+          DELETE_AFTER="$(date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"
+          TAGS=(purpose=clickbench-bench "run-id=${{ github.run_id }}" auto-delete=true "delete-after=${DELETE_AFTER}")
+
+          # Every resource carries the unique per-run VM name so teardown deletes
+          # exactly this run's resources by name. No default inbound rule; the
+          # only SSH allow is the runner-IP /32 added below.
+          az vm create \
+            -g "$RG" -n "$VM" \
+            --image Ubuntu2404 \
+            --size "${{ inputs.vm_size }}" \
+            --admin-username "$ADMIN" \
+            --generate-ssh-keys \
+            --public-ip-sku Standard \
+            --os-disk-size-gb 128 \
+            --nsg-rule NONE \
+            --nsg "${VM}-nsg" \
+            --public-ip-address "${VM}-pip" \
+            --vnet-name "${VM}-vnet" \
+            --subnet "${VM}-subnet" \
+            --os-disk-name "${VM}-osdisk" \
+            --location "${{ inputs.location }}" \
+            --tags "${TAGS[@]}" \
+            -o none
+
+          RUNNER_IP="$(curl -s https://api.ipify.org)"
+          az network nsg rule create \
+            -g "$RG" --nsg-name "${VM}-nsg" -n allow-ssh-runner --priority 300 \
+            --access Allow --protocol Tcp --direction Inbound \
+            --destination-port-ranges 22 \
+            --source-address-prefixes "${RUNNER_IP}/32" -o none
+
+          VM_IP="$(az vm show -d -g "$RG" -n "$VM" --query publicIps -o tsv)"
+          echo "vm_ip=$VM_IP" >> "$GITHUB_OUTPUT"
+          echo "Provisioned $VM (${{ inputs.vm_size }}) at $VM_IP in ${{ inputs.location }}"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          for i in $(seq 1 30); do
+            if ssh $SSH_OPTS -o ConnectTimeout=5 "${ADMIN}@${VM_IP}" true 2>/dev/null; then
+              echo "SSH up after ${i} tries"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH never came up"; exit 1
+
+      - name: Build harness + ingest + sweep (on VM)
+        id: run
+        run: |
+          set -euo pipefail
+          VM_IP="${{ steps.provision.outputs.vm_ip }}"
+          ssh $SSH_OPTS "${ADMIN}@${VM_IP}" \
+            "CB_REPO='${{ inputs.clickbench_repo }}' \
+             CB_REF='${{ inputs.clickbench_ref }}' \
+             PARTS='${{ inputs.partitions }}' \
+             ROWS='${{ inputs.rows }}' \
+             TARGET_SF_MB='${{ inputs.target_sf_mb }}' \
+             bash -s" <<'REMOTE' 2>&1 | tee /tmp/clickbench.log
+          set -euo pipefail
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkg-config libssl-dev git curl
+
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf \
+              --retry 5 --retry-connrefused --retry-delay 2 https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+
+          # Harness lives in the ClickBench repo (public). Needs lib/ (shared
+          # driver) + the infino/ system dir.
+          rm -rf "$HOME/ClickBench"
+          git clone --depth 1 --branch "$CB_REF" \
+            "https://github.com/${CB_REPO}.git" "$HOME/ClickBench"
+          cd "$HOME/ClickBench/infino"
+
+          echo "===== BUILD ====="
+          ./install                      # cargo build --release (infino from crates.io)
+          RESOLVED="$(grep -A1 '^name = "infino"' bench/Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)"
+          echo "infino crate: ${RESOLVED}"
+
+          echo "===== DOWNLOAD (${PARTS} partitions) ====="
+          END=$((PARTS - 1))
+          seq 0 "$END" | xargs -P"$PARTS" -I{} \
+            wget -q --continue \
+            "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet"
+
+          echo "===== LOAD (rows=${ROWS} target_sf=${TARGET_SF_MB}MB) ====="
+          t0=$(date +%s.%N)
+          INFINO_SRC="hits_*.parquet" INFINO_MAX_ROWS="$ROWS" INFINO_TARGET_SF_MB="$TARGET_SF_MB" ./load
+          t1=$(date +%s.%N)
+          awk -v a="$t0" -v b="$t1" 'BEGIN{printf "LOAD_TIME=%.1fs\n", b-a}'
+          echo "DATA_SIZE_BYTES=$(./data-size)"
+
+          echo "===== SWEEP ====="
+          ./bench.sh
+          REMOTE
+
+      - name: Publish summary
+        if: ${{ !cancelled() }}
+        run: |
+          set +e -u -o pipefail
+          LOG=/tmp/clickbench.log
+          {
+            echo "## ClickBench — infino (Azure ${{ inputs.location }})"
+            echo ""
+            infino_ver="$(grep -oE 'infino crate: .*' "$LOG" | head -1 | sed 's/infino crate: //')"
+            load_time="$(grep -oE 'LOAD_TIME=[0-9.]+s' "$LOG" | head -1 | cut -d= -f2)"
+            data_sz="$(grep -oE 'DATA_SIZE_BYTES=[0-9]+' "$LOG" | head -1 | cut -d= -f2)"
+            geomean="$(grep -oE 'hot geomean: .*' "$LOG" | head -1)"
+            echo "- infino \`${infino_ver:-?}\` · vm \`${{ inputs.vm_size }}\` · rows \`${{ inputs.rows != '' && inputs.rows || 'all (~100M)' }}\` · target_sf \`${{ inputs.target_sf_mb }}MB\`"
+            echo "- load \`${load_time:-?}\` · data size \`$(( ${data_sz:-0} / 1000000 )) MB\` · **${geomean:-hot geomean: n/a}**"
+            echo ""
+            if grep -q 'hot geomean' "$LOG"; then
+              echo "### Cold/hot per query"
+              echo '```'
+              # From the sweep table header to the geomean line.
+              awk '/^Q +cold/{f=1} f' "$LOG"
+              echo '```'
+            else
+              echo "**❌ No sweep results — see the uploaded log.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Surface hard failures loudly.
+          if ! grep -q 'hot geomean' "$LOG"; then
+            echo "::error::ClickBench sweep produced no results."
+            exit 1
+          fi
+
+      - name: Upload full log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickbench-log
+          path: /tmp/clickbench.log
+          if-no-files-found: warn
+
+      - name: Teardown (always)
+        if: always()
+        env:
+          NIC: ${{ env.VM }}VMNic
+        run: |
+          # Delete exactly this run's resources by name (VM name is unique per
+          # run), keeping the shared RG. Ordered so dependencies release first.
+          # Each is best-effort so a missing resource never fails teardown.
+          az vm delete                -g "$RG" -n "$VM"           --yes || true
+          az network nic delete       -g "$RG" -n "$NIC"                || true
+          az disk delete              -g "$RG" -n "${VM}-osdisk"  --yes || true
+          az network public-ip delete -g "$RG" -n "${VM}-pip"           || true
+          az network nsg delete       -g "$RG" -n "${VM}-nsg"           || true
+          az network vnet delete      -g "$RG" -n "${VM}-vnet"          || true
