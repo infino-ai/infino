@@ -27,9 +27,9 @@ on:
         default: "256"
         type: string
       vm_size:
-        description: "Azure VM size."
+        description: "Azure VM size. 16 vCPU / 64 GB suits the full 100M (data ~20 GB fits RAM; 16 cores for scan)."
         required: false
-        default: "Standard_D8s_v7"
+        default: "Standard_D16s_v7"
         type: string
       location:
         description: "VM region."
