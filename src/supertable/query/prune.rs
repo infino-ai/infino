@@ -203,10 +203,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-
-    use crate::superfile::vector::layout::VectorLayout;
     use crate::{
-        superfile::builder::FtsConfig,
+        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             SupertableOptions,
             manifest::{

@@ -2083,6 +2083,32 @@ impl ClusterCentroids {
         self
     }
 
+    /// Slice out the clusters named by `selected` (in that order) into a new
+    /// `ClusterCentroids`: centroid rows copied verbatim, counts carried, radii
+    /// carried when present. The OPANN routing-tree build uses this to give
+    /// every tree node an existing leaf centroid without re-encoding.
+    pub fn select_rows(&self, selected: &[u32]) -> Self {
+        let d = self.dim as usize;
+        let has_radii = self.radii.len() == self.n_cent as usize;
+        let mut centroids = Vec::with_capacity(selected.len() * d);
+        let mut counts = Vec::with_capacity(selected.len());
+        let mut radii = Vec::with_capacity(if has_radii { selected.len() } else { 0 });
+        for &i in selected {
+            centroids.extend_from_slice(self.centroid(i as usize));
+            counts.push(self.counts[i as usize]);
+            if has_radii {
+                radii.push(self.radii[i as usize]);
+            }
+        }
+        Self {
+            n_cent: selected.len() as u32,
+            dim: self.dim,
+            centroids,
+            counts,
+            radii,
+        }
+    }
+
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
     /// slice (zero-copy, no dequant).
     pub fn score_one(&self, metric: Metric, c: usize, query: &[f32]) -> f32 {

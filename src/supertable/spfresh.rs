@@ -30,6 +30,7 @@ use crate::{
             medoid_index_by,
         },
         distance::{Metric, distance},
+        spfresh::assign_replicas,
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -302,20 +303,45 @@ pub(crate) fn insert_split_centroid(
     (updated, new_cell_id)
 }
 
-/// Neighbor cells touched by a split of `split_cell`: P−1, P, the new sub-cell, P+1.
+/// Cells whose replica closure can change after `split_cell` is replaced by two
+/// sub-centroids. Cell ids are allocation ids, not geometric neighbors, so the
+/// affected set is derived from centroid distances rather than numeric adjacency.
 pub(crate) fn reassign_neighborhood(
+    clusters: &ClusterCentroids,
     split_cell: u32,
-    old_n_cent: u32,
     new_cell_id: u32,
+    metric: Metric,
+    eps: f32,
 ) -> Vec<u32> {
-    let mut ids = Vec::new();
-    if split_cell > 0 {
-        ids.push(split_cell - 1);
+    let dim = clusters.dim as usize;
+    if clusters.n_cent == 0 || dim == 0 {
+        return Vec::new();
     }
-    ids.push(split_cell);
-    ids.push(new_cell_id);
-    if split_cell + 1 < old_n_cent {
-        ids.push(split_cell + 1);
+    let centroids = clusters.to_fp32();
+    let mut ids = Vec::new();
+    let split_targets = [split_cell, new_cell_id];
+    for &cell in &split_targets {
+        if cell < clusters.n_cent {
+            ids.extend(assign_replicas(
+                metric,
+                clusters.centroid(cell as usize),
+                dim,
+                &centroids,
+                eps,
+            ));
+        }
+    }
+    for cell in 0..clusters.n_cent {
+        let replicas = assign_replicas(
+            metric,
+            clusters.centroid(cell as usize),
+            dim,
+            &centroids,
+            eps,
+        );
+        if replicas.iter().any(|id| split_targets.contains(id)) {
+            ids.push(cell);
+        }
     }
     ids.sort_unstable();
     ids.dedup();
@@ -380,9 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn reassign_neighborhood_includes_neighbors_and_new_cell() {
-        let ids = reassign_neighborhood(3, 8, 8);
-        assert_eq!(ids, vec![2, 3, 4, 8]);
+    fn reassign_neighborhood_uses_geometric_closure() {
+        let clusters = ClusterCentroids::from_fp32(
+            4,
+            2,
+            &[0.0, 0.0, 100.0, 0.0, 1.0, 0.0, 101.0, 0.0],
+            vec![1; 4],
+        );
+        let ids = reassign_neighborhood(&clusters, 0, 2, Metric::L2Sq, 0.1);
+        assert_eq!(ids, vec![0, 2]);
     }
 
     #[test]

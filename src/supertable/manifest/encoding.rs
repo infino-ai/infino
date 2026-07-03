@@ -43,9 +43,11 @@ use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
-use crate::superfile::vector::distance::decode_f32_le_vec;
-use crate::supertable::manifest::{
-    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+use crate::{
+    superfile::vector::distance::decode_f32_le_vec,
+    supertable::manifest::{
+        ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+    },
 };
 
 /// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).

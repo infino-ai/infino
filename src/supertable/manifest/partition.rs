@@ -318,8 +318,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::superfile::vector::layout::VectorLayout;
-    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
+    use crate::{
+        superfile::vector::layout::VectorLayout,
+        supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
+    };
 
     // ---- Helpers --------------------------------------------------------
 

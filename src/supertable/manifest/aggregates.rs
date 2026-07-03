@@ -201,10 +201,12 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
 
     use super::*;
-    use crate::superfile::vector::layout::VectorLayout;
-    use crate::supertable::manifest::{
-        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-        part::{ContentHash, PartId},
+    use crate::{
+        superfile::vector::layout::VectorLayout,
+        supertable::manifest::{
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+            part::{ContentHash, PartId},
+        },
     };
 
     /// A `ManifestListEntry` standing in for an existing part, carrying the

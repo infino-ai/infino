@@ -328,12 +328,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-
-    use crate::superfile::vector::layout::VectorLayout;
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             SupertableOptions,

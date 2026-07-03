@@ -756,7 +756,7 @@ fn fp32_rows_to_runs_with_centroids(col: &ColumnState, centroids: &[f32]) -> Vec
     let mut grouped: HashMap<u32, Fp32RunInput> = HashMap::new();
     for row_idx in 0..n_rows {
         let vector = &col.vectors[row_idx * dim..(row_idx + 1) * dim];
-        let cells = assign_replicas(col.config.metric, vector, dim, &centroids, eps);
+        let cells = assign_replicas(col.config.metric, vector, dim, centroids, eps);
         for cell in cells {
             let entry = grouped.entry(cell).or_insert_with(|| Fp32RunInput {
                 cluster_id: cell,

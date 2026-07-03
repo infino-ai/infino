@@ -1825,8 +1825,7 @@ async fn cold_fetch_to_disk_cancelable(
     let n_streams = store
         .config
         .cold_fetch_streams
-        .max(1)
-        .min(BACKGROUND_FILL_MAX_STREAMS);
+        .clamp(1, BACKGROUND_FILL_MAX_STREAMS);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
     let file = {
         let f = fs::OpenOptions::new()

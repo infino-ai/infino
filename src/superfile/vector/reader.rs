@@ -2050,10 +2050,10 @@ impl VectorReader {
                 };
                 let ((blocks, meta), region_bytes) = futures::try_join!(cluster_fut, region_fut)
                     .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                if let Some(bytes) = region_bytes {
-                    if let Ok(mut slot) = self.cold_stable_id_region.lock() {
-                        *slot = Some(bytes);
-                    }
+                if let Some(bytes) = region_bytes
+                    && let Ok(mut slot) = self.cold_stable_id_region.lock()
+                {
+                    *slot = Some(bytes);
                 }
                 (blocks, meta, false)
             };

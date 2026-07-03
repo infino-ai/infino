@@ -78,7 +78,7 @@ pub(crate) fn encode_centroids(
     dim: usize,
     centroids: &[f32],
 ) -> Result<Vec<u8>, HiddenCentroidsError> {
-    if dim == 0 || centroids.len() % dim != 0 {
+    if dim == 0 || !centroids.len().is_multiple_of(dim) {
         return Err(HiddenCentroidsError::DimMismatch);
     }
     let n_cent = centroids.len() / dim;

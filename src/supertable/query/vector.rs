@@ -95,7 +95,7 @@ use crate::{
         SuperfileReader,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, decode_f32_le_vec, distance},
+            distance::Metric,
             layout::VectorLayout,
             spfresh::{SpfreshRunProbe, SpfreshSearchHit},
         },
@@ -103,18 +103,15 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        hidden_centroids::ResidentCentroids,
         hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
-            list::{CellRoutingParams, PartitionStrategy, SpfreshRoutingIndex},
+            list::{CellRoutingParams, PartitionStrategy},
         },
+        opann::resident::SpfreshResidentTrees,
         tombstones::SidecarCache,
     },
 };
-
-/// Size of one little-endian fp32 component in manifest-encoded centroids.
-const F32_BYTES: usize = 4;
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -180,21 +177,27 @@ fn filter_superfiles_by_cells(
         .collect()
 }
 
+/// Inner probe budget: `INFINO_INNER_BUDGET` when set, else `nprobe * n_eligible`
+/// floored at `nprobe`. The single budget policy shared by the tree descent
+/// limit, the SPFresh run selector, and the IVF cluster fan-out.
+fn inner_budget(nprobe: usize, n_eligible: usize) -> usize {
+    std::env::var("INFINO_INNER_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|b| b.max(1))
+        .unwrap_or_else(|| nprobe.saturating_mul(n_eligible.max(1)).max(nprobe))
+}
+
 /// Truncate `scored` to the inner probe budget, keeping the lowest-scoring
-/// (nearest) entries. Budget is `INFINO_INNER_BUDGET` when set, else
-/// `nprobe * n_eligible` floored at `nprobe`. Shared by the SPFresh run selector
-/// and the IVF cluster fan-out so the budget policy is defined in one place.
+/// (nearest) entries. Shared by the SPFresh run selector and the IVF cluster
+/// fan-out so the budget policy is defined in one place.
 fn truncate_to_inner_budget<T>(
     scored: &mut Vec<T>,
     nprobe: usize,
     n_eligible: usize,
     score_of: impl Fn(&T) -> f32,
 ) {
-    let budget = std::env::var("INFINO_INNER_BUDGET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|b| b.max(1))
-        .unwrap_or_else(|| nprobe.saturating_mul(n_eligible.max(1)).max(nprobe));
+    let budget = inner_budget(nprobe, n_eligible);
     if scored.len() > budget {
         scored.select_nth_unstable_by(budget, |a, b| {
             score_of(a)
@@ -206,56 +209,56 @@ fn truncate_to_inner_budget<T>(
 }
 
 fn spfresh_run_probes_by_superfile(
-    routing: Option<SpfreshRoutingIndex>,
+    trees: &SpfreshResidentTrees,
     column: &str,
     superfiles: &[Arc<SuperfileEntry>],
-    metric: Metric,
     query: &[f32],
     nprobe: usize,
-    resident_centroids: Option<&ResidentCentroids>,
     routed_cells: Option<&[u32]>,
 ) -> HashMap<SuperfileUri, Vec<SpfreshRunProbe>> {
-    let Some(routing) = routing else {
-        return HashMap::new();
-    };
-    if routing.column != column {
+    if trees.column != column || trees.cells.is_empty() {
         return HashMap::new();
     }
     let by_uri: HashMap<String, Arc<SuperfileEntry>> = superfiles
         .iter()
         .map(|entry| (entry.uri.0.to_string(), Arc::clone(entry)))
         .collect();
-    // Score every routed fine centroid: user trees carry it inline in the
-    // `CellTreeNode`; hidden trees carry it in the resident centroid blob indexed
-    // by `ClusterRef.cluster_id`. A selected centroid may point to a base plus
-    // delta fragments; every live fragment is fetched and scored.
+    // Descend each selected cell's resident routing tree to choose that cell's
+    // nearest fine centroids — the per-cell tree traversal, never a flat scan
+    // of every leaf. Each cell contributes up to the shared inner budget; the
+    // merged candidate set is trimmed to the same budget below, so the final
+    // probe set is the globally nearest leaves across the selected cells.
+    let routed_cells: Option<HashSet<u32>> =
+        routed_cells.map(|cells| cells.iter().copied().collect());
+    let selected_cells: Vec<_> = trees
+        .cells
+        .iter()
+        .filter(|cell| {
+            routed_cells
+                .as_ref()
+                .is_none_or(|routed| routed.contains(&cell.cell_id))
+        })
+        .filter(|cell| cell.tree.is_some())
+        .collect();
+    if selected_cells.is_empty() {
+        return HashMap::new();
+    }
+    let per_cell_limit = inner_budget(nprobe, selected_cells.len());
     struct ScoredSpfreshLeaf {
         fragments: Vec<(SuperfileUri, SpfreshRunProbe)>,
         score: f32,
     }
-
     let mut scored: Vec<ScoredSpfreshLeaf> = Vec::new();
-    let routed_cells: Option<HashSet<u32>> =
-        routed_cells.map(|cells| cells.iter().copied().collect());
-    for cell in routing.cells {
-        if let Some(routed_cells) = routed_cells.as_ref()
-            && !routed_cells.contains(&cell.cell_id)
-        {
-            continue;
-        }
-        for (leaf_idx, leaf) in cell.leaves.into_iter().enumerate() {
-            let centroid = match cell.nodes.get(leaf_idx) {
-                Some(node) => decode_manifest_centroid(&node.centroid, query.len()),
-                None => resident_centroids
-                    .and_then(|centroids| centroids.centroid(leaf.cluster_id))
-                    .map(<[f32]>::to_vec),
-            };
-            let Some(centroid) = centroid else {
+    for cell in &selected_cells {
+        let tree = cell.tree.as_ref().expect("selected cells have a tree");
+        for (leaf, score) in tree.select_leaves(query, per_cell_limit) {
+            let Some((_, cluster_ref)) = trees.cluster_ref(&leaf) else {
                 continue;
             };
-            let score = distance(metric, query, &centroid);
-            let mut fragments = Vec::with_capacity(leaf.fragments.len());
-            for fragment in leaf.fragments {
+            // A selected fine centroid may point to a base plus delta
+            // fragments; every live fragment is fetched and scored.
+            let mut fragments = Vec::with_capacity(cluster_ref.fragments.len());
+            for fragment in &cluster_ref.fragments {
                 let Some(entry) = by_uri.get(&fragment.superfile_uri) else {
                     continue;
                 };
@@ -354,10 +357,6 @@ fn spfresh_hits_with_entry(
             stable_id: Some(hit.stable_id),
         })
         .collect()
-}
-
-fn decode_manifest_centroid(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
-    (bytes.len() == dim.checked_mul(F32_BYTES)?).then(|| decode_f32_le_vec(bytes))
 }
 
 async fn undrained_user_superfiles(
@@ -559,14 +558,13 @@ async fn read_ids_for_locals(
             return Ok(ids);
         }
         // Cold path: fetch the inline region async when present but not resident.
-        if let Some(v) = reader.vec() {
-            if let Some(ids) = v
+        if let Some(v) = reader.vec()
+            && let Some(ids) = v
                 .inline_stable_ids_for_locals_async(local_ids)
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?
-            {
-                return Ok(ids);
-            }
+        {
+            return Ok(ids);
         }
         if let Some(spfresh) = reader.spfresh_vec() {
             return spfresh
@@ -844,17 +842,13 @@ impl SupertableReader {
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
             .unwrap_or(Metric::L2Sq);
-        let resident_spfresh_centroids = self.resident_spfresh_centroids();
-        let resident_spfresh_centroids =
-            (!resident_spfresh_centroids.is_empty()).then_some(resident_spfresh_centroids);
+        let spfresh_trees = self.resident_spfresh_trees();
         let spfresh_runs = spfresh_run_probes_by_superfile(
-            manifest.get_spfresh_routing(),
+            &spfresh_trees,
             column,
             &superfiles,
-            metric,
             query,
             nprobe,
-            resident_spfresh_centroids.as_deref(),
             routed_cells,
         );
 
@@ -987,7 +981,7 @@ impl SupertableReader {
                         None
                     };
                     let deny = deny.map(Arc::new);
-                    let res = match probe {
+                    match probe {
                         Probe::Clusters(ids) => {
                             let hits = reader
                                 .vector_search_clusters_filtered(
@@ -1034,8 +1028,7 @@ impl SupertableReader {
                                 .map_err(|e| QueryError::Parquet(e.to_string()))?;
                             Ok(spfresh_hits_with_entry(&entry, hits))
                         }
-                    };
-                    res
+                    }
                 }
             };
         // Filtered search holds a per-superfile RoaringBitmap while the
@@ -1062,13 +1055,13 @@ impl SupertableReader {
         let mut hits = top_k_ascending(per_superfile, k);
         // Backstop for INCOMING staging superfiles (no inline `_id` region for
         // kernel deny): drop hits whose resolved user `_id` is tombstoned.
-        if let Some(deleted) = hidden_deleted.as_ref() {
-            if !deleted.is_empty() {
-                hits.retain(|h| {
-                    h.stable_id
-                        .is_none_or(|id| deleted.binary_search(&id).is_err())
-                });
-            }
+        if let Some(deleted) = hidden_deleted.as_ref()
+            && !deleted.is_empty()
+        {
+            hits.retain(|h| {
+                h.stable_id
+                    .is_none_or(|id| deleted.binary_search(&id).is_err())
+            });
         }
         Ok(hits)
     }
@@ -1123,7 +1116,7 @@ impl SupertableReader {
             terms: tokens.clone(),
             mode: filter.mode,
         }];
-        let surviving: HashSet<u128> = select_superfiles(&manifest, &prune_leaves)
+        let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
             .await?
             .iter()
             .map(|e| e.superfile_id.as_u128())
@@ -1132,7 +1125,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let superfiles = self
-            .vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+            .vector_pruned_superfiles_intersect(manifest, column, query, &surviving)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -1238,14 +1231,14 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = match plan.surviving_superfile_ids(&manifest).await? {
+        let superfiles = match plan.surviving_superfile_ids(manifest).await? {
             None => manifest
                 .get_pruned_superfiles_for_vector(column, query)
                 .await
                 .map_err(QueryError::ManifestLoad)?,
             Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
             Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+                self.vector_pruned_superfiles_intersect(manifest, column, query, &surviving)
                     .await?
             }
         };
@@ -1776,7 +1769,7 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::HashSet, slice, sync::Arc};
 
     use arrow::array::Array;
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
@@ -1796,6 +1789,7 @@ mod tests {
                 CellTree, CellTreeNode, ClusterRef, RunFragment, RunFragmentKind,
                 SpfreshRoutingIndex,
             },
+            opann::resident::build_resident_trees,
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -2074,6 +2068,8 @@ mod tests {
             out.extend_from_slice(&x.to_le_bytes());
             out
         };
+        // nprobe = 1 over one cell keeps the inner budget at one leaf, so the
+        // per-cell tree descent selects only the nearest fine centroid.
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: None,
@@ -2099,7 +2095,7 @@ mod tests {
                             superfile_uri: id.to_string(),
                             run_id: 3,
                             byte_range: (10, 20),
-                            row_count: 4,
+                            row_count: 100,
                             kind: RunFragmentKind::Base,
                         }],
                     },
@@ -2110,22 +2106,28 @@ mod tests {
                             superfile_uri: id.to_string(),
                             run_id: 1,
                             byte_range: (30, 20),
-                            row_count: 4,
+                            row_count: 100,
                             kind: RunFragmentKind::Base,
                         }],
                     },
                 ],
             }],
         };
+        let forest = build_resident_trees(
+            1,
+            1,
+            &routing,
+            &ResidentCentroids::default(),
+            Metric::L2Sq,
+            1,
+        );
 
         let selected = super::spfresh_run_probes_by_superfile(
-            Some(routing.clone()),
+            &forest,
             "emb",
-            &[entry.clone()],
-            Metric::L2Sq,
+            slice::from_ref(&entry),
             &[99.0],
             1,
-            None,
             None,
         );
         let probes = selected.get(&entry.uri).expect("selected probes");
@@ -2135,13 +2137,11 @@ mod tests {
         );
 
         let filtered_out = super::spfresh_run_probes_by_superfile(
-            Some(routing),
+            &forest,
             "emb",
-            &[entry.clone()],
-            Metric::L2Sq,
+            slice::from_ref(&entry),
             &[99.0],
             1,
-            None,
             Some(&[3]),
         );
         assert!(filtered_out.is_empty());
@@ -2165,6 +2165,9 @@ mod tests {
             vector_layout: VectorLayout::Spfresh,
             subsection_offsets: None,
         });
+        // nprobe = 1 over one cell keeps the inner budget at one leaf, so the
+        // per-cell tree descent selects only the nearest fine centroid — and
+        // every live fragment (base + delta) under it is expanded.
         let routing = SpfreshRoutingIndex {
             column: "emb".into(),
             centroid_blob_uri: Some("spfresh-centroids/centroids-test.bin".into()),
@@ -2179,7 +2182,7 @@ mod tests {
                             superfile_uri: id.to_string(),
                             run_id: 3,
                             byte_range: (10, 20),
-                            row_count: 4,
+                            row_count: 100,
                             kind: RunFragmentKind::Delta,
                         }],
                     },
@@ -2191,14 +2194,14 @@ mod tests {
                                 superfile_uri: id.to_string(),
                                 run_id: 1,
                                 byte_range: (30, 20),
-                                row_count: 4,
+                                row_count: 100,
                                 kind: RunFragmentKind::Base,
                             },
                             RunFragment {
                                 superfile_uri: id.to_string(),
                                 run_id: 2,
                                 byte_range: (50, 20),
-                                row_count: 4,
+                                row_count: 100,
                                 kind: RunFragmentKind::Delta,
                             },
                         ],
@@ -2210,15 +2213,14 @@ mod tests {
             dim: 1,
             centroids: Arc::from(vec![0.0f32, 100.0]),
         };
+        let forest = build_resident_trees(1, 1, &routing, &resident, Metric::L2Sq, 1);
 
         let selected = super::spfresh_run_probes_by_superfile(
-            Some(routing),
+            &forest,
             "emb",
-            &[entry.clone()],
-            Metric::L2Sq,
+            slice::from_ref(&entry),
             &[99.0],
             1,
-            Some(&resident),
             None,
         );
         let probes = selected.get(&entry.uri).expect("selected probes");

@@ -1195,14 +1195,14 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
-            if let Some(hi) = hidden_inner {
-                if let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await {
-                    tracing::warn!(
-                        "supertable: hidden vector-index deleted-set record failed: {e} \
-                         (user-table delete is durable; vector search may transiently \
-                         return deleted rows until the next successful record)"
-                    );
-                }
+            if let Some(hi) = hidden_inner
+                && let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await
+            {
+                tracing::warn!(
+                    "supertable: hidden vector-index deleted-set record failed: {e} \
+                     (user-table delete is durable; vector search may transiently \
+                     return deleted rows until the next successful record)"
+                );
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -1243,23 +1243,21 @@ impl SupertableWriter {
                 .get_global_vector_index()
                 .is_none()
             && !buffer.is_empty()
+            && let Some(vc) = self.inner.options.vector_columns.first()
+            && let Some(grid) = bootstrap_centroids_from_batch(
+                &buffer,
+                vc.dim,
+                super::handle::GLOBAL_VECTOR_CELL_COUNT,
+                vc.metric,
+            )
         {
-            if let Some(vc) = self.inner.options.vector_columns.first() {
-                if let Some(grid) = bootstrap_centroids_from_batch(
-                    &buffer,
-                    vc.dim,
-                    super::handle::GLOBAL_VECTOR_CELL_COUNT,
-                    vc.metric,
-                ) {
-                    let index = super::manifest::GlobalVectorIndex {
-                        column: vc.column.clone(),
-                        grid,
-                    };
-                    self.inner.manifest.store(Arc::new(
-                        self.inner.manifest.load().with_global_vector_index(index),
-                    ));
-                }
-            }
+            let index = super::manifest::GlobalVectorIndex {
+                column: vc.column.clone(),
+                grid,
+            };
+            self.inner.manifest.store(Arc::new(
+                self.inner.manifest.load().with_global_vector_index(index),
+            ));
         }
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
@@ -1841,6 +1839,36 @@ fn spfresh_leaf(cell_id: u32, cluster_id: u32, fragment: RunFragment) -> Cluster
     }
 }
 
+#[derive(Debug, Clone)]
+struct LiveFineCentroid {
+    cell_id: u32,
+    cluster_id: u32,
+    centroid: Vec<f32>,
+}
+
+fn live_fine_centroid_catalog(
+    routing: Option<&SpfreshRoutingIndex>,
+    resident: &ResidentCentroids,
+) -> Vec<LiveFineCentroid> {
+    let Some(routing) = routing else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for cell in &routing.cells {
+        for leaf in &cell.leaves {
+            let Some(centroid) = resident.centroid(leaf.cluster_id) else {
+                continue;
+            };
+            out.push(LiveFineCentroid {
+                cell_id: leaf.cell_id,
+                cluster_id: leaf.cluster_id,
+                centroid: centroid.to_vec(),
+            });
+        }
+    }
+    out
+}
+
 fn mean_run_centroid(rows: &[MaterializedIvfRow], cluster_id: u32, dim: usize) -> Option<Vec<f32>> {
     let mut centroid = vec![0.0f32; dim];
     let mut count = 0usize;
@@ -1953,31 +1981,51 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
     entries_to_remove: &[Arc<SuperfileEntry>],
     prepared: &[PreparedSuperfile],
     fragment_kind: RunFragmentKind,
+    preserve_existing_centroids: bool,
 ) -> Result<(SpfreshRoutingIndex, ResidentCentroids), BuildError> {
     let removed: HashSet<String> = entries_to_remove
         .iter()
         .map(|entry| entry.uri.0.to_string())
         .collect();
-    // Carry the prior resident centroids forward so existing leaves keep their
-    // (stable) resident indices; new runs append after them. Empty on the first
-    // drain, when there are no existing leaves to preserve.
-    let mut centroids = existing_centroids.centroids.to_vec();
+    // Rebuild the resident centroid blob from live leaves only. Old cluster ids
+    // are remapped so removed leaves do not leave dead fp32 slots resident forever.
+    let mut centroids = Vec::new();
+    let mut old_to_new: HashMap<u32, u32> = HashMap::new();
+    let mut leaf_pos_by_old: HashMap<(u32, u32), (usize, usize)> = HashMap::new();
     let mut cells: Vec<CellTree> = (0..n_cells).map(empty_cell_tree).collect();
     if let Some(existing) = existing
         && existing.column == column
     {
-        for mut cell in existing.cells {
+        for cell in existing.cells {
             let cell_id = cell.cell_id as usize;
             while cell_id >= cells.len() {
                 cells.push(empty_cell_tree(cells.len() as u32));
             }
-            for leaf in &mut cell.leaves {
+            for mut leaf in cell.leaves {
                 leaf.fragments
                     .retain(|fragment| !removed.contains(&fragment.superfile_uri));
+                if leaf.fragments.is_empty() {
+                    continue;
+                }
+                let old_cluster_id = leaf.cluster_id;
+                let new_cluster_id = if let Some(&new_id) = old_to_new.get(&old_cluster_id) {
+                    new_id
+                } else {
+                    let Some(centroid) = existing_centroids.centroid(old_cluster_id) else {
+                        continue;
+                    };
+                    let new_id = u32::try_from(centroids.len() / dim).map_err(|_| {
+                        BuildError::Store("SPFresh hidden centroid id overflow".into())
+                    })?;
+                    centroids.extend_from_slice(centroid);
+                    old_to_new.insert(old_cluster_id, new_id);
+                    new_id
+                };
+                leaf.cluster_id = new_cluster_id;
+                let leaf_idx = cells[cell_id].leaves.len();
+                cells[cell_id].leaves.push(leaf);
+                leaf_pos_by_old.insert((cell.cell_id, old_cluster_id), (cell_id, leaf_idx));
             }
-            cell.leaves.retain(|leaf| !leaf.fragments.is_empty());
-            cell.nodes.clear();
-            cells[cell_id] = cell;
         }
     }
 
@@ -1995,12 +2043,6 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
             cells.push(empty_cell_tree(cells.len() as u32));
         }
         for (run_id, run) in spfresh.runs().iter().enumerate() {
-            let Some(centroid) = mean_run_centroid(&rows, run.cluster_id, dim) else {
-                continue;
-            };
-            let centroid_id = u32::try_from(centroids.len() / dim)
-                .map_err(|_| BuildError::Store("SPFresh hidden centroid id overflow".into()))?;
-            centroids.extend_from_slice(&centroid);
             let range = spfresh
                 .run_range(run_id)
                 .ok_or_else(|| BuildError::Store(format!("SPFresh run {run_id} missing range")))?;
@@ -2011,9 +2053,44 @@ pub(in crate::supertable) fn extend_hidden_spfresh_routing(
                 run.row_count,
                 fragment_kind,
             )?;
+            if (fragment_kind == RunFragmentKind::Delta || preserve_existing_centroids)
+                && let Some(&(cell_idx, leaf_idx)) =
+                    leaf_pos_by_old.get(&(coarse_cell, run.cluster_id))
+            {
+                cells[cell_idx].leaves[leaf_idx].fragments.push(fragment);
+                continue;
+            }
+            if preserve_existing_centroids
+                && let Some(centroid) = existing_centroids.centroid(run.cluster_id)
+            {
+                let centroid_id = if let Some(&new_id) = old_to_new.get(&run.cluster_id) {
+                    new_id
+                } else {
+                    let new_id = u32::try_from(centroids.len() / dim).map_err(|_| {
+                        BuildError::Store("SPFresh hidden centroid id overflow".into())
+                    })?;
+                    centroids.extend_from_slice(centroid);
+                    old_to_new.insert(run.cluster_id, new_id);
+                    new_id
+                };
+                let leaf_idx = cells[cid].leaves.len();
+                cells[cid]
+                    .leaves
+                    .push(spfresh_leaf(coarse_cell, centroid_id, fragment));
+                leaf_pos_by_old.insert((coarse_cell, run.cluster_id), (cid, leaf_idx));
+                continue;
+            }
+            let Some(centroid) = mean_run_centroid(&rows, run.cluster_id, dim) else {
+                continue;
+            };
+            let centroid_id = u32::try_from(centroids.len() / dim)
+                .map_err(|_| BuildError::Store("SPFresh hidden centroid id overflow".into()))?;
+            centroids.extend_from_slice(&centroid);
+            let leaf_idx = cells[cid].leaves.len();
             cells[cid]
                 .leaves
                 .push(spfresh_leaf(coarse_cell, centroid_id, fragment));
+            leaf_pos_by_old.insert((coarse_cell, run.cluster_id), (cid, leaf_idx));
         }
     }
 
@@ -2730,25 +2807,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
 
             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
-            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-            if assign_skip {
-                for row in all_rows {
-                    by_cell.entry(row.cluster).or_default().push(row);
-                }
-            } else {
-                let clusters_ref = &running_clusters;
-                let assignments: Vec<u32> = hidden_inner.options.writer_pool.install(|| {
-                    all_rows
-                        .par_iter()
-                        .map(|row| {
-                            spfresh::nearest_cell_encoded(clusters_ref, metric, &row.encoded)
-                        })
-                        .collect()
-                });
-                for (row, cell) in all_rows.into_iter().zip(assignments) {
-                    by_cell.entry(cell).or_default().push(row);
-                }
-            }
             let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
 
             crate::superfile::vector::builder::build_phase_timers::reset();
@@ -2759,8 +2817,37 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             // query might route to. IVF keeps one run per cell (untouched).
             let n_cells;
             if hidden_vector_layout == VectorLayout::Spfresh {
-                let entries: Vec<(u32, Vec<MaterializedIvfRow>)> = by_cell.into_iter().collect();
-                let (new_prepared, new_cell_updates) =
+                let existing_routing = hidden_inner.manifest.load_full().get_spfresh_routing();
+                let existing_resident = hidden_inner.resident_spfresh_centroids.load_full();
+                let catalog =
+                    live_fine_centroid_catalog(existing_routing.as_ref(), &existing_resident);
+                let (new_prepared, new_cell_updates) = if catalog.is_empty() {
+                    let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+                    if assign_skip {
+                        for row in all_rows {
+                            by_cell.entry(row.cluster).or_default().push(row);
+                        }
+                    } else {
+                        let clusters_ref = &running_clusters;
+                        let assignments: Vec<u32> =
+                            hidden_inner.options.writer_pool.install(|| {
+                                all_rows
+                                    .par_iter()
+                                    .map(|row| {
+                                        spfresh::nearest_cell_encoded(
+                                            clusters_ref,
+                                            metric,
+                                            &row.encoded,
+                                        )
+                                    })
+                                    .collect()
+                            });
+                        for (row, cell) in all_rows.into_iter().zip(assignments) {
+                            by_cell.entry(cell).or_default().push(row);
+                        }
+                    }
+                    let entries: Vec<(u32, Vec<MaterializedIvfRow>)> =
+                        by_cell.into_iter().collect();
                     hidden_inner.options.writer_pool.install(|| {
                         build_spfresh_cell_shards_in_scope(
                             &hidden_inner,
@@ -2770,11 +2857,43 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             replication_eps(),
                             &running_clusters.counts,
                         )
-                    })?;
+                    })?
+                } else {
+                    hidden_inner.options.writer_pool.install(|| {
+                        build_spfresh_delta_shards_for_existing_centroids(
+                            &hidden_inner,
+                            all_rows,
+                            &catalog,
+                            vec_dim,
+                            metric,
+                            replication_eps(),
+                            &running_clusters.counts,
+                        )
+                    })?
+                };
                 n_cells = new_prepared.len();
                 cell_updates.extend(new_cell_updates);
                 prepared.extend(new_prepared);
             } else {
+                let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+                if assign_skip {
+                    for row in all_rows {
+                        by_cell.entry(row.cluster).or_default().push(row);
+                    }
+                } else {
+                    let clusters_ref = &running_clusters;
+                    let assignments: Vec<u32> = hidden_inner.options.writer_pool.install(|| {
+                        all_rows
+                            .par_iter()
+                            .map(|row| {
+                                spfresh::nearest_cell_encoded(clusters_ref, metric, &row.encoded)
+                            })
+                            .collect()
+                    });
+                    for (row, cell) in all_rows.into_iter().zip(assignments) {
+                        by_cell.entry(cell).or_default().push(row);
+                    }
+                }
                 let shards: Vec<(u32, ShardOutput, u32)> =
                     hidden_inner.options.writer_pool.install(|| {
                         by_cell
@@ -2863,6 +2982,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &no_removals,
                 &prepared,
                 RunFragmentKind::Delta,
+                false,
             )?)
         } else {
             None
@@ -3108,7 +3228,7 @@ pub(in crate::supertable) fn apply_fine_replication(
     let mut global_centroids: Vec<f32> = Vec::new();
     let mut global_map: Vec<(u32, u32)> = Vec::new();
     for ((cell, _), cents) in entries.iter().zip(centroids.iter()) {
-        let k = if dim == 0 { 0 } else { cents.len() / dim };
+        let k = cents.len().checked_div(dim).unwrap_or(0);
         for fine in 0..k {
             global_centroids.extend_from_slice(&cents[fine * dim..(fine + 1) * dim]);
             global_map.push((*cell, fine as u32));
@@ -3197,6 +3317,66 @@ fn build_spfresh_cell_shards_in_scope(
     Ok((prepared, cell_updates))
 }
 
+fn build_spfresh_delta_shards_for_existing_centroids(
+    inner: &SupertableInner,
+    rows: Vec<MaterializedIvfRow>,
+    catalog: &[LiveFineCentroid],
+    vec_dim: usize,
+    metric: Metric,
+    eps: f32,
+    base_counts: &[u32],
+) -> Result<(Vec<PreparedSuperfile>, HashMap<u32, u32>), BuildError> {
+    if rows.is_empty() || catalog.is_empty() {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+    let mut global_centroids = Vec::with_capacity(catalog.len() * vec_dim);
+    for item in catalog {
+        global_centroids.extend_from_slice(&item.centroid);
+    }
+    let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+    for row in rows {
+        for replica in fine_replicas_for_row(metric, vec_dim, &global_centroids, &row, eps) {
+            let Some(target) = catalog.get(replica as usize) else {
+                continue;
+            };
+            let mut routed = row.clone();
+            routed.cluster = target.cluster_id;
+            by_cell.entry(target.cell_id).or_default().push(routed);
+        }
+    }
+    let shards: Vec<(u32, ShardOutput, u32)> = by_cell
+        .into_par_iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .map(|(cell_id, mut rows)| {
+            rows.sort_by_key(|row| (row.cluster, row.stable_id));
+            for (local, row) in rows.iter_mut().enumerate() {
+                row.local_doc_id = local as u32;
+            }
+            let added = rows.len() as u32;
+            let shard =
+                build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Spfresh)?;
+            Ok::<_, BuildError>((cell_id, shard, added))
+        })
+        .collect::<Result<Vec<_>, BuildError>>()?;
+
+    let mut prepared = Vec::with_capacity(shards.len());
+    let mut cell_updates = HashMap::with_capacity(shards.len());
+    for (cell_id, shard, added) in shards {
+        let prep = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+        let entry = finish_superfile_entry(inner, prep.entry, Some(cell_id))?;
+        let base = base_counts.get(cell_id as usize).copied().unwrap_or(0);
+        cell_updates.insert(cell_id, base.saturating_add(added));
+        prepared.push(PreparedSuperfile {
+            entry,
+            bytes_for_store: prep.bytes_for_store,
+            bytes_for_storage: prep.bytes_for_storage,
+            bytes_for_cache: prep.bytes_for_cache,
+        });
+    }
+
+    Ok((prepared, cell_updates))
+}
+
 /// Drop replica copies of the same row, keeping one canonical copy per
 /// `stable_id`. Boundary replication stores a row in several runs; a compaction
 /// that merges those runs must collapse them before re-clustering so duplicates
@@ -3206,12 +3386,34 @@ fn dedup_materialized_by_stable_id(rows: &mut Vec<MaterializedIvfRow>) {
     rows.retain(|row| seen.insert(row.stable_id));
 }
 
+fn dedup_materialized_by_cluster_and_stable_id(rows: &mut Vec<MaterializedIvfRow>) {
+    let mut seen: HashSet<(u32, i128)> = HashSet::with_capacity(rows.len());
+    rows.retain(|row| seen.insert((row.cluster, row.stable_id)));
+}
+
+/// Merge hidden SPFresh fragments without changing the fine-centroid catalog.
+/// Ordinary merge is a physical compaction of base/delta fragments; centroid
+/// replacement is split/reassign's job because it must refresh cross-cell
+/// boundary replicas.
+pub(in crate::supertable) fn compact_spfresh_shard_preserving_clusters(
+    mut rows: Vec<MaterializedIvfRow>,
+    options: &SupertableOptions,
+) -> Result<ShardOutput, BuildError> {
+    dedup_materialized_by_cluster_and_stable_id(&mut rows);
+    rows.sort_by_key(|row| (row.cluster, row.stable_id));
+    for (local, row) in rows.iter_mut().enumerate() {
+        row.local_doc_id = local as u32;
+    }
+    build_one_shard_from_materialized(&rows, options, VectorLayout::Spfresh)
+}
+
 /// Rebuild one coarse cell's SPFresh shard from merged input rows (LIRE
 /// merge/split): dedup replicas by `stable_id`, retrain the cell's fine
 /// centroids over the union (which re-sizes runs toward the ~2 MB target — the
 /// implicit split), re-replicate within-cell boundaries at `eps`, then build the
 /// shard. Cross-cell replicas live in other cells' superfiles and are untouched
 /// by a single cell's compaction.
+#[cfg(test)]
 pub(in crate::supertable) fn rebuild_spfresh_shard_from_merged(
     mut rows: Vec<MaterializedIvfRow>,
     coarse_cell: u32,
@@ -3328,10 +3530,15 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     let mut sub_centroids = sub0;
     sub_centroids.extend_from_slice(&sub1);
 
-    let old_n_cent = clusters.n_cent;
     let (mut updated_clusters, new_cell_id) =
         spfresh::insert_split_centroid(&clusters, split_cell, &sub_centroids);
-    let neighborhood = spfresh::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
+    let neighborhood = spfresh::reassign_neighborhood(
+        &updated_clusters,
+        split_cell,
+        new_cell_id,
+        metric,
+        replication_eps(),
+    );
 
     let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
     for entry in manifest.superfiles.iter() {
@@ -3425,6 +3632,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
             &entries_to_remove,
             &prepared_for_routing,
             RunFragmentKind::Base,
+            false,
         )?;
         let uri = store_centroids(storage.as_ref(), resident.dim, resident.centroids.as_ref())
             .await
@@ -3436,7 +3644,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
                 .with_partition_strategy(PartitionStrategy::VectorCell {
                     column: column.clone(),
                     clusters: updated_clusters.clone(),
-                    routing: routing.clone(),
+                    routing,
                 })
                 .with_spfresh_routing(spfresh_routing),
         );
@@ -4116,7 +4324,7 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{collections::HashMap, sync::Arc, time::Instant};
 
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -4562,6 +4770,29 @@ mod tests {
         }
     }
 
+    fn test_spfresh_entry(
+        uri: SuperfileUri,
+        n_docs: u64,
+        partition_hint: Option<u32>,
+        offsets: Option<SubsectionOffsets>,
+    ) -> Arc<SuperfileEntry> {
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uri.0,
+            uri,
+            n_docs,
+            id_min: 0,
+            id_max: n_docs as i128,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint,
+            vector_layout: VectorLayout::Spfresh,
+            subsection_offsets: offsets,
+        })
+    }
+
     #[test]
     fn apply_fine_replication_replicates_boundary_row_across_cells() {
         // Cell 0 centroid (0,0), cell 1 centroid (10,0). The cell-0 row sits at
@@ -4633,6 +4864,37 @@ mod tests {
         let reader = SuperfileReader::open(shard.bytes).expect("open merged shard");
         let spfresh = reader.spfresh_vec().expect("spfresh blob");
         assert_eq!(spfresh.n_rows(), 3, "3 distinct stable_ids survive dedup");
+    }
+
+    #[test]
+    fn compact_spfresh_shard_preserves_cross_cluster_replicas() {
+        const DIM: usize = 16;
+        let mk = |stable_id: i128, cluster: u32| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster,
+            rabitq_code: Vec::new(),
+            encoded: EncodedCellRow {
+                stable_id,
+                scale: Arc::from(vec![1.0f32; DIM]),
+                offset: Arc::from(vec![0.0f32; DIM]),
+                codes: vec![1u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: Some(0.0),
+            },
+        };
+        let rows = vec![mk(100, 0), mk(100, 0), mk(100, 1), mk(200, 1)];
+        let shard = compact_spfresh_shard_preserving_clusters(rows, &options_vector_only(DIM))
+            .expect("compact");
+        let reader = SuperfileReader::open(shard.bytes).expect("open compacted shard");
+        let spfresh = reader.spfresh_vec().expect("spfresh blob");
+        assert_eq!(
+            spfresh.n_rows(),
+            3,
+            "duplicate within a cluster collapses, cross-cluster replica survives"
+        );
+        assert_eq!(spfresh.runs_for_cluster(0).len(), 1);
+        assert_eq!(spfresh.runs_for_cluster(1).len(), 1);
     }
 
     #[test]
@@ -4760,6 +5022,7 @@ mod tests {
             &[old_entry],
             &[prep],
             RunFragmentKind::Base,
+            false,
         )
         .expect("routing");
         let cell = routing
@@ -4779,6 +5042,151 @@ mod tests {
         // The appended leaf's cluster_id indexes the resident centroid blob.
         assert_eq!(resident.dim, DIM);
         assert!(resident.centroid(cell.leaves[0].cluster_id).is_some());
+    }
+
+    #[test]
+    fn spfresh_delta_routing_appends_to_existing_leaf_without_new_centroid() {
+        const DIM: usize = 16;
+        const ROWS: usize = 4;
+        const CELL_ID: u32 = 3;
+
+        let rows: Vec<MaterializedIvfRow> = (0..ROWS)
+            .map(|idx| {
+                let stable_id = 100 + idx as i128;
+                let mut codes = vec![0u8; DIM];
+                codes[0] = idx as u8;
+                MaterializedIvfRow {
+                    local_doc_id: idx as u32,
+                    stable_id,
+                    cluster: 0,
+                    rabitq_code: Vec::new(),
+                    encoded: EncodedCellRow {
+                        stable_id,
+                        scale: Arc::from(vec![1.0f32; DIM]),
+                        offset: Arc::from(vec![0.0f32; DIM]),
+                        codes,
+                        residuals: vec![0u8; DIM],
+                        norm_sq: Some(0.0),
+                    },
+                }
+            })
+            .collect();
+        let shard = build_one_shard_from_materialized(
+            &rows,
+            &options_vector_only(DIM),
+            VectorLayout::Spfresh,
+        )
+        .expect("build shard");
+        let offsets = build_subsection_offsets(&shard.bytes).expect("subsection offsets");
+        let uri = SuperfileUri::new_v4();
+        let entry = test_spfresh_entry(uri, shard.n_docs, Some(CELL_ID), Some(offsets));
+        let prep = PreparedSuperfile {
+            entry,
+            bytes_for_store: Some((uri, shard.bytes)),
+            bytes_for_storage: None,
+            bytes_for_cache: None,
+        };
+        let old_uri = SuperfileUri::new_v4();
+        let mut existing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: Some("spfresh-centroids/centroids-old.bin".into()),
+            cells: (0..GLOBAL_VECTOR_CELL_COUNT as u32)
+                .map(empty_cell_tree)
+                .collect(),
+        };
+        existing.cells[CELL_ID as usize].leaves.push(ClusterRef {
+            cell_id: CELL_ID,
+            cluster_id: 0,
+            fragments: vec![RunFragment {
+                superfile_uri: old_uri.0.to_string(),
+                run_id: 0,
+                byte_range: (11, 22),
+                row_count: ROWS as u32,
+                kind: RunFragmentKind::Base,
+            }],
+        });
+        let resident = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(vec![0.0f32; DIM]),
+        };
+
+        let (routing, resident) = extend_hidden_spfresh_routing(
+            Some(existing),
+            &resident,
+            "emb",
+            GLOBAL_VECTOR_CELL_COUNT as u32,
+            DIM,
+            &[],
+            &[prep],
+            RunFragmentKind::Delta,
+            false,
+        )
+        .expect("routing");
+        let cell = &routing.cells[CELL_ID as usize];
+        assert_eq!(cell.leaves.len(), 1);
+        assert_eq!(cell.leaves[0].cluster_id, 0);
+        assert_eq!(cell.leaves[0].fragments.len(), 2);
+        assert_eq!(cell.leaves[0].fragments[1].kind, RunFragmentKind::Delta);
+        assert_eq!(resident.centroids.len(), DIM);
+    }
+
+    #[test]
+    fn spfresh_routing_rebuild_compacts_live_centroid_blob() {
+        const DIM: usize = 4;
+        let remove_uri = SuperfileUri::new_v4();
+        let keep_uri = SuperfileUri::new_v4();
+        let remove_entry = test_spfresh_entry(remove_uri, 1, Some(0), None);
+        let mut existing = SpfreshRoutingIndex {
+            column: "emb".into(),
+            centroid_blob_uri: Some("spfresh-centroids/centroids-old.bin".into()),
+            cells: (0..2).map(empty_cell_tree).collect(),
+        };
+        existing.cells[0].leaves.push(ClusterRef {
+            cell_id: 0,
+            cluster_id: 0,
+            fragments: vec![RunFragment {
+                superfile_uri: remove_uri.0.to_string(),
+                run_id: 0,
+                byte_range: (0, 16),
+                row_count: 1,
+                kind: RunFragmentKind::Base,
+            }],
+        });
+        existing.cells[1].leaves.push(ClusterRef {
+            cell_id: 1,
+            cluster_id: 3,
+            fragments: vec![RunFragment {
+                superfile_uri: keep_uri.0.to_string(),
+                run_id: 0,
+                byte_range: (16, 16),
+                row_count: 1,
+                kind: RunFragmentKind::Base,
+            }],
+        });
+        let mut centroids = vec![0.0f32; 4 * DIM];
+        centroids[3 * DIM] = 42.0;
+        let resident = ResidentCentroids {
+            dim: DIM,
+            centroids: Arc::from(centroids),
+        };
+
+        let (routing, resident) = extend_hidden_spfresh_routing(
+            Some(existing),
+            &resident,
+            "emb",
+            2,
+            DIM,
+            &[remove_entry],
+            &[],
+            RunFragmentKind::Base,
+            false,
+        )
+        .expect("routing");
+        assert!(routing.cells[0].leaves.is_empty());
+        assert_eq!(routing.cells[1].leaves.len(), 1);
+        assert_eq!(routing.cells[1].leaves[0].cluster_id, 0);
+        assert_eq!(resident.centroids.len(), DIM);
+        assert_eq!(resident.centroid(0).expect("centroid")[0], 42.0);
     }
 
     #[test]
@@ -4933,6 +5341,7 @@ mod tests {
             &old_entries,
             &prepared,
             RunFragmentKind::Base,
+            false,
         )
         .expect("routing");
 

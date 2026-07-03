@@ -148,17 +148,15 @@ fn stable_ids_for_tagged_hits(reader: &SuperfileReader, locals: &[u32]) -> Optio
     if locals.is_empty() {
         return Some(Vec::new());
     }
-    if let Some(v) = reader.vec() {
-        if let Some(ids) = v.inline_stable_ids_for_locals(locals) {
-            return Some(ids);
-        }
+    if let Some(v) = reader.vec()
+        && let Some(ids) = v.inline_stable_ids_for_locals(locals)
+    {
+        return Some(ids);
     }
     if let Some(spfresh) = reader.spfresh_vec() {
         return spfresh.stable_ids_for_locals(locals).ok();
     }
-    if reader.parquet_bytes().is_none() {
-        return None;
-    }
+    reader.parquet_bytes()?;
     let id_column = reader.id_column();
     let batch = reader.take_by_local_doc_ids(locals, &[id_column]).ok()?;
     let array = batch.column(0).as_any().downcast_ref::<Decimal128Array>()?;
@@ -326,13 +324,11 @@ where
     // whose tombstones are resolved elsewhere (the hidden path filters via
     // the resident deleted-set, so its per-cell sidecars are always empty
     // and prefetching them is a wasted wave of GETs on the cold critical path).
-    if prefetch_tombstones {
-        if let Some(cache) = tombstone_cache.as_ref() {
-            let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            cache.prefetch(&ids, now).await;
-        }
+    if prefetch_tombstones && let Some(cache) = tombstone_cache.as_ref() {
+        let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        cache.prefetch(&ids, now).await;
     }
 
     let handles = units.into_iter().map(|(entry, params)| {

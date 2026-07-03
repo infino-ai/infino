@@ -31,10 +31,7 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     superfile::{
         builder::SuperfileBuilder,
-        vector::{
-            distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec,
-            spfresh::replication_eps,
-        },
+        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
     },
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
@@ -49,8 +46,8 @@ use crate::{
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, build_one_shard_from_materialized,
-            extend_hidden_spfresh_routing, finalize_compaction_commit, prepare_superfile,
-            rebuild_spfresh_shard_from_merged, split_overflow_cell_after_compaction,
+            compact_spfresh_shard_preserving_clusters, extend_hidden_spfresh_routing,
+            finalize_compaction_commit, prepare_superfile, split_overflow_cell_after_compaction,
             try_commit_attempt,
         },
     },
@@ -355,26 +352,10 @@ impl Supertable {
                 rows.extend(input_rows);
             }
             if is_hidden_vector_index_table(&self.inner().options) {
-                // Hidden index: blob stable ids are the real user `_id`s, so LIRE
-                // merge applies — dedup replicas, retrain the cell's fine
-                // centroids over the union (re-sizes runs toward ~2 MB, the
-                // implicit split), and re-replicate within-cell boundaries.
-                // Cross-cell replicas live in other cells and are untouched here.
-                let vec_col = manifest.options.vector_columns.first();
-                let dim = vec_col.map(|c| c.dim).unwrap_or(0);
-                let metric = vec_col.map(|c| c.metric).unwrap_or(Metric::L2Sq);
-                let coarse_cell = superfiles
-                    .first()
-                    .and_then(|entry| entry.partition_hint)
-                    .unwrap_or(0);
-                rebuild_spfresh_shard_from_merged(
-                    rows,
-                    coarse_cell,
-                    &manifest.options,
-                    dim,
-                    metric,
-                    replication_eps(),
-                )?
+                // Hidden merge is physical compaction only: preserve fine
+                // centroid ids so cross-cell replica coverage cannot go stale.
+                // Centroid-changing maintenance happens in split/reassign.
+                compact_spfresh_shard_preserving_clusters(rows, &manifest.options)?
             } else {
                 // User table: SPFresh blob stable ids are local (drain remaps them
                 // to real `_id`s), so dedup-by-stable-id would collapse distinct
@@ -588,6 +569,7 @@ impl Supertable {
                             &entries_to_remove,
                             slice::from_ref(&merged_segment),
                             RunFragmentKind::Base,
+                            true,
                         )
                         .map_err(|e| CompactionError::Build(e.to_string()))?;
                         if !resident.is_empty() {
@@ -1393,9 +1375,17 @@ mod tests {
 
         assert!(reader.vec().is_none());
         let spfresh = reader.spfresh_vec().expect("merged SPFresh blob");
+        let rows = spfresh.materialized_rows().expect("materialized rows");
+        let mut stable_ids: Vec<i128> = rows.iter().map(|row| row.stable_id).collect();
+        stable_ids.sort_unstable();
+        stable_ids.dedup();
         assert_eq!(
-            spfresh.n_rows(),
-            (SPFRESH_TEST_ROWS_PER_INPUT * SPFRESH_TEST_INPUTS) as u32
+            stable_ids.len(),
+            SPFRESH_TEST_ROWS_PER_INPUT * SPFRESH_TEST_INPUTS
+        );
+        assert!(
+            spfresh.n_rows() >= stable_ids.len() as u32,
+            "physical rows include retained boundary replicas"
         );
         assert!(!spfresh.runs().is_empty());
         let rows_in_runs: u32 = spfresh.runs().iter().map(|run| run.row_count).sum();

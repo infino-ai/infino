@@ -33,10 +33,9 @@
 #[cfg(target_arch = "x86_64")]
 use std::ptr::write_unaligned;
 
+use crate::superfile::vector::distance::{SQ8_RESIDUAL_DIVISOR, dot};
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
-
-use crate::superfile::vector::distance::{SQ8_RESIDUAL_DIVISOR, dot};
 
 /// Maximum Sq8 code value. Sq8 quantizes each component to a single
 /// unsigned byte, so the encoder clamps the FMA result to

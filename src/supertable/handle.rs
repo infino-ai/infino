@@ -39,10 +39,10 @@ use crate::{
         shutdown_query_runtime_on_drop,
     },
     storage::PrefixedStorageProvider,
-    superfile::vector::kmeans::kmeans,
-    superfile::vector::spfresh::hidden_index_layout,
+    superfile::vector::{kmeans::kmeans, spfresh::hidden_index_layout},
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats, hidden_centroids,
+        opann::resident::{SpfreshResidentTrees, build_resident_trees},
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -147,6 +147,12 @@ pub(super) struct SupertableInner {
     /// Hidden SPFresh fine centroids loaded from the manifest-owned side blob.
     /// Empty on user tables and on legacy/IVF hidden manifests.
     pub(super) resident_spfresh_centroids: ArcSwap<hidden_centroids::ResidentCentroids>,
+    /// Resident per-cell OPANN routing trees, built in memory from the
+    /// manifest's SPFresh routing (plus the resident centroid blob for hidden
+    /// leaves) at table open and rebuilt when the manifest snapshot or the
+    /// centroid blob swaps. Whole-tree residency replaces the ported branch's
+    /// paged on-disk form: descent is pure compute, zero object GETs.
+    pub(super) resident_spfresh_trees: ArcSwap<SpfreshResidentTrees>,
     /// Last time the read path checked the storage manifest pointer
     /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
     /// until the first check (so the first query always refreshes).
@@ -1073,6 +1079,14 @@ async fn build_handle(
     } else {
         hidden_centroids::ResidentCentroids::default()
     };
+    let resident_spfresh_centroids = Arc::new(resident_spfresh_centroids);
+    // The whole routing forest is built and made resident on table open;
+    // manifest swaps rebuild it through the reader accessor.
+    let resident_spfresh_trees = Arc::new(build_spfresh_trees_snapshot(
+        &options,
+        manifest.as_ref(),
+        &resident_spfresh_centroids,
+    ));
     let inner = Arc::new(SupertableInner {
         options,
         manifest: ArcSwap::new(manifest),
@@ -1084,7 +1098,8 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
-        resident_spfresh_centroids: ArcSwap::new(Arc::new(resident_spfresh_centroids)),
+        resident_spfresh_centroids: ArcSwap::new(resident_spfresh_centroids),
+        resident_spfresh_trees: ArcSwap::new(resident_spfresh_trees),
         last_pointer_check: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
@@ -1094,6 +1109,41 @@ async fn build_handle(
         let _ = st.run_gc_sweep_once().await;
     }
     Ok(st)
+}
+
+/// Build the resident OPANN routing forest for one manifest snapshot: one
+/// per-cell tree over the manifest's SPFresh routing leaves, hidden leaves
+/// resolved through `resident`. Empty (routes nothing) when the manifest has
+/// no SPFresh routing or the routing column isn't configured.
+fn build_spfresh_trees_snapshot(
+    options: &SupertableOptions,
+    manifest: &Manifest,
+    resident: &Arc<hidden_centroids::ResidentCentroids>,
+) -> SpfreshResidentTrees {
+    let resident_ptr = Arc::as_ptr(resident) as usize;
+    let empty = || SpfreshResidentTrees {
+        manifest_id: manifest.manifest_id,
+        resident_ptr,
+        ..SpfreshResidentTrees::default()
+    };
+    let Some(routing) = manifest.get_spfresh_routing() else {
+        return empty();
+    };
+    let Some(vc) = options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == routing.column)
+    else {
+        return empty();
+    };
+    build_resident_trees(
+        manifest.manifest_id,
+        resident_ptr,
+        &routing,
+        resident,
+        vc.metric,
+        vc.dim,
+    )
 }
 
 /// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
@@ -1295,8 +1345,26 @@ impl SupertableReader {
         self.inner.vector_index_table.as_ref()
     }
 
-    pub(crate) fn resident_spfresh_centroids(&self) -> Arc<hidden_centroids::ResidentCentroids> {
-        self.inner.resident_spfresh_centroids.load_full()
+    /// The resident OPANN routing forest for this reader's manifest snapshot.
+    /// Served from the handle's `ArcSwap` when it matches the snapshot (and
+    /// the current centroid blob); rebuilt in memory and swapped when a commit
+    /// / drain / compaction has moved either. Descent over the returned trees
+    /// is pure compute — zero object GETs.
+    pub(crate) fn resident_spfresh_trees(&self) -> Arc<SpfreshResidentTrees> {
+        let resident = self.inner.resident_spfresh_centroids.load_full();
+        let resident_ptr = Arc::as_ptr(&resident) as usize;
+        let current = self.inner.resident_spfresh_trees.load_full();
+        if current.manifest_id == self.manifest.manifest_id && current.resident_ptr == resident_ptr
+        {
+            return current;
+        }
+        let built = Arc::new(build_spfresh_trees_snapshot(
+            &self.inner.options,
+            self.manifest.as_ref(),
+            &resident,
+        ));
+        self.inner.resident_spfresh_trees.store(Arc::clone(&built));
+        built
     }
 }
 

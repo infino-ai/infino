@@ -7,9 +7,10 @@
 //! and Sq8-transcodes rerank rows only when a source cluster's quantizer
 //! differs from the destination — no fp32 corpus buffer and no re-kmeans.
 
+use std::collections::HashMap;
+
 use bytemuck::cast_slice;
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 use crate::superfile::{
     BuildError,
@@ -483,17 +484,15 @@ pub(crate) fn splice_fragments_into_cell(
                 let rowb = full_at + i * inp.per_vec_bytes;
                 let full_off = blk.rerank_base + i * per_vec_bytes;
                 bytes[full_off..full_off + dim * 2].copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
-                if store_norm {
-                    if let Some(norms_off) = sq8_norms_block_off {
-                        let n_sq = sq8_residual_norm_sq(
-                            scale_c,
-                            offset_c,
-                            &inp.sub[rowb..rowb + dim],
-                            &inp.sub[rowb + dim..rowb + dim + dim],
-                        );
-                        let n_off = norms_off + out_row * 4;
-                        bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
-                    }
+                if store_norm && let Some(norms_off) = sq8_norms_block_off {
+                    let n_sq = sq8_residual_norm_sq(
+                        scale_c,
+                        offset_c,
+                        &inp.sub[rowb..rowb + dim],
+                        &inp.sub[rowb + dim..rowb + dim + dim],
+                    );
+                    let n_off = norms_off + out_row * 4;
+                    bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                 }
             }
             debug_assert_eq!(count, blk.count);
