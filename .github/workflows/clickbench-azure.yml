@@ -250,11 +250,11 @@ jobs:
             echo "- load \`${load_time:-?}\` · data size \`$(( ${data_sz:-0} / 1000000 )) MB\` · **${geomean:-hot geomean: n/a}**"
             echo ""
             if grep -q 'hot geomean' "$LOG"; then
-              echo "### Cold/hot per query"
-              echo '```'
-              # From the sweep table header to the geomean line.
-              awk '/^Q +cold/{f=1} f' "$LOG"
-              echo '```'
+              echo "### Cold/hot per query (seconds)"
+              echo "| Q | cold | t2 | t3 | hot |"
+              echo "|--:|--:|--:|--:|--:|"
+              # Sweep data rows start with the query number; render as a table.
+              awk '/^[0-9]+[[:space:]]/{printf "| %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5}' "$LOG"
             else
               echo "**❌ No sweep results — see the uploaded log.**"
             fi
