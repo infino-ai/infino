@@ -502,8 +502,12 @@ impl Connection {
                 .sql(&sql)
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))?;
-            // Preserve the output schema so a zero-row result is a well-formed
-            // empty batch rather than a schema-less Vec.
+
+            // A RecordBatch carries the schema; an empty Vec does not. Capture
+            // the output schema before collect() consumes the DataFrame so a
+            // zero-row result returns one empty batch with the projected
+            // schema, rather than a schema-less Vec — which the Python binding's
+            // Table.from_batches([]) can't build from.
             let output_schema: SchemaRef = df.schema().inner().clone();
             let batches = df.collect().await.map_err(sql_exec_error)?;
             if batches.is_empty() {
@@ -1132,8 +1136,40 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_zero_row_result_carries_projected_schema() {
-        // A WHERE predicate that matches nothing must return a batch with the projected schema
+    fn query_sql_zero_row_filter_preserves_projected_schema() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+
+        // Same projection with rows gives the ground-truth schema to compare against.
+        let with_rows = conn
+            .query_sql("SELECT _id, title FROM docs")
+            .expect("query with rows");
+        let expected_schema = with_rows[0].schema();
+
+        let batches = conn
+            .query_sql("SELECT _id, title FROM docs WHERE title = 'no_match'")
+            .expect("zero-row query must not error");
+        assert!(
+            !batches.is_empty(),
+            "must contain at least one (empty) batch"
+        );
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "no rows should match");
+        assert_eq!(
+            batches[0].schema(),
+            expected_schema,
+            "zero-row schema must match the with-rows schema"
+        );
+    }
+
+    #[test]
+    fn query_sql_zero_row_group_by_preserves_projected_schema() {
+        // GROUP BY is a different DataFusion operator path from a filtered scan;
+        // zero matching groups must still produce a schema-bearing empty batch.
         let conn = connect("memory://").expect("connect");
         let docs = conn
             .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
@@ -1142,21 +1178,24 @@ mod tests {
             .expect("append");
 
         let batches = conn
-            .query_sql("SELECT title FROM docs WHERE title = 'no_match'")
-            .expect("zero-row query must not error");
+            .query_sql(
+                "SELECT title, COUNT(*) AS n FROM docs WHERE title = 'no_match' GROUP BY title",
+            )
+            .expect("zero-row GROUP BY must not error");
         assert!(
             !batches.is_empty(),
             "must contain at least one (empty) batch"
         );
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 0, "no rows should match");
+        assert_eq!(total_rows, 0, "no groups should form");
+        let schema = batches[0].schema();
         assert!(
-            batches[0]
-                .schema()
-                .fields()
-                .iter()
-                .any(|f| f.name() == "title"),
+            schema.fields().iter().any(|f| f.name() == "title"),
             "projected schema must include 'title'"
+        );
+        assert!(
+            schema.fields().iter().any(|f| f.name() == "n"),
+            "projected schema must include 'n'"
         );
     }
 
