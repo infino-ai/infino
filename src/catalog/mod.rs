@@ -1177,6 +1177,14 @@ mod tests {
         docs.append(&build_title_batch(&["alpha", "beta"]))
             .expect("append");
 
+        // The same aggregate over matching rows gives the ground-truth schema:
+        // an aggregate's output schema (group keys + aggregate exprs) must be
+        // identical whether or not any group forms.
+        let with_groups = conn
+            .query_sql("SELECT title, COUNT(*) AS n FROM docs GROUP BY title")
+            .expect("GROUP BY with rows");
+        let expected_schema = with_groups[0].schema();
+
         let batches = conn
             .query_sql(
                 "SELECT title, COUNT(*) AS n FROM docs WHERE title = 'no_match' GROUP BY title",
@@ -1188,14 +1196,10 @@ mod tests {
         );
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 0, "no groups should form");
-        let schema = batches[0].schema();
-        assert!(
-            schema.fields().iter().any(|f| f.name() == "title"),
-            "projected schema must include 'title'"
-        );
-        assert!(
-            schema.fields().iter().any(|f| f.name() == "n"),
-            "projected schema must include 'n'"
+        assert_eq!(
+            batches[0].schema(),
+            expected_schema,
+            "zero-group schema must match the with-groups schema"
         );
     }
 
