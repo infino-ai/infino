@@ -18,8 +18,9 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{
     ClientOptions, Error as ObjError, GetOptions, GetRange, MultipartUpload, ObjectMeta as OsMeta,
-    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, StaticCredentialProvider,
+    UpdateVersion,
+    gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
     path::Path as ObjPath,
 };
 
@@ -37,6 +38,14 @@ const GCS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whole-request timeout (incl. body), sized for a multi-MB superfile PUT.
 const GCS_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Reserved storage option carrying a pre-obtained OAuth2 bearer token for GCS
+/// (for example a short-lived, prefix-scoped access token the caller obtained
+/// out of band). Unlike the S3 session token or an Azure SAS, a GCS bearer token has no
+/// `object_store` config-key, so it is applied programmatically through the
+/// client's credential provider. When present it is consumed here rather than
+/// folded on as a `google_*` config key (which would be rejected as unknown).
+const GCS_BEARER_TOKEN_OPTION: &str = "google_bearer_token";
 
 /// GCS-backed `StorageProvider`. Cheap to clone; the inner
 /// `GoogleCloudStorage` shares its HTTP client across clones.
@@ -56,9 +65,10 @@ impl GcsStorageProvider {
         Self::new_with_prefix(bucket, "", &StorageOptions::new())
     }
 
-    /// GCS provider scoped to `prefix` inside `bucket`, configured from
-    /// `opts` (service-account key/path, keyed by object_store's `google_*`
-    /// strings). The prefix isolates each table under `gs://bucket/prefix/`.
+    /// GCS provider scoped to `prefix` inside `bucket`, configured from `opts`:
+    /// object_store's `google_*` config strings (service-account key/path), plus
+    /// the reserved [`GCS_BEARER_TOKEN_OPTION`] carrying a pre-obtained OAuth2
+    /// bearer token. The prefix isolates each table under `gs://bucket/prefix/`.
     pub fn new_with_prefix(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -66,11 +76,20 @@ impl GcsStorageProvider {
     ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let uri = format!("gs://{bucket}");
-        let builder = GoogleCloudStorageBuilder::new()
+        let mut builder = GoogleCloudStorageBuilder::new()
             .with_bucket_name(&bucket)
             .with_client_options(tuned_client_options())
             .with_retry(retry::config());
-        let builder = apply::<GoogleConfigKey, _>(builder, opts, &uri, |b, key, value| {
+        // A bearer token has no object_store config-key, so pull it out and set
+        // it on the client's credential provider; the rest fold on as config keys.
+        let mut config_opts = opts.clone();
+        if let Some(bearer) = config_opts.remove(GCS_BEARER_TOKEN_OPTION) {
+            builder =
+                builder.with_credentials(Arc::new(StaticCredentialProvider::new(GcpCredential {
+                    bearer,
+                })));
+        }
+        let builder = apply::<GoogleConfigKey, _>(builder, &config_opts, &uri, |b, key, value| {
             b.with_config(key, value)
         })?;
         let store = builder.build().map_err(|e| StorageError::Permanent {
@@ -348,6 +367,48 @@ mod tests {
             .build()
             .expect("build test store");
         GcsStorageProvider::from_object_store("test-bucket", store)
+    }
+
+    #[test]
+    fn new_with_prefix_applies_a_bearer_token() {
+        // A bearer token has no object_store config-key; the provider must apply
+        // it via the credential provider and build, not reject it as unknown.
+        let opts = StorageOptions::from([(
+            GCS_BEARER_TOKEN_OPTION.to_string(),
+            "ya29.a-test-access-token".to_string(),
+        )]);
+        let provider = GcsStorageProvider::new_with_prefix("test-bucket", "some/prefix", &opts)
+            .expect("a bearer token builds a provider");
+        assert_eq!(provider.bucket, "test-bucket");
+    }
+
+    #[test]
+    fn new_with_prefix_pairs_a_bearer_token_with_config_keys() {
+        // The bearer token is consumed; remaining `google_*` options still fold
+        // on as config keys (here a base URL), so the two paths coexist.
+        let opts = StorageOptions::from([
+            (
+                GCS_BEARER_TOKEN_OPTION.to_string(),
+                "ya29.a-test-access-token".to_string(),
+            ),
+            (
+                "google_base_url".to_string(),
+                "http://127.0.0.1:1".to_string(),
+            ),
+        ]);
+        let provider = GcsStorageProvider::new_with_prefix("test-bucket", "", &opts)
+            .expect("bearer token and config keys coexist");
+        assert_eq!(provider.bucket, "test-bucket");
+    }
+
+    #[test]
+    fn new_with_prefix_still_rejects_an_unknown_config_key() {
+        // Intercepting the bearer token must not weaken the loud-failure contract:
+        // an unrelated unknown key is still rejected, not silently dropped.
+        let opts = StorageOptions::from([("google_not_a_real_key".to_string(), "x".to_string())]);
+        let err = GcsStorageProvider::new_with_prefix("test-bucket", "", &opts)
+            .expect_err("an unknown config key is rejected");
+        assert!(matches!(err, StorageError::Permanent { .. }));
     }
 
     #[test]
