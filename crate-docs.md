@@ -144,4 +144,4 @@ enums.
 infino also ships **Python** (`pip install infino`) and **Node.js**
 (`npm install @infino-ai/infino`) bindings. For concepts, guides, and
 multi-language examples, see the full documentation at
-[docs.infino.ai](https://docs.infino.ai).
+[infino.ai/docs](https://infino.ai/docs).

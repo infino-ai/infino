@@ -7,8 +7,8 @@
 // Python/Node guides live in their own bindings and on the docs site.
 #![doc = include_str!("../crate-docs.md")]
 #![doc(
-    html_logo_url = "https://docs.infino.ai/logo/infino-logo.png",
-    html_favicon_url = "https://docs.infino.ai/favicon.png"
+    html_logo_url = "https://infino.ai/docs/logo/infino-logo.png",
+    html_favicon_url = "https://infino.ai/docs/favicon.png"
 )]
 // `coverage_nightly` is set by `cargo +nightly llvm-cov`. Under it we opt
 // into `#[coverage(off)]` annotations on stable-uncoverable error paths
