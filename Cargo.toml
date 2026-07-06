@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
