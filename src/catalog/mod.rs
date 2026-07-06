@@ -94,6 +94,12 @@ pub fn connect_with(
     uri: impl AsRef<str>,
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
+    if options.cold_fetch_mode == ColdFetchMode::RangeOnly && options.cache_dir.is_some() {
+        return Err(InfinoError::Config(
+            "range_only does not use a disk cache; omit cache_dir".into(),
+        ));
+    }
+
     let backend = parse_uri(uri.as_ref())?;
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
@@ -877,6 +883,17 @@ mod tests {
         assert!(matches!(
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn connect_range_only_with_cache_dir_is_rejected() {
+        let opts = ConnectOptions::new()
+            .with_cache_dir("/tmp/cache")
+            .with_cold_fetch_mode(ColdFetchMode::RangeOnly);
+        assert!(matches!(
+            connect_with("memory://", opts),
+            Err(InfinoError::Config(_))
         ));
     }
 

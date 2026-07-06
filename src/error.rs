@@ -78,6 +78,10 @@ pub enum InfinoError {
     /// variant.
     #[error("backend: {0}")]
     Backend(String),
+
+    /// An invalid or conflicting configuration was supplied.
+    #[error("config: {0}")]
+    Config(String),
 }
 
 impl InfinoError {

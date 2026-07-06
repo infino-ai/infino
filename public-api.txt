@@ -66,6 +66,7 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
 pub infino::InfinoError::Cardinality(alloc::string::String)
+pub infino::InfinoError::Config(alloc::string::String)
 pub infino::InfinoError::Io(alloc::string::String)
 pub infino::InfinoError::NotFound(alloc::string::String)
 pub infino::InfinoError::OverBudget(alloc::string::String)
