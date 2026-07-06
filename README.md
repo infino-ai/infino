@@ -327,7 +327,7 @@ on-disk bytes:
   pruning, and reader/writer concurrency.
 
 For concepts, quickstart, guides, and examples (Python, Node.js, and Rust), see
-the full documentation at **[docs.infino.ai](https://docs.infino.ai)**.
+the full documentation at **[infino.ai/docs](https://infino.ai/docs)**.
 
 ## SQL joins across tables
 

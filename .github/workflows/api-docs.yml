@@ -62,7 +62,7 @@ jobs:
           <style>body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem}
           a{color:#d24011}h1{font-size:1.6rem}li{margin:.5rem 0}</style></head>
           <body><h1>Infino API reference</h1>
-          <p>Language API references for <a href="https://docs.infino.ai">Infino</a>.</p>
+          <p>Language API references for <a href="https://infino.ai/docs">Infino</a>.</p>
           <ul>
             <li><a href="./python/infino.html">Python</a> — <code>pip install infino</code></li>
             <li><a href="./node/">Node.js</a> — <code>npm install @infino-ai/infino</code></li>

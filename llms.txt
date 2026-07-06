@@ -19,14 +19,14 @@ as Python and Node.js bindings.
 ## Concepts
 
 Full concepts, guides, and examples live at the documentation site,
-https://docs.infino.ai.
+https://infino.ai/docs.
 
-- [How Infino works](https://docs.infino.ai/how-it-works): the mental model —
+- [How Infino works](https://infino.ai/docs/how-it-works): the mental model —
   one copy of your data as Parquet, indexed and queried four ways, in-process.
-- [Object-storage-native retrieval](https://docs.infino.ai/concepts/object-storage-native-retrieval):
+- [Object-storage-native retrieval](https://infino.ai/docs/concepts/object-storage-native-retrieval):
   the core idea — search that runs directly on data in object storage instead
   of in a database or cluster that owns its own copy.
-- [Hybrid search](https://docs.infino.ai/guides/search/hybrid): keyword (BM25) +
+- [Hybrid search](https://infino.ai/docs/guides/search/hybrid): keyword (BM25) +
   vector retrieval fused into one ranked list, in one engine over one copy of the data.
 
 ## Architecture
@@ -41,10 +41,10 @@ https://docs.infino.ai.
 
 ## Reference
 
-- [FAQ](https://docs.infino.ai/faq): operational and architecture answers for evaluating
+- [FAQ](https://infino.ai/docs/faq): operational and architecture answers for evaluating
   Infino — whether it needs a server, durability and crash-safety, concurrency,
   Parquet compatibility, and how SQL runs in-process.
-- [Tradeoffs and limits](https://docs.infino.ai/tradeoffs): the honest envelope — what Infino
+- [Tradeoffs and limits](https://infino.ai/docs/tradeoffs): the honest envelope — what Infino
   is good at (warm-query speed, multi-modal retrieval, flat storage cost) and
   what it is not built for (cold first-touch latency, write-dominated and
   transactional workloads).
