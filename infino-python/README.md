@@ -53,7 +53,8 @@ def embed(topic):
     return v
 
 # Declare a schema and which columns to index. An "_id" column is added
-# automatically — you don't define it.
+# automatically — you don't define it. A vector column's dim must be in
+# [16, 4096]; here we use 16, the floor.
 schema = pa.schema([
     pa.field("source", pa.large_utf8(), nullable=False),
     pa.field("body", pa.large_utf8(), nullable=False),
