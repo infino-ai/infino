@@ -1,6 +1,6 @@
 {
   "name": "@infino-ai/infino",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
   "publishConfig": {
@@ -82,12 +82,12 @@
     "apache-arrow": "^17"
   },
   "optionalDependencies": {
-    "infx-darwin-x64": "0.1.3",
-    "infx-darwin-arm64": "0.1.3",
-    "infx-linux-x64-gnu": "0.1.3",
-    "infx-linux-arm64-gnu": "0.1.3",
-    "infx-linux-x64-musl": "0.1.3",
-    "infx-linux-arm64-musl": "0.1.3"
+    "infx-darwin-x64": "0.1.4",
+    "infx-darwin-arm64": "0.1.4",
+    "infx-linux-x64-gnu": "0.1.4",
+    "infx-linux-arm64-gnu": "0.1.4",
+    "infx-linux-x64-musl": "0.1.4",
+    "infx-linux-arm64-musl": "0.1.4"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
