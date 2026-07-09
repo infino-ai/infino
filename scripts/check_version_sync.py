@@ -16,9 +16,13 @@ The check fails (non-zero exit) when:
       the `--locked` publish at release time
 
 Usage:
-  check_version_sync.py    # verify; non-zero exit on any drift
+  check_version_sync.py                          # verify; non-zero exit on drift
+  check_version_sync.py --release-version 0.2.1  # also assert a version about
+                                                 # to publish sits on the
+                                                 # crate's release line
 """
 
+import argparse
 import json
 import re
 import sys
@@ -59,8 +63,13 @@ def release_line(version):
     return ".".join(version.split(".")[:2])
 
 
-def check(root):
-    """Verify the version contract under `root`; return error strings."""
+def check(root, release_version=None):
+    """Verify the version contract under `root`; return error strings.
+
+    `release_version` is a version about to be published (e.g. the value a
+    publish workflow was dispatched with); it must sit on the crate's
+    release line.
+    """
     root = Path(root)
     errors = []
 
@@ -68,6 +77,14 @@ def check(root):
     if crate is None:
         errors.append("no [package] version found in Cargo.toml")
     else:
+        if (release_version is not None
+                and release_line(release_version) != release_line(crate)):
+            errors.append(
+                f"release version {release_version} is on the "
+                f"{release_line(release_version)} line but the crate is on "
+                f"{release_line(crate)} ({crate}); major.minor is locked "
+                f"across the three packages (docs/versioning.md)"
+            )
         crate_locked = locked_version(root / "Cargo.lock", "infino")
         if crate_locked != crate:
             errors.append(
@@ -121,7 +138,14 @@ def check(root):
 
 
 def main():
-    errors = check(ROOT)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--release-version",
+        help="a version about to be published; must sit on the crate's "
+             "major.minor release line",
+    )
+    args = parser.parse_args()
+    errors = check(ROOT, release_version=args.release_version)
     if errors:
         for error in errors:
             print(f"version drift: {error}", file=sys.stderr)

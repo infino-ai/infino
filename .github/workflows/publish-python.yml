@@ -82,6 +82,12 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+      # The version about to publish must sit on the crate's major.minor
+      # release line (docs/versioning.md). Catches a mistyped manual dispatch
+      # — previously unvalidated — before the wheel matrix spins up.
+      - name: Check version against the crate's release line
+        run: python3 scripts/check_version_sync.py --release-version "${{ steps.check.outputs.version }}"
 
   build:
     name: wheel ${{ matrix.target }}

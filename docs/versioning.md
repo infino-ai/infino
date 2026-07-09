@@ -117,4 +117,7 @@ Patches diverge between coordinated minors; a minor bump realigns everything on
   `infino-node/package.json`, and `infino-python/Cargo.toml` all agree (patch
   ignored), that the `infx-*` platform pins track the Node package version, and
   that each Cargo.lock records its manifest's version so `--locked` publishes
-  don't fail at the tag. See `scripts/check_version_sync.py`.
+  don't fail at the tag. The binding publish workflows run the same guard
+  before building — `publish-python` validates the dispatched version against
+  the crate's line, `Node publish` validates the in-tree state. See
+  `scripts/check_version_sync.py`.

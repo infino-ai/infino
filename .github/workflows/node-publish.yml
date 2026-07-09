@@ -188,6 +188,12 @@ jobs:
             echo "::error::tag v$tag does not match infino-node/package.json version $pkg"
             exit 1
           fi
+      # The version about to publish is package.json's — assert it sits on the
+      # crate's major.minor release line and the infx-* pins track it
+      # (docs/versioning.md). Guards manual dispatches from a branch that
+      # never went through the PR gate.
+      - name: Check versions against the crate's release line
+        run: python3 scripts/check_version_sync.py
       - uses: actions/setup-node@v4
         with:
           node-version: "20"

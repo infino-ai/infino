@@ -129,6 +129,19 @@ class CheckVersionSync(unittest.TestCase):
         errors = check(self.root)
         self.assertEqual(len(errors), 2)
 
+    def test_release_version_on_the_crate_line_passes(self):
+        # A binding patch release (any patch) is fine as long as it sits on
+        # the crate's major.minor line.
+        write_fixture(self.root, crate="0.3.4")
+        self.assertEqual(check(self.root, release_version="0.3.9"), [])
+
+    def test_release_version_off_the_crate_line_fails(self):
+        write_fixture(self.root, crate="0.3.4")
+        errors = check(self.root, release_version="0.4.0")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("release version 0.4.0", errors[0])
+        self.assertIn("0.3", errors[0])
+
     def test_missing_version_field_fails_loudly(self):
         write_fixture(self.root)
         (self.root / "infino-python" / "Cargo.toml").write_text(
