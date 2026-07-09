@@ -49,8 +49,8 @@ jobs:
       # simpler and more reliable than cross-compiling from glibc.
       matrix:
         include:
-          - { os: ubuntu-latest, target: linux-x64-gnu }
-          - { os: ubuntu-24.04-arm, target: linux-arm64-gnu }
+          - { os: ubuntu-latest, target: linux-x64-gnu, glibc_image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian }
+          - { os: ubuntu-24.04-arm, target: linux-arm64-gnu, glibc_image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64 }
           - { os: macos-15-intel, target: darwin-x64 }
           - { os: macos-14, target: darwin-arm64 }
           - { os: ubuntu-latest, target: linux-x64-musl, musl: x86_64-unknown-linux-musl }
@@ -70,18 +70,38 @@ jobs:
           swap-storage: true
       # --- native build (glibc / macOS) ---
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !matrix.musl }}
+        if: ${{ !matrix.musl && !matrix.glibc_image }}
       - uses: actions/setup-node@v4
         if: ${{ !matrix.musl }}
         with:
           node-version: "20"
       - uses: Swatinem/rust-cache@v2
-        if: ${{ !matrix.musl }}
+        if: ${{ !matrix.musl && !matrix.glibc_image }}
         with:
           workspaces: infino-node
       - name: Build addon (native)
-        if: ${{ !matrix.musl }}
+        if: ${{ !matrix.musl && !matrix.glibc_image }}
         run: make node-build
+      # --- glibc build (older-baseline container) ---
+      # Linking on the ubuntu-24.04 runners stamps the addon with glibc 2.39
+      # symbols, so it fails to load on Debian 12 / Ubuntu 22.04 / the default
+      # node:22-slim image. Building inside the napi-rs Debian (bullseye)
+      # image pins the floor at glibc 2.31; the verify step below then loads
+      # the artifact on the newer host runner, covering forward compatibility.
+      - name: Build addon (glibc 2.31 baseline, in Debian container)
+        if: ${{ matrix.glibc_image }}
+        run: |
+          docker run --rm -v "$PWD:/build" -w /build/infino-node \
+            ${{ matrix.glibc_image }} \
+            bash -c "npm install --ignore-scripts && \
+                     npx napi build --platform --release --strip --js native.js --dts native.d.ts infino && \
+                     npx tsc"
+      - name: Check binary glibc floor
+        if: ${{ matrix.glibc_image }}
+        run: |
+          MAX=$(objdump -T infino-node/infino/*.node | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "max glibc symbol: $MAX"
+          [ "$(printf '%s\n' "$MAX" GLIBC_2.31 | sort -V | tail -1)" = "GLIBC_2.31" ]
       # Smoke-test the AS-SHIPPED package on this platform: pack the tarballs,
       # install them into a throwaway project, and run a real query — proving the
       # loader resolves the per-platform binary from a clean install (not the
