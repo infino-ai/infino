@@ -50,7 +50,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: linux-x64-gnu, glibc_image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian }
-          - { os: ubuntu-24.04-arm, target: linux-arm64-gnu, glibc_image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64-gnu, glibc_image: node:20-bullseye }
           - { os: macos-15-intel, target: darwin-x64 }
           - { os: macos-14, target: darwin-arm64 }
           - { os: ubuntu-latest, target: linux-x64-musl, musl: x86_64-unknown-linux-musl }
@@ -85,15 +85,21 @@ jobs:
       # --- glibc build (older-baseline container) ---
       # Linking on the ubuntu-24.04 runners stamps the addon with glibc 2.39
       # symbols, so it fails to load on Debian 12 / Ubuntu 22.04 / the default
-      # node:22-slim image. Building inside the napi-rs Debian (bullseye)
-      # image pins the floor at glibc 2.31; the verify step below then loads
-      # the artifact on the newer host runner, covering forward compatibility.
+      # node:22-slim image. Building inside a Debian bullseye container pins
+      # the floor at glibc 2.31: the napi-rs image on x64, and the multi-arch
+      # node:20-bullseye (rustup bootstrapped in-run) on arm64 — the napi-rs
+      # *-aarch64 tags are amd64-hosted cross-compile images and exec-fail on
+      # native arm runners. The verify step below then loads the artifact on
+      # the newer host runner, covering forward compatibility.
       - name: Build addon (glibc 2.31 baseline, in Debian container)
         if: ${{ matrix.glibc_image }}
         run: |
           docker run --rm -v "$PWD:/build" -w /build/infino-node \
             ${{ matrix.glibc_image }} \
-            bash -c "npm install --ignore-scripts && \
+            bash -c "command -v cargo >/dev/null || \
+                       (curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal); \
+                     export PATH=\$HOME/.cargo/bin:\$PATH && \
+                     npm install --ignore-scripts && \
                      npx napi build --platform --release --strip --js native.js --dts native.d.ts infino && \
                      npx tsc"
       - name: Check binary glibc floor
