@@ -102,6 +102,12 @@ jobs:
                      npm install --ignore-scripts && \
                      npx napi build --platform --release --strip --js native.js --dts native.d.ts infino && \
                      npx tsc"
+      # The container runs as root, so everything it wrote on the mounted
+      # workspace (node_modules, target/, the addon) is root-owned — the
+      # host-side verify step then fails with EACCES. Hand it all back.
+      - name: Restore workspace ownership after container build
+        if: ${{ matrix.glibc_image }}
+        run: sudo chown -R "$(id -u):$(id -g)" .
       - name: Check binary glibc floor
         if: ${{ matrix.glibc_image }}
         run: |
