@@ -1,7 +1,8 @@
 .PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
-        public-api public-api-update api-parity api-parity-update doc-check \
+        public-api public-api-update api-parity api-parity-update \
+        version-sync doc-check \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -13,6 +14,7 @@ check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
 	$(MAKE) api-parity
+	$(MAKE) version-sync
 	$(MAKE) doc-check
 
 # Apply formatting, including the import-layout rules above.
@@ -43,6 +45,16 @@ api-parity:
 
 api-parity-update:
 	python3 scripts/check_api_parity.py --update
+
+# Version-sync guard: the crate and both bindings must sit on one
+# `major.minor` release line (patch is independent per package), the
+# `infx-*` platform pins must track the Node package version, and each
+# Cargo.lock must record its own package's manifest version so `--locked`
+# publishes don't fail at release time. See docs/versioning.md. Pure
+# Python 3; no toolchain needed. The unittest run covers the guard itself.
+version-sync:
+	python3 -m unittest discover -s scripts -q
+	python3 scripts/check_version_sync.py
 
 # Doc-surface gate. Every public item on the default (docs.rs) surface must be
 # documented, and every intra-doc link must resolve. Uses default features so

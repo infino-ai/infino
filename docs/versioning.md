@@ -112,6 +112,9 @@ Patches diverge between coordinated minors; a minor bump realigns everything on
   `v<version>` tag; Node and Python still publish via their own manual workflows.
   Still worth naming a clear owner for the engine's version bumps so the crate
   doesn't fall behind the bindings on the shared release line.
-- **No drift guard yet.** A small CI check that asserts the `major.minor` of the
-  root `Cargo.toml`, `infino-node/package.json`, and `infino-python/Cargo.toml`
-  all agree (patch ignored) would enforce rule 2 cheaply. Recommended.
+- **Drift guard: done.** `make version-sync` (part of `make check`, so it runs
+  on every PR) asserts the `major.minor` of the root `Cargo.toml`,
+  `infino-node/package.json`, and `infino-python/Cargo.toml` all agree (patch
+  ignored), that the `infx-*` platform pins track the Node package version, and
+  that each Cargo.lock records its manifest's version so `--locked` publishes
+  don't fail at the tag. See `scripts/check_version_sync.py`.
