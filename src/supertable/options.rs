@@ -1769,6 +1769,33 @@ supertable:
     }
 
     #[test]
+    fn apply_config_disk_cache_root_with_range_only_is_rejected() {
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
+
+        let dir = env::temp_dir().join(format!("infino-opts-ro-cfg-{}", Uuid::new_v4()));
+        let cache_root = dir.join("cache");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n  disk_cache_root: {}\n  cold_fetch_mode: range_only\n",
+            dir.display(),
+            cache_root.display()
+        );
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(&yaml))).expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("range_only + disk_cache_root must be rejected");
+        assert!(
+            matches!(err, BuildError::Store(_)),
+            "expected BuildError::Store, got: {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_config_local_fs_without_root_is_rejected() {
         use figment::{
             Figment,

@@ -56,7 +56,7 @@ use crate::{
     supertable::{
         Supertable,
         options::{Consistency, SupertableOptions},
-        reader_cache::{DiskCacheConfig, DiskCacheStore},
+        reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
 
@@ -94,12 +94,6 @@ pub fn connect_with(
     uri: impl AsRef<str>,
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
-    if options.cold_fetch_mode == ColdFetchMode::RangeOnly && options.cache_dir.is_some() {
-        return Err(InfinoError::Config(
-            "range_only does not use a disk cache; omit cache_dir".into(),
-        ));
-    }
-
     let backend = parse_uri(uri.as_ref())?;
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
@@ -754,8 +748,13 @@ fn build_disk_cache(
     if let Some(budget) = options.cache_budget_bytes {
         cfg.disk_budget_bytes = budget;
     }
-    let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg)
-        .map_err(|e| InfinoError::Io(e.to_string()))?;
+    let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg).map_err(|e| {
+        if let DiskCacheError::Config(msg) = e {
+            InfinoError::Config(msg)
+        } else {
+            InfinoError::Io(e.to_string())
+        }
+    })?;
     Ok(Some(cache))
 }
 
@@ -887,14 +886,37 @@ mod tests {
     }
 
     #[test]
-    fn connect_range_only_with_cache_dir_is_rejected() {
+    fn create_table_range_only_with_cache_dir_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("infino-test-ro-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let cache_dir = dir.join("cache");
         let opts = ConnectOptions::new()
-            .with_cache_dir("/tmp/cache")
+            .with_cache_dir(&cache_dir)
             .with_cold_fetch_mode(ColdFetchMode::RangeOnly);
-        assert!(matches!(
-            connect_with("memory://", opts),
-            Err(InfinoError::Config(_))
-        ));
+        let conn = connect_with(format!("file://{}", dir.display()), opts)
+            .expect("connect succeeds; validation is deferred to table creation");
+        let err = conn
+            .create_table("t", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect_err("range_only + cache_dir must be rejected at table creation");
+        assert!(
+            matches!(err, InfinoError::Config(_)),
+            "expected InfinoError::Config, got: {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_table_cache_dir_with_non_range_only_mode_is_accepted() {
+        let dir = std::env::temp_dir().join(format!("infino-test-hybrid-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let cache_dir = dir.join("cache");
+        let opts = ConnectOptions::new()
+            .with_cache_dir(&cache_dir)
+            .with_cold_fetch_mode(ColdFetchMode::HybridWithPrefetch);
+        let conn = connect_with(format!("file://{}", dir.display()), opts).expect("connect");
+        conn.create_table("t", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("cache_dir + HybridWithPrefetch must be accepted");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Regression: on durable storage, `open_table` on a table that was
