@@ -323,20 +323,24 @@ async fn range_only_mode_bypasses_disk_cache() {
     // isn't the right entry point (callers should use
     // `StorageRangeSource` + `SuperfileReader::open_lazy`
     // directly).
+    //
+    // Note: Currently, setting a cache directory with RangeOnly is
+    // rejected at construction time. A future addition that relaxes this to
+    // support RangeOnly with cache fallback will need to update
+    // this test to assert reader rejection or admission rules.
     let store_dir = TempDir::new().expect("storage");
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
-    let bytes = build_test_bytes();
-    let uri = SuperfileUri::new_v4();
-    seed(&*local, uri, bytes).await;
 
-    let (_d, cache) = fresh_cache(local, ColdFetchMode::RangeOnly);
-    let err = cache
-        .reader(&uri)
-        .await
-        .expect_err("range-only must reject");
+    let cfg = DiskCacheConfig {
+        cache_root: store_dir.path().to_path_buf(),
+        cold_fetch_mode: ColdFetchMode::RangeOnly,
+        ..Default::default()
+    };
+    let err = DiskCacheStore::new_unpinned(local, cfg)
+        .expect_err("RangeOnly mode must be rejected during cache construction");
     assert!(
-        matches!(err, DiskCacheError::SuperfileOpen(_)),
-        "expected typed reject, got {err:?}"
+        matches!(err, DiskCacheError::Config(_)),
+        "expected DiskCacheError::Config, got {err:?}"
     );
 }
