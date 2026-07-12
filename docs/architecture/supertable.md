@@ -6,7 +6,9 @@ supports SQL, full-text, and vector search, while keeping readers
 consistent under concurrent writes.
 
 This document describes the table model and its guarantees. The superfile
-format is described in [superfile](./superfile.md).
+format is described in [superfile](./superfile.md); the physical files this
+layer writes and the pointer chain between them are in
+[on-disk layout](./on-disk-layout.md).
 
 ## Design
 

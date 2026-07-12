@@ -1,4 +1,6 @@
 pub mod infino
+pub use infino::arrow_array
+pub use infino::arrow_schema
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or

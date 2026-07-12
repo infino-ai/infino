@@ -793,6 +793,18 @@ impl DiskCacheStore {
         Ok(())
     }
 
+    /// `insert_warm`, but best-effort: logs and swallows the error
+    /// instead of returning it. Shared by every committer (writer,
+    /// compaction) that pre-populates the cache after a superfile is
+    /// already durable in storage. A failure here just means the
+    /// next query cold-fetches instead of hitting a warm cache, it
+    /// never fails the commit itself.
+    pub async fn insert_warm_or_warn(self: &Arc<Self>, uri: &SuperfileUri, bytes: Bytes) {
+        if let Err(e) = self.insert_warm(uri, bytes).await {
+            tracing::warn!(uri = %uri.0, error = %e, "failed to warm disk cache");
+        }
+    }
+
     // ----- internals -----
 
     fn now_us(&self) -> u64 {

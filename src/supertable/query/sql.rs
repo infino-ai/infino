@@ -95,6 +95,10 @@ impl SupertableReader {
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(sql = sql))
+    )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         // Read-consistency was applied when `Supertable::reader()` created
         // this pinned reader. SQL therefore observes the same snapshot as
@@ -138,6 +142,7 @@ impl SupertableReader {
     ///
     /// Freshness policy is applied when the reader is created by
     /// [`Supertable::reader`](crate::supertable::handle::Supertable::reader).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
         // This reader already pins the snapshot; clone is a handful of
         // Arc refcount bumps.

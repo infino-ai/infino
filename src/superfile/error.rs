@@ -197,6 +197,12 @@ pub enum VectorError {
     /// `LazyByteSourceError` should match on the source directly.
     #[error("lazy source error during vector search: {0}")]
     LazySource(String),
+
+    /// A cold cluster-block fetch would cross the connection memory budget;
+    /// the search is refused before the fetch. Surfaces as
+    /// `InfinoError::OverBudget`.
+    #[error("vector search exceeded the connection memory budget: {0}")]
+    OverBudget(String),
 }
 
 #[cfg(test)]

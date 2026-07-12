@@ -109,8 +109,12 @@ const ENFORCED_BUDGET_DENOMINATOR: u128 = 10;
 /// limit, not a different policy — so there is no trait. The one trait we do
 /// implement is the query engine's memory-pool interface, in a thin adapter
 /// that forwards to an `Arc<ConnectionMemoryBudget>`.
+///
+/// Must be `pub`: the `pub` vector-search functions take this type as an
+/// argument. It is still not public API, because `lib.rs` makes the whole `memory`
+/// module `pub` only under `test-helpers``, so a shipped build keeps this type crate-internal.
 #[derive(Debug)]
-pub(crate) struct ConnectionMemoryBudget {
+pub struct ConnectionMemoryBudget {
     // Enforced ceiling in bytes, already reduced to the headroom gate.
     // `None` is measure-only: count usage, never refuse.
     limit: Option<usize>,
@@ -179,7 +183,7 @@ impl ConnectionMemoryBudget {
     /// Reserve `n` bytes, returning a guard that frees them on drop. Fails with
     /// [`OverBudget`] if the reservation would cross the ceiling; a measured
     /// budget always succeeds.
-    pub fn try_reserve(self: &Arc<Self>, n: usize) -> Result<Reservation, OverBudget> {
+    pub(crate) fn try_reserve(self: &Arc<Self>, n: usize) -> Result<Reservation, OverBudget> {
         self.try_grow(n)?;
 
         Ok(Reservation {
@@ -246,19 +250,28 @@ impl ConnectionMemoryBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// The largest [`used`](Self::used) ever reached. Only grows; never reset.
-    pub(crate) fn peak(&self) -> usize {
-        self.peak_used.load(Ordering::Relaxed)
+    test_visible! {
+        /// The largest [`used`](Self::used) ever reached. Only grows; never reset.
+        /// Test-visible so integration tests can assert a query actually reserved
+        /// against the budget: a peak above 0 means the budget was wired and exercised.
+        fn peak(&self) -> usize {
+            self.peak_used.load(Ordering::Relaxed)
+        }
     }
 
-    /// The enforced ceiling, or `None` when measured.
-    pub(crate) fn limit(&self) -> Option<usize> {
-        self.limit
+    test_visible! {
+        /// The enforced ceiling, or `None` when measured.
+        fn limit(&self) -> Option<usize> {
+            self.limit
+        }
     }
 
-    /// Reservations refused so far.
-    pub(crate) fn denials(&self) -> u64 {
-        self.denials.load(Ordering::Relaxed)
+    test_visible! {
+        /// Reservations refused so far. Test-visible so integration tests can
+        /// assert the gate fired on an over-budget query.
+        fn denials(&self) -> u64 {
+            self.denials.load(Ordering::Relaxed)
+        }
     }
 }
 
@@ -284,6 +297,7 @@ impl fmt::Display for ConnectionMemoryBudget {
 #[derive(Debug)]
 pub(crate) struct Reservation {
     budget: Arc<ConnectionMemoryBudget>,
+    // memory in bytes, which is to be reserved
     size: usize,
 }
 

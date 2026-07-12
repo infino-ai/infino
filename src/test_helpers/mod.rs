@@ -78,6 +78,33 @@ pub fn default_disk_cache(
     DiskCacheStore::new(storage, cfg, pinned).expect("test disk cache")
 }
 
+/// A `DiskCacheStore` in `LazyForegroundWithBackgroundFill`: the foreground
+/// query reads through an `open_lazy` `StorageRangeSource`, so the superfile's
+/// bytes stay non-resident and every cold read is an object-store GET. That is
+/// the path the connection budget gates. `default_disk_cache`
+/// (`HybridWithPrefetch`) instead collects the cold responses into a resident
+/// in-memory reader, which reads warm and reserves nothing. Same budget,
+/// timers, and eviction otherwise.
+pub fn lazy_foreground_disk_cache(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &Path,
+) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: TEST_DISK_CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+        cold_fetch_streams: TEST_COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: TEST_COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        verify_crc_on_open: true,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned).expect("test lazy-foreground disk cache")
+}
+
 /// Build a `Decimal128Array(38, 0)` from `u64` ids.
 ///
 /// Centralizes the verbose three-step construction that

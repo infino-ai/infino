@@ -42,7 +42,7 @@ test = ["pytest", "pyarrow>=14"]
 
 [project.urls]
 Homepage = "https://infino.ai"
-Documentation = "https://docs.infino.ai"
+Documentation = "https://infino.ai/docs"
 Repository = "https://github.com/infino-ai/infino"
 Issues = "https://github.com/infino-ai/infino/issues"
 Changelog = "https://github.com/infino-ai/infino/releases"

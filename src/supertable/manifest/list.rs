@@ -1243,7 +1243,7 @@ mod tests {
         sync::Arc,
     };
 
-    use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
+    use arrow_array::{BinaryArray, BooleanArray, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use uuid::Uuid;
 
@@ -1399,8 +1399,10 @@ mod tests {
 
     #[test]
     fn scalar_agg_from_column_unorderable_type_is_none() {
-        // Date32 isn't in `column_min_max`'s supported set → no stats at all.
-        let arr: ArrayRef = Arc::new(Date32Array::from(vec![1, 2, 3]));
+        // Binary has no meaningful ordering, so it isn't in `column_min_max`'s
+        // supported set → no stats at all. (Temporal types now *are* supported;
+        // see `min_max_stats_cover_temporal_columns` in the parent module.)
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![&b"a"[..], b"b", b"c"]));
         assert!(ScalarStatsAgg::from_column(&arr).is_none());
     }
 
@@ -1408,10 +1410,10 @@ mod tests {
 
     #[test]
     fn scalar_agg_from_batches_skips_unorderable_column() {
-        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let schema = Schema::new(vec![Field::new("d", DataType::Binary, true)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
-            vec![Arc::new(Date32Array::from(vec![1, 2])) as ArrayRef],
+            vec![Arc::new(BinaryArray::from(vec![&b"a"[..], b"b"])) as ArrayRef],
         )
         .expect("batch");
         let table = ScalarStatsAgg::from_batches(&schema, &[&batch]);

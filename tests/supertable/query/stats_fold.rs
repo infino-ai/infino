@@ -14,7 +14,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, Date32Array, Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -229,5 +229,136 @@ fn tombstoned_tables_degrade_but_stay_correct() {
     assert_eq!(
         scalar_string(&st, "SELECT MAX(title) FROM supertable"),
         "delta"
+    );
+}
+
+// ---- temporal columns (Date32) ------------------------------------
+//
+// The manifest now records min/max for temporal types, so `MIN`/`MAX`
+// on a date column fold like an integer. This is the ClickBench
+// `EventDate` shape. `id` is a monotonic Int64 aligned with `day`, so a
+// delete can target the extremum row by a plain integer literal.
+
+/// Schema `(day: Date32, id: Int64)`; `id` tracks `day` so the max id is
+/// the max day.
+fn options_day_id() -> SupertableOptions {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("day", DataType::Date32, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    SupertableOptions::new(schema, vec![], vec![], None).expect("valid options")
+}
+
+/// Base day (days-since-epoch) for commit 0; later commits and rows step
+/// strictly upward so extrema have closed forms.
+const DAY_BASE: i32 = 15000;
+
+fn build_day_batch(idx: usize, schema: Arc<Schema>) -> RecordBatch {
+    let days: Vec<i32> = (0..ROWS_PER_COMMIT)
+        .map(|r| DAY_BASE + (idx * 100 + r) as i32)
+        .collect();
+    let ids: Vec<i64> = (0..ROWS_PER_COMMIT)
+        .map(|r| (idx * 1000 + r) as i64)
+        .collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(days)),
+            Arc::new(Int64Array::from(ids)),
+        ],
+    )
+    .expect("batch")
+}
+
+/// Single-cell Date32 (days-since-epoch) result of an aggregate query.
+fn scalar_date32(st: &Supertable, sql: &str) -> i32 {
+    let batches = st.reader().query_sql(sql).expect("sql");
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("date32 result")
+        .value(0)
+}
+
+#[test]
+fn temporal_aggregates_fold_without_scanning() {
+    let st = Supertable::create(options_day_id()).expect("create");
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    for idx in 0..COMMITS {
+        w.append(&build_day_batch(idx, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+
+    let min_day = DAY_BASE;
+    let max_day = DAY_BASE + ((COMMITS - 1) * 100 + ROWS_PER_COMMIT - 1) as i32;
+
+    // Values first — the fold must never change results.
+    assert_eq!(
+        scalar_date32(&st, "SELECT MIN(day) FROM supertable"),
+        min_day
+    );
+    assert_eq!(
+        scalar_date32(&st, "SELECT MAX(day) FROM supertable"),
+        max_day
+    );
+
+    // Plan shape: a tombstone-free date column folds from manifest stats,
+    // so the physical plan has no scan node. This is the regression that
+    // fails before temporal min/max is recorded (the column had no bounds,
+    // so `MIN`/`MAX(day)` fell back to a full `DataSourceExec` scan).
+    for sql in [
+        "SELECT MIN(day) FROM supertable",
+        "SELECT MAX(day) FROM supertable",
+    ] {
+        let plan = explain(&st, sql);
+        assert!(
+            !plan.contains("DataSourceExec"),
+            "{sql}: expected temporal statistics fold (no scan); plan was:\n{plan}"
+        );
+    }
+}
+
+#[test]
+fn temporal_fold_excludes_deleted_extremum() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(options_day_id().with_storage(storage)).expect("create");
+    let schema = st.options().schema.clone();
+
+    let mut w = st.writer().expect("writer");
+    for idx in 0..COMMITS {
+        w.append(&build_day_batch(idx, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+
+    let max_day = DAY_BASE + ((COMMITS - 1) * 100 + ROWS_PER_COMMIT - 1) as i32;
+    let second_max_day = max_day - 1;
+    let max_id = ((COMMITS - 1) * 1000 + ROWS_PER_COMMIT - 1) as i64;
+
+    // Clean table: max folds to the true extremum.
+    assert_eq!(
+        scalar_date32(&st, "SELECT MAX(day) FROM supertable"),
+        max_day
+    );
+
+    // Delete the row holding the max day (by its aligned id). The manifest
+    // max is now a dead row: a fold would report the stale `max_day`; the
+    // clean-view gate must decline the fold and the scan must report the
+    // true survivor max.
+    let pending = w.delete(col("id").eq(lit(max_id))).expect("delete");
+    assert_eq!(pending.matched, 1);
+    w.commit().expect("commit delete");
+    drop(w);
+
+    assert_eq!(
+        scalar_date32(&st, "SELECT MAX(day) FROM supertable"),
+        second_max_day
     );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -32,6 +32,12 @@ exclude = [
 # `benches/common.rs` get compiled as standalone (empty) bench
 # binaries.
 autobenches = false
+
+# docs.rs renders the default-feature surface (the public API); the internal
+# `test-helpers` modules stay off it. `--cfg docsrs` turns on the availability
+# annotations rustdoc emits under that cfg.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
 
 # Declare an explicit workspace so the bench-utils crate is a
 # first-class member rather than only a dev-dependency path
@@ -80,6 +86,15 @@ test-helpers = []
 # work or release-profile recall gates, but should not run as part of a
 # plain `cargo bench`.
 bench-diagnostics = []
+# Compiles the per-function timing spans (`#[tracing::instrument]`) on
+# the append/commit, SQL, search, superfile-open, and object-store
+# fetch paths. OFF by default: with the feature absent the
+# `cfg_attr`-gated attributes expand to nothing, so there is zero
+# runtime cost in a production build. Turn it on to profile where a
+# query or append spends its time; the always-on event logs (`debug!`
+# / `info!` / …) are independent of this flag and stay compiled in
+# regardless. Not part of the public API surface.
+detailed-tracing = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
@@ -270,6 +285,14 @@ tokio = { version = "1", features = ["test-util"] }
 
 proptest = "1"
 hdrhistogram = "7"
+
+# Subscriber for the `logging` example only — the library emits
+# `tracing` events/spans but never installs a subscriber (that is the
+# consumer's job). `env-filter` backs the example's `RUST_LOG` handling;
+# the default `fmt` feature supplies the formatter and the span
+# busy/idle timing output (`FmtSpan`). Dev-only; not part of the shipped
+# crate's dependency surface.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # s3s + s3s-fs power the "real S3 wire protocol" smoke test.
 # s3s is the S3-compatible HTTP server library; s3s-fs is its
 # filesystem backend. The test crate spawns s3s-fs on a random

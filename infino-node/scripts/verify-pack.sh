@@ -26,6 +26,10 @@ cd "$ROOT"
 # napi binary prefix.
 PKG_NAME="$(node -p "require('./package.json').name")"
 BIN_NAME="$(node -p "require('./package.json').napi.name")"
+# Per-platform packages are named after napi.package.name (e.g.
+# infx-linux-x64-gnu), NOT the npm package name — that's what the
+# generated loader requires, so it's what the reuse guard must grep for.
+PLAT_PKG="$(node -p "const p=require('./package.json'); (p.napi.package && p.napi.package.name) || p.name")"
 
 # Host platform in napi's node-platform naming.
 PLATFORM="$(node -p 'process.platform')"
@@ -86,7 +90,7 @@ done
 # A reused loader from a previous package name (after a napi.name change)
 # requires a different platform package and would fail at load — rebuild if
 # native.js doesn't reference the current platform package name.
-if [ "$NEED_BUILD" = "0" ] && ! grep -q "${PKG_NAME}-${TRIPLE}" infino/native.js 2>/dev/null; then
+if [ "$NEED_BUILD" = "0" ] && ! grep -q "${PLAT_PKG}-${TRIPLE}" infino/native.js 2>/dev/null; then
   NEED_BUILD=1
 fi
 if [ "$NEED_BUILD" = "1" ]; then

@@ -211,6 +211,10 @@ impl StorageProvider for AzureStorageProvider {
         .await
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+    )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
         retry::complete_range(uri, range, |r| async {

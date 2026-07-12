@@ -75,7 +75,12 @@ use tracing::debug;
 use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::resolve_hits_named};
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
-    superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
+    superfile::{
+        SuperfileReader,
+        error::{ReadError, VectorError},
+        fts::reader::BoolMode,
+        vector::distance::Metric,
+    },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -83,6 +88,20 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Map a per-superfile vector-search error to a query error. A budget refusal
+/// (the kernel's `VectorError::OverBudget`, boxed in `ReadError::Vector`) keeps
+/// its own variant so it surfaces as the public `InfinoError::OverBudget`;
+/// anything else is a generic query error.
+fn vector_read_query_error(e: ReadError) -> QueryError {
+    match e {
+        ReadError::Vector(v) => match *v {
+            VectorError::OverBudget(m) => QueryError::OverBudget(m),
+            other => QueryError::Parquet(other.to_string()),
+        },
+        other => QueryError::Parquet(other.to_string()),
+    }
+}
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -123,6 +142,10 @@ impl SupertableReader {
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`SupertableReader::vector_search`], which drives this via the
     /// sync→async bridge.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub(crate) async fn vector_search_async(
         &self,
         column: &str,
@@ -286,6 +309,8 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
+        // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
+        let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
 
         // `fanout_with`, not `fanout`: the body needs each superfile's  tombstone bitmap *before* its kernel
         // to push it in as a deny set (`fanout` only drops tombstones post-rank, which underflows).
@@ -297,6 +322,7 @@ impl SupertableReader {
             let column = Arc::clone(&column_arc);
             let query = Arc::clone(&query_arc);
             let reader_pool = Arc::clone(&reader_pool);
+            let budget = budget.clone();
             async move {
                 // For unfiltered path:
                 //  - it resolve this superfile's tombstone  bitmap once (a warm cache hit after the orchestrator's
@@ -315,19 +341,19 @@ impl SupertableReader {
                     Probe::Clusters(ids) => {
                         reader
                             .vector_search_clusters_filtered(
-                                &column, &query, k, &ids, options, bitmap, deny, pool,
+                                &column, &query, k, &ids, options, bitmap, deny, pool, budget,
                             )
                             .await
                     }
                     Probe::Nprobe => {
                         reader
                             .vector_hits_filtered_async(
-                                &column, &query, k, options, bitmap, deny, pool,
+                                &column, &query, k, options, bitmap, deny, pool, budget,
                             )
                             .await
                     }
                 }
-                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                .map_err(vector_read_query_error)?;
 
                 Ok::<Vec<SuperfileHit>, QueryError>(dispatch::tag_hits(&entry, hits))
             }
@@ -370,6 +396,10 @@ impl SupertableReader {
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`Self::vector_hits_filtered`].
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub(crate) async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -760,9 +790,9 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
-    /// # use arrow_array::types::Float32Type;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    /// # use infino::arrow_array::types::Float32Type;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new(
@@ -784,6 +814,10 @@ impl Supertable {
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub fn vector_search(
         &self,
         column: &str,
@@ -821,11 +855,13 @@ mod tests {
     use roaring::RoaringBitmap;
     use tokio::runtime;
 
-    use super::{VectorFilter, VectorSearchOptions};
+    use super::{VectorFilter, VectorSearchOptions, vector_read_query_error};
     use crate::{
+        InfinoError,
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            error::{ReadError, VectorError},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -847,6 +883,28 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(fut)
+    }
+
+    #[test]
+    fn over_budget_vector_error_surfaces_as_infino_over_budget() {
+        // A cold vector search that crosses the budget returns
+        // `VectorError::OverBudget` (see the vector reader tests). Confirm it
+        // routes all the way to the public `InfinoError::OverBudget` and isn't
+        // flattened to a generic query error.
+        let read_err = ReadError::Vector(Box::new(VectorError::OverBudget("gate".into())));
+        let q = vector_read_query_error(read_err);
+
+        assert!(matches!(q, QueryError::OverBudget(_)), "got {q:?}");
+        assert!(matches!(
+            InfinoError::from(QueryError::OverBudget("x".into())),
+            InfinoError::OverBudget(_)
+        ));
+
+        // A non-budget read error stays a generic query error.
+        assert!(matches!(
+            vector_read_query_error(ReadError::MissingKv("k")),
+            QueryError::Parquet(_)
+        ));
     }
 
     fn fixed_list_f32(dim: usize) -> DataType {

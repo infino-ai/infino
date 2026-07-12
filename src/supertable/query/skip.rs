@@ -392,7 +392,7 @@ pub(crate) fn scalar_value_may_match(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{ArrayRef, Int64Array, LargeStringArray};
+    use arrow_array::{ArrayRef, Date32Array, Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
     use uuid::Uuid;
@@ -690,6 +690,17 @@ mod tests {
         Arc::new(e)
     }
 
+    // Date32 bounds stored as days-since-epoch, the ClickBench `EventDate`
+    // shape now that temporal columns carry manifest min/max.
+    fn seg_with_date_stats(col: &str, min: i32, max: i32) -> Arc<SuperfileEntry> {
+        let mut e = empty_superfile();
+        let mn: ArrayRef = Arc::new(Date32Array::from(vec![min]));
+        let mx: ArrayRef = Arc::new(Date32Array::from(vec![max]));
+        e.scalar_stats
+            .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        Arc::new(e)
+    }
+
     fn pred(column: &str, op: ScalarOp, value: ScalarValue) -> ScalarPredicate {
         ScalarPredicate {
             column: column.to_string(),
@@ -839,6 +850,39 @@ mod tests {
                 &[pred("x", ScalarOp::LtEq, ScalarValue::Int64(Some(0)))]
             ),
             vec![true, false]
+        );
+    }
+
+    #[test]
+    fn scalar_skip_range_ops_prune_temporal_columns() {
+        // Two date superfiles with disjoint ranges (as ClickBench's
+        // time-ordered `hits` produces). Before temporal min/max landed these
+        // carried no bounds and neither could ever be pruned.
+        let d = |day| ScalarValue::Date32(Some(day));
+        let segs = vec![
+            seg_with_date_stats("EventDate", 100, 200),
+            seg_with_date_stats("EventDate", 500, 600),
+        ];
+        // EventDate > 300 → A.max=200 can't; B kept.
+        assert_eq!(
+            scalar_skip(&segs, &[pred("EventDate", ScalarOp::Gt, d(300))]),
+            vec![false, true]
+        );
+        // EventDate < 300 → A.min=100 ok; B.min=500 can't.
+        assert_eq!(
+            scalar_skip(&segs, &[pred("EventDate", ScalarOp::Lt, d(300))]),
+            vec![true, false]
+        );
+        // BETWEEN 250 AND 450 (>=250 AND <=450) → both disjoint ranges pruned.
+        assert_eq!(
+            scalar_skip(
+                &segs,
+                &[
+                    pred("EventDate", ScalarOp::GtEq, d(250)),
+                    pred("EventDate", ScalarOp::LtEq, d(450)),
+                ]
+            ),
+            vec![false, false]
         );
     }
 

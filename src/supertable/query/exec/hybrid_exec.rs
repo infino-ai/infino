@@ -118,6 +118,10 @@ impl SupertableReader {
     /// `pub(crate)` kernel; the public surface is the sync
     /// [`SupertableReader::hybrid_search`].
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+    )]
     pub(crate) async fn hybrid_search_async(
         &self,
         text_col: &str,
@@ -168,6 +172,10 @@ impl Supertable {
     /// bounds each retriever and the fused result. `projection` follows
     /// the same rules as [`Supertable::bm25_search`].
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+    )]
     pub fn hybrid_search(
         &self,
         text_col: &str,

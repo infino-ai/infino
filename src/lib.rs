@@ -6,6 +6,10 @@
 // runs as a `cargo test --doc` doctest so it can't drift from the API. The
 // Python/Node guides live in their own bindings and on the docs site.
 #![doc = include_str!("../crate-docs.md")]
+#![doc(
+    html_logo_url = "https://infino.ai/docs/logo/infino-logo.png",
+    html_favicon_url = "https://infino.ai/docs/favicon.png"
+)]
 // `coverage_nightly` is set by `cargo +nightly llvm-cov`. Under it we opt
 // into `#[coverage(off)]` annotations on stable-uncoverable error paths
 // (OOM handlers, overflow guards). On stable the feature flag is inert
@@ -115,6 +119,13 @@ pub mod supertable;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod supertable;
 
+// Same reason: benches/tests that drive the vector kernel name
+// `ConnectionMemoryBudget` in its signatures.
+#[cfg(feature = "test-helpers")]
+pub mod memory;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod memory;
+
 // `roaring` is already an internal dependency. Re-export it under
 // `test-helpers` only, so a bench can build an allow-set for the filtered
 // vector kernel without its own `roaring` dependency. Off the public
@@ -126,11 +137,15 @@ pub use roaring;
 // public items are re-exported at the crate root below.
 mod catalog;
 mod error;
-mod memory;
 mod runtime_bridge;
+mod utils;
 
 // ---- Curated public surface ----
 
+/// Arrow `Schema` / `RecordBatch` builders for the public API.
+/// Import as `infino::arrow_schema` and `infino::arrow_array`.
+pub use arrow_array;
+pub use arrow_schema;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};

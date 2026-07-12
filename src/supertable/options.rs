@@ -816,6 +816,15 @@ impl SupertableOptions {
         }
     }
 
+    test_visible! {
+        /// The connection memory budget these options carry. Exposed for
+        /// integration tests that assert budget accounting (peak / denials)
+        /// after a query, confirming the budget was wired to the query path.
+        fn connection_budget(&self) -> &Arc<ConnectionMemoryBudget> {
+            &self.connection_memory_budget
+        }
+    }
+
     /// Apply system [`Config`] to this `SupertableOptions`.
     /// Rebuilds the reader / writer thread pools, copies
     /// supertable knobs, and attaches configured persistent

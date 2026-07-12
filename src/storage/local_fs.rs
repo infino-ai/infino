@@ -127,6 +127,10 @@ impl StorageProvider for LocalFsStorageProvider {
         Ok((bytes, meta))
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+    )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = Self::path(uri)?;
         self.store

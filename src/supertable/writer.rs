@@ -276,8 +276,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -289,6 +289,10 @@ impl Supertable {
     /// posts.append(&batch)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(rows = batch.num_rows()))
+    )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self
             .writer()
@@ -306,8 +310,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use datafusion::prelude::{col, lit};
     /// # use infino::{connect, IndexSpec};
     /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
@@ -321,6 +325,10 @@ impl Supertable {
     /// assert_eq!(stats.matched(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows()))
+    )]
     pub fn update(
         &self,
         predicate: Expr,
@@ -343,8 +351,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use datafusion::prelude::{col, lit};
     /// # use infino::{connect, IndexSpec};
     /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
@@ -357,6 +365,7 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         let mut w = self
             .writer()
@@ -422,6 +431,10 @@ impl SupertableWriter {
     /// unconditionally; the buffered batch's schema therefore
     /// matches [`SupertableOptions::scalar_schema`] with the
     /// id column at position 0.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len()))
+    )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
 
@@ -710,6 +723,14 @@ impl SupertableWriter {
     /// [`CommitResult`]: crate::supertable::mutations::CommitResult
     /// [`MutationStats`]: crate::supertable::mutations::MutationStats
     /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(
+            buffered = self.buffer.len(),
+            updates = self.pending_updates.len(),
+            deletes = self.pending_deletes.len(),
+        ))
+    )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
         // Step 1: flush appends. A failure here is atomic —
         // the buffer is preserved and no mutation WAL has
@@ -963,6 +984,10 @@ impl SupertableWriter {
     /// Rows are balanced evenly across shards regardless of the
     /// caller's `append()` cadence — many small appends followed by
     /// one `commit` produce the same shard layout as one large append.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(buffered = self.buffer.len()))
+    )]
     fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -1775,6 +1800,10 @@ pub(in crate::supertable) fn persist_commit(
 // the parallelism below the threshold. The default
 // threshold (100 MiB) matches the S3 SDK's standard
 // cutoff.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(superfiles = pending_storage_writes.len()))
+)]
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
@@ -2025,14 +2054,7 @@ fn warm_cache_after_commit(
     let cache = Arc::clone(cache);
     let drive = async move {
         for (uri, bytes) in pending {
-            if let Err(e) = cache.insert_warm(&uri, bytes).await {
-                tracing::warn!(
-                    "supertable: warm cache pre-population failed for {}: {} \
-                     (superfile is durable in storage; first query will cold-fetch)",
-                    uri.0,
-                    e
-                );
-            }
+            cache.insert_warm_or_warn(&uri, bytes).await;
         }
     };
     match Handle::try_current() {

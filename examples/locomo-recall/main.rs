@@ -42,9 +42,12 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use infino::{BoolMode, IndexSpec, Metric, VectorSearchOptions, connect};
+use infino::{
+    BoolMode, IndexSpec, Metric, VectorSearchOptions,
+    arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
+    arrow_schema::{DataType, Field, Schema},
+    connect,
+};
 use serde::Deserialize;
 
 /// Top-k retrieved per query (headline is recall@10).
