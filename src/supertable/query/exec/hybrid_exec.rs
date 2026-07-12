@@ -183,7 +183,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -191,7 +191,7 @@ impl Supertable {
                 projection,
                 "hybrid_search",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])
     }
 }

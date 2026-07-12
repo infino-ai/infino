@@ -797,6 +797,7 @@ impl Supertable {
         self.reader()
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
+            .map_err(|e| e.with_context("vector_search", None))
     }
 }
 
