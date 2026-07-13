@@ -36,7 +36,7 @@ use crate::{
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
-            SealRecord, WalStore,
+            Etag, SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -370,7 +370,7 @@ impl Supertable {
         // goes stale.
         let compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
-        let mut sealed_ids: Vec<Uuid> = Vec::with_capacity(inputs.len());
+        let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
         for entry in &inputs {
             loop {
                 match tombstones_admin::seal(
@@ -382,8 +382,12 @@ impl Supertable {
                 )
                 .await
                 {
-                    Ok(_) => {
-                        sealed_ids.push(entry.superfile_id);
+                    Ok((sidecar, etag)) => {
+                        sealed.push(SealedInput {
+                            superfile_id: entry.superfile_id,
+                            bitmap: sidecar.bitmap,
+                            etag,
+                        });
                         break;
                     }
                     Err(TombstonesAdminError::CasLost { .. }) => {
@@ -397,14 +401,14 @@ impl Supertable {
                         superfile_id,
                         existing_compaction_id,
                     }) => {
-                        unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::SidecarConflict {
                             superfile_id,
                             existing_compaction_id,
                         });
                     }
                     Err(TombstonesAdminError::WalStore(e)) => {
-                        unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Seal(e.to_string()));
                     }
                 }
@@ -414,7 +418,7 @@ impl Supertable {
         let merged_segment = match self.merge_superfiles(&inputs).await {
             Ok(seg) => seg,
             Err(e) => {
-                unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+                unseal_all(&wal_store, sealed).await;
                 return Err(CompactionError::Build(e.to_string()));
             }
         };
@@ -497,30 +501,49 @@ impl Supertable {
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
                     if let Err(e) = self.refresh().await {
-                        unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
                     time::sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => {
-                    unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+                    unseal_all(&wal_store, sealed).await;
                     return Err(CompactionError::Commit(e.to_string()));
                 }
             }
         }
 
-        unseal_all(&wal_store, compaction_id, &sealed_ids).await;
+        unseal_all(&wal_store, sealed).await;
         Err(CompactionError::Commit(
             "commit retries exhausted".to_string(),
         ))
     }
 }
 
-/// Best-effort of clearing every seal this attempt placed
-async fn unseal_all(wal_store: &WalStore, compaction_id: Uuid, sealed_ids: &[Uuid]) {
-    for id in sealed_ids {
-        if let Err(e) = tombstones_admin::unseal(wal_store, *id, compaction_id).await {
-            warn!(superfile_id = %id, error = %e, "compact: failed to unseal after aborting");
+/// One superfile this attempt sealed: enough to unseal it later with
+/// no extra GET (`unseal` uses the etag + bitmap straight from `seal`).
+struct SealedInput {
+    superfile_id: Uuid,
+    bitmap: RoaringBitmap,
+    etag: Etag,
+}
+
+/// Best-effort: clear every seal this attempt placed, in parallel --
+/// each one is an independent sidecar, so there's no ordering or
+/// shared-state reason to do them one at a time.
+async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
+    let results = join_all(sealed.into_iter().map(|s| {
+        let wal_store = wal_store.clone();
+        async move {
+            let result =
+                tombstones_admin::unseal(&wal_store, s.superfile_id, s.bitmap, &s.etag).await;
+            (s.superfile_id, result)
+        }
+    }))
+    .await;
+    for (superfile_id, result) in results {
+        if let Err(e) = result {
+            warn!(superfile_id = %superfile_id, error = %e, "compact: failed to unseal after aborting");
         }
     }
 }
