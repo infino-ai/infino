@@ -179,6 +179,11 @@ const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
 const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
+/// How old a tombstone sidecar seal has to be before compaction treats
+/// its owner as dead and takes over, instead of backing off.
+/// Scale this up if target_superfile_size_mb is raised well past the default
+pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+
 /// Compaction settings: target size, fill floor, and memory budget.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -190,6 +195,9 @@ pub struct CompactionSettings {
     pub min_fill_percent: u8,
     /// Maximum memory budget for materializing inputs during a single merge, in MiB.
     pub max_memory_mb: u64,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before it's treated as abandoned
+    pub stale_seal_timeout_ms: u64,
 }
 
 impl Default for CompactionSettings {
@@ -198,6 +206,7 @@ impl Default for CompactionSettings {
             target_superfile_size_mb: DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB,
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
 }

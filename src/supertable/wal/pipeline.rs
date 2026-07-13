@@ -59,6 +59,7 @@ use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 use arrow::ipc::reader::StreamReader;
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use bytes::Bytes;
+use chrono::Utc;
 use roaring::RoaringBitmap;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -82,6 +83,7 @@ use crate::{
             state_doc::{
                 IdSpan, OpKind, RowId, TombstoneEntry, TombstoneOutcome, WalState, WalStateDoc,
             },
+            tombstones_admin,
             tombstones_codec::TombstonesSidecar,
         },
         writer::{build_subsection_offsets, persist_commit},
@@ -626,9 +628,10 @@ fn build_vector_summary(
 // 2. **CAS-PUT the tombstone sidecar** under
 //    `superfiles/<superfile_id>.tombstones`: GET (etag), union
 //    the new doc-id bit, PUT with `If-Match`. Loops on CAS-loss.
-//    A `seal.is_some()` response means a compactor is mid-flight;
-//    the writer must re-read the manifest and re-resolve against
-//    the merged target.
+//    A fresh (non-stale) seal means a compactor is mid-flight; the
+//    writer must re-read the manifest and re-resolve against the
+//    merged target. A stale seal (compactor crashed before
+//    unsealing) is taken over instead of backed off on.
 // 3. **Per-target WAL state CAS:** the entry flips to `Tombstoned`
 //    or `NotFound`, with `tombstoned_in_superfile` recorded for
 //    audit.
@@ -965,15 +968,20 @@ async fn resolve_and_tombstone_one(
 enum SidecarCasOutcome {
     /// The new doc-id bit is now durable in the sidecar.
     Landed,
-    /// The current sidecar carries a non-`None` seal — a compactor
-    /// is mid-flight against this superfile. The caller must
-    /// re-read the manifest and re-resolve.
+    /// The current sidecar carries a fresh (non-stale) seal — a
+    /// compactor is presumed still mid-flight against this
+    /// superfile. The caller must re-read the manifest and re-resolve.
+    /// A *stale* seal doesn't produce this outcome; we take it over
+    /// instead (see `cas_tombstone_bit`).
     Sealed,
 }
 
 /// GET → union-the-bit → PUT with bounded CAS-loss retries.
-/// Detects sealed sidecars and surfaces them up via the typed
-/// outcome so the caller's outer loop can re-resolve.
+/// Detects *fresh* sealed sidecars and surfaces them up via the typed
+/// outcome so the caller's outer loop can re-resolve. A stale seal
+/// (its compactor crashed before unsealing) is treated as no seal at
+/// all: we proceed to land the bit and clear it, same as
+/// `tombstones_admin::seal`'s own steal-if-stale behavior.
 async fn cas_tombstone_bit(
     wal_store: &WalStore,
     superfile_id: Uuid,
@@ -986,9 +994,21 @@ async fn cas_tombstone_bit(
             None => (None, None),
         };
 
-        // Sealed → bail out to the outer resolve loop.
+        // Sealed → bail out to the outer resolve loop, but only while
+        // the seal is still fresh. A stale seal means its compactor
+        // crashed before unsealing (see `tombstones_admin::seal`'s
+        // steal-if-stale logic) -- if we kept treating it as live,
+        // this update/delete would retry and eventually fail with
+        // `SealedSidecarRetryExhausted` even long after the seal
+        // stopped meaning anything. Falling through here lands our
+        // bit with `seal: None` below, clearing the dead seal too.
         if let Some(sc) = &existing
-            && sc.seal.is_some()
+            && let Some(seal) = sc.seal.as_ref()
+            && !tombstones_admin::is_seal_stale(
+                seal.sealed_at,
+                Utc::now(),
+                Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS),
+            )
         {
             return Ok(SidecarCasOutcome::Sealed);
         }
@@ -2156,5 +2176,64 @@ mod tests {
             post.tombstone_progress[0].outcome,
             TombstoneOutcome::Pending
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_seal_does_not_block_a_delete() {
+        // Same setup as `sealed_sidecar_surfaces_after_retry_budget`,
+        // but the seal is old enough to be stale (its compactor is
+        // presumed dead, e.g. a crash mid-merge). The delete must
+        // land its tombstone bit right away instead of backing off
+        // and eventually exhausting the sealed-retry budget.
+        let (_dir, st, ws, sf_id, id_min, _id_max) =
+            published_superfile_fixture(&["seal"], 60_000).await;
+
+        let stale_sealed_at = Utc::now()
+            - chrono::Duration::from_std(Duration::from_millis(
+                tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS,
+            ))
+            .unwrap_or_default()
+            - chrono::Duration::seconds(1);
+        let sealed = TombstonesSidecar {
+            seal: Some(SealRecord {
+                compaction_id: Uuid::from_u128(0xDEAD_C0DE),
+                sealed_at: stale_sealed_at,
+            }),
+            bitmap: RoaringBitmap::new(),
+        };
+        ws.put_tombstones(sf_id, None, &sealed)
+            .await
+            .expect("seed stale-sealed sidecar");
+
+        let (wal, etag) = create_delete_wal(&ws, 207, &[id_min]).await;
+
+        // Must complete well within one sealed-retry backoff step,
+        // not fall into the retry loop at all.
+        let (outcome, new_wal, _) = timeout(
+            Duration::from_millis(500),
+            run_tombstone_phase(&st, &ws, &wal, &etag),
+        )
+        .await
+        .expect("must not enter the sealed-retry loop for a stale seal")
+        .expect("tombstone phase must succeed");
+
+        assert_eq!(
+            outcome,
+            TombstonePhaseOutcome::Applied {
+                n_tombstoned: 1,
+                n_not_found: 0,
+            }
+        );
+        assert_eq!(new_wal.state, WalState::Complete);
+
+        // The bit landed, and the stale seal got cleared along with it.
+        let bitmap = read_sidecar_bitmap(&ws, sf_id).await;
+        assert_eq!(bitmap.iter().collect::<Vec<u32>>(), vec![0u32]);
+        let (post_sidecar, _) = ws
+            .get_tombstones(sf_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(post_sidecar.seal.is_none());
     }
 }

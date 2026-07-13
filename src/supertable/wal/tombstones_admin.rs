@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+pub use crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS;
 use crate::supertable::wal::{
     persistence::{WalStore, WalStoreError},
     state_doc::SealRecord,
@@ -61,23 +62,20 @@ pub enum TombstonesAdminError {
     WalStore(#[from] WalStoreError),
 }
 
-/// How old a seal has to be before we treat its owner as dead and
-/// take over, instead of backing off. A crashed compactor never
-/// gets to unseal its own inputs, so this is what actually
-/// recovers them.
-pub const DEFAULT_STALE_SEAL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-
 /// `true` if a seal placed at `sealed_at` is older than
-/// [`DEFAULT_STALE_SEAL_TIMEOUT`] as of `now`. Shared by [`seal`]
-/// (deciding whether to steal it) and the compactor's candidate
-/// selection (deciding whether a sealed superfile is even worth
-/// proposing again).
+/// `stale_timeout` as of `now`. Shared by [`seal`] (deciding whether
+/// to steal it) and the compactor's candidate selection (deciding
+/// whether a sealed superfile is even worth proposing again). Callers
+/// pass [`DEFAULT_STALE_SEAL_TIMEOUT_MS`] (converted to a `Duration`)
+/// unless a table's `CompactionSettings::stale_seal_timeout_ms`
+/// overrides it.
 pub fn is_seal_stale(
     sealed_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
+    stale_timeout: Duration,
 ) -> bool {
     let age = (now - sealed_at).to_std().unwrap_or(Duration::ZERO);
-    age >= DEFAULT_STALE_SEAL_TIMEOUT
+    age >= stale_timeout
 }
 
 /// Atomically stamp the seal flag on a per-superfile tombstone
@@ -103,6 +101,7 @@ pub async fn seal(
     superfile_id: Uuid,
     compaction_id: Uuid,
     sealed_at: chrono::DateTime<chrono::Utc>,
+    stale_timeout: Duration,
 ) -> Result<TombstonesSidecar, TombstonesAdminError> {
     let (existing, etag_opt) = match wal_store.get_tombstones(superfile_id).await? {
         Some((sc, etag)) => (Some(sc), Some(etag)),
@@ -115,7 +114,7 @@ pub async fn seal(
         if existing_seal.compaction_id == compaction_id {
             return Ok(existing.clone());
         }
-        if !is_seal_stale(existing_seal.sealed_at, sealed_at) {
+        if !is_seal_stale(existing_seal.sealed_at, sealed_at, stale_timeout) {
             return Err(TombstonesAdminError::AlreadySealed {
                 superfile_id,
                 existing_compaction_id: existing_seal.compaction_id,
@@ -219,6 +218,9 @@ mod tests {
     use super::*;
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
 
+    const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
+        Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
     fn fixture() -> (TempDir, WalStore) {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -231,7 +233,9 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x100);
         let cid = Uuid::from_u128(0xC0DE);
-        let sealed = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let sealed = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         assert_eq!(sealed.seal.expect("set").compaction_id, cid);
         assert!(sealed.bitmap.is_empty());
 
@@ -261,7 +265,9 @@ mod tests {
         .expect("seed");
 
         let cid = Uuid::from_u128(0xABCD);
-        let sealed = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let sealed = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         assert_eq!(sealed.bitmap, bitmap, "seal must preserve the bitmap");
         assert_eq!(sealed.seal.expect("set").compaction_id, cid);
     }
@@ -271,8 +277,12 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x300);
         let cid = Uuid::from_u128(0xDEAD);
-        let first = seal(&ws, sf, cid, Utc::now()).await.expect("seal-1");
-        let again = seal(&ws, sf, cid, Utc::now()).await.expect("seal-2");
+        let first = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-1");
+        let again = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-2");
         // SealRecord's sealed_at goes through ms-precision
         // truncation on disk so we compare the
         // compaction-identifying fields only, not the timestamp.
@@ -289,8 +299,10 @@ mod tests {
         let sf = Uuid::from_u128(0x400);
         let cid_a = Uuid::from_u128(0x1111);
         let cid_b = Uuid::from_u128(0x2222);
-        let _ = seal(&ws, sf, cid_a, Utc::now()).await.expect("seal-a");
-        let err = seal(&ws, sf, cid_b, Utc::now())
+        let _ = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
+        let err = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error");
         assert!(matches!(
@@ -311,11 +323,13 @@ mod tests {
         let old_time = Utc::now()
             - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
             - chrono::Duration::seconds(1);
-        let _ = seal(&ws, sf, cid_a, old_time).await.expect("seal-a");
+        let _ = seal(&ws, sf, cid_a, old_time, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
 
         // cid_a's seal is older than the timeout, so it's presumed
         // dead and cid_b can take over.
-        let stolen = seal(&ws, sf, cid_b, Utc::now())
+        let stolen = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect("seal-b should steal the stale seal");
         assert_eq!(stolen.seal.expect("set").compaction_id, cid_b);
@@ -327,10 +341,12 @@ mod tests {
         let sf = Uuid::from_u128(0x460);
         let cid_a = Uuid::from_u128(0x1111);
         let cid_b = Uuid::from_u128(0x2222);
-        let _ = seal(&ws, sf, cid_a, Utc::now()).await.expect("seal-a");
+        let _ = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
 
         // cid_a's seal is fresh; cid_b must not be able to take over.
-        let err = seal(&ws, sf, cid_b, Utc::now())
+        let err = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must not steal a fresh seal");
         assert!(matches!(err, TombstonesAdminError::AlreadySealed { .. }));
@@ -368,7 +384,9 @@ mod tests {
             .await
             .expect("seed");
         let cid = Uuid::from_u128(0xC0DEC0DE);
-        let _ = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         let rows = live_rows(&ws, sf, 4).await.expect("live");
         assert_eq!(rows, vec![0u32, 1, 3]);
     }
@@ -393,7 +411,9 @@ mod tests {
 
         // Compactor-side: seal afterwards.
         let cid = Uuid::from_u128(0xC0DEFACE);
-        let _ = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
 
         // Live-rows excludes the tombstoned row.
         let rows = live_rows(&ws, sf, 5).await.expect("live");
@@ -405,7 +425,9 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x900);
         let cid = Uuid::from_u128(0xAAAA);
-        let _ = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
 
         unseal(&ws, sf, cid).await.expect("unseal");
 
@@ -419,7 +441,9 @@ mod tests {
         let sf = Uuid::from_u128(0x901);
         let cid_a = Uuid::from_u128(0xAAAA);
         let cid_b = Uuid::from_u128(0xBBBB);
-        let _ = seal(&ws, sf, cid_a, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
 
         // cid_b was never the owner, so this must be a no-op.
         unseal(&ws, sf, cid_b).await.expect("unseal");

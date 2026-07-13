@@ -233,6 +233,7 @@ impl Supertable {
 
         // Build SuperfileStats for every superfile in the snapshot.
         let now = Utc::now();
+        let stale_seal_timeout = std::time::Duration::from_millis(cfg.stale_seal_timeout_ms);
         let stats: Vec<SuperfileStats> = manifest
             .get_all_superfiles()
             .iter()
@@ -242,9 +243,9 @@ impl Supertable {
                     .cloned()
                     .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
                 let tombstoned_docs = bitmap.len();
-                let sealed_by_other = seal
-                    .as_ref()
-                    .is_some_and(|s| !tombstones_admin::is_seal_stale(s.sealed_at, now));
+                let sealed_by_other = seal.as_ref().is_some_and(|s| {
+                    !tombstones_admin::is_seal_stale(s.sealed_at, now, stale_seal_timeout)
+                });
                 SuperfileStats {
                     superfile_id: entry.superfile_id,
                     partition_key: entry.partition_key.clone(),
@@ -263,7 +264,7 @@ impl Supertable {
         let jobs = select(&stats, cfg);
 
         for job in jobs {
-            self.run_compaction_job(job).await?;
+            self.run_compaction_job(job, stale_seal_timeout).await?;
             self.refresh()
                 .await
                 .map_err(|e| CompactionError::Refresh(e.to_string()))?;
@@ -335,6 +336,7 @@ impl Supertable {
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -376,6 +378,7 @@ impl Supertable {
                     entry.superfile_id,
                     compaction_id,
                     sealed_at,
+                    stale_seal_timeout,
                 )
                 .await
                 {
@@ -533,12 +536,16 @@ mod tests {
     use super::*;
     use crate::{
         BoolMode, Supertable,
+        config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         supertable::{
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
     };
+
+    const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -710,7 +717,7 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error on unknown input");
         assert!(
@@ -745,9 +752,15 @@ mod tests {
             .expect("storage-backed table");
         let wal_store = WalStore::new(storage);
         let foreign_cid = Uuid::new_v4();
-        tombstones_admin::seal(&wal_store, entry_b.superfile_id, foreign_cid, Utc::now())
-            .await
-            .expect("seal entry_b as foreign");
+        tombstones_admin::seal(
+            &wal_store,
+            entry_b.superfile_id,
+            foreign_cid,
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("seal entry_b as foreign");
 
         let job = CompactionJob {
             partition_key: entry_a.partition_key.clone(),
@@ -755,7 +768,7 @@ mod tests {
             estimated_output_bytes: 1,
         };
         let err = st
-            .run_compaction_job(job)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must conflict on entry_b");
         assert!(matches!(err, CompactionError::SidecarConflict { .. }));
@@ -816,14 +829,14 @@ mod tests {
             .expect("storage-backed table");
         let wal_store = WalStore::new(storage);
         let old_time = Utc::now()
-            - chrono::Duration::from_std(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT)
-                .unwrap_or_default()
+            - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
             - chrono::Duration::seconds(1);
         tombstones_admin::seal(
             &wal_store,
             crashed_entry.superfile_id,
             Uuid::new_v4(),
             old_time,
+            DEFAULT_STALE_SEAL_TIMEOUT,
         )
         .await
         .expect("simulate a stale seal");
@@ -2208,9 +2221,15 @@ mod tests {
         let abandoned_compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
         for id in &stranded_ids {
-            tombstones_admin::seal(&wal_store, *id, abandoned_compaction_id, sealed_at)
-                .await
-                .expect("seal");
+            tombstones_admin::seal(
+                &wal_store,
+                *id,
+                abandoned_compaction_id,
+                sealed_at,
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("seal");
         }
 
         // New data arrives and a generous compaction config runs.
