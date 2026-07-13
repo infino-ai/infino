@@ -134,6 +134,7 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
 pub struct infino::CompactionSettings
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
+pub infino::CompactionSettings::stale_seal_timeout_ms: u64
 pub infino::CompactionSettings::target_superfile_size_mb: u64
 impl core::clone::Clone for infino::CompactionSettings
 pub fn infino::CompactionSettings::clone(&self) -> infino::CompactionSettings
