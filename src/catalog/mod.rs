@@ -441,8 +441,13 @@ impl Connection {
         }
     }
 
-    /// Remove a table from the catalog. Fails with
-    /// [`InfinoError::NotFound`] if it isn't registered.
+    /// Remove a table from the catalog. **Idempotent**: dropping a table that
+    /// is not registered is a no-op success, not an error. A caller may retry a
+    /// drop whose first attempt committed the removal but whose success was not
+    /// observed (a lost response, or a proxy retrying on a timeout); the retry
+    /// finds the table already gone and must still succeed. This matches the
+    /// object store's own delete semantics (deleting a missing key is not an
+    /// error), which the whole engine is built on.
     ///
     /// Unregistering is always logical and O(1): the `name → location`
     /// entry leaves the catalog, and readers pinned to a pre-drop
@@ -450,7 +455,8 @@ impl Connection {
     /// storage subtree (its unique per-creation location) after the
     /// catalog commit — the name is gone first, so a crash mid-purge
     /// can only leave unreferenced orphans, never a half-deleted live
-    /// table. For `memory://`, tables live in-process and free with the
+    /// table. When the table was already absent there is nothing to purge.
+    /// For `memory://`, tables live in-process and free with the
     /// last handle, so `purge` has nothing extra to do.
     ///
     /// ```
@@ -467,14 +473,12 @@ impl Connection {
     pub fn drop_table(&self, name: &str, purge: bool) -> Result<(), InfinoError> {
         info!(table = name, purge, "dropping table");
         match &self.inner.store {
-            CatalogStore::Memory(map) => map
-                .lock()
-                .expect("catalog mutex poisoned")
-                .remove(name)
-                .map(|_| ())
-                .ok_or_else(|| {
-                    InfinoError::NotFound(name.to_string()).with_context("drop_table", Some(name))
-                }),
+            CatalogStore::Memory(map) => {
+                // Idempotent: an absent table is a no-op success, so a retried
+                // drop never spuriously fails.
+                map.lock().expect("catalog mutex poisoned").remove(name);
+                Ok(())
+            }
             CatalogStore::Storage {
                 root,
                 handles,
@@ -493,20 +497,19 @@ impl Connection {
                 // Capture the removed entry's location out of the OCC
                 // closure; on a retry the freshest body is re-read, so
                 // the last successful attempt's location wins.
+                // Idempotent: a missing entry is a no-op (a retried drop whose
+                // first attempt already committed the removal must still
+                // succeed). `location` then stays `None`, so the purge below is
+                // skipped — there is nothing left to reclaim.
                 let mut location: Option<String> = None;
                 bridge_sync_to_async(commit_catalog(root.as_ref(), |body| {
-                    match body.tables.remove(name) {
-                        Some(entry) => {
-                            location = Some(entry.location);
-                            Ok(())
-                        }
-                        None => Err(InfinoError::NotFound(name.to_string())),
+                    if let Some(entry) = body.tables.remove(name) {
+                        location = Some(entry.location);
                     }
+                    Ok(())
                 }))
                 .map_err(|e| e.with_context("drop_table", Some(name)))?;
-                if purge {
-                    let location =
-                        location.expect("catalog commit succeeded => an entry was removed");
+                if let (true, Some(location)) = (purge, location) {
                     // Delete everything under the table's unique
                     // location. Listing is component-aware, so a sibling
                     // location sharing a string prefix never matches;
@@ -1058,6 +1061,36 @@ mod tests {
             matches!(conn.open_table("docs"), Err(InfinoError::NotFound(_))),
             "open after drop must be NotFound, not a stale memoized handle"
         );
+    }
+
+    /// A retried `drop_table` must be idempotent. In a distributed deployment a
+    /// caller retries a drop whose first attempt committed the catalog removal
+    /// but whose response was not observed as success (a later purge step
+    /// failed, or a proxy retried on a timeout). The retry then finds the table
+    /// already gone: it must succeed as a no-op, not hard-error `NotFound`, or
+    /// the caller sees a spurious "not found" for a drop that in fact succeeded
+    /// (and, under a retry loop, exhausts its budget failing on every attempt).
+    #[test]
+    fn storage_drop_table_is_idempotent_on_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+
+        // First drop removes the table from the catalog and purges its bytes.
+        conn.drop_table("docs", true).expect("first drop succeeds");
+        assert!(
+            conn.list_tables().expect("list").is_empty(),
+            "the table is gone from the catalog after the first drop"
+        );
+
+        // The retry: dropping an already-removed table must be a no-op success,
+        // not a NotFound error.
+        conn.drop_table("docs", true)
+            .expect("a retried drop of an already-removed table must be idempotent");
     }
 
     /// `drop_table` racing `open_table` on the same name must not leave a stale
@@ -1944,12 +1977,15 @@ mod tests {
     }
 
     #[test]
-    fn drop_missing_is_not_found() {
+    fn drop_missing_is_idempotent_no_op() {
+        // Dropping a table that was never registered is a no-op success, not an
+        // error: drop is idempotent so a retried drop is retry-safe (matches the
+        // object store's delete semantics).
         let conn = connect("memory://").expect("connect");
-        assert!(matches!(
-            conn.drop_table("nope", false),
-            Err(InfinoError::NotFound(_))
-        ));
+        conn.drop_table("nope", false)
+            .expect("dropping an absent table is a no-op success");
+        conn.drop_table("nope", true)
+            .expect("dropping an absent table with purge is also a no-op success");
     }
 
     #[test]
