@@ -107,6 +107,7 @@ impl InfinoError {
             Self::Query(m) => Self::Query(format!("{prefix}: {m}")),
             Self::OverBudget(m) => Self::OverBudget(format!("{prefix}: {m}")),
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
+            Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
         }
     }
 }
@@ -218,6 +219,7 @@ mod tests {
         assert_eq!(InfinoError::Io("t".into()).to_string(), "io: t");
         assert_eq!(InfinoError::Query("t".into()).to_string(), "query: t");
         assert_eq!(InfinoError::Backend("t".into()).to_string(), "backend: t");
+        assert_eq!(InfinoError::Config("t".into()).to_string(), "config: t");
     }
 
     #[test]
