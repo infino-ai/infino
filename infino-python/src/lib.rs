@@ -323,21 +323,24 @@ struct CompactOptions {
     max_memory_mb: Option<u64>,
     min_fill_percent: Option<u8>,
     target_superfile_size_mb: Option<u64>,
+    stale_seal_timeout_ms: Option<u64>,
 }
 
 #[pymethods]
 impl CompactOptions {
     #[new]
-    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None))]
+    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None, stale_seal_timeout_ms=None))]
     fn new(
         max_memory_mb: Option<u64>,
         min_fill_percent: Option<u8>,
         target_superfile_size_mb: Option<u64>,
+        stale_seal_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             max_memory_mb,
             min_fill_percent,
             target_superfile_size_mb,
+            stale_seal_timeout_ms,
         }
     }
 }
@@ -615,6 +618,9 @@ impl Table {
             }
             if let Some(v) = o.target_superfile_size_mb {
                 s.target_superfile_size_mb = v;
+            }
+            if let Some(v) = o.stale_seal_timeout_ms {
+                s.stale_seal_timeout_ms = v;
             }
         }
         let opts = OptimizeOptions::compact(s);

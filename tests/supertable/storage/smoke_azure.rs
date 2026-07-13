@@ -356,6 +356,75 @@ async fn azure_cas_conformance_holds() {
     delete_emulator_container(&container).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_azure_conditional_get_answers_304_on_unchanged() {
+    // The native `If-None-Match` path in
+    // `AzureStorageProvider::get_if_none_match` — the wire-level 304
+    // the refresh probe rides. Only a real Azure endpoint (or
+    // Azurite) evaluates the header; the in-process s3s-fs emulator
+    // does not, so this is the lane that actually proves it.
+    if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "real_azure_conditional_get_answers_304_on_unchanged: skipped \
+             (set INFINO_TEST_REAL_AZURE=1 and AZURE_STORAGE_CONTAINER_NAME to enable)"
+        );
+        return;
+    }
+    let container = match std::env::var("AZURE_STORAGE_CONTAINER_NAME") {
+        Ok(container) => container,
+        Err(_) => {
+            eprintln!(
+                "real_azure_conditional_get_answers_304_on_unchanged: skipped \
+                 (missing AZURE_STORAGE_CONTAINER_NAME)"
+            );
+            return;
+        }
+    };
+    let prefix = format!("infino-conditional-get/{}", uuid::Uuid::new_v4());
+    let storage = AzureStorageProvider::new_with_prefix(
+        &container,
+        &prefix,
+        &super::azure_helpers::azure_storage_options_from_env(),
+    )
+    .expect("azure provider");
+
+    let uri = "probe/pointer";
+    storage
+        .put_atomic(uri, bytes::Bytes::from_static(b"v1"))
+        .await
+        .expect("put v1");
+    let (_, meta) = storage.get(uri).await.expect("get v1");
+    let etag_v1 = meta.etag.expect("azure reports etags");
+
+    // Unchanged blob + matching etag → bodyless 304 → `None`.
+    let unchanged = storage
+        .get_if_none_match(uri, &etag_v1)
+        .await
+        .expect("conditional get against unchanged blob");
+    assert!(
+        unchanged.is_none(),
+        "real Azure must answer If-None-Match on an unchanged blob as 304"
+    );
+    eprintln!("[real-azure] If-None-Match on unchanged blob → 304 OK");
+
+    // Rewrite the blob; the stale etag must read through to the new
+    // body with a fresh etag.
+    storage
+        .put_if_match(uri, bytes::Bytes::from_static(b"v2-longer"), Some(&etag_v1))
+        .await
+        .expect("cas rewrite");
+    let (body, meta2) = storage
+        .get_if_none_match(uri, &etag_v1)
+        .await
+        .expect("conditional get against rewritten blob")
+        .expect("changed blob returns the body");
+    assert_eq!(body, bytes::Bytes::from_static(b"v2-longer"));
+    assert_ne!(meta2.etag.expect("etag"), etag_v1);
+    eprintln!("[real-azure] If-None-Match on rewritten blob → 200 + new etag OK");
+
+    storage.delete(uri).await.expect("cleanup");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn supertable_real_azure_round_trip() {
     if std::env::var("INFINO_TEST_REAL_AZURE").ok().as_deref() != Some("1") {

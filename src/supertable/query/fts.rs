@@ -210,6 +210,10 @@ impl SupertableReader {
     /// sync→async bridge.
     ///
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+    )]
     pub(crate) async fn bm25_search_async(
         &self,
         column: &str,
@@ -504,6 +508,10 @@ impl SupertableReader {
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::token_match`].
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+    )]
     pub(crate) async fn token_match_async(
         &self,
         column: &str,
@@ -963,8 +971,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, BoolMode, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -979,6 +987,10 @@ impl Supertable {
     /// assert_eq!(rows[0].num_columns(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, mode = ?mode))
+    )]
     pub fn bm25_search(
         &self,
         column: &str,
@@ -991,6 +1003,7 @@ impl Supertable {
         self.reader()
             .bm25_search(column, query, k, mode, projection)
             .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("bm25_search", None))
     }
 
     /// Unranked token match over one FTS column: every row whose
@@ -999,6 +1012,10 @@ impl Supertable {
     /// [`Supertable::bm25_search`], but the `score` column is `0.0` and
     /// row order is unspecified — a candidate set, not a ranking.
     /// `projection` follows the same rules as `bm25_search`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, mode = ?mode))
+    )]
     pub fn token_match(
         &self,
         column: &str,
@@ -1010,7 +1027,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .token_match(column, query, mode)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -1018,7 +1035,7 @@ impl Supertable {
                 projection,
                 "token_match",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("token_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1027,6 +1044,10 @@ impl Supertable {
     /// like [`Supertable::bm25_search`], with `score` fixed at `0.0` and
     /// unspecified row order. `projection` follows the same rules as
     /// `bm25_search`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column))
+    )]
     pub fn exact_match(
         &self,
         column: &str,
@@ -1037,7 +1058,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .exact_match(column, value)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -1045,7 +1066,7 @@ impl Supertable {
                 projection,
                 "exact_match",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("exact_match", None))?;
         Ok(vec![batch])
     }
 
@@ -1058,8 +1079,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, BoolMode, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -1076,6 +1097,7 @@ impl Supertable {
         self.reader()
             .count(column, query, mode)
             .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("count", None))
     }
 }
 

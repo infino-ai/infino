@@ -30,7 +30,8 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::{config::Dialect, execution::context::SessionContext};
+use dashmap::DashMap;
+use datafusion::{config::Dialect, error::DataFusionError};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -44,7 +45,7 @@ use uri::{Backend, parse_uri};
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -54,7 +55,7 @@ use crate::{
     },
     supertable::{
         Supertable,
-        options::SupertableOptions,
+        options::{Consistency, SupertableOptions},
         reader_cache::{DiskCacheConfig, DiskCacheStore},
     },
 };
@@ -103,7 +104,11 @@ pub fn connect_with(
             if options.validate {
                 bridge_sync_to_async(read_catalog(root.as_ref()))?;
             }
-            CatalogStore::Storage(root)
+            CatalogStore::Storage {
+                root,
+                handles: DashMap::new(),
+                building: DashMap::new(),
+            }
         }
     };
 
@@ -149,7 +154,37 @@ struct ConnectionInner {
 /// the tables themselves) in-process.
 enum CatalogStore {
     Memory(Mutex<HashMap<String, Supertable>>),
-    Storage(Arc<dyn StorageProvider>),
+    /// Durable backend. `handles` is the warm cache (name → live `Supertable`);
+    /// `building` is a per-name lock guarding the build or evict of an entry.
+    /// Both, because the read must be lock-free but the build must be single:
+    /// two `Supertable`s for one name would race their cold-fetch finalizers on
+    /// the same cache file (a SIGBUS in the mmap path).
+    ///
+    /// Lifecycle of one name:
+    ///   1. `open_table` / `query_sql` checks `handles` first: a hit is a
+    ///      lock-free clone, the common path (`memory://` memoizes the same way
+    ///      via `Memory`).
+    ///   2. A miss takes that name's `building` lock, re-checks `handles` (a
+    ///      peer may have just built it), then builds the `Supertable` once and
+    ///      inserts it. Same-name openers queue on the lock so exactly one store
+    ///      is built; different names build in parallel.
+    ///   3. `create_table` inserts under the same lock, `drop_table` evicts
+    ///      under it. So build, create, and drop of one name never overlap, and
+    ///      a dropped name is never left behind in `handles`.
+    Storage {
+        root: Arc<dyn StorageProvider>,
+        /// Warm cache of live handles. Sharded so concurrent queries on one
+        /// `Connection` don't serialize on a lock.
+        handles: DashMap<String, Supertable>,
+        /// Per-name build/evict lock. Never removed once created: a concurrent
+        /// opener may hold or await the `Arc`, so evicting it mid-use would let
+        /// two builds proceed.
+        ///
+        /// One empty `Arc<Mutex<()>>` therefore lingers per distinct name ever
+        /// seen. We can bound it with refcount-gated eviction (drop only when no
+        /// one holds the `Arc`) later.
+        building: DashMap<String, Arc<Mutex<()>>>,
+    },
 }
 
 impl Connection {
@@ -159,7 +194,7 @@ impl Connection {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// use infino::{connect, IndexSpec};
     ///
     /// let db = connect("memory://")?;
@@ -175,7 +210,7 @@ impl Connection {
         schema: SchemaRef,
         indexes: IndexSpec,
     ) -> Result<Supertable, InfinoError> {
-        validate_name(name)?;
+        validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         let tokenizer = table_tokenizer(&indexes);
 
@@ -188,17 +223,24 @@ impl Connection {
                     tokenizer,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
-                let handle = Supertable::create(opts)?;
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                let handle = Supertable::create(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
-                    return Err(InfinoError::AlreadyExists(name.to_string()));
+                    return Err(InfinoError::AlreadyExists(name.to_string())
+                        .with_context("create_table", Some(name)));
                 }
                 map.insert(name.to_string(), handle.clone());
                 info!(table = name, backend = "memory", "created table");
                 Ok(handle)
             }
-            CatalogStore::Storage(root) => {
+            CatalogStore::Storage {
+                root,
+                handles,
+                building,
+            } => {
                 // Record what was actually used to build the table, so
                 // `open_table` reconstructs matching options (the
                 // supertable's options-hash check then validates them).
@@ -222,20 +264,23 @@ impl Connection {
                 let location = unique_location(name);
                 let entry = TableEntry {
                     location: location.clone(),
-                    schema_ipc: schema_to_ipc(&schema)?,
+                    schema_ipc: schema_to_ipc(&schema)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns().to_vec(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
 
                 let table_storage =
-                    backend_to_provider(&self.inner.backend.join(&location), &self.inner.options)?
+                    backend_to_provider(&self.inner.backend.join(&location), &self.inner.options)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?
                         .expect("non-memory backend yields a storage provider");
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
                 // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+                    .map_err(|e| e.with_context("create_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -243,15 +288,27 @@ impl Connection {
                     tokenizer,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
+
+                // Match `open_table`'s memoized handles: Strong keeps every
+                // query re-checking the manifest pointer (see `open_table`).
+                opts = opts.with_read_consistency(Consistency::Strong);
+
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
                 // (distinct) location just orphans its empty subtree; the
                 // catalog OCC below decides the single name winner.
-                let handle = Supertable::create(opts)?;
+                let handle = Supertable::create(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
+
+                // Gate the commit + memo insert: else a racing `open_table`
+                // sees the commit, misses the memo, and builds a rival store.
+                let gate = single_flight_gate(building, name);
+                let _built = gate.lock().expect("catalog build gate poisoned");
 
                 let name_owned = name.to_string();
                 bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
@@ -260,7 +317,13 @@ impl Connection {
                     }
                     body.tables.insert(name_owned.clone(), entry.clone());
                     Ok(())
-                }))?;
+                }))
+                .map_err(|e| e.with_context("create_table", Some(name)))?;
+
+                // Seed the memo: `query_sql` reads back through this same
+                // handle, so in-process writes are visible at once.
+                handles.insert(name.to_string(), handle.clone());
+
                 info!(table = name, location = %location, "created table");
                 Ok(handle)
             }
@@ -272,7 +335,7 @@ impl Connection {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -289,15 +352,39 @@ impl Connection {
                 .expect("catalog mutex poisoned")
                 .get(name)
                 .cloned()
-                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
-            CatalogStore::Storage(root) => {
-                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
-                let entry = body
-                    .tables
-                    .get(name)
-                    .ok_or_else(|| InfinoError::NotFound(name.to_string()))?;
+                .ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                }),
 
-                let schema = schema_from_ipc(&entry.schema_ipc)?;
+            CatalogStore::Storage {
+                root,
+                handles,
+                building,
+            } => {
+                // Warm path: lock-free sharded lookup, no serialization.
+                if let Some(handle) = handles.get(name) {
+                    return Ok(handle.clone());
+                }
+
+                // Cold path: build once under the gate. Blocks here if a
+                // same-name peer is mid-build (same `Arc`, same mutex); the
+                // winner builds, the rest wake to find a warm `handles`.
+                let gate = single_flight_gate(building, name);
+                let _built = gate.lock().expect("catalog build gate poisoned");
+
+                // A peer may have built it while we waited on the gate.
+                if let Some(handle) = handles.get(name) {
+                    return Ok(handle.clone());
+                }
+
+                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let entry = body.tables.get(name).ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                })?;
+
+                let schema = schema_from_ipc(&entry.schema_ipc)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
                 // Rebuild the index spec from the recorded declarations and
                 // lower it through the *same* path `create_table` used, so
                 // the defaults it applies (rotation seed, rerank codec) are
@@ -311,7 +398,8 @@ impl Connection {
                         v.column.clone(),
                         v.dim,
                         v.n_cent,
-                        metric_from_str(&v.metric)?,
+                        metric_from_str(&v.metric)
+                            .map_err(|e| e.with_context("open_table", Some(name)))?,
                     );
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
@@ -320,11 +408,14 @@ impl Connection {
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
                     &self.inner.options,
-                )?
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
+
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -332,17 +423,31 @@ impl Connection {
                     tokenizer,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
-                )?;
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
-                Ok(Supertable::open(opts)?)
+                // Strong: re-check the manifest pointer per query (cheap,
+                // short-circuits when unchanged), matching the old rebuild's
+                // freshness without its cost.
+                opts = opts.with_read_consistency(Consistency::Strong);
+                let handle = Supertable::open(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
+                handles.insert(name.to_string(), handle.clone());
+
+                Ok(handle)
             }
         }
     }
 
-    /// Remove a table from the catalog. Fails with
-    /// [`InfinoError::NotFound`] if it isn't registered.
+    /// Remove a table from the catalog. **Idempotent**: dropping a table that
+    /// is not registered is a no-op success, not an error. A caller may retry a
+    /// drop whose first attempt committed the removal but whose success was not
+    /// observed (a lost response, or a proxy retrying on a timeout); the retry
+    /// finds the table already gone and must still succeed. This matches the
+    /// object store's own delete semantics (deleting a missing key is not an
+    /// error), which the whole engine is built on.
     ///
     /// Unregistering is always logical and O(1): the `name → location`
     /// entry leaves the catalog, and readers pinned to a pre-drop
@@ -350,12 +455,13 @@ impl Connection {
     /// storage subtree (its unique per-creation location) after the
     /// catalog commit — the name is gone first, so a crash mid-purge
     /// can only leave unreferenced orphans, never a half-deleted live
-    /// table. For `memory://`, tables live in-process and free with the
+    /// table. When the table was already absent there is nothing to purge.
+    /// For `memory://`, tables live in-process and free with the
     /// last handle, so `purge` has nothing extra to do.
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -367,29 +473,43 @@ impl Connection {
     pub fn drop_table(&self, name: &str, purge: bool) -> Result<(), InfinoError> {
         info!(table = name, purge, "dropping table");
         match &self.inner.store {
-            CatalogStore::Memory(map) => map
-                .lock()
-                .expect("catalog mutex poisoned")
-                .remove(name)
-                .map(|_| ())
-                .ok_or_else(|| InfinoError::NotFound(name.to_string())),
-            CatalogStore::Storage(root) => {
+            CatalogStore::Memory(map) => {
+                // Idempotent: an absent table is a no-op success, so a retried
+                // drop never spuriously fails.
+                map.lock().expect("catalog mutex poisoned").remove(name);
+                Ok(())
+            }
+            CatalogStore::Storage {
+                root,
+                handles,
+                building,
+            } => {
+                // Gate the evict + commit: else a racing `open_table` that read
+                // the pre-commit catalog re-inserts the handle after we evict,
+                // and the warm path keeps serving the dropped table.
+                let gate = single_flight_gate(building, name);
+                let _dropping = gate.lock().expect("catalog build gate poisoned");
+
+                // Evict first: a later create/open rebuilds fresh, and this
+                // frees the handle's `DiskCacheStore`.
+                handles.remove(name);
+
                 // Capture the removed entry's location out of the OCC
                 // closure; on a retry the freshest body is re-read, so
                 // the last successful attempt's location wins.
+                // Idempotent: a missing entry is a no-op (a retried drop whose
+                // first attempt already committed the removal must still
+                // succeed). `location` then stays `None`, so the purge below is
+                // skipped — there is nothing left to reclaim.
                 let mut location: Option<String> = None;
                 bridge_sync_to_async(commit_catalog(root.as_ref(), |body| {
-                    match body.tables.remove(name) {
-                        Some(entry) => {
-                            location = Some(entry.location);
-                            Ok(())
-                        }
-                        None => Err(InfinoError::NotFound(name.to_string())),
+                    if let Some(entry) = body.tables.remove(name) {
+                        location = Some(entry.location);
                     }
-                }))?;
-                if purge {
-                    let location =
-                        location.expect("catalog commit succeeded => an entry was removed");
+                    Ok(())
+                }))
+                .map_err(|e| e.with_context("drop_table", Some(name)))?;
+                if let (true, Some(location)) = (purge, location) {
                     // Delete everything under the table's unique
                     // location. Listing is component-aware, so a sibling
                     // location sharing a string prefix never matches;
@@ -399,7 +519,8 @@ impl Connection {
                         let objects = root.list_with_prefix(&location).await?;
                         try_join_all(objects.iter().map(|uri| root.delete(uri))).await?;
                         Ok::<(), StorageError>(())
-                    })?;
+                    })
+                    .map_err(|e| InfinoError::from(e).with_context("drop_table", Some(name)))?;
                 }
                 Ok(())
             }
@@ -427,7 +548,7 @@ impl Connection {
                 names.sort();
                 Ok(names)
             }
-            CatalogStore::Storage(root) => {
+            CatalogStore::Storage { root, .. } => {
                 let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
                 Ok(body.tables.into_keys().collect())
             }
@@ -441,8 +562,8 @@ impl Connection {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -452,9 +573,17 @@ impl Connection {
     /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(sql = sql))
+    )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
-        let ctx = SessionContext::new();
+
+        // Gate SQL heap on the connection budget: DataFusion allocates the
+        // working set (sort / aggregate / join), so its pool is the gate.
+        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
@@ -462,11 +591,11 @@ impl Connection {
         let statement = ctx
             .state()
             .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
         let refs = ctx
             .state()
             .resolve_table_references(&statement)
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
         let mut handles: Vec<Supertable> = Vec::new();
@@ -477,13 +606,13 @@ impl Connection {
             }
             match self.open_table(&name) {
                 Ok(table) => {
-                    table
-                        .register_into(&ctx, &name)
-                        .map_err(|e| InfinoError::Query(e.to_string()))?;
+                    table.register_into(&ctx, &name).map_err(|e| {
+                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
+                    })?;
                     handles.push(table);
                 }
                 Err(InfinoError::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.with_context("query_sql", None)),
             }
         }
 
@@ -497,18 +626,34 @@ impl Connection {
             let df = ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()))?;
-            df.collect()
+                .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+
+            // A RecordBatch carries the schema; an empty Vec does not. Capture
+            // the output schema before collect() consumes the DataFrame so a
+            // zero-row result returns one empty batch with the projected
+            // schema, rather than a schema-less Vec — which the Python binding's
+            // Table.from_batches([]) can't build from.
+            let output_schema: SchemaRef = df.schema().inner().clone();
+            let batches = df
+                .collect()
                 .await
-                .map_err(|e| InfinoError::Query(e.to_string()))
+                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
+            if batches.is_empty() {
+                Ok(vec![RecordBatch::new_empty(output_schema)])
+            } else {
+                Ok(batches)
+            }
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
         // be multi-thread: a table-free query can be a search TVF, which
         // fans out object-store reads under the hood.
         match handles.first() {
-            Some(table) => table.block_on_query(drive),
-            None => bridge_on_runtime(drive, &self.query_runtime()),
+            Some(table) => table
+                .block_on_query(drive)
+                .map_err(|e: InfinoError| e.with_context("query_sql", None)),
+            None => bridge_on_runtime(drive, &self.query_runtime())
+                .map_err(|e: InfinoError| e.with_context("query_sql", None)),
         }
     }
 
@@ -535,6 +680,15 @@ fn build_options(
     // Set last so no builder step can reset the shared connection budget.
     opts.connection_memory_budget = connection_memory_budget;
     Ok(opts)
+}
+
+/// Map a SQL execution error to the public error: a budget exhaustion becomes
+/// [`InfinoError::OverBudget`], anything else a generic query error.
+fn sql_exec_error(e: DataFusionError) -> InfinoError {
+    match e {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
+        other => InfinoError::Query(other.to_string()),
+    }
 }
 
 /// The v1 default tokenizer, required iff the spec has FTS columns.
@@ -597,6 +751,16 @@ fn build_disk_cache(
     let cache = DiskCacheStore::new_unpinned(Arc::clone(storage), cfg)
         .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some(cache))
+}
+
+/// The per-name single-flight gate, created on first use. Returned as an owned
+/// `Arc` (not a `DashMap` reference) so the caller locks it *after* the map
+/// access returns, never holding a shard across the build's blocking I/O.
+fn single_flight_gate(building: &DashMap<String, Arc<Mutex<()>>>, name: &str) -> Arc<Mutex<()>> {
+    building
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Table names are flat, case-sensitive `[A-Za-z0-9_-]+` identifiers
@@ -671,8 +835,9 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, sync::Arc};
+    use std::{fs, path::Path, sync::Arc, thread};
 
+    use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -753,6 +918,336 @@ mod tests {
             .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
             .expect("bm25_search after append");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
+    }
+
+    /// Row count via SQL — used by the memoization tests below.
+    fn count_rows(conn: &Connection, table: &str) -> i64 {
+        let batches = conn
+            .query_sql(&format!("SELECT COUNT(*) FROM {table}"))
+            .expect("count query");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) yields Int64")
+            .value(0)
+    }
+
+    /// The memoized storage handle must reuse its warm disk cache across
+    /// `query_sql` calls: the first query cold-fetches the superfile, the
+    /// second hits the cache and does no further cold fetch. Guards the
+    /// `open_table` handle memoization for durable backends.
+    #[test]
+    fn storage_query_sql_reuses_warm_disk_cache_across_calls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        // Writer connection creates + fills the table. Its own writer path
+        // populates the in-memory reader tier, so a reader that did NOT write
+        // the superfile is needed to exercise the disk-cache cold path.
+        let writer = connect(&uri).expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Fresh reader connection with a disk cache: empty in-memory tier, so
+        // the first read cold-fetches through the disk cache. A projecting
+        // scan (reads `title`) forces a real superfile read, unlike `COUNT(*)`
+        // which is answered from manifest stats.
+        let reader = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(cache.path().to_path_buf()),
+        )
+        .expect("connect reader");
+
+        reader.query_sql("SELECT title FROM docs").expect("scan q1");
+        let cold_after_q1 = reader
+            .open_table("docs")
+            .expect("open")
+            .stats()
+            .n_cold_fetches
+            .expect("disk cache attached");
+        assert!(
+            cold_after_q1 > 0,
+            "first query should cold-fetch the superfile"
+        );
+
+        // Query 2 reuses the memoized handle: it must hit the warm cache, not
+        // re-fetch. Before memoization this rebuilt the store and cold-fetched
+        // again.
+        reader.query_sql("SELECT title FROM docs").expect("scan q2");
+        let cold_after_q2 = reader
+            .open_table("docs")
+            .expect("open")
+            .stats()
+            .n_cold_fetches
+            .expect("disk cache attached");
+        assert_eq!(
+            cold_after_q2, cold_after_q1,
+            "second query must reuse the warm disk cache, not cold-fetch again"
+        );
+    }
+
+    /// A server holds one `Connection` and fans out concurrent queries. Many
+    /// parallel first-opens of the same table must single-flight: build exactly
+    /// one `Supertable`/`DiskCacheStore`, so the one superfile is cold-fetched
+    /// once, not once per racing thread. A double-build would spin up rival
+    /// stores that each cold-fetch (and race their finalizers on the same cache
+    /// file, the SIGBUS in the mmap path).
+    #[test]
+    fn storage_concurrent_first_opens_build_one_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        let reader = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(cache.path().to_path_buf()),
+        )
+        .expect("connect reader");
+
+        // 8 threads race through open_table for the same, not-yet-open table.
+        thread::scope(|s| {
+            let joins: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| reader.query_sql("SELECT title FROM docs").expect("scan")))
+                .collect();
+            for j in joins {
+                j.join().expect("query thread");
+            }
+        });
+
+        // One store built (single-flight) and one superfile, so exactly one
+        // cold fetch despite 8 concurrent queries. More would mean rival stores.
+        let cold = reader
+            .open_table("docs")
+            .expect("open")
+            .stats()
+            .n_cold_fetches
+            .expect("disk cache attached");
+        assert_eq!(
+            cold, 1,
+            "concurrent first-opens must build one store and cold-fetch the superfile once"
+        );
+    }
+
+    /// Sequential self-heal: dropping a table clears its memoized handle, so a
+    /// later `open_table` reads the catalog and reports `NotFound` rather than
+    /// serving the dropped table from the warm memo fast path.
+    #[test]
+    fn storage_drop_invalidates_memo_then_open_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+        // Warm the memo so the drop must actively evict it.
+        conn.open_table("docs").expect("open before drop");
+
+        conn.drop_table("docs", true).expect("drop");
+
+        assert!(
+            matches!(conn.open_table("docs"), Err(InfinoError::NotFound(_))),
+            "open after drop must be NotFound, not a stale memoized handle"
+        );
+    }
+
+    /// A retried `drop_table` must be idempotent. In a distributed deployment a
+    /// caller retries a drop whose first attempt committed the catalog removal
+    /// but whose response was not observed as success (a later purge step
+    /// failed, or a proxy retried on a timeout). The retry then finds the table
+    /// already gone: it must succeed as a no-op, not hard-error `NotFound`, or
+    /// the caller sees a spurious "not found" for a drop that in fact succeeded
+    /// (and, under a retry loop, exhausts its budget failing on every attempt).
+    #[test]
+    fn storage_drop_table_is_idempotent_on_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+
+        // First drop removes the table from the catalog and purges its bytes.
+        conn.drop_table("docs", true).expect("first drop succeeds");
+        assert!(
+            conn.list_tables().expect("list").is_empty(),
+            "the table is gone from the catalog after the first drop"
+        );
+
+        // The retry: dropping an already-removed table must be a no-op success,
+        // not a NotFound error.
+        conn.drop_table("docs", true)
+            .expect("a retried drop of an already-removed table must be idempotent");
+    }
+
+    /// `drop_table` racing `open_table` on the same name must not leave a stale
+    /// memoized handle: an open that read the pre-commit catalog must not
+    /// re-insert after the drop evicts. The `building` gate (held across evict +
+    /// commit) serializes them, so once the drop settles the table stays gone.
+    /// Loop many rounds to hit the window; post-join `open_table` is `NotFound`.
+    #[test]
+    fn storage_concurrent_drop_and_open_never_serves_dropped() {
+        const ROUNDS: usize = 20;
+        const OPENERS: usize = 4;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        for round in 0..ROUNDS {
+            let name = format!("t{round}");
+            conn.create_table(&name, schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create_table")
+                .append(&build_title_batch(&["fox"]))
+                .expect("append");
+            // Warm the memo, so a racing open can observe (and must not restore)
+            // an entry the drop is removing.
+            conn.open_table(&name).expect("open before race");
+
+            thread::scope(|s| {
+                for _ in 0..OPENERS {
+                    s.spawn(|| {
+                        // Both Ok (raced before the drop) and NotFound (raced
+                        // after) are valid mid-race; neither may panic.
+                        let _ = conn.open_table(&name);
+                    });
+                }
+                s.spawn(|| {
+                    conn.drop_table(&name, false).expect("drop");
+                });
+            });
+
+            assert!(
+                matches!(conn.open_table(&name), Err(InfinoError::NotFound(_))),
+                "round {round}: table must stay dropped, no stale handle in the memo"
+            );
+        }
+    }
+
+    /// `create_table` racing `open_table` on the same name: benign, but must
+    /// stay so. The gate serializes the create's commit + memo insert against
+    /// the open, so no rival store is memoized. A racing open sees the table or
+    /// `NotFound`, never a panic or other error; afterward the table queries.
+    #[test]
+    fn storage_concurrent_create_and_open_stays_consistent() {
+        const ROUNDS: usize = 20;
+        const OPENERS: usize = 4;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        for round in 0..ROUNDS {
+            let name = format!("t{round}");
+
+            thread::scope(|s| {
+                s.spawn(|| {
+                    conn.create_table(&name, schema_id_title(), IndexSpec::new().fts("title"))
+                        .expect("create_table")
+                        .append(&build_title_batch(&["fox"]))
+                        .expect("append");
+                });
+                for _ in 0..OPENERS {
+                    s.spawn(|| {
+                        // Pre-commit opens see NotFound; post-commit opens see
+                        // the table. Both are fine; a panic or other error is
+                        // not.
+                        match conn.open_table(&name) {
+                            Ok(_) | Err(InfinoError::NotFound(_)) => {}
+                            Err(e) => panic!("round {round}: unexpected open error: {e}"),
+                        }
+                    });
+                }
+            });
+
+            // After the race the table is present and the appended row is
+            // readable through the memoized handle (one store, writes visible).
+            assert_eq!(
+                count_rows(&conn, &name),
+                1,
+                "round {round}: created table must be queryable with its row"
+            );
+        }
+    }
+
+    /// A commit made after a table has been queried (so its handle is
+    /// memoized and warm) must be visible to the next query. Guards that
+    /// memoizing the handle does not serve a stale manifest.
+    #[test]
+    fn storage_query_sql_sees_commit_after_the_handle_is_memoized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+        let table = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+        table
+            .append(&build_title_batch(&["one"]))
+            .expect("append 1");
+
+        // First query memoizes + warms the handle.
+        assert_eq!(count_rows(&conn, "docs"), 1);
+
+        // Commit a second row through a handle from the same connection
+        // (the memoized one), then re-query: the memoized handle must see it.
+        conn.open_table("docs")
+            .expect("open")
+            .append(&build_title_batch(&["two"]))
+            .expect("append 2");
+        assert_eq!(
+            count_rows(&conn, "docs"),
+            2,
+            "the memoized handle must reflect the new commit, not a stale snapshot"
+        );
+    }
+
+    /// Cross-connection freshness: memoizing must not pin the snapshot a handle
+    /// first saw. A second connection commits on the same storage; the first
+    /// connection's memoized handle sees it on the next query, because it opens
+    /// `Strong` and re-reads the manifest pointer. This is the guarantee the old
+    /// rebuild-per-query gave for free and the reason memoized handles use
+    /// `Strong` rather than the default bounded staleness.
+    #[test]
+    fn storage_memoized_handle_sees_another_connections_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["one"]))
+            .expect("append 1");
+
+        // A separate connection memoizes + warms its own handle for `docs`.
+        let reader = connect(&uri).expect("connect reader");
+        assert_eq!(count_rows(&reader, "docs"), 1);
+
+        // The other connection commits a second row.
+        writer
+            .open_table("docs")
+            .expect("reopen for append")
+            .append(&build_title_batch(&["two"]))
+            .expect("append 2");
+
+        assert_eq!(
+            count_rows(&reader, "docs"),
+            2,
+            "memoized handle must reflect another connection's commit, not a pinned snapshot"
+        );
     }
 
     #[test]
@@ -1031,6 +1526,160 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    // Many distinct group keys force DataFusion's aggregate to build a real
+    // hash table, so its memory pool (the connection budget) is exercised.
+    fn many_distinct_titles() -> Vec<String> {
+        (0..4000)
+            .map(|i| format!("distinct title number {i} with some filler text"))
+            .collect()
+    }
+
+    fn append_titles(conn: &Connection) -> usize {
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let titles = many_distinct_titles();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        docs.append(&build_title_batch(&refs)).expect("append");
+        titles.len()
+    }
+
+    /// Ingest the fixture on a measured connection, then return a 0-byte-gate
+    /// connection over the same durable store plus the row count. Ingest is
+    /// gated by the budget too, so setup runs on a measured connection and only
+    /// the query connection carries the gate. Hold the `TempDir`: dropping it
+    /// deletes the store.
+    fn tiny_budget_conn_after_ingest() -> (tempfile::TempDir, Connection, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let n = append_titles(&connect(&uri).expect("writer connect"));
+        let conn = connect_with(
+            &uri,
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("query connect");
+        (dir, conn, n)
+    }
+
+    const HEAVY_GROUP_BY: &str = "SELECT title, COUNT(*) AS n FROM docs GROUP BY title";
+
+    #[test]
+    fn query_sql_under_measure_only_default_is_never_refused() {
+        // Default budget only measures, so even a heavy aggregate runs.
+        let conn = connect("memory://").expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect("measure-only never refuses");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_under_a_generous_budget_succeeds() {
+        // 1 GiB is far more than the query needs, so the gate never trips.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1 << 30),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn.query_sql(HEAVY_GROUP_BY).expect("well under 1 GiB");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_over_a_tiny_budget_is_refused_as_over_budget() {
+        // 0-byte gate: the aggregate can't reserve its first byte, and spilling
+        // needs memory it doesn't have, so it's refused as OverBudget.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect_err("a 0-byte gate refuses the aggregate");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
+        // A projection streams (no buffering), so it reserves nothing and runs
+        // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
+        let (_dir, conn, n) = tiny_budget_conn_after_ingest();
+        let out = conn
+            .query_sql("SELECT title FROM docs")
+            .expect("a streaming scan is not gated");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_zero_row_filter_preserves_projected_schema() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+
+        // Same projection with rows gives the ground-truth schema to compare against.
+        let with_rows = conn
+            .query_sql("SELECT _id, title FROM docs")
+            .expect("query with rows");
+        let expected_schema = with_rows[0].schema();
+
+        let batches = conn
+            .query_sql("SELECT _id, title FROM docs WHERE title = 'no_match'")
+            .expect("zero-row query must not error");
+        assert!(
+            !batches.is_empty(),
+            "must contain at least one (empty) batch"
+        );
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "no rows should match");
+        assert_eq!(
+            batches[0].schema(),
+            expected_schema,
+            "zero-row schema must match the with-rows schema"
+        );
+    }
+
+    #[test]
+    fn query_sql_zero_row_group_by_preserves_projected_schema() {
+        // GROUP BY is a different DataFusion operator path from a filtered scan;
+        // zero matching groups must still produce a schema-bearing empty batch.
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+
+        // The same aggregate over matching rows gives the ground-truth schema:
+        // an aggregate's output schema (group keys + aggregate exprs) must be
+        // identical whether or not any group forms.
+        let with_groups = conn
+            .query_sql("SELECT title, COUNT(*) AS n FROM docs GROUP BY title")
+            .expect("GROUP BY with rows");
+        let expected_schema = with_groups[0].schema();
+
+        let batches = conn
+            .query_sql(
+                "SELECT title, COUNT(*) AS n FROM docs WHERE title = 'no_match' GROUP BY title",
+            )
+            .expect("zero-row GROUP BY must not error");
+        assert!(
+            !batches.is_empty(),
+            "must contain at least one (empty) batch"
+        );
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "no groups should form");
+        assert_eq!(
+            batches[0].schema(),
+            expected_schema,
+            "zero-group schema must match the with-groups schema"
+        );
     }
 
     #[test]
@@ -1335,12 +1984,15 @@ mod tests {
     }
 
     #[test]
-    fn drop_missing_is_not_found() {
+    fn drop_missing_is_idempotent_no_op() {
+        // Dropping a table that was never registered is a no-op success, not an
+        // error: drop is idempotent so a retried drop is retry-safe (matches the
+        // object store's delete semantics).
         let conn = connect("memory://").expect("connect");
-        assert!(matches!(
-            conn.drop_table("nope", false),
-            Err(InfinoError::NotFound(_))
-        ));
+        conn.drop_table("nope", false)
+            .expect("dropping an absent table is a no-op success");
+        conn.drop_table("nope", true)
+            .expect("dropping an absent table with purge is also a no-op success");
     }
 
     #[test]
@@ -1491,5 +2143,59 @@ mod tests {
             1,
             "expected the persisted doc to be searchable"
         );
+    }
+
+    /// Finding #3: public API boundaries prefix operation (+ table when
+    /// known) into the InfinoError message so Display carries context.
+    #[test]
+    fn public_api_errors_carry_operation_and_table_context() {
+        use datafusion::prelude::{col, lit};
+
+        // --- Catalog methods know the table name ---
+        let conn = connect("memory://").expect("connect");
+        let err = conn.open_table("posts").expect_err("missing table");
+        assert!(matches!(err, InfinoError::NotFound(_)));
+        assert!(err.to_string().contains("open_table(posts):"), "got: {err}");
+
+        conn.create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create posts");
+        let err = conn
+            .create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect_err("duplicate create");
+        assert!(matches!(err, InfinoError::AlreadyExists(_)));
+        assert!(
+            err.to_string().contains("create_table(posts):"),
+            "got: {err}"
+        );
+
+        // --- Supertable methods: operation only (no catalog name on handle) ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path");
+        let conn = connect(uri).expect("connect");
+        conn.create_table("posts", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create posts");
+        let posts = conn.open_table("posts").expect("open");
+        posts
+            .append(&build_title_batch(&["hello world"]))
+            .expect("append one row");
+
+        let err = posts
+            .update(
+                col("title").eq(lit("hello world")),
+                &build_title_batch(&["a", "b"]),
+            )
+            .expect_err("cardinality mismatch");
+        assert!(matches!(err, InfinoError::Cardinality(_)));
+        assert!(err.to_string().contains("update:"), "got: {err}");
+
+        let err = posts
+            .bm25_search("title", "-onlyneg", TOP_K, BoolMode::Or, None)
+            .expect_err("negation-only query");
+        assert!(matches!(err, InfinoError::Query(_)));
+        assert!(err.to_string().contains("bm25_search:"), "got: {err}");
+
+        let err = conn.query_sql("NOT VALID SQL @@@").expect_err("bad sql");
+        assert!(matches!(err, InfinoError::Query(_)));
+        assert!(err.to_string().contains("query_sql:"), "got: {err}");
     }
 }

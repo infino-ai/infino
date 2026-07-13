@@ -18,6 +18,7 @@ use infino::{
     supertable::{
         Supertable,
         mutations::MutationError,
+        options::Consistency,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
     },
     test_helpers::{build_title_batch, default_supertable_options},
@@ -159,6 +160,88 @@ async fn writer_delete_on_predicate_with_no_matches_returns_zero_outcome() {
     assert_eq!(outcome.matched(), 0);
     assert_eq!(outcome.n_tombstoned(), 0);
     assert_eq!(outcome.n_not_found(), 0);
+}
+
+/// The cross-worker delete-propagation contract: a second handle on
+/// the same storage (modeling another worker process with its own
+/// tombstone cache) sees a delete on the *very next query* under
+/// `Consistency::Strong` — no TTL window. The delete pipeline stamps
+/// the touched superfile's tombstone seq into the manifest, the
+/// reader's per-query pointer refresh picks the stamp up, and the
+/// sidecar cache refetches exactly the named sidecar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_is_visible_to_other_handles_on_next_query() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage_a: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let storage_b: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+    let writer_handle =
+        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage_a)))
+            .expect("create");
+    let mut w = writer_handle.writer().expect("writer");
+    w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+        .expect("append");
+    w.commit().expect("commit");
+
+    // "Another worker": a separate handle with its own (empty)
+    // tombstone cache, reading at strong consistency.
+    let reader_handle = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage_b))
+            .with_read_consistency(Consistency::Strong),
+    )
+    .expect("open");
+
+    // Warm the other worker's caches with a pre-delete query so the
+    // later assertion exercises invalidation, not a cold read.
+    let n_rows: usize = reader_handle
+        .reader()
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .expect("pre-delete fts")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n_rows, 1, "row visible before the delete");
+
+    // Worker A deletes the row. Commit = sidecar CAS-PUT + manifest
+    // seq stamp; the stamp is its own manifest version.
+    let manifest_id_before = writer_handle.manifest_id();
+    w.delete(col("title").eq(lit("bravo"))).expect("delete");
+    w.commit().expect("commit delete");
+    drop(w);
+    assert!(
+        writer_handle.manifest_id() > manifest_id_before,
+        "the delete's tombstone-seq stamp publishes a new manifest version"
+    );
+
+    // The very next query on the other worker must drop the row.
+    let n_rows: usize = reader_handle
+        .reader()
+        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .expect("post-delete fts")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n_rows, 0, "delete visible to the other handle immediately");
+
+    let batches = reader_handle
+        .reader()
+        .query_sql("SELECT title FROM supertable ORDER BY title")
+        .expect("post-delete sql");
+    let titles: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .expect("title col");
+            (0..col.len()).map(move |i| col.value(i).to_string())
+        })
+        .collect();
+    assert_eq!(titles, vec!["alpha".to_string(), "charlie".into()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

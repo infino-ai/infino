@@ -83,6 +83,17 @@ pub trait SuperfileReaderCache: Send + Sync {
     /// cached superfile. Used by tests + observability that need to
     /// confirm RAM bounds match expectations.
     fn resident_bytes(&self) -> usize;
+
+    /// Drop a superfile's cached bytes once it's no longer referenced
+    /// by the manifest (e.g. merged away by compaction).
+    ///
+    /// Safe under concurrency: a caller already holding an
+    /// `Arc<SuperfileReader>` keeps it alive regardless. A later
+    /// `reader()` for this `uri` just misses and falls back to
+    /// storage, which still has the bytes until `gc()` reclaims them.
+    ///
+    /// Default no-op — bounded caches (e.g. LRU) don't need this.
+    fn remove(&self, _uri: &SuperfileUri) {}
 }
 
 /// Error type for [`SuperfileReaderCache`] operations.

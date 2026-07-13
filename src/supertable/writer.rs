@@ -68,6 +68,7 @@ use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::{runtime::Handle, task::block_in_place, time::sleep};
 use tracing::{debug, error};
+use uuid::Uuid;
 
 use super::{
     build::fanout_shards,
@@ -96,6 +97,7 @@ use super::{
 use crate::superfile::ReadError;
 use crate::{
     InfinoError,
+    memory::{ConnectionMemoryBudget, Reservation},
     storage::{StorageError, StorageProvider},
     superfile::{
         SuperfileReader,
@@ -123,6 +125,27 @@ use crate::{
     },
 };
 
+// Approximate multiples for the memory the build will use, reserved up front rather than
+// accounted for exactly. Building the superfile holds the FTS and vector blobs plus the
+// serialized file in memory at once, so the real peak is a few times the raw ingested bytes.
+//
+// Each kind of blob has a separate factor, so the estimate tracks the schema & ingestion data
+// closely: memory for building vector blobs >> memory for the FTS blob >> memory for plain
+// scalar columns.
+//
+// Stored as numerator over DENOM so the estimate stays integer-only (halves).
+const BUILD_SCRATCH_DENOM: usize = 2;
+
+// Scalar columns, held then serialized into the Parquet body: ~2.5x.
+const BUILD_SCALAR_NUM: usize = 5;
+
+// f32 vector payload, rebuilt as quantized + rerank codecs alongside the raw input: ~6.5x.
+const BUILD_VECTOR_NUM: usize = 13;
+
+// FTS text, ~1.5x for the FST + postings structures. Added on top of the scalar factor, not
+// instead of it: the same text bytes are held as a column and drive the index build at once.
+const BUILD_FTS_NUM: usize = 3;
+
 /// Single-writer append + commit handle.
 ///
 /// At most one outstanding per supertable. Acquire via
@@ -135,9 +158,16 @@ pub struct SupertableWriter {
     /// SuperfileBuilder) owns the buffer so commit() can rayon-
     /// shard it across workers, each running its own builder.
     buffer: Vec<BufferedBatch>,
-    /// Estimated byte cost of `buffer` so append() can auto-flush
-    /// when the buffer crosses the configured threshold.
-    buffer_bytes: usize,
+    /// Held Arrow scalar bytes across `buffer` (id + user columns,
+    /// including the FTS text columns).
+    buffer_scalar_bytes: usize,
+    /// Held f32 vector payload bytes across `buffer`.
+    buffer_vector_bytes: usize,
+    /// Byte size of the FTS-indexed text columns within `buffer`. A
+    /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
+    /// only to weight the build-scratch reserve, since the FTS index
+    /// structures built at commit scale with the text input.
+    buffer_fts_bytes: usize,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -175,7 +205,7 @@ impl fmt::Debug for SupertableWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupertableWriter")
             .field("buffered_batches", &self.buffer.len())
-            .field("buffered_bytes", &self.buffer_bytes)
+            .field("buffered_bytes", &self.buffered_bytes())
             .field("manifest_id", &self.inner.manifest.load().manifest_id)
             .finish()
     }
@@ -276,8 +306,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -289,10 +319,18 @@ impl Supertable {
     /// posts.append(&batch)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(rows = batch.num_rows()))
+    )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
-        let mut w = self.writer()?;
-        w.append(batch)?;
-        w.commit()?;
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+        w.append(batch)
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
+        w.commit()
+            .map_err(|e| InfinoError::from(e).with_context("append", None))?;
         Ok(())
     }
 
@@ -302,8 +340,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use datafusion::prelude::{col, lit};
     /// # use infino::{connect, IndexSpec};
     /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
@@ -317,14 +355,25 @@ impl Supertable {
     /// assert_eq!(stats.matched(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows()))
+    )]
     pub fn update(
         &self,
         predicate: Expr,
         new_rows: &RecordBatch,
     ) -> Result<MutationStats, InfinoError> {
-        let mut w = self.writer()?;
-        w.update(predicate, new_rows.clone())?;
-        single_outcome(w.commit()?)
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("update", None))?;
+        w.update(predicate, new_rows.clone())
+            .map_err(|e| InfinoError::from(e).with_context("update", None))?;
+        single_outcome(
+            w.commit()
+                .map_err(|e| InfinoError::from(e).with_context("update", None))?,
+        )
+        .map_err(|e| e.with_context("update", None))
     }
 
     /// Tombstone every row matching `predicate`, then commit. Durable
@@ -332,8 +381,8 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{LargeStringArray, RecordBatch};
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use datafusion::prelude::{col, lit};
     /// # use infino::{connect, IndexSpec};
     /// # let dir = tempfile::tempdir()?; // update/delete need durable storage
@@ -346,10 +395,18 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
-        let mut w = self.writer()?;
-        w.delete(predicate)?;
-        single_outcome(w.commit()?)
+        let mut w = self
+            .writer()
+            .map_err(|e| InfinoError::from(e).with_context("delete", None))?;
+        w.delete(predicate)
+            .map_err(|e| InfinoError::from(e).with_context("delete", None))?;
+        single_outcome(
+            w.commit()
+                .map_err(|e| InfinoError::from(e).with_context("delete", None))?,
+        )
+        .map_err(|e| e.with_context("delete", None))
     }
 
     test_visible! {
@@ -371,7 +428,9 @@ impl Supertable {
             Ok(_) => Ok(SupertableWriter {
                 inner: Arc::clone(self.inner()),
                 buffer: Vec::new(),
-                buffer_bytes: 0,
+                buffer_scalar_bytes: 0,
+                buffer_vector_bytes: 0,
+                buffer_fts_bytes: 0,
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
             }),
@@ -388,9 +447,12 @@ impl SupertableWriter {
         self.buffer.len()
     }
 
-    /// Estimated bytes of buffered (un-committed) data.
+    /// Bytes of buffered (un-committed) data actually held in memory:
+    /// the scalar columns plus the f32 vector payload. This is the
+    /// figure the auto-flush threshold is compared against (the FTS
+    /// weighting only affects the build-scratch reserve, not held size).
     pub fn buffered_bytes(&self) -> usize {
-        self.buffer_bytes
+        self.buffer_scalar_bytes + self.buffer_vector_bytes
     }
 
     /// Add one batch to the in-memory buffer. Triggers an
@@ -404,35 +466,40 @@ impl SupertableWriter {
     /// unconditionally; the buffered batch's schema therefore
     /// matches [`SupertableOptions::scalar_schema`] with the
     /// id column at position 0.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len()))
+    )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
 
         // Validate + split. Batch schema is user_schema (no id col).
         let (scalar_no_id, _vector_slices) = split_vectors(batch, options)?;
 
-        // Re-derive owned Arc<Float32Array> handles for each
-        // vector column. We can't keep the &[f32] slices from
-        // split_vectors in the buffer (their lifetime is tied to
-        // `batch`, which the caller reclaims after this returns).
-        // The Arc<Float32Array> shares the same underlying buffer
-        // — no bytes copied.
+        // Re-derive owned Arc<Float32Array> handles for each vector column. We can't keep the &[f32] slices from
+        // split_vectors in the buffer (their lifetime is tied to `batch`, which the caller reclaims after this returns).
+        // The Arc<Float32Array> shares the same underlying buffer — no bytes copied.
         let mut vectors = Vec::with_capacity(options.vector_columns.len());
         for vc in &options.vector_columns {
             let col_idx = batch
                 .schema()
                 .index_of(&vc.column)
                 .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
             let fsl = batch
                 .column(col_idx)
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or(BuildError::BatchSchemaMismatch)?;
+
             let values = fsl.values();
+
             let f32_arr = values
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or(BuildError::BatchSchemaMismatch)?
                 .clone();
+
             vectors.push(Arc::new(f32_arr));
         }
 
@@ -452,6 +519,7 @@ impl SupertableWriter {
                 ids.push(generator.next_id());
             }
         }
+
         let id_array = Decimal128Array::from(ids)
             .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
             .expect(
@@ -464,24 +532,33 @@ impl SupertableWriter {
         let scalar = RecordBatch::try_new(options.scalar_schema(), columns)
             .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
-        // Estimate byte cost: Arrow scalar columns + f32 vector
-        // payload. RecordBatch::get_array_memory_size accounts
-        // for buffer allocations (rough but good enough for
-        // threshold gating).
-        let bytes = scalar.get_array_memory_size()
-            + vectors
-                .iter()
-                .map(|v| v.len() * mem::size_of::<f32>())
-                .sum::<usize>();
+        // Estimate byte cost per input class. get_array_memory_size accounts for
+        // Arrow buffer allocations (rough but good enough); the vector payload is
+        // its exact f32 size. The FTS text columns are a subset of the scalar
+        // columns, summed separately only to weight the build-scratch reserve.
+        let scalar_bytes = scalar.get_array_memory_size();
+        let vector_bytes = vectors
+            .iter()
+            .map(|v| v.len() * mem::size_of::<f32>())
+            .sum::<usize>();
+        let fts_bytes = options
+            .fts_columns
+            .iter()
+            .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+            .map(|idx| scalar.column(idx).get_array_memory_size())
+            .sum::<usize>();
 
         self.buffer.push(BufferedBatch { scalar, vectors });
-        self.buffer_bytes += bytes;
+        self.buffer_scalar_bytes += scalar_bytes;
+        self.buffer_vector_bytes += vector_bytes;
+        self.buffer_fts_bytes += fts_bytes;
 
-        // Auto-flush if over threshold.
+        // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
+        // reserve-time concern, not held memory.
         let threshold = (options.commit_threshold_size_mb as usize)
             .saturating_mul(1024)
             .saturating_mul(1024);
-        if threshold > 0 && self.buffer_bytes >= threshold {
+        if threshold > 0 && self.buffered_bytes() >= threshold {
             self.commit_appends_internal()?;
         }
 
@@ -692,6 +769,14 @@ impl SupertableWriter {
     /// [`CommitResult`]: crate::supertable::mutations::CommitResult
     /// [`MutationStats`]: crate::supertable::mutations::MutationStats
     /// [`CommitError::PartialCommit`]: crate::supertable::mutations::CommitError::PartialCommit
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(
+            buffered = self.buffer.len(),
+            updates = self.pending_updates.len(),
+            deletes = self.pending_deletes.len(),
+        ))
+    )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {
         // Step 1: flush appends. A failure here is atomic —
         // the buffer is preserved and no mutation WAL has
@@ -945,12 +1030,30 @@ impl SupertableWriter {
     /// Rows are balanced evenly across shards regardless of the
     /// caller's `append()` cadence — many small appends followed by
     /// one `commit` produce the same shard layout as one large append.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(buffered = self.buffer.len()))
+    )]
     fn commit_appends_internal(&mut self) -> Result<(), BuildError> {
         if self.buffer.is_empty() {
             return Ok(());
         }
+
+        // Try reserving the transient heap from the ConnectionMemoryBudget before draining the buffer.
+        // For now, if memory reservation is refused, the buffer is left untouched, but this behaviour can be changed.
+        //
+        // Held until this function returns, i.e. past `publish_superfiles` below.
+        let _build_guard = reserve_build_scratch(
+            &self.inner.options.connection_memory_budget,
+            self.buffer_scalar_bytes,
+            self.buffer_vector_bytes,
+            self.buffer_fts_bytes,
+        )?;
+
         let buffer = mem::take(&mut self.buffer);
-        self.buffer_bytes = 0;
+        self.buffer_scalar_bytes = 0;
+        self.buffer_vector_bytes = 0;
+        self.buffer_fts_bytes = 0;
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
@@ -983,7 +1086,10 @@ impl SupertableWriter {
             superfiles = outputs.len(),
             "published appended superfiles"
         );
+
         publish_superfiles(&self.inner, outputs)?;
+
+        // Reserved memory (if any) via _build_guard is freed now.
         Ok(())
     }
 }
@@ -1041,6 +1147,36 @@ impl ShardOutput {
             scalar_stats,
         }
     }
+}
+
+/// Reserve the build's estimated transient heap:
+///
+/// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
+///
+/// returns `OverBudget` when a bounded budget can't fit it.
+fn reserve_build_scratch(
+    budget: &Arc<ConnectionMemoryBudget>,
+    scalar_bytes: usize,
+    vector_bytes: usize,
+    fts_bytes: usize,
+) -> Result<Reservation, BuildError> {
+    //  The constants are kept integer rather than float, so the estimate is calculated as such:
+    //
+    //     (BUILD_SCALAR_NUM * scalar_bytes) + (BUILD_VECTOR_NUM * vector_bytes) + (BUILD_FTS_NUM * fts_bytes)
+    //   ------------------------------------------------------------------------------------------------------
+    //                                            BUILD_SCRATCH_DENOM
+    //
+    let estimate = scalar_bytes
+        .saturating_mul(BUILD_SCALAR_NUM)
+        .saturating_add(vector_bytes.saturating_mul(BUILD_VECTOR_NUM))
+        .saturating_add(fts_bytes.saturating_mul(BUILD_FTS_NUM))
+        / BUILD_SCRATCH_DENOM;
+
+    budget
+        .try_reserve(estimate)
+        // Label the message "during ingest" so it can be told apart from a query
+        // or SQL over-budget error once it reaches the public InfinoError.
+        .map_err(|e| BuildError::OverBudget(format!("during ingest, {e}")))
 }
 
 /// Build one superfile from one slice of buffered batches. Runs on
@@ -1736,6 +1872,7 @@ pub(in crate::supertable) fn persist_commit(
     };
 
     inner.manifest.store(Arc::new(new_manifest));
+    inner.reconcile_tombstone_seqs();
     Ok(())
 }
 
@@ -1757,6 +1894,10 @@ pub(in crate::supertable) fn persist_commit(
 // the parallelism below the threshold. The default
 // threshold (100 MiB) matches the S3 SDK's standard
 // cutoff.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(superfiles = pending_storage_writes.len()))
+)]
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
@@ -1896,7 +2037,66 @@ async fn refresh_inner_state_async(
         }
     };
     inner.manifest.store(manifest);
+    inner.reconcile_tombstone_seqs();
     Ok(())
+}
+
+/// CAS-publish a successor manifest whose tombstone seq for every
+/// superfile in `touched` is bumped to the successor's `manifest_id`.
+///
+/// This is the mutation pipeline's post-sidecar stamp: it runs after
+/// the tombstone phase's sidecar CAS-PUTs and *before* the WAL flips
+/// to `Complete`, so a crash in between is completed by the recovery
+/// sweep and "WAL complete ⇒ manifest stamped" holds. Readers on
+/// other processes pick the bump up on their next manifest refresh
+/// and refetch exactly the named sidecars — this is what bounds
+/// cross-process delete visibility by the read-consistency window.
+///
+/// No superfile entries or parts change, so each attempt writes only
+/// the list + pointer. OCC discipline matches [`persist_commit`]:
+/// reload on contention, jittered backoff, bounded by
+/// `max_commit_retries`.
+pub(in crate::supertable) async fn stamp_tombstone_seqs(
+    inner: &SupertableInner,
+    touched: &[Uuid],
+) -> Result<(), SupertableCommitError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let Some(new_manifest) = old.with_tombstone_seqs_bumped(touched) else {
+            // No persisted list ⇒ in-process-only ⇒ nothing to stamp.
+            return Ok(());
+        };
+        let prev_etag = match get_current_manifest_etag(&storage, Arc::clone(&old)).await {
+            Ok(etag) => etag,
+            // Pointer moved past our snapshot — reload and retry.
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage).await?;
+                sleep(backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                inner.reconcile_tombstone_seqs();
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage).await?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SupertableCommitError::WriteContentionExhausted)
 }
 
 /// Storage path for a superfile's bytes. Lives under `data/`
@@ -2007,14 +2207,7 @@ fn warm_cache_after_commit(
     let cache = Arc::clone(cache);
     let drive = async move {
         for (uri, bytes) in pending {
-            if let Err(e) = cache.insert_warm(&uri, bytes).await {
-                tracing::warn!(
-                    "supertable: warm cache pre-population failed for {}: {} \
-                     (superfile is durable in storage; first query will cold-fetch)",
-                    uri.0,
-                    e
-                );
-            }
+            cache.insert_warm_or_warn(&uri, bytes).await;
         }
     };
     match Handle::try_current() {
@@ -2114,6 +2307,191 @@ mod tests {
         let titles =
             LargeStringArray::from((0..n).map(|i| format!("doc {i} alpha")).collect::<Vec<_>>());
         RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("build batch")
+    }
+
+    // ---- ingest memory budget ----------------------------------------
+
+    #[test]
+    fn reserve_build_scratch_weights_each_input_class() {
+        // Pins the per-class estimate against the constants: a measured budget
+        // never denies, so `used()` is exactly the reserved amount. The point of
+        // the split (vs one blanket factor) is that a byte of vector payload
+        // reserves more than a byte of scalar, and the FTS term is additive on
+        // top of the scalar hold, not a replacement.
+        let budget = ConnectionMemoryBudget::measured();
+        let (scalar, vector, fts) = (1000usize, 2000usize, 400usize);
+
+        let guard = reserve_build_scratch(&budget, scalar, vector, fts)
+            .expect("measured budget never denies");
+        let expected =
+            (BUILD_SCALAR_NUM * scalar + BUILD_VECTOR_NUM * vector + BUILD_FTS_NUM * fts)
+                / BUILD_SCRATCH_DENOM;
+        assert_eq!(budget.used(), expected);
+        drop(guard);
+        assert_eq!(budget.used(), 0, "reservation released on drop");
+
+        // Same byte count, different class: vector costs strictly more than
+        // scalar, and adding FTS text raises the reserve further. Read `used()`
+        // while the guard is alive, then release it before the next call.
+        let reserved = |s, v, f| {
+            let _guard = reserve_build_scratch(&budget, s, v, f).expect("measured");
+            budget.used()
+        };
+        let scalar_only = reserved(1000, 0, 0);
+        let vector_only = reserved(0, 1000, 0);
+        let scalar_plus_fts = reserved(1000, 0, 1000);
+        assert!(
+            vector_only > scalar_only,
+            "a vector byte must reserve more than a scalar byte ({vector_only} vs {scalar_only})"
+        );
+        assert!(
+            scalar_plus_fts > scalar_only,
+            "the FTS term is additive on top of scalar ({scalar_plus_fts} vs {scalar_only})"
+        );
+    }
+
+    #[test]
+    fn append_over_budget_is_refused() {
+        // A 1-byte bounded budget floors the enforced gate to 0, so building
+        // any non-empty batch (whose weighted reserve is > 0) is refused. The
+        // public folded append surfaces it as InfinoError::OverBudget.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let err = st
+            .append(&build_simple_batch(0, 8))
+            .expect_err("build over a 0-byte gate is refused");
+        let InfinoError::OverBudget(msg) = err else {
+            panic!("expected InfinoError::OverBudget, got {err:?}");
+        };
+        // The message names the ingest path, so a caller can tell it apart from
+        // a query or SQL over-budget error (which share the OverBudget variant).
+        assert!(
+            msg.contains("ingest"),
+            "over-budget message should identify ingest: {msg}"
+        );
+
+        // Nothing was published, and a refused reservation commits nothing.
+        assert_eq!(st.reader().n_docs_total(), 0);
+        assert!(st.options().connection_memory_budget.denials() >= 1);
+        assert_eq!(st.options().connection_memory_budget.peak(), 0);
+    }
+
+    #[test]
+    fn append_under_measured_budget_runs_and_tracks_peak() {
+        // Measured budget never refuses; the build still reserves, so peak > 0
+        // proves the reservation ran on the ingest path.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::measured();
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_simple_batch(0, 8))
+            .expect("measured budget never refuses");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(
+            budget.peak() > 0,
+            "the build must reserve against the budget"
+        );
+    }
+
+    #[test]
+    fn append_under_ample_bounded_budget_runs() {
+        // A bounded (enforcing) budget well above the build must admit the
+        // ingest, not refuse on principle.
+        const AMPLE_BUDGET_BYTES: u64 = 1 << 30; // 1 GiB, far above an 8-row batch.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(AMPLE_BUDGET_BYTES);
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_simple_batch(0, 8))
+            .expect("under-budget append runs under a bounded budget");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(budget.limit().is_some(), "bounded, not measured");
+    }
+
+    #[test]
+    fn over_budget_commit_preserves_the_buffer() {
+        // Reserving before draining the buffer means a refused commit leaves the
+        // buffered rows intact, so the caller can retry or back off.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let mut w = st.writer().expect("writer");
+        w.append(&build_simple_batch(0, 8)).expect("append buffers");
+        assert_eq!(w.buffered_batches(), 1);
+
+        let err = w
+            .commit()
+            .expect_err("commit over a 0-byte gate is refused");
+        assert!(
+            matches!(err, CommitError::AppendFlush(BuildError::OverBudget(_))),
+            "got {err:?}"
+        );
+        // The buffer was not drained.
+        assert_eq!(w.buffered_batches(), 1);
+    }
+
+    #[test]
+    fn auto_flush_over_budget_is_refused_from_append() {
+        // With a commit threshold set, `append` auto-flushes once the buffer
+        // crosses it, so the refusal surfaces out of `append` itself (the
+        // auto-flush exit) rather than an explicit `commit`. A batch large
+        // enough to exceed the 1 MiB threshold in one call trips it.
+        const AUTO_FLUSH_TRIP_ROWS: usize = 40_000;
+        let mut opts = options_id_title_serial().with_commit_threshold_size_mb(1);
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let mut w = st.writer().expect("writer");
+        let err = w
+            .append(&build_simple_batch(0, AUTO_FLUSH_TRIP_ROWS))
+            .expect_err("auto-flush over a 0-byte gate is refused");
+        assert!(matches!(err, BuildError::OverBudget(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn vector_ingest_over_budget_is_refused() {
+        // The gate covers the vector build path too: a vector-schema ingest over
+        // a 0-byte gate is refused as the public OverBudget, nothing published.
+        let dim = 16;
+        let mut opts = options_with_vector(dim);
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+
+        let err = st
+            .append(&build_vector_batch(0, 8, dim))
+            .expect_err("vector build over a 0-byte gate is refused");
+        assert!(matches!(err, InfinoError::OverBudget(_)), "got {err:?}");
+        assert_eq!(st.reader().n_docs_total(), 0);
+    }
+
+    #[test]
+    fn vector_ingest_reserves_and_runs_under_measured() {
+        // Measured never refuses; peak > 0 proves the vector build (kmeans +
+        // quantization + serialized blob) actually reserved against the budget.
+        let dim = 16;
+        let mut opts = options_with_vector(dim);
+        opts.connection_memory_budget = ConnectionMemoryBudget::measured();
+        let st = Supertable::create(opts).expect("create");
+
+        st.append(&build_vector_batch(0, 8, dim))
+            .expect("measured vector ingest runs");
+        assert_eq!(st.reader().n_docs_total(), 8);
+
+        let budget = &st.options().connection_memory_budget;
+        assert_eq!(budget.denials(), 0);
+        assert!(
+            budget.peak() > 0,
+            "the vector build must reserve against the budget"
+        );
     }
 
     // ---- writer slot exclusion ---------------------------------------

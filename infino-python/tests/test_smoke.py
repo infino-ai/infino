@@ -119,6 +119,22 @@ def test_query_sql_returns_pyarrow_table():
     assert out.column("n")[0].as_py() == 3
 
 
+def test_query_sql_zero_row_filter_preserves_projected_schema():
+    db = infino.connect("memory://")
+    table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    table.append(_title_batch(["alpha", "beta"]))
+
+    # Ground-truth schema from a query that returns rows.
+    with_rows = db.query_sql("SELECT title FROM docs")
+    expected_schema = with_rows.schema
+
+    # Zero-row result must carry the identical schema.
+    out = db.query_sql("SELECT title FROM docs WHERE title = 'no_match'")
+    assert out.num_rows == 0
+    assert out.to_pylist() == []
+    assert out.schema == expected_schema
+
+
 def test_query_sql_bm25_tvf():
     db = infino.connect("memory://")
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))

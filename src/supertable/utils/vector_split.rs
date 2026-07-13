@@ -32,7 +32,10 @@
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 
-use crate::supertable::{error::BuildError, options::SupertableOptions};
+use crate::{
+    supertable::{error::BuildError, options::SupertableOptions},
+    utils::schema,
+};
 
 /// Maximum number of null row offsets collected into a
 /// `VectorColumnHasNulls` error. Bounds the error payload so a batch
@@ -53,7 +56,7 @@ pub(crate) fn split_vectors<'a>(
     //    declared schema. We don't allow per-batch schema drift
     //    (per non-goal "Schema evolution"). Equality is by
     //    structural comparison.
-    if batch.schema().as_ref() != options.schema.as_ref() {
+    if !schema::compare_schema(&batch.schema(), &options.schema) {
         return Err(BuildError::BatchSchemaMismatch);
     }
 

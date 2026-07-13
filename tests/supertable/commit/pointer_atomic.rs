@@ -166,6 +166,7 @@ fn fresh_part(seed: u8) -> ManifestPart {
 
 fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
     Manifest {
+        tombstone_seqs: Default::default(),
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),

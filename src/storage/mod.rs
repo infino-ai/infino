@@ -144,6 +144,28 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// use `meta.etag` directly.
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError>;
 
+    /// Conditional read — like [`Self::get`], but returns `Ok(None)`
+    /// ("not modified") when the object's current etag equals `etag`,
+    /// and the full body + metadata otherwise.
+    ///
+    /// The default implementation issues a plain [`Self::get`] and
+    /// compares etags locally — correct on every backend, though it
+    /// still transfers the body. HTTP backends (S3, Azure) override
+    /// it with a native `If-None-Match` request so the "unchanged"
+    /// case is a bodyless 304. Callers use this for high-frequency
+    /// freshness probes of tiny objects (the manifest pointer).
+    async fn get_if_none_match(
+        &self,
+        uri: &str,
+        etag: &str,
+    ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+        let (bytes, meta) = self.get(uri).await?;
+        if meta.etag.as_deref() == Some(etag) {
+            return Ok(None);
+        }
+        Ok(Some((bytes, meta)))
+    }
+
     /// Range-fetch. `range.end` is exclusive.
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 

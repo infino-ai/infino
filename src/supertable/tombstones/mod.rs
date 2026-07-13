@@ -13,6 +13,8 @@
 //!
 //! - [`cache::SidecarCache`] — the DashMap-backed cache, plus the
 //!   sync-callable `bitmap_for` accessor the query paths use.
+//! - [`cache::TombstoneSeqView`] — the manifest-derived freshness
+//!   authority the cache validates entries against.
 //! - [`cache::SidecarCacheError`] — typed errors surfaced when a
 //!   refresh fails.
 //!
@@ -20,4 +22,4 @@
 
 pub mod cache;
 
-pub use cache::{SidecarCache, SidecarCacheError};
+pub use cache::{SidecarCache, SidecarCacheError, TombstoneSeqView};

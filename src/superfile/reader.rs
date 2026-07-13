@@ -43,6 +43,7 @@ use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 
 use crate::{
+    memory::ConnectionMemoryBudget,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
@@ -181,6 +182,7 @@ impl SuperfileReader {
     /// promotion can verify after the full superfile is materialized.
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub async fn open_lazy_with(
         source: Arc<dyn LazyByteSource>,
         _opts: OpenOptions,
@@ -1121,7 +1123,7 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_hits_filtered_async(column, query, k, options, None, None, None)
+        self.vector_hits_filtered_async(column, query, k, options, None, None, None, None)
             .await
     }
 
@@ -1145,6 +1147,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
@@ -1152,10 +1155,18 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
-        Ok(
-            v.search_async(column, query, k, nprobe, rerank_mult, allow, deny, pool)
-                .await?,
+        Ok(v.search_async(
+            column,
+            query,
+            k,
+            nprobe,
+            rerank_mult,
+            allow,
+            deny,
+            pool,
+            budget,
         )
+        .await?)
     }
 
     /// As [`Self::vector_search`], but probes an **externally chosen**
@@ -1171,8 +1182,10 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_search_clusters_filtered(column, query, k, clusters, options, None, None, None)
-            .await
+        self.vector_search_clusters_filtered(
+            column, query, k, clusters, options, None, None, None, None,
+        )
+        .await
     }
 
     /// As [`Self::vector_search_clusters`], but restricts the kNN
@@ -1193,6 +1206,7 @@ impl SuperfileReader {
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -1200,10 +1214,18 @@ impl SuperfileReader {
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
-        Ok(
-            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow, deny, pool)
-                .await?,
+        Ok(v.search_clusters_async(
+            column,
+            query,
+            k,
+            clusters,
+            rerank_mult,
+            allow,
+            deny,
+            pool,
+            budget,
         )
+        .await?)
     }
 }
 
@@ -1233,20 +1255,26 @@ impl VectorSearchOptions {
     /// Filtered default `nprobe` (internal; applied when the query carries a filter).
     pub(crate) const FILTERED_DEFAULT_NPROBE: usize = 8;
 
+    /// Default options — engine-default `nprobe` and rerank multiplier.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set the number of IVF partitions to probe. Higher improves recall at
+    /// the cost of more work.
     pub fn with_nprobe(mut self, n: usize) -> Self {
         self.nprobe = Some(n);
         self
     }
 
+    /// Set the over-fetch multiplier for the exact-rerank stage. Higher
+    /// improves recall at the cost of more work.
     pub fn with_rerank_mult(mut self, n: usize) -> Self {
         self.rerank_mult = Some(n.max(1));
         self
     }
 
+    /// The configured rerank multiplier, if one was set.
     pub fn rerank_mult(&self) -> Option<usize> {
         self.rerank_mult
     }

@@ -23,10 +23,13 @@
 //! after that swap, the writer's re-resolve routes to the
 //! merged target and lands the tombstone there.
 
+use std::time::Duration;
+
 use uuid::Uuid;
 
+pub use crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS;
 use crate::supertable::wal::{
-    persistence::{WalStore, WalStoreError},
+    persistence::{Etag, WalStore, WalStoreError},
     state_doc::SealRecord,
     tombstones_codec::TombstonesSidecar,
 };
@@ -59,11 +62,27 @@ pub enum TombstonesAdminError {
     WalStore(#[from] WalStoreError),
 }
 
+/// `true` if a seal placed at `sealed_at` is older than
+/// `stale_timeout` as of `now`. Shared by [`seal`] (deciding whether
+/// to steal it) and the compactor's candidate selection (deciding
+/// whether a sealed superfile is even worth proposing again). Callers
+/// pass [`DEFAULT_STALE_SEAL_TIMEOUT_MS`] (converted to a `Duration`)
+/// unless a table's `CompactionSettings::stale_seal_timeout_ms`
+/// overrides it.
+pub fn is_seal_stale(
+    sealed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    stale_timeout: Duration,
+) -> bool {
+    let age = (now - sealed_at).to_std().unwrap_or(Duration::ZERO);
+    age >= stale_timeout
+}
+
 /// Atomically stamp the seal flag on a per-superfile tombstone
-/// sidecar. Idempotent only on the same `compaction_id`:
-/// repeating the seal call with a different `compaction_id`
-/// surfaces `AlreadySealed` so the caller can pick up the
-/// abandoned merge.
+/// sidecar. Returns the sealed sidecar plus the etag the PUT (or,
+/// on the idempotent no-op branch, the GET) landed under -- callers
+/// that later call [`unseal`] pass that etag straight through, no
+/// re-read needed.
 ///
 /// Behaviour:
 ///
@@ -72,40 +91,41 @@ pub enum TombstonesAdminError {
 /// - Sidecar present + unsealed → preserve the existing bitmap,
 ///   stamp the seal, CAS-PUT.
 /// - Sidecar present + sealed by **the same `compaction_id`** →
-///   no-op success; return the existing sidecar. Lets the
-///   compactor's recovery path replay seal calls safely.
-/// - Sidecar present + sealed by a different compaction →
-///   `AlreadySealed` so the compactor knows to recover that
-///   work first.
-/// - CAS-loss on the PUT → `CasLost` so the compactor can
-///   re-read + decide whether to retry (typically yes, after
-///   re-reading the manifest).
+///   no-op, return the existing sidecar.
+/// - Sidecar present + sealed by a different compaction, not
+///   stale yet → `AlreadySealed`, someone else's live work, leave
+///   it alone.
+/// - Sidecar present + sealed by a different compaction, stale →
+///   that compactor is presumed dead, take the seal over.
+/// - CAS-loss on the PUT → `CasLost` so the caller can re-read +
+///   retry.
 pub async fn seal(
     wal_store: &WalStore,
     superfile_id: Uuid,
     compaction_id: Uuid,
     sealed_at: chrono::DateTime<chrono::Utc>,
-) -> Result<TombstonesSidecar, TombstonesAdminError> {
+    stale_timeout: Duration,
+) -> Result<(TombstonesSidecar, Etag), TombstonesAdminError> {
     let (existing, etag_opt) = match wal_store.get_tombstones(superfile_id).await? {
         Some((sc, etag)) => (Some(sc), Some(etag)),
         None => (None, None),
     };
 
-    // Already sealed → idempotent on the same compaction id,
-    // error otherwise. The mismatched-id case means a previous
-    // compaction sealed this sidecar and didn't finish; the
-    // caller has to drive that abandoned merge to completion
-    // (or unwind it) before sealing again with a fresh id.
     if let Some(existing) = &existing
         && let Some(existing_seal) = existing.seal.as_ref()
     {
         if existing_seal.compaction_id == compaction_id {
-            return Ok(existing.clone());
+            let etag = etag_opt.expect("sidecar present implies its GET returned an etag");
+            return Ok((existing.clone(), etag));
         }
-        return Err(TombstonesAdminError::AlreadySealed {
-            superfile_id,
-            existing_compaction_id: existing_seal.compaction_id,
-        });
+        if !is_seal_stale(existing_seal.sealed_at, sealed_at, stale_timeout) {
+            return Err(TombstonesAdminError::AlreadySealed {
+                superfile_id,
+                existing_compaction_id: existing_seal.compaction_id,
+            });
+        }
+        // Stale: that compactor is presumed dead, fall through and
+        // take the seal over.
     }
 
     let bitmap = existing
@@ -123,8 +143,31 @@ pub async fn seal(
         .put_tombstones(superfile_id, etag_opt.as_ref(), &sealed)
         .await
     {
-        Ok(_new_etag) => Ok(sealed),
+        Ok(new_etag) => Ok((sealed, new_etag)),
         Err(WalStoreError::CasFailed { .. }) => Err(TombstonesAdminError::CasLost { superfile_id }),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Clear a seal previously placed by [`seal`], using the bitmap and
+/// etag that call returned. No GET: one CAS-PUT. If the sidecar has
+/// changed since (a writer bypassed our now-stale seal, or another
+/// compactor stole it), the CAS fails and we no-op -- whatever
+/// changed it already resolved the seal, there's nothing left for us
+/// to clear.
+pub async fn unseal(
+    wal_store: &WalStore,
+    superfile_id: Uuid,
+    bitmap: roaring::RoaringBitmap,
+    etag: &Etag,
+) -> Result<(), TombstonesAdminError> {
+    let unsealed = TombstonesSidecar { seal: None, bitmap };
+    match wal_store
+        .put_tombstones(superfile_id, Some(etag), &unsealed)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(WalStoreError::CasFailed { .. }) => Ok(()),
         Err(other) => Err(other.into()),
     }
 }
@@ -171,6 +214,9 @@ mod tests {
     use super::*;
     use crate::storage::{LocalFsStorageProvider, StorageProvider};
 
+    const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
+        Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
     fn fixture() -> (TempDir, WalStore) {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -183,7 +229,9 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x100);
         let cid = Uuid::from_u128(0xC0DE);
-        let sealed = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let (sealed, _etag) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         assert_eq!(sealed.seal.expect("set").compaction_id, cid);
         assert!(sealed.bitmap.is_empty());
 
@@ -213,7 +261,9 @@ mod tests {
         .expect("seed");
 
         let cid = Uuid::from_u128(0xABCD);
-        let sealed = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let (sealed, _etag) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         assert_eq!(sealed.bitmap, bitmap, "seal must preserve the bitmap");
         assert_eq!(sealed.seal.expect("set").compaction_id, cid);
     }
@@ -223,8 +273,12 @@ mod tests {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x300);
         let cid = Uuid::from_u128(0xDEAD);
-        let first = seal(&ws, sf, cid, Utc::now()).await.expect("seal-1");
-        let again = seal(&ws, sf, cid, Utc::now()).await.expect("seal-2");
+        let (first, _etag1) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-1");
+        let (again, _etag2) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-2");
         // SealRecord's sealed_at goes through ms-precision
         // truncation on disk so we compare the
         // compaction-identifying fields only, not the timestamp.
@@ -241,8 +295,10 @@ mod tests {
         let sf = Uuid::from_u128(0x400);
         let cid_a = Uuid::from_u128(0x1111);
         let cid_b = Uuid::from_u128(0x2222);
-        let _ = seal(&ws, sf, cid_a, Utc::now()).await.expect("seal-a");
-        let err = seal(&ws, sf, cid_b, Utc::now())
+        let _ = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
+        let err = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error");
         assert!(matches!(
@@ -252,6 +308,44 @@ mod tests {
                 ..
             } if existing_compaction_id == cid_a
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_steals_a_stale_seal_from_a_different_compaction() {
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x450);
+        let cid_a = Uuid::from_u128(0x1111);
+        let cid_b = Uuid::from_u128(0x2222);
+        let old_time = Utc::now()
+            - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
+            - chrono::Duration::seconds(1);
+        let _ = seal(&ws, sf, cid_a, old_time, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
+
+        // cid_a's seal is older than the timeout, so it's presumed
+        // dead and cid_b can take over.
+        let (stolen, _etag) = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-b should steal the stale seal");
+        assert_eq!(stolen.seal.expect("set").compaction_id, cid_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_does_not_steal_a_fresh_seal() {
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x460);
+        let cid_a = Uuid::from_u128(0x1111);
+        let cid_b = Uuid::from_u128(0x2222);
+        let _ = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
+
+        // cid_a's seal is fresh; cid_b must not be able to take over.
+        let err = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect_err("must not steal a fresh seal");
+        assert!(matches!(err, TombstonesAdminError::AlreadySealed { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,7 +380,9 @@ mod tests {
             .await
             .expect("seed");
         let cid = Uuid::from_u128(0xC0DEC0DE);
-        let _ = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
         let rows = live_rows(&ws, sf, 4).await.expect("live");
         assert_eq!(rows, vec![0u32, 1, 3]);
     }
@@ -311,10 +407,75 @@ mod tests {
 
         // Compactor-side: seal afterwards.
         let cid = Uuid::from_u128(0xC0DEFACE);
-        let _ = seal(&ws, sf, cid, Utc::now()).await.expect("seal");
+        let _ = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
 
         // Live-rows excludes the tombstoned row.
         let rows = live_rows(&ws, sf, 5).await.expect("live");
         assert_eq!(rows, vec![0u32, 1, 2, 4]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unseal_clears_our_own_seal() {
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x900);
+        let cid = Uuid::from_u128(0xAAAA);
+        let (sealed, etag) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
+
+        unseal(&ws, sf, sealed.bitmap, &etag).await.expect("unseal");
+
+        let (after, _etag) = ws.get_tombstones(sf).await.expect("get").expect("present");
+        assert!(after.seal.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unseal_no_ops_when_the_seal_has_since_changed() {
+        // Simulates: our seal went stale mid-merge and a different
+        // compactor stole it (or a writer bypassed it) before we got
+        // around to unsealing. Our stale etag must not be able to
+        // clobber whatever is there now.
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x901);
+        let cid_a = Uuid::from_u128(0xAAAA);
+        let cid_b = Uuid::from_u128(0xBBBB);
+        let (sealed_a, etag_a) = seal(&ws, sf, cid_a, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-a");
+
+        // Someone else re-seals under a different compaction_id,
+        // moving the etag forward.
+        let old_time = Utc::now()
+            - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
+            - chrono::Duration::seconds(1);
+        // Force cid_a's seal to look stale so cid_b can steal it,
+        // simulating the time-of-check having since moved on.
+        ws.put_tombstones(
+            sf,
+            Some(&etag_a),
+            &TombstonesSidecar {
+                seal: Some(SealRecord {
+                    compaction_id: cid_a,
+                    sealed_at: old_time,
+                }),
+                bitmap: sealed_a.bitmap.clone(),
+            },
+        )
+        .await
+        .expect("backdate seal-a");
+        let _ = seal(&ws, sf, cid_b, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal-b steals the now-stale seal");
+
+        // cid_a's unseal, using its now-stale etag, must no-op rather
+        // than clobber cid_b's live seal.
+        unseal(&ws, sf, sealed_a.bitmap, &etag_a)
+            .await
+            .expect("unseal must no-op, not error");
+
+        let (after, _etag) = ws.get_tombstones(sf).await.expect("get").expect("present");
+        assert_eq!(after.seal.expect("still sealed").compaction_id, cid_b);
     }
 }

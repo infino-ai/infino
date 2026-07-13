@@ -290,6 +290,39 @@ impl StorageProvider for S3StorageProvider {
         .await
     }
 
+    async fn get_if_none_match(
+        &self,
+        uri: &str,
+        etag: &str,
+    ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+        let path = self.path(uri)?;
+        // Native `If-None-Match`: an unchanged object comes back as a
+        // bodyless 304 instead of a full read.
+        retry::with_reissue(|| async {
+            let options = GetOptions {
+                if_none_match: Some(etag.to_string()),
+                ..GetOptions::default()
+            };
+            let result = match self.store.get_opts(&path, options).await {
+                Ok(result) => result,
+                Err(ObjError::NotModified { .. }) => return Ok(None),
+                Err(e) => return Err(translate(uri, e)),
+            };
+            let meta = ObjectMeta {
+                size: result.meta.size as u64,
+                etag: result.meta.e_tag.clone(),
+                last_modified: result.meta.last_modified.into(),
+            };
+            let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+            Ok(Some((bytes, meta)))
+        })
+        .await
+    }
+
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+    )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
         retry::complete_range(uri, range, |r| async {

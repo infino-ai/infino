@@ -57,6 +57,10 @@ use crate::{
 /// Warm opens are in-memory cache hits (microseconds); cold opens
 /// fetch the superfile header/footer from object storage. Always
 /// `await`ed so the open I/O overlaps across the fan-out.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(uri = ?entry.uri))
+)]
 pub(crate) async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,

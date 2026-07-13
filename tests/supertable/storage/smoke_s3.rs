@@ -58,6 +58,7 @@ use std::{net::SocketAddr, sync::Arc};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    InfinoError,
     config::{
         CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
         StorageSettings, SupertableSettings,
@@ -68,7 +69,10 @@ use infino::{
         query::VectorSearchOptions,
         storage::{S3StorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
+    test_helpers::{
+        build_title_batch, default_disk_cache, default_supertable_options,
+        lazy_foreground_disk_cache,
+    },
 };
 
 /// Single-thread rayon pool for deterministic S3 smoke runs.
@@ -85,6 +89,40 @@ const VECTOR_SEARCH_K: usize = 3;
 const VECTOR_NPROBE: usize = 4;
 /// BM25 top-k for the smoke FTS query.
 const BM25_TOP_K: usize = 10;
+/// Connection memory budget for the over-budget e2e: 1 byte. The 90%
+/// gate floors to 0, so the first cold cluster-block fetch (which is
+/// always more than 0 bytes) is refused. Any positive value would do;
+/// 1 makes "the smallest possible allowance still denies" explicit.
+const TINY_BUDGET_BYTES: u64 = 1;
+/// Row count for the over-budget e2e fixture. Large enough that the IVF
+/// cluster blocks are a genuine cold object-store fetch rather than being
+/// swallowed by the lazy reader's open-range prefetch (which, on the tiny
+/// 8-row smoke fixture, would leave the whole vector subsection resident
+/// → warm → not gated). A few thousand rows puts real bytes in each
+/// cluster block.
+const BUDGET_N_ROWS: usize = 4096;
+/// Expected peak reservation for the measured control's cold vector search.
+/// The cold cluster-block fetch over the `BUDGET_N_ROWS` fixture (dim 16,
+/// `n_cent` 4, Sq8 rerank, `nprobe` 4) is a deterministic 126,464 B. Assert
+/// a band around it: tight enough to prove it's the real cluster fetch (not
+/// a stray small read), loose enough to survive minor codec / layout drift.
+const CONTROL_PEAK_LOW_BYTES: usize = 100_000;
+const CONTROL_PEAK_HIGH_BYTES: usize = 160_000;
+/// A bounded (enforcing) budget set generously above one cold fetch. Proves an
+/// enforcing budget admits an under-budget query rather than refusing on
+/// principle: the 90% gate is 900 KB, far above the ~126 KB fetch. Distinct
+/// from the measured control, whose `None` limit can never deny by construction.
+const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
+/// The 90% gate `AMPLE_BUDGET_BYTES` resolves to (`limit()` returns the gate,
+/// not the raw config value). Asserted so the test proves the budget is truly
+/// bounded, not silently measured.
+const AMPLE_BUDGET_GATE_BYTES: usize = 900_000;
+/// Connection budget for the shared-budget (multi-superfile) e2e. Sized to
+/// admit one superfile's ~126 KB cold cluster-block fetch but not two at once:
+/// the 90% gate is ~180 KB, so a single fetch fits and the two concurrent
+/// fetches of the fan-out (~253 KB together) cross it. This is what proves the
+/// budget is shared across superfiles rather than per-superfile.
+const SHARED_BUDGET_BYTES: u64 = 200_000;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
@@ -218,6 +256,97 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
         compaction: CompactionSettings::default(),
         memory: MemorySettings::default(),
     }
+}
+
+/// A `Config` that carries only a connection memory budget; storage
+/// backend is `None` so `apply_config` leaves the storage / disk cache
+/// unattached (the caller wires those explicitly afterward). Drives the
+/// bounded budget onto options via the same `apply_config` path a
+/// `config.yaml`-built connection takes.
+fn budget_only_config(connection_budget_bytes: u64) -> Config {
+    Config {
+        supertable: SupertableSettings::default(),
+        storage: StorageSettings {
+            backend: StorageBackend::None,
+            ..StorageSettings::default()
+        },
+        compaction: CompactionSettings::default(),
+        memory: MemorySettings {
+            connection_budget_bytes,
+        },
+    }
+}
+
+/// An `S3StorageProvider` pointed at the in-process s3s-fs `endpoint`, boxed as
+/// a trait object. Every budget-e2e handle (producer + consumers) reaches the
+/// same bucket through one of these.
+fn budget_s3_provider(endpoint: &str) -> Arc<dyn StorageProvider> {
+    Arc::new(
+        S3StorageProvider::new_with_endpoint(
+            endpoint,
+            TEST_BUCKET,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+        )
+        .expect("s3 provider for budget e2e"),
+    )
+}
+
+/// Open a fresh consumer against `storage` with a lazy-foreground disk cache
+/// (so vector reads stay cold / non-resident) and `connection_budget_bytes` as
+/// the connection budget (0 = measured). Returns the handle plus the cache's
+/// `TempDir` guard: it must outlive the query, since dropping it unlinks the
+/// cache files the reader is still reading through.
+fn open_budget_consumer(
+    dim: usize,
+    storage: &Arc<dyn StorageProvider>,
+    connection_budget_bytes: u64,
+) -> (Supertable, TempDir) {
+    let cache_dir = TempDir::new().expect("budget consumer cache tempdir");
+    let cache = lazy_foreground_disk_cache(Arc::clone(storage), cache_dir.path());
+    let consumer = Supertable::open(
+        real_s3_options(dim)
+            .apply_config(&budget_only_config(connection_budget_bytes))
+            .expect("apply budget config to consumer options")
+            .with_storage(Arc::clone(storage))
+            .with_disk_cache(cache),
+    )
+    .expect("Supertable::open via S3 (budget consumer)");
+    (consumer, cache_dir)
+}
+
+/// A larger vector+FTS batch for the over-budget e2e: `BUDGET_N_ROWS`
+/// rows so the IVF cluster blocks carry real bytes (see
+/// [`BUDGET_N_ROWS`]). Each row's embedding is a one-hot at `row % dim`
+/// (enough spread for `n_cent` clusters); the title carries the row
+/// index so FTS has content too.
+fn budget_vector_batch(dim: usize, n_rows: usize) -> RecordBatch {
+    let titles = LargeStringArray::from(
+        (0..n_rows)
+            .map(|i| format!("budget vector row {i}"))
+            .collect::<Vec<_>>(),
+    );
+    let mut flat = Vec::with_capacity(n_rows * dim);
+    for row in 0..n_rows {
+        for d in 0..dim {
+            flat.push(if d == row % dim { 1.0 } else { 0.0 });
+        }
+    }
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let values = Float32Array::from(flat);
+    let vectors = FixedSizeListArray::try_new(
+        item_field,
+        dim as i32,
+        Arc::new(values) as Arc<dyn Array>,
+        None,
+    )
+    .expect("fixed-size vector array");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(dim), false),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(vectors)]).expect("batch")
 }
 
 fn real_s3_batch(dim: usize) -> RecordBatch {
@@ -678,5 +807,286 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
         "[s3-smoke-tvf] bm25 / vector / hybrid via query_sql over S3 OK; \
          n_cold_fetches={} cache_bytes={}",
         post.n_cold_fetches, post.current_bytes
+    );
+}
+
+/// A cold vector search over the S3 wire protocol, under a bounded
+/// per-connection memory budget, is refused with `InfinoError::OverBudget`.
+///
+/// The consumer opens with `TINY_BUDGET_BYTES` (bounded) and a
+/// lazy-foreground disk cache, so the foreground vector query reads through
+/// a `StorageRangeSource`:
+///  - the superfile's byte source is never resident, so the cold
+///    cluster-block fetch is a real object-store GET.
+///  - that GET reserves against the budget first; the reservation exceeds
+///    the (floored-to-0) gate and is refused before the GET is issued.
+///  - the refusal propagates the full chain to the public error:
+///    cold-fetch reserve (deny) -> VectorError::OverBudget ->
+///    ReadError::Vector -> QueryError::OverBudget -> InfinoError::OverBudget.
+///
+/// A measured (unbounded) control then runs the identical cold query to
+/// completion, so deny-on-cold is the only behavioral change the budget
+/// introduces. Warm (resident) queries are never gated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_vector_search_over_budget_via_s3_wire_protocol() {
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!(
+            "supertable_cold_vector_search_over_budget_via_s3_wire_protocol: skipped \
+             (set INFINO_TEST_S3=1 to enable)"
+        );
+        return;
+    }
+
+    let (addr, _fs_root_guard) = spawn_s3s_fs().await;
+    let endpoint = format!("http://{}", addr);
+    let dim = EMB_DIM;
+    eprintln!("[s3-budget] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+
+    // Producer: commit a vector batch through the S3 wire protocol.
+    let storage = budget_s3_provider(&endpoint);
+    {
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via S3");
+        assert_eq!(producer.manifest_id(), 1);
+    }
+
+    // Consumer: fresh handle + lazy-foreground disk cache (reads stay
+    // non-resident) under a bounded connection budget. `_cache_guard` keeps
+    // the cache files alive for the query.
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    assert_eq!(consumer.manifest_id(), 1);
+    assert_eq!(consumer.reader().n_docs_total(), BUDGET_N_ROWS as u64);
+
+    // One-hot query at dim 0. Under a measured budget row 0 is the
+    // closest match; here the cold cluster-block fetch must be refused
+    // before the vector shortlist runs.
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let result = consumer.vector_search(
+        "emb",
+        &q,
+        VECTOR_SEARCH_K,
+        VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+        None,
+        None,
+    );
+
+    match result {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[s3-budget] cold vector search refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(hits) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold vector search returned {} batch(es)",
+            hits.len()
+        ),
+    }
+
+    // Budget accounting on the refused path: the gate fired (>=1 denial) and,
+    // because a refused reservation commits nothing, peak usage stays 0.
+    let bounded_budget = consumer.options().connection_budget();
+    eprintln!(
+        "[s3-budget] bounded budget: denials={} peak={} B",
+        bounded_budget.denials(),
+        bounded_budget.peak()
+    );
+    assert!(
+        bounded_budget.denials() >= 1,
+        "bounded budget must record >=1 denial; got {}",
+        bounded_budget.denials()
+    );
+    assert_eq!(
+        bounded_budget.peak(),
+        0,
+        "a refused cold fetch commits nothing, so peak must stay 0"
+    );
+
+    // Control: the identical cold query over the identical fixture runs to
+    // completion under a measured (unbounded) budget. Proves the deny above
+    // is caused by the budget, not by a broken fixture or a cold-path error.
+    // Fresh consumer + fresh cache so the read is cold again.
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_hits = control
+        .vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("measured cold vector search should run to completion");
+    let control_rows: usize = control_hits.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold vector search returned no rows over S3"
+    );
+    // The measured budget never refuses, so the same cold cluster-block fetch
+    // that the bounded budget rejected is here reserved + released: peak > 0
+    // proves the reservation actually ran on the query path (never denied).
+    let control_budget = control.options().connection_budget();
+    eprintln!(
+        "[s3-budget] measured control: rows={control_rows} denials={} peak={} B",
+        control_budget.denials(),
+        control_budget.peak()
+    );
+    assert_eq!(
+        control_budget.denials(),
+        0,
+        "measured budget must never deny"
+    );
+    let control_peak = control_budget.peak();
+    assert!(
+        (CONTROL_PEAK_LOW_BYTES..=CONTROL_PEAK_HIGH_BYTES).contains(&control_peak),
+        "measured cold vector search peak {control_peak} B outside expected \
+         [{CONTROL_PEAK_LOW_BYTES}, {CONTROL_PEAK_HIGH_BYTES}] band; \
+         a peak near 0 means the budget was never exercised on the query path"
+    );
+
+    // Bounded but ample: an enforcing budget well above one fetch must admit
+    // the query. A bounded budget refuses only when a reservation would cross
+    // the gate, not on principle, so the same cold fetch that a 1-byte budget
+    // rejected runs here, reserves, and never denies.
+    let (ample, _ample_guard) = open_budget_consumer(dim, &storage, AMPLE_BUDGET_BYTES);
+    let ample_budget = ample.options().connection_budget();
+    // The limit is set (not `None`), so this is genuinely bounded, not measured.
+    assert_eq!(
+        ample_budget.limit(),
+        Some(AMPLE_BUDGET_GATE_BYTES),
+        "ample budget must be bounded (an enforced gate), not measured"
+    );
+    let ample_hits = ample
+        .vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("under-budget cold vector search should run under a bounded budget");
+    let ample_rows: usize = ample_hits.iter().map(|b| b.num_rows()).sum();
+    let ample_peak = ample_budget.peak();
+    eprintln!(
+        "[s3-budget] bounded-ample: rows={ample_rows} denials={} peak={ample_peak} B",
+        ample_budget.denials()
+    );
+    assert!(
+        ample_rows >= 1,
+        "bounded-ample cold vector search returned no rows"
+    );
+    assert_eq!(
+        ample_budget.denials(),
+        0,
+        "an under-budget query must not be denied by a bounded budget"
+    );
+    assert!(
+        (CONTROL_PEAK_LOW_BYTES..=CONTROL_PEAK_HIGH_BYTES).contains(&ample_peak),
+        "bounded-ample peak {ample_peak} B outside expected \
+         [{CONTROL_PEAK_LOW_BYTES}, {CONTROL_PEAK_HIGH_BYTES}] band"
+    );
+}
+
+/// The per-connection budget is shared across the multi-superfile fan-out, so
+/// several superfiles' cold fetches accumulate against one ceiling. A
+/// per-superfile budget would never add up, and this is what pins that.
+///
+/// Two commits produce two superfiles, each with its own ~126 KB cold
+/// cluster-block fetch. The unfiltered fan-out probes them concurrently, so
+/// both reservations are live against the same budget at once:
+///  - measured (unbounded): both fetch, the query runs, and peak climbs past a
+///    single superfile's fetch (the two live reservations sum on one budget).
+///  - bounded to `SHARED_BUDGET_BYTES` (fits one fetch, not two): the second
+///    concurrent reservation crosses the ceiling and the query is refused as
+///    `InfinoError::OverBudget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_vector_budget_is_shared_across_superfiles_via_s3_wire_protocol() {
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!(
+            "supertable_vector_budget_is_shared_across_superfiles_via_s3_wire_protocol: skipped \
+             (set INFINO_TEST_S3=1 to enable)"
+        );
+        return;
+    }
+
+    let (addr, _fs_root_guard) = spawn_s3s_fs().await;
+    let endpoint = format!("http://{}", addr);
+    let dim = EMB_DIM;
+    eprintln!("[s3-shared] s3s-fs spawned on {endpoint} bucket={TEST_BUCKET}");
+
+    // Producer: two commits => two superfiles, each `BUDGET_N_ROWS` rows.
+    let storage = budget_s3_provider(&endpoint);
+    {
+        let producer = Supertable::create(real_s3_options(dim).with_storage(Arc::clone(&storage)))
+            .expect("create shared-budget producer");
+        for commit in 0..2 {
+            let mut w = producer.writer().expect("shared-budget producer writer");
+            w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+                .expect("append large vector+FTS batch");
+            w.commit().expect("shared-budget producer commit via S3");
+            assert_eq!(producer.manifest_id(), commit + 1);
+        }
+    }
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let search = |table: &Supertable| {
+        table.vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+    };
+
+    // Measured: both superfiles fetch, the query runs, and the peak exceeds a
+    // single superfile's fetch => the two reservations summed on one budget.
+    let (measured, _measured_guard) = open_budget_consumer(dim, &storage, 0);
+    assert_eq!(measured.reader().n_superfiles(), 2);
+    assert_eq!(measured.reader().n_docs_total(), (BUDGET_N_ROWS as u64) * 2);
+    let measured_hits = search(&measured).expect("measured search over two superfiles runs");
+    let measured_rows: usize = measured_hits.iter().map(|b| b.num_rows()).sum();
+    let measured_peak = measured.options().connection_budget().peak();
+    eprintln!("[s3-shared] measured: rows={measured_rows} peak={measured_peak} B");
+    assert!(
+        measured_rows >= 1,
+        "measured two-superfile search returned no rows"
+    );
+    assert!(
+        measured_peak > CONTROL_PEAK_HIGH_BYTES,
+        "peak {measured_peak} B should exceed one superfile's fetch \
+         ({CONTROL_PEAK_HIGH_BYTES} B): the two fetches must sum on one budget"
+    );
+
+    // Bounded to fit one fetch but not two: the second concurrent reservation
+    // crosses the ceiling, so the shared budget refuses the query.
+    let (bounded, _bounded_guard) = open_budget_consumer(dim, &storage, SHARED_BUDGET_BYTES);
+    let result = search(&bounded);
+    let bounded_budget = bounded.options().connection_budget();
+    eprintln!(
+        "[s3-shared] bounded: denials={} peak={} B result={}",
+        bounded_budget.denials(),
+        bounded_budget.peak(),
+        if result.is_ok() { "ok" } else { "over-budget" }
+    );
+    match result {
+        Err(InfinoError::OverBudget(_)) => {}
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(hits) => panic!(
+            "two concurrent {CONTROL_PEAK_HIGH_BYTES}-B fetches must cross a \
+             {SHARED_BUDGET_BYTES}-B budget; got {} batch(es)",
+            hits.len()
+        ),
+    }
+    assert!(
+        bounded_budget.denials() >= 1,
+        "the shared budget must record the crossing"
     );
 }

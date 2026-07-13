@@ -200,6 +200,47 @@ pub async fn read_pointer(
     }
 }
 
+/// Outcome of a conditional pointer probe ([`probe_pointer`]).
+pub enum PointerProbe {
+    /// No pointer object exists — never-created table, or a lost
+    /// pointer. Mirrors [`read_pointer`]'s `Ok(None)`.
+    Absent,
+    /// The pointer's etag matches the caller's last-seen etag: no
+    /// commit has been published since, so the caller's manifest
+    /// view is already current. No body was transferred.
+    NotModified,
+    /// The pointer was read (unconditionally, or because it changed
+    /// since the caller's etag). `meta.etag` is the token to carry
+    /// into the next probe.
+    Read(PointerFile, ObjectMeta),
+}
+
+/// Read the pointer file, skipping the body when it hasn't changed.
+///
+/// With `if_none_match: Some(etag)` this is the read-path freshness
+/// probe: on S3/Azure an unchanged pointer answers as a bodyless
+/// HTTP 304 ([`PointerProbe::NotModified`]), so the per-query
+/// consistency check under `Consistency::Strong` (and the per-window
+/// check under `BoundedStaleness`) costs a roundtrip but no
+/// transfer or parse. `None` degrades to a plain [`read_pointer`].
+pub async fn probe_pointer(
+    storage: &dyn StorageProvider,
+    if_none_match: Option<&str>,
+) -> Result<PointerProbe, ManifestLoadError> {
+    let Some(etag) = if_none_match else {
+        return Ok(match read_pointer(storage).await? {
+            Some((pointer, meta)) => PointerProbe::Read(pointer, meta),
+            None => PointerProbe::Absent,
+        });
+    };
+    match storage.get_if_none_match(POINTER_PATH, etag).await {
+        Ok(None) => Ok(PointerProbe::NotModified),
+        Ok(Some((bytes, meta))) => Ok(PointerProbe::Read(PointerFile::from_bytes(&bytes)?, meta)),
+        Err(StorageError::NotFound { .. }) => Ok(PointerProbe::Absent),
+        Err(e) => Err(ManifestLoadError::Storage(e)),
+    }
+}
+
 pub struct EncodedPart {
     pub part: ManifestPart,
     pub encoded: Vec<u8>,
@@ -616,6 +657,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_pointer_covers_absent_read_and_not_modified() {
+        let (_dir, storage) = local_storage();
+
+        // Absent pointer, with and without a stale etag in hand.
+        assert!(matches!(
+            probe_pointer(storage.as_ref(), None).await.expect("probe"),
+            PointerProbe::Absent
+        ));
+        assert!(matches!(
+            probe_pointer(storage.as_ref(), Some("\"gone\""))
+                .await
+                .expect("probe"),
+            PointerProbe::Absent
+        ));
+
+        // First read (no etag) returns the pointer + its etag.
+        let p = sample_pointer();
+        write_pointer(storage.as_ref(), &p, None)
+            .await
+            .expect("write");
+        let PointerProbe::Read(read, meta) =
+            probe_pointer(storage.as_ref(), None).await.expect("probe")
+        else {
+            panic!("expected Read");
+        };
+        assert_eq!(read, p);
+        let etag = meta.etag.expect("localfs reports etags");
+
+        // Same etag → NotModified, no pointer parse.
+        assert!(matches!(
+            probe_pointer(storage.as_ref(), Some(&etag))
+                .await
+                .expect("probe"),
+            PointerProbe::NotModified
+        ));
+
+        // Pointer rewritten (next manifest version) → the stale etag
+        // reads through to the new pointer. The longer uri changes
+        // the byte length, so the mtime+size etag can't collide even
+        // within one filesystem clock tick.
+        let mut p2 = sample_pointer();
+        p2.manifest_id += 1;
+        p2.manifest_uri = "manifest/manifest-000008-successor.json".into();
+        write_pointer(storage.as_ref(), &p2, Some(&etag))
+            .await
+            .expect("cas rewrite");
+        let PointerProbe::Read(read2, meta2) = probe_pointer(storage.as_ref(), Some(&etag))
+            .await
+            .expect("probe")
+        else {
+            panic!("expected Read after rewrite");
+        };
+        assert_eq!(read2, p2);
+        assert_ne!(meta2.etag.expect("etag"), etag);
+    }
+
+    #[tokio::test]
     async fn write_pointer_create_then_read_roundtrip() {
         // Initial commit shape: no expected_prev_etag, so
         // write_pointer routes through put_atomic and lands
@@ -665,6 +763,7 @@ mod tests {
         // columns, an empty schema. Encoding only requires the
         // format header + the empty collections.
         let list = PersistedManifest {
+            tombstone_seqs: Default::default(),
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),

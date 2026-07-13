@@ -85,6 +85,18 @@ pub struct Manifest {
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
     pub parts: Vec<ManifestPartEntry>,
+    /// Per-superfile tombstone-sidecar version: `superfile_id →` the
+    /// `manifest_id` of the commit whose tombstone phase last changed
+    /// that superfile's sidecar. The mutation pipeline stamps this map
+    /// (a fresh list + pointer CAS) right after its sidecar CAS-PUTs
+    /// land, so a reader that refreshes the manifest learns *which*
+    /// sidecars changed without polling each one — cross-process
+    /// delete visibility is bounded by the read-consistency window,
+    /// not a sidecar cache TTL. The map is authoritative for sidecar
+    /// *existence* too: a superfile absent from it has no sidecar, so
+    /// readers skip the storage GET entirely. Entries are dropped when
+    /// their superfile leaves the manifest (compaction/removal).
+    pub tombstone_seqs: BTreeMap<Uuid, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +743,7 @@ struct ManifestDto {
     vector_columns: Vec<VectorColumnInfoDto>,
     partition_strategy: PartitionStrategyDto,
     parts: Vec<ManifestPartEntryDto>,
+    tombstone_seqs: BTreeMap<String, u64>, // UUID keys
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1147,6 +1160,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         parts,
+        tombstone_seqs: l
+            .tombstone_seqs
+            .iter()
+            .map(|(id, seq)| (id.to_string(), *seq))
+            .collect(),
     })
 }
 
@@ -1178,6 +1196,15 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         parts,
+        tombstone_seqs: d
+            .tombstone_seqs
+            .into_iter()
+            .map(|(id, seq)| {
+                Uuid::parse_str(&id)
+                    .map(|u| (u, seq))
+                    .map_err(|_| ListParseError::BadFieldValue("tombstone_seqs", id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
     })
 }
 
@@ -1234,7 +1261,7 @@ mod tests {
         sync::Arc,
     };
 
-    use arrow_array::{BooleanArray, Date32Array, Int64Array, StringArray};
+    use arrow_array::{BinaryArray, BooleanArray, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use uuid::Uuid;
 
@@ -1390,8 +1417,10 @@ mod tests {
 
     #[test]
     fn scalar_agg_from_column_unorderable_type_is_none() {
-        // Date32 isn't in `column_min_max`'s supported set → no stats at all.
-        let arr: ArrayRef = Arc::new(Date32Array::from(vec![1, 2, 3]));
+        // Binary has no meaningful ordering, so it isn't in `column_min_max`'s
+        // supported set → no stats at all. (Temporal types now *are* supported;
+        // see `min_max_stats_cover_temporal_columns` in the parent module.)
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![&b"a"[..], b"b", b"c"]));
         assert!(ScalarStatsAgg::from_column(&arr).is_none());
     }
 
@@ -1399,10 +1428,10 @@ mod tests {
 
     #[test]
     fn scalar_agg_from_batches_skips_unorderable_column() {
-        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let schema = Schema::new(vec![Field::new("d", DataType::Binary, true)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
-            vec![Arc::new(Date32Array::from(vec![1, 2])) as ArrayRef],
+            vec![Arc::new(BinaryArray::from(vec![&b"a"[..], b"b"])) as ArrayRef],
         )
         .expect("batch");
         let table = ScalarStatsAgg::from_batches(&schema, &[&batch]);
@@ -1650,6 +1679,7 @@ mod tests {
 
     fn empty_list() -> Manifest {
         Manifest {
+            tombstone_seqs: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -1821,6 +1851,16 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_lists_equal(&decoded, &list);
+    }
+
+    #[test]
+    fn tombstone_seqs_roundtrip() {
+        let mut list = empty_list();
+        list.tombstone_seqs.insert(Uuid::from_u128(0x42), 7);
+        list.tombstone_seqs.insert(Uuid::from_u128(0x43), 9);
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.tombstone_seqs, list.tombstone_seqs);
     }
 
     #[test]

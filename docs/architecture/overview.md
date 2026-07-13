@@ -1,7 +1,7 @@
 # Infino Architecture Overview
 
 A plain-language tour of what Infino is, how it's built, and how it
-differs from the database, search engine, and vector database alternatives. 
+differs from the database, search engine, and vector database alternatives.
 For more technical detail, see [superfile](./superfile.md) (the superfile format) and
 [supertable](./supertable.md) (the table layer).
 
@@ -11,8 +11,8 @@ For more technical detail, see [superfile](./superfile.md) (the superfile format
 
 For most retrieval and RAG workloads, hybrid queries are useful for improving the cost, latency, and accuracy of results. In Infino, SQL, keyword, and vector run over **one copy of the data** through **one query path**, making **hybrid search** a first-class, single-pass operation.
 
- The data lives in object storage at object-storage prices, and  
-compute pulls in only what a query actually touches, caching the hot  
+ The data lives in object storage at object-storage prices, and
+compute pulls in only what a query actually touches, caching the hot
 parts locally for speed. You do not need to maintain a separate cluster.
 
 ## The mental model
@@ -39,19 +39,22 @@ Think of three ideas:
         Application
             │  connect(uri) → Connection
             ▼
-        Connection  ── catalog of tables (name → supertable) ──┐
+        Connection  ── catalog of tables (name → supertable) ───┐
             │  create / open / list / drop · cross-table SQL    │
-            ▼                                                    │
-        Supertable  ── manifest (the file list) ──┐             │
-            │                                      │             │
+            ▼                                                   │
+        Supertable  ── manifest (the file list) ───┐            │
+            │                                      │            │
    stateless compute                       immutable files      │
-   + local cache (hot)                     (superfiles)          │
-            │                                      │             │
-            └──────────── byte-range reads ────────┴─────────────┘
+   + local cache (hot)                     (superfiles)         │
+            │                                      │            │
+            └──────────── byte-range reads ────────┴────────────┘
+                                 |
                                  ▼
                       Object storage (S3) — cheap, durable,
                               the source of truth
 ```
+
+To see how these pieces land as actual files (the catalog, per-table subtrees, manifests, superfiles, and tombstones) and how a read walks from one to the next, see [on-disk layout](./on-disk-layout.md).
 
 ## Opening Infino
 
@@ -301,4 +304,3 @@ SQL filters, over one copy of the data and one snapshot.
 behind fast approximate vector search.
 - **Object storage / S3** — cheap, durable, near-infinite remote
 storage used as the source of truth.
-

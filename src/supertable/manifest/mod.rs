@@ -36,7 +36,7 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
     sync::{Arc, OnceLock},
@@ -44,7 +44,7 @@ use std::{
 
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use dashmap::DashMap;
 use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -271,7 +271,7 @@ impl ManifestSnapshot {
     /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
     pub(crate) fn materialized_empty(options: Arc<SupertableOptions>) -> Self {
         let strategy = options.effective_partition_strategy();
-        let list = Self::build_list(&options, strategy, 0, Vec::new());
+        let list = Self::build_list(&options, strategy, 0, Vec::new(), BTreeMap::new());
         let loader = options.storage.as_ref().map(|storage| {
             Arc::new(ManifestPartLoader::new_with_cache(
                 storage.clone(),
@@ -288,14 +288,16 @@ impl ManifestSnapshot {
     }
 
     /// Build a manifest list from the supertable `options` at `manifest_id`,
-    /// carrying `parts`. Shared by the commit path ([`Self::update`]) and the
-    /// initial empty-manifest materialization ([`Self::materialized_empty`]) so
-    /// the options→list field mapping lives in one place.
+    /// carrying `parts` and the tombstone-seq state. Shared by the commit path
+    /// ([`Self::update`]) and the initial empty-manifest materialization
+    /// ([`Self::materialized_empty`]) so the options→list field mapping lives
+    /// in one place.
     fn build_list(
         options: &SupertableOptions,
         strategy: PartitionStrategy,
         manifest_id: u64,
         parts: Vec<ManifestPartEntry>,
+        tombstone_seqs: BTreeMap<Uuid, u64>,
     ) -> Manifest {
         Manifest {
             format_version: LIST_FORMAT_VERSION.into(),
@@ -323,6 +325,7 @@ impl ManifestSnapshot {
                 .collect(),
             partition_strategy: strategy,
             parts,
+            tombstone_seqs,
         }
     }
 
@@ -391,7 +394,19 @@ impl ManifestSnapshot {
             Some(p) => p,
             None => return Err(ManifestLoadError::PointerNotFound),
         };
+        Self::load_with_pointer(current_manifest, storage, options, pointer).await
+    }
 
+    /// [`Self::load`] with the pointer already in hand. Split out so
+    /// the refresh path can read the pointer itself (conditionally,
+    /// via [`probe_pointer`]) and still share the list + parts
+    /// loading below.
+    pub(crate) async fn load_with_pointer(
+        current_manifest: Option<Arc<Self>>,
+        storage: Arc<dyn StorageProvider>,
+        options: Option<Arc<SupertableOptions>>,
+        pointer: PointerFile,
+    ) -> Result<Arc<Self>, ManifestLoadError> {
         if let Some(current_manifest) = &current_manifest
             && current_manifest.superfile_list.manifest_id >= pointer.manifest_id
         {
@@ -678,6 +693,45 @@ impl ManifestSnapshot {
         }
     }
 
+    /// The persisted list's per-superfile tombstone-seq map. `None`
+    /// for in-process-only manifests (no persisted list ⇒ no sidecars
+    /// can exist).
+    pub fn get_tombstone_seqs(&self) -> Option<&BTreeMap<Uuid, u64>> {
+        self.list.as_ref().map(|l| &l.tombstone_seqs)
+    }
+
+    /// Build a successor manifest identical to `self` except that every
+    /// superfile in `touched` has its tombstone seq set to the successor's
+    /// `manifest_id`. This is the mutation pipeline's post-sidecar stamp:
+    /// no superfile entries or parts change, so persisting the successor
+    /// is a list + pointer write only (empty `parts_to_write`).
+    ///
+    /// Returns `None` for in-process-only manifests (no persisted list —
+    /// nothing to stamp, and no cross-process readers to inform).
+    pub(crate) fn with_tombstone_seqs_bumped(&self, touched: &[Uuid]) -> Option<Self> {
+        let list = self.list.as_ref()?;
+        let next_id = self.get_next_manifest_id();
+        let mut new_list = list.clone();
+        new_list.manifest_id = next_id;
+        for id in touched {
+            new_list.tombstone_seqs.insert(*id, next_id);
+        }
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.manifest_id = next_id;
+        // Same parts as the predecessor — inherit the loaded-part cache
+        // wholesale so the stamp never forces a part re-fetch.
+        let parts = DashMap::new();
+        for kv in self.parts.iter() {
+            parts.insert(*kv.key(), Arc::clone(kv.value()));
+        }
+        Some(Self {
+            superfile_list,
+            list: Some(new_list),
+            parts,
+            loader: self.loader.clone(),
+        })
+    }
+
     /// Lazy-load entry point for manifest parts.
     ///
     /// Concurrent callers on the same not-yet-loaded `part_id`
@@ -871,17 +925,29 @@ impl ManifestSnapshot {
                 out_list_entries_after_removal.push(fresh_entry);
             }
         }
-        let new_list = Self::build_list(
-            opts.as_ref(),
-            strategy,
-            self.get_next_manifest_id(),
-            out_list_entries_after_removal,
-        );
 
         let ids_to_remove = entries_to_remove
             .iter()
             .map(|e| e.superfile_id)
             .collect::<HashSet<_>>();
+
+        // Carry the tombstone-seq map forward, dropping entries for
+        // superfiles this commit removes — their sidecars leave the
+        // manifest with them.
+        let mut tombstone_seqs = self
+            .list
+            .as_ref()
+            .map(|list| list.tombstone_seqs.clone())
+            .unwrap_or_default();
+        tombstone_seqs.retain(|id, _| !ids_to_remove.contains(id));
+
+        let new_list = Self::build_list(
+            opts.as_ref(),
+            strategy,
+            self.get_next_manifest_id(),
+            out_list_entries_after_removal,
+            tombstone_seqs,
+        );
         let mut new_superfile_list = self
             .get_all_superfiles()
             .iter()
@@ -1307,6 +1373,28 @@ pub(crate) fn merge_min_max_arrays(
         }};
     }
 
+    // Same fold, re-attaching the column's timezone (the constructor drops
+    // it) so the merged bound keeps the exact type its inputs carried.
+    macro_rules! ts_merge {
+        ($array_ty:ty, $tz:expr) => {{
+            let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
+            let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
+            Some((
+                Arc::new(
+                    <$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])
+                        .with_timezone_opt($tz.clone()),
+                ) as ArrayRef,
+                Arc::new(
+                    <$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])
+                        .with_timezone_opt($tz.clone()),
+                ) as ArrayRef,
+            ))
+        }};
+    }
+
     match existing_min.data_type() {
         DataType::UInt8 => prim_merge!(UInt8Array),
         DataType::UInt16 => prim_merge!(UInt16Array),
@@ -1381,6 +1469,20 @@ pub(crate) fn merge_min_max_arrays(
                 ),
             ))
         }
+
+        // Mirror `column_min_max`'s temporal set; without these arms a
+        // multi-superfile (or compacted) temporal column errors the merge and
+        // drops its stat, silently regressing the fold and range prune.
+        DataType::Date32 => prim_merge!(Date32Array),
+        DataType::Date64 => prim_merge!(Date64Array),
+        DataType::Time32(TimeUnit::Second) => prim_merge!(Time32SecondArray),
+        DataType::Time32(TimeUnit::Millisecond) => prim_merge!(Time32MillisecondArray),
+        DataType::Time64(TimeUnit::Microsecond) => prim_merge!(Time64MicrosecondArray),
+        DataType::Time64(TimeUnit::Nanosecond) => prim_merge!(Time64NanosecondArray),
+        DataType::Timestamp(TimeUnit::Second, tz) => ts_merge!(TimestampSecondArray, tz),
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => ts_merge!(TimestampMillisecondArray, tz),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => ts_merge!(TimestampMicrosecondArray, tz),
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => ts_merge!(TimestampNanosecondArray, tz),
         _ => None,
     }
 }
@@ -1391,7 +1493,8 @@ pub(crate) fn merge_min_max_arrays(
 /// supported type yields length-1 *null* min/max arrays (not `None`), so
 /// its null count is still recorded and `IS [NOT] NULL` can prune on it.
 /// Supported set: integer (signed + unsigned, all widths), float
-/// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
+/// (f32, f64), boolean, Utf8, LargeUtf8, Decimal128, and temporal
+/// (Date32/64, Time32/64, Timestamp). The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
 /// `FixedSizeList<Float32>` won't appear here in practice.
 /// Exact column sum as a length-1 array typed to match SQL `SUM`'s
@@ -1528,6 +1631,21 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }};
     }
 
+    // Timestamps are the same primitive fold, but the `from(vec![..])`
+    // constructor builds a zone-less array; re-attach the column's zone so
+    // the bound keeps its exact type (a naive-vs-zoned mismatch would fail
+    // the cross-superfile merge and stat reconstruction).
+    macro_rules! ts {
+        ($array_ty:ty, $tz:expr) => {{
+            let a = col.as_any().downcast_ref::<$array_ty>()?;
+            let mn_arr: ArrayRef =
+                Arc::new(<$array_ty>::from(vec![agg::min(a)]).with_timezone_opt($tz.clone()));
+            let mx_arr: ArrayRef =
+                Arc::new(<$array_ty>::from(vec![agg::max(a)]).with_timezone_opt($tz.clone()));
+            Some((mn_arr, mx_arr))
+        }};
+    }
+
     match col.data_type() {
         DataType::UInt8 => prim!(UInt8Array),
         DataType::UInt16 => prim!(UInt16Array),
@@ -1575,6 +1693,19 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
                 ),
             ))
         }
+
+        // Temporal columns are numeric-backed and orderable, so min/max fold
+        // (DataFusion's aggregate fast-path) and prune the same as integers.
+        DataType::Date32 => prim!(Date32Array),
+        DataType::Date64 => prim!(Date64Array),
+        DataType::Time32(TimeUnit::Second) => prim!(Time32SecondArray),
+        DataType::Time32(TimeUnit::Millisecond) => prim!(Time32MillisecondArray),
+        DataType::Time64(TimeUnit::Microsecond) => prim!(Time64MicrosecondArray),
+        DataType::Time64(TimeUnit::Nanosecond) => prim!(Time64NanosecondArray),
+        DataType::Timestamp(TimeUnit::Second, tz) => ts!(TimestampSecondArray, tz),
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => ts!(TimestampMillisecondArray, tz),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => ts!(TimestampMicrosecondArray, tz),
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => ts!(TimestampNanosecondArray, tz),
         _ => None,
     }
 }
@@ -1773,8 +1904,11 @@ impl ClusterCentroids {
 mod tests {
     use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
 
-    use arrow_array::{Array, Int64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        Array, Date32Array, Date64Array, Int64Array, Time64MicrosecondArray,
+        TimestampMicrosecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use dashmap::DashMap;
     use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
@@ -1833,6 +1967,61 @@ mod tests {
         assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
         let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
         assert!(mn.is_null(0) && mx.is_null(0));
+    }
+
+    #[test]
+    fn min_max_stats_cover_temporal_columns() {
+        let scalar = |a: &ArrayRef| ScalarValue::try_from_array(a, 0).expect("decode");
+
+        // Date32 (the ClickBench `EventDate` case that used to carry no stat):
+        // numeric-backed, so min/max record and fold like an integer.
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![Some(20100), Some(19000), None]));
+        let (mn, mx) = column_min_max(&d).expect("date stat");
+        assert_eq!(scalar(&mn), ScalarValue::Date32(Some(19000)));
+        assert_eq!(scalar(&mx), ScalarValue::Date32(Some(20100)));
+
+        // Two superfiles' date bounds fold to the outer extremes.
+        let lo: ArrayRef = Arc::new(Date32Array::from(vec![Some(19000)]));
+        let hi: ArrayRef = Arc::new(Date32Array::from(vec![Some(20100)]));
+        let olo: ArrayRef = Arc::new(Date32Array::from(vec![Some(18000)]));
+        let ohi: ArrayRef = Arc::new(Date32Array::from(vec![Some(21000)]));
+        let (mn, mx) = merge_min_max_arrays(&lo, &olo, &hi, &ohi).expect("date merge");
+        assert_eq!(scalar(&mn), ScalarValue::Date32(Some(18000)));
+        assert_eq!(scalar(&mx), ScalarValue::Date32(Some(21000)));
+
+        // Timestamp keeps its timezone through both build and merge. A
+        // naive-vs-zoned mismatch would fail the merge and silently drop the
+        // stat, so assert the type survives, not just the value.
+        let tz = "+05:30";
+        let ts: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(200i64), Some(100)]).with_timezone(tz),
+        );
+        let zoned = DataType::Timestamp(TimeUnit::Microsecond, Some(tz.into()));
+        let (mn, mx) = column_min_max(&ts).expect("ts stat");
+        assert_eq!(mn.data_type(), &zoned);
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::TimestampMicrosecond(Some(100), Some(tz.into()))
+        );
+        assert_eq!(
+            scalar(&mx),
+            ScalarValue::TimestampMicrosecond(Some(200), Some(tz.into()))
+        );
+        let (mmn, _mmx) = merge_min_max_arrays(&mn, &mn, &mx, &mx).expect("ts merge keeps tz");
+        assert_eq!(mmn.data_type(), &zoned);
+
+        // Date64 (ms-since-epoch) and Time64 ride the same `prim!` arm as
+        // Date32; spot-check that each records and reconstructs to its type.
+        let d64: ArrayRef = Arc::new(Date64Array::from(vec![Some(9i64), Some(2)]));
+        assert_eq!(
+            scalar(&column_min_max(&d64).expect("date64 stat").0),
+            ScalarValue::Date64(Some(2))
+        );
+        let t64: ArrayRef = Arc::new(Time64MicrosecondArray::from(vec![Some(7i64), Some(3)]));
+        assert_eq!(
+            scalar(&column_min_max(&t64).expect("time64 stat").0),
+            ScalarValue::Time64Microsecond(Some(3))
+        );
     }
 
     /// Folded Sq8-domain scoring must equal dequantize-then-distance
@@ -2251,6 +2440,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> list::Manifest {
             list::Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2544,6 +2734,7 @@ mod tests {
         use list::PartitionStrategy;
         let entry = part::PartId::new_v4();
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2707,6 +2898,7 @@ mod tests {
         Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -2797,6 +2989,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2933,6 +3126,7 @@ mod tests {
         // List order: [part_0, part_1, part_2]. The last part is the latest
         // (the rewrite candidate); the two earlier parts carry over unchanged.
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3130,6 +3324,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3219,6 +3414,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3343,6 +3539,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3466,6 +3663,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3599,6 +3797,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3748,6 +3947,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3956,6 +4156,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4042,6 +4243,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4145,6 +4347,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4271,6 +4474,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4391,6 +4595,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4468,6 +4673,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4564,6 +4770,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4681,6 +4888,7 @@ mod tests {
             })
             .collect();
         list::Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

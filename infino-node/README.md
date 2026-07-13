@@ -80,17 +80,17 @@ CommonJS works too — `const { connect, IndexSpec } = require("@infino-ai/infin
 
 ## Documentation
 
-Full docs, guides, and the API reference live at **[docs.infino.ai](https://docs.infino.ai)**:
+Full docs, guides, and the API reference live at **[infino.ai/docs](https://infino.ai/docs)**:
 
-- [Quickstart](https://docs.infino.ai/quickstart) — install to first query
-- [Core concepts](https://docs.infino.ai/core-concepts) — superfiles, commits, and indexes
-- Guides — [Tables & indexing](https://docs.infino.ai/guides/tables) ·
-  [Search: BM25, vector, hybrid](https://docs.infino.ai/guides/search) ·
-  [Embeddings](https://docs.infino.ai/guides/embeddings) ·
-  [Storage & credentials](https://docs.infino.ai/guides/storage)
-- [SQL reference](https://docs.infino.ai/sql-reference) — query tables and the search table-valued functions
-- [API reference](https://docs.infino.ai/api-reference) — the full Node surface, generated from the package
-- [Integrations](https://docs.infino.ai/integrations) — LangChain, CrewAI, Vercel AI SDK, MCP
+- [Quickstart](https://infino.ai/docs/quickstart) — install to first query
+- [Core concepts](https://infino.ai/docs/core-concepts) — superfiles, commits, and indexes
+- Guides — [Tables & indexing](https://infino.ai/docs/guides/tables) ·
+  [Search: BM25, vector, hybrid](https://infino.ai/docs/guides/search) ·
+  [Embeddings](https://infino.ai/docs/guides/embeddings) ·
+  [Storage & credentials](https://infino.ai/docs/guides/storage)
+- [SQL reference](https://infino.ai/docs/sql-reference) — query tables and the search table-valued functions
+- [API reference](https://infino.ai/docs/api-reference) — the full Node surface, generated from the package
+- [Integrations](https://infino.ai/docs/integrations) — LangChain, CrewAI, Vercel AI SDK, MCP
 - [Examples](examples) — runnable agent-memory and hybrid-search-service demos
 
 ## Building from source

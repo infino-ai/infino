@@ -225,6 +225,9 @@ pub struct OptimizeOptions {
     pub min_fill_percent: Option<u32>,
     /// Target merged-superfile size, in MB.
     pub target_superfile_size_mb: Option<u32>,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before compaction treats its owner as dead and takes over.
+    pub stale_seal_timeout_ms: Option<u32>,
 }
 
 /// Row counts from an `update` / `delete`.
@@ -670,6 +673,9 @@ impl Table {
             }
             if let Some(v) = o.target_superfile_size_mb {
                 s.target_superfile_size_mb = v as u64;
+            }
+            if let Some(v) = o.stale_seal_timeout_ms {
+                s.stale_seal_timeout_ms = v as u64;
             }
         }
         let opts = InfinoOptimizeOptions::compact(s);

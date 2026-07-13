@@ -91,6 +91,10 @@ use std::{
     },
 };
 
+mod datafusion_pool;
+
+pub(crate) use datafusion_pool::budgeted_session_context;
+
 /// The fraction of a configured budget we actually enforce: gate at 9/10 and
 /// leave the final 1/10 as headroom for allocations too small to track. Applied
 /// once, in [`ConnectionMemoryBudget::with_limit`].
@@ -105,14 +109,22 @@ const ENFORCED_BUDGET_DENOMINATOR: u128 = 10;
 /// limit, not a different policy — so there is no trait. The one trait we do
 /// implement is the query engine's memory-pool interface, in a thin adapter
 /// that forwards to an `Arc<ConnectionMemoryBudget>`.
+///
+/// Must be `pub`: the `pub` vector-search functions take this type as an
+/// argument. It is still not public API, because `lib.rs` makes the whole `memory`
+/// module `pub` only under `test-helpers``, so a shipped build keeps this type crate-internal.
 #[derive(Debug)]
-pub(crate) struct ConnectionMemoryBudget {
+pub struct ConnectionMemoryBudget {
     // Enforced ceiling in bytes, already reduced to the headroom gate.
     // `None` is measure-only: count usage, never refuse.
     limit: Option<usize>,
     // Bytes reserved across all live reservations. Every access is `Relaxed`: this is a pure
     // accounting counter, it guards no other memory, so no  stronger ordering is needed.
     used: AtomicUsize,
+    // The largest memory `used` ever reached. Observability only, never gates. Exact
+    // even under concurrency: each grow records its own atomic post-add value,
+    // and `fetch_max` can't lose a maximum.
+    peak_used: AtomicUsize,
     // Count of refused reservations (a count, not bytes); observability only,
     // never affects gating.
     denials: AtomicU64,
@@ -125,6 +137,7 @@ impl ConnectionMemoryBudget {
         Arc::new(Self {
             limit: None,
             used: AtomicUsize::new(0),
+            peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
         })
     }
@@ -149,6 +162,7 @@ impl ConnectionMemoryBudget {
         Arc::new(Self {
             limit: Some(limit),
             used: AtomicUsize::new(0),
+            peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
         })
     }
@@ -169,7 +183,7 @@ impl ConnectionMemoryBudget {
     /// Reserve `n` bytes, returning a guard that frees them on drop. Fails with
     /// [`OverBudget`] if the reservation would cross the ceiling; a measured
     /// budget always succeeds.
-    pub fn try_reserve(self: &Arc<Self>, n: usize) -> Result<Reservation, OverBudget> {
+    pub(crate) fn try_reserve(self: &Arc<Self>, n: usize) -> Result<Reservation, OverBudget> {
         self.try_grow(n)?;
 
         Ok(Reservation {
@@ -179,13 +193,15 @@ impl ConnectionMemoryBudget {
     }
 
     /// Charge `n` bytes to the counter, refusing if that would cross the
-    /// ceiling. On refusal the counter is left unchanged. Backs both
-    /// [`Self::try_reserve`] and [`Reservation::try_grow`].
-    fn try_grow(&self, n: usize) -> Result<(), OverBudget> {
+    /// ceiling. On refusal the counter is left unchanged. Backs
+    /// [`Self::try_reserve`], [`Reservation::try_grow`], and the DataFusion
+    /// pool adapter's `try_grow`.
+    pub(crate) fn try_grow(&self, n: usize) -> Result<(), OverBudget> {
         match self.limit {
             // Unbounded
             None => {
-                self.used.fetch_add(n, Ordering::Relaxed);
+                let prev = self.used.fetch_add(n, Ordering::Relaxed);
+                self.record_peak(prev.saturating_add(n));
                 Ok(())
             }
 
@@ -194,7 +210,7 @@ impl ConnectionMemoryBudget {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                     used.checked_add(n).filter(|next| *next <= limit)
                 })
-                .map(|_| ())
+                .map(|prev| self.record_peak(prev.saturating_add(n)))
                 .map_err(|used| {
                     // Budget exceeded
                     self.denials.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +227,13 @@ impl ConnectionMemoryBudget {
     /// Charge `n` bytes unconditionally, for a caller that has already committed
     /// the allocation and cannot fail — the query engine's infallible `grow`.
     pub(crate) fn grow_unchecked(&self, n: usize) {
-        self.used.fetch_add(n, Ordering::Relaxed);
+        let prev = self.used.fetch_add(n, Ordering::Relaxed);
+        self.record_peak(prev.saturating_add(n));
+    }
+
+    /// Raise the recorded peak to `used_now` if it's a new maximum.
+    fn record_peak(&self, used_now: usize) {
+        self.peak_used.fetch_max(used_now, Ordering::Relaxed);
     }
 
     /// Return `n` bytes to the budget.
@@ -228,14 +250,28 @@ impl ConnectionMemoryBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// The enforced ceiling, or `None` when measured.
-    pub(crate) fn limit(&self) -> Option<usize> {
-        self.limit
+    test_visible! {
+        /// The largest [`used`](Self::used) ever reached. Only grows; never reset.
+        /// Test-visible so integration tests can assert a query actually reserved
+        /// against the budget: a peak above 0 means the budget was wired and exercised.
+        fn peak(&self) -> usize {
+            self.peak_used.load(Ordering::Relaxed)
+        }
     }
 
-    /// Reservations refused so far.
-    pub(crate) fn denials(&self) -> u64 {
-        self.denials.load(Ordering::Relaxed)
+    test_visible! {
+        /// The enforced ceiling, or `None` when measured.
+        fn limit(&self) -> Option<usize> {
+            self.limit
+        }
+    }
+
+    test_visible! {
+        /// Reservations refused so far. Test-visible so integration tests can
+        /// assert the gate fired on an over-budget query.
+        fn denials(&self) -> u64 {
+            self.denials.load(Ordering::Relaxed)
+        }
     }
 }
 
@@ -261,6 +297,7 @@ impl fmt::Display for ConnectionMemoryBudget {
 #[derive(Debug)]
 pub(crate) struct Reservation {
     budget: Arc<ConnectionMemoryBudget>,
+    // memory in bytes, which is to be reserved
     size: usize,
 }
 
@@ -334,6 +371,25 @@ mod tests {
     }
 
     #[test]
+    fn peak_holds_the_largest_used() {
+        let budget = ConnectionMemoryBudget::measured();
+        let r1 = budget.try_reserve(1000).expect("ok");
+        let r2 = budget.try_reserve(500).expect("ok");
+        assert_eq!(budget.used(), 1500);
+        assert_eq!(budget.peak(), 1500);
+
+        // `used` falls back to 0, but the peak stays at the largest value seen.
+        drop((r1, r2));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.peak(), 1500);
+
+        // A smaller later reservation doesn't lower the peak.
+        let r3 = budget.try_reserve(200).expect("ok");
+        assert_eq!(budget.peak(), 1500);
+        drop(r3);
+    }
+
+    #[test]
     fn with_limit_bakes_in_the_headroom_gate() {
         // 1000 configured -> gate at 900 (9/10).
         let budget = ConnectionMemoryBudget::with_limit(1000);
@@ -356,6 +412,8 @@ mod tests {
         let budget = ConnectionMemoryBudget::with_limit(1000); // gate = 900
         let held = budget.try_reserve(900).expect("exactly at the gate fits");
         assert_eq!(budget.used(), 900);
+        // A bounded reservation records the peak too.
+        assert_eq!(budget.peak(), 900);
 
         let err = budget
             .try_reserve(1)
@@ -369,8 +427,9 @@ mod tests {
             }
         );
         assert_eq!(budget.denials(), 1);
-        // A denied reservation must not have changed the counter.
+        // A denied reservation must not have changed the counter or the peak.
         assert_eq!(budget.used(), 900);
+        assert_eq!(budget.peak(), 900);
 
         drop(held);
         assert_eq!(budget.used(), 0);
@@ -408,6 +467,7 @@ mod tests {
         let budget = ConnectionMemoryBudget::with_limit(1000); // gate = 900
         budget.grow_unchecked(5000); // well over the gate, but unconditional
         assert_eq!(budget.used(), 5000);
+        assert_eq!(budget.peak(), 5000); // grow_unchecked records the peak too
         assert_eq!(budget.denials(), 0); // not a refusal path
         budget.release(5000);
         assert_eq!(budget.used(), 0);

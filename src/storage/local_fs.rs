@@ -127,6 +127,10 @@ impl StorageProvider for LocalFsStorageProvider {
         Ok((bytes, meta))
     }
 
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(uri = uri, len = range.end - range.start))
+    )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = Self::path(uri)?;
         self.store
@@ -333,6 +337,36 @@ mod tests {
             .expect("put");
         let (got, _) = p.get("data/seg-abc.sf.parquet").await.expect("get");
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn get_if_none_match_skips_unchanged_and_reads_changed() {
+        // Exercises the trait's default conditional-get (plain get +
+        // local etag compare) — the semantics every backend must
+        // honor: matching etag → `None`; changed object → full body.
+        let (_dir, p) = provider();
+        let uri = "cond/pointer";
+        p.put_atomic(uri, Bytes::from_static(b"v1"))
+            .await
+            .expect("put v1");
+        let (_, meta) = p.get(uri).await.expect("get v1");
+        let etag_v1 = meta.etag.expect("localfs reports etags");
+
+        let unchanged = p.get_if_none_match(uri, &etag_v1).await.expect("probe");
+        assert!(unchanged.is_none(), "matching etag answers not-modified");
+
+        // Overwrite with different content (and length, so the
+        // mtime+size etag can't collide within one clock tick).
+        p.put_if_match(uri, Bytes::from_static(b"v2-longer"), Some(&etag_v1))
+            .await
+            .expect("cas overwrite");
+        let changed = p
+            .get_if_none_match(uri, &etag_v1)
+            .await
+            .expect("probe changed")
+            .expect("changed object returns the body");
+        assert_eq!(changed.0, Bytes::from_static(b"v2-longer"));
+        assert_ne!(changed.1.etag.expect("etag"), etag_v1);
     }
 
     #[tokio::test]

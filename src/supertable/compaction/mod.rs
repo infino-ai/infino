@@ -23,6 +23,7 @@ use chrono::Utc;
 use futures::future::join_all;
 use roaring::RoaringBitmap;
 use tokio::time;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -35,7 +36,7 @@ use crate::{
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
-            SealRecord, WalStore,
+            Etag, SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -231,6 +232,8 @@ impl Supertable {
             };
 
         // Build SuperfileStats for every superfile in the snapshot.
+        let now = Utc::now();
+        let stale_seal_timeout = std::time::Duration::from_millis(cfg.stale_seal_timeout_ms);
         let stats: Vec<SuperfileStats> = manifest
             .get_all_superfiles()
             .iter()
@@ -240,7 +243,9 @@ impl Supertable {
                     .cloned()
                     .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
                 let tombstoned_docs = bitmap.len();
-                let sealed_by_other = seal.is_some();
+                let sealed_by_other = seal.as_ref().is_some_and(|s| {
+                    !tombstones_admin::is_seal_stale(s.sealed_at, now, stale_seal_timeout)
+                });
                 SuperfileStats {
                     superfile_id: entry.superfile_id,
                     partition_key: entry.partition_key.clone(),
@@ -259,7 +264,7 @@ impl Supertable {
         let jobs = select(&stats, cfg);
 
         for job in jobs {
-            self.run_compaction_job(job).await?;
+            self.run_compaction_job(job, stale_seal_timeout).await?;
             self.refresh()
                 .await
                 .map_err(|e| CompactionError::Refresh(e.to_string()))?;
@@ -331,6 +336,7 @@ impl Supertable {
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -356,12 +362,15 @@ impl Supertable {
             })
             .collect::<Result<_, _>>()?;
 
-        // Seal every input sidecar.
-        // once sealed, further incoming updates are rejected
-        // and this seal flag helps to prevent overlapping compactions
-        // on same files
+        // Seal every input sidecar so no writer can land a tombstone
+        // on a file that's about to disappear, and so another
+        // compactor doesn't pick up the same inputs. If we die
+        // before unsealing (crash, not a caught error), `seal`
+        // itself lets a later compactor take over once the seal
+        // goes stale.
         let compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
+        let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
         for entry in &inputs {
             loop {
                 match tombstones_admin::seal(
@@ -369,10 +378,18 @@ impl Supertable {
                     entry.superfile_id,
                     compaction_id,
                     sealed_at,
+                    stale_seal_timeout,
                 )
                 .await
                 {
-                    Ok(_) => break,
+                    Ok((sidecar, etag)) => {
+                        sealed.push(SealedInput {
+                            superfile_id: entry.superfile_id,
+                            bitmap: sidecar.bitmap,
+                            etag,
+                        });
+                        break;
+                    }
                     Err(TombstonesAdminError::CasLost { .. }) => {
                         // A writer landed a tombstone bit between our
                         // GET and our PUT. Re-read and retry — the
@@ -384,29 +401,38 @@ impl Supertable {
                         superfile_id,
                         existing_compaction_id,
                     }) => {
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::SidecarConflict {
                             superfile_id,
                             existing_compaction_id,
                         });
                     }
                     Err(TombstonesAdminError::WalStore(e)) => {
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Seal(e.to_string()));
                     }
                 }
             }
         }
 
-        let merged_segment = self
-            .merge_superfiles(&inputs)
-            .await
-            .map_err(|e| CompactionError::Build(e.to_string()))?;
+        let merged_segment = match self.merge_superfiles(&inputs).await {
+            Ok(seg) => seg,
+            Err(e) => {
+                unseal_all(&wal_store, sealed).await;
+                return Err(CompactionError::Build(e.to_string()));
+            }
+        };
 
-        let new_entries = vec![merged_segment.entry];
-        let mut pending_storage_writes = vec![
-            merged_segment
-                .bytes_for_storage
-                .ok_or(CompactionError::EmptyMergedSuperfile)?,
-        ];
+        let PreparedSuperfile {
+            entry: merged_entry,
+            bytes_for_store,
+            bytes_for_storage,
+            bytes_for_cache,
+        } = merged_segment;
+        let merged_superfile_id = merged_entry.superfile_id;
+        let new_entries = vec![merged_entry];
+        let mut pending_storage_writes =
+            vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?];
 
         let opts = Arc::clone(&inner.options);
         let max_retries = opts.max_commit_retries.max(1);
@@ -441,20 +467,84 @@ impl Supertable {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    // Warm the merged superfile into the cache, same as a
+                    // normal writer commit does. Without this every query
+                    // against it misses and re-fetches + re-opens from
+                    // storage every single time.
+                    if let Some((uri, bytes)) = bytes_for_store
+                        && let Err(e) = opts.store.insert(uri, bytes)
+                    {
+                        warn!(
+                            superfile_id = %merged_superfile_id,
+                            error = %e,
+                            "compact: failed to warm reader cache for merged superfile"
+                        );
+                    }
+                    // Same warm-up, disk-cache side: mirrors what a normal
+                    // write does when prepopulate_cache_on_commit is on.
+                    // Shares the writer's own insert_warm_or_warn so the
+                    // two paths can't drift out of sync again.
+                    if let Some((uri, bytes)) = bytes_for_cache
+                        && let Some(cache) = opts.disk_cache.as_ref()
+                    {
+                        cache.insert_warm_or_warn(&uri, bytes).await;
+                    }
+                    // Drop the merged-away inputs so the in-memory cache
+                    // doesn't grow forever across repeated compactions.
+                    // The disk cache is already size-bounded (LRU), so its
+                    // stale entries just age out on their own.
+                    for entry in &entries_to_remove {
+                        opts.store.remove(&entry.uri);
+                    }
+                    return Ok(());
+                }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                    self.refresh()
-                        .await
-                        .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                    if let Err(e) = self.refresh().await {
+                        unseal_all(&wal_store, sealed).await;
+                        return Err(CompactionError::Refresh(e.to_string()));
+                    }
                     time::sleep(backoff_delay(attempt)).await;
                 }
-                Err(e) => return Err(CompactionError::Commit(e.to_string())),
+                Err(e) => {
+                    unseal_all(&wal_store, sealed).await;
+                    return Err(CompactionError::Commit(e.to_string()));
+                }
             }
         }
 
+        unseal_all(&wal_store, sealed).await;
         Err(CompactionError::Commit(
             "commit retries exhausted".to_string(),
         ))
+    }
+}
+
+/// One superfile this attempt sealed: enough to unseal it later with
+/// no extra GET (`unseal` uses the etag + bitmap straight from `seal`).
+struct SealedInput {
+    superfile_id: Uuid,
+    bitmap: RoaringBitmap,
+    etag: Etag,
+}
+
+/// Best-effort: clear every seal this attempt placed, in parallel --
+/// each one is an independent sidecar, so there's no ordering or
+/// shared-state reason to do them one at a time.
+async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
+    let results = join_all(sealed.into_iter().map(|s| {
+        let wal_store = wal_store.clone();
+        async move {
+            let result =
+                tombstones_admin::unseal(&wal_store, s.superfile_id, s.bitmap, &s.etag).await;
+            (s.superfile_id, result)
+        }
+    }))
+    .await;
+    for (superfile_id, result) in results {
+        if let Err(e) = result {
+            warn!(superfile_id = %superfile_id, error = %e, "compact: failed to unseal after aborting");
+        }
     }
 }
 
@@ -469,12 +559,16 @@ mod tests {
     use super::*;
     use crate::{
         BoolMode, Supertable,
+        config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         supertable::{
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
     };
+
+    const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -646,12 +740,147 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error on unknown input");
         assert!(
             matches!(err, CompactionError::SuperfileNotFound(id) if id == bogus),
             "{err:?}"
+        );
+    }
+
+    /// If one input is already sealed by a different, still-live
+    /// compaction, we abort -- but must unseal whatever we already
+    /// sealed ourselves this attempt, not leave it stranded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_unseals_its_own_inputs_when_a_later_one_conflicts() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+
+        let entries = st.reader().manifest().superfiles.clone();
+        assert_eq!(entries.len(), 2);
+        let (entry_a, entry_b) = (&entries[0], &entries[1]);
+
+        // entry_b is already held by a different, still-live compaction.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let foreign_cid = Uuid::new_v4();
+        tombstones_admin::seal(
+            &wal_store,
+            entry_b.superfile_id,
+            foreign_cid,
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("seal entry_b as foreign");
+
+        let job = CompactionJob {
+            partition_key: entry_a.partition_key.clone(),
+            inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
+            estimated_output_bytes: 1,
+        };
+        let err = st
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect_err("must conflict on entry_b");
+        assert!(matches!(err, CompactionError::SidecarConflict { .. }));
+
+        // entry_a got sealed by us first, then unsealed on the abort.
+        let (sidecar_a, _) = wal_store
+            .get_tombstones(entry_a.superfile_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(sidecar_a.seal.is_none());
+
+        // entry_b's foreign seal is untouched -- it's not ours to clear.
+        let (sidecar_b, _) = wal_store
+            .get_tombstones(entry_b.superfile_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            sidecar_b.seal.expect("still sealed").compaction_id,
+            foreign_cid
+        );
+    }
+
+    /// A stale seal (left behind by a crashed compactor, no error
+    /// ever caught to clean it up) must not exclude its superfile
+    /// from selection forever. Once it's older than
+    /// `DEFAULT_STALE_SEAL_TIMEOUT`, a fresh `compact_async` call
+    /// must pick it up and actually merge it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_recovers_a_superfile_stuck_under_a_stale_seal() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        let entries = st.reader().manifest().superfiles.clone();
+        let crashed_entry = &entries[0];
+
+        // Simulate a compactor that sealed this file and then died
+        // long enough ago that its seal is now stale.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let old_time = Utc::now()
+            - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
+            - chrono::Duration::seconds(1);
+        tombstones_admin::seal(
+            &wal_store,
+            crashed_entry.superfile_id,
+            Uuid::new_v4(),
+            old_time,
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("simulate a stale seal");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact must succeed and recover the stale seal");
+
+        // The stuck superfile must not still be sitting in the
+        // manifest under its original id -- it has to have actually
+        // been picked up and merged, not just left alone while its
+        // 9 unsealed siblings merged around it.
+        let still_stuck = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .any(|s| s.superfile_id == crashed_entry.superfile_id);
+        assert!(
+            !still_stuck,
+            "the stale-sealed superfile must have been merged, not left behind"
         );
     }
 
@@ -1593,6 +1822,463 @@ mod tests {
                 .map(|b| b.num_rows())
                 .sum();
             assert_eq!(n, 2, "term '{term}' should match exactly 2 docs");
+        }
+    }
+
+    /// The merged superfile from compaction must be warmed into the
+    /// reader cache, and the merged-away inputs must be evicted from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_warms_merged_superfile_and_evicts_merged_away_ones_from_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        // Combined size must clear small_compact_cfg()'s ~10KB floor,
+        // or select() emits no job at all.
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        let old_uris: Vec<_> = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.uri)
+            .collect();
+        assert_eq!(old_uris.len(), 10);
+        // Each commit already warmed the cache on its own.
+        for uri in &old_uris {
+            assert!(
+                st.inner().options.store.reader(uri).is_ok(),
+                "pre-merge superfile {uri:?} should already be warm from its own commit"
+            );
+        }
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let merged_uri = st.reader().manifest().superfiles[0].uri;
+        assert!(
+            st.inner().options.store.reader(&merged_uri).is_ok(),
+            "merged superfile must be warmed into the in-memory cache right after compact"
+        );
+        for uri in &old_uris {
+            assert!(
+                st.inner().options.store.reader(uri).is_err(),
+                "merged-away superfile {uri:?} must be evicted from the in-memory cache"
+            );
+        }
+    }
+
+    /// Same as the in-memory case, but for a disk-cache-attached table:
+    /// the merged superfile should already be resident in the disk
+    /// cache right after compact, with no cold fetch needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_warms_merged_superfile_into_disk_cache() {
+        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("disk-cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create supertable");
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let cold_fetches_after_compact = cache.stats().n_cold_fetches;
+
+        // A query against the merged file must not trigger a cold
+        // fetch -- it should already be resident from compaction's
+        // own warm-up.
+        let n: usize = st
+            .token_match("title", "alpha", BoolMode::And, None)
+            .expect("token_match")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n, 2);
+        assert_eq!(
+            cache.stats().n_cold_fetches,
+            cold_fetches_after_compact,
+            "querying the merged superfile should not cold-fetch -- it \
+             should already be warm in the disk cache from compaction"
+        );
+    }
+
+    /// Vocabulary for realistic term-frequency spread (no `rand` dep).
+    const LATENCY_BENCH_WORDS: &[&str] = &[
+        "system",
+        "storage",
+        "query",
+        "index",
+        "engine",
+        "object",
+        "table",
+        "column",
+        "vector",
+        "search",
+        "cluster",
+        "replica",
+        "cache",
+        "buffer",
+        "stream",
+        "batch",
+        "record",
+        "field",
+        "schema",
+        "partition",
+    ];
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Builds one superfile's worth of rows. `shard_tag` is this
+    /// superfile's unique narrow term; `broad_term` shows up in 1/3
+    /// rows.
+    fn latency_bench_shard_batch(
+        shard_tag: &str,
+        broad_term: &str,
+        row_offset: usize,
+        n_rows: usize,
+    ) -> arrow_array::RecordBatch {
+        let titles: Vec<String> = (0..n_rows)
+            .map(|local_i| {
+                let i = row_offset + local_i;
+                // Cheap multiplicative hash, spreads word choice without a rand dep.
+                let words: Vec<&str> = (0..5)
+                    .map(|k| {
+                        let h = (i as u64)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(k as u64 * 40_503);
+                        LATENCY_BENCH_WORDS[(h % LATENCY_BENCH_WORDS.len() as u64) as usize]
+                    })
+                    .collect();
+                let common = if i.is_multiple_of(3) {
+                    format!(" {broad_term}")
+                } else {
+                    String::new()
+                };
+                format!("{shard_tag}{common} {} row{i}", words.join(" "))
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        build_title_batch(&refs)
+    }
+
+    fn latency_bench_warm_median(
+        st: &Supertable,
+        query: &str,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> u128 {
+        for _ in 0..warmup_iters {
+            st.bm25_search("title", query, 10, BoolMode::Or, None)
+                .expect("bm25_search warmup");
+        }
+        let mut samples = Vec::with_capacity(measured_iters);
+        for _ in 0..measured_iters {
+            let start = Instant::now();
+            st.bm25_search("title", query, 10, BoolMode::Or, None)
+                .expect("bm25_search measured");
+            samples.push(start.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// Exact match count (unlike `bm25_search`'s top-k), so it catches
+    /// old pre-compact files leaking back into results.
+    fn latency_bench_count_hits(st: &Supertable, query: &str) -> u64 {
+        st.count("title", query, BoolMode::Or).expect("count")
+    }
+
+    /// Warm `bm25_search` latency after merging many small superfiles
+    /// into one, on a real local-filesystem corpus (no cloud needed).
+    /// Scale via env vars: `INFINO_COMPACT_BENCH_TOTAL_MB` (default 500),
+    /// `INFINO_COMPACT_BENCH_N_SUPERFILES` (default 40),
+    /// `INFINO_COMPACT_BENCH_TARGET_MB` (default = total).
+    #[ignore = "perf diagnostic for issue #372/#378; run with --ignored --nocapture"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_latency_at_scale() {
+        const APPROX_BYTES_PER_DOC: u64 = 90;
+        const BROAD_TERM: &str = "broadterm";
+        const WARMUP_ITERS: usize = 20;
+        const MEASURED_ITERS: usize = 50;
+
+        let total_mb = env_usize("INFINO_COMPACT_BENCH_TOTAL_MB", 500);
+        let n_superfiles = env_usize("INFINO_COMPACT_BENCH_N_SUPERFILES", 40);
+        let compact_target_mb = env_usize("INFINO_COMPACT_BENCH_TARGET_MB", total_mb.max(1)) as u64;
+
+        let total_docs = (total_mb as u64 * 1_000_000) / APPROX_BYTES_PER_DOC;
+        let docs_per_superfile = (total_docs as usize / n_superfiles).max(1);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        let narrow_term = format!("shard{}", n_superfiles / 2);
+
+        for i in 0..n_superfiles {
+            let shard_tag = format!("shard{i}");
+            let mut w = st.writer().expect("writer");
+            w.append(&latency_bench_shard_batch(
+                &shard_tag,
+                BROAD_TERM,
+                i * docs_per_superfile,
+                docs_per_superfile,
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let n_before = st.reader().n_superfiles();
+        let docs_before = st.reader().n_docs_total();
+        let narrow_hits_before = latency_bench_count_hits(&st, &narrow_term);
+        let broad_hits_before = latency_bench_count_hits(&st, BROAD_TERM);
+        let narrow_before =
+            latency_bench_warm_median(&st, &narrow_term, WARMUP_ITERS, MEASURED_ITERS);
+        let broad_before = latency_bench_warm_median(&st, BROAD_TERM, WARMUP_ITERS, MEASURED_ITERS);
+
+        st.compact_async(&CompactionSettings {
+            target_superfile_size_mb: compact_target_mb,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        })
+        .await
+        .expect("compact");
+
+        let n_after = st.reader().n_superfiles();
+        assert!(n_after < n_before, "compact should reduce superfile count");
+
+        // No old-file double-counting: doc/hit counts must be identical.
+        assert_eq!(st.reader().n_docs_total(), docs_before);
+        assert_eq!(
+            latency_bench_count_hits(&st, &narrow_term),
+            narrow_hits_before
+        );
+        assert_eq!(latency_bench_count_hits(&st, BROAD_TERM), broad_hits_before);
+
+        let narrow_after =
+            latency_bench_warm_median(&st, &narrow_term, WARMUP_ITERS, MEASURED_ITERS);
+        let broad_after = latency_bench_warm_median(&st, BROAD_TERM, WARMUP_ITERS, MEASURED_ITERS);
+
+        eprintln!(
+            "superfiles: {n_before} -> {n_after}, narrow: {narrow_before}us -> {narrow_after}us, \
+             broad: {broad_before}us -> {broad_after}us"
+        );
+
+        // Narrow only ever touches one relevant superfile (bloom-skips
+        // the rest either way), so it must stay flat regardless of
+        // merge count.
+        assert!(
+            narrow_after <= narrow_before * 2,
+            "narrow query regressed: {narrow_before}us -> {narrow_after}us"
+        );
+
+        mem::forget(dir);
+    }
+
+    /// compact() drops the manifest's superfile count right away, but
+    /// the merged-away files stay on disk until a gc() sweep past the
+    /// safety gap deletes them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_reduces_manifest_count_but_gc_safety_gap_leaves_old_files_on_disk() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+
+        for titles in [
+            ["alpha first", "alpha second"],
+            ["bravo first", "bravo second"],
+            ["charlie first", "charlie second"],
+            ["delta first", "delta second"],
+            ["echo first", "echo second"],
+            ["foxtrot first", "foxtrot second"],
+            ["golf first", "golf second"],
+            ["hotel first", "hotel second"],
+            ["india first", "india second"],
+            ["juliet first", "juliet second"],
+        ] {
+            commit_titles(&st, &titles);
+        }
+
+        let before_n_superfiles = st.reader().n_superfiles();
+        let before_data_objects = storage
+            .list_with_prefix_metadata("data")
+            .await
+            .expect("list data/ before compact")
+            .len();
+        assert_eq!(before_data_objects, before_n_superfiles);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let after_n_superfiles = st.reader().n_superfiles();
+        assert!(
+            after_n_superfiles < before_n_superfiles,
+            "manifest superfile count must drop right after compact"
+        );
+
+        // Old inputs are orphaned, not deleted, until gc() runs.
+        let after_data_objects = storage
+            .list_with_prefix_metadata("data")
+            .await
+            .expect("list data/ after compact")
+            .len();
+        assert_eq!(after_data_objects, before_data_objects + 1);
+
+        // Default 1-day safety gap: everything here is brand new, so
+        // gc() deletes nothing yet.
+        let default_gap_report = st
+            .gc(crate::config::DEFAULT_GC_SAFETY_GAP)
+            .expect("gc with default safety gap");
+        assert_eq!(default_gap_report.objects_deleted, 0);
+        let after_default_gc_objects = storage
+            .list_with_prefix_metadata("data")
+            .await
+            .expect("list data/ after default-gap gc")
+            .len();
+        assert_eq!(after_default_gc_objects, before_data_objects + 1);
+
+        // A shrunk safety gap reclaims the orphaned inputs, and disk
+        // count catches up with the manifest.
+        let zero_gap_report = st
+            .gc(std::time::Duration::ZERO)
+            .expect("gc with zero safety gap");
+        assert!(
+            zero_gap_report.objects_deleted > 0,
+            "a gc() past the safety gap must reclaim the orphaned pre-merge inputs"
+        );
+        let after_zero_gap_objects = storage
+            .list_with_prefix_metadata("data")
+            .await
+            .expect("list data/ after zero-gap gc")
+            .len();
+        assert_eq!(after_zero_gap_objects, after_n_superfiles);
+
+        mem::forget(dir);
+    }
+
+    /// A superfile sealed by an abandoned compaction attempt (a merge
+    /// that started but never finished) is never unsealed, so
+    /// `pack_partition`'s `!sealed_by_other` filter excludes it from
+    /// every future compaction pass, forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superfiles_sealed_by_an_abandoned_compaction_are_stranded_forever() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+
+        let stranded_ids: Vec<Uuid> = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.superfile_id)
+            .collect();
+        assert_eq!(stranded_ids.len(), 2);
+
+        // Simulate a compaction that sealed its inputs then died
+        // before committing the merge.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let abandoned_compaction_id = Uuid::new_v4();
+        let sealed_at = Utc::now();
+        for id in &stranded_ids {
+            tombstones_admin::seal(
+                &wal_store,
+                *id,
+                abandoned_compaction_id,
+                sealed_at,
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("seal");
+        }
+
+        // New data arrives and a generous compaction config runs.
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 1024,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        };
+        st.compact_async(&cfg)
+            .await
+            .expect("compact must not error");
+
+        // The two stranded superfiles are still sitting untouched —
+        // they can never be merged, so they leak permanently.
+        let remaining_ids: HashSet<Uuid> = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.superfile_id)
+            .collect();
+        for id in &stranded_ids {
+            assert!(remaining_ids.contains(id));
         }
     }
 

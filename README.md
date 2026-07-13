@@ -146,8 +146,8 @@ const billing  = db.querySql("SELECT body FROM docs WHERE source = 'help-center'
 ```rust
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use infino::arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use infino::arrow_schema::{DataType, Field, Schema};
 use infino::{connect, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions};
 
 // Tiny stand-in for your embedding model so this runs as-is — a 16-dim
@@ -327,7 +327,7 @@ on-disk bytes:
   pruning, and reader/writer concurrency.
 
 For concepts, quickstart, guides, and examples (Python, Node.js, and Rust), see
-the full documentation at **[docs.infino.ai](https://docs.infino.ai)**.
+the full documentation at **[infino.ai/docs](https://infino.ai/docs)**.
 
 ## SQL joins across tables
 
@@ -342,8 +342,8 @@ base, fuse the two rankings (reciprocal-rank fusion), and join provenance
 ```rust
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use infino::arrow_array::{FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch};
+use infino::arrow_schema::{DataType, Field, Schema};
 use infino::{connect, IndexSpec, Metric};
 
 // Tiny stand-in for your embedding model so this runs as-is; real

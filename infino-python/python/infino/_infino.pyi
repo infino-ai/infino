@@ -38,6 +38,7 @@ class Connection:
 class IndexSpec:
     def __init__(self) -> None: ...
     def fts(self, column: str) -> IndexSpec: ...
+    # `dim` must be in [16, 4096]; out-of-range raises at `create_table`.
     def vector(self, column: str, dim: int, n_cent: int, metric: Metric) -> IndexSpec: ...
 
 class Table:
@@ -126,4 +127,5 @@ class OptimizeOptions:
         max_memory_mb: int | None = ...,
         min_fill_percent: int | None = ...,
         target_superfile_size_mb: int | None = ...,
+        stale_seal_timeout_ms: int | None = ...,
     ) -> None: ...

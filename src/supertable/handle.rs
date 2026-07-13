@@ -40,11 +40,11 @@ use crate::{
     storage::StorageError,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
-        manifest::commit::read_pointer,
+        manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
-        tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
+        tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
         utils::idgen::IdGenerator,
         wal::{
             WalStore, gc,
@@ -138,6 +138,14 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<Instant>>,
+    /// Etag of the manifest pointer from this handle's last storage
+    /// probe. Powers the conditional (`If-None-Match`) freshness
+    /// probe in [`Supertable::refresh`]: an unchanged pointer answers
+    /// as a bodyless 304 instead of a full read. `None` until the
+    /// first probe, and stale right after this process's own commits
+    /// (which rewrite the pointer without capturing its new etag) —
+    /// the next probe then takes the full-read path and re-seeds it.
+    pub(super) last_pointer_etag: Mutex<Option<String>>,
 }
 
 impl SupertableInner {
@@ -146,6 +154,23 @@ impl SupertableInner {
     /// [`shared_query_runtime`].
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         shared_io_runtime()
+    }
+
+    /// Push the current manifest's tombstone-seq view into the
+    /// sidecar cache. Called wherever a newer manifest is swapped
+    /// into `self.manifest` (refresh, commit, mutation stamp) so the
+    /// cache's freshness authority tracks the snapshot readers pin.
+    /// No-op when the cache's view is already at (or past) the
+    /// current manifest — the common every-query case, kept clone-free.
+    pub(crate) fn reconcile_tombstone_seqs(&self) {
+        let Some(cache) = self.tombstone_cache.as_ref() else {
+            return;
+        };
+        let manifest = self.manifest.load();
+        if manifest.manifest_id <= cache.view_manifest_id() {
+            return;
+        }
+        cache.reconcile(tombstone_seq_view(&manifest));
     }
 }
 
@@ -242,7 +267,7 @@ impl Supertable {
         } else {
             Arc::new(ManifestSnapshot::empty(options.clone()))
         };
-        let tombstone_cache = build_tombstone_cache(&options);
+        let tombstone_cache = build_tombstone_cache(&options, &initial);
         let id_generator = IdGenerator::new();
         let handle_id = SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
@@ -255,6 +280,7 @@ impl Supertable {
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
+            last_pointer_etag: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
@@ -334,7 +360,7 @@ impl Supertable {
         let options_arc = Arc::new(options);
 
         let manifest = ManifestSnapshot::load(None, storage, Some(options_arc.clone())).await?;
-        let tombstone_cache = build_tombstone_cache(&options_arc);
+        let tombstone_cache = build_tombstone_cache(&options_arc, &manifest);
         // Fresh generator per open. The 64-bit ms timestamp
         // prefix advances naturally across process restarts, so
         // re-opened supertables never re-mint values that already
@@ -353,6 +379,7 @@ impl Supertable {
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
+            last_pointer_etag: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         debug!(
@@ -410,14 +437,48 @@ impl Supertable {
             })?
             .clone();
 
+        // Conditional pointer probe: with the last-seen etag in hand,
+        // an unchanged pointer answers as a bodyless 304 — the
+        // steady-state cost of the consistency check is one
+        // roundtrip, no transfer, no parse.
+        let prev_etag = self
+            .inner
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned")
+            .clone();
+        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref())
+            .await
+            .map_err(OpenError::ManifestLoadError)?;
+        let (pointer, meta) = match probe {
+            PointerProbe::Absent | PointerProbe::NotModified => return Ok(false),
+            PointerProbe::Read(pointer, meta) => (pointer, meta),
+        };
+        *self
+            .inner
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+
         let current = self.inner.manifest.load_full();
-        let manifest = match ManifestSnapshot::load(Some(current), storage, None).await {
+        let manifest = match ManifestSnapshot::load_with_pointer(
+            Some(current),
+            storage,
+            None,
+            pointer,
+        )
+        .await
+        {
             Ok(manifest) => manifest,
-            Err(ManifestLoadError::PointerNotFound) => return Ok(false),
+            // Pointer changed but our in-memory state already
+            // covers it (e.g. this process's own commit rewrote
+            // the pointer) — nothing newer to load, and the etag
+            // captured above makes the next probe a 304.
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
             Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };
         self.inner.manifest.store(manifest);
+        self.inner.reconcile_tombstone_seqs();
         debug!(
             manifest_id = self.inner.manifest.load().manifest_id,
             "refreshed manifest"
@@ -513,7 +574,7 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
@@ -764,11 +825,30 @@ fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
 /// Build the tombstone-sidecar cache when storage is attached.
 /// Returns `None` for in-memory-only supertables — no sidecars
 /// can exist there, so the query paths skip the filter hook
-/// entirely.
-fn build_tombstone_cache(options: &Arc<SupertableOptions>) -> Option<Arc<SidecarCache>> {
+/// entirely. The cache is born with the seq view of `manifest`
+/// (the snapshot the handle opens with), so it is authoritative
+/// from the first query.
+fn build_tombstone_cache(
+    options: &Arc<SupertableOptions>,
+    manifest: &ManifestSnapshot,
+) -> Option<Arc<SidecarCache>> {
     let storage = options.storage.as_ref()?.clone();
     let wal_store = WalStore::new(storage);
-    Some(Arc::new(SidecarCache::new(wal_store, DEFAULT_REFRESH_TTL)))
+    Some(Arc::new(SidecarCache::new(
+        wal_store,
+        DEFAULT_SEAL_TTL,
+        tombstone_seq_view(manifest),
+    )))
+}
+
+/// The tombstone-seq view of `manifest`, in the shape the sidecar
+/// cache validates against. An in-process-only manifest (no
+/// persisted list) has no sidecars, so its view is empty.
+fn tombstone_seq_view(manifest: &ManifestSnapshot) -> Arc<TombstoneSeqView> {
+    Arc::new(TombstoneSeqView {
+        manifest_id: manifest.manifest_id,
+        seqs: manifest.get_tombstone_seqs().cloned().unwrap_or_default(),
+    })
 }
 
 impl fmt::Debug for Supertable {

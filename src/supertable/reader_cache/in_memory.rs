@@ -131,6 +131,13 @@ impl SuperfileReaderCache for InMemoryReaderCache {
             .map(|e| e.bytes.len())
             .sum()
     }
+
+    fn remove(&self, uri: &SuperfileUri) {
+        self.inner
+            .write()
+            .expect("InMemoryReaderCache rwlock poisoned")
+            .remove(uri);
+    }
 }
 
 #[cfg(test)]

@@ -427,6 +427,29 @@ mod tests {
         assert_eq!(storage.call_count(), 0);
     }
 
+    /// `StorageRangeSource` holds no local buffer, so it can never satisfy a
+    /// range synchronously: `try_get_range_sync` is always `None` and every
+    /// read falls to the async `range` GET. Callers treat a `None` here as "not
+    /// resident, must fetch"; the connection memory budget keys off exactly
+    /// that, so a future sync cache that returned `Some` would read as resident
+    /// and silently escape the cold-fetch gate. This pins the invariant.
+    #[tokio::test]
+    async fn try_get_range_sync_is_never_resident() {
+        let blob = Bytes::from(vec![7u8; 256]);
+        let storage = Arc::new(ChunkedStorage::new(blob.clone(), 256, blob.len()));
+        let src = StorageRangeSource::with_known_size(
+            Arc::clone(&storage) as Arc<dyn StorageProvider>,
+            "seg.sf.parquet",
+            blob.len() as u64,
+        );
+
+        // `None` even for in-bounds ranges (nothing is buffered locally), and
+        // the check answers from memory without a storage call.
+        assert!(src.try_get_range_sync(0, 64).is_none());
+        assert!(src.try_get_range_sync(200, 56).is_none());
+        assert_eq!(storage.call_count(), 0);
+    }
+
     /// `new` issues one HEAD up-front and caches the discovered size,
     /// so `size()` is non-zero before any `range`/`tail` I/O.
     #[tokio::test]
