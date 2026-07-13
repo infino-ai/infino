@@ -12,8 +12,13 @@
 // fused in the engine). Build the addon first, then:
 //
 //   npm install
-//   node index.mjs          # downloads a catalog sample + model, serves on :3000
-//   SMOKE=1 node index.mjs  # start, self-check, exit (the CI end-to-end gate)
+//   node index.mjs          # downloads a live catalog sample + model, serves on :3000
+//   SMOKE=1 node index.mjs  # self-check against a bundled catalog, then exit (the CI gate)
+//
+// Interactive runs pull a live catalog from the HuggingFace Hub and fall back to a
+// small bundled sample if the Hub is unreachable; the SMOKE gate always indexes the
+// bundled sample so it stays deterministic and never depends on a third-party
+// service being up.
 //
 // (TypeScript usage is identical — same imports, fully typed.)
 
@@ -22,6 +27,7 @@ import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { connect, IndexSpec } from "infino";
 import { pipeline } from "@huggingface/transformers";
+import { SAMPLE_CATALOG } from "./sample-catalog.mjs";
 
 // --- a tiny local embedder: no API key, downloads once then cached -----------
 const DIM = 384;
@@ -86,6 +92,12 @@ async function loadCatalog(n) {
   return out;
 }
 
+// The offline catalog: shipped with the example so a run never hard-depends on
+// the Hub being reachable (see sample-catalog.mjs).
+function loadBundledSample(n) {
+  return SAMPLE_CATALOG.slice(0, n);
+}
+
 // --- index the catalog once at startup: one table, FTS + vector --------------
 const DIR = "./catalog-store";
 rmSync(DIR, { recursive: true, force: true });
@@ -96,8 +108,22 @@ const catalog = db.createTable(
   new IndexSpec().fts("text").vector("vector", DIM, 1, "cosine"),
 );
 
-process.stderr.write(`loading ${CATALOG_N} products from ${DATASET} …\n`);
-const products = await loadCatalog(CATALOG_N);
+// Interactive runs index a live sample from the Hub, falling back to the bundled
+// catalog if it's unreachable. The SMOKE self-check always indexes the bundled
+// catalog so the end-to-end gate is deterministic and independent of Hub uptime.
+let products;
+if (process.env.SMOKE) {
+  products = loadBundledSample(CATALOG_N);
+  process.stderr.write(`indexing ${products.length} bundled products (SMOKE self-check)\n`);
+} else {
+  process.stderr.write(`loading ${CATALOG_N} products from ${DATASET} …\n`);
+  try {
+    products = await loadCatalog(CATALOG_N);
+  } catch (e) {
+    products = loadBundledSample(CATALOG_N);
+    process.stderr.write(`${e.message}; falling back to ${products.length} bundled products\n`);
+  }
+}
 const rows = [];
 let i = 0;
 for (const p of products) rows.push({ id: `p${i++}`, title: p.title, text: p.text, category: p.category, price: p.price, rating: p.rating, vector: await embed(p.text) });
