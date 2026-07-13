@@ -81,6 +81,9 @@ export interface OptimizeOptions {
   minFillPercent?: number;
   /** Target merged-superfile size, in MB. */
   targetSuperfileSizeMb?: number;
+  /** How old a sealed tombstone sidecar has to be, in milliseconds,
+   * before compaction treats its owner as dead and takes over. */
+  staleSealTimeoutMs?: number;
 }
 
 export interface Bm25SearchOptions {
