@@ -98,6 +98,7 @@ impl ConnectOptions {
 
     /// Choose how cold misses are serviced (see [`ColdFetchMode`]). Only
     /// meaningful with [`with_cache_dir`](Self::with_cache_dir).
+    /// `RangeOnly` is the cacheless path and is rejected if a `cache_dir` is set.
     pub fn with_cold_fetch_mode(mut self, mode: ColdFetchMode) -> Self {
         self.cold_fetch_mode = mode;
         self
