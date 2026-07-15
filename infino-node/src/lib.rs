@@ -484,6 +484,8 @@ impl Table {
     /// IPC `Buffer` (read with `tableFromIPC`). `mode` is `"or"` (default)
     /// or `"and"`. `projection` selects the returned columns — pass
     /// `["_id", "score"]` for just id + score, or omit for full rows.
+    /// `score` is a similarity (higher is better) — opposite direction
+    /// from `vectorSearch`'s distance. Fuse with `hybridSearch`.
     #[napi]
     pub fn bm25_search(
         &self,
@@ -508,7 +510,9 @@ impl Table {
     /// (crosses by reference — no copy). Returns matching rows as an Arrow
     /// IPC `Buffer` (read with `tableFromIPC`). `projection` selects the
     /// returned columns (`["_id", "score"]` for just id + score, or omit
-    /// for full rows).
+    /// for full rows). `score` is a distance (`0.0` = perfect match) —
+    /// opposite direction from `bm25Search`'s similarity. Fuse with
+    /// `hybridSearch`.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn vector_search(

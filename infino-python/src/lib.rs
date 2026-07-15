@@ -414,10 +414,13 @@ impl Table {
 
     /// BM25 search over one FTS column. Returns a pyarrow `Table`.
     /// `projection` names the output columns (`_id`, any scalar column,
-    /// or the trailing `score` — higher is better); omitting it returns
-    /// the engine-native `_id` + `score` pair with no scalar decode.
-    /// Materializing row data is an explicit opt-in by naming columns.
-    /// `mode` is `"or"` (default) or `"and"`.
+    /// or the trailing `score` — a similarity, higher is better);
+    /// omitting it returns the engine-native `_id` + `score` pair with
+    /// no scalar decode. Materializing row data is an explicit opt-in by
+    /// naming columns. `mode` is `"or"` (default) or `"and"`.
+    ///
+    /// `score` is a similarity (higher is better) — opposite direction
+    /// from `vector_search`'s distance. Fuse with `hybrid_search`.
     #[pyo3(signature = (column, query, k, mode=None, projection=None))]
     fn bm25_search<'py>(
         &self,
@@ -441,10 +444,15 @@ impl Table {
 
     /// Vector kNN over one vector column. `query` is a `list[float]`.
     /// Returns a pyarrow `Table`. `projection` names the output columns
-    /// (`_id`, any scalar column, or the trailing `score` — distance,
-    /// smaller is nearer); omitting it returns the engine-native
-    /// `_id` + `score` pair with no scalar decode. Materializing row
-    /// data is an explicit opt-in by naming columns.
+    /// (`_id`, any scalar column, or the trailing `score` — a distance,
+    /// `0.0` is a perfect match and larger is farther); omitting it
+    /// returns the engine-native `_id` + `score` pair with no scalar
+    /// decode. Materializing row data is an explicit opt-in by naming
+    /// columns.
+    ///
+    /// `score` is a distance (`0.0` = perfect match) — opposite
+    /// direction from `bm25_search`'s similarity. Fuse with
+    /// `hybrid_search`.
     ///
     /// Pass `filter_column` and `filter_query` together to restrict the
     /// search to rows whose (FTS-indexed) `filter_column` matches the

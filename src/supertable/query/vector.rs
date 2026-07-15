@@ -763,6 +763,10 @@ impl Supertable {
     /// returning Arrow rows nearest-first (distance score, smaller is
     /// nearer).
     ///
+    /// `score` is a distance (`0.0` = perfect match) — the opposite
+    /// direction from [`Supertable::bm25_search`]'s similarity. Fuse the
+    /// two with [`Supertable::hybrid_search`], not by raw score.
+    ///
     /// Pins a fresh reader (applying the read-consistency policy), runs
     /// the IVF fan-out, and resolves the top-`k` nearest hits to Arrow
     /// rows.

@@ -316,7 +316,9 @@ export class Table {
     this.inner.append(dataToIpc(data, () => this.schema()));
   }
 
-  /** Ranked BM25 search; rows as records (or an Arrow `Table`). */
+  /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
+   * similarity (higher is better) — opposite direction from `vectorSearch`'s
+   * distance. Fuse with `hybridSearch`. */
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
@@ -324,7 +326,9 @@ export class Table {
     return decode(buf, opts.arrow);
   }
 
-  /** Vector kNN; rows as records (or an Arrow `Table`). */
+  /** Vector kNN; rows as records (or an Arrow `Table`). `score` is a distance
+   * (`0.0` = perfect match) — opposite direction from `bm25Search`'s
+   * similarity. Fuse with `hybridSearch`. */
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions & { arrow: true }): arrow.Table;
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts?: VectorSearchOptions): RowRecord[];
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {

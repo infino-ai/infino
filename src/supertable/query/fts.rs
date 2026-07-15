@@ -960,6 +960,10 @@ impl Supertable {
     /// Single-column BM25 search over the current snapshot, returning
     /// Arrow rows best-score-first (BM25 relevance, higher is better).
     ///
+    /// `score` is a similarity (higher is better) — the opposite
+    /// direction from [`Supertable::vector_search`]'s distance. Fuse the
+    /// two with [`Supertable::hybrid_search`], not by raw score.
+    ///
     /// Pins a fresh reader (applying the read-consistency policy), runs
     /// the BM25 fan-out, and resolves the top-`k` hits to Arrow rows.
     ///
