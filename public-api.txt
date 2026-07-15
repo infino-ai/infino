@@ -117,6 +117,7 @@ pub infino::OptimizeError::SidecarConflict
 pub infino::OptimizeError::SidecarConflict::existing_compaction_id: uuid::Uuid
 pub infino::OptimizeError::SidecarConflict::superfile_id: uuid::Uuid
 pub infino::OptimizeError::SuperfileNotFound(uuid::Uuid)
+pub infino::OptimizeError::WalGc(infino::supertable::wal::gc::GcError)
 impl core::convert::From<infino::GcError> for infino::OptimizeError
 pub fn infino::OptimizeError::from(infino::GcError) -> Self
 impl core::error::Error for infino::OptimizeError

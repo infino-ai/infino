@@ -327,6 +327,9 @@ pub enum OptimizeError {
     /// The post-compaction garbage-collection step failed.
     #[error("gc failed during optimize: {0}")]
     Gc(#[from] GcError),
+    /// The post-compaction WAL sweep failed.
+    #[error("wal sweep failed during optimize: {0}")]
+    WalGc(#[from] crate::supertable::wal::gc::GcError),
 }
 
 impl From<CompactionError> for OptimizeError {

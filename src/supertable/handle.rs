@@ -689,16 +689,12 @@ impl Supertable {
         bridge_on_runtime(drive, &self.inner.query_runtime())
     }
 
-    /// Operator hatch: run one GC sweep over this supertable's
-    /// `wal/mutations/` prefix. Reaps `Complete` WALs older
-    /// than the wal-grace window + orphan `.arrow` sidecars
-    /// older than the sidecar-grace window. Tests that need custom
-    /// grace windows call `crate::supertable::wal::gc::run_sweep`
-    /// directly.
-    /// Not public API: WAL/sidecar GC is engine-driven — it runs
-    /// automatically on [`Supertable::open`] and (production) on a
-    /// background cadence. This manual hook is a crate internal used
-    /// only by in-crate unit tests.
+    /// Run one GC sweep over this supertable's `wal/mutations/` prefix.
+    /// Reaps `Complete` WALs older than the wal-grace window + orphan
+    /// `.arrow` sidecars older than the sidecar-grace window. Runs at
+    /// `Supertable::open`/`create` and again on every `optimize()` call.
+    /// Not public API: exposed only as a manual hook for in-crate tests
+    /// that need custom grace windows via `wal::gc::run_sweep` directly.
     pub(crate) async fn run_gc_sweep_once(&self) -> Result<gc::GcReport, gc::GcError> {
         gc::run_sweep(
             self,
@@ -707,6 +703,13 @@ impl Supertable {
             gc::DEFAULT_SIDECAR_GRACE,
         )
         .await
+    }
+
+    /// Sync-bridged version of [`run_gc_sweep_once`], for callers (like
+    /// [`Supertable::optimize`]) that aren't already inside an async
+    /// context.
+    pub(crate) fn run_gc_sweep_once_blocking(&self) -> Result<gc::GcReport, gc::GcError> {
+        bridge_on_runtime(self.run_gc_sweep_once(), &self.inner.query_runtime())
     }
 
     /// Observability snapshot of the supertable's load.

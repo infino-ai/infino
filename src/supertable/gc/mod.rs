@@ -15,6 +15,7 @@ use crate::{
         ManifestSnapshot,
         error::GcError,
         manifest::commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
+        wal::persistence::{SUPERFILES_DIR, WalStore},
     },
 };
 
@@ -43,6 +44,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> HashSet<String> {
     }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
+        live.insert(WalStore::tombstones_path(sf.superfile_id));
     }
     live
 }
@@ -67,7 +69,7 @@ impl Supertable {
 
         let mut report = GcReport::default();
 
-        for prefix in [MANIFEST_DIR, MANIFEST_PARTS_DIR, "data"] {
+        for prefix in [MANIFEST_DIR, MANIFEST_PARTS_DIR, "data", SUPERFILES_DIR] {
             let entries = storage.list_with_prefix_metadata(prefix).await?;
             for (key, meta) in entries {
                 if live.contains(&key) {

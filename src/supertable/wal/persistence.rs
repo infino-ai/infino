@@ -142,7 +142,7 @@ const STATE_EXT: &str = "json";
 const ARROW_EXT: &str = "arrow";
 
 /// Storage prefix for per-superfile tombstone sidecars.
-const SUPERFILES_DIR: &str = "superfiles";
+pub(crate) const SUPERFILES_DIR: &str = "superfiles";
 
 /// File extension for tombstone sidecars.
 const TOMBSTONES_EXT: &str = "tombstones";
@@ -175,7 +175,7 @@ impl WalStore {
         format!("{WAL_DIR}/{}.{ARROW_EXT}", wal_id.to_hex())
     }
 
-    fn tombstones_path(superfile_id: uuid::Uuid) -> String {
+    pub(crate) fn tombstones_path(superfile_id: uuid::Uuid) -> String {
         // UUID's default `Display` is the hyphenated 36-char hex
         // string we use everywhere else in the codebase for
         // superfile identifiers.
