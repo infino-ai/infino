@@ -485,6 +485,10 @@ const TERM_BETA_PERIOD: u64 = 4;
 const TERM_GAMMA_PERIOD: u64 = 5;
 const TERM_DELTA_PERIOD: u64 = 7;
 const TERM_EPSILON_PERIOD: u64 = 20;
+/// Planting period for equal-frequency terms in the multi-block OR oracle.
+const UNIFORM_OR_TERM_PERIOD: u64 = 2;
+/// Number of document-length variants in the multi-block OR oracle.
+const OR_DOC_LENGTH_VARIANTS: u64 = 5;
 /// Filler-token bucket count (`no00`..`no49`) for doc-length variation.
 const FILLER_TERM_MODULUS: u64 = 50;
 /// AND top-k retrieving the full large intersection.
@@ -541,6 +545,55 @@ pub fn build_multi_block_corpus() -> Vec<(u64, String)> {
 pub fn build_multi_block_reader(owned: &[(u64, String)]) -> SuperfileReader {
     let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
     build_infino_superfile(&refs)
+}
+
+#[tokio::test]
+async fn oracle_or_multi_block_scores_match_brute_force() {
+    // Equal posting lists give these terms identical upper bounds, so
+    // the public OR dispatcher selects windowed union by construction.
+    // The lists span several blocks with full SIMD batches and a scalar
+    // final-block tail; extra filler varies document-length norms.
+    let mut corp_owned = Vec::with_capacity(MULTI_BLOCK_N_DOCS as usize);
+    for doc in 0..MULTI_BLOCK_N_DOCS {
+        let mut text = if doc.is_multiple_of(UNIFORM_OR_TERM_PERIOD) {
+            String::from("alpha beta gamma delta")
+        } else {
+            String::from("filler")
+        };
+        for _ in 0..doc % OR_DOC_LENGTH_VARIANTS {
+            text.push_str(" filler");
+        }
+        corp_owned.push((doc, text));
+    }
+    let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let reader = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    let query = "alpha beta gamma delta";
+
+    let mut infino_hits = reader
+        .bm25_hits_async("title", query, MULTI_BLOCK_N_DOCS as usize, BoolMode::Or)
+        .await
+        .expect("OR search");
+    let mut oracle_hits = oracle.top_k(query, MULTI_BLOCK_N_DOCS as usize, tok.as_ref());
+    infino_hits.sort_unstable_by_key(|(doc, _)| *doc);
+    oracle_hits.sort_unstable_by_key(|(doc, _)| *doc);
+
+    assert_eq!(
+        infino_hits.len(),
+        oracle_hits.len(),
+        "OR hit counts disagree"
+    );
+    for ((infino_doc, infino_score), (oracle_doc, oracle_score)) in
+        infino_hits.iter().zip(&oracle_hits)
+    {
+        assert_eq!(*infino_doc as u64, *oracle_doc, "OR doc-id mismatch");
+        let delta = (infino_score - oracle_score).abs();
+        assert!(
+            delta < BM25_SCORE_ABS_TOLERANCE,
+            "score divergence on doc {infino_doc}: infino={infino_score} oracle={oracle_score} delta={delta}"
+        );
+    }
 }
 
 /// Compute the expected AND intersection for the multi-block corpus

@@ -2383,6 +2383,39 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
+                    let pos = c.pos;
+                    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
+                        let doc_ids = [
+                            c.block_doc_ids[pos],
+                            c.block_doc_ids[pos + 1],
+                            c.block_doc_ids[pos + 2],
+                            c.block_doc_ids[pos + 3],
+                        ];
+                        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let contributions = bm25::score_one_term_x4(
+                                c.idf_x_k1p1,
+                                [
+                                    c.block_tfs[pos],
+                                    c.block_tfs[pos + 1],
+                                    c.block_tfs[pos + 2],
+                                    c.block_tfs[pos + 3],
+                                ],
+                                [
+                                    dl_norm_k1[doc_ids[0] as usize],
+                                    dl_norm_k1[doc_ids[1] as usize],
+                                    dl_norm_k1[doc_ids[2] as usize],
+                                    dl_norm_k1[doc_ids[3] as usize],
+                                ],
+                            );
+                            for lane in 0..bm25::SCORE_SIMD_LANES {
+                                let local = (doc_ids[lane] - base) as usize;
+                                scores[local] += contributions[lane];
+                                present[local >> 6] |= 1u64 << (local & 63);
+                            }
+                            c.advance_by(bm25::SCORE_SIMD_LANES);
+                            continue;
+                        }
+                    }
                     let local = (d - base) as usize;
                     scores[local] += bm25::score_with_dl_norm_k1(
                         c.idf_x_k1p1,
@@ -3478,19 +3511,41 @@ impl TermCursor {
 
     /// Advance one position. Crosses block boundaries automatically;
     /// decodes the next block on demand.
+    #[inline(always)]
     fn next(&mut self) {
         if self.is_exhausted() {
             return;
         }
         self.pos += 1;
         if self.pos >= self.block_n {
-            self.current_block += 1;
-            if self.current_block > self.inspect_block {
-                self.inspect_block = self.current_block;
-            }
-            if self.current_block < self.blocks.len() {
-                self.decode_current_block();
-            }
+            self.advance_block();
+        }
+    }
+
+    /// Advance a known in-block batch, crossing to the next block when
+    /// `count` consumes its remaining postings. Unlike [`Self::next`],
+    /// callers must not start at or advance past the decoded block end.
+    #[inline(always)]
+    fn advance_by(&mut self, count: usize) {
+        debug_assert!(!self.is_exhausted());
+        debug_assert!(count > 0 && self.pos + count <= self.block_n);
+        self.pos += count;
+        // The assertion above makes equality equivalent to `>=` here.
+        if self.pos == self.block_n {
+            self.advance_block();
+        }
+    }
+
+    /// Move to and decode the next posting block, or mark the cursor
+    /// exhausted when the current block is the last one.
+    #[inline(always)]
+    fn advance_block(&mut self) {
+        self.current_block += 1;
+        if self.current_block > self.inspect_block {
+            self.inspect_block = self.current_block;
+        }
+        if self.current_block < self.blocks.len() {
+            self.decode_current_block();
         }
     }
 
@@ -4586,7 +4641,7 @@ mod tests {
         let mut b = FtsBuilder::new(tok);
         b.register_column("body".into()).expect("register");
         for i in 0..N_DOCS {
-            let mut text = String::from("alpha "); // ~every doc
+            let mut text = String::from("alpha zeta eta theta "); // ~every doc
             if i % 2 == 0 {
                 text.push_str("beta ");
             }
@@ -4604,12 +4659,23 @@ mod tests {
         let blob = Bytes::from(b.finish().expect("finish"));
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
+        let col = r.resolve_column_id("body").expect("col");
+        let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
+        let uniform_cursors = r
+            .build_term_cursors(col, uniform_terms)
+            .await
+            .expect("uniform cursors");
+        assert!(
+            prefer_windowed_union(&uniform_cursors),
+            "production router should select windowed union for equal upper bounds"
+        );
 
         let shapes: &[&[&str]] = &[
             &["alpha", "beta"],
             &["alpha", "beta", "gamma"],
             &["beta", "gamma", "delta"], // no single dominator
             &["alpha", "beta", "gamma", "delta", "epsilon"],
+            uniform_terms,
         ];
         for terms in shapes {
             for k in [1usize, 5, 50, 1000] {

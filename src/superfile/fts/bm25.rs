@@ -35,9 +35,10 @@ pub const B: f32 = 0.75;
 /// `idf >= 0`) for every valid `(N, df)` — the "BM25+1" form.
 const IDF_SMOOTHING: f64 = 0.5;
 
-/// SIMD lane count for the four-wide BM25 scorer ([`f32x4`]). The
-/// multi-term path scores this many cursors at one doc per call.
-const SCORE_SIMD_LANES: usize = 4;
+/// SIMD lane count for the four-wide BM25 scorers ([`f32x4`]). The
+/// multi-term path scores this many cursors at one doc per call; the
+/// windowed-union path scores this many docs from one cursor.
+pub(super) const SCORE_SIMD_LANES: usize = 4;
 
 /// BM25 inverse-document-frequency. Plus-half smoothing keeps the log
 /// argument ≥ 1, so `idf(N, df) >= 0` for all valid `(N, df)`.
@@ -119,6 +120,23 @@ pub fn score_simd_x4(
     let num = idf_v * tf_v;
     let scores = num / denom;
     scores.reduce_add()
+}
+
+/// Score one cursor at four documents in one SIMD operation. Each
+/// document has its own term frequency and length normalization; the
+/// cursor's precomputed `idf * (K1 + 1)` is shared across all lanes.
+/// Returns the four independent contributions without reducing them.
+/// Callers pass posting-list term frequencies (`tf > 0`); unlike
+/// [`score_simd_x4`], this path does not use zero-padded lanes.
+#[inline(always)]
+pub(super) fn score_one_term_x4(
+    idf_x_k1p1: f32,
+    tfs: [u32; SCORE_SIMD_LANES],
+    dl_norm_k1: [f32; SCORE_SIMD_LANES],
+) -> [f32; SCORE_SIMD_LANES] {
+    let tf_v = f32x4::from([tfs[0] as f32, tfs[1] as f32, tfs[2] as f32, tfs[3] as f32]);
+    let scores = f32x4::splat(idf_x_k1p1) * tf_v / (tf_v + f32x4::from(dl_norm_k1));
+    scores.to_array()
 }
 
 #[cfg(test)]
@@ -333,5 +351,22 @@ mod tests {
         ];
         let simd = score_simd_x4(idfs_x_k1p1, tfs, k1_norm);
         assert!((scalar - simd).abs() < 1e-4, "simd={simd} scalar={scalar}");
+    }
+
+    #[test]
+    fn one_term_simd_x4_equals_scalar_lanes() {
+        let idf_x_k1p1 = idf(1_000_000, 10_000) * (K1 + 1.0);
+        let tfs = [1, 2, 5, 9];
+        let dl_norm_k1 = [0.4, 0.9, 1.2, 3.5];
+        let simd = score_one_term_x4(idf_x_k1p1, tfs, dl_norm_k1);
+
+        for lane in 0..SCORE_SIMD_LANES {
+            let scalar = score_with_dl_norm_k1(idf_x_k1p1, tfs[lane], dl_norm_k1[lane]);
+            assert!(
+                approx(simd[lane], scalar, 1e-6),
+                "lane {lane}: simd={} scalar={scalar}",
+                simd[lane]
+            );
+        }
     }
 }
