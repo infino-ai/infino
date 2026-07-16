@@ -144,6 +144,14 @@ use crate::superfile::{
 ///     pointers through unrelated allocator buckets).
 type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 
+/// Reusable per-document term-frequency table for the in-RAM build path.
+///
+/// Keys borrow from [`FtsBuilder::bump`] with the same lifetime-extension
+/// discipline as [`TermIdMap`]. The table is drained after every document
+/// and cleared before the arena is reset, so only its bucket allocation
+/// persists across calls.
+type DocTfMap = HbHashMap<&'static str, u32, FxBuildHasher>;
+
 #[derive(Default)]
 struct FinishProfile {
     enabled: bool,
@@ -1085,6 +1093,14 @@ pub struct FtsBuilder {
     /// Tracks the number of distinct local_doc_ids ever seen by add_doc.
     /// Used as `n_docs` for the FTS blob header.
     n_docs: u32,
+    /// Per-document term-frequency table for the in-RAM path. Draining
+    /// keeps its bucket allocation, avoiding a fresh allocation and
+    /// repeated growth for every document.
+    ///
+    /// Declared before `bump` so it drops first. Its transient `&str`
+    /// keys borrow from that arena under the lifetime invariant described
+    /// on [`DocTfMap`].
+    doc_tf: DocTfMap,
     /// Per-shard bump arena reused across every `add_doc` call.
     /// Holds the transient `&str` keys of the per-doc tf hashmap.
     /// Reset at the top of each `add_doc` so the leftover bytes are
@@ -1144,6 +1160,7 @@ impl FtsBuilder {
             spill_partitions: DEFAULT_SPILL_PARTITIONS,
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
+            doc_tf: DocTfMap::with_hasher(FxBuildHasher),
             bump: Bump::new(),
         }
     }
@@ -1473,12 +1490,9 @@ impl FtsBuilder {
             .downcast_ref::<AsciiLowerTokenizer>();
         let mut tokens_in_doc: u64 = 0;
 
-        // Reset the per-shard bump arena: leftover token bytes
-        // from the prior `add_doc` call are invalidated before we
-        // reuse the chunk. `Bump::reset` keeps the largest chunk
-        // (no system-allocator round trip on the steady-state
-        // doc) and frees any extra chunks the pathological-long
-        // doc grew.
+        // Clear borrowed keys before resetting their backing arena.
+        // Both containers retain their allocations for the next doc.
+        self.doc_tf.clear();
         self.bump.reset();
         let bump = &self.bump;
 
@@ -1486,8 +1500,7 @@ impl FtsBuilder {
         // with the *borrowed* `&str` token from the tokenizer's
         // input slice and only pays the `bump.alloc_str` copy on
         // the miss path. Hit-path cost: hash + load + increment.
-        let mut tf_per_term: HbHashMap<&'static str, u32, FxBuildHasher> =
-            HbHashMap::with_hasher(FxBuildHasher);
+        let tf_per_term = &mut self.doc_tf;
         let mut on_token = |tok: &str| {
             tokens_in_doc += 1;
             let hash = compute_hash(tf_per_term.hasher(), tok);
@@ -1502,15 +1515,14 @@ impl FtsBuilder {
                     // Miss path: copy borrowed token bytes into
                     // the bump arena so the key outlives the
                     // tokenizer's input lifetime, then widen the
-                    // bump ref to `'static` tied to the HashMap's
-                    // lifetime. The HashMap drops at the end of
-                    // this call — well before `self.bump` is
-                    // reset on the next call.
+                    // bump ref to `'static` tied to the scratch
+                    // table's lifetime.
                     let bumped: &str = bump.alloc_str(tok);
                     // SAFETY: the `'static` tag is a lie — the real
-                    // lifetime is `self.bump`, which is reset only on the
-                    // next call, after this HashMap (and `extended`) has
-                    // been dropped at the end of the current call.
+                    // lifetime is `self.bump`. The table is drained below,
+                    // cleared before the arena is reset on the next call,
+                    // and declared before `bump` so it also drops first if
+                    // unwinding leaves entries behind.
                     let extended: &'static str = unsafe { std::mem::transmute(bumped) };
                     e.insert_hashed_nocheck(hash, extended, 1);
                 }
@@ -1544,7 +1556,7 @@ impl FtsBuilder {
         // the miss path constructs a `Box::<str>::from(term)` for
         // insertion. Bytes accounting folds into the same loop.
         let mut new_bytes: usize = 0;
-        for (term, tf) in tf_per_term {
+        for (term, tf) in tf_per_term.drain() {
             let term_len = term.len();
             match terms.get_mut(term) {
                 Some(acc) => {
@@ -1671,8 +1683,11 @@ impl FtsBuilder {
             spill_partitions: _,
             max_partition_bytes: _,
             n_docs,
-            bump: _,
+            doc_tf,
+            bump,
         } = self;
+        drop(doc_tf);
+        drop(bump);
 
         let n_columns = columns.len() as u32;
         let mut n_terms_total_usize: usize = 0;
@@ -1808,8 +1823,11 @@ impl FtsBuilder {
             spill_partitions: _,
             max_partition_bytes,
             n_docs,
-            bump: _,
+            doc_tf,
+            bump,
         } = self;
+        drop(doc_tf);
+        drop(bump);
 
         let n_columns = columns.len() as u32;
         let mut n_terms_total_usize: usize = 0;
@@ -2826,6 +2844,26 @@ mod tests {
         b.register_column("title".into()).expect("register column");
         let err = b.add_doc(99, 0, "text").expect_err("expected error");
         assert!(matches!(err, BuildError::FtsColumnTypeInvalid { .. }));
+    }
+
+    #[test]
+    fn add_doc_reuses_term_frequency_table_capacity() {
+        let mut b = FtsBuilder::new(tokenizer());
+        b.register_column("title".into()).expect("register column");
+        b.add_doc(0, 0, "alpha beta gamma delta epsilon zeta eta theta")
+            .expect("add first doc");
+
+        assert!(b.doc_tf.is_empty(), "per-document table must be drained");
+        let capacity = b.doc_tf.capacity();
+        assert!(capacity > 0, "first document must allocate table buckets");
+
+        b.add_doc(0, 1, "alpha beta alpha").expect("add second doc");
+        assert!(b.doc_tf.is_empty(), "per-document table must be drained");
+        assert_eq!(
+            b.doc_tf.capacity(),
+            capacity,
+            "subsequent documents must reuse the existing buckets"
+        );
     }
 
     #[tokio::test]
