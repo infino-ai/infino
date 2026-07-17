@@ -37,8 +37,12 @@ const BMW_SCORE_TOLERANCE: f32 = 1e-5;
 fn build_with_two_columns() -> (Bytes, String) {
     let tok = default_tokenizer();
     let mut b = FtsBuilder::new(tok);
-    let _ = b.register_column("title".into()).expect("register column");
-    let _ = b.register_column("body".into()).expect("register column");
+    let _ = b
+        .register_column("title".into(), false)
+        .expect("register column");
+    let _ = b
+        .register_column("body".into(), false)
+        .expect("register column");
 
     // Doc 0: title="rust runtime", body="tokio fast async"
     b.add_doc(0, 0, "rust runtime").expect("add doc");
@@ -232,7 +236,8 @@ async fn bmw_single_term_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
     let mut b = FtsBuilder::new(default_tokenizer());
-    b.register_column("body".into()).expect("register column");
+    b.register_column("body".into(), false)
+        .expect("register column");
 
     // Build ~500 docs with the term "foo" appearing in every other doc
     // with varying tfs (1..=8) — produces multiple posting blocks, plenty

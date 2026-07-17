@@ -3758,7 +3758,8 @@ mod tests {
         // 3 docs, 1 column.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         b.add_doc(0, 0, "rust async runtime").expect("add doc");
         b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
         b.add_doc(0, 2, "java spring boot").expect("add doc");
@@ -3912,7 +3913,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
             if i % 2 == 0 {
@@ -3990,7 +3991,8 @@ mod tests {
         // score, ascending doc_id tiebreak).
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         // 20 docs sprinkled with mixed term combinations.
         let docs = [
             "alpha",
@@ -4142,7 +4144,8 @@ mod tests {
     fn build_mixed_df_blob() -> (Bytes, String) {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         // `common`     → df = 3 (PFOR form)
         // `rust`       → df = 2 (PFOR form)
         // `uniqzero`  → df = 1 (inline form)
@@ -4268,7 +4271,7 @@ mod tests {
 
         let mut b_inline = FtsBuilder::new(tok.clone());
         b_inline
-            .register_column("body".into())
+            .register_column("body".into(), false)
             .expect("register column");
         for i in 0..20 {
             b_inline
@@ -4279,7 +4282,7 @@ mod tests {
 
         let mut b_pfor = FtsBuilder::new(tok);
         b_pfor
-            .register_column("body".into())
+            .register_column("body".into(), false)
             .expect("register column");
         // Same 20 terms but all appearing in every doc → df = 20 → PFOR.
         for i in 0..20 {
@@ -4569,8 +4572,8 @@ mod tests {
     async fn search_multi_weights_and_combines_columns() {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("title".into()).expect("register");
-        b.register_column("body".into()).expect("register");
+        b.register_column("title".into(), false).expect("register");
+        b.register_column("body".into(), false).expect("register");
         // doc 0: title "rust"; doc 1: body "rust"; doc 2: neither.
         b.add_doc(0, 0, "rust").expect("add");
         b.add_doc(1, 0, "systems").expect("add");
@@ -4597,7 +4600,7 @@ mod tests {
         // ranged path actually clips some out.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
@@ -4646,7 +4649,7 @@ mod tests {
     async fn search_or_range_with_floor_prunes() {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
@@ -4666,7 +4669,7 @@ mod tests {
         // BMM path on the planted corpus.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         let docs = [
             "alpha beta",
             "alpha",
@@ -4718,7 +4721,7 @@ mod tests {
 
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
             // `alpha` in ~every doc, `beta` in ~half, `gamma` every
@@ -4773,7 +4776,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha zeta eta theta "); // ~every doc
             if i % 2 == 0 {
@@ -4844,7 +4847,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha ");
             if i % 2 == 0 {
@@ -4889,7 +4892,7 @@ mod tests {
         const N_DOCS: u32 = 4000;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common "); // every doc
             if i % 2 == 0 {
@@ -4936,7 +4939,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha ");
             if i % 2 == 0 {

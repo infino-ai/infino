@@ -474,7 +474,7 @@ impl SuperfileBuilder {
                 .clone();
             let mut fb = FtsBuilder::new(tk);
             for fc in &opts.fts_columns {
-                fb.register_column(fc.column.clone())?;
+                fb.register_column(fc.column.clone(), fc.positions)?;
             }
             Some(fb)
         };
