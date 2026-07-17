@@ -175,7 +175,15 @@ def prepare(root, package, version=None):
     if "crate" in targets:
         stamp_manifest(root / "Cargo.toml", targets["crate"])
         stamp_lock(root / "Cargo.lock", "infino", targets["crate"])
-        changed += ["Cargo.toml", "Cargo.lock"]
+        # The bindings build the crate as a path dependency, so their
+        # lockfiles record its version too; sync them or their --locked
+        # builds (maturin / napi) fail at release time.
+        stamp_lock(root / "infino-node" / "Cargo.lock", "infino",
+                   targets["crate"])
+        stamp_lock(root / "infino-python" / "Cargo.lock", "infino",
+                   targets["crate"])
+        changed += ["Cargo.toml", "Cargo.lock", "infino-node/Cargo.lock",
+                    "infino-python/Cargo.lock"]
     if "node" in targets:
         stamp_node_package(root / "infino-node" / "package.json",
                            targets["node"])
@@ -191,6 +199,7 @@ def prepare(root, package, version=None):
                    targets["python"])
         changed += ["infino-python/Cargo.toml", "infino-python/Cargo.lock"]
 
+    changed = list(dict.fromkeys(changed))
     drift = check(root)
     if drift:
         raise ReleasePrepError(

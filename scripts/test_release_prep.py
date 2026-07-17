@@ -25,14 +25,28 @@ class Prepare(unittest.TestCase):
     def node_manifest(self):
         return json.loads((self.root / "infino-node" / "package.json").read_text())
 
-    def test_crate_patch_stamps_only_the_root_manifest_and_lock(self):
+    def test_crate_patch_stamps_root_and_syncs_binding_lockfiles(self):
         changed = prepare(self.root, "crate", "0.3.5")
-        self.assertEqual(sorted(changed), ["Cargo.lock", "Cargo.toml"])
+        self.assertEqual(
+            sorted(changed),
+            ["Cargo.lock", "Cargo.toml", "infino-node/Cargo.lock",
+             "infino-python/Cargo.lock"],
+        )
         self.assertEqual(manifest_version(self.root / "Cargo.toml"), "0.3.5")
         self.assertEqual(locked_version(self.root / "Cargo.lock", "infino"), "0.3.5")
+        # The bindings' own versions stay put, but their lockfiles' record
+        # of the crate (a path dependency) moves with it.
         self.assertEqual(self.node_manifest()["version"], "0.3.2")
         self.assertEqual(
+            locked_version(self.root / "infino-node" / "Cargo.lock", "infino"),
+            "0.3.5",
+        )
+        self.assertEqual(
             manifest_version(self.root / "infino-python" / "Cargo.toml"), "0.3.5"
+        )
+        self.assertEqual(
+            locked_version(self.root / "infino-python" / "Cargo.lock", "infino"),
+            "0.3.5",
         )
         self.assertEqual(check(self.root), [])
 

@@ -14,6 +14,10 @@ The check fails (non-zero exit) when:
   (c) a Cargo.lock records a different version for its own package than
       the matching Cargo.toml — a bump that skipped the lockfile breaks
       the `--locked` publish at release time
+  (d) a binding's Cargo.lock records a different version for `infino`
+      than the root Cargo.toml — the bindings build the crate as a path
+      dependency, so a stale entry breaks their `--locked` builds
+      (maturin / napi) the same way
 
 Usage:
   check_version_sync.py                          # verify; non-zero exit on drift
@@ -112,6 +116,18 @@ def check(root, release_version=None):
                     f"the package version is {node}; the platform pins "
                     f"track the package version"
                 )
+        if crate is not None:
+            node_lock_infino = locked_version(
+                root / "infino-node" / "Cargo.lock", "infino"
+            )
+            if node_lock_infino != crate:
+                errors.append(
+                    f"infino-node/Cargo.lock records infino "
+                    f"{node_lock_infino} but the crate is {crate}; the "
+                    f"binding builds the crate as a path dependency — "
+                    f"regenerate the lockfile (its --locked build breaks "
+                    f"otherwise)"
+                )
         # The node crate is unpublished (`publish = false`), but its version
         # must track package.json so no committed version file lies.
         node_crate = manifest_version(root / "infino-node" / "Cargo.toml")
@@ -152,6 +168,18 @@ def check(root, release_version=None):
                 f"{python_locked} but infino-python/Cargo.toml says {python}; "
                 f"regenerate the lockfile (releases publish with --locked)"
             )
+        if crate is not None:
+            python_lock_infino = locked_version(
+                root / "infino-python" / "Cargo.lock", "infino"
+            )
+            if python_lock_infino != crate:
+                errors.append(
+                    f"infino-python/Cargo.lock records infino "
+                    f"{python_lock_infino} but the crate is {crate}; the "
+                    f"binding builds the crate as a path dependency — "
+                    f"regenerate the lockfile (its --locked build breaks "
+                    f"otherwise)"
+                )
 
     return errors
 
