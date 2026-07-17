@@ -152,6 +152,73 @@ impl BruteForceBm25 {
         scored
     }
 
+    /// Clause-model top-k: the match set is the docs containing
+    /// **every** must (or, with no musts, **any** should), minus docs
+    /// containing any negative. A matching doc's score sums its must
+    /// contributions plus each should that lands on it — shoulds are
+    /// scoring-only and never add or remove a match. Mirrors the
+    /// production must/should walk; tie-break is ascending doc_id,
+    /// identical to the other helpers.
+    pub fn top_k_clauses(
+        &self,
+        musts: &[String],
+        shoulds: &[String],
+        negatives: &[String],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        if k == 0 || (musts.is_empty() && shoulds.is_empty()) || self.n == 0 {
+            return Vec::new();
+        }
+
+        let n = self.n as f32;
+        let avgdl = self.avgdl;
+
+        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
+        'docs: for doc in &self.docs {
+            for neg in negatives {
+                if doc.tf.contains_key(neg) {
+                    continue 'docs;
+                }
+            }
+            for must in musts {
+                if !doc.tf.contains_key(must) {
+                    continue 'docs;
+                }
+            }
+            let dl = doc.dl as f32;
+            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let mut score: f32 = 0.0;
+            let mut any_should = false;
+            for term in musts.iter().chain(shoulds) {
+                let Some(&tf) = doc.tf.get(term) else {
+                    continue;
+                };
+                any_should |= !musts.contains(term);
+                let df = *self.df.get(term).unwrap_or(&0) as f32;
+                if df == 0.0 {
+                    continue;
+                }
+                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                let tf_f = tf as f32;
+                score += idf * tf_f * (K1 + 1.0) / (tf_f + dl_norm);
+            }
+            // With musts, every surviving doc matches (score > 0 since
+            // idf is always positive); with none, only docs hit by at
+            // least one should are in the union.
+            if !musts.is_empty() || any_should {
+                scored.push((doc.doc_id, score));
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        scored.truncate(k);
+        scored
+    }
+
     /// Same as [`Self::top_k_terms`] but with AND semantics: only docs
     /// that contain *every* query term contribute a score. Used by the
     /// AND-mode oracle tests against the reader's leapfrog

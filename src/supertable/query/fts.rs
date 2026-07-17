@@ -228,41 +228,49 @@ impl SupertableReader {
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
-        // Parse the query once here, not per superfile. The fan-out
-        // closures below need owned ('static) data for tokio::spawn,
-        // so this is the one place the tokens are copied — the prune
-        // and every per-superfile search reuse them.
-        let parsed = AsciiLowerTokenizer.parse(query);
-        let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
-        let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
+        // Parse the query once here, not per superfile, resolving the
+        // bare tokens' polarity from the default operator (`And` ⇒
+        // must, `Or` ⇒ should). The fan-out closures below need owned
+        // ('static) data for tokio::spawn, so this is the one place
+        // the tokens are copied — the prune and every per-superfile
+        // search reuse them.
+        let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
+        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
+        let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
 
-        // Negation-only (e.g. `-foo`): no positive anchor to rank. Reject
-        // up front so the per-superfile excluding kernel never has to, and
-        // so the unranked count / token_match path surfaces the identical
-        // error (see `parse_and_prune`).
-        if positives.is_empty() && !negatives.is_empty() {
+        if musts.is_empty() && shoulds.is_empty() {
+            // No scorable clause at all. Empty / punctuation-only
+            // queries match nothing (not an error); negation-only
+            // (e.g. `-foo`) has no anchor to rank — reject up front so
+            // the per-superfile kernel never has to, and so the
+            // unranked count / token_match path surfaces the identical
+            // error (see `parse_and_prune`).
+            if negatives.is_empty() {
+                return Ok(Vec::new());
+            }
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
         }
 
         // Pick the superfiles to search, via the shared two-tier bloom
-        // prune. Only positive terms prune — a negated term must never
-        // drop a superfile: a superfile without it is the best case (none
-        // of its docs can be excluded), and under `And` it would even
-        // prune every superfile that lacks the negated term.
-        // The leaf takes `positives` by value to avoid cloning the
-        // list; we take it back right after the call.
+        // prune. Musts prune hardest: every match contains all of
+        // them, so a superfile lacking any must is skipped regardless
+        // of `mode`. A pure should query prunes exactly as the flat
+        // term list did. Negated terms never prune — a superfile
+        // without a negated term is the best case (none of its docs
+        // can be excluded) — and shoulds never prune once a must
+        // exists, since they only affect scores.
+        let (prune_terms, prune_mode) = if musts.is_empty() {
+            (shoulds.clone(), mode)
+        } else {
+            (musts.clone(), BoolMode::And)
+        };
         let prune_leaf = PruneLeaf::TermPresence {
             column: column_owned.clone(),
-            terms: positives,
-            mode,
+            terms: prune_terms,
+            mode: prune_mode,
         };
         let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
-        let PruneLeaf::TermPresence {
-            terms: positives, ..
-        } = prune_leaf
-        else {
-            unreachable!("leaf constructed as TermPresence above")
-        };
         if kept.is_empty() {
             return Ok(Vec::new());
         }
@@ -271,9 +279,10 @@ impl SupertableReader {
         // threads than there are kept superfiles AND we're on the
         // multi-term OR hot path, slice each superfile into doc_id
         // sub-ranges so the fan-out can saturate every pool thread.
-        // Single-term OR and AND stay on the un-ranged call.
+        // Single-term OR, AND, and any query with a must or negated
+        // clause stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        let fanout = fanout_for(mode, positives.len(), !negatives.is_empty());
+        let fanout = fanout_for(musts.len(), shoulds.len(), !negatives.is_empty());
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
         let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
             .into_iter()
@@ -283,7 +292,8 @@ impl SupertableReader {
             })
             .collect();
 
-        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let must_arc: Arc<Vec<String>> = Arc::new(musts);
+        let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let column_arc = Arc::new(column_owned);
 
@@ -305,49 +315,43 @@ impl SupertableReader {
         // superfile) plus the superfile id for the tombstone-aware merge.
         let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
-            let term_arc = Arc::clone(&term_arc);
+            let must_arc = Arc::clone(&must_arc);
+            let should_arc = Arc::clone(&should_arc);
             let neg_arc = Arc::clone(&neg_arc);
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
             async move {
-                let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 let floor = shared.floor();
                 let hits = match range {
-                    // Ranged units exist only for negation-free queries
-                    // (`fanout_for` never slices otherwise).
-                    Some((start, end)) => r
-                        .bm25_search_or_range_pretokenized_with_floor(
+                    // Ranged units exist only for pure multi-should
+                    // queries (`fanout_for` never slices when a must
+                    // or negated clause exists).
+                    Some((start, end)) => {
+                        let should_refs: Vec<&str> =
+                            should_arc.iter().map(|s| s.as_str()).collect();
+                        r.bm25_search_or_range_pretokenized_with_floor(
                             &column_arc,
-                            &term_refs,
+                            &should_refs,
                             k,
                             start,
                             end,
                             floor,
                         )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
-                    None if neg_arc.is_empty() => r
-                        .bm25_search_pretokenized_with_floor(
-                            &column_arc,
-                            &term_refs,
-                            k,
-                            mode,
-                            floor,
-                        )
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    }
                     None => {
-                        // Negated queries run unfloored (the excluding
-                        // kernel carries no cross-segment floor today);
-                        // their survivors still merge below, which is
-                        // harmless bookkeeping.
+                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
+                        let should_refs: Vec<&str> =
+                            should_arc.iter().map(|s| s.as_str()).collect();
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        r.bm25_search_pretokenized_excluding(
+                        r.bm25_search_clauses(
                             &column_arc,
-                            &term_refs,
+                            &must_refs,
+                            &should_refs,
                             &neg_refs,
                             k,
-                            mode,
+                            floor,
                         )
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))?
@@ -471,33 +475,51 @@ impl SupertableReader {
     /// positive, e.g. `-foo`) is rejected with [`QueryError::InvalidQuery`],
     /// the same as the scored search path — there is no positive anchor to
     /// match against.
+    /// Parse `query` into clauses, resolve the unranked **match set**
+    /// terms, and bloom-prune the superfile list.
+    ///
+    /// Unranked matching has no scores for a should clause to raise,
+    /// so the match set is the musts' intersection whenever any must
+    /// exists (`+a b` matches exactly the docs containing `a`; the
+    /// bare `b` is scoring-only and contributes nothing here) —
+    /// keeping `token_match` / `count` consistent with which docs the
+    /// scored search returns. With no musts, the bare terms match
+    /// under `mode` exactly as before.
+    ///
+    /// Returns `(match_terms, match_mode, negatives, kept)`.
     async fn parse_and_prune(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<Arc<SuperfileEntry>>), QueryError> {
-        let parsed = AsciiLowerTokenizer.parse(query);
-        let positives: Vec<String> = parsed.positives.into_iter().map(Cow::into_owned).collect();
-        let negatives: Vec<String> = parsed.negatives.into_iter().map(Cow::into_owned).collect();
-        if positives.is_empty() {
+    ) -> Result<(Vec<String>, BoolMode, Vec<String>, Vec<Arc<SuperfileEntry>>), QueryError> {
+        let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+        let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
+        let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
+        let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
+        if musts.is_empty() && shoulds.is_empty() {
             if negatives.is_empty() {
                 // No tokens at all (empty/whitespace query) — nothing to
                 // match, not an error.
-                return Ok((positives, negatives, Vec::new()));
+                return Ok((Vec::new(), mode, negatives, Vec::new()));
             }
             // Negation-only (e.g. `-foo`): reject, matching the scored
             // search path, which has no positive anchor to rank or match.
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
         }
+        let (match_terms, match_mode) = if musts.is_empty() {
+            (shoulds, mode)
+        } else {
+            (musts, BoolMode::And)
+        };
         let prune_leaf = PruneLeaf::TermPresence {
             column: column.to_owned(),
-            terms: positives.clone(),
-            mode,
+            terms: match_terms.clone(),
+            mode: match_mode,
         };
         let kept =
             select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
-        Ok((positives, negatives, kept))
+        Ok((match_terms, match_mode, negatives, kept))
     }
 
     /// Unranked token match across the pinned snapshot. Returns
@@ -505,6 +527,10 @@ impl SupertableReader {
     /// token, `And` = every token) as [`SuperfileHit`]s — **no scoring**
     /// (`score` is left `0.0`; these results are unordered). Superfile
     /// skip uses the same term-bloom prune as BM25.
+    ///
+    /// With a `+must` clause, the match set is the musts' intersection
+    /// and bare (should) tokens are ignored — they only affect scores,
+    /// and there are none here (see [`Self::parse_and_prune`]).
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::token_match`].
@@ -518,14 +544,15 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let (positives, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
+        let (match_terms, match_mode, negatives, kept) =
+            self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
         let has_negatives = !negatives.is_empty();
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let term_arc: Arc<Vec<String>> = Arc::new(match_terms);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
@@ -534,7 +561,7 @@ impl SupertableReader {
             async move {
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 let docs = r
-                    .token_match(&column_arc, &refs, mode)
+                    .token_match(&column_arc, &refs, match_mode)
                     .await
                     .map_err(|e| QueryError::Parquet(e.to_string()))?;
                 // Drop any positive match that also carries a negated
@@ -567,6 +594,12 @@ impl SupertableReader {
     /// pinned snapshot — **count only, no scoring and no row
     /// materialization**.
     ///
+    /// With a `+must` clause, the count is the musts' intersection
+    /// cardinality — bare (should) tokens affect only scores, so they
+    /// never change which docs are counted (see
+    /// [`Self::parse_and_prune`]). `count("+climate policy")` is the
+    /// number of docs containing `climate`.
+    ///
     /// Fast path: a single-token query against a superfile with no
     /// tombstones resolves from the term dictionary's stored document
     /// frequency ([`SuperfileReader::term_df`]) — O(1) per superfile, no
@@ -580,15 +613,16 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
-        let (positives, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
+        let (match_terms, match_mode, negatives, kept) =
+            self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(0);
         }
 
-        let single_term = positives.len() == 1;
+        let single_term = match_terms.len() == 1;
         let has_negatives = !negatives.is_empty();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(positives);
+        let term_arc: Arc<Vec<String>> = Arc::new(match_terms);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
@@ -622,7 +656,7 @@ impl SupertableReader {
                     // (union of the negatives) or a tombstone.
                     if has_negatives || tomb.is_some() {
                         let docs = r
-                            .token_match(&column_arc, &refs, mode)
+                            .token_match(&column_arc, &refs, match_mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?;
                         let excluded: RoaringBitmap = if has_negatives {
@@ -653,7 +687,7 @@ impl SupertableReader {
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?
                     } else {
-                        r.token_match_count(&column_arc, &refs, mode)
+                        r.token_match_count(&column_arc, &refs, match_mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?
                     };
@@ -843,11 +877,12 @@ enum FanOut {
     SubRanges,
 }
 
-/// Pick the fan-out for a term query: only multi-term OR has a
-/// range-aware kernel, and negation has no ranged kernel (v1), so
-/// everything else stays one un-ranged unit per superfile.
-fn fanout_for(mode: BoolMode, n_positives: usize, has_negatives: bool) -> FanOut {
-    if mode == BoolMode::Or && n_positives >= OR_FANOUT_MIN_TERMS && !has_negatives {
+/// Pick the fan-out for a term query: only the pure multi-should
+/// union (a flat multi-term OR — no must and no negated clause) has a
+/// range-aware kernel, so everything else stays one un-ranged unit
+/// per superfile.
+fn fanout_for(n_musts: usize, n_shoulds: usize, has_negatives: bool) -> FanOut {
+    if n_musts == 0 && n_shoulds >= OR_FANOUT_MIN_TERMS && !has_negatives {
         FanOut::SubRanges
     } else {
         FanOut::PerSuperfile
@@ -1645,6 +1680,104 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    /// Two-superfile fixture for the clause model: `climate` docs are
+    /// split across superfiles, and one superfile has no `climate` at
+    /// all (so the must prune drops it).
+    fn seeded_clause_supertable() -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["climate change policy", "climate science report"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(
+            10,
+            &["policy analysis quarterly", "climate policy summit"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    #[test]
+    fn must_should_match_set_and_count_across_superfiles() {
+        let st = seeded_clause_supertable();
+        let r = st.reader();
+
+        // 3 docs contain `climate`; `policy` is scoring-only and must
+        // not pull in "policy analysis quarterly".
+        let hits = r
+            .bm25_hits("title", "+climate policy", 10, BoolMode::Or)
+            .expect("bm25 +climate policy");
+        assert_eq!(hits.len(), 3, "match set is the must set");
+
+        // Count agrees with the scored match set and ignores shoulds.
+        let n = r
+            .count("title", "+climate policy", BoolMode::Or)
+            .expect("count +climate policy");
+        assert_eq!(n, 3);
+        // Flat OR over the same tokens is the union — strictly bigger.
+        let union = r
+            .count("title", "climate policy", BoolMode::Or)
+            .expect("count union");
+        assert_eq!(union, 4);
+
+        // Docs matching must+should outrank must-only docs: both
+        // climate∧policy docs come first.
+        let top2: Vec<f32> = hits.iter().take(2).map(|h| h.score).collect();
+        let third = hits[2].score;
+        assert!(
+            top2.iter().all(|s| *s > third),
+            "climate∧policy docs must outrank climate-only: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn must_should_token_match_matches_musts_only() {
+        let st = seeded_clause_supertable();
+        let r = st.reader();
+        // Unranked matching has no scores for the should to raise —
+        // the match set is exactly the must set.
+        let tm = r
+            .token_match("title", "+climate policy", BoolMode::Or)
+            .expect("tm +climate policy");
+        assert_eq!(tm.len(), 3);
+    }
+
+    #[test]
+    fn must_should_with_negation_across_superfiles() {
+        let st = seeded_clause_supertable();
+        let r = st.reader();
+        // Negation still excludes: drop the summit doc from the
+        // climate must set.
+        let hits = r
+            .bm25_hits("title", "+climate policy -summit", 10, BoolMode::Or)
+            .expect("bm25 with negation");
+        assert_eq!(hits.len(), 2);
+        let n = r
+            .count("title", "+climate policy -summit", BoolMode::Or)
+            .expect("count with negation");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn absent_must_prunes_every_superfile() {
+        let st = seeded_clause_supertable();
+        let r = st.reader();
+        // The must term exists nowhere: bloom-prune (or the empty
+        // intersection) yields no hits despite the common should.
+        let hits = r
+            .bm25_hits("title", "+zzzabsent policy", 10, BoolMode::Or)
+            .expect("bm25 absent must");
+        assert!(hits.is_empty());
+        let n = r
+            .count("title", "+zzzabsent policy", BoolMode::Or)
+            .expect("count absent must");
+        assert_eq!(n, 0);
+    }
+
     #[test]
     fn token_match_no_match_returns_empty() {
         let st = seeded_three_doc_supertable();
@@ -1657,26 +1790,17 @@ mod tests {
 
     #[test]
     fn fanout_for_only_multi_term_or_without_negation_subranges() {
-        // Multi-term OR, no negation → sub-range eligible.
-        assert!(matches!(
-            fanout_for(BoolMode::Or, 2, false),
-            FanOut::SubRanges
-        ));
-        // Single-term OR stays per-superfile.
-        assert!(matches!(
-            fanout_for(BoolMode::Or, 1, false),
-            FanOut::PerSuperfile
-        ));
+        // Multi-should union (flat multi-term OR), no negation →
+        // sub-range eligible.
+        assert!(matches!(fanout_for(0, 2, false), FanOut::SubRanges));
+        // Single should stays per-superfile.
+        assert!(matches!(fanout_for(0, 1, false), FanOut::PerSuperfile));
         // Negation disables sub-ranges.
-        assert!(matches!(
-            fanout_for(BoolMode::Or, 2, true),
-            FanOut::PerSuperfile
-        ));
-        // And mode stays per-superfile.
-        assert!(matches!(
-            fanout_for(BoolMode::And, 2, false),
-            FanOut::PerSuperfile
-        ));
+        assert!(matches!(fanout_for(0, 2, true), FanOut::PerSuperfile));
+        // Any must clause (including flat And queries, whose bare
+        // terms all resolve to musts) stays per-superfile.
+        assert!(matches!(fanout_for(2, 0, false), FanOut::PerSuperfile));
+        assert!(matches!(fanout_for(1, 1, false), FanOut::PerSuperfile));
     }
 
     #[test]

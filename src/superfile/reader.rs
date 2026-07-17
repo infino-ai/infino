@@ -757,12 +757,16 @@ impl SuperfileReader {
     /// hits ordered by descending score — this is the hit kernel, not a
     /// row-returning search; row materialization is `take_by_local_doc_ids`.
     ///
-    /// ## Negation (`-term`)
+    /// ## Clause sigils (`+term`, `-term`)
     ///
-    /// A `-`-prefixed term excludes every doc containing it, regardless
-    /// of score; `mode` applies to the positive terms only. Example:
-    /// `"rust -python"` scores docs with `rust`, dropping any that also
-    /// contain `python`. A query with only negated terms is rejected
+    /// A `+`-prefixed term is a **must**: every result contains it. A
+    /// `-`-prefixed term is a **must-not**: any doc containing it is
+    /// excluded, regardless of score. Bare terms take their polarity
+    /// from `mode`, the default operator: `And` requires them like
+    /// musts; `Or` makes them scoring-only **shoulds** when a must
+    /// exists (`"+climate policy"` matches docs with `climate`, and
+    /// docs also mentioning `policy` rank higher) and a plain union
+    /// when none does. A query with only negated terms is rejected
     /// (`FtsError::NegationOnly`).
     pub async fn bm25_hits_async(
         &self,
@@ -773,12 +777,14 @@ impl SuperfileReader {
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let tok = AsciiLowerTokenizer;
 
-        // Split the query into positive and negated terms. The parsed
+        // Split the query into clause lists and resolve the bare
+        // tokens' polarity from the default operator. The parsed
         // tokens borrow `query`, so nothing is copied here.
-        let parsed = tok.parse(query);
-        let positives: Vec<&str> = parsed.positives.iter().map(|t| &**t).collect();
-        let negatives: Vec<&str> = parsed.negatives.iter().map(|t| &**t).collect();
-        self.bm25_search_pretokenized_excluding(column, &positives, &negatives, k, mode)
+        let clauses = tok.parse(query).into_clauses(mode);
+        let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
+        let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
+        let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
+        self.bm25_search_clauses(column, &musts, &shoulds, &negatives, k, f32::NEG_INFINITY)
             .await
     }
 
@@ -924,23 +930,28 @@ impl SuperfileReader {
         Ok(out)
     }
 
-    /// Pre-tokenized BM25 search with negated terms excluded — the
-    /// negation sibling of [`Self::bm25_search_pretokenized`]. The
-    /// supertable fan-out parses the `-` sigil once at the orchestrator
-    /// and hands every superfile the split lists through here.
-    pub(crate) async fn bm25_search_pretokenized_excluding(
+    /// Pre-tokenized BM25 search over explicit clause lists — the
+    /// clause sibling of [`Self::bm25_search_pretokenized`]. The
+    /// supertable fan-out parses the `+`/`-` sigils and resolves the
+    /// default operator once at the orchestrator, then hands every
+    /// superfile the split lists through here. `musts` all have to
+    /// match; `shoulds` only raise scores; `negatives` exclude. Docs
+    /// scoring strictly below `floor` are pruned
+    /// (`f32::NEG_INFINITY` disables the floor).
+    pub(crate) async fn bm25_search_clauses(
         &self,
         column: &str,
-        positives: &[&str],
+        musts: &[&str],
+        shoulds: &[&str],
         negatives: &[&str],
         k: usize,
-        mode: BoolMode,
+        floor: f32,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .search_excluding(column, positives, negatives, k, mode)
+            .search_excluding(column, musts, shoulds, negatives, k, floor)
             .await?)
     }
 

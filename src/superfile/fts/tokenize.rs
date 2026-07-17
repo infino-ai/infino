@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Tokenization, plus BM25 query parsing ([`Tokenizer::parse`]).
-//! The parser lives here because the `-` negation sigil must be
-//! handled before tokenizing — the tokenizer splits on `-`.
+//! The parser lives here because the `+` / `-` clause sigils must be
+//! handled before tokenizing — the tokenizer splits on both.
 //!
 //! Ships one tokenizer: [`AsciiLowerTokenizer`]. The [`Tokenizer`]
 //! trait is the extension point for ICU / language-aware stemmers /
@@ -27,6 +27,8 @@ use std::{
 };
 
 use wide::u8x16;
+
+use super::reader::BoolMode;
 
 /// Smallest byte value that is non-ASCII (has the high bit set). The
 /// v1 ASCII-only rule drops any token containing a byte `>= this`.
@@ -95,15 +97,23 @@ pub trait Tokenizer: Send + Sync + 'static {
         self.tokenize_each(text, &mut |t| f(Cow::Owned(t.to_owned())));
     }
 
-    /// Used to parse a query: `"rust -python"` → positives `["rust"]`,
-    /// negatives `["python"]`. A query with no positives is not an
-    /// error here; the caller checks.
+    /// Used to parse a query into its clauses by leading sigil:
+    /// `"+rust async -python"` → musts `["rust"]`, positives
+    /// `["async"]`, negatives `["python"]`. A `+`-prefixed run is a
+    /// **must** clause (the doc must contain it), a `-`-prefixed run
+    /// a **must-not** clause (hard exclusion), and a bare run lands
+    /// in `positives`, whose polarity the query layer resolves from
+    /// the default operator (`BoolMode`). A query with no must or
+    /// positive clause is not an error here; the caller checks.
     fn parse<'q>(&self, query: &'q str) -> ParsedQuery<'q> {
         let mut parsed = ParsedQuery::default();
         for run in query.split_whitespace() {
-            match run.strip_prefix('-') {
-                Some(rest) if !rest.is_empty() => {
+            match (run.strip_prefix('-'), run.strip_prefix('+')) {
+                (Some(rest), _) if !rest.is_empty() => {
                     self.tokenize_each_query(rest, &mut |t| parsed.negatives.push(t));
+                }
+                (_, Some(rest)) if !rest.is_empty() => {
+                    self.tokenize_each_query(rest, &mut |t| parsed.musts.push(t));
                 }
                 _ => self.tokenize_each_query(run, &mut |t| parsed.positives.push(t)),
             }
@@ -326,13 +336,60 @@ fn simd_scan_token_run(bytes: &[u8], mut pos: usize) -> (usize, bool, bool) {
     (pos, had_upper, had_non_ascii)
 }
 
-/// A parsed BM25 query: positive (scored) and negative (excluding)
-/// tokens. Tokens may borrow the query string, so this can't outlive
-/// the query.
+/// A parsed BM25 query, split into its clause lists by leading sigil:
+/// `+term` → `musts`, bare `term` → `positives`, `-term` →
+/// `negatives`. Tokens may borrow the query string, so this can't
+/// outlive the query.
 #[derive(Debug, Default)]
 pub struct ParsedQuery<'q> {
+    /// `+`-sigiled tokens: the doc must contain every one.
+    pub musts: Vec<Cow<'q, str>>,
+    /// Bare (sigil-less) tokens. Their polarity comes from the
+    /// default operator: [`BoolMode::And`] treats them as musts,
+    /// [`BoolMode::Or`] as shoulds (scoring-only once any must
+    /// exists; a plain union when none does).
     pub positives: Vec<Cow<'q, str>>,
+    /// `-`-sigiled tokens: any doc containing one is excluded.
     pub negatives: Vec<Cow<'q, str>>,
+}
+
+/// A query's clause lists with the default operator already applied —
+/// what [`ParsedQuery::into_clauses`] produces and the search kernels
+/// consume. `shoulds` is non-empty only under [`BoolMode::Or`].
+#[derive(Debug, Default)]
+pub struct QueryClauses<'q> {
+    /// Every doc in the result must contain all of these.
+    pub musts: Vec<Cow<'q, str>>,
+    /// Scoring-only when `musts` is non-empty; otherwise the match is
+    /// their union.
+    pub shoulds: Vec<Cow<'q, str>>,
+    /// Docs containing any of these are excluded.
+    pub negatives: Vec<Cow<'q, str>>,
+}
+
+impl<'q> ParsedQuery<'q> {
+    /// Resolve the bare tokens' polarity from the default operator
+    /// `mode`: `And` folds them into `musts`, `Or` makes them
+    /// `shoulds`. Sigiled tokens keep their explicit polarity.
+    pub fn into_clauses(self, mode: BoolMode) -> QueryClauses<'q> {
+        let ParsedQuery {
+            mut musts,
+            positives,
+            negatives,
+        } = self;
+        let shoulds = match mode {
+            BoolMode::And => {
+                musts.extend(positives);
+                Vec::new()
+            }
+            BoolMode::Or => positives,
+        };
+        QueryClauses {
+            musts,
+            shoulds,
+            negatives,
+        }
+    }
 }
 
 impl Tokenizer for AsciiLowerTokenizer {
@@ -676,8 +733,99 @@ mod tests {
     #[test]
     fn parse_empty_query() {
         let p = parse("");
+        assert!(p.musts.is_empty());
         assert!(p.positives.is_empty());
         assert!(p.negatives.is_empty());
+    }
+
+    // ---- parse (the `+` must sigil) ----
+
+    #[test]
+    fn parse_must_sigil() {
+        let p = parse("+climate policy");
+        assert_eq!(p.musts, vec!["climate"]);
+        assert_eq!(p.positives, vec!["policy"]);
+        assert!(p.negatives.is_empty());
+    }
+
+    #[test]
+    fn parse_all_must() {
+        let p = parse("+griffith +observatory");
+        assert_eq!(p.musts, vec!["griffith", "observatory"]);
+        assert!(p.positives.is_empty());
+    }
+
+    #[test]
+    fn parse_must_with_negation() {
+        let p = parse("+python -snake -monty");
+        assert_eq!(p.musts, vec!["python"]);
+        assert!(p.positives.is_empty());
+        assert_eq!(p.negatives, vec!["snake", "monty"]);
+    }
+
+    #[test]
+    fn parse_interior_plus_is_not_must() {
+        // `a+b` is one run with an interior `+`; the scan splits it
+        // into two bare tokens. Nothing is a must clause.
+        let p = parse("a+b");
+        assert!(p.musts.is_empty());
+        assert_eq!(p.positives, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_bare_plus_contributes_nothing() {
+        let p = parse("rust + python");
+        assert!(p.musts.is_empty());
+        assert_eq!(p.positives, vec!["rust", "python"]);
+    }
+
+    #[test]
+    fn parse_must_term_is_normalized() {
+        // The must side is lower-cased like the index.
+        let p = parse("+RUST async");
+        assert_eq!(p.musts, vec!["rust"]);
+        assert_eq!(p.positives, vec!["async"]);
+    }
+
+    #[test]
+    fn parse_minus_wins_over_plus_ordering() {
+        // `-` is checked first, so `-+x` negates (strip `-`, the scan
+        // drops the `+`); `+-x` is a must (strip `+`, scan drops `-`).
+        let p = parse("-+x");
+        assert_eq!(p.negatives, vec!["x"]);
+        let p = parse("+-x");
+        assert_eq!(p.musts, vec!["x"]);
+    }
+
+    // ---- into_clauses (default-operator resolution) ----
+
+    #[test]
+    fn into_clauses_or_maps_bare_to_should() {
+        let c = parse("+climate policy -spam").into_clauses(BoolMode::Or);
+        assert_eq!(c.musts, vec!["climate"]);
+        assert_eq!(c.shoulds, vec!["policy"]);
+        assert_eq!(c.negatives, vec!["spam"]);
+    }
+
+    #[test]
+    fn into_clauses_and_folds_bare_into_musts() {
+        let c = parse("+climate policy -spam").into_clauses(BoolMode::And);
+        assert_eq!(c.musts, vec!["climate", "policy"]);
+        assert!(c.shoulds.is_empty());
+        assert_eq!(c.negatives, vec!["spam"]);
+    }
+
+    #[test]
+    fn into_clauses_legacy_shapes_unchanged() {
+        // Sigil-less queries resolve exactly as the pre-clause model:
+        // Or ⇒ all shoulds (union), And ⇒ all musts (intersection).
+        let c = parse("rust async").into_clauses(BoolMode::Or);
+        assert!(c.musts.is_empty());
+        assert_eq!(c.shoulds, vec!["rust", "async"]);
+
+        let c = parse("rust async").into_clauses(BoolMode::And);
+        assert_eq!(c.musts, vec!["rust", "async"]);
+        assert!(c.shoulds.is_empty());
     }
 
     #[test]
