@@ -14,7 +14,12 @@
 //! `<root>/data/seg-abc.sf.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,6 +29,7 @@ use object_store::{
     Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::{ObjectMeta, StorageError, StorageProvider};
 
@@ -95,6 +101,23 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
             source: Box::new(other),
         },
     }
+}
+
+/// Per-root async lock serializing LocalFS conditional PUTs within this process.
+///
+/// The conditional update is a read-then-overwrite bracketed by a blocking file
+/// `flock`. Acquired directly, many concurrent conditional PUTs each block a
+/// tokio worker on that `flock`; once the contenders outnumber the worker
+/// threads, the lock holder can't be scheduled to release and the runtime
+/// deadlocks. Serializing here lets contenders await (yielding the worker)
+/// instead, so only one ever holds the `flock` at a time.
+fn conditional_put_lock(root: &Path) -> Arc<AsyncMutex<()>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry
+        .lock()
+        .expect("conditional-put lock registry poisoned");
+    Arc::clone(map.entry(root.to_path_buf()).or_default())
 }
 
 #[async_trait]
@@ -187,6 +210,10 @@ impl StorageProvider for LocalFsStorageProvider {
             // don't need this scaffolding — see
             // `S3StorageProvider::put_if_match`.
             Some(expected) => {
+                // Serialize contenders in-process so they await here instead of
+                // piling up on the blocking flock below and starving the runtime.
+                let put_lock = conditional_put_lock(&self.root);
+                let _put_guard = put_lock.lock().await;
                 let lock_path = self.root.join("_supertable").join(".lock");
                 // The pointer commit path already creates
                 // `_supertable/` on the first write; doing it
@@ -444,6 +471,63 @@ mod tests {
 
         let (got, _) = p.get("ptr/current").await.expect("get v2");
         assert_eq!(got.as_ref(), b"v2");
+    }
+
+    // Plain std test with an out-of-runtime watchdog: many conditional-PUT
+    // contenders far exceed the worker pool, so if the read-then-overwrite pins
+    // worker threads on the file lock the runtime wedges. A tokio timeout can't
+    // catch that (the frozen runtime never fires its timer), so the deadlock is
+    // detected via `recv_timeout` on the test thread instead.
+    #[test]
+    fn concurrent_put_if_match_does_not_deadlock_runtime() {
+        use std::sync::mpsc;
+
+        let (_dir, p) = provider();
+        let p = Arc::new(p);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let p = Arc::clone(&p);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let results = rt.block_on(async move {
+                    p.put_atomic("ptr/current", Bytes::from_static(b"v0"))
+                        .await
+                        .expect("seed");
+                    let etag = p
+                        .head("ptr/current")
+                        .await
+                        .expect("head")
+                        .etag
+                        .expect("LocalFS etag");
+                    const N: usize = 32;
+                    let tasks = (0..N).map(|i| {
+                        let p = Arc::clone(&p);
+                        let etag = etag.clone();
+                        tokio::spawn(async move {
+                            p.put_if_match("ptr/current", Bytes::from(format!("v{i}")), Some(&etag))
+                                .await
+                        })
+                    });
+                    futures::future::join_all(tasks).await
+                });
+                let _ = tx.send(results);
+            })
+        };
+
+        let results = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("conditional PUT deadlocked the runtime under concurrency");
+        worker.join().expect("worker thread");
+
+        // CAS integrity: exactly one writer wins against the shared etag; every
+        // loser sees PreconditionFailed.
+        let wins = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+        assert_eq!(wins, 1, "exactly one writer should win the CAS");
     }
 
     #[tokio::test]
