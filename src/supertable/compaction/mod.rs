@@ -20,7 +20,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{self, StreamExt},
+};
 use roaring::RoaringBitmap;
 use tokio::time;
 use tracing::warn;
@@ -533,11 +536,16 @@ struct SealedInput {
     etag: Etag,
 }
 
-/// Best-effort: clear every seal this attempt placed, in parallel --
-/// each one is an independent sidecar, so there's no ordering or
-/// shared-state reason to do them one at a time.
+/// Cap on in-flight unseal calls. Single-writer model: one compactor
+/// commits at a time, so there's no throughput reason to fire every
+/// unseal at once.
+const MAX_CONCURRENT_UNSEALS: usize = 8;
+
+/// Best-effort: clear every seal this attempt placed. Each one is an
+/// independent sidecar, so order doesn't matter, but they're bounded
+/// to a small number in flight rather than all at once.
 async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
-    let results = join_all(sealed.into_iter().map(|s| {
+    let results = stream::iter(sealed.into_iter().map(|s| {
         let wal_store = wal_store.clone();
         async move {
             let result =
@@ -545,6 +553,8 @@ async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
             (s.superfile_id, result)
         }
     }))
+    .buffer_unordered(MAX_CONCURRENT_UNSEALS)
+    .collect::<Vec<_>>()
     .await;
     for (superfile_id, result) in results {
         if let Err(e) = result {
