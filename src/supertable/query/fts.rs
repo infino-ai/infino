@@ -783,12 +783,17 @@ impl SupertableReader {
     /// sync→async bridge ([`SupertableReader::block_on`]). Returns up
     /// to `k` hits sorted by BM25 score *descending*.
     ///
-    /// ## Negation (`-term`)
+    /// ## Query clauses (`+term`, `-term`)
     ///
-    /// A `-`-prefixed query term excludes every doc containing it,
-    /// regardless of score; `mode` applies to the positive terms only.
-    /// `"rust -python"` scores docs with `rust`, dropping any that also
-    /// contain `python`. A query with only negated terms is an error.
+    /// A `+`-prefixed term is a **must**: every hit contains it. A
+    /// `-`-prefixed term is a **must-not**: docs containing it are
+    /// excluded, regardless of score. Bare terms take their polarity
+    /// from `mode`, the default operator — `And` requires them like
+    /// musts; `Or` makes them scoring-only **shoulds** when a must
+    /// exists (`"+climate policy"` matches the docs containing
+    /// `climate`, ranking those that also mention `policy` higher)
+    /// and a plain union when none does. A query with only negated
+    /// terms is an error.
     pub fn bm25_hits(
         &self,
         column: &str,
@@ -812,7 +817,10 @@ impl SupertableReader {
 
     /// Unranked token match over this reader's pinned snapshot. Returns
     /// every row whose `column` matches `query`'s tokens under `mode`
-    /// (`Or` = any token, `And` = every token). The returned hits are
+    /// (`Or` = any token, `And` = every token). With a `+must` clause
+    /// the match set is the musts' intersection and bare terms are
+    /// ignored — unranked matching has no scores for a should to
+    /// raise; `-term` exclusions apply. The returned hits are
     /// **unranked** — `score` is `0.0` and order is unspecified — unlike
     /// the ranked [`SupertableReader::bm25_search`]. Drives the async
     /// kernel via the sync→async bridge ([`SupertableReader::block_on`]).
@@ -995,6 +1003,14 @@ impl Supertable {
     /// Single-column BM25 search over the current snapshot, returning
     /// Arrow rows best-score-first (BM25 relevance, higher is better).
     ///
+    /// The query string carries lucene-style clause sigils: `+term`
+    /// is a must (every hit contains it), `-term` a must-not (hard
+    /// exclusion), and bare terms take their polarity from `mode`,
+    /// the default operator (`And` ⇒ must, `Or` ⇒ scoring-only should
+    /// once any must exists). `"+climate policy"` under `Or` matches
+    /// the docs containing `climate` and ranks those also mentioning
+    /// `policy` higher.
+    ///
     /// `score` is a similarity (higher is better) — the opposite
     /// direction from [`Supertable::vector_search`]'s distance. Fuse the
     /// two with [`Supertable::hybrid_search`], not by raw score.
@@ -1047,10 +1063,13 @@ impl Supertable {
 
     /// Unranked token match over one FTS column: every row whose
     /// `column` matches `query`'s tokens under `mode` (`Or` = any token,
-    /// `And` = every token). Returns Arrow rows like
-    /// [`Supertable::bm25_search`], but the `score` column is `0.0` and
-    /// row order is unspecified — a candidate set, not a ranking.
-    /// `projection` follows the same rules as `bm25_search`.
+    /// `And` = every token). With a `+must` clause the match set is
+    /// the musts' intersection and bare terms are ignored (no scores
+    /// for a should to raise); `-term` exclusions apply. Returns
+    /// Arrow rows like [`Supertable::bm25_search`], but the `score`
+    /// column is `0.0` and row order is unspecified — a candidate
+    /// set, not a ranking. `projection` follows the same rules as
+    /// `bm25_search`.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(column = column, mode = ?mode))
@@ -1116,6 +1135,12 @@ impl Supertable {
     /// superfile from the term dictionary's document frequency, so
     /// counting a high-frequency term is cheap.
     ///
+    /// With a `+must` clause the count is the musts' intersection
+    /// cardinality — bare (should) terms affect only scores, never
+    /// which docs count, so `count("+climate policy")` is the number
+    /// of docs containing `climate`. A lone must keeps the O(1) df
+    /// fast path. `-term` exclusions apply as in search.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
@@ -1130,6 +1155,9 @@ impl Supertable {
     /// # )?)?;
     /// let n = posts.count("body", "fox", BoolMode::Or)?;
     /// assert_eq!(n, 1);
+    /// // `+must` defines the count; bare terms are scoring-only:
+    /// let n = posts.count("body", "+quick lazy", BoolMode::Or)?;
+    /// assert_eq!(n, 1); // docs containing `quick`
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {

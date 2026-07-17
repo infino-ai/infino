@@ -47,12 +47,18 @@ use crate::superfile::{
     lazy_source::{LazyByteSource, PrefetchedSource, Source},
 };
 
-/// Boolean-mode for multi-term queries.
+/// Default operator for a query's bare (sigil-less) terms. Terms
+/// carrying an explicit clause sigil keep their polarity regardless
+/// of mode: `+term` is a must (every hit contains it), `-term` a
+/// must-not (hard exclusion).
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum BoolMode {
-    /// All query terms must match the doc.
+    /// Bare terms are musts: all of them must match the doc.
     And,
-    /// Any query term matching contributes to the doc's score.
+    /// Bare terms are shoulds: any of them matching contributes to
+    /// the doc's score. When the query also carries `+must` terms,
+    /// the musts alone define the match set and bare terms become
+    /// scoring-only.
     Or,
 }
 
