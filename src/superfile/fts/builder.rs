@@ -1598,7 +1598,7 @@ impl FtsBuilder {
                 {
                     RawEntryMut::Occupied(mut e) => {
                         *e.get_mut() += 1;
-                        *e.key()
+                        e.key()
                     }
                     RawEntryMut::Vacant(e) => {
                         let bumped: &str = bump.alloc_str(tok);
