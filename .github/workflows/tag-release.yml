@@ -1,0 +1,83 @@
+name: Tag release
+
+# Merging a release PR (stamped by `make release-prep PACKAGE=crate|all`)
+# changes the crate version on main. This workflow notices that, pushes the
+# matching `v<version>` tag, and kicks off the publish workflows — so a
+# release is: run release-prep, merge the PR, done.
+#
+# Tags pushed with the workflow's own GITHUB_TOKEN deliberately do not fire
+# tag-push workflows (GitHub's recursion guard), so after tagging this
+# dispatches the publish workflows explicitly, pinned to the tag ref: the
+# crate always; for a coordinated `vX.Y.0`, Node and Python too — the same
+# split the tag-push path encodes in the workflows' own gates.
+#
+# Binding-only patches (Node/Python bumped, crate untouched) never reach this
+# workflow — they don't change the root Cargo.toml. Those are dispatched
+# manually per docs/versioning.md.
+
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.toml"]
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch the publish workflows
+
+# One tagging run at a time; never cancel one mid-flight.
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag and kick off publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # HEAD^ is the pre-merge main tip (squash and merge commits alike);
+          # depth 2 is enough for the before/after version comparison.
+          fetch-depth: 2
+      # A release merge is "the [package] version changed and its tag doesn't
+      # exist yet". Dependency edits to Cargo.toml leave the version alone and
+      # skip; a deliberately deleted tag stays deleted (version unchanged). A
+      # version *changed to an already-tagged value* is a broken state —
+      # registries are immutable — so that fails loudly instead of re-tagging.
+      - id: detect
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          previous="$(git show HEAD^:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          if [ "$version" = "$previous" ]; then
+            echo "version unchanged ($version); not a release merge"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "::error::Cargo.toml changed to $version but tag v$version already exists"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Refuse to tag an inconsistent tree: the same guard the PR gate runs,
+      # plus the release-line check on the new version.
+      - name: Check the tree is version-consistent
+        if: steps.detect.outputs.release == 'true'
+        run: python3 scripts/check_version_sync.py --release-version "${{ steps.detect.outputs.version }}"
+      - name: Push tag
+        if: steps.detect.outputs.release == 'true'
+        run: |
+          git tag "v${{ steps.detect.outputs.version }}"
+          git push origin "v${{ steps.detect.outputs.version }}"
+      - name: Kick off publish workflows
+        if: steps.detect.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          gh workflow run crate-publish.yml --ref "v$VERSION" -f dry_run=false
+          if [ "${VERSION##*.}" = "0" ]; then
+            gh workflow run node-publish.yml --ref "v$VERSION" -f dry_run=false
+            gh workflow run publish-python.yml --ref "v$VERSION" -f target=pypi
+          fi

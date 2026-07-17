@@ -38,14 +38,14 @@ ROOT = Path(__file__).resolve().parent.parent
 _STRICT_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 FOLLOW_UP = {
-    "crate": "merge the release PR, then push tag v{v} — the crate publishes;"
-             " the bindings' workflows skip a patch tag",
+    "crate": "merge the release PR — the 'Tag release' workflow pushes v{v}"
+             " and kicks off the crate publish (bindings skip a patch)",
     "node": "merge the release PR, then dispatch the 'Node publish' workflow"
             " (uncheck dry_run to publish)",
     "python": "merge the release PR, then dispatch the 'Publish Python"
               " package' workflow (it reads the version from the tree)",
-    "all": "merge the release PR, then push tag v{v} — all three publish"
-           " workflows fire",
+    "all": "merge the release PR — the 'Tag release' workflow pushes v{v}"
+           " and kicks off all three publish workflows",
 }
 
 
