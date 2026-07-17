@@ -18,7 +18,7 @@ use std::{sync::Arc, time::Duration};
 use chrono::{Duration as ChronoDuration, Utc};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    CompactionSettings, OptimizeOptions,
+    CompactionSettings, GcSettings, OptimizeOptions,
     superfile::fts::reader::BoolMode,
     supertable::{
         Supertable,
@@ -299,5 +299,72 @@ async fn optimize_reaps_completed_wal_past_grace() {
         count_dir(&wal_dir),
         0,
         "optimize must reap a completed wal past its grace window"
+    );
+}
+
+#[test]
+fn optimize_honors_overridden_gc_safety_gap() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    // Ten commits so combined live_bytes clear the compaction floor, same
+    // as `compact_then_gc_removes_stale_files_and_preserves_queries`.
+    let markers = [
+        "alphatoken",
+        "betatoken",
+        "gammatoken",
+        "deltatoken",
+        "epsilontoken",
+        "zetatoken",
+        "etatoken",
+        "thetatoken",
+        "iotatoken",
+        "kappatoken",
+    ];
+    for m in &markers {
+        commit_titles(
+            &st,
+            &[&format!("{m} marker"), "filler alpha", "filler bravo"],
+        );
+    }
+
+    let data_dir = dir.path().join("data");
+    let n_commits = count_dir(&data_dir);
+
+    // Default gc_safety_gap (1 day): the stale pre-compaction superfiles
+    // were just written, so optimize()'s bundled gc sweep must not touch
+    // them, even though compaction ran and left them orphaned.
+    st.optimize(&small_optimize_opts())
+        .expect("optimize with default gc_safety_gap");
+    let n_after_compact = st.reader().n_superfiles();
+    assert!(
+        n_after_compact < n_commits,
+        "compaction must have merged the ten commits into fewer superfiles"
+    );
+    assert_eq!(
+        count_dir(&data_dir),
+        n_commits + n_after_compact,
+        "default gc_safety_gap must keep freshly orphaned superfiles on disk \
+         alongside the newly compacted ones"
+    );
+
+    // Zeroing gc_safety_gap on the same table now reclaims them in the
+    // same optimize() call, with no separate st.gc() needed.
+    let opts = OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        ..CompactionSettings::default()
+    })
+    .with_gc(GcSettings::default().with_safety_gap(Duration::ZERO));
+    st.optimize(&opts).expect("optimize with gc safety_gap=0");
+
+    let r = st.reader();
+    assert_eq!(
+        count_dir(&data_dir),
+        r.n_superfiles(),
+        "gc_safety_gap=0 must reclaim every orphaned superfile down to the live set"
     );
 }

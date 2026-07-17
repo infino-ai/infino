@@ -149,7 +149,7 @@ pub use arrow_schema;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
-pub use config::{CompactionSettings, OptimizeOptions};
+pub use config::{CompactionSettings, GcSettings, OptimizeOptions};
 /// The single public error type for the curated API.
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
