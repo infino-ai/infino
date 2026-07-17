@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "infino-node"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-array",

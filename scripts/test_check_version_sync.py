@@ -21,10 +21,13 @@ PLATFORM_PACKAGES = (
 
 
 def write_fixture(root, crate="0.3.4", crate_lock=None, node="0.3.2",
-                  pins=None, python="0.3.5", python_lock=None):
+                  pins=None, node_crate=None, node_crate_lock=None,
+                  python="0.3.5", python_lock=None):
     """Materialize the minimal manifest/lockfile tree the guard reads."""
     root = Path(root)
     crate_lock = crate_lock if crate_lock is not None else crate
+    node_crate = node_crate if node_crate is not None else node
+    node_crate_lock = node_crate_lock if node_crate_lock is not None else node_crate
     python_lock = python_lock if python_lock is not None else python
     pins = pins if pins is not None else {p: node for p in PLATFORM_PACKAGES}
 
@@ -53,7 +56,21 @@ def write_fixture(root, crate="0.3.4", crate_lock=None, node="0.3.2",
         "name": "@infino-ai/infino",
         "version": node,
         "optionalDependencies": pins,
-    }))
+    }, indent=2) + "\n")
+    (node_dir / "Cargo.toml").write_text(
+        "[package]\n"
+        'name = "infino-node"\n'
+        f'version = "{node_crate}"\n'
+    )
+    (node_dir / "Cargo.lock").write_text(
+        "[[package]]\n"
+        'name = "infino"\n'
+        f'version = "{crate}"\n'
+        "\n"
+        "[[package]]\n"
+        'name = "infino-node"\n'
+        f'version = "{node_crate_lock}"\n'
+    )
 
     py_dir = root / "infino-python"
     py_dir.mkdir()
@@ -109,6 +126,23 @@ class CheckVersionSync(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("infx-linux-arm64-musl", errors[0])
         self.assertIn("0.3.1", errors[0])
+
+    def test_node_crate_manifest_out_of_step_with_package_json_fails(self):
+        # infino-node/Cargo.toml is unpublished (`publish = false`) but its
+        # version must track package.json so no version file lies.
+        write_fixture(self.root, node="0.3.2", node_crate="0.3.1",
+                      node_crate_lock="0.3.1")
+        errors = check(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("infino-node/Cargo.toml", errors[0])
+        self.assertIn("0.3.1", errors[0])
+
+    def test_node_crate_lockfile_behind_manifest_fails(self):
+        write_fixture(self.root, node="0.3.2", node_crate="0.3.2",
+                      node_crate_lock="0.3.1")
+        errors = check(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("infino-node/Cargo.lock", errors[0])
 
     def test_crate_lockfile_behind_manifest_fails(self):
         # A version bump that skips Cargo.lock breaks `cargo publish --locked`

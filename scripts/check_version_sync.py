@@ -112,6 +112,25 @@ def check(root, release_version=None):
                     f"the package version is {node}; the platform pins "
                     f"track the package version"
                 )
+        # The node crate is unpublished (`publish = false`), but its version
+        # must track package.json so no committed version file lies.
+        node_crate = manifest_version(root / "infino-node" / "Cargo.toml")
+        if node_crate != node:
+            errors.append(
+                f"infino-node/Cargo.toml records {node_crate} but "
+                f"infino-node/package.json says {node}; the node crate "
+                f"manifest tracks the npm package version"
+            )
+        else:
+            node_crate_locked = locked_version(
+                root / "infino-node" / "Cargo.lock", "infino-node"
+            )
+            if node_crate_locked != node_crate:
+                errors.append(
+                    f"infino-node/Cargo.lock records infino-node "
+                    f"{node_crate_locked} but infino-node/Cargo.toml says "
+                    f"{node_crate}; regenerate the lockfile"
+                )
 
     python = manifest_version(root / "infino-python" / "Cargo.toml")
     if python is None:

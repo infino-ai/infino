@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Stamp every version file for a release, per docs/versioning.md.
+
+One engine, three published packages, three kinds of release:
+
+  release_prep.py --package crate  --version 0.1.5   # engine patch
+  release_prep.py --package node   --version 0.1.5   # Node-only patch
+  release_prep.py --package python --version 0.1.6   # Python-only patch
+  release_prep.py --package all    --version 0.2.0   # coordinated minor/major
+
+A single-package bump must stay on the crate's `major.minor` release line
+and move that package strictly forward (registries are immutable — every
+publish needs a fresh version). A coordinated release must have patch 0
+(the binding publish workflows key on the `.0` tag suffix) and moves all
+three packages onto the new line together.
+
+Each scope stamps every file that carries that package's version — manifest,
+lockfile, and for Node the `infx-*` platform pins — then re-runs the
+version-sync guard as a self-check, and prints the follow-up step (which tag
+to push or which workflow to dispatch).
+
+Plain `X.Y.Z` versions only; pre-releases are rare enough to stamp by hand.
+Typical use, from the repo root:
+
+  make release-prep PACKAGE=node VERSION=0.1.5
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+from check_version_sync import check, manifest_version, release_line
+
+ROOT = Path(__file__).resolve().parent.parent
+
+_STRICT_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+FOLLOW_UP = {
+    "crate": "merge the release PR, then push tag v{v} — the crate publishes;"
+             " the bindings' workflows skip a patch tag",
+    "node": "merge the release PR, then dispatch the 'Node publish' workflow"
+            " (uncheck dry_run to publish)",
+    "python": "merge the release PR, then dispatch the 'Publish Python"
+              " package' workflow (it reads the version from the tree)",
+    "all": "merge the release PR, then push tag v{v} — all three publish"
+           " workflows fire",
+}
+
+
+class ReleasePrepError(Exception):
+    """A requested release violates the versioning contract."""
+
+
+def parse_version(version):
+    m = _STRICT_VERSION.match(version)
+    if not m:
+        raise ReleasePrepError(
+            f"version must be plain X.Y.Z (got {version!r}); stamp"
+            f" pre-releases by hand"
+        )
+    return tuple(int(part) for part in m.groups())
+
+
+def stamp_manifest(path, version):
+    """Rewrite the `[package]` version of a Cargo.toml."""
+    text, count = re.subn(
+        r'(?m)^version = "[^"]*"', f'version = "{version}"',
+        path.read_text(), count=1,
+    )
+    if count != 1:
+        raise ReleasePrepError(f"no [package] version found in {path}")
+    path.write_text(text)
+
+
+def stamp_lock(path, name, version):
+    """Rewrite the version Cargo.lock records for package `name`."""
+    text, count = re.subn(
+        rf'(?ms)(\[\[package\]\]\nname = "{name}"\nversion = ")[^"]*(")',
+        rf"\g<1>{version}\g<2>", path.read_text(), count=1,
+    )
+    if count != 1:
+        raise ReleasePrepError(f"no {name} entry found in {path}")
+    path.write_text(text)
+
+
+def stamp_node_package(path, version):
+    """Rewrite package.json's version and its infx-* platform pins."""
+    manifest = json.loads(path.read_text())
+    manifest["version"] = version
+    for pin in manifest.get("optionalDependencies", {}):
+        if pin.startswith("infx-"):
+            manifest["optionalDependencies"][pin] = version
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+
+
+def current_versions(root):
+    return {
+        "crate": manifest_version(root / "Cargo.toml"),
+        "node": json.loads(
+            (root / "infino-node" / "package.json").read_text()
+        )["version"],
+        "python": manifest_version(root / "infino-python" / "Cargo.toml"),
+    }
+
+
+def validate(root, package, version):
+    """Raise ReleasePrepError unless the bump obeys the versioning rules."""
+    requested = parse_version(version)
+    current = current_versions(root)
+    crate = current["crate"]
+
+    if package == "all":
+        if requested[2] != 0:
+            raise ReleasePrepError(
+                f"a coordinated release needs patch 0 (got {version}); the"
+                f" binding publish workflows fire only on a vX.Y.0 tag"
+            )
+        for name, cur in current.items():
+            if requested <= parse_version(cur):
+                raise ReleasePrepError(
+                    f"coordinated version {version} does not move {name}"
+                    f" forward (currently {cur})"
+                )
+    else:
+        if release_line(version) != release_line(crate):
+            raise ReleasePrepError(
+                f"a {package} patch must stay on the crate's release line"
+                f" {release_line(crate)} (got {version}); changing the line"
+                f" is a coordinated release (--package all)"
+            )
+        cur = current[package]
+        if requested <= parse_version(cur):
+            raise ReleasePrepError(
+                f"{package} is already at {cur}; the new version must move"
+                f" it strictly forward (got {version})"
+            )
+
+
+def prepare(root, package, version):
+    """Validate, then stamp every file carrying `package`'s version.
+
+    Returns the repo-relative paths that were rewritten. Nothing is written
+    if validation fails.
+    """
+    root = Path(root)
+    validate(root, package, version)
+
+    changed = []
+    if package in ("crate", "all"):
+        stamp_manifest(root / "Cargo.toml", version)
+        stamp_lock(root / "Cargo.lock", "infino", version)
+        changed += ["Cargo.toml", "Cargo.lock"]
+    if package in ("node", "all"):
+        stamp_node_package(root / "infino-node" / "package.json", version)
+        stamp_manifest(root / "infino-node" / "Cargo.toml", version)
+        stamp_lock(root / "infino-node" / "Cargo.lock", "infino-node", version)
+        changed += ["infino-node/package.json", "infino-node/Cargo.toml",
+                    "infino-node/Cargo.lock"]
+    if package in ("python", "all"):
+        stamp_manifest(root / "infino-python" / "Cargo.toml", version)
+        stamp_lock(root / "infino-python" / "Cargo.lock", "infino-python",
+                   version)
+        changed += ["infino-python/Cargo.toml", "infino-python/Cargo.lock"]
+
+    drift = check(root)
+    if drift:
+        raise ReleasePrepError(
+            "stamping left the tree inconsistent (bug in this script):\n  "
+            + "\n  ".join(drift)
+        )
+    return changed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", required=True,
+                        choices=["crate", "node", "python", "all"])
+    parser.add_argument("--version", required=True,
+                        help="new version, plain X.Y.Z")
+    args = parser.parse_args()
+
+    try:
+        changed = prepare(ROOT, args.package, args.version)
+    except ReleasePrepError as error:
+        print(f"release-prep: {error}", file=sys.stderr)
+        return 1
+
+    print(f"stamped {args.package} -> {args.version}:")
+    for path in changed:
+        print(f"  {path}")
+    print("\nnext steps:")
+    print(f"  1. commit on a branch and open the release PR, e.g.:")
+    print(f"       git checkout -b release-{args.package}-{args.version}")
+    print(f"       git commit -am 'release: {args.package} {args.version}'")
+    print(f"  2. {FOLLOW_UP[args.package].format(v=args.version)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,12 +1,14 @@
 name: Publish Python package
 
 # Release of the `infino` Python package: validate the version, build one binary
-# wheel per platform/arch, then upload. A `v<version>` tag publishes to real
-# PyPI with the version derived from the tag — but ONLY for a coordinated
-# minor/major release (patch == 0, e.g. `v0.2.0`); a crate-only patch tag (e.g.
-# `v0.1.1`) is skipped, since patch is independent per package. A manual run
-# (workflow_dispatch) — the path for an independent Python patch — chooses the
-# version and the PyPI (default) / TestPyPI target.
+# wheel per platform/arch, then upload. The version is the one committed in
+# `infino-python/Cargo.toml` (stamped by `make release-prep`). A `v<version>`
+# tag publishes to real PyPI after asserting the tag matches the tree — but
+# ONLY for a coordinated minor/major release (patch == 0, e.g. `v0.2.0`); a
+# crate-only patch tag (e.g. `v0.1.1`) is skipped, since patch is independent
+# per package. A manual run (workflow_dispatch) — the path for an independent
+# Python patch — publishes the tree's version to the PyPI (default) / TestPyPI
+# target.
 #
 # Two facts shape the whole pipeline:
 #   - abi3 (pyo3 `abi3-py39`) → a single wheel per platform/arch covers all
@@ -20,10 +22,6 @@ on:
     tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version, SemVer (e.g. 0.1.0, 0.1.0-rc.1)"
-        required: true
-        type: string
       target:
         description: "Index to publish to"
         required: true
@@ -62,18 +60,24 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       target: ${{ steps.check.outputs.target }}
     steps:
-      # On a tag push, derive the version from the tag (`v0.1.0` -> `0.1.0`) and
-      # publish to real PyPI; a manual run uses its inputs (PyPI default).
-      # Reject a non-SemVer version before the matrix spins up: Cargo's
-      # `version` requires SemVer (it rejects PEP 440 like `0.1.0rc1`), and
-      # maturin renders SemVer to the wheel's PEP 440 (`0.1.0-rc.1` → `0.1.0rc1`).
+      - uses: actions/checkout@v5
+      # The version is the one committed in infino-python/Cargo.toml (stamped
+      # by `make release-prep`). On a tag push, assert the tag matches it — a
+      # coordinated release can't ship an unstamped tree. Reject a non-SemVer
+      # version before the matrix spins up: Cargo's `version` requires SemVer
+      # (it rejects PEP 440 like `0.1.0rc1`), and maturin renders SemVer to
+      # the wheel's PEP 440 (`0.1.0-rc.1` → `0.1.0rc1`).
       - id: check
         run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' infino-python/Cargo.toml | head -1)"
           if [ "${{ github.event_name }}" = "push" ]; then
-            version="${GITHUB_REF_NAME#v}"
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag v$tag does not match infino-python/Cargo.toml version $version"
+              exit 1
+            fi
             target="pypi"
           else
-            version="${{ inputs.version }}"
             target="${{ inputs.target }}"
           fi
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
@@ -82,10 +86,9 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v5
       # The version about to publish must sit on the crate's major.minor
-      # release line (docs/versioning.md). Catches a mistyped manual dispatch
-      # — previously unvalidated — before the wheel matrix spins up.
+      # release line (docs/versioning.md), and the whole tree must be
+      # version-consistent, before the wheel matrix spins up.
       - name: Check version against the crate's release line
         run: python3 scripts/check_version_sync.py --release-version "${{ steps.check.outputs.version }}"
 
@@ -129,36 +132,9 @@ jobs:
           python-version: "3.12"
 
       # Version is dynamic (pyproject `dynamic = ["version"]`) → maturin reads
-      # it from Cargo.toml. Stamp it into Cargo.toml *and* Cargo.lock so the
-      # build stays --locked. python3 over sed: one script, every runner,
-      # Windows included.
-      - name: Stamp version
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          python3 - "$VERSION" <<'PY'
-          import pathlib, re, sys
-
-          version = sys.argv[1]
-
-          toml = pathlib.Path("infino-python/Cargo.toml")
-          patched, count = re.subn(
-              r'(?m)^version = "[^"]*"', f'version = "{version}"',
-              toml.read_text(), count=1)
-          assert count == 1, "[package] version not found in Cargo.toml"
-          toml.write_text(patched)
-
-          lock = pathlib.Path("infino-python/Cargo.lock")
-          patched, count = re.subn(
-              r'(?ms)(\[\[package\]\]\nname = "infino-python"\nversion = ")[^"]*(")',
-              rf"\g<1>{version}\g<2>", lock.read_text(), count=1)
-          assert count == 1, "infino-python entry not found in Cargo.lock"
-          lock.write_text(patched)
-
-          print(f"stamped infino-python -> {version}")
-          PY
-
+      # it straight from the committed infino-python/Cargo.toml; `make
+      # release-prep` stamps Cargo.toml and Cargo.lock together, so the build
+      # stays --locked with no CI-side rewriting.
       # `manylinux` is honored only for Linux targets and ignored elsewhere;
       # musl targets need the musllinux image, every other target builds glibc.
       # `sccache` caches inside the container, avoiding a host cache whose glibc mismatches it.

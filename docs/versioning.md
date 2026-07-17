@@ -52,6 +52,12 @@ contract for how their versions relate.
 
 ## How to release
 
+Stamp the version files with `make release-prep PACKAGE=<crate|node|python|all>
+VERSION=X.Y.Z` — it validates the bump against the rules above, rewrites every
+file carrying that package's version (manifest, lockfile, and the Node
+platform pins), re-runs the drift guard, and prints the follow-up step. Land
+the stamped change as an ordinary PR, then trigger the publish:
+
 A `v<version>` tag is the release trigger; what it publishes depends on whether
 it is a patch or a coordinated minor/major.
 
@@ -72,8 +78,11 @@ it is a patch or a coordinated minor/major.
   field.) The bindings must never ship a new minor before their code exposes that
   minor's engine changes.
 - **Binding-only patch** (Node or Python, independent of the crate's patch) — bump
-  that binding's version and run its workflow **manually** (`Node publish` /
-  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched.
+  that binding's version (`make release-prep PACKAGE=node|python VERSION=…`),
+  land it, then run its workflow **manually** (`Node publish` /
+  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched. Both
+  workflows publish the version committed in the tree — Node from
+  `infino-node/package.json`, Python from `infino-python/Cargo.toml`.
 
 **Patch counters are independent per package and never shared**, so the crate's
 patch and a binding's patch can never collide on a registry — only `major.minor`

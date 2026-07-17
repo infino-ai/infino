@@ -2,7 +2,7 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update api-parity api-parity-update \
-        version-sync doc-check \
+        version-sync release-prep doc-check \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -55,6 +55,14 @@ api-parity-update:
 version-sync:
 	python3 -m unittest discover -s scripts -q
 	python3 scripts/check_version_sync.py
+
+# Stamp every version file for a release and print the follow-up step.
+# PACKAGE selects the scope: crate | node | python (single-package patch,
+# stays on the crate's release line) or all (coordinated minor/major,
+# patch must be 0). See docs/versioning.md.
+#   make release-prep PACKAGE=node VERSION=0.1.5
+release-prep:
+	python3 scripts/release_prep.py --package $(PACKAGE) --version $(VERSION)
 
 # Doc-surface gate. Every public item on the default (docs.rs) surface must be
 # documented, and every intra-doc link must resolve. Uses default features so
