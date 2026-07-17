@@ -58,11 +58,13 @@ version-sync:
 
 # Stamp every version file for a release and print the follow-up step.
 # PACKAGE selects the scope: crate | node | python (single-package patch,
-# stays on the crate's release line) or all (coordinated minor/major,
-# patch must be 0). See docs/versioning.md.
+# stays on the crate's release line), each (every package to its own next
+# patch; no VERSION), or all (coordinated minor/major, patch must be 0).
+# See docs/versioning.md.
 #   make release-prep PACKAGE=node VERSION=0.1.5
+#   make release-prep PACKAGE=each
 release-prep:
-	python3 scripts/release_prep.py --package $(PACKAGE) --version $(VERSION)
+	python3 scripts/release_prep.py --package $(PACKAGE) $(if $(VERSION),--version $(VERSION))
 
 # Doc-surface gate. Every public item on the default (docs.rs) surface must be
 # documented, and every intra-doc link must resolve. Uses default features so

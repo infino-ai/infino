@@ -104,6 +104,29 @@ class Prepare(unittest.TestCase):
         with self.assertRaisesRegex(ReleasePrepError, "does not move"):
             prepare(self.root, "all", "0.3.0")
 
+    def test_each_bumps_every_package_to_its_own_next_patch(self):
+        # crate 0.3.4 / node 0.3.2 / python 0.3.5 move independently —
+        # divergent patch counters stay divergent, everyone steps forward.
+        changed = prepare(self.root, "each")
+        self.assertEqual(len(changed), 7)
+        self.assertEqual(manifest_version(self.root / "Cargo.toml"), "0.3.5")
+        manifest = self.node_manifest()
+        self.assertEqual(manifest["version"], "0.3.3")
+        for pin in PLATFORM_PACKAGES:
+            self.assertEqual(manifest["optionalDependencies"][pin], "0.3.3")
+        self.assertEqual(
+            manifest_version(self.root / "infino-python" / "Cargo.toml"), "0.3.6"
+        )
+        self.assertEqual(check(self.root), [])
+
+    def test_each_rejects_an_explicit_version(self):
+        with self.assertRaisesRegex(ReleasePrepError, "next patch"):
+            prepare(self.root, "each", "0.4.0")
+
+    def test_single_package_scope_requires_a_version(self):
+        with self.assertRaisesRegex(ReleasePrepError, "required"):
+            prepare(self.root, "crate", None)
+
     def test_rejects_malformed_version(self):
         with self.assertRaisesRegex(ReleasePrepError, "X.Y.Z"):
             prepare(self.root, "crate", "1.2")

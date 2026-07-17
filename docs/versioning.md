@@ -55,8 +55,11 @@ contract for how their versions relate.
 Stamp the version files with `make release-prep PACKAGE=<crate|node|python|all>
 VERSION=X.Y.Z` — it validates the bump against the rules above, rewrites every
 file carrying that package's version (manifest, lockfile, and the Node
-platform pins), re-runs the drift guard, and prints the follow-up step. Land
-the stamped change as an ordinary PR, then trigger the publish:
+platform pins), re-runs the drift guard, and prints the follow-up step.
+`make release-prep PACKAGE=each` (no `VERSION`) bumps every package to its own
+next patch in one go — for a fix that genuinely ships in all three; patch
+counters stay independent. Land the stamped change as an ordinary PR, then
+trigger the publish:
 
 A `v<version>` tag is the release trigger; what it publishes depends on whether
 it is a patch or a coordinated minor/major.
