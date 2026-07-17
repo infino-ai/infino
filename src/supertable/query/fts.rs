@@ -1224,6 +1224,7 @@ mod tests {
             schema_id_title(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),
@@ -1258,6 +1259,7 @@ mod tests {
             "_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),

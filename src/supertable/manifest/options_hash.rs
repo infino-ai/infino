@@ -83,6 +83,18 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
     for c in &opts.fts_columns {
         push_str(&mut buf, &c.column);
     }
+    // 3b. positions flags — appended as a tagged block, and ONLY when
+    //     some column opts in. An all-false table's stream stays
+    //     byte-identical to hashes stamped before positions existed,
+    //     so pre-positions manifests keep verifying; a positional
+    //     table hashes differently from its positionless twin (the
+    //     built superfiles differ, so the options identity must too).
+    if opts.fts_columns.iter().any(|c| c.positions) {
+        push_tag(&mut buf, b"fts_positions");
+        for c in &opts.fts_columns {
+            buf.push(c.positions as u8);
+        }
+    }
 
     // 4. vector_columns (same declared-order rationale).
     push_tag(&mut buf, b"vector_columns");
@@ -235,6 +247,7 @@ mod tests {
             schema_title_only(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -275,6 +288,7 @@ mod tests {
             )])),
             vec![FtsConfig {
                 column: "body".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -299,6 +313,7 @@ mod tests {
             )])),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -325,9 +340,11 @@ mod tests {
             vec![
                 FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 },
                 FtsConfig {
                     column: "subtitle".into(),
+                    positions: false,
                 },
             ],
             vec![],
@@ -354,9 +371,11 @@ mod tests {
             vec![
                 FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 },
                 FtsConfig {
                     column: "subtitle".into(),
+                    positions: false,
                 },
             ],
             vec![],
@@ -368,9 +387,11 @@ mod tests {
             vec![
                 FtsConfig {
                     column: "subtitle".into(),
+                    positions: false,
                 },
                 FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 },
             ],
             vec![],
@@ -382,6 +403,61 @@ mod tests {
         assert_ne!(h_a.0, h_b.0);
     }
 
+    /// The positions flag is hashed via a tagged block appended ONLY
+    /// when some column opts in. Three properties pin the
+    /// compatibility contract:
+    ///   1. all-false hashes stay stable against a golden value, so
+    ///      manifests stamped before positions existed keep
+    ///      verifying (the golden guards future encoding drift);
+    ///   2. flipping a column to positional changes the hash;
+    ///   3. WHICH column is positional matters (per-column bytes,
+    ///      not a single any() bit).
+    #[test]
+    fn compute_options_hash_positions_flag() {
+        let schema_two = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("subtitle", DataType::LargeUtf8, false),
+        ]));
+        let opts = |title_pos: bool, subtitle_pos: bool| {
+            SupertableOptions::new(
+                schema_two.clone(),
+                vec![
+                    FtsConfig {
+                        column: "title".into(),
+                        positions: title_pos,
+                    },
+                    FtsConfig {
+                        column: "subtitle".into(),
+                        positions: subtitle_pos,
+                    },
+                ],
+                vec![],
+                Some(default_tokenizer()),
+            )
+            .expect("opts")
+        };
+        let h_ff = compute_options_hash(&opts(false, false), &time_range());
+        let h_tf = compute_options_hash(&opts(true, false), &time_range());
+        let h_ft = compute_options_hash(&opts(false, true), &time_range());
+        assert_ne!(h_ff.0, h_tf.0, "positional column must change the hash");
+        assert_ne!(h_tf.0, h_ft.0, "which column is positional must matter");
+
+        // Golden: the all-false stream contains no positions block, so
+        // this value equals what pre-positions code produced for the
+        // same options. If this assertion ever fails, the encoding
+        // drifted and every existing table would fail open-validation.
+        let hex: String = h_ff.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, ALL_FALSE_GOLDEN_HEX);
+    }
+
+    /// blake3 of the two-fts-column, all-positions-false fixture in
+    /// [`compute_options_hash_positions_flag`], captured from the
+    /// encoding as it existed before the positions flag — the
+    /// all-false stream appends no positions block, so the bytes are
+    /// identical by construction.
+    const ALL_FALSE_GOLDEN_HEX: &str =
+        "a89715d00cba061aed0b06910a2fde77a9b980c1f7a25c1d5eca901790c6f24a";
+
     #[test]
     fn compute_options_hash_changes_with_vector_columns() {
         // Adding a vector column changes the vector_columns
@@ -392,6 +468,7 @@ mod tests {
             schema_title_emb(16),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

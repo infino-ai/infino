@@ -126,15 +126,19 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
         vec![
             FtsConfig {
                 column: TITLE_COLUMN.into(),
+                positions: false,
             },
             FtsConfig {
                 column: BUCKET_COLUMN.into(),
+                positions: false,
             },
             FtsConfig {
                 column: KEY_COLUMN.into(),
+                positions: false,
             },
             FtsConfig {
                 column: CATEGORY_COLUMN.into(),
+                positions: false,
             },
         ],
         vec![VectorConfig {

@@ -80,6 +80,7 @@ fn build_test_bytes() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -324,6 +325,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", LAZY_VEC_ROT_SEED)],
         Some(default_tokenizer()),

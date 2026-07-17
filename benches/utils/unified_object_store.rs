@@ -239,6 +239,7 @@ fn build_superfile_bytes() -> Bytes {
         ID_COLUMN,
         vec![FtsConfig {
             column: FTS_COLUMN.into(),
+            positions: false,
         }],
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
@@ -1899,6 +1900,7 @@ pub(crate) mod diag {
             schema,
             vec![FtsConfig {
                 column: FTS_COLUMN.into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: VEC_COLUMN.into(),

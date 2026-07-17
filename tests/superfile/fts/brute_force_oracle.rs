@@ -120,6 +120,7 @@ pub fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),

@@ -205,6 +205,7 @@ pub fn default_supertable_options() -> SupertableOptions {
         schema_id_title(),
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),

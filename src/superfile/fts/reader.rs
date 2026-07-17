@@ -197,6 +197,9 @@ pub struct ColumnMeta {
     /// add + mul vs recomputing on the fly. Computed once per
     /// reader at `open` time.
     pub dl_norm_k1: Vec<f32>,
+    /// Whether this column's index carries token positions (from
+    /// `inf.fts.columns`); phrase queries require it.
+    pub positions: bool,
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV
@@ -211,6 +214,12 @@ pub struct FtsColumnConfig {
     /// been emitted with it implicitly.
     #[serde(default = "default_tokenizer")]
     pub tokenizer: String,
+    /// Whether this column's index records token positions (phrase
+    /// support). Files written before positions existed lack the
+    /// field, which can only mean no positions — so a missing field
+    /// deserializes to `false`.
+    #[serde(default)]
+    pub positions: bool,
 }
 
 fn default_tokenizer() -> String {
@@ -578,6 +587,7 @@ impl FtsReader {
                 doc_lengths_range: doc_lengths_offset..array_end,
                 avgdl,
                 dl_norm_k1,
+                positions: col_cfg.positions,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }

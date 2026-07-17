@@ -1125,6 +1125,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![SfVectorConfig {
             column: "emb".into(),
@@ -1171,6 +1172,7 @@ pub fn build_superfile_with_metric(
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![SfVectorConfig {
             column: "emb".into(),

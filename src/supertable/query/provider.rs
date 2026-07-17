@@ -1883,6 +1883,7 @@ mod tests {
             cat_title_schema(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),

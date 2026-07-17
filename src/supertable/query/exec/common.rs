@@ -722,6 +722,7 @@ mod tests {
             schema,
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

@@ -232,6 +232,7 @@ mod tests {
     fn fc(name: &str) -> FtsConfig {
         FtsConfig {
             column: name.into(),
+            positions: false,
         }
     }
 

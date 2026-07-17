@@ -425,6 +425,7 @@ mod tests {
                 schema,
                 vec![FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 }],
                 vec![],
                 Some(tk),

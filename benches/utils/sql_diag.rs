@@ -132,6 +132,7 @@ fn supertable_options() -> SupertableOptions {
         baseline_schema(),
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),

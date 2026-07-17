@@ -932,6 +932,7 @@ mod tests {
             schema_with_vector(dim),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
@@ -995,6 +996,7 @@ mod tests {
             "_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: "emb".into(),

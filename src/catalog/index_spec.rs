@@ -92,6 +92,7 @@ impl IndexSpec {
             .iter()
             .map(|column| FtsConfig {
                 column: column.clone(),
+                positions: false,
             })
             .collect();
         let vectors = self

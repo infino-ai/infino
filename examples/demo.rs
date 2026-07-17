@@ -84,6 +84,7 @@ fn demo_superfile() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![VectorConfig::new(
             "emb".into(),

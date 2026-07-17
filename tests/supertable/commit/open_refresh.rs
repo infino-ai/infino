@@ -252,6 +252,7 @@ fn open_rejects_mismatched_options_via_options_hash() {
         other_schema,
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(tk),

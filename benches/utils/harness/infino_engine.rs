@@ -47,6 +47,7 @@ fn build_superfile(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
         ID_COLUMN,
         vec![FtsConfig {
             column: column.to_string(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),

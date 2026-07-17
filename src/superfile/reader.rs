@@ -1409,6 +1409,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -1776,9 +1777,11 @@ mod tests {
             vec![
                 FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 },
                 FtsConfig {
                     column: "body".into(),
+                    positions: false,
                 },
             ],
             vec![],

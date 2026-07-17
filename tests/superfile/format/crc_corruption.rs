@@ -61,6 +61,7 @@ fn build_corruptable_superfile() -> Vec<u8> {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", CRC_TEST_ROT_SEED)],
         Some(default_tokenizer()),

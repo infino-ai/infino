@@ -288,6 +288,7 @@ async fn vector_query_excludes_tombstoned_row() {
         schema_with_vec(),
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("embedding", VECTOR_ROT_SEED)],
         Some(tk),
@@ -475,6 +476,7 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
             schema(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("embedding", VECTOR_ROT_SEED)],
             Some(tk),

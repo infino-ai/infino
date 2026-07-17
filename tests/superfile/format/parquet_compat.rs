@@ -86,6 +86,7 @@ fn build_planted_superfile() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", PARQUET_COMPAT_ROT_SEED)],
         Some(default_tokenizer()),
