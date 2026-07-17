@@ -781,8 +781,8 @@ pub mod fts {
             exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
         }
 
-        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
-            self.reader.count_matching(column, terms, mode)
+        fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
+            self.reader.count_matching(column, query, mode)
         }
     }
 

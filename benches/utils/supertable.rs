@@ -873,10 +873,10 @@ pub mod fts {
         fn count_matching(
             &self,
             column: &str,
-            terms: &[&str],
+            query: &str,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> u64 {
-            self.consumer.reader().count_matching(column, terms, mode)
+            self.consumer.reader().count_matching(column, query, mode)
         }
     }
 }

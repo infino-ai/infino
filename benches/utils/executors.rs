@@ -178,7 +178,13 @@ pub mod fts {
     use std::collections::HashMap;
 
     use infino::{
-        superfile::{SuperfileReader, fts::reader::BoolMode as InfinoBoolMode},
+        superfile::{
+            SuperfileReader,
+            fts::{
+                reader::BoolMode as InfinoBoolMode,
+                tokenize::{AsciiLowerTokenizer, Tokenizer},
+            },
+        },
         supertable::SupertableReader,
     };
 
@@ -377,6 +383,23 @@ pub mod fts {
             ],
             mode: BoolMode::And,
         },
+        // Mixed clause shapes (`+must` + bare shoulds under Or): the
+        // must intersection drives the walk, shoulds are scoring-only.
+        FtsQuery {
+            name: "must_common_should_common",
+            terms: &["+term00050", "term00001"],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "must_rare_should_common",
+            terms: &["+term09999", "term00001"],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "must_two_should_two",
+            terms: &["+term00050", "+term00051", "term00001", "term00052"],
+            mode: BoolMode::Or,
+        },
     ];
 
     /// OR query names, in table order.
@@ -400,6 +423,13 @@ pub mod fts {
         "three_similar_and",
         "five_term_and",
         "ten_term_and",
+    ];
+
+    /// Mixed must/should clause query names, in table order.
+    pub const CLAUSE_QUERIES: &[&str] = &[
+        "must_common_should_common",
+        "must_rare_should_common",
+        "must_two_should_two",
     ];
 
     pub fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
@@ -465,9 +495,10 @@ pub mod fts {
         /// Count phase: the matching-doc count from the dedicated count
         /// primitives — single-term `term_df` (O(1) from the dictionary
         /// header), multi-term `token_match` cardinality — with no BM25
-        /// scoring and no row materialization. `terms` are the
-        /// already-tokenized query terms.
-        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64;
+        /// scoring and no row materialization. `query` is the raw query
+        /// string so `+must` clause sigils resolve exactly as the
+        /// production count path resolves them.
+        fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64;
     }
 
     /// Fetch-phase measurement for a raw superfile reader: kernel hits,
@@ -510,20 +541,32 @@ pub mod fts {
             superfile_rows_fetched(self, column, query, k, mode)
         }
 
-        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
+        fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
             crate::tiers::block_on(async {
+                // Resolve the match set exactly as the supertable count
+                // does: with `+must` clauses, the count is the musts'
+                // intersection (shoulds only affect scores, so they
+                // never change which docs count); otherwise the bare
+                // terms match under `mode`.
+                let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+                let (terms, eff_mode) = if clauses.musts.is_empty() {
+                    (clauses.shoulds, mode)
+                } else {
+                    (clauses.musts, InfinoBoolMode::And)
+                };
+                let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
                 // Single term: df is the exact match count, read O(1) from
                 // the dictionary header. Multi-term: the dedicated count
                 // primitive (union/intersection cardinality, no scoring,
                 // no id materialization) — the same path the supertable
                 // count uses, not `token_match().len()` (which would
                 // materialize the id list through the slower merge walk).
-                if terms.len() == 1 {
-                    self.term_df(column, terms[0])
+                if refs.len() == 1 {
+                    self.term_df(column, refs[0])
                         .await
                         .expect("superfile term_df")
                 } else {
-                    self.token_match_count(column, terms, mode)
+                    self.token_match_count(column, &refs, eff_mode)
                         .await
                         .expect("superfile token_match_count")
                 }
@@ -554,9 +597,8 @@ pub mod fts {
                 .sum()
         }
 
-        fn count_matching(&self, column: &str, terms: &[&str], mode: InfinoBoolMode) -> u64 {
-            let query = terms.join(" ");
-            self.count(column, &query, mode).expect("supertable count")
+        fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
+            self.count(column, query, mode).expect("supertable count")
         }
     }
 
@@ -765,13 +807,21 @@ pub mod fts {
         };
         let and_block = Block {
             subtitle: "AND queries".into(),
-            headers: header_cols,
+            headers: header_cols.clone(),
             rows: AND_QUERIES
                 .iter()
                 .map(|&n| search_row(n, warm_map.as_ref(), cold))
                 .collect(),
         };
-        let mut blocks = vec![or_block, and_block];
+        let clause_block = Block {
+            subtitle: "Must/should queries (+must, bare should)".into(),
+            headers: header_cols,
+            rows: CLAUSE_QUERIES
+                .iter()
+                .map(|&n| search_row(n, warm_map.as_ref(), cold))
+                .collect(),
+        };
+        let mut blocks = vec![or_block, and_block, clause_block];
         if let Some(probes) = probes {
             blocks.push(Block {
                 subtitle: "Per-algorithm probes (WAND+BMW vs MaxScore+BMM)".into(),
@@ -822,11 +872,12 @@ pub mod fts {
             .map(|q| {
                 eprintln!("[{log_prefix}] count: query {}...", q.name);
                 let mode = to_infino_mode(q.mode);
-                let n = reader.count_matching(column, q.terms, mode);
+                let query = q.terms.join(" ");
+                let n = reader.count_matching(column, &query, mode);
                 let mut samples = Vec::with_capacity(iters);
                 for _ in 0..iters {
                     let t = Instant::now();
-                    let got = reader.count_matching(column, q.terms, mode);
+                    let got = reader.count_matching(column, &query, mode);
                     samples.push(t.elapsed());
                     std::hint::black_box(got);
                 }
@@ -876,14 +927,19 @@ pub mod fts {
         };
         let and_block = Block {
             subtitle: "AND queries".into(),
-            headers,
+            headers: headers.clone(),
             rows: AND_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        let clause_block = Block {
+            subtitle: "Must/should queries (count = must intersection)".into(),
+            headers,
+            rows: CLAUSE_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
         };
         report.emit(&Section {
             anchor: anchor.into(),
             title,
             note: note.into(),
-            blocks: vec![or_block, and_block],
+            blocks: vec![or_block, and_block, clause_block],
         });
     }
 }
