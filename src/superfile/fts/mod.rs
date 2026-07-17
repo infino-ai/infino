@@ -8,7 +8,7 @@ pub mod bm25;
 pub mod builder;
 pub mod dict;
 pub(crate) mod fst_value;
-pub mod posting;
 pub(crate) mod positions;
+pub mod posting;
 pub mod reader;
 pub mod tokenize;

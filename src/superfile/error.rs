@@ -39,6 +39,12 @@ pub enum BuildError {
     #[error("user column name {0:?} contains reserved \\x1F separator")]
     ReservedSeparatorInColumnName(String),
 
+    #[error(
+        "FTS column {column:?}: document exceeds the u32::MAX token-position \
+         limit of the positional index"
+    )]
+    PositionOverflow { column: String },
+
     #[error("schema mismatch: self={mine:?} other={other:?}")]
     SchemaMismatch { mine: String, other: String },
 

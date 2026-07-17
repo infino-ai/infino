@@ -17,6 +17,8 @@
 
 /// Largest byte length one encoded `u32` can occupy (LEB128: 5 × 7
 /// bits ≥ 32 bits). Used to reserve scratch capacity.
+/// (Consumed by the read path that follows in this series.)
+#[allow(dead_code)]
 pub(crate) const MAX_VARINT_BYTES: usize = 5;
 
 /// LEB128 continuation flag: high bit set ⇒ another byte follows.
@@ -44,6 +46,7 @@ pub(crate) fn push_varint(out: &mut Vec<u8>, mut v: u32) {
 /// `*at` past it. Returns `None` on truncated input or a value that
 /// overflows `u32` — both only reachable on corrupt bytes, which the
 /// caller surfaces as a read error.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn read_varint(bytes: &[u8], at: &mut usize) -> Option<u32> {
     let mut v: u32 = 0;
@@ -83,11 +86,16 @@ pub(crate) fn encode_run(out: &mut Vec<u8>, positions: &[u32]) {
 /// Decode one run of exactly `tf` positions from `bytes` at `*at`,
 /// appending the absolute positions to `out` and advancing `*at`.
 /// `None` on corrupt (truncated / overflowing) bytes.
+#[allow(dead_code)]
 pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u32>) -> Option<()> {
     let mut prev: u32 = 0;
     for i in 0..tf {
         let delta = read_varint(bytes, at)?;
-        let p = if i == 0 { delta } else { prev.checked_add(delta)? };
+        let p = if i == 0 {
+            delta
+        } else {
+            prev.checked_add(delta)?
+        };
         out.push(p);
         prev = p;
     }
@@ -96,6 +104,7 @@ pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u3
 
 /// Advance `*at` past one run of `tf` positions without materializing
 /// them. `None` on truncated bytes.
+#[allow(dead_code)]
 pub(crate) fn skip_run(bytes: &[u8], at: &mut usize, tf: u32) -> Option<()> {
     for _ in 0..tf {
         read_varint(bytes, at)?;
