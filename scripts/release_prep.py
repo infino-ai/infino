@@ -40,17 +40,18 @@ ROOT = Path(__file__).resolve().parent.parent
 _STRICT_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 FOLLOW_UP = {
-    "crate": "merge the release PR — the 'Tag release' workflow pushes v{v}"
-             " and kicks off the crate publish (bindings skip a patch)",
-    "node": "merge the release PR, then dispatch the 'Node publish' workflow"
-            " (uncheck dry_run to publish)",
-    "python": "merge the release PR, then dispatch the 'Publish Python"
-              " package' workflow (it reads the version from the tree)",
-    "all": "merge the release PR — the 'Tag release' workflow pushes v{v}"
-           " and kicks off all three publish workflows",
-    "each": "merge the release PR — 'Tag release' tags and publishes the"
-            " crate; then dispatch 'Node publish' (uncheck dry_run) and"
-            " 'Publish Python package' for the bindings",
+    "crate": "merge the release PR — on merge it is tagged v{v} and the"
+             " crate publishes",
+    "node": "merge the release PR — the Node publish is dispatched"
+            " automatically on merge (for a rehearsal, run 'Node publish'"
+            " with dry_run before merging)",
+    "python": "merge the release PR — the Python publish is dispatched"
+              " automatically on merge (for a rehearsal, run it with"
+              " target=testpypi before merging)",
+    "all": "merge the release PR — on merge it is tagged v{v} and all"
+           " three packages publish",
+    "each": "merge the release PR — on merge the crate is tagged and all"
+            " three packages publish at their own new patches",
 }
 
 

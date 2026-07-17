@@ -1,0 +1,119 @@
+name: Release on merge
+
+# Merging a release PR (stamped by `make release-prep`) changes committed
+# package versions on main. This workflow applies one uniform rule: whichever
+# package's version changed in the merge gets its publish triggered — so a
+# release of any scope is: run release-prep, merge the PR, done.
+#
+#   - crate version changed  -> push the `v<version>` tag + publish the crate
+#   - Node version changed   -> dispatch `Node publish` (real, not dry-run)
+#   - Python version changed -> dispatch `Publish Python package` (PyPI)
+#
+# A coordinated `vX.Y.0` release needs no special case: all three versions
+# change in that merge, so all three publishes fire. Bindings stay tagless
+# per docs/versioning.md — only the crate's version mints a tag. For a
+# rehearsal, dispatch a binding's workflow manually BEFORE merging (Node:
+# dry_run; Python: target=testpypi).
+#
+# Tags pushed with the workflow's own GITHUB_TOKEN deliberately do not fire
+# tag-push workflows (GitHub's recursion guard), so every publish is
+# dispatched explicitly — pinned to the fresh tag when one was created,
+# otherwise to main.
+#
+# Version-neutral edits to these files (dependency changes etc.) detect no
+# version change and skip. A crate version changed to an already-tagged
+# value is a broken state — registries are immutable — and fails loudly
+# instead of re-tagging.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "infino-node/package.json"
+      - "infino-python/Cargo.toml"
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch the publish workflows
+
+# One release run at a time; never cancel one mid-flight.
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Detect release and kick off publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # HEAD^ is the pre-merge main tip (squash and merge commits alike);
+          # depth 2 is enough for the before/after version comparison.
+          fetch-depth: 2
+      - id: detect
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          crate_prev="$(git show HEAD^:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          node="$(jq -r .version infino-node/package.json)"
+          node_prev="$(git show HEAD^:infino-node/package.json | jq -r .version)"
+          python="$(sed -n 's/^version = "\(.*\)"/\1/p' infino-python/Cargo.toml | head -1)"
+          python_prev="$(git show HEAD^:infino-python/Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+
+          release=false
+          for pkg in crate node python; do
+            eval "cur=\$$pkg prev=\$${pkg}_prev"
+            if [ "$cur" != "$prev" ]; then
+              echo "$pkg version changed: $prev -> $cur"
+              echo "${pkg}_changed=true" >> "$GITHUB_OUTPUT"
+              release=true
+            else
+              echo "${pkg}_changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+          if [ "$release" = "false" ]; then
+            echo "no package version changed; not a release merge"
+          fi
+          if [ "$crate" != "$crate_prev" ] && \
+             git ls-remote --exit-code origin "refs/tags/v$crate" >/dev/null 2>&1; then
+            echo "::error::Cargo.toml changed to $crate but tag v$crate already exists"
+            exit 1
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "crate_version=$crate" >> "$GITHUB_OUTPUT"
+      # Refuse to release an inconsistent tree: the same guard the PR gate
+      # runs, plus the release-line check when the crate moved.
+      - name: Check the tree is version-consistent
+        if: steps.detect.outputs.release == 'true'
+        run: |
+          if [ "${{ steps.detect.outputs.crate_changed }}" = "true" ]; then
+            python3 scripts/check_version_sync.py --release-version "${{ steps.detect.outputs.crate_version }}"
+          else
+            python3 scripts/check_version_sync.py
+          fi
+      - name: Push tag
+        if: steps.detect.outputs.crate_changed == 'true'
+        run: |
+          git tag "v${{ steps.detect.outputs.crate_version }}"
+          git push origin "v${{ steps.detect.outputs.crate_version }}"
+      # Dispatch at the fresh tag when one exists (immutable snapshot of the
+      # merge); otherwise at main.
+      - name: Kick off publish workflows
+        if: steps.detect.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.detect.outputs.crate_changed }}" = "true" ]; then
+            ref="v${{ steps.detect.outputs.crate_version }}"
+            gh workflow run crate-publish.yml --ref "$ref" -f dry_run=false
+          else
+            ref="main"
+          fi
+          if [ "${{ steps.detect.outputs.node_changed }}" = "true" ]; then
+            gh workflow run node-publish.yml --ref "$ref" -f dry_run=false
+          fi
+          if [ "${{ steps.detect.outputs.python_changed }}" = "true" ]; then
+            gh workflow run publish-python.yml --ref "$ref" -f target=pypi
+          fi

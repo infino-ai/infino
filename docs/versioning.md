@@ -66,8 +66,8 @@ it is a patch or a coordinated minor/major.
 
 - **Crate patch** (`vX.Y.Z`, `Z > 0`, e.g. `v0.1.1`) — bump `version` in the root
   `Cargo.toml` (`make release-prep PACKAGE=crate`) and land it. On merge, the
-  `Tag release` workflow (`.github/workflows/tag-release.yml`) pushes the
-  matching tag and kicks off `Publish crate`
+  `Release on merge` workflow (`.github/workflows/release-on-merge.yml`) pushes
+  the matching tag and kicks off `Publish crate`
   (`.github/workflows/crate-publish.yml`), which publishes to crates.io.
   **The Node and Python workflows skip a crate patch** — their
   coordinated-release gate fires only when `patch == 0` — so the crate patches
@@ -77,18 +77,20 @@ it is a patch or a coordinated minor/major.
 - **Coordinated minor/major** (`vX.Y.0`, e.g. `v0.2.0`) — land the engine change,
   **update the Node and Python binding code for any new or changed engine
   surface**, bump the crate *and* both bindings to the same `X.Y.0`
-  (`make release-prep PACKAGE=all`), and land the bump. On merge, `Tag release`
-  pushes the `vX.Y.0` tag and kicks off all three publish workflows — crate →
+  (`make release-prep PACKAGE=all`), and land the bump. On merge, `Release on
+  merge` pushes the `vX.Y.0` tag and kicks off all three publish workflows — crate →
   crates.io, Node → npm, Python → PyPI — at `X.Y.0`. (Node's `napi prepublish`
   derives the per-platform package versions and `optionalDependencies` pins
   from that single `package.json` field.) The bindings must never ship a new
   minor before their code exposes that minor's engine changes.
 - **Binding-only patch** (Node or Python, independent of the crate's patch) — bump
-  that binding's version (`make release-prep PACKAGE=node|python VERSION=…`),
-  land it, then run its workflow **manually** (`Node publish` /
-  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched. Both
-  workflows publish the version committed in the tree — Node from
-  `infino-node/package.json`, Python from `infino-python/Cargo.toml`.
+  that binding's version (`make release-prep PACKAGE=node|python VERSION=…`)
+  and land it. On merge, `Release on merge` dispatches that binding's publish
+  workflow automatically. No tag; the crate is untouched. Both workflows
+  publish the version committed in the tree — Node from
+  `infino-node/package.json`, Python from `infino-python/Cargo.toml`. For a
+  rehearsal, dispatch the workflow manually *before* merging (Node with
+  `dry_run`; Python with `target=testpypi`).
 
 **Patch counters are independent per package and never shared**, so the crate's
 patch and a binding's patch can never collide on a registry — only `major.minor`
