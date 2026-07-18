@@ -24,19 +24,18 @@ pub const CRC_BYTES: usize = 4;
 pub mod fts {
     /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` + version `01`.
     pub const MAGIC: &[u8; 8] = b"INFFTS01";
-    /// Numeric version emitted in the blob header (redundant with magic
-    /// suffix; future-proofing for a per-section version separate from
-    /// section identity). Version 1 is the positionless layout with the
-    /// 48-byte header; files with no positional column keep writing it,
-    /// byte-identical to before positions existed.
+    /// Legacy blob version: the positionless layout with the 48-byte
+    /// header. **Read-only** — files written before the positions
+    /// region existed carry it and stay readable forever; new code
+    /// always writes [`VERSION_POSITIONS`].
     pub const VERSION: u32 = 1;
 
-    /// Header version written when any FTS column records token
-    /// positions: the header grows to [`HEADER_SIZE_V2`] with the
-    /// positions-region offset at [`hdr::POSITIONS_OFFSET_OFF`], and a
-    /// positions region sits between the postings region and the
-    /// doc-lengths directory. Readers accept both versions; only
-    /// files that actually carry positions require this one.
+    /// The version new code writes: the header grows to
+    /// [`HEADER_SIZE_V2`] with the positions-region offset at
+    /// [`hdr::POSITIONS_OFFSET_OFF`], and a positions region —
+    /// empty unless a column records positions — sits between the
+    /// postings region and the doc-lengths directory. Readers accept
+    /// both versions.
     pub const VERSION_POSITIONS: u32 = 2;
 
     /// Fixed-point scale for the per-column average document length.

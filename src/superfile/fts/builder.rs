@@ -1864,8 +1864,6 @@ impl FtsBuilder {
                 (state.total_tokens as f32) / (n as f32)
             };
         }
-        let any_positional = work.iter().any(|(_, state, _)| state.positions);
-
         let scratch_path = scratch_dir.path().to_path_buf();
         // Posting body scratch file. Encoded posting blocks for every
         // (column, term) flow here in lex order, then get streamed
@@ -1874,10 +1872,9 @@ impl FtsBuilder {
         let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
-        let mut positions_sink = match any_positional {
-            true => Some(PositionsSink::create(&scratch_path)?),
-            false => None,
-        };
+        // Every blob carries a positions region (empty when no column
+        // records positions) — new code always writes the v2 layout.
+        let mut positions_sink = PositionsSink::create(&scratch_path)?;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
@@ -1935,12 +1932,7 @@ impl FtsBuilder {
                     false => Vec::new(),
                 };
                 let term_positions = match col_positions {
-                    true => Some((
-                        positions_sink
-                            .as_mut()
-                            .expect("sink created for positional builds"),
-                        term_runs.as_slice(),
-                    )),
+                    true => Some((&mut positions_sink, term_runs.as_slice())),
                     false => None,
                 };
                 encode_and_emit_term(
@@ -2035,17 +2027,14 @@ impl FtsBuilder {
             };
         }
 
-        let any_positional = work.iter().any(|(_, state, _)| state.positions);
-
         let scratch_path = scratch_dir.path().to_path_buf();
         let postings_path = scratch_path.join("infino_fts_postings.bin");
         let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
-        let mut positions_sink = match any_positional {
-            true => Some(PositionsSink::create(&scratch_path)?),
-            false => None,
-        };
+        // Every blob carries a positions region (empty when no column
+        // records positions) — new code always writes the v2 layout.
+        let mut positions_sink = PositionsSink::create(&scratch_path)?;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
@@ -2126,12 +2115,7 @@ impl FtsBuilder {
                             false => Vec::new(),
                         };
                         let term_positions = match col_positions {
-                            true => Some((
-                                positions_sink
-                                    .as_mut()
-                                    .expect("sink created for positional builds"),
-                                term_runs.as_slice(),
-                            )),
+                            true => Some((&mut positions_sink, term_runs.as_slice())),
                             false => None,
                         };
                         encode_and_emit_term(
@@ -2500,13 +2484,11 @@ struct BlobAssemblyInputs {
     /// Bytes written so far to `postings_writer` (excluding trailer).
     /// Assembly grows this by 4 when it appends the CRC.
     postings_len: u64,
-    /// Positions region sink — `Some` iff any registered column is
-    /// positional, in which case the blob gets a v2 header and the
-    /// region lands between the postings and the doc-lengths
-    /// directory (even when empty, so region accounting stays
-    /// uniform). `None` produces a v1 blob byte-identical to builds
-    /// before positions existed.
-    positions_sink: Option<PositionsSink>,
+    /// Positions region sink. Always present: new code always writes
+    /// the v2 layout, with the region (possibly just its CRC-of-empty
+    /// trailer) between the postings and the doc-lengths directory.
+    /// v1 remains a read-only legacy format.
+    positions_sink: PositionsSink,
     /// Whichever FST sink was used during the per-column emit loop
     /// (exactly one of the two variants).
     fst_sink: FstSinkFinish,
@@ -2587,18 +2569,17 @@ fn assemble_and_write_blob<W: Write>(
     }
 
     // Close the positions region file the same way (CRC trailer +
-    // flush). An all-inline positional build leaves a body of zero
-    // bytes — the region is then just the 4-byte CRC-of-empty, the
-    // same legal shape an empty postings region takes.
-    let positions_region = match positions_sink {
-        Some(mut sink) => {
-            let crc_le = sink.crc_acc.to_le_bytes();
-            sink.writer.write_all(&crc_le)?;
-            sink.writer.flush()?;
-            drop(sink.writer);
-            Some((sink.path, sink.len + crc_le.len() as u64))
-        }
-        None => None,
+    // flush). A build with no positional column (or whose positional
+    // terms all inlined) leaves a body of zero bytes — the region is
+    // then just the 4-byte CRC-of-empty, the same legal shape an
+    // empty postings region takes.
+    let positions_region = {
+        let mut sink = positions_sink;
+        let crc_le = sink.crc_acc.to_le_bytes();
+        sink.writer.write_all(&crc_le)?;
+        sink.writer.flush()?;
+        drop(sink.writer);
+        (sink.path, sink.len + crc_le.len() as u64)
     };
 
     // Finalise the FST. Either path produces "FST bytes followed
@@ -2665,18 +2646,14 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    let header_size: u64 = match positions_region {
-        Some(_) => format::fts::HEADER_SIZE_V2 as u64,
-        None => FTS_HEADER_SIZE as u64,
-    };
+    let header_size: u64 = format::fts::HEADER_SIZE_V2 as u64;
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
     // The positions region sits between the postings and the
     // doc-lengths directory (keeping the lazy-open doc-lengths tail
     // fetch small); absent, the directory follows postings directly.
     let positions_offset: u64 = postings_offset + postings_len;
-    let positions_total_len: u64 = positions_region.as_ref().map_or(0, |(_, len)| *len);
-    let doc_lengths_table_offset: u64 = positions_offset + positions_total_len;
+    let doc_lengths_table_offset: u64 = positions_offset + positions_region.1;
     let mut doc_lengths_array_offset: u64 =
         doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
 
@@ -2725,20 +2702,14 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    let version = match positions_region {
-        Some(_) => format::fts::VERSION_POSITIONS,
-        None => format::fts::VERSION,
-    };
-    header.extend_from_slice(&version.to_le_bytes()); // 4
+    header.extend_from_slice(&format::fts::VERSION_POSITIONS.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
     header.extend_from_slice(&fst_offset.to_le_bytes()); // 8
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
-    if positions_region.is_some() {
-        header.extend_from_slice(&positions_offset.to_le_bytes()); // 8 (v2 only)
-    }
+    header.extend_from_slice(&positions_offset.to_le_bytes()); // 8
     debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
 
     w.write_all(&header)?;
@@ -2754,9 +2725,9 @@ fn assemble_and_write_blob<W: Write>(
         BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
     io::copy(&mut postings_reader, w)?;
     drop(postings_reader);
-    if let Some((positions_path, _)) = &positions_region {
+    {
         let mut positions_reader =
-            BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(positions_path)?);
+            BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&positions_region.0)?);
         io::copy(&mut positions_reader, w)?;
     }
 
@@ -3372,9 +3343,9 @@ mod tests {
 
         // Magic.
         assert_eq!(&blob[0..8], format::fts::MAGIC);
-        // Version.
+        // Version — new code always writes the v2 (positions) layout.
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION);
+        assert_eq!(version, format::fts::VERSION_POSITIONS);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -3384,11 +3355,11 @@ mod tests {
         // n_terms_total = 2 ("hello", "world") (u32 at 20..24).
         let n_terms = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]);
         assert_eq!(n_terms, 2);
-        // fst_offset == 48 (u64 at 24..32).
+        // fst_offset == the v2 header size (u64 at 24..32).
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&blob[24..32]);
         let fst_off = u64::from_le_bytes(buf);
-        assert_eq!(fst_off, 48);
+        assert_eq!(fst_off, format::fts::HEADER_SIZE_V2 as u64);
     }
 
     /// Determinism gate: two independent in-RAM builds over the
@@ -3747,10 +3718,14 @@ mod tests {
         buf.copy_from_slice(&blob[40..48]);
         let dir_off = u64::from_le_bytes(buf) as usize;
 
-        assert_eq!(fst_off, 48);
+        assert_eq!(fst_off, format::fts::HEADER_SIZE_V2);
         assert!(postings_off > fst_off, "postings after FST");
         assert!(dir_off > postings_off, "directory after postings");
         assert!(dir_off <= blob.len(), "directory offset within blob");
+        buf.copy_from_slice(&blob[48..56]);
+        let positions_off = u64::from_le_bytes(buf) as usize;
+        assert!(positions_off > postings_off, "positions after postings");
+        assert!(dir_off > positions_off, "directory after positions");
     }
 
     #[test]
@@ -3873,6 +3848,101 @@ mod tests {
 
     // ---- positional format (v2 blob) ----
 
+    /// Rewrite a freshly-built positionless v2 blob into the legacy v1
+    /// layout: version 1, 48-byte header (drop the positions-offset
+    /// field), the empty positions region (4-byte CRC) removed, and
+    /// every absolute offset — the three header offsets plus each
+    /// doc-lengths directory entry's array offset — shifted
+    /// accordingly. This is exactly the byte layout pre-positions
+    /// code wrote, letting the "new code reads v1" contract be tested
+    /// without keeping a binary fixture.
+    fn synthesize_v1_blob(v2: &[u8]) -> Vec<u8> {
+        const V2_HEADER: usize = 56;
+        const V1_HEADER: usize = 48;
+        const HEADER_SHRINK: u64 = (V2_HEADER - V1_HEADER) as u64;
+        const EMPTY_REGION_CRC: u64 = 4;
+
+        let read_u64 = |at: usize| u64::from_le_bytes(v2[at..at + 8].try_into().expect("8 bytes"));
+        let read_u32 = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().expect("4 bytes"));
+        assert_eq!(read_u32(8), format::fts::VERSION_POSITIONS);
+        let fst_off = read_u64(24);
+        let postings_off = read_u64(32);
+        let doc_lengths_off = read_u64(40);
+        let positions_off = read_u64(48);
+        assert_eq!(
+            doc_lengths_off - positions_off,
+            EMPTY_REGION_CRC,
+            "synthesis requires a positionless blob (empty region)"
+        );
+        let n_columns = read_u32(12) as usize;
+
+        let mut out = Vec::with_capacity(v2.len() - V2_HEADER + V1_HEADER);
+        out.extend_from_slice(&v2[0..8]); // magic
+        out.extend_from_slice(&format::fts::VERSION.to_le_bytes());
+        out.extend_from_slice(&v2[12..24]); // n_columns, n_docs, n_terms
+        out.extend_from_slice(&(fst_off - HEADER_SHRINK).to_le_bytes());
+        out.extend_from_slice(&(postings_off - HEADER_SHRINK).to_le_bytes());
+        let v1_doc_lengths_off = doc_lengths_off - HEADER_SHRINK - EMPTY_REGION_CRC;
+        out.extend_from_slice(&v1_doc_lengths_off.to_le_bytes());
+        // FST + postings regions byte-for-byte (their internal offsets
+        // are region-relative).
+        out.extend_from_slice(&v2[V2_HEADER..positions_off as usize]);
+        // Skip the empty positions region; doc-lengths directory
+        // entries carry ABSOLUTE array offsets — shift each by the
+        // total shrink. Entry layout: column_id u32 | array_off u64 |
+        // avgdl u32 (16 bytes), then a directory CRC we must
+        // recompute since its bytes changed.
+        let dir_start = doc_lengths_off as usize;
+        let dir_size = n_columns * 16;
+        let mut dir = Vec::with_capacity(dir_size);
+        for c in 0..n_columns {
+            let e = dir_start + c * 16;
+            dir.extend_from_slice(&v2[e..e + 4]);
+            let arr_off = read_u64(e + 4) - HEADER_SHRINK - EMPTY_REGION_CRC;
+            dir.extend_from_slice(&arr_off.to_le_bytes());
+            dir.extend_from_slice(&v2[e + 12..e + 16]);
+        }
+        let dir_crc = crc32c(&dir);
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&dir_crc.to_le_bytes());
+        // Per-column arrays (+ their CRCs) byte-for-byte.
+        out.extend_from_slice(&v2[dir_start + dir_size + 4..]);
+        out
+    }
+
+    #[tokio::test]
+    async fn new_code_reads_synthesized_v1_blob() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+        let v2_blob = build_title_blob(&docs, false);
+        let v1_blob = bytes::Bytes::from(synthesize_v1_blob(&v2_blob));
+        assert_eq!(
+            u32::from_le_bytes(v1_blob[8..12].try_into().expect("version bytes")),
+            format::fts::VERSION
+        );
+
+        let v1 = FtsReader::open(v1_blob, title_json(false)).expect("v1 opens");
+        let v2 = FtsReader::open(v2_blob, title_json(false)).expect("v2 opens");
+        let queries: &[&[&str]] = &[&["common"], &["uniqueonce"], &["common", "medium"]];
+        for terms in queries {
+            let a = v1
+                .search("title", terms, docs.len(), BoolMode::Or)
+                .await
+                .expect("v1 search");
+            let b = v2
+                .search("title", terms, docs.len(), BoolMode::Or)
+                .await
+                .expect("v2 search");
+            assert_eq!(a, b, "v1/v2 results diverged for {terms:?}");
+            assert!(!a.is_empty());
+        }
+        assert_eq!(
+            v1.term_df("title", "common").await.expect("v1 df"),
+            v2.term_df("title", "common").await.expect("v2 df"),
+        );
+    }
+
     /// Column-json for the single "title" column, with or without the
     /// positions flag — matching what `fts_columns_json` emits.
     fn title_json(positional: bool) -> &'static str {
@@ -3917,25 +3987,32 @@ mod tests {
     }
 
     #[test]
-    fn positionless_blob_stays_v1_and_positional_writes_v2() {
+    fn every_build_writes_v2_and_positionless_region_is_empty() {
         let docs = positional_corpus();
-        let v1 = build_title_blob(&docs, false);
-        let v2 = build_title_blob(&docs, true);
+        let plain = build_title_blob(&docs, false);
+        let positional = build_title_blob(&docs, true);
 
         let version_of = |blob: &bytes::Bytes| {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
-        assert_eq!(version_of(&v1), format::fts::VERSION);
-        assert_eq!(version_of(&v2), format::fts::VERSION_POSITIONS);
+        // New code always writes v2; v1 is a read-only legacy format.
+        assert_eq!(version_of(&plain), format::fts::VERSION_POSITIONS);
+        assert_eq!(version_of(&positional), format::fts::VERSION_POSITIONS);
+
+        // A positionless build's region is just the CRC-of-empty.
+        let read_u64_plain =
+            |at: usize| u64::from_le_bytes(plain[at..at + 8].try_into().expect("8 header bytes"));
+        let region_len = read_u64_plain(40) - read_u64_plain(48);
+        assert_eq!(region_len, 4, "positionless region = 4-byte CRC only");
 
         // The v2 positions-region offset points between the postings
         // region and the doc-lengths directory.
         let read_u64 = |blob: &bytes::Bytes, at: usize| {
             u64::from_le_bytes(blob[at..at + 8].try_into().expect("8 header bytes"))
         };
-        let postings_off = read_u64(&v2, 32);
-        let doc_lengths_off = read_u64(&v2, 40);
-        let positions_off = read_u64(&v2, 48);
+        let postings_off = read_u64(&positional, 32);
+        let doc_lengths_off = read_u64(&positional, 40);
+        let positions_off = read_u64(&positional, 48);
         assert!(postings_off < positions_off, "positions follow postings");
         assert!(
             positions_off < doc_lengths_off,

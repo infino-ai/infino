@@ -303,7 +303,16 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        let header = fetch_lazy_range(source.as_ref(), 0..FTS_HEADER_SIZE, "fts header").await?;
+        // One GET covers either header size: any real FTS blob is
+        // larger than the 56-byte v2 header (header + FST CRC +
+        // postings CRC + a non-empty doc-lengths directory), so
+        // fetching the v2 span up front costs no extra round-trip on
+        // v1 blobs and saves one on v2.
+        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
+        let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
+        if header.len() < FTS_HEADER_SIZE {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
+        }
         if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
                 section: "fts",
@@ -317,25 +326,17 @@ impl FtsReader {
                 "fts section version {version}"
             ))));
         }
-        // A v2 blob's header extension ([48..56], the positions-region
-        // offset) is fetched here and installed in the overlay so
-        // `open_with_source` reads it without another GET. The FST
-        // directory starts right after whichever header applies.
+        // The FST directory starts right after whichever header
+        // applies; a v2 header's extension bytes are already in the
+        // fetched span (and in the overlay below), so
+        // `open_with_source` re-reads them without another GET.
         let header_size = match version {
             v if v == format::fts::VERSION_POSITIONS => format::fts::HEADER_SIZE_V2,
             _ => FTS_HEADER_SIZE,
         };
-        let header_ext = match header_size > FTS_HEADER_SIZE {
-            true => Some(
-                fetch_lazy_range(
-                    source.as_ref(),
-                    FTS_HEADER_SIZE..header_size,
-                    "fts header ext",
-                )
-                .await?,
-            ),
-            false => None,
-        };
+        if header.len() < header_size {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
+        }
 
         let postings_offset =
             read_u64_le(&header[hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES])
@@ -375,9 +376,6 @@ impl FtsReader {
 
         let mut overlay = PrefetchedSource::new(source);
         overlay.install(0, header);
-        if let Some(ext) = header_ext {
-            overlay.install(FTS_HEADER_SIZE as u64, ext);
-        }
         overlay.install(header_size as u64, fst_region);
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
@@ -4406,24 +4404,26 @@ mod tests {
                 .try_into()
                 .expect("postings_off_i slice is 8 bytes"),
         ) as usize;
-        let dir_off_i = u64::from_le_bytes(
-            blob_inline[40..48]
+        // v2 layout: the postings region ends where the positions
+        // region begins (header bytes [48..56]).
+        let positions_off_i = u64::from_le_bytes(
+            blob_inline[48..56]
                 .try_into()
-                .expect("dir_off_i slice is 8 bytes"),
+                .expect("positions_off_i slice is 8 bytes"),
         ) as usize;
-        let postings_size_inline = dir_off_i - postings_off_i;
+        let postings_size_inline = positions_off_i - postings_off_i;
 
         let postings_off_p = u64::from_le_bytes(
             blob_pfor[32..40]
                 .try_into()
                 .expect("postings_off_p slice is 8 bytes"),
         ) as usize;
-        let dir_off_p = u64::from_le_bytes(
-            blob_pfor[40..48]
+        let positions_off_p = u64::from_le_bytes(
+            blob_pfor[48..56]
                 .try_into()
-                .expect("dir_off_p slice is 8 bytes"),
+                .expect("positions_off_p slice is 8 bytes"),
         ) as usize;
-        let postings_size_pfor = dir_off_p - postings_off_p;
+        let postings_size_pfor = positions_off_p - postings_off_p;
 
         // Inline-only blob's postings region holds just the trailing
         // CRC32 (4 B). PFOR blob holds 20 terms × (20 B metadata +
