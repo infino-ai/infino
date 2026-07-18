@@ -344,7 +344,7 @@ enum ColumnPostings {
     /// vocabulary, which is typically O(10^4 - 10^6) even on 10M-
     /// doc corpora — millions of bytes, not gigabytes.
     Spilled {
-        partitions: Vec<SpillPartition>,
+        partitions: Vec<SpillPartition<PLAIN_RECORD_LANES>>,
         term_to_id: TermIdMap,
         /// Per-id reverse lookup used by `finish_to` to recover term
         /// bytes for FST emit. Entries are `&'static str` slices
@@ -410,7 +410,7 @@ impl ColumnPostings {
 /// branches instead of ~150M.
 const SPILL_BATCH_TRIPLES: usize = 341;
 
-struct SpillPartition {
+struct SpillPartition<const N: usize> {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
     /// In-memory batch buffer flushed into `writer` when full.
@@ -429,7 +429,7 @@ struct SpillPartition {
     /// (LE hosts) — zero copy. BE hosts pay a per-triple byte-swap
     /// path. Capacity reserved to `SPILL_BATCH_TRIPLES` up front so
     /// the steady-state push is branch-free w.r.t. capacity.
-    batch: Vec<Triple>,
+    batch: Vec<[u32; N]>,
 }
 
 /// Fixed on-disk record size in the spill files: 4 bytes `term_id`
@@ -449,16 +449,19 @@ const TRIPLE_BYTES: usize = mem::size_of::<Triple>();
 /// on little-endian hosts.
 type Triple = [u32; 3];
 
+/// Lane count of the plain (positionless) spill record.
+const PLAIN_RECORD_LANES: usize = 3;
+
 #[inline(always)]
-fn triple_term_id(t: &Triple) -> u32 {
+fn triple_term_id<const N: usize>(t: &[u32; N]) -> u32 {
     t[0]
 }
 #[inline(always)]
-fn triple_doc_id(t: &Triple) -> u32 {
+fn triple_doc_id<const N: usize>(t: &[u32; N]) -> u32 {
     t[1]
 }
 #[inline(always)]
-fn triple_tf(t: &Triple) -> u32 {
+fn triple_tf<const N: usize>(t: &[u32; N]) -> u32 {
     t[2]
 }
 
@@ -500,13 +503,11 @@ fn write_triple<W: Write>(w: &mut W, term_id: u32, doc_id: u32, tf: u32) -> Resu
 /// which paid the `BufWriter`'s "does this fit in the inline
 /// buffer?" branch on every single posting.
 #[inline(always)]
-fn push_triple_batched(
-    partition: &mut SpillPartition,
-    term_id: u32,
-    doc_id: u32,
-    tf: u32,
+fn push_record_batched<const N: usize>(
+    partition: &mut SpillPartition<N>,
+    rec: [u32; N],
 ) -> Result<(), BuildError> {
-    partition.batch.push([term_id, doc_id, tf]);
+    partition.batch.push(rec);
     if partition.batch.len() >= SPILL_BATCH_TRIPLES {
         flush_partition_batch(partition)?;
     }
@@ -518,7 +519,9 @@ fn push_triple_batched(
 /// from `finish_to`'s flush stage so partial buffers reach disk
 /// before the merge starts.
 #[inline]
-fn flush_partition_batch(partition: &mut SpillPartition) -> Result<(), BuildError> {
+fn flush_partition_batch<const N: usize>(
+    partition: &mut SpillPartition<N>,
+) -> Result<(), BuildError> {
     if partition.batch.is_empty() {
         return Ok(());
     }
@@ -531,7 +534,7 @@ fn flush_partition_batch(partition: &mut SpillPartition) -> Result<(), BuildErro
     // the LE fast read path stays valid cross-arch.
     #[cfg(target_endian = "little")]
     {
-        writer.write_all(bytemuck::cast_slice::<Triple, u8>(&partition.batch))?;
+        writer.write_all(bytemuck::cast_slice::<[u32; N], u8>(&partition.batch))?;
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -552,20 +555,21 @@ fn flush_partition_batch(partition: &mut SpillPartition) -> Result<(), BuildErro
 /// On a big-endian host the same bytes are read but each triple
 /// is byte-swapped on the way in — kept behind a `cfg` so x86_64
 /// and arm64 hit the fast cast path.
-fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
+fn read_partition_records<const N: usize>(path: &Path) -> Result<Vec<[u32; N]>, BuildError> {
     let mut bytes = Vec::new();
     let mut f = File::open(path)?;
     f.read_to_end(&mut bytes)?;
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    if bytes.len() % TRIPLE_BYTES != 0 {
+    let rec_bytes = mem::size_of::<[u32; N]>();
+    if bytes.len() % rec_bytes != 0 {
         return Err(BuildError::Io(Error::new(
             ErrorKind::InvalidData,
             format!(
                 "spill partition {path:?} length {} not a multiple of {}",
                 bytes.len(),
-                TRIPLE_BYTES
+                rec_bytes
             ),
         )));
     }
@@ -576,38 +580,30 @@ fn read_partition_triples(path: &Path) -> Result<Vec<Triple>, BuildError> {
         // returns a `Vec` whose buffer is aligned at least to
         // `align_of::<usize>()` (8 bytes on x86_64), so the cast
         // to `[u32; 3]` (alignment 4) is sound.
-        let triples: &[Triple] = bytemuck::try_cast_slice(&bytes).map_err(|_| {
+        let records: &[[u32; N]] = bytemuck::try_cast_slice(&bytes).map_err(|_| {
             BuildError::Io(Error::new(
                 ErrorKind::InvalidData,
                 "bytemuck: spill bytes failed alignment for &[Triple]",
             ))
         })?;
-        Ok(triples.to_vec())
+        Ok(records.to_vec())
     }
     #[cfg(not(target_endian = "little"))]
     {
-        let n = bytes.len() / TRIPLE_BYTES;
+        let n = bytes.len() / rec_bytes;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let off = i * TRIPLE_BYTES;
-            let t = [
-                u32::from_le_bytes(
-                    bytes[off..off + 4]
+            let off = i * rec_bytes;
+            let mut rec = [0u32; N];
+            for (lane, slot) in rec.iter_mut().enumerate() {
+                let at = off + lane * 4;
+                *slot = u32::from_le_bytes(
+                    bytes[at..at + 4]
                         .try_into()
-                        .expect("invariant: 4-byte triple field"),
-                ),
-                u32::from_le_bytes(
-                    bytes[off + 4..off + 8]
-                        .try_into()
-                        .expect("invariant: 4-byte triple field"),
-                ),
-                u32::from_le_bytes(
-                    bytes[off + 8..off + 12]
-                        .try_into()
-                        .expect("invariant: 4-byte triple field"),
-                ),
-            ];
-            out.push(t);
+                        .expect("invariant: 4-byte record lane"),
+                );
+            }
+            out.push(rec);
         }
         Ok(out)
     }
@@ -726,28 +722,27 @@ fn intern_term_id(
 /// Ordering is inverted (heap returns the *smallest* sort key
 /// first) by implementing `Ord` reversed; `BinaryHeap` is a max-
 /// heap.
-struct MergeEntry {
+struct MergeEntry<const N: usize> {
     /// `(lex_rank as u64) << 32 | doc_id as u64`.
     sort_key: u64,
-    /// Original term_id (used at emit time to look up the term
-    /// bytes via `id_to_term`).
-    term_id: u32,
-    tf: u32,
+    /// The full record — term_id/doc_id/tf lanes plus, on positional
+    /// columns, the positions-blob offset lanes.
+    rec: [u32; N],
     reader_idx: usize,
 }
 
-impl PartialEq for MergeEntry {
+impl<const N: usize> PartialEq for MergeEntry<N> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
-impl Eq for MergeEntry {}
-impl PartialOrd for MergeEntry {
+impl<const N: usize> Eq for MergeEntry<N> {}
+impl<const N: usize> PartialOrd for MergeEntry<N> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for MergeEntry {
+impl<const N: usize> Ord for MergeEntry<N> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse so the largest "smallest" wins on pop — gives
         // BinaryHeap min-heap behaviour over (lex_rank, doc_id).
@@ -776,50 +771,44 @@ fn pack_sort_key(lex_rank: u32, doc_id: u32) -> u64 {
 /// and then k-way-merged via a `BinaryHeap` of cursors so the
 /// finish-time sort never holds more than one chunk plus one
 /// record per chunk file at a time.
-enum PartitionIter {
-    InMemory(IntoIter<Triple>),
+enum PartitionIter<const N: usize> {
+    InMemory(IntoIter<[u32; N]>),
     Merge {
         readers: Vec<BufReader<File>>,
-        heap: BinaryHeap<MergeEntry>,
+        heap: BinaryHeap<MergeEntry<N>>,
         /// Sorted-chunk files; kept alive so their inodes don't
         /// get reaped before iteration finishes.
         _chunk_paths: Vec<PathBuf>,
     },
 }
 
-impl PartitionIter {
+impl<const N: usize> PartitionIter<N> {
     /// Pull the next sorted triple from this partition, looking up
     /// the sort key via `lex_rank` when refilling a merge cursor
     /// (so the heap stays minimal — only sort_key + tf + term_id
     /// + reader_idx).
-    fn next_with(&mut self, lex_rank: &[u32]) -> Option<Result<Triple, BuildError>> {
+    fn next_with(&mut self, lex_rank: &[u32]) -> Option<Result<[u32; N], BuildError>> {
         match self {
             PartitionIter::InMemory(it) => it.next().map(Ok),
             PartitionIter::Merge { readers, heap, .. } => {
                 let MergeEntry {
-                    sort_key,
-                    term_id,
-                    tf,
-                    reader_idx,
+                    rec, reader_idx, ..
                 } = heap.pop()?;
-                // Low 32 bits of the packed key carry doc_id.
-                let popped: Triple = [term_id, sort_key as u32, tf];
-                match read_one_triple(&mut readers[reader_idx]) {
+                match read_one_record::<_, N>(&mut readers[reader_idx]) {
                     Ok(Some(next_t)) => {
                         let next_id = triple_term_id(&next_t);
                         let next_doc = triple_doc_id(&next_t);
                         let key = pack_sort_key(lex_rank[next_id as usize], next_doc);
                         heap.push(MergeEntry {
                             sort_key: key,
-                            term_id: next_id,
-                            tf: triple_tf(&next_t),
+                            rec: next_t,
                             reader_idx,
                         });
                     }
                     Ok(None) => { /* chunk drained */ }
                     Err(e) => return Some(Err(e)),
                 }
-                Some(Ok(popped))
+                Some(Ok(rec))
             }
         }
     }
@@ -827,23 +816,32 @@ impl PartitionIter {
 
 /// Read a single 12-byte triple from a sorted-chunk file. Returns
 /// `Ok(None)` on clean EOF.
-fn read_one_triple<R: Read>(r: &mut R) -> Result<Option<Triple>, BuildError> {
-    let mut buf = [0u8; TRIPLE_BYTES];
-    match r.read_exact(&mut buf) {
+fn read_one_record<R: Read, const N: usize>(r: &mut R) -> Result<Option<[u32; N]>, BuildError> {
+    let mut buf = [0u8; MAX_RECORD_BYTES];
+    let rec_bytes = mem::size_of::<[u32; N]>();
+    match r.read_exact(&mut buf[..rec_bytes]) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(BuildError::Io(e)),
     }
-    Ok(Some([
-        u32::from_le_bytes(buf[0..4].try_into().expect("slice len 4")),
-        u32::from_le_bytes(buf[4..8].try_into().expect("slice len 4")),
-        u32::from_le_bytes(buf[8..12].try_into().expect("slice len 4")),
-    ]))
+    let mut rec = [0u32; N];
+    for (lane, slot) in rec.iter_mut().enumerate() {
+        let at = lane * 4;
+        *slot = u32::from_le_bytes(buf[at..at + 4].try_into().expect("slice len 4"));
+    }
+    Ok(Some(rec))
 }
+
+/// Stack-buffer bound for [`read_one_record`]: the widest spill
+/// record (the positional 5-lane form).
+const MAX_RECORD_BYTES: usize = mem::size_of::<[u32; 5]>();
 
 /// Write a slice of triples to a sorted-chunk file. Single
 /// `write_all` per chunk on LE hosts via `bytemuck` byte-cast.
-fn write_triples_sorted(triples: &[Triple], path: &Path) -> Result<(), BuildError> {
+fn write_records_sorted<const N: usize>(
+    triples: &[[u32; N]],
+    path: &Path,
+) -> Result<(), BuildError> {
     let mut w = BufWriter::with_capacity(PARTITION_BUF_SIZE, File::create(path)?);
     #[cfg(target_endian = "little")]
     {
@@ -860,17 +858,17 @@ fn write_triples_sorted(triples: &[Triple], path: &Path) -> Result<(), BuildErro
     Ok(())
 }
 
-fn spill_sorted_chunk(
-    chunk: &mut Vec<Triple>,
+fn spill_sorted_chunk<const N: usize>(
+    chunk: &mut Vec<[u32; N]>,
     scratch_dir: &Path,
     partition_label: &str,
     chunk_idx: usize,
     lex_rank: &[u32],
     out_paths: &mut Vec<PathBuf>,
 ) -> Result<(), BuildError> {
-    radix_sort_triples_by_lex_rank(chunk, lex_rank);
+    radix_sort_records_by_lex_rank(chunk, lex_rank);
     let path = scratch_dir.join(format!("{partition_label}_sorted{chunk_idx}.bin"));
-    write_triples_sorted(chunk, &path)?;
+    write_records_sorted(chunk, &path)?;
     chunk.clear();
     #[cfg(test)]
     finish_debug::record_chunk_path(&path);
@@ -952,7 +950,7 @@ mod finish_debug {
 ///
 /// Falls back to `sort_unstable_by` for tiny inputs where the counts
 /// allocation outweighs the algorithmic savings.
-fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
+fn radix_sort_records_by_lex_rank<const N: usize>(triples: &mut Vec<[u32; N]>, lex_rank: &[u32]) {
     let n = triples.len();
     if n < RADIX_SORT_MIN_TRIPLES {
         triples.sort_unstable_by(|a, b| {
@@ -1004,7 +1002,7 @@ fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
     // `triples` in arrival order and arrival order is `(doc_id,
     // term_id_within_doc)`, the within-rank order in `out` is the
     // partition's `doc_id` order — i.e. `(lex_rank, doc_id)`.
-    let mut out: Vec<Triple> = vec![[0u32; 3]; n];
+    let mut out: Vec<[u32; N]> = vec![[0u32; N]; n];
     for t in triples.iter() {
         let rank = unsafe { *lex_rank.get_unchecked(t[0] as usize) } as usize;
         let dst = unsafe { *offsets.get_unchecked(rank) } as usize;
@@ -1021,17 +1019,17 @@ fn radix_sort_triples_by_lex_rank(triples: &mut Vec<Triple>, lex_rank: &[u32]) {
 /// memory path when the on-disk partition is at or below
 /// `max_partition_bytes` and the external-merge path when it
 /// isn't.
-fn open_partition_sorted(
+fn open_partition_sorted<const N: usize>(
     partition_path: &Path,
     max_partition_bytes: u64,
     scratch_dir: &Path,
     partition_label: &str,
     lex_rank: &[u32],
-) -> Result<PartitionIter, BuildError> {
+) -> Result<PartitionIter<N>, BuildError> {
     let len = fs::metadata(partition_path)?.len();
     if len <= max_partition_bytes {
-        let mut triples = read_partition_triples(partition_path)?;
-        radix_sort_triples_by_lex_rank(&mut triples, lex_rank);
+        let mut triples = read_partition_records::<N>(partition_path)?;
+        radix_sort_records_by_lex_rank(&mut triples, lex_rank);
         return Ok(PartitionIter::InMemory(triples.into_iter()));
     }
 
@@ -1040,13 +1038,13 @@ fn open_partition_sorted(
     // in RAM, write sorted-chunk spill, then k-way merge. The
     // resident peak during this path is one chunk's triples plus
     // one triple per chunk file in the heap.
-    let chunk_triples = (max_partition_bytes as usize) / TRIPLE_BYTES;
+    let chunk_triples = (max_partition_bytes as usize) / mem::size_of::<[u32; N]>();
     let mut sorted_chunk_paths: Vec<PathBuf> = Vec::new();
     let mut r = BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(partition_path)?);
-    let mut chunk: Vec<Triple> =
+    let mut chunk: Vec<[u32; N]> =
         Vec::with_capacity(chunk_triples.min(EXTERNAL_MERGE_CHUNK_CAP_TRIPLES));
     let mut chunk_idx: usize = 0;
-    while let Some(t) = read_one_triple(&mut r)? {
+    while let Some(t) = read_one_record::<_, N>(&mut r)? {
         chunk.push(t);
         if chunk.len() >= chunk_triples {
             spill_sorted_chunk(
@@ -1075,15 +1073,14 @@ fn open_partition_sorted(
     for p in &sorted_chunk_paths {
         readers.push(BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(p)?));
     }
-    let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::with_capacity(readers.len());
+    let mut heap: BinaryHeap<MergeEntry<N>> = BinaryHeap::with_capacity(readers.len());
     for (idx, reader) in readers.iter_mut().enumerate() {
-        if let Some(t) = read_one_triple(reader)? {
+        if let Some(t) = read_one_record::<_, N>(reader)? {
             let term_id = triple_term_id(&t);
             let doc_id = triple_doc_id(&t);
             heap.push(MergeEntry {
                 sort_key: pack_sort_key(lex_rank[term_id as usize], doc_id),
-                term_id,
-                tf: triple_tf(&t),
+                rec: t,
                 reader_idx: idx,
             });
         }
@@ -1299,11 +1296,11 @@ impl FtsBuilder {
     /// Open spill partition files for a column and return them.
     /// Called the first time a column's in-RAM accumulator crosses
     /// `spill_threshold_bytes`.
-    fn open_partitions_for_column(
+    fn open_partitions_for_column<const N: usize>(
         scratch_dir: &Path,
         column_id: u32,
         n_partitions: usize,
-    ) -> Result<Vec<SpillPartition>, BuildError> {
+    ) -> Result<Vec<SpillPartition<N>>, BuildError> {
         let mut partitions = Vec::with_capacity(n_partitions);
         for partition in 0..n_partitions {
             let path = scratch_dir.join(format!("fts_col{column_id}_part{partition}.bin"));
@@ -1329,7 +1326,7 @@ impl FtsBuilder {
     /// to intern any new terms they see.
     fn flush_in_ram_to_partitions(
         terms: FxHashMap<Box<str>, Vec<(u32, u32)>>,
-        partitions: &mut [SpillPartition],
+        partitions: &mut [SpillPartition<PLAIN_RECORD_LANES>],
         term_to_id: &mut TermIdMap,
         id_to_term: &mut Vec<&'static str>,
         arena: &Bump,
@@ -1349,7 +1346,7 @@ impl FtsBuilder {
             let (term_id, _is_new) = intern_term_id(term_to_id, id_to_term, arena, &term);
             let p = (term_id as usize) & mask;
             for (doc_id, tf) in postings {
-                push_triple_batched(&mut partitions[p], term_id, doc_id, tf)?;
+                push_record_batched(&mut partitions[p], [term_id, doc_id, tf])?;
             }
         }
         Ok(())
@@ -1506,7 +1503,7 @@ impl FtsBuilder {
             *slot = 0;
             let p = (term_id as usize) & mask;
             let partition = unsafe { partitions.get_unchecked_mut(p) };
-            push_triple_batched(partition, term_id, local_doc_id, tf)?;
+            push_record_batched(partition, [term_id, local_doc_id, tf])?;
         }
 
         Ok(())
@@ -3800,7 +3797,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("empty.part");
         fs::write(&path, []).expect("write empty file");
-        let triples = read_partition_triples(&path).expect("read empty");
+        let triples = read_partition_records::<PLAIN_RECORD_LANES>(&path).expect("read empty");
         assert!(triples.is_empty());
     }
 
@@ -3815,7 +3812,7 @@ mod tests {
             bytes.extend_from_slice(&field.to_le_bytes());
         }
         fs::write(&path, &bytes).expect("write triples");
-        let triples = read_partition_triples(&path).expect("read triples");
+        let triples = read_partition_records::<PLAIN_RECORD_LANES>(&path).expect("read triples");
         assert_eq!(triples, vec![[3u32, 4, 5], [6u32, 7, 8]]);
     }
 
@@ -3827,7 +3824,7 @@ mod tests {
         let path = dir.path().join("ragged.part");
         // One full triple plus a stray byte.
         fs::write(&path, vec![0u8; TRIPLE_BYTES + 1]).expect("write ragged file");
-        let err = read_partition_triples(&path).expect_err("expected error");
+        let err = read_partition_records::<PLAIN_RECORD_LANES>(&path).expect_err("expected error");
         match err {
             BuildError::Io(e) => {
                 assert_eq!(e.kind(), ErrorKind::InvalidData);
@@ -3844,14 +3841,12 @@ mod tests {
         // exercises the derived `PartialEq` / `PartialOrd` bridges too.
         let small = MergeEntry {
             sort_key: 10,
-            term_id: 1,
-            tf: 1,
+            rec: [1u32, 10, 1],
             reader_idx: 0,
         };
         let large = MergeEntry {
             sort_key: 20,
-            term_id: 2,
-            tf: 1,
+            rec: [2u32, 20, 1],
             reader_idx: 1,
         };
         // Reversed ordering: the smaller sort_key is the "greater"
@@ -3862,15 +3857,15 @@ mod tests {
 
         let small_dup = MergeEntry {
             sort_key: 10,
-            term_id: 9,
-            tf: 9,
+            rec: [9u32, 10, 9],
             reader_idx: 0,
         };
         // Equality is keyed on the comparator (sort_key then
-        // reader_idx); term_id / tf are payload and don't affect it.
+        // reader_idx); the record lanes are payload and don't
+        // affect it.
         assert!(small == small_dup);
 
-        let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
+        let mut heap: BinaryHeap<MergeEntry<PLAIN_RECORD_LANES>> = BinaryHeap::new();
         heap.push(large);
         heap.push(small);
         assert_eq!(heap.pop().expect("non-empty heap").sort_key, 10);

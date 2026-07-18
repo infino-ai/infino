@@ -111,7 +111,7 @@ bitpacking = "0.9"
 crc-fast = "1.10.0"
 wide = "1"
 fst = "0.4"
-bytemuck = "1"
+bytemuck = { version = "1", features = ["min_const_generics"] }
 
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for
 # per-query scratch, plus the custom MemoryArena in fts/arena.rs.
