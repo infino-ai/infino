@@ -46,7 +46,6 @@ pub(crate) fn push_varint(out: &mut Vec<u8>, mut v: u32) {
 /// `*at` past it. Returns `None` on truncated input or a value that
 /// overflows `u32` — both only reachable on corrupt bytes, which the
 /// caller surfaces as a read error.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn read_varint(bytes: &[u8], at: &mut usize) -> Option<u32> {
     let mut v: u32 = 0;
@@ -104,7 +103,6 @@ pub(crate) fn decode_run(bytes: &[u8], at: &mut usize, tf: u32, out: &mut Vec<u3
 
 /// Advance `*at` past one run of `tf` positions without materializing
 /// them. `None` on truncated bytes.
-#[allow(dead_code)]
 pub(crate) fn skip_run(bytes: &[u8], at: &mut usize, tf: u32) -> Option<()> {
     for _ in 0..tf {
         read_varint(bytes, at)?;

@@ -99,8 +99,8 @@ use crate::superfile::{
     fts::{
         bm25,
         dict::{DictBuilder, StreamingDictBuilder},
-        fst_value::FstValue,
-        positions::encode_run,
+        fst_value::{FstValue, INLINE_TF_MAX},
+        positions::{encode_run, read_varint, skip_run},
         posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer},
     },
@@ -214,6 +214,13 @@ impl FinishProfile {
 /// `df`, `postings_length`, and `num_blocks` stay u32; only the absolute
 /// offset into the postings region needs the full u64 range.
 pub(crate) const TERM_META_SIZE: usize = 20;
+
+/// Extended per-term metadata header for terms of a **positional**
+/// column: the 20-byte layout plus `positions_offset` (u64, absolute
+/// within the positions region) and `positions_length` (u32). The
+/// column's positions flag selects the stride — the two layouts never
+/// mix within one column.
+pub(crate) const TERM_META_POSITIONAL_SIZE: usize = 32;
 
 /// Skip-table entry size in bytes.
 pub(crate) const SKIP_ENTRY_SIZE: usize = 16;
@@ -1860,6 +1867,7 @@ impl FtsBuilder {
                 (state.total_tokens as f32) / (n as f32)
             };
         }
+        let any_positional = work.iter().any(|(_, state, _)| state.positions);
 
         let scratch_path = scratch_dir.path().to_path_buf();
         // Posting body scratch file. Encoded posting blocks for every
@@ -1869,6 +1877,10 @@ impl FtsBuilder {
         let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
+        let mut positions_sink = match any_positional {
+            true => Some(PositionsSink::create(&scratch_path)?),
+            false => None,
+        };
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
@@ -1886,7 +1898,7 @@ impl FtsBuilder {
                 name: col_name,
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
-                positions: _col_positions,
+                positions: col_positions,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -1894,12 +1906,12 @@ impl FtsBuilder {
 
             // In-RAM path invariant: dispatcher checked
             // `!any_spilled`, so every column is `InRam`.
-            let terms = match posting_state {
+            let (terms, mut pos_runs) = match posting_state {
                 ColumnPostings::InRam {
                     terms,
-                    pos_runs: _,
+                    pos_runs,
                     bytes: _,
-                } => terms,
+                } => (terms, pos_runs),
                 ColumnPostings::Spilled { .. } => unreachable!(
                     "finish_to_inram dispatched on !any_spilled; \
                      Spilled column cannot appear here"
@@ -1916,6 +1928,24 @@ impl FtsBuilder {
             let mut entries: InRamEntries = terms.into_iter().collect();
             entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             for (term, postings) in entries {
+                // A positional column hands the term's runs (removed
+                // by value so the map shrinks as it drains) plus the
+                // shared region sink to the encoder.
+                let term_runs: Vec<u8> = match col_positions {
+                    true => pos_runs
+                        .remove(&term)
+                        .expect("positional term accumulated a position run"),
+                    false => Vec::new(),
+                };
+                let term_positions = match col_positions {
+                    true => Some((
+                        positions_sink
+                            .as_mut()
+                            .expect("sink created for positional builds"),
+                        term_runs.as_slice(),
+                    )),
+                    false => None,
+                };
                 encode_and_emit_term(
                     &term,
                     &postings,
@@ -1929,6 +1959,7 @@ impl FtsBuilder {
                     &mut postings_len,
                     Some(&mut fst_inram),
                     None,
+                    term_positions,
                     &mut finish_profile,
                     &mut term_scratch,
                 )?;
@@ -1944,6 +1975,7 @@ impl FtsBuilder {
                 postings_path,
                 postings_crc_acc,
                 postings_len,
+                positions_sink,
                 fst_sink: FstSinkFinish::InRam(fst_inram),
                 n_columns,
                 n_docs,
@@ -2006,11 +2038,17 @@ impl FtsBuilder {
             };
         }
 
+        let any_positional = work.iter().any(|(_, state, _)| state.positions);
+
         let scratch_path = scratch_dir.path().to_path_buf();
         let postings_path = scratch_path.join("infino_fts_postings.bin");
         let mut postings_writer = BufWriter::new(File::create(&postings_path)?);
         let mut postings_len: u64 = 0;
         let mut postings_crc_acc: u32 = 0;
+        let mut positions_sink = match any_positional {
+            true => Some(PositionsSink::create(&scratch_path)?),
+            false => None,
+        };
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
         let mut finish_profile = FinishProfile::from_env();
@@ -2056,7 +2094,7 @@ impl FtsBuilder {
                 name: col_name,
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
-                positions: _col_positions,
+                positions: col_positions,
             } = col_state;
             let col_name_bytes = col_name.as_bytes();
             let avgdl = avgdl_per_col[orig_col_idx];
@@ -2065,7 +2103,7 @@ impl FtsBuilder {
             match posting_state {
                 ColumnPostings::InRam {
                     terms,
-                    pos_runs: _,
+                    pos_runs: mut col_pos_runs,
                     bytes: _,
                 } => {
                     // Sort term keys; per-term doc lists are already
@@ -2080,6 +2118,25 @@ impl FtsBuilder {
                     // are unique.
                     entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
                     for (term, postings) in entries {
+                        // Positional columns never spill (their
+                        // accumulator is pinned in RAM), so a spilled
+                        // build's positional terms all pass through
+                        // this arm with their runs.
+                        let term_runs: Vec<u8> = match col_positions {
+                            true => col_pos_runs
+                                .remove(&term)
+                                .expect("positional term accumulated a position run"),
+                            false => Vec::new(),
+                        };
+                        let term_positions = match col_positions {
+                            true => Some((
+                                positions_sink
+                                    .as_mut()
+                                    .expect("sink created for positional builds"),
+                                term_runs.as_slice(),
+                            )),
+                            false => None,
+                        };
                         encode_and_emit_term(
                             &term,
                             &postings,
@@ -2093,6 +2150,7 @@ impl FtsBuilder {
                             &mut postings_len,
                             None,
                             Some(&mut fst_streaming),
+                            term_positions,
                             &mut finish_profile,
                             &mut term_scratch,
                         )?;
@@ -2280,6 +2338,10 @@ impl FtsBuilder {
                             &mut postings_len,
                             None,
                             Some(&mut fst_streaming),
+                            // Positional columns never transition to
+                            // the spill path, so a merged (spilled)
+                            // term has no positions.
+                            None,
                             &mut finish_profile,
                             &mut term_scratch,
                         )?;
@@ -2376,6 +2438,7 @@ impl FtsBuilder {
                 postings_path,
                 postings_crc_acc,
                 postings_len,
+                positions_sink,
                 fst_sink: FstSinkFinish::Streaming {
                     builder: fst_streaming,
                     path: fst_streaming_path,
@@ -2398,6 +2461,34 @@ impl FtsBuilder {
 /// like "build everything, then assemble" instead of routing through
 /// a long positional argument list. All fields are consumed by
 /// assembly.
+/// Streaming sink for the positions region, mirroring the postings
+/// scratch-file quartet (writer, path, running CRC, running length).
+/// Created by a finish path iff any registered column is positional;
+/// its running `len` doubles as the next term's `positions_offset`
+/// (offsets in term metadata are relative to the region start).
+struct PositionsSink {
+    writer: BufWriter<File>,
+    path: PathBuf,
+    crc_acc: u32,
+    len: u64,
+}
+
+impl PositionsSink {
+    fn create(scratch_path: &Path) -> Result<Self, BuildError> {
+        let path = scratch_path.join("infino_fts_positions.bin");
+        Ok(Self {
+            writer: BufWriter::new(File::create(&path)?),
+            path,
+            crc_acc: 0,
+            len: 0,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), BuildError> {
+        write_counted(&mut self.writer, &mut self.crc_acc, &mut self.len, bytes)
+    }
+}
+
 struct BlobAssemblyInputs {
     /// Open scratch writer holding every encoded posting block in
     /// lex order. Assembly closes it (CRC trailer + flush) before
@@ -2412,6 +2503,13 @@ struct BlobAssemblyInputs {
     /// Bytes written so far to `postings_writer` (excluding trailer).
     /// Assembly grows this by 4 when it appends the CRC.
     postings_len: u64,
+    /// Positions region sink — `Some` iff any registered column is
+    /// positional, in which case the blob gets a v2 header and the
+    /// region lands between the postings and the doc-lengths
+    /// directory (even when empty, so region accounting stays
+    /// uniform). `None` produces a v1 blob byte-identical to builds
+    /// before positions existed.
+    positions_sink: Option<PositionsSink>,
     /// Whichever FST sink was used during the per-column emit loop
     /// (exactly one of the two variants).
     fst_sink: FstSinkFinish,
@@ -2462,6 +2560,7 @@ fn assemble_and_write_blob<W: Write>(
         postings_path,
         postings_crc_acc,
         mut postings_len,
+        positions_sink,
         fst_sink,
         n_columns,
         n_docs,
@@ -2489,6 +2588,21 @@ fn assemble_and_write_blob<W: Write>(
     if let Some(t) = postings_close_start {
         finish_profile.postings_close += t.elapsed();
     }
+
+    // Close the positions region file the same way (CRC trailer +
+    // flush). An all-inline positional build leaves a body of zero
+    // bytes — the region is then just the 4-byte CRC-of-empty, the
+    // same legal shape an empty postings region takes.
+    let positions_region = match positions_sink {
+        Some(mut sink) => {
+            let crc_le = sink.crc_acc.to_le_bytes();
+            sink.writer.write_all(&crc_le)?;
+            sink.writer.flush()?;
+            drop(sink.writer);
+            Some((sink.path, sink.len + crc_le.len() as u64))
+        }
+        None => None,
+    };
 
     // Finalise the FST. Either path produces "FST bytes followed
     // by 4 trailing CRC bytes"; the source differs.
@@ -2554,10 +2668,18 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    let header_size: u64 = FTS_HEADER_SIZE as u64;
+    let header_size: u64 = match positions_region {
+        Some(_) => format::fts::HEADER_SIZE_V2 as u64,
+        None => FTS_HEADER_SIZE as u64,
+    };
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
-    let doc_lengths_table_offset: u64 = postings_offset + postings_len;
+    // The positions region sits between the postings and the
+    // doc-lengths directory (keeping the lazy-open doc-lengths tail
+    // fetch small); absent, the directory follows postings directly.
+    let positions_offset: u64 = postings_offset + postings_len;
+    let positions_total_len: u64 = positions_region.as_ref().map_or(0, |(_, len)| *len);
+    let doc_lengths_table_offset: u64 = positions_offset + positions_total_len;
     let mut doc_lengths_array_offset: u64 =
         doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
 
@@ -2606,13 +2728,20 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    header.extend_from_slice(&format::fts::VERSION.to_le_bytes()); // 4
+    let version = match positions_region {
+        Some(_) => format::fts::VERSION_POSITIONS,
+        None => format::fts::VERSION,
+    };
+    header.extend_from_slice(&version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
     header.extend_from_slice(&fst_offset.to_le_bytes()); // 8
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
+    if positions_region.is_some() {
+        header.extend_from_slice(&positions_offset.to_le_bytes()); // 8 (v2 only)
+    }
     debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
 
     w.write_all(&header)?;
@@ -2628,6 +2757,11 @@ fn assemble_and_write_blob<W: Write>(
         BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(&postings_path)?);
     io::copy(&mut postings_reader, w)?;
     drop(postings_reader);
+    if let Some((positions_path, _)) = &positions_region {
+        let mut positions_reader =
+            BufReader::with_capacity(PARTITION_BUF_SIZE, File::open(positions_path)?);
+        io::copy(&mut positions_reader, w)?;
+    }
 
     // Drop the scratch tempdir as soon as the streamed source
     // files (FST + posting body) have been copied into `w`. The
@@ -2696,6 +2830,10 @@ struct TermScratch {
     /// concatenated block bytes; written to `postings_writer` as one
     /// `write_counted` call.
     term_buf: Vec<u8>,
+    /// Per-term positions-block offsets (one per PFOR block, byte
+    /// offset of the block's first run within the term's positions
+    /// bytes) for positional columns. Reused like the other buffers.
+    pos_block_offsets: Vec<u32>,
 }
 
 /// Encode one term's posting list and emit the resulting FST entry
@@ -2719,6 +2857,7 @@ fn encode_and_emit_term<W: Write>(
     postings_len: &mut u64,
     fst_entries_inram: Option<&mut DictBuilder>,
     mut fst_streaming: Option<&mut StreamingDictBuilder<BufWriter<File>>>,
+    mut term_positions: Option<(&mut PositionsSink, &[u8])>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
 ) -> Result<(), BuildError> {
@@ -2738,10 +2877,31 @@ fn encode_and_emit_term<W: Write>(
 
     let df = pairs.len() as u64;
 
-    let fst_value: u64 = if df == 1 {
-        profile.encode_df1 += 1;
+    // A df=1 posting inlines into the FST value when the WHOLE
+    // posting fits: a positionless column always does (doc_id + tf);
+    // a positional column only when tf == 1 and the single position
+    // fits the 30-bit slot — the position rides where tf normally
+    // lives, tf implied 1 (one position is exactly what a phrase
+    // check needs). Otherwise even a df=1 term takes the PFOR form so
+    // its positions land in the region.
+    let inline_value: Option<u64> = if df == 1 {
         let (doc_id, tf) = pairs[0];
-        FstValue::pack_inline(doc_id, tf)
+        match &term_positions {
+            None => Some(FstValue::pack_inline(doc_id, tf)),
+            Some((_, runs)) if tf == 1 => {
+                let mut at = 0;
+                let pos = read_varint(runs, &mut at).expect("builder-encoded run is well-formed");
+                (pos <= INLINE_TF_MAX).then(|| FstValue::pack_inline(doc_id, pos))
+            }
+            Some(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let fst_value: u64 = if let Some(v) = inline_value {
+        profile.encode_df1 += 1;
+        v
     } else {
         profile.encode_pfor += 1;
         let idf_t = bm25::idf(n_docs as u64, df);
@@ -2804,7 +2964,32 @@ fn encode_and_emit_term<W: Write>(
         let metadata_offset = *postings_len;
         let skip_table_size = encoded_blocks.len() * SKIP_ENTRY_SIZE;
         let blocks_total_size: usize = encoded_blocks.iter().map(|b| b.bytes.len()).sum();
-        let postings_length = (TERM_META_SIZE + skip_table_size + blocks_total_size) as u64;
+        let term_meta_size = match term_positions {
+            Some(_) => TERM_META_POSITIONAL_SIZE,
+            None => TERM_META_SIZE,
+        };
+        let postings_length = (term_meta_size + skip_table_size + blocks_total_size) as u64;
+
+        // Per-block byte offsets into this term's position runs: walk
+        // the runs once, recording where each 128-doc block's first
+        // run starts, so the reader can fetch/decode one block's
+        // positions without touching its predecessors.
+        let pos_block_offsets = &mut scratch.pos_block_offsets;
+        pos_block_offsets.clear();
+        if let Some((_, runs)) = &term_positions {
+            debug_assert!(
+                runs.len() <= u32::MAX as usize,
+                "single-term positions > 4 GiB"
+            );
+            let mut at: usize = 0;
+            for (i, &(_, tf)) in pairs.iter().enumerate() {
+                if i % BLOCK_LEN == 0 {
+                    pos_block_offsets.push(at as u32);
+                }
+                skip_run(runs, &mut at, tf).expect("builder-encoded runs are well-formed");
+            }
+            debug_assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+        }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");
         debug_assert!(
@@ -2825,12 +3010,16 @@ fn encode_and_emit_term<W: Write>(
         term_buf.extend_from_slice(&metadata_offset.to_le_bytes());
         term_buf.extend_from_slice(&(postings_length as u32).to_le_bytes());
         term_buf.extend_from_slice(&num_blocks.to_le_bytes());
-        debug_assert_eq!(term_buf.len(), TERM_META_SIZE);
+        if let Some((sink, runs)) = &term_positions {
+            term_buf.extend_from_slice(&sink.len.to_le_bytes());
+            term_buf.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+        }
+        debug_assert_eq!(term_buf.len(), term_meta_size);
         if let Some(start) = meta_write_start {
             profile.encode_meta_write += start.elapsed();
         }
 
-        let mut block_offset: u32 = (TERM_META_SIZE + skip_table_size) as u32;
+        let mut block_offset: u32 = (term_meta_size + skip_table_size) as u32;
         let skip_write_start = profile.enabled.then(Instant::now);
         for (i, blk) in encoded_blocks.iter().enumerate() {
             let max_bm25 = block_ub_per_block[i];
@@ -2847,7 +3036,10 @@ fn encode_and_emit_term<W: Write>(
             term_buf.extend_from_slice(&blk.last_doc_id.to_le_bytes());
             term_buf.extend_from_slice(&block_offset.to_le_bytes());
             term_buf.extend_from_slice(&max_bm25_x1000.to_le_bytes());
-            term_buf.extend_from_slice(&0u32.to_le_bytes());
+            // Positionless columns keep writing zero here —
+            // byte-identical to the field's reserved era.
+            let pos_block_off = pos_block_offsets.get(i).copied().unwrap_or(0);
+            term_buf.extend_from_slice(&pos_block_off.to_le_bytes());
             block_offset += blk.bytes.len() as u32;
         }
         if let Some(start) = skip_write_start {
@@ -2862,6 +3054,10 @@ fn encode_and_emit_term<W: Write>(
         write_counted(postings_writer, postings_crc_acc, postings_len, term_buf)?;
         if let Some(start) = block_write_start {
             profile.encode_block_write += start.elapsed();
+        }
+
+        if let Some((sink, runs)) = term_positions.as_mut() {
+            sink.write(runs)?;
         }
 
         FstValue::pack_pfor(metadata_offset, postings_length as u32)
