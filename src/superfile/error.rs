@@ -192,6 +192,16 @@ pub enum FtsError {
     #[error("query has only negated terms; at least one positive term is required")]
     NegationOnly,
 
+    /// A phrase query needs token positions but the column was built
+    /// without them (`FtsConfig::positions` was false). A typed error
+    /// — never a silent bag-of-words fallback, which would return
+    /// wrong matches.
+    #[error(
+        "phrase query on column {column:?}, which was indexed without token \
+         positions; rebuild with positions enabled to use phrase queries"
+    )]
+    PositionsUnavailable { column: String },
+
     #[error("read error: {0}")]
     Read(#[from] ReadError),
 }

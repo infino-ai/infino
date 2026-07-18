@@ -89,7 +89,10 @@ use crate::{
     InfinoError,
     superfile::{
         SuperfileReader,
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::{
+            reader::ClauseLists,
+            tokenize::{AsciiLowerTokenizer, Tokenizer},
+        },
     },
     supertable::{
         error::QueryError,
@@ -238,15 +241,27 @@ impl SupertableReader {
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
+        let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
+            phrases
+                .into_iter()
+                .map(|p| p.into_iter().map(Cow::into_owned).collect())
+                .collect()
+        };
+        let must_phrases = own_phrases(clauses.must_phrases);
+        let should_phrases = own_phrases(clauses.should_phrases);
+        let negative_phrases = own_phrases(clauses.negative_phrases);
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+        let has_phrases =
+            !must_phrases.is_empty() || !should_phrases.is_empty() || !negative_phrases.is_empty();
 
-        if musts.is_empty() && shoulds.is_empty() {
+        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
             // No scorable clause at all. Empty / punctuation-only
             // queries match nothing (not an error); negation-only
             // (e.g. `-foo`) has no anchor to rank — reject up front so
             // the per-superfile kernel never has to, and so the
             // unranked count / token_match path surfaces the identical
             // error (see `parse_and_prune`).
-            if negatives.is_empty() {
+            if negatives.is_empty() && negative_phrases.is_empty() {
                 return Ok(Vec::new());
             }
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
@@ -254,17 +269,30 @@ impl SupertableReader {
 
         // Pick the superfiles to search, via the shared two-tier bloom
         // prune. Musts prune hardest: every match contains all of
-        // them, so a superfile lacking any must is skipped regardless
-        // of `mode`. A pure should query prunes exactly as the flat
-        // term list did. Negated terms never prune — a superfile
-        // without a negated term is the best case (none of its docs
-        // can be excluded) — and shoulds never prune once a must
-        // exists, since they only affect scores.
-        let (prune_terms, prune_mode) = if musts.is_empty() {
+        // them — a phrase's member terms included, since a phrase
+        // match requires every member present — so a superfile
+        // lacking any is skipped regardless of `mode`. A pure should
+        // query prunes as the flat term list did (phrase members join
+        // the union: a doc matching the phrase contains each member).
+        // Negated atoms never prune, and shoulds never prune once a
+        // must exists, since they only affect scores.
+        let (mut prune_terms, prune_mode) = if !has_musts {
             (shoulds.clone(), mode)
         } else {
             (musts.clone(), BoolMode::And)
         };
+        match has_musts {
+            true => {
+                for p in &must_phrases {
+                    prune_terms.extend(p.iter().cloned());
+                }
+            }
+            false => {
+                for p in &should_phrases {
+                    prune_terms.extend(p.iter().cloned());
+                }
+            }
+        }
         let prune_leaf = PruneLeaf::TermPresence {
             column: column_owned.clone(),
             terms: prune_terms,
@@ -282,7 +310,12 @@ impl SupertableReader {
         // Single-term OR, AND, and any query with a must or negated
         // clause stay on the un-ranged call.
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        let fanout = fanout_for(musts.len(), shoulds.len(), !negatives.is_empty());
+        // Phrase-bearing queries stay per-superfile: the ranged
+        // kernel is the pure term-union fast path.
+        let fanout = match has_phrases {
+            true => FanOut::PerSuperfile,
+            false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
+        };
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
         let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
             .into_iter()
@@ -295,6 +328,9 @@ impl SupertableReader {
         let must_arc: Arc<Vec<String>> = Arc::new(musts);
         let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
+        let must_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(must_phrases);
+        let should_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(should_phrases);
+        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negative_phrases);
         let column_arc = Arc::new(column_owned);
 
         // Cross-segment threshold sharing: each unit reads the global
@@ -318,6 +354,9 @@ impl SupertableReader {
             let must_arc = Arc::clone(&must_arc);
             let should_arc = Arc::clone(&should_arc);
             let neg_arc = Arc::clone(&neg_arc);
+            let must_ph_arc = Arc::clone(&must_ph_arc);
+            let should_ph_arc = Arc::clone(&should_ph_arc);
+            let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
             async move {
@@ -347,9 +386,14 @@ impl SupertableReader {
                         let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
                         r.bm25_search_clauses(
                             &column_arc,
-                            &must_refs,
-                            &should_refs,
-                            &neg_refs,
+                            ClauseLists {
+                                musts: &must_refs,
+                                shoulds: &should_refs,
+                                negatives: &neg_refs,
+                                must_phrases: &must_ph_arc,
+                                should_phrases: &should_ph_arc,
+                                negative_phrases: &neg_ph_arc,
+                            },
                             k,
                             floor,
                         )

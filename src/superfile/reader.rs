@@ -20,7 +20,7 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{fmt, io, str, sync::Arc};
+use std::{borrow::Cow, fmt, io, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -48,7 +48,7 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, FtsReader},
+            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::reader::{self as vector_reader, VectorReader},
@@ -784,8 +784,29 @@ impl SuperfileReader {
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
-        self.bm25_search_clauses(column, &musts, &shoulds, &negatives, k, f32::NEG_INFINITY)
-            .await
+        let own = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
+            phrases
+                .into_iter()
+                .map(|p| p.into_iter().map(Cow::into_owned).collect())
+                .collect()
+        };
+        let must_phrases = own(clauses.must_phrases);
+        let should_phrases = own(clauses.should_phrases);
+        let negative_phrases = own(clauses.negative_phrases);
+        self.bm25_search_clauses(
+            column,
+            ClauseLists {
+                musts: &musts,
+                shoulds: &shoulds,
+                negatives: &negatives,
+                must_phrases: &must_phrases,
+                should_phrases: &should_phrases,
+                negative_phrases: &negative_phrases,
+            },
+            k,
+            f32::NEG_INFINITY,
+        )
+        .await
     }
 
     /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
@@ -941,18 +962,14 @@ impl SuperfileReader {
     pub(crate) async fn bm25_search_clauses(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
-        negatives: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts
-            .search_excluding(column, musts, shoulds, negatives, k, floor)
-            .await?)
+        Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
     /// Prefix-expanded BM25 search.

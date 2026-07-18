@@ -43,6 +43,7 @@ use crate::superfile::{
         },
         dict::{DictReader, make_key},
         fst_value::FstValue,
+        positions::{decode_run, skip_run},
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
     },
@@ -62,6 +63,42 @@ pub enum BoolMode {
     /// the musts alone define the match set and bare terms become
     /// scoring-only.
     Or,
+}
+
+/// A query's parsed clause lists, borrowed for one search call —
+/// terms and phrases per polarity, with the default operator already
+/// resolved (see `ParsedQuery::into_clauses`). Grouped so the search
+/// entry points don't take nine parallel parameters.
+#[derive(Default)]
+pub(crate) struct ClauseLists<'a> {
+    pub musts: &'a [&'a str],
+    pub shoulds: &'a [&'a str],
+    pub negatives: &'a [&'a str],
+    pub must_phrases: &'a [Vec<String>],
+    pub should_phrases: &'a [Vec<String>],
+    pub negative_phrases: &'a [Vec<String>],
+}
+
+impl ClauseLists<'_> {
+    /// Any phrase atom anywhere routes the query to the atom walks.
+    fn has_phrases(&self) -> bool {
+        !self.must_phrases.is_empty()
+            || !self.should_phrases.is_empty()
+            || !self.negative_phrases.is_empty()
+    }
+
+    /// Nothing to rank or match on the positive side.
+    fn no_positive_atoms(&self) -> bool {
+        self.musts.is_empty()
+            && self.shoulds.is_empty()
+            && self.must_phrases.is_empty()
+            && self.should_phrases.is_empty()
+    }
+
+    /// Nothing negated either.
+    fn no_negative_atoms(&self) -> bool {
+        self.negatives.is_empty() && self.negative_phrases.is_empty()
+    }
 }
 
 impl From<&str> for BoolMode {
@@ -265,9 +302,8 @@ pub struct FtsReader {
     fst_range: Range<usize>,
     postings_range: Range<usize>,
     /// Byte range of the positions region (CRC stripped) — `Some`
-    /// iff the blob is v2 (some column recorded positions). Consumed
-    /// by the phrase read path that follows in this series.
-    #[allow(dead_code)]
+    /// iff the blob is v2. Phrase queries fetch per-term run ranges
+    /// out of it via [`Self::fetch_term_positions`].
     positions_range: Option<Range<usize>>,
     columns: Vec<ColumnMeta>,
     column_id_by_name: HashMap<String, u32>,
@@ -759,6 +795,235 @@ impl FtsReader {
             })
     }
 
+    /// Fetch each requested term's position-run bytes from the
+    /// positions region — the phrase sibling of
+    /// [`fetch_term_postings`](Self::fetch_term_postings): one range
+    /// per term, fanned out in parallel, never the whole region.
+    /// `terms` pairs are `(positions_offset, positions_length)` from
+    /// the terms' metadata; zero-length entries (inline terms) yield
+    /// empty buffers without touching the source.
+    async fn fetch_term_positions(&self, terms: &[(u64, u32)]) -> Result<Vec<Bytes>, FtsError> {
+        if terms.iter().all(|&(_, len)| len == 0) {
+            return Ok(vec![Bytes::new(); terms.len()]);
+        }
+        let region = self.positions_range.as_ref().ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "positional term in a blob with no positions region".into(),
+            ))
+        })?;
+        let base = region.start;
+        let region_len = region.len();
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
+        for &(off, len) in terms {
+            let off = off as usize;
+            let len = len as usize;
+            if off + len > region_len {
+                return Err(FtsError::Read(ReadError::MalformedVersion(
+                    "term positions range runs past positions region".into(),
+                )));
+            }
+            ranges.push(base + off..base + off + len);
+        }
+        self.source
+            .get_ranges_parallel_async(&ranges)
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/positions term range fetch failed: {e}"
+                )))
+            })
+    }
+
+    /// Build one [`AnyCursor`] per requested atom, preserving input
+    /// order: first the `terms`, then the `phrases`. An atom whose
+    /// term (or any phrase member) is absent from the column yields
+    /// `None` — the caller applies polarity semantics (a missing must
+    /// empties the result; a missing should or negative is dropped).
+    ///
+    /// Multi-token phrases require the column to be positional;
+    /// otherwise [`FtsError::PositionsUnavailable`].
+    async fn build_atom_cursors(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+    ) -> Result<Vec<Option<AnyCursor>>, FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        if !phrases.is_empty() && !col_meta.positions {
+            return Err(FtsError::PositionsUnavailable {
+                column: col_meta.name.clone(),
+            });
+        }
+        let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
+        for term in terms {
+            let mut cursors = self.build_term_cursors(column_id, &[term]).await?;
+            out.push(cursors.pop().map(AnyCursor::Term));
+        }
+        for phrase in phrases {
+            let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
+            let cursors = self.build_term_cursors(column_id, &member_refs).await?;
+            if cursors.len() != member_refs.len() {
+                // A member is absent — the phrase can never match.
+                out.push(None);
+                continue;
+            }
+            let pos_ranges: Vec<(u64, u32)> = cursors
+                .iter()
+                .map(|c| (c.positions_offset, c.positions_length))
+                .collect();
+            let positions = self.fetch_term_positions(&pos_ranges).await?;
+            out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
+                cursors, positions,
+            )?)));
+        }
+        Ok(out)
+    }
+
+    /// Ranked search over heterogeneous atoms — the walk every
+    /// phrase-bearing query takes. With musts, the match set is their
+    /// intersection and shoulds are scoring-only (the clause model);
+    /// with none, the shoulds' union matches. Docs excluded by
+    /// `filter` never reach the heap; docs scoring strictly below
+    /// `floor_eff` are dropped at admission.
+    fn run_atoms_search(
+        &self,
+        column_id: u32,
+        mut musts: Vec<AnyCursor>,
+        mut shoulds: Vec<AnyCursor>,
+        k: usize,
+        mut filter: Option<AtomExcludeFilter>,
+        floor_eff: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1.as_slice();
+        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+
+        if musts.is_empty() {
+            // Union of shoulds, doc-at-a-time: score every atom
+            // sitting on the frontier doc, then advance them past it.
+            loop {
+                let Some(doc) = shoulds
+                    .iter()
+                    .filter(|a| !a.is_exhausted())
+                    .map(AnyCursor::current_doc_id)
+                    .min()
+                else {
+                    break;
+                };
+                let admitted = match filter.as_mut() {
+                    Some(f) => f.admits(doc)?,
+                    None => true,
+                };
+                if admitted {
+                    let norm = dl_norm_k1[doc as usize];
+                    let score: f32 = shoulds
+                        .iter()
+                        .filter(|a| !a.is_exhausted() && a.current_doc_id() == doc)
+                        .map(|a| a.score_current(norm))
+                        .sum();
+                    if score > floor_eff {
+                        and_heap_push(&mut heap, k, None, score, doc);
+                    }
+                }
+                let Some(next) = doc.checked_add(1) else {
+                    break;
+                };
+                for a in shoulds.iter_mut() {
+                    if !a.is_exhausted() && a.current_doc_id() == doc {
+                        a.skip_to(next)?;
+                    }
+                }
+            }
+            return Ok(drain_top_k_desc(heap));
+        }
+
+        // Must-driven walk: leapfrog the musts to each common doc,
+        // score musts + landing shoulds there.
+        let mut target = 0u32;
+        'docs: loop {
+            let mut aligned = target;
+            let mut i = 0usize;
+            while i < musts.len() {
+                let a = &mut musts[i];
+                a.skip_to(aligned)?;
+                if a.is_exhausted() {
+                    break 'docs;
+                }
+                let here = a.current_doc_id();
+                if here > aligned {
+                    aligned = here;
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+            let admitted = match filter.as_mut() {
+                Some(f) => f.admits(aligned)?,
+                None => true,
+            };
+            if admitted {
+                let norm = dl_norm_k1[aligned as usize];
+                let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
+                for sh in shoulds.iter_mut() {
+                    sh.skip_to(aligned)?;
+                    if !sh.is_exhausted() && sh.current_doc_id() == aligned {
+                        score += sh.score_current(norm);
+                    }
+                }
+                if score > floor_eff {
+                    and_heap_push(&mut heap, k, None, score, aligned);
+                }
+            }
+            let Some(next) = aligned.checked_add(1) else {
+                break;
+            };
+            target = next;
+        }
+        Ok(drain_top_k_desc(heap))
+    }
+
+    /// Unranked count over heterogeneous atoms: the cardinality of the
+    /// musts' intersection (minus exclusions) — shoulds have no scores
+    /// to raise here, matching the clause model's unranked semantics.
+    fn count_atoms(
+        &self,
+        mut musts: Vec<AnyCursor>,
+        mut filter: Option<AtomExcludeFilter>,
+    ) -> Result<u64, FtsError> {
+        let mut n = 0u64;
+        let mut target = 0u32;
+        'docs: loop {
+            let mut aligned = target;
+            let mut i = 0usize;
+            while i < musts.len() {
+                let a = &mut musts[i];
+                a.skip_to(aligned)?;
+                if a.is_exhausted() {
+                    break 'docs;
+                }
+                let here = a.current_doc_id();
+                if here > aligned {
+                    aligned = here;
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+            let admitted = match filter.as_mut() {
+                Some(f) => f.admits(aligned)?,
+                None => true,
+            };
+            if admitted {
+                n += 1;
+            }
+            let Some(next) = aligned.checked_add(1) else {
+                break;
+            };
+            target = next;
+        }
+        Ok(n)
+    }
+
     /// Resolve a column name to its dense column_id, or
     /// `FtsError::UnknownColumn` if the column isn't FTS-indexed in
     /// this superfile. Shared by every public search entry point.
@@ -893,9 +1158,7 @@ impl FtsReader {
     pub(crate) async fn search_excluding(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
-        negatives: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
@@ -903,23 +1166,65 @@ impl FtsReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        if musts.is_empty() && shoulds.is_empty() {
-            if negatives.is_empty() {
+        if lists.no_positive_atoms() {
+            if lists.no_negative_atoms() {
                 return Ok(Vec::new());
             }
             return Err(FtsError::NegationOnly);
         }
+        let floor_eff = floor.next_down();
 
-        let mut filter = match negatives {
+        if lists.has_phrases() {
+            // Phrase-bearing query: the heterogeneous atom walks.
+            let must_atoms = self
+                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .await?;
+            if must_atoms.iter().any(Option::is_none) {
+                // A must atom can never match in this superfile.
+                return Ok(Vec::new());
+            }
+            let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
+            let should_atoms: Vec<AnyCursor> = self
+                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let negative_atoms: Vec<AnyCursor> = self
+                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let filter = match negative_atoms.is_empty() {
+                true => None,
+                false => Some(AtomExcludeFilter::new(negative_atoms)),
+            };
+            return self.run_atoms_search(
+                column_id,
+                must_atoms,
+                should_atoms,
+                k,
+                filter,
+                floor_eff,
+            );
+        }
+
+        let mut filter = match lists.negatives {
             [] => None,
             _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, negatives).await?,
+                self.build_term_cursors(column_id, lists.negatives).await?,
             )),
         };
-
-        let floor_eff = floor.next_down();
-        self.search_clauses(column_id, musts, shoulds, k, filter.as_mut(), floor_eff)
-            .await
+        self.search_clauses(
+            column_id,
+            lists.musts,
+            lists.shoulds,
+            k,
+            filter.as_mut(),
+            floor_eff,
+        )
+        .await
     }
 
     /// Shared dispatch for [`Self::search_with_floor`] and
@@ -1387,9 +1692,9 @@ impl FtsReader {
                     // the term's single position, tf implied 1 — the
                     // builder only inlines tf == 1 postings there.
                     // Scoring must use the implied tf, never the slot.
-                    let tf = match col_meta.positions {
-                        true => 1,
-                        false => tf,
+                    let (tf, inline_position) = match col_meta.positions {
+                        true => (1, Some(tf)),
+                        false => (tf, None),
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                     cursors.push(TermCursor::new_inline(
@@ -1397,6 +1702,7 @@ impl FtsReader {
                         tf,
                         self.n_docs as u64,
                         dl_norm_k1,
+                        inline_position,
                     ));
                 }
                 Resolved::Pfor => {
@@ -2918,6 +3224,326 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
     out
 }
 
+/// One member term of a [`PhraseCursor`]: its posting cursor, its
+/// fetched position runs, and a lazily-built per-block cache of each
+/// pair's run offset.
+struct PhraseMember {
+    cursor: TermCursor,
+    /// The term's complete position runs (empty for an inline df=1
+    /// member, whose single position rides on the cursor).
+    positions: Bytes,
+    /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
+    idf: f32,
+    /// Byte offset of each decoded-block pair's run within
+    /// `positions`, valid for `run_offsets_block`. Rebuilt on block
+    /// crossings by one `skip_run` walk over the block's runs.
+    run_offsets: Vec<u32>,
+    /// Which block index `run_offsets` covers (`usize::MAX` = none).
+    run_offsets_block: usize,
+    /// Scratch for the member's decoded positions at the aligned doc.
+    pos_scratch: Vec<u32>,
+}
+
+/// Sentinel for [`PhraseMember::run_offsets_block`]: no block cached.
+const NO_BLOCK_CACHED: usize = usize::MAX;
+
+impl PhraseMember {
+    /// The member's positions at its cursor's current doc, decoded
+    /// into `pos_scratch`. The cursor must be positioned on a doc
+    /// (not exhausted).
+    fn decode_current_positions(&mut self) -> Result<(), FtsError> {
+        self.pos_scratch.clear();
+        if let Some(p) = self.cursor.inline_position {
+            self.pos_scratch.push(p);
+            return Ok(());
+        }
+        let block = self.cursor.current_block;
+        if self.run_offsets_block != block {
+            // One forward walk locates every pair's run in this
+            // block: start at the block's recorded first-run offset,
+            // then skip each pair's `tf` varints.
+            self.run_offsets.clear();
+            let mut at = self.cursor.blocks[block].positions_block_offset as usize;
+            for i in 0..self.cursor.block_n {
+                self.run_offsets.push(at as u32);
+                skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position runs truncated within block".into(),
+                    ))
+                })?;
+            }
+            self.run_offsets_block = block;
+        }
+        let pair = self.cursor.pos;
+        let mut at = self.run_offsets[pair] as usize;
+        decode_run(
+            &self.positions,
+            &mut at,
+            self.cursor.block_tfs[pair],
+            &mut self.pos_scratch,
+        )
+        .ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "position run truncated or overflowing".into(),
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// Doc-at-a-time cursor over an exact phrase: the members'
+/// intersection drives doc alignment, and a doc matches only when the
+/// members' positions verify adjacency (member `i` at `p + i` for
+/// some anchor `p`). Scores as one BM25 atom with `tf` = the number
+/// of verified anchors and `idf` = Σ member idf. Exposes the same
+/// notion of term- and block-level upper bounds as [`TermCursor`], so
+/// the atom walks can prune with it:
+/// `bound = phrase_idf × min_i(member_bound_i / idf_i)` — sound
+/// because the phrase tf in any doc is ≤ every member's tf there and
+/// the BM25 tf-factor is monotone in tf.
+struct PhraseCursor {
+    members: Vec<PhraseMember>,
+    /// Σ member idf × (K1 + 1) — the phrase's scoring constant.
+    idf_x_k1p1: f32,
+    /// Phrase-scaled term-level upper bound (see type docs).
+    term_max_bm25: f32,
+    /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
+    current_doc: u32,
+    /// Number of verified anchors at `current_doc`.
+    current_tf: u32,
+}
+
+impl PhraseCursor {
+    /// Build from member cursors (query order) and their fetched
+    /// position runs, then seek to the first matching doc.
+    fn new(cursors: Vec<TermCursor>, positions: Vec<Bytes>) -> Result<Self, FtsError> {
+        debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
+        debug_assert_eq!(cursors.len(), positions.len());
+        let mut idf_sum = 0.0f32;
+        let mut min_scaled_bound = f32::INFINITY;
+        let members: Vec<PhraseMember> = cursors
+            .into_iter()
+            .zip(positions)
+            .map(|(cursor, positions)| {
+                let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
+                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
+                idf_sum += idf;
+                PhraseMember {
+                    cursor,
+                    positions,
+                    idf,
+                    run_offsets: Vec::new(),
+                    run_offsets_block: NO_BLOCK_CACHED,
+                    pos_scratch: Vec::new(),
+                }
+            })
+            .collect();
+        let mut cursor = Self {
+            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
+            term_max_bm25: idf_sum * min_scaled_bound,
+            members,
+            current_doc: 0,
+            current_tf: 0,
+        };
+        cursor.seek_match(0)?;
+        Ok(cursor)
+    }
+
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        self.current_doc == u32::MAX
+    }
+
+    #[inline]
+    fn current_doc_id(&self) -> u32 {
+        self.current_doc
+    }
+
+    #[inline]
+    fn current_tf(&self) -> u32 {
+        self.current_tf
+    }
+
+    /// Advance to the first verified phrase match at doc ≥ `target`.
+    fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
+        if self.is_exhausted() || self.current_doc >= target {
+            return Ok(());
+        }
+        self.seek_match(target)
+    }
+
+    /// Leapfrog the members to their next common doc ≥ `from`, verify
+    /// adjacency there, and repeat until a match or exhaustion.
+    fn seek_match(&mut self, mut from: u32) -> Result<(), FtsError> {
+        'docs: loop {
+            // Align every member to the same doc ≥ `from`.
+            let mut aligned = from;
+            let mut i = 0usize;
+            while i < self.members.len() {
+                let c = &mut self.members[i].cursor;
+                c.skip_to(aligned);
+                if c.is_exhausted() {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+                let here = c.current_doc_id();
+                if here > aligned {
+                    // Restart alignment at the higher doc.
+                    aligned = here;
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+
+            // Verify adjacency at the aligned doc.
+            let tf = self.verify_at_aligned()?;
+            if tf > 0 {
+                self.current_doc = aligned;
+                self.current_tf = tf;
+                return Ok(());
+            }
+            from = match aligned.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+            };
+            continue 'docs;
+        }
+    }
+
+    /// Count the phrase's anchors at the members' aligned doc: the
+    /// first member's positions `p` where member `i` also has `p + i`
+    /// for every `i`. Member position lists are ascending, so each
+    /// probe is a binary search over a per-doc-tf-sized slice.
+    fn verify_at_aligned(&mut self) -> Result<u32, FtsError> {
+        for m in self.members.iter_mut() {
+            m.decode_current_positions()?;
+        }
+        let (anchor, rest) = self.members.split_first_mut().expect("members >= 2");
+        let mut tf = 0u32;
+        'anchors: for &p in &anchor.pos_scratch {
+            for (i, m) in rest.iter().enumerate() {
+                let want = match p.checked_add(i as u32 + 1) {
+                    Some(w) => w,
+                    None => continue 'anchors,
+                };
+                if m.pos_scratch.binary_search(&want).is_err() {
+                    continue 'anchors;
+                }
+            }
+            tf += 1;
+        }
+        Ok(tf)
+    }
+
+    /// Score the phrase at its current doc with the caller-supplied
+    /// per-doc BM25 normalization.
+    #[inline]
+    fn score_current(&self, dl_norm_k1: f32) -> f32 {
+        bm25::score_with_dl_norm_k1(self.idf_x_k1p1, self.current_tf, dl_norm_k1)
+    }
+
+    /// Phrase-scaled block-level upper bound over `[range_start,
+    /// range_end]` — the block analog of `term_max_bm25`.
+    fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        let mut min_scaled = f32::INFINITY;
+        for m in self.members.iter_mut() {
+            let b = m.cursor.block_max_in_range(range_start, range_end);
+            min_scaled = min_scaled.min(b / m.idf);
+        }
+        let idf_sum = self.idf_x_k1p1 / (bm25::K1 + 1.0);
+        idf_sum * min_scaled
+    }
+}
+
+/// A query atom's cursor: a plain term or an exact phrase. The atom
+/// walks below are heterogeneous doc-at-a-time loops over this enum —
+/// deliberately separate from the field-level optimized kernels
+/// (flat-merge AND, MaxScore/BMM, windowed union), which keep serving
+/// term-only queries unchanged. A query containing any phrase routes
+/// here: correctness-first walks whose per-doc cost is dominated by
+/// the phrase verification itself.
+enum AnyCursor {
+    Term(TermCursor),
+    Phrase(PhraseCursor),
+}
+
+impl AnyCursor {
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        match self {
+            AnyCursor::Term(c) => c.is_exhausted(),
+            AnyCursor::Phrase(c) => c.is_exhausted(),
+        }
+    }
+
+    #[inline]
+    fn current_doc_id(&self) -> u32 {
+        match self {
+            AnyCursor::Term(c) => c.current_doc_id(),
+            AnyCursor::Phrase(c) => c.current_doc_id(),
+        }
+    }
+
+    /// Advance to the first (phrase: first *verified*) doc ≥ `target`.
+    fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
+        match self {
+            AnyCursor::Term(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
+            AnyCursor::Phrase(c) => c.skip_to(target),
+        }
+    }
+
+    /// BM25 contribution at the cursor's current doc.
+    #[inline]
+    fn score_current(&self, dl_norm_k1: f32) -> f32 {
+        match self {
+            AnyCursor::Term(c) => {
+                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
+            }
+            AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
+        }
+    }
+}
+
+/// Atom-walk exclusion gate: the heterogeneous sibling of
+/// [`ExcludeFilter`], additionally able to exclude docs containing a
+/// negated *phrase*. Same monotonic-doc contract.
+struct AtomExcludeFilter {
+    atoms: Vec<AnyCursor>,
+    last_doc: u32,
+}
+
+impl AtomExcludeFilter {
+    fn new(atoms: Vec<AnyCursor>) -> Self {
+        Self { atoms, last_doc: 0 }
+    }
+
+    /// `false` iff `doc` matches any negated atom.
+    fn admits(&mut self, doc: u32) -> Result<bool, FtsError> {
+        debug_assert!(
+            doc >= self.last_doc,
+            "AtomExcludeFilter fed non-monotonic doc: {doc} < {}",
+            self.last_doc
+        );
+        self.last_doc = doc;
+        for a in &mut self.atoms {
+            a.skip_to(doc)?;
+            if !a.is_exhausted() && a.current_doc_id() == doc {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Exclusion gate for negated (`-term`) clauses: holds one
 /// [`TermCursor`] per negated term, streamed with `skip_to` (a common
 /// negated list is never fully decoded). A doc is rejected if it appears
@@ -3336,6 +3962,12 @@ struct TermMeta {
     /// Absolute offset (within the postings region) of the first
     /// skip-table entry: `metadata_offset + TERM_META_SIZE`.
     skip_start: usize,
+    /// This term's byte offset in the positions region (positional
+    /// columns; zero otherwise).
+    positions_offset: u64,
+    /// Byte length of this term's position runs (positional columns;
+    /// zero otherwise).
+    positions_length: u32,
 }
 
 impl TermMeta {
@@ -3372,6 +4004,20 @@ impl TermMeta {
                 ..metadata_offset + term_meta::NUM_BLOCKS_OFF + U32_BYTES],
         ) as usize;
 
+        let (positions_offset, positions_length) = match positional {
+            true => (
+                read_u64_le(
+                    &postings[metadata_offset + term_meta::POSITIONS_OFFSET_OFF
+                        ..metadata_offset + term_meta::POSITIONS_OFFSET_OFF + U64_BYTES],
+                ),
+                read_u32_le(
+                    &postings[metadata_offset + term_meta::POSITIONS_LENGTH_OFF
+                        ..metadata_offset + term_meta::POSITIONS_LENGTH_OFF + U32_BYTES],
+                ),
+            ),
+            false => (0, 0),
+        };
+
         let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
         if skip_end > postings.len() {
@@ -3384,6 +4030,8 @@ impl TermMeta {
             postings_length,
             num_blocks,
             skip_start,
+            positions_offset,
+            positions_length,
         })
     }
 
@@ -3420,6 +4068,19 @@ impl TermMeta {
         )
     }
 
+    /// This block's position-run byte offset within the term's
+    /// positions bytes — the skip entry's fourth field (zero on
+    /// positionless columns, where it is the reserved slot).
+    #[inline]
+    fn positions_block_offset(&self, postings: &[u8], i: usize) -> u32 {
+        debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
+        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+        read_u32_le(
+            &postings[entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF
+                ..entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF + U32_BYTES],
+        )
+    }
+
     /// End offset (relative to the term's `metadata_offset`) of block
     /// `i`'s bytes. Blocks are concatenated back-to-back, so each
     /// block ends where the next one's `block_offset` begins; the last
@@ -3449,6 +4110,10 @@ struct BlockMeta {
     /// Per-block BM25 upper bound, recovered from the skip table's
     /// fixed-point `max_bm25_x1000` field.
     block_max_bm25: f32,
+    /// Byte offset of this block's first position run within the
+    /// term's positions bytes (positional columns; zero otherwise —
+    /// the field is the skip entry's formerly-reserved slot).
+    positions_block_offset: u32,
 }
 
 /// Per-query-term cursor used by [`FtsReader::run_max_score_bmm`]
@@ -3511,6 +4176,17 @@ struct TermCursor {
     /// search hot loops index only the bytes this term touches, never
     /// the whole postings region.
     bytes: Bytes,
+    /// This term's byte range in the positions region (positional
+    /// columns; zeros otherwise). The phrase path fetches the range
+    /// and locates per-doc runs via the blocks'
+    /// `positions_block_offset`.
+    positions_offset: u64,
+    positions_length: u32,
+    /// The single position of an inline (df=1, tf=1) term of a
+    /// positional column — the inline FST value's slot carries it
+    /// instead of a tf. `None` on PFOR cursors and on positionless
+    /// columns.
+    inline_position: Option<u32>,
 }
 
 impl TermCursor {
@@ -3538,6 +4214,7 @@ impl TermCursor {
                 block_byte_offset: metadata_offset + block_offset_in_term,
                 block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
                 block_max_bm25,
+                positions_block_offset: term_meta.positions_block_offset(postings, i),
             });
         }
 
@@ -3553,6 +4230,9 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: term_bytes,
+            positions_offset: term_meta.positions_offset,
+            positions_length: term_meta.positions_length,
+            inline_position: None,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -3567,7 +4247,13 @@ impl TermCursor {
     /// doc means min_dl = dl and max_tf = tf, so the per-block UB
     /// formula collapses to the score itself). Computed at query time
     /// since there's no skip-table entry stored for inline terms.
-    fn new_inline(doc_id: u32, tf: u32, n_docs: u64, dl_norm_k1: f32) -> Self {
+    fn new_inline(
+        doc_id: u32,
+        tf: u32,
+        n_docs: u64,
+        dl_norm_k1: f32,
+        inline_position: Option<u32>,
+    ) -> Self {
         let idf = bm25::idf(n_docs, 1);
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
@@ -3580,6 +4266,7 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
+            positions_block_offset: 0,
         }];
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
@@ -3599,6 +4286,9 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: Bytes::new(),
+            positions_offset: 0,
+            positions_length: 0,
+            inline_position,
         }
     }
 
@@ -4627,13 +5317,168 @@ mod tests {
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }
 
+    // ---- phrase atoms ----
+
+    /// Corpus with controlled adjacency for "new york": docs 0, 2
+    /// match (doc 4 twice); docs 1, 3 contain both words but never
+    /// adjacent in order.
+    fn build_phrase_blob() -> (Bytes, &'static str) {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        b.register_column("title".into(), true).expect("register");
+        let docs = [
+            "new york city",
+            "york new haven",
+            "the new york times",
+            "new haven york",
+            "new york new york",
+        ];
+        for (i, d) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, d).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#,
+        )
+    }
+
+    fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
+        vec![terms.iter().map(|t| t.to_string()).collect()]
+    }
+
+    #[tokio::test]
+    async fn phrase_matches_adjacent_in_order_only() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 2, 4], "adjacency in order only");
+        // Doc 4 has the phrase twice — highest tf, and with uniform
+        // doc lengths in play its score must strictly exceed doc 0's
+        // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
+        assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    #[tokio::test]
+    async fn phrase_composes_with_clauses() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ny = phrase(&["new", "york"]);
+
+        // Must-phrase + must-term: "the" only in doc 2.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    musts: &["the"],
+                    must_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("must phrase + term");
+        assert_eq!(
+            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            vec![2],
+            "+\"new york\" +the"
+        );
+
+        // Negated phrase: haven-docs minus the phrase docs.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    shoulds: &["haven"],
+                    negative_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("negated phrase");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "haven docs don't contain the phrase");
+    }
+
+    #[tokio::test]
+    async fn phrase_with_absent_member_matches_nothing() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ghost = phrase(&["new", "zealand"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    must_phrases: &ghost,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("ghost phrase");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn phrase_on_positionless_column_is_typed_error() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        b.register_column("title".into(), false).expect("register");
+        b.add_doc(0, 0, "new york").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let r =
+            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let err = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect_err("must be a typed error");
+        assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+
     #[tokio::test]
     async fn search_excluding_drops_negated_docs() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         // "runtime" hits docs 0 and 1; negate "async" (only in doc 0).
         let hits = r
-            .search_excluding("body", &[], &["runtime"], &["async"], 10, f32::NEG_INFINITY)
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["runtime"],
+                    negatives: &["async"],
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
             .await
             .expect("search excluding");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -4645,7 +5490,15 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let err = r
-            .search_excluding("body", &[], &[], &["rust"], 10, f32::NEG_INFINITY)
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    negatives: &["rust"],
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
             .await
             .expect_err("negation-only");
         assert!(matches!(err, FtsError::NegationOnly));
@@ -4656,7 +5509,7 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let hits = r
-            .search_excluding("body", &[], &[], &[], 10, f32::NEG_INFINITY)
+            .search_excluding("body", ClauseLists::default(), 10, f32::NEG_INFINITY)
             .await
             .expect("empty");
         assert!(hits.is_empty());
