@@ -106,6 +106,47 @@ use crate::{
     },
 };
 
+/// An unranked query's match set: the terms and exact phrases every
+/// (`And`) or any (`Or`) of which a doc must contain. Produced by
+/// `parse_and_prune` from the clause model — the must side when any
+/// must exists (shoulds have no scores to raise unranked), the bare
+/// side under the default operator otherwise.
+struct UnrankedMatchSet {
+    terms: Vec<String>,
+    phrases: Vec<Vec<String>>,
+    mode: BoolMode,
+}
+
+impl Default for UnrankedMatchSet {
+    fn default() -> Self {
+        Self {
+            terms: Vec::new(),
+            phrases: Vec::new(),
+            mode: BoolMode::Or,
+        }
+    }
+}
+
+impl UnrankedMatchSet {
+    fn has_phrases(&self) -> bool {
+        !self.phrases.is_empty()
+    }
+}
+
+/// An unranked query's negated atoms (docs containing any are
+/// excluded).
+#[derive(Default)]
+struct UnrankedNegatives {
+    terms: Vec<String>,
+    phrases: Vec<Vec<String>>,
+}
+
+impl UnrankedNegatives {
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.phrases.is_empty()
+    }
+}
+
 /// Rejection message for a query with negated terms but no positive
 /// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
 /// both reject the case identically.
@@ -530,40 +571,76 @@ impl SupertableReader {
     /// scored search returns. With no musts, the bare terms match
     /// under `mode` exactly as before.
     ///
-    /// Returns `(match_terms, match_mode, negatives, kept)`.
+    /// Returns `(match_set, negatives, kept)`.
     async fn parse_and_prune(
         &self,
         column: &str,
         query: &str,
         mode: BoolMode,
-    ) -> Result<(Vec<String>, BoolMode, Vec<String>, Vec<Arc<SuperfileEntry>>), QueryError> {
+    ) -> Result<
+        (
+            UnrankedMatchSet,
+            UnrankedNegatives,
+            Vec<Arc<SuperfileEntry>>,
+        ),
+        QueryError,
+    > {
         let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
-        if musts.is_empty() && shoulds.is_empty() {
-            if negatives.is_empty() {
+        let own_phrases = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
+            phrases
+                .into_iter()
+                .map(|p| p.into_iter().map(Cow::into_owned).collect())
+                .collect()
+        };
+        let must_phrases = own_phrases(clauses.must_phrases);
+        let should_phrases = own_phrases(clauses.should_phrases);
+        let negative_phrases = own_phrases(clauses.negative_phrases);
+        let negs = UnrankedNegatives {
+            terms: negatives,
+            phrases: negative_phrases,
+        };
+        let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+        if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
+            if negs.terms.is_empty() && negs.phrases.is_empty() {
                 // No tokens at all (empty/whitespace query) — nothing to
                 // match, not an error.
-                return Ok((Vec::new(), mode, negatives, Vec::new()));
+                return Ok((UnrankedMatchSet::default(), negs, Vec::new()));
             }
             // Negation-only (e.g. `-foo`): reject, matching the scored
             // search path, which has no positive anchor to rank or match.
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
         }
-        let (match_terms, match_mode) = if musts.is_empty() {
-            (shoulds, mode)
-        } else {
-            (musts, BoolMode::And)
+        // Unranked matching has no scores for a should to raise, so
+        // the match set is the must side whenever any must exists.
+        let match_set = match has_musts {
+            true => UnrankedMatchSet {
+                terms: musts,
+                phrases: must_phrases,
+                mode: BoolMode::And,
+            },
+            false => UnrankedMatchSet {
+                terms: shoulds,
+                phrases: should_phrases,
+                mode,
+            },
         };
+        // Prune on the match set's terms plus its phrases' members —
+        // a phrase match requires every member present.
+        let mut prune_terms = match_set.terms.clone();
+        for p in &match_set.phrases {
+            prune_terms.extend(p.iter().cloned());
+        }
         let prune_leaf = PruneLeaf::TermPresence {
             column: column.to_owned(),
-            terms: match_terms.clone(),
-            mode: match_mode,
+            terms: prune_terms,
+            mode: match_set.mode,
         };
         let kept =
             select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
-        Ok((match_terms, match_mode, negatives, kept))
+        Ok((match_set, negs, kept))
     }
 
     /// Unranked token match across the pinned snapshot. Returns
@@ -588,38 +665,58 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let (match_terms, match_mode, negatives, kept) =
-            self.parse_and_prune(column, query, mode).await?;
+        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
+        let match_mode = match_set.mode;
         let has_negatives = !negatives.is_empty();
+        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_terms);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
+        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
+        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
+        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
+        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
+            let phrase_arc = Arc::clone(&phrase_arc);
             let neg_arc = Arc::clone(&neg_arc);
+            let neg_ph_arc = Arc::clone(&neg_ph_arc);
             async move {
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                let docs = r
-                    .token_match(&column_arc, &refs, match_mode)
-                    .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // Any phrase atom (match or negated) takes the
+                // phrase-aware walk; plain-token queries keep the
+                // optimized token_match path unchanged.
+                let docs = match phrase_involved {
+                    true => r
+                        .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                    false => r
+                        .token_match(&column_arc, &refs, match_mode)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                };
                 // Drop any positive match that also carries a negated
-                // term (union of the negatives). The df / count fast
+                // atom (union of the negatives). The df / count fast
                 // paths can't express exclusion, so negation forces a
                 // materialized walk over both sets.
                 let docs = if has_negatives {
                     let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let excluded: RoaringBitmap = r
-                        .token_match(&column_arc, &neg_refs, BoolMode::Or)
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
-                        .into_iter()
-                        .collect();
+                    let excluded: RoaringBitmap = match neg_ph_arc.is_empty() {
+                        true => r
+                            .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                        false => r
+                            .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                    }
+                    .into_iter()
+                    .collect();
                     docs.into_iter()
                         .filter(|d| !excluded.contains(*d))
                         .collect::<Vec<_>>()
@@ -657,17 +754,20 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
-        let (match_terms, match_mode, negatives, kept) =
-            self.parse_and_prune(column, query, mode).await?;
+        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
         if kept.is_empty() {
             return Ok(0);
         }
 
-        let single_term = match_terms.len() == 1;
+        let match_mode = match_set.mode;
+        let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
         let has_negatives = !negatives.is_empty();
+        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_terms);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
+        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
+        let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
+        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
+        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
         // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
@@ -680,7 +780,9 @@ impl SupertableReader {
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
+                let phrase_arc = Arc::clone(&phrase_arc);
                 let neg_arc = Arc::clone(&neg_arc);
+                let neg_ph_arc = Arc::clone(&neg_ph_arc);
                 async move {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
@@ -699,17 +801,35 @@ impl SupertableReader {
                     // matches, then drop any doc carrying a negated term
                     // (union of the negatives) or a tombstone.
                     if has_negatives || tomb.is_some() {
-                        let docs = r
-                            .token_match(&column_arc, &refs, match_mode)
-                            .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                        let docs = match phrase_involved {
+                            true => r
+                                .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                            false => r
+                                .token_match(&column_arc, &refs, match_mode)
+                                .await
+                                .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                        };
                         let excluded: RoaringBitmap = if has_negatives {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                            r.token_match(&column_arc, &neg_refs, BoolMode::Or)
-                                .await
-                                .map_err(|e| QueryError::Parquet(e.to_string()))?
-                                .into_iter()
-                                .collect()
+                            match neg_ph_arc.is_empty() {
+                                true => r
+                                    .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                                    .await
+                                    .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                                false => r
+                                    .atoms_match_ids(
+                                        &column_arc,
+                                        &neg_refs,
+                                        &neg_ph_arc,
+                                        BoolMode::Or,
+                                    )
+                                    .await
+                                    .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                            }
+                            .into_iter()
+                            .collect()
                         } else {
                             RoaringBitmap::new()
                         };
@@ -728,6 +848,10 @@ impl SupertableReader {
                     // match walk through the counting sink.
                     let n = if single_term {
                         r.term_df(&column_arc, &term_arc[0])
+                            .await
+                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                    } else if phrase_involved {
+                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode)
                             .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?
                     } else {
@@ -1773,6 +1897,96 @@ mod tests {
         .expect("append");
         w.commit().expect("commit");
         st
+    }
+
+    /// Positional twin of the options fixture, for phrase queries.
+    fn options_positional_one_superfile_per_commit() -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: true,
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// Two superfiles with controlled "new york" adjacency: docs in
+    /// the first commit match (0, 1), the second commit has both
+    /// words non-adjacent plus one more match.
+    fn seeded_phrase_supertable() -> Supertable {
+        let st = Supertable::create(options_positional_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["new york city", "the new york times"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(10, &["york loves new haven", "big new york"]))
+            .expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
+    #[test]
+    fn phrase_query_end_to_end() {
+        let st = seeded_phrase_supertable();
+        let r = st.reader();
+
+        // Ranked: exactly the adjacent-in-order docs across both
+        // superfiles.
+        let hits = r
+            .bm25_hits("title", r#""new york""#, 10, BoolMode::Or)
+            .expect("phrase hits");
+        assert_eq!(hits.len(), 3, "three docs contain the phrase");
+
+        // Count = the phrase match set.
+        let n = r
+            .count("title", r#""new york""#, BoolMode::Or)
+            .expect("phrase count");
+        assert_eq!(n, 3);
+        // The non-adjacent doc is the difference vs the token AND.
+        let and_count = r
+            .count("title", "+new +york", BoolMode::Or)
+            .expect("token and count");
+        assert_eq!(and_count, 4);
+
+        // Phrase composed with clauses: must-phrase + must-term.
+        let hits = r
+            .bm25_hits("title", r#"+"new york" +the"#, 10, BoolMode::Or)
+            .expect("phrase + term");
+        assert_eq!(hits.len(), 1);
+
+        // Negated phrase: docs with `york` minus the phrase docs.
+        let n = r
+            .count("title", r#"york -"new york""#, BoolMode::Or)
+            .expect("negated phrase count");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn phrase_on_positionless_table_errors() {
+        let st = seeded_clause_supertable();
+        let r = st.reader();
+        let err = r
+            .bm25_hits("title", r#""climate change""#, 10, BoolMode::Or)
+            .expect_err("typed error expected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("positions"),
+            "error should say positions are missing: {msg}"
+        );
+        let err = r
+            .count("title", r#""climate change""#, BoolMode::Or)
+            .expect_err("count errors too");
+        assert!(err.to_string().contains("positions"));
     }
 
     #[test]

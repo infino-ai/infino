@@ -901,15 +901,12 @@ impl FtsReader {
         if musts.is_empty() {
             // Union of shoulds, doc-at-a-time: score every atom
             // sitting on the frontier doc, then advance them past it.
-            loop {
-                let Some(doc) = shoulds
-                    .iter()
-                    .filter(|a| !a.is_exhausted())
-                    .map(AnyCursor::current_doc_id)
-                    .min()
-                else {
-                    break;
-                };
+            while let Some(doc) = shoulds
+                .iter()
+                .filter(|a| !a.is_exhausted())
+                .map(AnyCursor::current_doc_id)
+                .min()
+            {
                 let admitted = match filter.as_mut() {
                     Some(f) => f.admits(doc)?,
                     None => true,
@@ -939,6 +936,7 @@ impl FtsReader {
 
         // Must-driven walk: leapfrog the musts to each common doc,
         // score musts + landing shoulds there.
+        let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
         let mut target = 0u32;
         'docs: loop {
             let mut aligned = target;
@@ -957,10 +955,30 @@ impl FtsReader {
                 }
                 i += 1;
             }
-            let admitted = match filter.as_mut() {
-                Some(f) => f.admits(aligned)?,
-                None => true,
+            // Bar skip: the kth-best (or the seeded floor) minus the
+            // most the shoulds could add bounds what the musts must
+            // reach; a candidate whose must-side block bounds can't
+            // get there is dead without scoring (and, for phrase
+            // shoulds, without any position work).
+            let bar = match heap.len() >= k {
+                true => heap.peek().expect("heap len == k").0.max(floor_eff),
+                false => floor_eff,
             };
+            let scoring_needed = match bar > f32::NEG_INFINITY {
+                true => {
+                    let must_ub: f32 = musts
+                        .iter_mut()
+                        .map(|a| a.block_max_in_range(aligned, aligned))
+                        .sum();
+                    must_ub + should_ub > bar
+                }
+                false => true,
+            };
+            let admitted = scoring_needed
+                && match filter.as_mut() {
+                    Some(f) => f.admits(aligned)?,
+                    None => true,
+                };
             if admitted {
                 let norm = dl_norm_k1[aligned as usize];
                 let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
@@ -982,45 +1000,135 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
-    /// Unranked count over heterogeneous atoms: the cardinality of the
-    /// musts' intersection (minus exclusions) — shoulds have no scores
-    /// to raise here, matching the clause model's unranked semantics.
-    fn count_atoms(
+    /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
+    /// `on_doc` for every matching doc in ascending order. `And` walks
+    /// the atoms' intersection (a phrase atom's own verification is
+    /// part of its cursor); `Or` walks their union. The shared spine
+    /// of the phrase-aware `token_match` / `count` entries.
+    fn walk_atoms_match(
         &self,
-        mut musts: Vec<AnyCursor>,
+        mut atoms: Vec<AnyCursor>,
+        mode: BoolMode,
         mut filter: Option<AtomExcludeFilter>,
-    ) -> Result<u64, FtsError> {
-        let mut n = 0u64;
-        let mut target = 0u32;
-        'docs: loop {
-            let mut aligned = target;
-            let mut i = 0usize;
-            while i < musts.len() {
-                let a = &mut musts[i];
-                a.skip_to(aligned)?;
-                if a.is_exhausted() {
-                    break 'docs;
+        mut on_doc: impl FnMut(u32),
+    ) -> Result<(), FtsError> {
+        match mode {
+            BoolMode::Or => {
+                while let Some(doc) = atoms
+                    .iter()
+                    .filter(|a| !a.is_exhausted())
+                    .map(AnyCursor::current_doc_id)
+                    .min()
+                {
+                    let admitted = match filter.as_mut() {
+                        Some(f) => f.admits(doc)?,
+                        None => true,
+                    };
+                    if admitted {
+                        on_doc(doc);
+                    }
+                    let Some(next) = doc.checked_add(1) else {
+                        break;
+                    };
+                    for a in atoms.iter_mut() {
+                        if !a.is_exhausted() && a.current_doc_id() == doc {
+                            a.skip_to(next)?;
+                        }
+                    }
                 }
-                let here = a.current_doc_id();
-                if here > aligned {
-                    aligned = here;
-                    i = 0;
-                    continue;
+                Ok(())
+            }
+            BoolMode::And => {
+                let mut target = 0u32;
+                'docs: loop {
+                    let mut aligned = target;
+                    let mut i = 0usize;
+                    while i < atoms.len() {
+                        let a = &mut atoms[i];
+                        a.skip_to(aligned)?;
+                        if a.is_exhausted() {
+                            break 'docs;
+                        }
+                        let here = a.current_doc_id();
+                        if here > aligned {
+                            aligned = here;
+                            i = 0;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    let admitted = match filter.as_mut() {
+                        Some(f) => f.admits(aligned)?,
+                        None => true,
+                    };
+                    if admitted {
+                        on_doc(aligned);
+                    }
+                    let Some(next) = aligned.checked_add(1) else {
+                        break;
+                    };
+                    target = next;
                 }
-                i += 1;
+                Ok(())
             }
-            let admitted = match filter.as_mut() {
-                Some(f) => f.admits(aligned)?,
-                None => true,
-            };
-            if admitted {
-                n += 1;
-            }
-            let Some(next) = aligned.checked_add(1) else {
-                break;
-            };
-            target = next;
         }
+    }
+
+    /// Phrase-aware unranked match: the `local_doc_id`s matching the
+    /// terms + phrases under `mode`, ascending — the atoms sibling of
+    /// [`Self::token_match`], used whenever the match set contains a
+    /// phrase. Under `And`, a missing atom empties the set.
+    pub(crate) async fn atoms_match_ids(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let atoms: Vec<AnyCursor> = match mode {
+            BoolMode::And => {
+                if built.iter().any(Option::is_none) {
+                    return Ok(Vec::new());
+                }
+                built.into_iter().flatten().collect()
+            }
+            BoolMode::Or => built.into_iter().flatten().collect(),
+        };
+        if atoms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        self.walk_atoms_match(atoms, mode, None, |d| out.push(d))?;
+        Ok(out)
+    }
+
+    /// Phrase-aware unranked match **count** — the atoms sibling of
+    /// [`Self::token_match_count`].
+    pub(crate) async fn atoms_match_count(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<u64, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let atoms: Vec<AnyCursor> = match mode {
+            BoolMode::And => {
+                if built.iter().any(Option::is_none) {
+                    return Ok(0);
+                }
+                built.into_iter().flatten().collect()
+            }
+            BoolMode::Or => built.into_iter().flatten().collect(),
+        };
+        if atoms.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u64;
+        self.walk_atoms_match(atoms, mode, None, |_| n += 1)?;
         Ok(n)
     }
 
@@ -3359,11 +3467,6 @@ impl PhraseCursor {
         self.current_doc
     }
 
-    #[inline]
-    fn current_tf(&self) -> u32 {
-        self.current_tf
-    }
-
     /// Advance to the first verified phrase match at doc ≥ `target`.
     fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
         if self.is_exhausted() || self.current_doc >= target {
@@ -3509,6 +3612,24 @@ impl AnyCursor {
                 bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
             }
             AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
+        }
+    }
+
+    /// Atom-level score upper bound (any doc).
+    #[inline]
+    fn term_max_bm25(&self) -> f32 {
+        match self {
+            AnyCursor::Term(c) => c.term_max_bm25,
+            AnyCursor::Phrase(c) => c.term_max_bm25,
+        }
+    }
+
+    /// Score upper bound over the doc range (see the cursors' docs).
+    #[inline]
+    fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        match self {
+            AnyCursor::Term(c) => c.block_max_in_range(range_start, range_end),
+            AnyCursor::Phrase(c) => c.block_max_in_range(range_start, range_end),
         }
     }
 }

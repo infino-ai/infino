@@ -887,6 +887,39 @@ impl SuperfileReader {
         Ok(fts.token_match_count(column, tokens, mode).await?)
     }
 
+    /// Phrase-aware unranked match: `local_doc_id`s whose `column`
+    /// matches the `terms` and exact `phrases` under `mode`,
+    /// ascending. Used by the table layer whenever the match set
+    /// contains a phrase; plain-token queries keep
+    /// [`token_match`](Self::token_match).
+    pub(crate) async fn atoms_match_ids(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.atoms_match_ids(column, terms, phrases, mode).await?)
+    }
+
+    /// Phrase-aware unranked match **count** — the phrase sibling of
+    /// [`token_match_count`](Self::token_match_count).
+    pub(crate) async fn atoms_match_count(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<u64, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.atoms_match_count(column, terms, phrases, mode).await?)
+    }
+
     /// Document frequency of `token` in `column` (0 if absent) — a cheap
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to
