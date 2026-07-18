@@ -94,7 +94,6 @@ use crate::superfile::{
     format::{
         self, FST_SEPARATOR,
         checksum::{crc32c, crc32c_append},
-        fts::HEADER_SIZE as FTS_HEADER_SIZE,
     },
     fts::{
         bm25,
@@ -446,14 +445,10 @@ struct SpillPartition<const N: usize> {
 /// and reinterprets as `&[[u32; 3]]` via `bytemuck` — zero per-
 /// record allocation, no UTF-8 validation, no `Box<str>` round-
 /// trips.
-const TRIPLE_BYTES: usize = mem::size_of::<Triple>();
-
 /// Sortable + heap-mergeable posting triple. Matches the on-disk
 /// layout (`[term_id_le, doc_id_le, tf_le]`) exactly so a partition
 /// file's bytes can be reinterpreted as `&[Triple]` without copying
 /// on little-endian hosts.
-type Triple = [u32; 3];
-
 /// Lane count of the plain (positionless) spill record.
 const PLAIN_RECORD_LANES: usize = 3;
 
@@ -639,7 +634,7 @@ fn read_partition_records<const N: usize>(path: &Path) -> Result<Vec<[u32; N]>, 
         let records: &[[u32; N]] = bytemuck::try_cast_slice(&bytes).map_err(|_| {
             BuildError::Io(Error::new(
                 ErrorKind::InvalidData,
-                "bytemuck: spill bytes failed alignment for &[Triple]",
+                "bytemuck: spill bytes failed alignment for the record slice",
             ))
         })?;
         Ok(records.to_vec())
@@ -3151,7 +3146,13 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             }
             group.push((triple_doc_id(t), triple_tf(t)));
             if blob_mmaps.is_some() {
-                group_pos.push((t[3] as u64) | ((t[4] as u64) << 32));
+                // The generic walk serves both widths; the offset
+                // lanes exist only on the positional record, which is
+                // the only case with `blob_mmaps` present.
+                debug_assert_eq!(N, POSITIONAL_RECORD_LANES);
+                let rec: &[u32; POSITIONAL_RECORD_LANES] =
+                    t[..].try_into().expect("positional record width");
+                group_pos.push(record_pos_off(rec));
             }
             pos += 1;
         }
@@ -4206,7 +4207,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ragged.part");
         // One full triple plus a stray byte.
-        fs::write(&path, vec![0u8; TRIPLE_BYTES + 1]).expect("write ragged file");
+        fs::write(
+            &path,
+            vec![0u8; mem::size_of::<[u32; PLAIN_RECORD_LANES]>() + 1],
+        )
+        .expect("write ragged file");
         let err = read_partition_records::<PLAIN_RECORD_LANES>(&path).expect_err("expected error");
         match err {
             BuildError::Io(e) => {
