@@ -2535,8 +2535,9 @@ const ADMIT_CODE_WORD_BITS: usize = 64;
 /// sign quantizer, the query's packed sign code, and a cosine lookup table
 /// indexed by Hamming distance (`cos(π·h/dim)` — the standard sign-sketch
 /// angle estimator). Built **once per query** and shared across every
-/// [`ClusterCentroids`] instance; the failed first cut of this idea built
-/// rotation state per instance and re-rotated the query thousands of times.
+/// [`ClusterCentroids`] instance — building rotation state per instance
+/// re-rotates the query thousands of times per search (measured ~51 ms of
+/// admit at 1M pre-drain vs ~1 ms with the shared state).
 #[derive(Debug)]
 pub(crate) struct RabitqAdmitQuery {
     rot_seed: u64,

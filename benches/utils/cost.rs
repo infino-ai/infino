@@ -1352,15 +1352,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     };
 
     // ---- Block 5: monthly cost summary ----
-    // The standing bill for one table at an assumed steady load: capacity,
-    // reads, writes, and RAM. Reads/writes price the measured steady-state
-    // per-unit costs at 1M units/month. RAM is split by what it actually
-    // is: an open table PINS only anonymous heap (routing state — grids,
-    // 1-bit admit slabs, counts, manifest metadata); the rest of measured
-    // RSS is file-backed mmap page cache over the local NVMe copy —
-    // reclaimable under pressure and only needed while actively serving
-    // the warm blend, so it is priced as a serving reservation, not as an
-    // open-table cost. All inputs are measured — a line without a
+    // The standing bill for one table at the assumed steady load. RAM is
+    // priced as two lines because the two kinds behave differently: anon
+    // heap is unreclaimable while the process lives; file-backed mmap is
+    // page cache over the local NVMe copy, evicted under pressure and
+    // re-faulted on demand. Both show an hourly rate (for callers whose
+    // serving processes are not always-on) and bill the always-on month
+    // as the upper bound. All inputs are measured — a line without a
     // measurement is omitted, never guessed.
     let last_state = query_states.last();
     let steady_pinned_bytes = last_state
@@ -1522,19 +1520,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
         month
     });
-    // Residency is priced per ACTIVE hour — "pinned" means unreclaimable
-    // only while the serving process is alive. The $/month column assumes
-    // an always-on process (the upper bound, and the exact number for the
-    // summary's uniform 1M-queries/mo load, whose 2.6 s inter-arrival gap
-    // never trips an idle reaper). On-demand serving (process reaped after
-    // an idle window) multiplies the hourly rate by its duty cycle and
-    // pays the measured cold-open line once per process start instead.
     let pinned_hour = inst.ram_share(steady_pinned_bytes) * inst.usd_per_hour;
     let working_set_hour = inst.ram_share(steady_working_set_bytes) * inst.usd_per_hour;
     summary_rows.push(vec![
         text("Serving memory — pinned while process alive (anon heap)"),
         text(format!(
-            "{} ({:.0}% of {}) · {}/active-hour · 24/7 shown",
+            "{} ({:.0}% of {}), {} per serving hour",
             fmt_bytes(steady_pinned_bytes),
             inst.ram_share(steady_pinned_bytes) * 100.0,
             inst.name,
@@ -1545,7 +1536,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     summary_rows.push(vec![
         text("Serving memory — mmap page cache (evictable)"),
         text(format!(
-            "{} ({:.0}% of {}) · {}/active-hour · sustains the warm blend",
+            "{} ({:.0}% of {}), {} per serving hour",
             fmt_bytes(steady_working_set_bytes),
             inst.ram_share(steady_working_set_bytes) * 100.0,
             inst.name,
