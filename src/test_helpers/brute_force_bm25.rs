@@ -33,6 +33,21 @@ use crate::superfile::fts::tokenize::Tokenizer;
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
+/// Number of times `phrase` occurs contiguously (in order) in
+/// `tokens` — the brute-force phrase tf.
+fn phrase_tf(tokens: &[String], phrase: &[String]) -> u32 {
+    if phrase.is_empty() || tokens.len() < phrase.len() {
+        return 0;
+    }
+    let mut tf = 0u32;
+    for start in 0..=(tokens.len() - phrase.len()) {
+        if tokens[start..start + phrase.len()] == *phrase {
+            tf += 1;
+        }
+    }
+    tf
+}
+
 /// Per-doc statistics derived from the corpus once and reused
 /// across queries.
 struct DocStats {
@@ -42,6 +57,8 @@ struct DocStats {
     dl: u32,
     /// Term frequencies for this doc: term → count.
     tf: HashMap<String, u32>,
+    /// The doc's token sequence, for phrase adjacency scans.
+    tokens: Vec<String>,
 }
 
 /// Pre-tokenized corpus + per-term df + corpus avgdl. Construct
@@ -68,10 +85,12 @@ impl BruteForceBm25 {
 
         for (doc_id, text) in corpus {
             let mut tf: HashMap<String, u32> = HashMap::new();
+            let mut tokens: Vec<String> = Vec::new();
             let mut dl: u32 = 0;
             tokenizer.tokenize_each(text, &mut |tok| {
                 dl += 1;
                 *tf.entry(tok.to_owned()).or_insert(0) += 1;
+                tokens.push(tok.to_owned());
             });
             for term in tf.keys() {
                 *df.entry(term.clone()).or_insert(0) += 1;
@@ -81,6 +100,7 @@ impl BruteForceBm25 {
                 doc_id: *doc_id,
                 dl,
                 tf,
+                tokens,
             });
         }
 
@@ -206,6 +226,109 @@ impl BruteForceBm25 {
             // idf is always positive); with none, only docs hit by at
             // least one should are in the union.
             if !musts.is_empty() || any_should {
+                scored.push((doc.doc_id, score));
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        scored.truncate(k);
+        scored
+    }
+
+    /// Phrase-aware clause-model top-k: like
+    /// [`Self::top_k_clauses`], with exact phrases in every polarity.
+    /// A phrase matches a doc when its token sequence occurs
+    /// contiguously in order; its per-doc tf is the number of
+    /// occurrence starts, and it scores as one BM25 atom with
+    /// `idf = Σ member idf` — mirroring the production phrase atom.
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_k_atoms(
+        &self,
+        musts: &[String],
+        must_phrases: &[Vec<String>],
+        shoulds: &[String],
+        should_phrases: &[Vec<String>],
+        negatives: &[String],
+        negative_phrases: &[Vec<String>],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let no_positive = musts.is_empty()
+            && must_phrases.is_empty()
+            && shoulds.is_empty()
+            && should_phrases.is_empty();
+        if k == 0 || no_positive || self.n == 0 {
+            return Vec::new();
+        }
+
+        let n = self.n as f32;
+        let idf_of = |term: &String| -> f32 {
+            let df = *self.df.get(term).unwrap_or(&0) as f32;
+            match df > 0.0 {
+                true => (1.0 + (n - df + 0.5) / (df + 0.5)).ln(),
+                false => 0.0,
+            }
+        };
+        let phrase_idf = |p: &Vec<String>| -> f32 { p.iter().map(idf_of).sum() };
+
+        let avgdl = self.avgdl;
+        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(self.docs.len());
+        'docs: for doc in &self.docs {
+            for neg in negatives {
+                if doc.tf.contains_key(neg) {
+                    continue 'docs;
+                }
+            }
+            for p in negative_phrases {
+                if phrase_tf(&doc.tokens, p) > 0 {
+                    continue 'docs;
+                }
+            }
+            for must in musts {
+                if !doc.tf.contains_key(must) {
+                    continue 'docs;
+                }
+            }
+            let mut must_phrase_tfs: Vec<u32> = Vec::with_capacity(must_phrases.len());
+            for p in must_phrases {
+                let tf = phrase_tf(&doc.tokens, p);
+                if tf == 0 {
+                    continue 'docs;
+                }
+                must_phrase_tfs.push(tf);
+            }
+
+            let dl = doc.dl as f32;
+            let dl_norm = K1 * (1.0 - B + B * dl / avgdl.max(f32::MIN_POSITIVE));
+            let tf_factor = |tf: u32| -> f32 { tf as f32 * (K1 + 1.0) / (tf as f32 + dl_norm) };
+
+            let mut score: f32 = 0.0;
+            let mut matched_any_should = false;
+            for term in musts {
+                score += idf_of(term) * tf_factor(doc.tf[term]);
+            }
+            for (p, tf) in must_phrases.iter().zip(&must_phrase_tfs) {
+                score += phrase_idf(p) * tf_factor(*tf);
+            }
+            for term in shoulds {
+                if let Some(&tf) = doc.tf.get(term) {
+                    matched_any_should = true;
+                    score += idf_of(term) * tf_factor(tf);
+                }
+            }
+            for p in should_phrases {
+                let tf = phrase_tf(&doc.tokens, p);
+                if tf > 0 {
+                    matched_any_should = true;
+                    score += phrase_idf(p) * tf_factor(tf);
+                }
+            }
+
+            let has_musts = !musts.is_empty() || !must_phrases.is_empty();
+            if has_musts || matched_any_should {
                 scored.push((doc.doc_id, score));
             }
         }
