@@ -145,8 +145,10 @@ use crate::{
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
+            quant::BitQuantizer,
             reader::VectorReader,
             rerank_codec::RerankCodec,
+            rotation::RandomRotation,
             spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},
         },
     },
@@ -2130,6 +2132,38 @@ impl PreparedSuperfile {
     }
 }
 
+/// One vector column's per-cell manifest summary from a freshly written
+/// superfile: the per-cluster fp32 centroids (so a query ranks this
+/// superfile's clusters globally without opening it) plus the 1-bit
+/// admit slab computed alongside them — the summary wire blob persists
+/// both, and consumers decode the slab at hydration instead of
+/// re-deriving one rotation per centroid. Shared by the commit staging
+/// path and the WAL update pipeline.
+pub(crate) fn build_column_vector_summary(
+    vec_reader: &VectorReader,
+    vc: &VectorConfig,
+) -> Option<VectorSummary> {
+    let centroid = vec_reader.summary(&vc.column)?;
+    let cells: Vec<CellVectorSummary> = vec_reader
+        .cluster_centroids_by_cell(&vc.column)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
+            cell_id,
+            clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
+        })
+        .collect();
+    let rotation = RandomRotation::new(vc.dim, vc.rot_seed);
+    let quant = BitQuantizer::new(vc.dim);
+    for cell in &cells {
+        if cell.clusters.dim as usize == vc.dim {
+            cell.clusters
+                .prewarm_admit_codes(&rotation, &quant, vc.rot_seed);
+        }
+    }
+    Some(VectorSummary { centroid, cells })
+}
+
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
@@ -2203,20 +2237,8 @@ pub(super) fn prepare_superfile_with_uri(
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some(centroid) = vec_reader.summary(&vc.column) {
-                // Stage the per-cluster centroids (Sq8) into the
-                // manifest so a query can rank this superfile's clusters
-                // globally without opening the superfile.
-                let cells = vec_reader
-                    .cluster_centroids_by_cell(&vc.column)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
-                        cell_id,
-                        clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
-                    })
-                    .collect();
-                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, cells });
+            if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
+                vector_summary.insert(vc.column.clone(), summary);
             }
         }
     }

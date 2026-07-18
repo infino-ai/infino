@@ -84,26 +84,50 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
     target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
 }
 
+/// Partition row count past which the per-cell training sample switches
+/// from points-per-centroid to a row fraction. At the 10M design point a
+/// hidden cell holds ~39K rows and `64 × n_cent` (~6.7% of the cell)
+/// trains balanced fine runs (measured p50 566 rows vs ~950 target). At
+/// 100M cell sizes (~98K rows) the same flat sample collapses the
+/// run-size distribution (measured p50 69 / max 23,918) and post-drain
+/// recall with it (0.199). Below this threshold the flat sample is both
+/// sufficient and *better* — boosting it at 1M-scale cells measured a
+/// 0.02 recall drop (0.995 → 0.975) — so the row-fraction floor engages
+/// only above it.
+const PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS: usize = 65_536;
+
+/// Row fraction of an oversized partition the training sample must cover
+/// once past [`PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS`]: a quarter
+/// of the rows, keeping the trained shape scale-invariant as cells grow.
+const PARTITION_SAMPLE_ROW_FRACTION_DIVISOR: usize = 4;
+
 /// K-means training sample for a **per-partition sub-build** (the drain's
-/// per-cell IVF build): purely *points per centroid* (`mult × n_cent`), floored
-/// at one `mult` for tiny `n_cent` and sharing the upper cap; the caller bounds
-/// it by the row count (`.min(n_docs)`).
+/// per-cell IVF build): *points per centroid* (`mult × n_cent`), floored
+/// at one `mult` for tiny `n_cent` and sharing the upper cap; the caller
+/// bounds it by the row count (`.min(n_docs)`). Partitions past
+/// [`PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS`] raise the sample to a
+/// quarter of their rows so the fine-run distribution stays balanced at
+/// 100M-scale cell sizes (see the threshold's doc for both measurements).
 ///
-/// Unlike [`default_kmeans_sample_size`] there is no absolute representativeness
-/// floor — that floor suits the global build over the whole corpus, whereas a
-/// per-cell sub-build trains a few sub-centroids over one cell, so the sample
-/// need only scale with the sub-cluster count. `mult` is sourced from
-/// `vector.kmeans_pts_per_centroid` (falling back to the built-in default when
-/// it is set to zero).
-pub fn partition_kmeans_sample_size(n_cent: usize) -> usize {
+/// Unlike [`default_kmeans_sample_size`] there is no absolute
+/// representativeness floor — that floor suits the global build over the
+/// whole corpus, whereas a per-cell sub-build trains sub-centroids over
+/// one cell. `mult` is sourced from `vector.kmeans_pts_per_centroid`
+/// (falling back to the built-in default when it is set to zero).
+pub fn partition_kmeans_sample_size(n_cent: usize, n_rows: usize) -> usize {
     let configured = config::global().vector.kmeans_pts_per_centroid;
     let mult = if configured > 0 {
         configured
     } else {
         KMEANS_SAMPLE_NCENT_MULT
     };
-    mult.saturating_mul(n_cent)
-        .clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
+    let per_centroid = mult.saturating_mul(n_cent);
+    let sample = if n_rows > PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS {
+        per_centroid.max(n_rows / PARTITION_SAMPLE_ROW_FRACTION_DIVISOR)
+    } else {
+        per_centroid
+    };
+    sample.clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
 }
 
 /// Online reservoir for f32 vector samples.
@@ -273,6 +297,28 @@ mod tests {
             r.update(&row);
         }
         r
+    }
+
+    /// The row-fraction floor engages only past the oversized-partition
+    /// threshold: 10M-scale cells keep the flat per-centroid sample
+    /// (boosting them measured a 1M recall drop), 100M-scale cells train
+    /// on a quarter of their rows, and the cap still binds.
+    #[test]
+    fn partition_sample_row_fraction_gated_by_threshold() {
+        // 10M design point: ~39K-row cell stays on the flat sample.
+        assert_eq!(partition_kmeans_sample_size(41, 39_062), 41 * 64);
+        // 1M shape: ~3.9K-row cell, flat sample, floored at one mult.
+        assert_eq!(partition_kmeans_sample_size(4, 3_906), 4 * 64);
+        // 100M shape: ~98K-row cell crosses the threshold — a quarter of
+        // the rows beats 64×92.
+        assert_eq!(partition_kmeans_sample_size(92, 97_656), 97_656 / 4);
+        // Just under the threshold: still flat.
+        assert_eq!(partition_kmeans_sample_size(64, 65_536), 64 * 64);
+        // Enormous partitions still cap.
+        assert_eq!(
+            partition_kmeans_sample_size(4_096, 40_000_000),
+            KMEANS_SAMPLE_SIZE_CAP
+        );
     }
 
     #[test]

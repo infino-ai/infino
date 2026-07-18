@@ -47,7 +47,8 @@ use thiserror::Error;
 use crate::{
     superfile::vector::distance::decode_f32_le_vec,
     supertable::manifest::{
-        CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary,
+        ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
+        VectorSummary,
         bloom::Bloom,
         list::{ScalarStatsAgg, ScalarValueCounts},
     },
@@ -55,6 +56,12 @@ use crate::{
 
 /// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
 const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
+/// Wire tag for fp32 centroids with a persisted 1-bit admit slab
+/// (`b"CFR1"`). Body after the fp32 block: `rot_seed: u64`,
+/// `words_per_code: u32`, `codes[n_cent * words_per_code]: u64 LE`,
+/// `norms[n_cent]: f32 LE`. Summary blobs only — grid centroids and the
+/// options hash stay on the fp32 tag so existing tables keep validating.
+const CLUSTER_CENTROIDS_WIRE_FP32_RABITQ: u32 = 0x3152_4643;
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -602,6 +609,50 @@ pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     out
 }
 
+/// Summary-wire encoder: fp32 plus, when the instance carries a built
+/// 1-bit admit slab, the slab itself — so hydration decodes it instead of
+/// re-deriving one rotation per fine centroid. Grid centroids and the
+/// options hash keep [`encode_cluster_centroids`]; changing their bytes
+/// would fail every existing table's options-hash check at open.
+pub fn encode_cluster_centroids_summary(cl: &ClusterCentroids) -> Vec<u8> {
+    let Some(admit) = cl.admit_codes_built() else {
+        return encode_cluster_centroids(cl);
+    };
+    let nc = cl.n_cent as usize;
+    let cd = cl.dim as usize;
+    // Same stripped-summary guard as the fp32 encoder: a summary whose
+    // fp32 was dropped must never reach the wire (see
+    // `encode_cluster_centroids`).
+    assert!(
+        cl.centroids.len() == nc * cd,
+        "encode_cluster_centroids_summary on a stripped summary ({} of {} fp32 values); \
+         writer handles must not enable summary_centroids_from_superfiles",
+        cl.centroids.len(),
+        nc * cd,
+    );
+    let mut out = Vec::with_capacity(
+        12 + nc * 4 + nc * cd * 4 + 12 + admit.codes.len() * 8 + admit.norms.len() * 4,
+    );
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_FP32_RABITQ.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    for &v in &cl.centroids {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&admit.rot_seed.to_le_bytes());
+    out.extend_from_slice(&(admit.words_per_code as u32).to_le_bytes());
+    for &word in &admit.codes {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for &norm in &admit.norms {
+        out.extend_from_slice(&norm.to_le_bytes());
+    }
+    out
+}
+
 pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
@@ -612,9 +663,10 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     }
 
     let tag = read_u32(&mut c, "cluster_wire_tag")?;
-    if tag != CLUSTER_CENTROIDS_WIRE_FP32 {
+    if tag != CLUSTER_CENTROIDS_WIRE_FP32 && tag != CLUSTER_CENTROIDS_WIRE_FP32_RABITQ {
         return Err(DecodeError::InvalidVectorSummary(format!(
-            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x}"
+            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x} \
+             or {CLUSTER_CENTROIDS_WIRE_FP32_RABITQ:#010x}"
         )));
     }
 
@@ -638,11 +690,52 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
     let centroids = decode_f32_le_vec(centroids_b);
 
-    Ok(ClusterCentroids::from_decoded(
+    if tag == CLUSTER_CENTROIDS_WIRE_FP32 {
+        return Ok(ClusterCentroids::from_decoded(
+            n_cent as u32,
+            cdim as u32,
+            centroids,
+            counts,
+        ));
+    }
+
+    let rot_seed = read_u64(&mut c, "admit_rot_seed")?;
+    let words_per_code = read_u32(&mut c, "admit_words_per_code")? as usize;
+    // Reject a header whose word width disagrees with the declared dim —
+    // scoring would slice the code slab at the wrong stride.
+    let expected_words = cdim.div_ceil(ADMIT_CODE_WORD_BITS);
+    if words_per_code != expected_words {
+        return Err(DecodeError::InvalidVectorSummary(format!(
+            "admit slab words_per_code {words_per_code}, want {expected_words} for dim {cdim}"
+        )));
+    }
+    let codes_bytes = n_cent
+        .checked_mul(words_per_code)
+        .and_then(|words| words.checked_mul(8))
+        .ok_or_else(|| {
+            DecodeError::InvalidVectorSummary(format!(
+                "admit slab byte size overflow: n_cent={n_cent} words_per_code={words_per_code}"
+            ))
+        })?;
+    let codes_b = view_n(&mut c, codes_bytes, "admit_codes")?;
+    let codes: Vec<u64> = codes_b
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        .collect();
+    let norms_b = view_n(&mut c, n_cent * 4, "admit_norms")?;
+    let norms = decode_f32_le_vec(norms_b);
+
+    Ok(ClusterCentroids::from_decoded_with_admit(
         n_cent as u32,
         cdim as u32,
         centroids,
         counts,
+        RabitqAdmitCodes {
+            rot_seed,
+            words_per_code,
+            codes,
+            norms,
+        },
     ))
 }
 
@@ -656,7 +749,7 @@ pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     out.extend_from_slice(&(s.cells.len() as u32).to_le_bytes());
     for cell in &s.cells {
         out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
-        let encoded = encode_cluster_centroids(&cell.clusters);
+        let encoded = encode_cluster_centroids_summary(&cell.clusters);
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         out.extend_from_slice(&encoded);
     }
@@ -768,6 +861,13 @@ pub fn decode_vector_summary_map(
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
     let b = view_n(c, 4, what)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u64(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u64, DecodeError> {
+    let b = view_n(c, 8, what)?;
+    Ok(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
@@ -1371,5 +1471,79 @@ mod vector_summary_tests {
             ROT_SEED,
         );
         let _ = super::encode_cluster_centroids(&clusters);
+    }
+
+    /// Same guard on the summary-wire path (the encoder a real part /
+    /// slow-blob write goes through): a stripped instance carries a slab
+    /// but no fp32, and must fail loudly rather than serialize short.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_vector_summary_on_stripped_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let s = VectorSummary {
+            centroid: vec![0.0; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(1),
+                clusters,
+            }],
+        };
+        let _ = encode_vector_summary(&s);
+    }
+
+    /// A summary whose admit slab was computed at write time round-trips
+    /// the slab through the wire: decode seeds it directly, so neither
+    /// hydration nor the first query re-derives codes.
+    #[test]
+    fn round_trips_admit_slab_alongside_centroids() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 32;
+        const ROT_SEED: u64 = 7;
+        let n_cent = 3u32;
+        let mut centroids = vec![0.0f32; 3 * DIM];
+        centroids[0] = 1.0;
+        centroids[DIM + 4] = 1.0;
+        centroids[2 * DIM + 9] = -1.0;
+        let counts = vec![5u32, 0, 7];
+        let clusters = ClusterCentroids::from_fp32(n_cent, DIM as u32, &centroids, counts.clone());
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let expected_slab = clusters
+            .admit_codes_built()
+            .expect("slab built at write time")
+            .clone();
+        let s = VectorSummary {
+            centroid: vec![0.25; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(3),
+                clusters,
+            }],
+        };
+
+        let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
+        let decoded = &got.cells[0].clusters;
+        assert_eq!(decoded.centroids, centroids, "fp32 must survive the slab");
+        assert_eq!(decoded.counts, counts);
+        assert_eq!(
+            *decoded
+                .admit_codes_built()
+                .expect("decode must seed the admit slab"),
+            expected_slab,
+            "persisted slab must round-trip bit-exact"
+        );
     }
 }

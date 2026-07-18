@@ -1755,7 +1755,7 @@ pub(crate) fn build_cell_subsection_from_source(
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
-        partition_kmeans_sample_size(requested_n_cent).min(n_docs)
+        partition_kmeans_sample_size(requested_n_cent, n_docs).min(n_docs)
     };
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
     let sample = match &source {

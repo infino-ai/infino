@@ -2536,7 +2536,7 @@ pub struct CellVectorSummary {
 }
 
 /// Bits per `u64` word in a packed centroid sign code.
-const ADMIT_CODE_WORD_BITS: usize = 64;
+pub(crate) const ADMIT_CODE_WORD_BITS: usize = 64;
 
 /// Per-query state for the 1-bit admit prefilter: the column's rotation and
 /// sign quantizer, the query's packed sign code, and a cosine lookup table
@@ -2696,17 +2696,19 @@ fn hamming_words(a: &[u64], b: &[u64]) -> u32 {
 }
 
 /// Packed 1-bit sign codes for every centroid in a [`ClusterCentroids`],
-/// plus per-centroid norms for the metric transforms. Derived lazily from
-/// the resident fp32 centroids with the column rotation; wire format is
-/// untouched (fp32 stays canonical).
-#[derive(Debug, Clone)]
-struct RabitqAdmitCodes {
-    rot_seed: u64,
-    words_per_code: usize,
+/// plus per-centroid norms for the metric transforms. Computed wherever
+/// the centroids are computed (commit staging, drain packs) and persisted
+/// beside the fp32 in the summary wire blob, so hydration decodes the
+/// slab instead of re-deriving one rotation per fine centroid; legacy
+/// fp32-only blobs still derive it at hydration.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RabitqAdmitCodes {
+    pub(crate) rot_seed: u64,
+    pub(crate) words_per_code: usize,
     /// `n_cent * words_per_code`, cluster-major.
-    codes: Vec<u64>,
+    pub(crate) codes: Vec<u64>,
     /// `‖centroid[c]‖` per cluster.
-    norms: Vec<f32>,
+    pub(crate) norms: Vec<f32>,
 }
 
 /// Per-cluster IVF centroids for one vector column, stored canonically as fp32
@@ -2981,6 +2983,27 @@ impl ClusterCentroids {
         let _ = self
             .admit_codes
             .get_or_init(|| self.build_admit_codes(rotation, quant, rot_seed));
+    }
+
+    /// The built admit slab, if any — the summary wire encoder persists it
+    /// beside the fp32 centroids when present.
+    pub(crate) fn admit_codes_built(&self) -> Option<&RabitqAdmitCodes> {
+        self.admit_codes.get()
+    }
+
+    /// Wire-decode constructor for summary blobs that carry a persisted
+    /// admit slab: seed the `OnceLock` so no query or hydration pass ever
+    /// re-derives it.
+    pub(crate) fn from_decoded_with_admit(
+        n_cent: u32,
+        dim: u32,
+        centroids: Vec<f32>,
+        counts: Vec<u32>,
+        admit: RabitqAdmitCodes,
+    ) -> Self {
+        let decoded = Self::from_decoded(n_cent, dim, centroids, counts);
+        let _ = decoded.admit_codes.set(admit);
+        decoded
     }
 
     /// 1-bit prefilter: the best (smallest) estimated admit score across
