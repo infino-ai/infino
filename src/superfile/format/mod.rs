@@ -22,7 +22,11 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
-    /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` + version `01`.
+    /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
+    /// `01`. The trailing `01` is a fixed part of the section
+    /// identity, **not** a version — it never changes across blob
+    /// versions (v2 blobs carry this same magic). The blob's version
+    /// is the `u32` at [`hdr::VERSION_OFF`], and only that field.
     pub const MAGIC: &[u8; 8] = b"INFFTS01";
     /// Legacy blob version: the positionless layout with the 48-byte
     /// header. **Read-only** — files written before the positions
