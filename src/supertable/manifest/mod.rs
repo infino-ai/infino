@@ -54,7 +54,7 @@ use futures::future;
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg};
-use rayon::prelude::*;
+use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -840,6 +840,13 @@ impl ManifestSnapshot {
         if options.summary_centroids_from_superfiles {
             strip_summary_centroids(&mut all_superfiles, &options.vector_columns);
         }
+        // Build the remaining resident summaries' admit slabs now (parallel)
+        // rather than lazily on the first query's admit scan.
+        prewarm_summary_admit_slabs(
+            &all_superfiles,
+            &options.vector_columns,
+            &options.reader_pool,
+        );
 
         let mut new_superfile_list = SuperfileList::empty(options.clone());
         new_superfile_list.manifest_id = pointer.manifest_id;
@@ -2577,18 +2584,12 @@ impl RabitqAdmitQuery {
     }
 }
 
-/// Read-only-consumer memory mode: for every uniquely-owned entry, build
-/// each summary cell's 1-bit admit slab from its resident fp32 centroids
-/// and then drop the fp32 vectors. One rotation + quantizer pair per
-/// column, shared across all entries. Entries whose `Arc` is shared (a
-/// previous snapshot or a loaded manifest part also references them) are
-/// skipped — they were either stripped by the earlier load or belong to
-/// maintenance state that needs fp32.
-fn strip_summary_centroids(
-    superfiles: &mut [Arc<SuperfileEntry>],
+/// One shared rotation + sign quantizer per vector column, for
+/// hydration-time slab work over every summary instance.
+fn admit_encoders(
     vector_columns: &[VectorConfig],
-) {
-    let encoders: HashMap<&str, (RandomRotation, BitQuantizer, u64)> = vector_columns
+) -> HashMap<&str, (RandomRotation, BitQuantizer, u64)> {
+    vector_columns
         .iter()
         .map(|vc| {
             (
@@ -2600,7 +2601,21 @@ fn strip_summary_centroids(
                 ),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// Read-only-consumer memory mode: for every uniquely-owned entry, build
+/// each summary cell's 1-bit admit slab from its resident fp32 centroids
+/// and then drop the fp32 vectors. One rotation + quantizer pair per
+/// column, shared across all entries. Entries whose `Arc` is shared (a
+/// previous snapshot or a loaded manifest part also references them) are
+/// skipped — they were either stripped by the earlier load or belong to
+/// maintenance state that needs fp32.
+fn strip_summary_centroids(
+    superfiles: &mut [Arc<SuperfileEntry>],
+    vector_columns: &[VectorConfig],
+) {
+    let encoders = admit_encoders(vector_columns);
     if encoders.is_empty() {
         return;
     }
@@ -2621,6 +2636,41 @@ fn strip_summary_centroids(
             }
         }
     }
+}
+
+/// Pre-build every summary cell's 1-bit admit slab at hydration, in
+/// parallel on the table's reader pool. The slab is otherwise built
+/// lazily on first scan, which lands the whole encode on the first
+/// (cold) query — measured +1.4 s on a 100M-doc cold search (~105K fine
+/// centroids, one rotation+sign-pack each, single-threaded). Open
+/// absorbs the same work in a rayon pass instead. Idempotent: stripped
+/// or already-warm instances are `OnceLock` no-ops.
+fn prewarm_summary_admit_slabs(
+    superfiles: &[Arc<SuperfileEntry>],
+    vector_columns: &[VectorConfig],
+    pool: &ThreadPool,
+) {
+    let encoders = admit_encoders(vector_columns);
+    if encoders.is_empty() {
+        return;
+    }
+    pool.install(|| {
+        superfiles.par_iter().for_each(|entry| {
+            for (column, summary) in &entry.vector_summary {
+                let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                    continue;
+                };
+                for cell in &summary.cells {
+                    if cell.clusters.dim as usize != quant.dim || !cell.clusters.vectors_resident()
+                    {
+                        continue;
+                    }
+                    cell.clusters
+                        .prewarm_admit_codes(rotation, quant, *rot_seed);
+                }
+            }
+        });
+    });
 }
 
 /// Pack a byte sign code into little-endian u64 words, zero-padding the
@@ -2906,7 +2956,8 @@ impl ClusterCentroids {
     /// Packed sign codes for the 1-bit admit prefilter — built once per
     /// instance from the resident fp32 centroids with the query's shared
     /// rotation/quantizer (no per-instance rotation state). Pre-populated
-    /// by [`Self::strip_centroids_after_slab`] on stripped summaries.
+    /// at hydration ([`prewarm_summary_admit_slabs`]) and by
+    /// [`Self::strip_centroids_after_slab`] on stripped summaries.
     fn admit_codes(&self, admit: &RabitqAdmitQuery) -> &RabitqAdmitCodes {
         let cache = self
             .admit_codes
@@ -2916,6 +2967,20 @@ impl ClusterCentroids {
             "admit codes built with a different rot_seed"
         );
         cache
+    }
+
+    /// Hydration-time slab fill: build the packed admit codes now so the
+    /// first query does not pay the encode. `OnceLock` no-op when already
+    /// built (a reload reusing warm entries, or a stripped summary).
+    pub(crate) fn prewarm_admit_codes(
+        &self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) {
+        let _ = self
+            .admit_codes
+            .get_or_init(|| self.build_admit_codes(rotation, quant, rot_seed));
     }
 
     /// 1-bit prefilter: the best (smallest) estimated admit score across
