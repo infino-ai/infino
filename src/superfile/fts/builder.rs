@@ -4291,7 +4291,7 @@ mod tests {
 
         let mut out = Vec::with_capacity(v2.len() - V2_HEADER + V1_HEADER);
         out.extend_from_slice(&v2[0..8]); // magic
-        out.extend_from_slice(&format::fts::VERSION.to_le_bytes());
+        out.extend_from_slice(&format::fts::VERSION_LEGACY.to_le_bytes());
         out.extend_from_slice(&v2[12..24]); // n_columns, n_docs, n_terms
         out.extend_from_slice(&(fst_off - HEADER_SHRINK).to_le_bytes());
         out.extend_from_slice(&(postings_off - HEADER_SHRINK).to_le_bytes());
@@ -4432,7 +4432,7 @@ mod tests {
         let v1_blob = bytes::Bytes::from(synthesize_v1_blob(&v2_blob));
         assert_eq!(
             u32::from_le_bytes(v1_blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION
+            format::fts::VERSION_LEGACY
         );
 
         let v1 = FtsReader::open(v1_blob, title_json(false)).expect("v1 opens");

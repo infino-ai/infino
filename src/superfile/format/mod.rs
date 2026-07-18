@@ -30,9 +30,10 @@ pub mod fts {
     pub const MAGIC: &[u8; 8] = b"INFFTS01";
     /// Legacy blob version: the positionless layout with the 48-byte
     /// header. **Read-only** — files written before the positions
-    /// region existed carry it and stay readable forever; new code
-    /// always writes [`VERSION_POSITIONS`].
-    pub const VERSION: u32 = 1;
+    /// region existed carry it and stay readable until support is
+    /// explicitly dropped; new code always writes
+    /// [`VERSION_POSITIONS`].
+    pub const VERSION_LEGACY: u32 = 1;
 
     /// The version new code writes: the header grows to
     /// [`HEADER_SIZE_V2`] with the positions-region offset at
@@ -56,7 +57,7 @@ pub mod fts {
     /// write and read must agree on the scale.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// Total FTS blob header size in bytes for [`VERSION`] (no
+    /// Total FTS blob header size in bytes for [`VERSION_LEGACY`] (no
     /// positions). The FST directory begins immediately after this
     /// fixed-size header.
     pub const HEADER_SIZE: usize = 48;

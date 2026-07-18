@@ -321,7 +321,7 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION && version != format::fts::VERSION_POSITIONS {
+        if version != format::fts::VERSION_LEGACY && version != format::fts::VERSION_POSITIONS {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
@@ -410,7 +410,7 @@ impl FtsReader {
         // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
         let positional_blob = match version {
-            v if v == format::fts::VERSION => false,
+            v if v == format::fts::VERSION_LEGACY => false,
             v if v == format::fts::VERSION_POSITIONS => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
