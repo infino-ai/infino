@@ -3875,4 +3875,170 @@ mod tests {
         heap.push(small);
         assert_eq!(heap.pop().expect("non-empty heap").sort_key, 10);
     }
+
+    // ---- positional format (v2 blob) ----
+
+    /// Column-json for the single "title" column, with or without the
+    /// positions flag — matching what `fts_columns_json` emits.
+    fn title_json(positional: bool) -> &'static str {
+        match positional {
+            true => r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#,
+            false => r#"[{"name":"title","tokenizer":"ascii_lower"}]"#,
+        }
+    }
+
+    /// Build a one-column blob from `docs`, positional or not.
+    fn build_title_blob(docs: &[String], positional: bool) -> bytes::Bytes {
+        let mut b = FtsBuilder::new(tokenizer());
+        b.register_column("title".into(), positional)
+            .expect("register column");
+        for (i, text) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, text).expect("add doc");
+        }
+        bytes::Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Corpus exercising every positional emit shape: a multi-block
+    /// common term (> 2 × BLOCK_LEN docs), a df=1 tf=1 term (inline
+    /// position packing), a df=1 tf>1 term (PFOR-forced df=1), and a
+    /// medium term with within-doc repeats (multi-varint runs).
+    fn positional_corpus() -> Vec<String> {
+        let n_docs = 3 * BLOCK_LEN + 7;
+        let mut docs = Vec::with_capacity(n_docs);
+        for i in 0..n_docs {
+            let mut t = String::from("common filler");
+            if i % 5 == 0 {
+                t.push_str(" medium medium");
+            }
+            if i == 42 {
+                t.push_str(" uniqueonce");
+            }
+            if i == 43 {
+                t.push_str(" dupdup dupdup dupdup");
+            }
+            docs.push(t);
+        }
+        docs
+    }
+
+    #[test]
+    fn positionless_blob_stays_v1_and_positional_writes_v2() {
+        let docs = positional_corpus();
+        let v1 = build_title_blob(&docs, false);
+        let v2 = build_title_blob(&docs, true);
+
+        let version_of = |blob: &bytes::Bytes| {
+            u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
+        };
+        assert_eq!(version_of(&v1), format::fts::VERSION);
+        assert_eq!(version_of(&v2), format::fts::VERSION_POSITIONS);
+
+        // The v2 positions-region offset points between the postings
+        // region and the doc-lengths directory.
+        let read_u64 = |blob: &bytes::Bytes, at: usize| {
+            u64::from_le_bytes(blob[at..at + 8].try_into().expect("8 header bytes"))
+        };
+        let postings_off = read_u64(&v2, 32);
+        let doc_lengths_off = read_u64(&v2, 40);
+        let positions_off = read_u64(&v2, 48);
+        assert!(postings_off < positions_off, "positions follow postings");
+        assert!(
+            positions_off < doc_lengths_off,
+            "doc-lengths directory follows positions"
+        );
+        // The region is non-empty: the corpus has multi-doc terms
+        // whose runs must land in it (only df=1 tf=1 inlines skip it).
+        assert!(doc_lengths_off - positions_off > 4, "region has a body");
+    }
+
+    #[tokio::test]
+    async fn positional_build_searches_identically_to_positionless() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        let docs = positional_corpus();
+        let v1 = FtsReader::open(build_title_blob(&docs, false), title_json(false)).expect("v1");
+        let v2 = FtsReader::open(build_title_blob(&docs, true), title_json(true)).expect("v2");
+
+        // Positions must never change matching or scoring: identical
+        // (doc, score) lists for every query shape — multi-block
+        // common term, inline df=1 (tf=1), PFOR-forced df=1 (tf>1),
+        // AND / OR multi-term.
+        let queries: &[(&[&str], BoolMode)] = &[
+            (&["common"], BoolMode::Or),
+            (&["uniqueonce"], BoolMode::Or),
+            (&["dupdup"], BoolMode::Or),
+            (&["medium", "uniqueonce"], BoolMode::Or),
+            (&["common", "medium"], BoolMode::And),
+        ];
+        let k = docs.len();
+        for (terms, mode) in queries {
+            let a = v1
+                .search("title", terms, k, *mode)
+                .await
+                .expect("v1 search");
+            let b = v2
+                .search("title", terms, k, *mode)
+                .await
+                .expect("v2 search");
+            assert_eq!(a, b, "results diverged for {terms:?} ({mode:?})");
+            assert!(!a.is_empty(), "corpus sanity: {terms:?} matches");
+        }
+
+        // Count + df fast paths agree too (df reads the term meta's
+        // first bytes — layout-stable across the stride change).
+        for term in ["common", "medium", "uniqueonce", "dupdup"] {
+            let a = v1.term_df("title", term).await.expect("v1 df");
+            let b = v2.term_df("title", term).await.expect("v2 df");
+            assert_eq!(a, b, "df diverged for {term}");
+            let ca = v1
+                .token_match_count("title", &[term], BoolMode::Or)
+                .await
+                .expect("v1 count");
+            let cb = v2
+                .token_match_count("title", &[term], BoolMode::Or)
+                .await
+                .expect("v2 count");
+            assert_eq!(ca, cb, "count diverged for {term}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_columns_only_positional_column_pays() {
+        use crate::superfile::fts::reader::{BoolMode, FtsReader};
+
+        // Two columns, one positional: the blob is v2, and both
+        // columns keep answering queries (each with its own term-meta
+        // stride).
+        let mut b = FtsBuilder::new(tokenizer());
+        b.register_column("body".into(), false).expect("register");
+        b.register_column("title".into(), true).expect("register");
+        for i in 0..(BLOCK_LEN as u32 + 9) {
+            b.add_doc(0, i, "shared bodyterm").expect("body doc");
+            b.add_doc(1, i, "shared titleterm titleterm")
+                .expect("title doc");
+        }
+        let blob = bytes::Bytes::from(b.finish().expect("finish"));
+        assert_eq!(
+            u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
+            format::fts::VERSION_POSITIONS
+        );
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let body_hits = r
+            .search("body", &["bodyterm"], 10, BoolMode::Or)
+            .await
+            .expect("body search");
+        let title_hits = r
+            .search("title", &["titleterm"], 10, BoolMode::Or)
+            .await
+            .expect("title search");
+        assert_eq!(body_hits.len(), 10);
+        assert_eq!(title_hits.len(), 10);
+        // The same term string scoped to each column stays isolated.
+        let shared_body = r
+            .token_match_count("body", &["shared"], BoolMode::Or)
+            .await
+            .expect("shared body");
+        assert_eq!(shared_body, BLOCK_LEN as u64 + 9);
+    }
 }

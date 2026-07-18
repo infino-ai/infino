@@ -38,7 +38,9 @@ use crate::superfile::{
     },
     fts::{
         bm25,
-        builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE},
+        builder::{
+            DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
+        },
         dict::{DictReader, make_key},
         fst_value::FstValue,
         posting::{BLOCK_LEN, decode_block},
@@ -262,6 +264,11 @@ pub struct FtsReader {
     n_terms_total: u32,
     fst_range: Range<usize>,
     postings_range: Range<usize>,
+    /// Byte range of the positions region (CRC stripped) — `Some`
+    /// iff the blob is v2 (some column recorded positions). Consumed
+    /// by the phrase read path that follows in this series.
+    #[allow(dead_code)]
+    positions_range: Option<Range<usize>>,
     columns: Vec<ColumnMeta>,
     column_id_by_name: HashMap<String, u32>,
 }
@@ -305,11 +312,30 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION {
+        if version != format::fts::VERSION && version != format::fts::VERSION_POSITIONS {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
+        // A v2 blob's header extension ([48..56], the positions-region
+        // offset) is fetched here and installed in the overlay so
+        // `open_with_source` reads it without another GET. The FST
+        // directory starts right after whichever header applies.
+        let header_size = match version {
+            v if v == format::fts::VERSION_POSITIONS => format::fts::HEADER_SIZE_V2,
+            _ => FTS_HEADER_SIZE,
+        };
+        let header_ext = match header_size > FTS_HEADER_SIZE {
+            true => Some(
+                fetch_lazy_range(
+                    source.as_ref(),
+                    FTS_HEADER_SIZE..header_size,
+                    "fts header ext",
+                )
+                .await?,
+            ),
+            false => None,
+        };
 
         let postings_offset =
             read_u64_le(&header[hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES])
@@ -339,11 +365,7 @@ impl FtsReader {
         // keeping the open-time GET count minimal and avoiding
         // per-column range calls during metadata decode.
         let (fst_region, doc_lengths_tail) = futures::try_join!(
-            fetch_lazy_range(
-                source.as_ref(),
-                FTS_HEADER_SIZE..postings_offset,
-                "fts/dict"
-            ),
+            fetch_lazy_range(source.as_ref(), header_size..postings_offset, "fts/dict"),
             fetch_lazy_range(
                 source.as_ref(),
                 doc_lengths_table_offset..fts_blob_len,
@@ -353,7 +375,10 @@ impl FtsReader {
 
         let mut overlay = PrefetchedSource::new(source);
         overlay.install(0, header);
-        overlay.install(FTS_HEADER_SIZE as u64, fst_region);
+        if let Some(ext) = header_ext {
+            overlay.install(FTS_HEADER_SIZE as u64, ext);
+        }
+        overlay.install(header_size as u64, fst_region);
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
         Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
@@ -382,12 +407,25 @@ impl FtsReader {
             }));
         }
 
-        // Version check.
+        // Version check. v1 = no positions (48-byte header); v2 adds
+        // the positions-region offset at [48..56] and a positions
+        // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION {
-            return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            ))));
+        let positional_blob = match version {
+            v if v == format::fts::VERSION => false,
+            v if v == format::fts::VERSION_POSITIONS => true,
+            _ => {
+                return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
+                    "fts section version {version}"
+                ))));
+            }
+        };
+        let header_size = match positional_blob {
+            true => format::fts::HEADER_SIZE_V2,
+            false => FTS_HEADER_SIZE,
+        };
+        if source_len < header_size {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
 
         let n_columns =
@@ -402,6 +440,19 @@ impl FtsReader {
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
+        // The v2 extension lives past the 48 bytes fetched above; on
+        // the lazy path it resolves from the prefetch overlay.
+        let positions_offset: Option<usize> = match positional_blob {
+            true => {
+                let ext = fetch_source_range(
+                    &source,
+                    FTS_HEADER_SIZE..format::fts::HEADER_SIZE_V2,
+                    "fts header ext",
+                )?;
+                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
+            }
+            false => None,
+        };
 
         // Bounds-check every offset against the blob length before
         // any slice indexing. A single byte flip in the header can
@@ -414,24 +465,31 @@ impl FtsReader {
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
-        if fst_offset < FTS_HEADER_SIZE
+        let postings_end = positions_offset.unwrap_or(doc_lengths_table_offset);
+        if fst_offset < header_size
             || postings_offset < fst_offset + 4
-            || doc_lengths_table_offset < postings_offset + 4
+            || postings_end < postings_offset + 4
+            || doc_lengths_table_offset < postings_end
             || doc_lengths_table_offset > source_len
+            || positions_offset.is_some_and(|po| doc_lengths_table_offset < po + 4)
         {
             return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
-                 doc_lengths={doc_lengths_table_offset}, blob_len={}",
+                 positions={positions_offset:?}, doc_lengths={doc_lengths_table_offset}, \
+                 blob_len={}",
                 source_len
             ))));
         }
 
-        // Postings region length: we don't store it explicitly (CRC32C of
-        // the body is at postings_offset + len - 4). Compute from the
-        // surrounding offsets — postings ends where the doc-lengths
+        // Region lengths aren't stored explicitly (each region ends
+        // with its CRC32C). Compute from the surrounding offsets —
+        // postings end where the positions region begins (or the
+        // doc-lengths directory on a v1 blob), positions end where the
         // directory begins.
         let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
-        let postings_range = postings_offset..doc_lengths_table_offset.saturating_sub(4); // strip CRC
+        let postings_range = postings_offset..postings_end.saturating_sub(4); // strip CRC
+        let positions_range: Option<Range<usize>> =
+            positions_offset.map(|po| po..doc_lengths_table_offset.saturating_sub(4));
 
         // Verify FST CRC32C (4 bytes after fst body).
         if opts.verify_crc {
@@ -453,12 +511,9 @@ impl FtsReader {
 
         // Verify postings region CRC32C.
         if opts.verify_crc {
-            let postings_crc_pos = doc_lengths_table_offset.saturating_sub(4);
-            let postings_crc_bytes = fetch_source_range(
-                &source,
-                postings_crc_pos..doc_lengths_table_offset,
-                "fts/postings crc",
-            )?;
+            let postings_crc_pos = postings_end.saturating_sub(4);
+            let postings_crc_bytes =
+                fetch_source_range(&source, postings_crc_pos..postings_end, "fts/postings crc")?;
             let postings_crc_expected = read_u32_le(&postings_crc_bytes);
             let postings_bytes =
                 fetch_source_range(&source, postings_range.clone(), "fts/postings")?;
@@ -466,6 +521,27 @@ impl FtsReader {
             if postings_crc_expected != postings_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
                     section: "fts/postings",
+                    column: String::new(),
+                }));
+            }
+        }
+
+        // Verify positions region CRC32C (v2 blobs only).
+        if opts.verify_crc
+            && let Some(pos_range) = &positions_range
+        {
+            let crc_pos = doc_lengths_table_offset.saturating_sub(4);
+            let crc_bytes = fetch_source_range(
+                &source,
+                crc_pos..doc_lengths_table_offset,
+                "fts/positions crc",
+            )?;
+            let crc_expected = read_u32_le(&crc_bytes);
+            let pos_bytes = fetch_source_range(&source, pos_range.clone(), "fts/positions")?;
+            let crc_actual = crc32c(&pos_bytes);
+            if crc_expected != crc_actual {
+                return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                    section: "fts/positions",
                     column: String::new(),
                 }));
             }
@@ -598,6 +674,7 @@ impl FtsReader {
             n_terms_total,
             fst_range,
             postings_range,
+            positions_range,
             columns,
             column_id_by_name,
         })
@@ -1143,6 +1220,14 @@ impl FtsReader {
                 // skip-table, no PFOR decode. The single doc's score
                 // is the entire result for any k ≥ 1 (unless it sits
                 // strictly below the caller's floor).
+                //
+                // On a positional column the slot carries the term's
+                // single position, tf implied 1 (the builder only
+                // inlines tf == 1 there) — score with the implied tf.
+                let tf = match col_meta.positions {
+                    true => 1,
+                    false => tf,
+                };
                 let idf_t = bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
@@ -1176,7 +1261,7 @@ impl FtsReader {
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        let term_meta = TermMeta::parse(postings, metadata_offset)?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
@@ -1300,6 +1385,14 @@ impl FtsReader {
         for r in resolved {
             match r {
                 Resolved::Inline { doc_id, tf } => {
+                    // On a positional column the inline slot carries
+                    // the term's single position, tf implied 1 — the
+                    // builder only inlines tf == 1 postings there.
+                    // Scoring must use the implied tf, never the slot.
+                    let tf = match col_meta.positions {
+                        true => 1,
+                        false => tf,
+                    };
                     let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                     cursors.push(TermCursor::new_inline(
                         doc_id,
@@ -1310,7 +1403,11 @@ impl FtsReader {
                 }
                 Resolved::Pfor => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    cursors.push(TermCursor::new(term_bytes, self.n_docs as u64)?);
+                    cursors.push(TermCursor::new(
+                        term_bytes,
+                        self.n_docs as u64,
+                        col_meta.positions,
+                    )?);
                 }
             }
         }
@@ -3248,8 +3345,17 @@ impl TermMeta {
     /// Returns `Err` (never panics) on a corrupt or malicious
     /// `metadata_offset` — the crate-wide "untrusted input yields
     /// `Err`, not a slice-index panic" rule.
-    fn parse(postings: &[u8], metadata_offset: usize) -> Result<Self, FtsError> {
-        if metadata_offset + TERM_META_SIZE > postings.len() {
+    fn parse(postings: &[u8], metadata_offset: usize, positional: bool) -> Result<Self, FtsError> {
+        // Positional columns carry the extended 32-byte header (the
+        // term's positions offset + length after `num_blocks`); the
+        // skip table starts after whichever stride applies. The
+        // positions fields themselves are consumed by the phrase read
+        // path, not here.
+        let term_meta_size = match positional {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+        if metadata_offset + term_meta_size > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "term metadata offset out of postings region".into(),
             )));
@@ -3268,7 +3374,7 @@ impl TermMeta {
                 ..metadata_offset + term_meta::NUM_BLOCKS_OFF + U32_BYTES],
         ) as usize;
 
-        let skip_start = metadata_offset + TERM_META_SIZE;
+        let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
         if skip_end > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
@@ -3415,11 +3521,11 @@ impl TermCursor {
     /// the term's 20-byte metadata header (offset 0) and runs to the
     /// end of its last block — the contiguous range
     /// [`FtsReader::fetch_term_postings`] fetched for this term.
-    fn new(term_bytes: Bytes, n_docs: u64) -> Result<Self, FtsError> {
+    fn new(term_bytes: Bytes, n_docs: u64, positional: bool) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        let term_meta = TermMeta::parse(postings, metadata_offset)?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional)?;
         let idf = bm25::idf(n_docs, term_meta.df);
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
