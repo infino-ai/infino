@@ -216,6 +216,27 @@ impl core::marker::Unpin for infino::GcReport
 impl core::marker::UnsafeUnpin for infino::GcReport
 impl core::panic::unwind_safe::RefUnwindSafe for infino::GcReport
 impl core::panic::unwind_safe::UnwindSafe for infino::GcReport
+pub struct infino::GcSettings
+pub infino::GcSettings::safety_gap: core::time::Duration
+impl infino::GcSettings
+pub fn infino::GcSettings::with_safety_gap(self, core::time::Duration) -> Self
+impl core::clone::Clone for infino::GcSettings
+pub fn infino::GcSettings::clone(&self) -> infino::GcSettings
+impl core::cmp::Eq for infino::GcSettings
+impl core::cmp::PartialEq for infino::GcSettings
+pub fn infino::GcSettings::eq(&self, &infino::GcSettings) -> bool
+impl core::default::Default for infino::GcSettings
+pub fn infino::GcSettings::default() -> Self
+impl core::fmt::Debug for infino::GcSettings
+pub fn infino::GcSettings::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for infino::GcSettings
+impl core::marker::Freeze for infino::GcSettings
+impl core::marker::Send for infino::GcSettings
+impl core::marker::Sync for infino::GcSettings
+impl core::marker::Unpin for infino::GcSettings
+impl core::marker::UnsafeUnpin for infino::GcSettings
+impl core::panic::unwind_safe::RefUnwindSafe for infino::GcSettings
+impl core::panic::unwind_safe::UnwindSafe for infino::GcSettings
 pub struct infino::IndexSpec
 impl infino::IndexSpec
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -257,6 +278,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::MutationStats
 pub struct infino::OptimizeOptions
 impl infino::OptimizeOptions
 pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
+pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::clone(&self) -> infino::OptimizeOptions
 impl core::default::Default for infino::OptimizeOptions

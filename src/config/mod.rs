@@ -214,6 +214,29 @@ impl Default for CompactionSettings {
 /// Minimum age an unreferenced object must reach before [`crate::Supertable::optimize`] deletes it.
 pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
+/// Gc settings used by `optimize()`'s bundled gc sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcSettings {
+    /// Minimum age an unreferenced object must reach before it's deleted.
+    pub safety_gap: Duration,
+}
+
+impl Default for GcSettings {
+    fn default() -> Self {
+        Self {
+            safety_gap: DEFAULT_GC_SAFETY_GAP,
+        }
+    }
+}
+
+impl GcSettings {
+    /// Gc settings with the given safety gap;
+    pub fn with_safety_gap(mut self, gap: Duration) -> Self {
+        self.safety_gap = gap;
+        self
+    }
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -221,6 +244,7 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 #[derive(Debug, Clone, Default)]
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
+    pub(crate) gc: GcSettings,
 }
 
 impl OptimizeOptions {
@@ -228,7 +252,14 @@ impl OptimizeOptions {
     pub fn compact(settings: CompactionSettings) -> Self {
         Self {
             compaction: settings,
+            gc: GcSettings::default(),
         }
+    }
+
+    /// Override the gc settings `optimize()`'s bundled sweep uses.
+    pub fn with_gc(mut self, gc: GcSettings) -> Self {
+        self.gc = gc;
+        self
     }
 }
 
