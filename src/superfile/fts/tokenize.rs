@@ -107,7 +107,69 @@ pub trait Tokenizer: Send + Sync + 'static {
     /// positive clause is not an error here; the caller checks.
     fn parse<'q>(&self, query: &'q str) -> ParsedQuery<'q> {
         let mut parsed = ParsedQuery::default();
-        for run in query.split_whitespace() {
+        let bytes = query.as_bytes();
+        let mut i = 0usize;
+        let mut seg_start = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let Some(close_rel) = query[i + 1..].find('"') else {
+                // Unbalanced quote: treat the dangling `"` as
+                // whitespace (lenient, like lucene's parser) — close
+                // the unquoted segment here and keep scanning after it.
+                self.parse_unquoted_segment(&query[seg_start..i], &mut parsed);
+                i += 1;
+                seg_start = i;
+                continue;
+            };
+            let close = i + 1 + close_rel;
+            // A `+` / `-` glued to the opening quote — and itself at a
+            // token boundary — sets the phrase's polarity; the sigil
+            // byte is excluded from the unquoted segment.
+            let sigil = match i > seg_start {
+                true => {
+                    let boundary = i - 1 == seg_start || bytes[i - 2].is_ascii_whitespace();
+                    match (boundary, bytes[i - 1]) {
+                        (true, b'+') => Some(b'+'),
+                        (true, b'-') => Some(b'-'),
+                        _ => None,
+                    }
+                }
+                false => None,
+            };
+            let unquoted_end = match sigil {
+                Some(_) => i - 1,
+                None => i,
+            };
+            self.parse_unquoted_segment(&query[seg_start..unquoted_end], &mut parsed);
+            let mut terms: Vec<Cow<'q, str>> = Vec::new();
+            self.tokenize_each_query(&query[i + 1..close], &mut |t| terms.push(t));
+            match (terms.len(), sigil) {
+                // Empty quotes contribute nothing.
+                (0, _) => {}
+                // A single-token phrase is just that term — degrade to
+                // the term list of the same polarity.
+                (1, Some(b'-')) => parsed.negatives.push(terms.pop().expect("one term")),
+                (1, Some(b'+')) => parsed.musts.push(terms.pop().expect("one term")),
+                (1, _) => parsed.positives.push(terms.pop().expect("one term")),
+                (_, Some(b'-')) => parsed.negative_phrases.push(terms),
+                (_, Some(b'+')) => parsed.must_phrases.push(terms),
+                (_, _) => parsed.positive_phrases.push(terms),
+            }
+            i = close + 1;
+            seg_start = i;
+        }
+        self.parse_unquoted_segment(&query[seg_start..], &mut parsed);
+        parsed
+    }
+
+    /// Parse one stretch of query text containing no quotes — the
+    /// pre-phrase grammar: whitespace runs with optional `+`/`-`
+    /// clause sigils.
+    fn parse_unquoted_segment<'q>(&self, segment: &'q str, parsed: &mut ParsedQuery<'q>) {
+        for run in segment.split_whitespace() {
             match (run.strip_prefix('-'), run.strip_prefix('+')) {
                 (Some(rest), _) if !rest.is_empty() => {
                     self.tokenize_each_query(rest, &mut |t| parsed.negatives.push(t));
@@ -118,7 +180,6 @@ pub trait Tokenizer: Send + Sync + 'static {
                 _ => self.tokenize_each_query(run, &mut |t| parsed.positives.push(t)),
             }
         }
-        parsed
     }
 }
 
@@ -351,6 +412,16 @@ pub struct ParsedQuery<'q> {
     pub positives: Vec<Cow<'q, str>>,
     /// `-`-sigiled tokens: any doc containing one is excluded.
     pub negatives: Vec<Cow<'q, str>>,
+    /// `+"…"`-quoted runs of two or more tokens: the doc must contain
+    /// the exact token sequence. (Single-token phrases degrade into
+    /// `musts`.)
+    pub must_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// Bare-quoted multi-token runs; polarity resolved from the
+    /// default operator like bare terms.
+    pub positive_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// `-"…"`-quoted multi-token runs: any doc containing the exact
+    /// sequence is excluded.
+    pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
 }
 
 /// A query's clause lists with the default operator already applied —
@@ -365,6 +436,13 @@ pub struct QueryClauses<'q> {
     pub shoulds: Vec<Cow<'q, str>>,
     /// Docs containing any of these are excluded.
     pub negatives: Vec<Cow<'q, str>>,
+    /// Multi-token phrases every doc in the result must contain.
+    pub must_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// Scoring-only phrases when `musts`/`must_phrases` is non-empty;
+    /// otherwise part of the union match.
+    pub should_phrases: Vec<Vec<Cow<'q, str>>>,
+    /// Docs containing any of these exact sequences are excluded.
+    pub negative_phrases: Vec<Vec<Cow<'q, str>>>,
 }
 
 impl<'q> ParsedQuery<'q> {
@@ -376,6 +454,9 @@ impl<'q> ParsedQuery<'q> {
             mut musts,
             positives,
             negatives,
+            mut must_phrases,
+            positive_phrases,
+            negative_phrases,
         } = self;
         let shoulds = match mode {
             BoolMode::And => {
@@ -384,10 +465,20 @@ impl<'q> ParsedQuery<'q> {
             }
             BoolMode::Or => positives,
         };
+        let should_phrases = match mode {
+            BoolMode::And => {
+                must_phrases.extend(positive_phrases);
+                Vec::new()
+            }
+            BoolMode::Or => positive_phrases,
+        };
         QueryClauses {
             musts,
             shoulds,
             negatives,
+            must_phrases,
+            should_phrases,
+            negative_phrases,
         }
     }
 }
@@ -795,6 +886,99 @@ mod tests {
         assert_eq!(p.negatives, vec!["x"]);
         let p = parse("+-x");
         assert_eq!(p.musts, vec!["x"]);
+    }
+
+    // ---- parse (quoted phrase atoms) ----
+
+    #[test]
+    fn parse_pure_phrase() {
+        let p = parse(r#""griffith observatory""#);
+        assert_eq!(p.positive_phrases, vec![vec!["griffith", "observatory"]]);
+        assert!(p.positives.is_empty());
+        assert!(p.musts.is_empty());
+    }
+
+    #[test]
+    fn parse_phrase_polarities() {
+        let p = parse(r#"+"the who" -"memory unsafe" "new york""#);
+        assert_eq!(p.must_phrases, vec![vec!["the", "who"]]);
+        assert_eq!(p.negative_phrases, vec![vec!["memory", "unsafe"]]);
+        assert_eq!(p.positive_phrases, vec![vec!["new", "york"]]);
+    }
+
+    #[test]
+    fn parse_phrase_mixes_with_terms() {
+        let p = parse(r#"+"the who" +uk rust -python"#);
+        assert_eq!(p.must_phrases, vec![vec!["the", "who"]]);
+        assert_eq!(p.musts, vec!["uk"]);
+        assert_eq!(p.positives, vec!["rust"]);
+        assert_eq!(p.negatives, vec!["python"]);
+    }
+
+    #[test]
+    fn parse_single_token_phrase_degrades_to_term() {
+        let p = parse(r#""york" +"london" -"paris""#);
+        assert!(p.positive_phrases.is_empty());
+        assert!(p.must_phrases.is_empty());
+        assert!(p.negative_phrases.is_empty());
+        assert_eq!(p.positives, vec!["york"]);
+        assert_eq!(p.musts, vec!["london"]);
+        assert_eq!(p.negatives, vec!["paris"]);
+    }
+
+    #[test]
+    fn parse_empty_quotes_contribute_nothing() {
+        let p = parse(r#"rust "" async"#);
+        assert_eq!(p.positives, vec!["rust", "async"]);
+        assert!(p.positive_phrases.is_empty());
+    }
+
+    #[test]
+    fn parse_unbalanced_quote_is_whitespace() {
+        // The dangling quote splits the text; everything parses as
+        // bare terms (lenient, never an error).
+        let p = parse(r#"rust "new york"#);
+        assert_eq!(p.positives, vec!["rust", "new", "york"]);
+        assert!(p.positive_phrases.is_empty());
+    }
+
+    #[test]
+    fn parse_phrase_tokens_are_normalized() {
+        // Phrase innards run through the same tokenizer: lowercased,
+        // punctuation split.
+        let p = parse(r#""New-York City""#);
+        assert_eq!(p.positive_phrases, vec![vec!["new", "york", "city"]]);
+    }
+
+    #[test]
+    fn parse_interior_sigil_before_quote_is_not_polarity() {
+        // `abc+"x y"`: the `+` is interior to the run, not a phrase
+        // sigil — the phrase is bare and `abc` parses from the
+        // unquoted segment (its trailing `+` strips as punctuation).
+        let p = parse(r#"abc+"x y""#);
+        assert_eq!(p.positives, vec!["abc"]);
+        assert_eq!(p.positive_phrases, vec![vec!["x", "y"]]);
+        assert!(p.must_phrases.is_empty());
+    }
+
+    #[test]
+    fn parse_adjacent_phrases() {
+        let p = parse(r#""a b""c d""#);
+        assert_eq!(p.positive_phrases, vec![vec!["a", "b"], vec!["c", "d"]]);
+    }
+
+    #[test]
+    fn into_clauses_resolves_phrase_polarity_by_mode() {
+        let c = parse(r#""new york" +"the who" -"bad seq" rust"#).into_clauses(BoolMode::Or);
+        assert_eq!(c.should_phrases, vec![vec!["new", "york"]]);
+        assert_eq!(c.must_phrases, vec![vec!["the", "who"]]);
+        assert_eq!(c.negative_phrases, vec![vec!["bad", "seq"]]);
+        assert_eq!(c.shoulds, vec!["rust"]);
+
+        let c = parse(r#""new york" rust"#).into_clauses(BoolMode::And);
+        assert_eq!(c.must_phrases, vec![vec!["new", "york"]]);
+        assert!(c.should_phrases.is_empty());
+        assert_eq!(c.musts, vec!["rust"]);
     }
 
     // ---- into_clauses (default-operator resolution) ----
