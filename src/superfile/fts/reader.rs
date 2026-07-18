@@ -898,9 +898,22 @@ impl FtsReader {
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
 
+        // Per-atom pruning slack: an atom only needs to contribute
+        // more than the walk's bar minus what every *other* atom could
+        // possibly add. Phrase atoms use it to skip position work on
+        // docs that provably can't matter (`skip_to_pruned`).
+        let atom_slack = |atoms: &[AnyCursor], extra_ub: f32| -> Vec<f32> {
+            let total: f32 = atoms.iter().map(AnyCursor::term_max_bm25).sum();
+            atoms
+                .iter()
+                .map(|a| total - a.term_max_bm25() + extra_ub)
+                .collect()
+        };
+
         if musts.is_empty() {
             // Union of shoulds, doc-at-a-time: score every atom
             // sitting on the frontier doc, then advance them past it.
+            let others_ub = atom_slack(&shoulds, 0.0);
             while let Some(doc) = shoulds
                 .iter()
                 .filter(|a| !a.is_exhausted())
@@ -925,9 +938,13 @@ impl FtsReader {
                 let Some(next) = doc.checked_add(1) else {
                     break;
                 };
-                for a in shoulds.iter_mut() {
+                let bar = match heap.len() >= k {
+                    true => heap.peek().expect("heap len == k").0.max(floor_eff),
+                    false => floor_eff,
+                };
+                for (a, &others) in shoulds.iter_mut().zip(&others_ub) {
                     if !a.is_exhausted() && a.current_doc_id() == doc {
-                        a.skip_to(next)?;
+                        a.skip_to_pruned(next, bar - others, dl_norm_k1)?;
                     }
                 }
             }
@@ -937,13 +954,22 @@ impl FtsReader {
         // Must-driven walk: leapfrog the musts to each common doc,
         // score musts + landing shoulds there.
         let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
+        let must_others_ub = atom_slack(&musts, should_ub);
+        let should_others_ub: Vec<f32> = {
+            let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
+            atom_slack(&shoulds, must_ub_total)
+        };
         let mut target = 0u32;
         'docs: loop {
+            let bar = match heap.len() >= k {
+                true => heap.peek().expect("heap len == k").0.max(floor_eff),
+                false => floor_eff,
+            };
             let mut aligned = target;
             let mut i = 0usize;
             while i < musts.len() {
                 let a = &mut musts[i];
-                a.skip_to(aligned)?;
+                a.skip_to_pruned(aligned, bar - must_others_ub[i], dl_norm_k1)?;
                 if a.is_exhausted() {
                     break 'docs;
                 }
@@ -959,18 +985,16 @@ impl FtsReader {
             // most the shoulds could add bounds what the musts must
             // reach; a candidate whose must-side block bounds can't
             // get there is dead without scoring (and, for phrase
-            // shoulds, without any position work).
-            let bar = match heap.len() >= k {
-                true => heap.peek().expect("heap len == k").0.max(floor_eff),
-                false => floor_eff,
-            };
+            // shoulds, without any position work). `>=`, not `>`: a
+            // doc exactly at the bar can still displace the incumbent
+            // kth-best on the ascending-doc-id tie-break.
             let scoring_needed = match bar > f32::NEG_INFINITY {
                 true => {
                     let must_ub: f32 = musts
                         .iter_mut()
                         .map(|a| a.block_max_in_range(aligned, aligned))
                         .sum();
-                    must_ub + should_ub > bar
+                    must_ub + should_ub >= bar
                 }
                 false => true,
             };
@@ -982,8 +1006,8 @@ impl FtsReader {
             if admitted {
                 let norm = dl_norm_k1[aligned as usize];
                 let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
-                for sh in shoulds.iter_mut() {
-                    sh.skip_to(aligned)?;
+                for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
+                    sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
                     if !sh.is_exhausted() && sh.current_doc_id() == aligned {
                         score += sh.score_current(norm);
                     }
@@ -3453,7 +3477,7 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
         };
-        cursor.seek_match(0)?;
+        cursor.seek_match(0, f32::NEG_INFINITY, &[])?;
         Ok(cursor)
     }
 
@@ -3472,12 +3496,39 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target)
+        self.seek_match(target, f32::NEG_INFINITY, &[])
+    }
+
+    /// [`Self::skip_to`] for ranked walks: additionally skips docs
+    /// whose phrase contribution provably can't matter. `bar` is the
+    /// most this atom may need to contribute (the walk's pruning bar
+    /// minus every other atom's upper bound); a doc whose phrase
+    /// score bound falls strictly below it is passed over without any
+    /// position work — sound for top-k because the doc's total score
+    /// then can't reach the bar, but NOT for match/count walks, which
+    /// must keep using [`Self::skip_to`].
+    fn skip_to_pruned(
+        &mut self,
+        target: u32,
+        bar: f32,
+        dl_norm_k1: &[f32],
+    ) -> Result<(), FtsError> {
+        if self.is_exhausted() || self.current_doc >= target {
+            return Ok(());
+        }
+        self.seek_match(target, bar, dl_norm_k1)
     }
 
     /// Leapfrog the members to their next common doc ≥ `from`, verify
-    /// adjacency there, and repeat until a match or exhaustion.
-    fn seek_match(&mut self, mut from: u32) -> Result<(), FtsError> {
+    /// adjacency there, and repeat until a match or exhaustion. When
+    /// `bar` is finite, aligned docs are pre-screened without touching
+    /// positions: the phrase tf can't exceed any member's tf, so the
+    /// BM25 score at the members' minimum tf bounds the phrase's
+    /// contribution, and a doc strictly below `bar` is skipped before
+    /// the run decode. (`<`, not `<=`: a doc exactly at the bar can
+    /// still displace the incumbent kth-best on the ascending-doc-id
+    /// tie-break, so it must be verified.)
+    fn seek_match(&mut self, mut from: u32, bar: f32, dl_norm_k1: &[f32]) -> Result<(), FtsError> {
         'docs: loop {
             // Align every member to the same doc ≥ `from`.
             let mut aligned = from;
@@ -3498,6 +3549,31 @@ impl PhraseCursor {
                     continue;
                 }
                 i += 1;
+            }
+
+            if bar > f32::NEG_INFINITY {
+                let min_tf = self
+                    .members
+                    .iter()
+                    .map(|m| m.cursor.current_tf())
+                    .min()
+                    .expect("members >= 2");
+                let ub = bm25::score_with_dl_norm_k1(
+                    self.idf_x_k1p1,
+                    min_tf,
+                    dl_norm_k1[aligned as usize],
+                );
+                if ub < bar {
+                    from = match aligned.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            self.current_doc = u32::MAX;
+                            self.current_tf = 0;
+                            return Ok(());
+                        }
+                    };
+                    continue 'docs;
+                }
             }
 
             // Verify adjacency at the aligned doc.
@@ -3601,6 +3677,26 @@ impl AnyCursor {
                 Ok(())
             }
             AnyCursor::Phrase(c) => c.skip_to(target),
+        }
+    }
+
+    /// [`Self::skip_to`] with the ranked walks' pruning bar: a phrase
+    /// atom skips docs it provably can't lift over the bar without
+    /// doing any position work (see [`PhraseCursor::skip_to_pruned`]).
+    /// Term atoms ignore the bar — their per-doc score costs nothing
+    /// beyond the postings walk itself.
+    fn skip_to_pruned(
+        &mut self,
+        target: u32,
+        bar: f32,
+        dl_norm_k1: &[f32],
+    ) -> Result<(), FtsError> {
+        match self {
+            AnyCursor::Term(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
+            AnyCursor::Phrase(c) => c.skip_to_pruned(target, bar, dl_norm_k1),
         }
     }
 
