@@ -204,7 +204,7 @@ pub fn options_for(
     let fts = if modality.has_fts() {
         vec![FtsConfig {
             column: TEXT_COLUMN.into(),
-            positions: false,
+            positions: true,
         }]
     } else {
         vec![]

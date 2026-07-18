@@ -1050,7 +1050,7 @@ pub fn calibrate_superfile(
 /// both bench harnesses construct the index identically.
 pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
     let mut b = FtsBuilder::new(default_tokenizer());
-    b.register_column("title".to_string(), false)
+    b.register_column("title".to_string(), true)
         .expect("register column");
     for (i, text) in docs.iter().enumerate() {
         b.add_doc(0, i as u32, text).expect("add doc");

@@ -892,7 +892,7 @@ impl SuperfileReader {
     /// ascending. Used by the table layer whenever the match set
     /// contains a phrase; plain-token queries keep
     /// [`token_match`](Self::token_match).
-    pub(crate) async fn atoms_match_ids(
+    pub async fn atoms_match_ids(
         &self,
         column: &str,
         terms: &[&str],
@@ -907,7 +907,7 @@ impl SuperfileReader {
 
     /// Phrase-aware unranked match **count** — the phrase sibling of
     /// [`token_match_count`](Self::token_match_count).
-    pub(crate) async fn atoms_match_count(
+    pub async fn atoms_match_count(
         &self,
         column: &str,
         terms: &[&str],

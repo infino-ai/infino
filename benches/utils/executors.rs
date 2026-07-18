@@ -400,6 +400,29 @@ pub mod fts {
             terms: &["+term00050", "+term00051", "term00001", "term00052"],
             mode: BoolMode::Or,
         },
+        // Exact phrases (quoted atoms). The Zipfian corpus gives the
+        // top terms frequent chance adjacency, so these measure the
+        // real intersect-then-verify pipeline with non-empty results.
+        FtsQuery {
+            name: "phrase_two_common",
+            terms: &[r#""term00001 term00002""#],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "phrase_two_mixed",
+            terms: &[r#""term00001 term00500""#],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "phrase_three_common",
+            terms: &[r#""term00001 term00002 term00003""#],
+            mode: BoolMode::Or,
+        },
+        FtsQuery {
+            name: "phrase_plus_must_term",
+            terms: &[r#"+"term00001 term00002""#, "+term00010"],
+            mode: BoolMode::Or,
+        },
     ];
 
     /// OR query names, in table order.
@@ -430,6 +453,14 @@ pub mod fts {
         "must_common_should_common",
         "must_rare_should_common",
         "must_two_should_two",
+    ];
+
+    /// Phrase query names, in table order.
+    pub const PHRASE_QUERIES: &[&str] = &[
+        "phrase_two_common",
+        "phrase_two_mixed",
+        "phrase_three_common",
+        "phrase_plus_must_term",
     ];
 
     pub fn to_infino_mode(mode: BoolMode) -> InfinoBoolMode {
@@ -547,13 +578,26 @@ pub mod fts {
                 // does: with `+must` clauses, the count is the musts'
                 // intersection (shoulds only affect scores, so they
                 // never change which docs count); otherwise the bare
-                // terms match under `mode`.
+                // terms match under `mode`. Phrase atoms take the
+                // phrase-aware walk.
                 let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
-                let (terms, eff_mode) = if clauses.musts.is_empty() {
-                    (clauses.shoulds, mode)
+                let has_musts = !clauses.musts.is_empty() || !clauses.must_phrases.is_empty();
+                let (terms, phrases, eff_mode) = if has_musts {
+                    (clauses.musts, clauses.must_phrases, InfinoBoolMode::And)
                 } else {
-                    (clauses.musts, InfinoBoolMode::And)
+                    (clauses.shoulds, clauses.should_phrases, mode)
                 };
+                if !phrases.is_empty() {
+                    let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
+                    let owned: Vec<Vec<String>> = phrases
+                        .into_iter()
+                        .map(|p| p.into_iter().map(|t| t.into_owned()).collect())
+                        .collect();
+                    return self
+                        .atoms_match_count(column, &refs, &owned, eff_mode)
+                        .await
+                        .expect("superfile atoms_match_count");
+                }
                 let refs: Vec<&str> = terms.iter().map(|t| &**t).collect();
                 // Single term: df is the exact match count, read O(1) from
                 // the dictionary header. Multi-term: the dedicated count
@@ -815,13 +859,21 @@ pub mod fts {
         };
         let clause_block = Block {
             subtitle: "Must/should queries (+must, bare should)".into(),
-            headers: header_cols,
+            headers: header_cols.clone(),
             rows: CLAUSE_QUERIES
                 .iter()
                 .map(|&n| search_row(n, warm_map.as_ref(), cold))
                 .collect(),
         };
-        let mut blocks = vec![or_block, and_block, clause_block];
+        let phrase_block = Block {
+            subtitle: "Phrase queries (exact adjacency)".into(),
+            headers: header_cols,
+            rows: PHRASE_QUERIES
+                .iter()
+                .map(|&n| search_row(n, warm_map.as_ref(), cold))
+                .collect(),
+        };
+        let mut blocks = vec![or_block, and_block, clause_block, phrase_block];
         if let Some(probes) = probes {
             blocks.push(Block {
                 subtitle: "Per-algorithm probes (WAND+BMW vs MaxScore+BMM)".into(),
@@ -932,14 +984,19 @@ pub mod fts {
         };
         let clause_block = Block {
             subtitle: "Must/should queries (count = must intersection)".into(),
-            headers,
+            headers: headers.clone(),
             rows: CLAUSE_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
+        };
+        let phrase_block = Block {
+            subtitle: "Phrase queries (count = verified matches)".into(),
+            headers,
+            rows: PHRASE_QUERIES.iter().map(|&n| count_row(n, &map)).collect(),
         };
         report.emit(&Section {
             anchor: anchor.into(),
             title,
             note: note.into(),
-            blocks: vec![or_block, and_block, clause_block],
+            blocks: vec![or_block, and_block, clause_block, phrase_block],
         });
     }
 }
