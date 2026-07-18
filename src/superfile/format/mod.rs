@@ -32,8 +32,8 @@ pub mod fts {
     /// header. **Read-only** — files written before the positions
     /// region existed carry it and stay readable until support is
     /// explicitly dropped; new code always writes
-    /// [`VERSION_POSITIONS`].
-    pub const VERSION_LEGACY: u32 = 1;
+    /// [`VERSION_V2`].
+    pub const VERSION_V1_LEGACY: u32 = 1;
 
     /// The version new code writes: the header grows to
     /// [`HEADER_SIZE_V2`] with the positions-region offset at
@@ -41,7 +41,7 @@ pub mod fts {
     /// empty unless a column records positions — sits between the
     /// postings region and the doc-lengths directory. Readers accept
     /// both versions.
-    pub const VERSION_POSITIONS: u32 = 2;
+    pub const VERSION_V2: u32 = 2;
 
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
@@ -57,12 +57,12 @@ pub mod fts {
     /// write and read must agree on the scale.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// Total FTS blob header size in bytes for [`VERSION_LEGACY`] (no
+    /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
     /// positions). The FST directory begins immediately after this
     /// fixed-size header.
-    pub const HEADER_SIZE: usize = 48;
+    pub const HEADER_SIZE_V1_LEGACY: usize = 48;
 
-    /// Header size for [`VERSION_POSITIONS`]: the v1 fields plus the
+    /// Header size for [`VERSION_V2`]: the v1 fields plus the
     /// trailing positions-region offset (`u64` at
     /// [`hdr::POSITIONS_OFFSET_OFF`]).
     pub const HEADER_SIZE_V2: usize = 56;
@@ -102,9 +102,9 @@ pub mod fts {
         /// `[40..48]` doc-lengths directory offset (`u64` LE).
         pub const DOC_LENGTHS_DIR_OFF: usize = 40;
         /// `[48..56]` positions region offset (`u64` LE).
-        /// [`VERSION_POSITIONS`](super::VERSION_POSITIONS) headers
+        /// [`VERSION_V2`](super::VERSION_V2) headers
         /// only — a v1 header ends at
-        /// [`HEADER_SIZE`](super::HEADER_SIZE). The region sits
+        /// [`HEADER_SIZE_V1_LEGACY`](super::HEADER_SIZE_V1_LEGACY). The region sits
         /// between the postings region and the doc-lengths directory
         /// so the lazy-open doc-lengths tail fetch stays small.
         pub const POSITIONS_OFFSET_OFF: usize = 48;

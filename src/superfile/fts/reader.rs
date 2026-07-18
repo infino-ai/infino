@@ -32,8 +32,8 @@ use crate::superfile::{
         self, FST_SEPARATOR,
         checksum::crc32c,
         fts::{
-            HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry,
-            term_meta,
+            HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
+            skip_entry, term_meta,
         },
     },
     fts::{
@@ -321,7 +321,7 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION_LEGACY && version != format::fts::VERSION_POSITIONS {
+        if version != format::fts::VERSION_V1_LEGACY && version != format::fts::VERSION_V2 {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
@@ -331,7 +331,7 @@ impl FtsReader {
         // fetched span (and in the overlay below), so
         // `open_with_source` re-reads them without another GET.
         let header_size = match version {
-            v if v == format::fts::VERSION_POSITIONS => format::fts::HEADER_SIZE_V2,
+            v if v == format::fts::VERSION_V2 => format::fts::HEADER_SIZE_V2,
             _ => FTS_HEADER_SIZE,
         };
         if header.len() < header_size {
@@ -410,8 +410,8 @@ impl FtsReader {
         // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
         let positional_blob = match version {
-            v if v == format::fts::VERSION_LEGACY => false,
-            v if v == format::fts::VERSION_POSITIONS => true,
+            v if v == format::fts::VERSION_V1_LEGACY => false,
+            v if v == format::fts::VERSION_V2 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"

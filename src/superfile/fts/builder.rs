@@ -2958,7 +2958,7 @@ fn assemble_and_write_blob<W: Write>(
     let blob_copy_start = finish_profile.enabled.then(Instant::now);
     let mut header = Vec::with_capacity(header_size as usize);
     header.extend_from_slice(format::fts::MAGIC); // 8
-    header.extend_from_slice(&format::fts::VERSION_POSITIONS.to_le_bytes()); // 4
+    header.extend_from_slice(&format::fts::VERSION_V2.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4
     header.extend_from_slice(&n_terms_total.to_le_bytes()); // 4
@@ -3754,7 +3754,7 @@ mod tests {
         assert_eq!(&blob[0..8], format::fts::MAGIC);
         // Version — new code always writes the v2 (positions) layout.
         let version = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]);
-        assert_eq!(version, format::fts::VERSION_POSITIONS);
+        assert_eq!(version, format::fts::VERSION_V2);
         // n_columns.
         let n_cols = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]);
         assert_eq!(n_cols, 1);
@@ -4277,7 +4277,7 @@ mod tests {
 
         let read_u64 = |at: usize| u64::from_le_bytes(v2[at..at + 8].try_into().expect("8 bytes"));
         let read_u32 = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().expect("4 bytes"));
-        assert_eq!(read_u32(8), format::fts::VERSION_POSITIONS);
+        assert_eq!(read_u32(8), format::fts::VERSION_V2);
         let fst_off = read_u64(24);
         let postings_off = read_u64(32);
         let doc_lengths_off = read_u64(40);
@@ -4291,7 +4291,7 @@ mod tests {
 
         let mut out = Vec::with_capacity(v2.len() - V2_HEADER + V1_HEADER);
         out.extend_from_slice(&v2[0..8]); // magic
-        out.extend_from_slice(&format::fts::VERSION_LEGACY.to_le_bytes());
+        out.extend_from_slice(&format::fts::VERSION_V1_LEGACY.to_le_bytes());
         out.extend_from_slice(&v2[12..24]); // n_columns, n_docs, n_terms
         out.extend_from_slice(&(fst_off - HEADER_SHRINK).to_le_bytes());
         out.extend_from_slice(&(postings_off - HEADER_SHRINK).to_le_bytes());
@@ -4390,7 +4390,7 @@ mod tests {
         let spilled_pos = build_title_blob_spilled(&docs, true, None);
         assert_eq!(
             u32::from_le_bytes(spilled_pos[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_POSITIONS
+            format::fts::VERSION_V2
         );
         let inram_pos = build_title_blob(&docs, true);
         let inram_plain = build_title_blob(&docs, false);
@@ -4432,7 +4432,7 @@ mod tests {
         let v1_blob = bytes::Bytes::from(synthesize_v1_blob(&v2_blob));
         assert_eq!(
             u32::from_le_bytes(v1_blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_LEGACY
+            format::fts::VERSION_V1_LEGACY
         );
 
         let v1 = FtsReader::open(v1_blob, title_json(false)).expect("v1 opens");
@@ -4509,8 +4509,8 @@ mod tests {
             u32::from_le_bytes(blob[8..12].try_into().expect("4 header bytes"))
         };
         // New code always writes v2; v1 is a read-only legacy format.
-        assert_eq!(version_of(&plain), format::fts::VERSION_POSITIONS);
-        assert_eq!(version_of(&positional), format::fts::VERSION_POSITIONS);
+        assert_eq!(version_of(&plain), format::fts::VERSION_V2);
+        assert_eq!(version_of(&positional), format::fts::VERSION_V2);
 
         // A positionless build's region is just the CRC-of-empty.
         let read_u64_plain =
@@ -4605,7 +4605,7 @@ mod tests {
         let blob = bytes::Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             u32::from_le_bytes(blob[8..12].try_into().expect("version bytes")),
-            format::fts::VERSION_POSITIONS
+            format::fts::VERSION_V2
         );
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"},{"name":"title","tokenizer":"ascii_lower","positions":true}]"#;
         let r = FtsReader::open(blob, json).expect("open");
