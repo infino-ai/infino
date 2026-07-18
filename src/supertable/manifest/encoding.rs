@@ -25,7 +25,7 @@
 //!   as length-prefixed bytes.
 //! - [`encode_vector_summary`] / [`decode_vector_summary`] —
 //!   custom packed: dim (LE u32), centroid (dim × LE f32),
-//!   radius (LE f32).
+//!   then the cluster-centroid block.
 //!
 //! Wrapped variants — [`encode_fts_summary_map`] /
 //! [`encode_vector_summary_map`] — emit the
@@ -36,20 +36,25 @@
 //! mismatch; callers (the manifest part decoder) wrap that
 //! into [`OpenError::ManifestPartParse`].
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
-use crate::supertable::manifest::{
-    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+use crate::{
+    superfile::vector::distance::decode_f32_le_vec,
+    supertable::manifest::{
+        CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary,
+        bloom::Bloom,
+        list::{ScalarStatsAgg, ScalarValueCounts},
+    },
 };
+
+/// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
+const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -118,8 +123,9 @@ pub enum EncodeError {
 // One RecordBatch carries every column's stats as length-1
 // columns named by suffix: `<col>__min` / `<col>__max`
 // (always, paired), plus optional `<col>__nulls` (UInt64),
-// `<col>__sum` (the column's SUM result type) and
-// `<col>__hll` (Binary, raw HLL registers). The logical
+// `<col>__sum` (the column's SUM result type),
+// `<col>__hll` (Binary, raw HLL registers), and
+// `<col>__value_counts` (Binary, nested Arrow IPC). The logical
 // schema is reconstructed at decode time by stripping the
 // suffixes; data types are preserved by the IPC format
 // itself. Decoding tolerates absent optional stats (segments
@@ -130,6 +136,9 @@ const MAX_SUFFIX: &str = "__max";
 const NULLS_SUFFIX: &str = "__nulls";
 const SUM_SUFFIX: &str = "__sum";
 const HLL_SUFFIX: &str = "__hll";
+const VALUE_COUNTS_SUFFIX: &str = "__value_counts";
+const VALUE_COUNTS_VALUE_FIELD: &str = "value";
+const VALUE_COUNTS_COUNT_FIELD: &str = "count";
 
 pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
     if stats.is_empty() {
@@ -183,6 +192,16 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
             ));
             arrays.push(Arc::new(BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef);
         }
+        if let Some(value_counts) = &agg.value_counts {
+            let encoded = encode_value_counts(value_counts)
+                .expect("value counts built from Arrow values must encode");
+            fields.push(Field::new(
+                format!("{key}{VALUE_COUNTS_SUFFIX}"),
+                DataType::Binary,
+                true,
+            ));
+            arrays.push(Arc::new(BinaryArray::from(vec![encoded.as_slice()])) as ArrayRef);
+        }
     }
     let schema = Arc::new(Schema::new(fields));
     let batch =
@@ -220,6 +239,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
     let mut null_counts: HashMap<String, u64> = HashMap::new();
     let mut sums: HashMap<String, ArrayRef> = HashMap::new();
     let mut hlls: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut value_counts: HashMap<String, ScalarValueCounts> = HashMap::new();
     for (i, field) in schema.fields().iter().enumerate() {
         let name = field.name();
         let column = batch.column(i);
@@ -249,6 +269,16 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
             if !arr.is_empty() && !arr.is_null(0) {
                 hlls.insert(base.to_string(), arr.value(0).to_vec());
             }
+        } else if let Some(base) = name.strip_suffix(VALUE_COUNTS_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __value_counts column is not Binary"))
+                })?;
+            if !arr.is_empty() && !arr.is_null(0) {
+                value_counts.insert(base.to_string(), decode_value_counts(arr.value(0))?);
+            }
         } else {
             return Err(DecodeError::ArrowIpc(format!(
                 "unrecognized stats column suffix: {name}"
@@ -270,6 +300,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         let null_count = null_counts.remove(&base);
         let sum = sums.remove(&base);
         let hll = hlls.remove(&base);
+        let value_counts = value_counts.remove(&base);
         stats.insert(
             base,
             ScalarStatsAgg {
@@ -278,6 +309,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
                 null_count,
                 sum,
                 hll,
+                value_counts,
             },
         );
     }
@@ -291,6 +323,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         .keys()
         .chain(sums.keys())
         .chain(hlls.keys())
+        .chain(value_counts.keys())
         .next()
     {
         return Err(DecodeError::ArrowIpc(format!(
@@ -298,6 +331,80 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         )));
     }
     Ok(stats)
+}
+
+pub(crate) fn encode_value_counts(
+    value_counts: &ScalarValueCounts,
+) -> Result<Vec<u8>, EncodeError> {
+    let values = ScalarValue::iter_to_array(
+        value_counts
+            .entries()
+            .iter()
+            .map(|(value, _)| value.clone()),
+    )
+    .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let counts = Arc::new(UInt64Array::from_iter_values(
+        value_counts.entries().iter().map(|(_, count)| *count),
+    )) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE_COUNTS_VALUE_FIELD, values.data_type().clone(), false),
+        Field::new(VALUE_COUNTS_COUNT_FIELD, DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values, counts])
+        .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_value_counts(bytes: &[u8]) -> Result<ScalarValueCounts, DecodeError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    if batch.num_columns() != 2 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "value counts expected 2 columns, got {}",
+            batch.num_columns()
+        )));
+    }
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| DecodeError::ArrowIpc("value counts count column is not UInt64".into()))?;
+    if batch.column(0).len() != counts.len() {
+        return Err(DecodeError::ArrowIpc(
+            "value counts value/count lengths differ".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(counts.len());
+    for row in 0..counts.len() {
+        if batch.column(0).is_null(row) || counts.is_null(row) {
+            return Err(DecodeError::ArrowIpc(
+                "value counts cannot contain nulls".into(),
+            ));
+        }
+        let value = ScalarValue::try_from_array(batch.column(0), row)
+            .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+        entries.push((value, counts.value(row)));
+    }
+    ScalarValueCounts::from_entries(entries)
+        .ok_or_else(|| DecodeError::ArrowIpc("invalid exact value counts".into()))
 }
 
 /// Encode a single length-1 [`ArrayRef`] as Arrow-IPC stream bytes —
@@ -419,13 +526,13 @@ pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
 pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
-    let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
+    let bloom_bytes = view_n(&mut c, bloom_len, "bloom_bytes")?;
     // Empty bloom run ⇒ "no bloom info" (None); a non-empty run must be a
     // valid bloom layout.
     let term_bloom = if bloom_bytes.is_empty() {
         None
     } else {
-        Some(Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
+        Some(Bloom::from_bytes(bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
     };
     let n_terms_distinct = u64::from(read_u32(&mut c, "n_terms_distinct")?);
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
@@ -456,108 +563,111 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 // Layout (all LE):
 //   u32 dim
 //   [dim × f32]   (centroid)
-//   f32 radius
+//   u32 n_cells
+//   per cell:
+//     u32 cell_id (`u32::MAX` = unscoped legacy IVF)
+//     u32 cluster_block_len
+//     cluster-centroid block
 // ---------------------------------------------------------
+
+/// fp32 cluster-centroid block: `n_cent, dim, tag, counts[n_cent],
+/// centroids[n_cent*dim]` — all little-endian.
+pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
+    let nc = cl.n_cent as usize;
+    let cd = cl.dim as usize;
+    let body = nc * cd;
+    let mut out = Vec::with_capacity(12 + nc * 4 + body * 4);
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_FP32.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    for &v in &cl.centroids {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, DecodeError> {
+    let mut c = Cursor::new(bytes);
+    let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
+    let cdim = read_u32(&mut c, "cluster_dim")? as usize;
+
+    if n_cent == 0 {
+        return Ok(ClusterCentroids::empty());
+    }
+
+    let tag = read_u32(&mut c, "cluster_wire_tag")?;
+    if tag != CLUSTER_CENTROIDS_WIRE_FP32 {
+        return Err(DecodeError::InvalidVectorSummary(format!(
+            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x}"
+        )));
+    }
+
+    let counts_b = view_n(&mut c, n_cent * 4, "cluster_counts")?;
+    let counts: Vec<u32> = counts_b
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    // n_cent * cdim can't overflow usize on 64-bit (both are u32), but the
+    // *4 byte size can — check the whole chain so a crafted header errors
+    // rather than wrapping to a short read (silent truncation).
+    let body_bytes = n_cent
+        .checked_mul(cdim)
+        .and_then(|body| body.checked_mul(4))
+        .ok_or_else(|| {
+            DecodeError::InvalidVectorSummary(format!(
+                "cluster centroids byte size overflow: n_cent={n_cent} dim={cdim}"
+            ))
+        })?;
+    let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
+    let centroids = decode_f32_le_vec(centroids_b);
+
+    Ok(ClusterCentroids::from_decoded(
+        n_cent as u32,
+        cdim as u32,
+        centroids,
+        counts,
+    ))
+}
 
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     let dim = s.centroid.len();
-    let cl = &s.clusters;
-    let nc = cl.n_cent as usize;
-    let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(4 + dim * 4 + 4 + 8 + nc * (4 + 4 + 4) + nc * cd);
+    let mut out = Vec::new();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     for &v in &s.centroid {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&s.radius.to_le_bytes());
-    // Per-cluster centroid block: n_cent, dim, then counts / mins /
-    // scales / Sq8 codes. `n_cent == 0` encodes a superfile with no
-    // vector index for the column (empty trailer).
-    out.extend_from_slice(&cl.n_cent.to_le_bytes());
-    out.extend_from_slice(&cl.dim.to_le_bytes());
-    for &c in &cl.counts {
-        out.extend_from_slice(&c.to_le_bytes());
+    out.extend_from_slice(&(s.cells.len() as u32).to_le_bytes());
+    for cell in &s.cells {
+        out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
+        let encoded = encode_cluster_centroids(&cell.clusters);
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
     }
-    for &m in &cl.mins {
-        out.extend_from_slice(&m.to_le_bytes());
-    }
-    for &sc in &cl.scales {
-        out.extend_from_slice(&sc.to_le_bytes());
-    }
-    out.extend_from_slice(&cl.codes);
     out
 }
 
 pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError> {
     let mut c = Cursor::new(bytes);
     let dim = read_u32(&mut c, "dim")? as usize;
-    let mut centroid = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let b = read_n(&mut c, 4, "centroid_float")?;
-        if b.len() != 4 {
-            return Err(DecodeError::InvalidVectorSummary(format!(
-                "truncated centroid at index {i}"
-            )));
-        }
-        let arr = [b[0], b[1], b[2], b[3]];
-        centroid.push(f32::from_le_bytes(arr));
-    }
-    let rb = read_n(&mut c, 4, "radius")?;
-    if rb.len() != 4 {
-        return Err(DecodeError::InvalidVectorSummary("truncated radius".into()));
-    }
-    let radius = f32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
+    let centroid_bytes = view_n(&mut c, dim * 4, "centroid")?;
+    let centroid = decode_f32_le_vec(centroid_bytes);
 
-    // Per-cluster centroid block (new-engine format). `n_cent == 0` is
-    // a superfile with no vector index for the column.
-    let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
-    let cdim = read_u32(&mut c, "cluster_dim")? as usize;
-
-    let counts_b = read_n(&mut c, n_cent * 4, "cluster_counts")?;
-    if counts_b.len() != n_cent * 4 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster counts".into(),
-        ));
+    let n_cells = read_u32(&mut c, "vector_summary_n_cells")? as usize;
+    let mut cells = Vec::with_capacity(n_cells);
+    for _ in 0..n_cells {
+        let raw_cell_id = read_u32(&mut c, "vector_summary_cell_id")?;
+        let block_len = read_u32(&mut c, "vector_summary_cluster_block_len")? as usize;
+        let block = view_n(&mut c, block_len, "vector_summary_cluster_block")?;
+        cells.push(CellVectorSummary {
+            cell_id: (raw_cell_id != u32::MAX).then_some(raw_cell_id),
+            clusters: decode_cluster_centroids(block)?,
+        });
     }
-    let counts: Vec<u32> = counts_b
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-
-    let ms_b = read_n(&mut c, n_cent * 8, "cluster_min_scale")?;
-    if ms_b.len() != n_cent * 8 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster min/scale".into(),
-        ));
-    }
-    let floats: Vec<f32> = ms_b
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    let mins = floats[0..n_cent].to_vec();
-    let scales = floats[n_cent..2 * n_cent].to_vec();
-
-    let codes_b = read_n(&mut c, n_cent * cdim, "cluster_codes")?;
-    if codes_b.len() != n_cent * cdim {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster codes".into(),
-        ));
-    }
-    let codes = codes_b.to_vec();
-
-    Ok(VectorSummary {
-        centroid,
-        radius,
-        clusters: ClusterCentroids {
-            n_cent: n_cent as u32,
-            dim: cdim as u32,
-            codes,
-            mins,
-            scales,
-            counts,
-            code_moments: OnceLock::new(),
-        },
-    })
+    Ok(VectorSummary { centroid, cells })
 }
 
 // ---------------------------------------------------------
@@ -598,8 +708,8 @@ pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("fts key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "fts_value_len")? as usize;
-        let v = read_n(&mut c, vl, "fts_value")?;
-        out.insert(key, decode_fts_summary(&v)?);
+        let v = view_n(&mut c, vl, "fts_value")?;
+        out.insert(key, decode_fts_summary(v)?);
     }
     Ok(out)
 }
@@ -632,8 +742,8 @@ pub fn decode_vector_summary_map(
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "vec_value_len")? as usize;
-        let v = read_n(&mut c, vl, "vec_value")?;
-        out.insert(key, decode_vector_summary(&v)?);
+        let v = view_n(&mut c, vl, "vec_value")?;
+        out.insert(key, decode_vector_summary(v)?);
     }
     Ok(out)
 }
@@ -643,11 +753,24 @@ pub fn decode_vector_summary_map(
 // ---------------------------------------------------------
 
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
-    let b = read_n(c, 4, what)?;
+    let b = view_n(c, 4, what)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    view_n(c, n, what).map(<[u8]>::to_vec)
+}
+
+/// Borrow the next `n` bytes from the cursor without copying. The payload
+/// decoders (centroids, bloom blocks) view the wire bytes in place and do
+/// one SIMD pass straight into their final allocation — the manifest's
+/// centroid regions are pure little-endian fp32, so decode stays a bounds
+/// check plus a cast-speed copy, never a per-element parse.
+fn view_n<'a>(
+    c: &mut Cursor<&'a [u8]>,
+    n: usize,
+    what: &'static str,
+) -> Result<&'a [u8], DecodeError> {
     let pos = c.position() as usize;
     let buf = *c.get_ref();
     if pos + n > buf.len() {
@@ -657,9 +780,8 @@ fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>
             had: buf.len().saturating_sub(pos),
         });
     }
-    let out = buf[pos..pos + n].to_vec();
     c.set_position((pos + n) as u64);
-    Ok(out)
+    Ok(&buf[pos..pos + n])
 }
 
 #[cfg(test)]
@@ -675,9 +797,10 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, ScalarStatsAgg, decode_fts_summary, decode_fts_summary_map,
-        decode_length1_array, decode_scalar_stats, decode_vector_summary,
-        decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
+        DecodeError, ScalarStatsAgg, ScalarValue, ScalarValueCounts, decode_fts_summary,
+        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_value_counts,
+        decode_vector_summary, decode_vector_summary_map, encode_length1_array,
+        encode_scalar_stats, read_n, read_u32,
     };
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
@@ -706,6 +829,86 @@ mod decode_error_tests {
             w.finish().expect("ipc finish");
         }
         out
+    }
+
+    /// `decode_value_counts` rejects corrupt / wrong-shaped manifest bytes with
+    /// a typed `DecodeError` (never a panic): manifest bytes are read from
+    /// object storage and can be truncated or corrupted.
+    #[test]
+    fn decode_value_counts_rejects_malformed_input() {
+        use arrow_array::UInt64Array;
+
+        // Not an Arrow-IPC stream at all → reader init / collect fails.
+        assert!(matches!(
+            decode_value_counts(b"definitely-not-arrow-ipc"),
+            Err(DecodeError::ArrowIpc(_))
+        ));
+
+        // A single-column batch (the wire form is value + count = 2 columns).
+        let one_col = ipc_batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+        );
+        assert!(matches!(
+            decode_value_counts(&one_col),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("2 columns")
+        ));
+
+        // Count column typed Int64 instead of UInt64 → downcast rejected.
+        let wrong_count = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("count", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![7i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&wrong_count),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("UInt64")
+        ));
+
+        // A null value entry → value counts must not carry nulls.
+        let with_null = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new("count", DataType::UInt64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&with_null),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
+        ));
+    }
+
+    /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed
+    /// error rather than panicking.
+    #[test]
+    fn decode_length1_array_rejects_malformed_input() {
+        // Garbage bytes → IPC error.
+        assert!(decode_length1_array(b"not-ipc").is_err());
+
+        // Two columns where a length-1 aggregate wire form has exactly one.
+        let two_col = ipc_batch(
+            vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2i64])) as ArrayRef,
+            ],
+        );
+        assert!(
+            decode_length1_array(&two_col).is_err(),
+            "a multi-column batch is not a valid length-1 aggregate",
+        );
     }
 
     /// An empty blob decodes to an empty table (the zero-length sentinel
@@ -738,6 +941,10 @@ mod decode_error_tests {
                 null_count: Some(7),
                 sum: Some(i64_arr(5050)),
                 hll: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                value_counts: ScalarValueCounts::from_entries(vec![
+                    (ScalarValue::Int64(Some(1)), 2),
+                    (ScalarValue::Int64(Some(100)), 3),
+                ]),
             },
         );
         // Min/max only (the `from_min_max` shape).
@@ -754,6 +961,7 @@ mod decode_error_tests {
                 null_count: Some(2),
                 sum: None,
                 hll: None,
+                value_counts: None,
             },
         );
 
@@ -1081,7 +1289,7 @@ mod decode_error_tests {
 #[cfg(test)]
 mod vector_summary_tests {
     use super::{decode_vector_summary, encode_vector_summary};
-    use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
+    use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
 
     #[test]
     fn round_trips_with_cluster_centroids() {
@@ -1098,45 +1306,36 @@ mod vector_summary_tests {
         let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
         let s = VectorSummary {
             centroid: vec![1.0, 2.0, 3.0, 4.0],
-            radius: 9.0,
-            clusters,
+            cells: vec![CellVectorSummary {
+                cell_id: Some(7),
+                clusters,
+            }],
         };
 
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!((got.radius - s.radius).abs() < 1e-9);
-        assert_eq!(got.clusters.n_cent, n_cent);
-        assert_eq!(got.clusters.dim, dim);
-        assert_eq!(got.clusters.counts, counts);
-        assert_eq!(got.clusters.codes, s.clusters.codes);
-        assert_eq!(got.clusters.mins, s.clusters.mins);
-        assert_eq!(got.clusters.scales, s.clusters.scales);
+        assert_eq!(got.cells[0].cell_id, Some(7));
+        assert_eq!(got.cells[0].clusters.n_cent, n_cent);
+        assert_eq!(got.cells[0].clusters.dim, dim);
+        assert_eq!(got.cells[0].clusters.counts, counts);
+        assert_eq!(
+            got.cells[0].clusters.centroids,
+            s.cells[0].clusters.centroids
+        );
 
-        // Dequantized centroids are within one Sq8 step of the source.
-        for c in 0..n_cent as usize {
-            let mut out = vec![0f32; dim as usize];
-            got.clusters.dequantize_into(c, &mut out);
-            let src = &centroids[c * dim as usize..(c + 1) * dim as usize];
-            let step = got.clusters.scales[c];
-            for (o, e) in out.iter().zip(src) {
-                assert!(
-                    (o - e).abs() <= step + 1e-6,
-                    "cluster {c}: dequant {o} vs {e} (step {step})"
-                );
-            }
-        }
+        // fp32 storage is lossless: decode returns the input centroids verbatim.
+        let roundtrip = got.cells[0].clusters.to_fp32();
+        assert_eq!(roundtrip, centroids);
     }
 
     #[test]
     fn round_trips_with_empty_clusters() {
         let s = VectorSummary {
             centroid: vec![0.5, -0.5],
-            radius: 1.0,
-            clusters: ClusterCentroids::empty(),
+            cells: Vec::new(),
         };
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!(got.clusters.is_empty());
-        assert_eq!(got.clusters.n_cent, 0);
+        assert!(got.cells.is_empty());
     }
 }

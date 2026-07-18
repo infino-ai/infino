@@ -133,7 +133,7 @@ fn two_successive_commits_both_publish() {
         "three manifest files (manifest_id 0 + 1 + 2)"
     );
 
-    // Manifest part count = 2 (each commit writes a fresh part
+    // ManifestSnapshot part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
     // means a fresh part per commit, no reuse).
     let manifest_parts_dir = dir.path().join("manifest-parts");

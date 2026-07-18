@@ -210,7 +210,8 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            provided_centroids: None,
         }],
         Some(infino::test_helpers::default_tokenizer()),
     )
@@ -254,7 +255,7 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
-        memory: MemorySettings::default(),
+        ..Config::default()
     }
 }
 
@@ -274,6 +275,7 @@ fn budget_only_config(connection_budget_bytes: u64) -> Config {
         memory: MemorySettings {
             connection_budget_bytes,
         },
+        ..Config::default()
     }
 }
 
@@ -502,6 +504,109 @@ async fn supertable_smoke_via_s3_wire_protocol() {
     );
 
     eprintln!("[s3-smoke] smoke done");
+}
+
+/// Multi-commit vector ingest through the S3 wire protocol — a local repro of
+/// the EC2 `supertable_vector` ingest hang. Commits run on a `spawn_blocking`
+/// thread (no ambient runtime → `block_on_writer_future` takes the `Err` branch
+/// onto `query_runtime`, exactly as the EC2 ingest harness drives it), across
+/// enough commits to trigger the background OPANN drain (the multi-commit
+/// path that hangs on EC2). A `timeout` converts a deadlock into a fast test
+/// failure instead of wedging the runner.
+///
+/// Endpoint: in-process s3s-fs by default — but s3s-fs does NOT enforce
+/// conditional If-Match PUT, so the drain↔commit OCC race is masked and a hang
+/// may not reproduce here. Set `INFINO_TEST_S3_ENDPOINT` to a real
+/// conditional-PUT server (e.g. MinIO at `http://127.0.0.1:9000`, with a
+/// pre-created `infino-s3-smoke` bucket) for a faithful repro.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn supertable_s3s_multi_commit_vector_no_hang() {
+    // Requires a real conditional-PUT (If-Match) endpoint — MinIO or real S3.
+    // s3s-fs is intentionally unsupported here: it doesn't enforce conditional
+    // PUT, so multi-commit OCC behaves differently (it wedges commit 0 for an
+    // unrelated reason). Run e.g. `minio server <dir>` (bucket `infino-s3-smoke`,
+    // root creds = TEST_ACCESS_KEY/TEST_SECRET_KEY), then:
+    //   INFINO_TEST_S3=1 INFINO_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+    if std::env::var("INFINO_TEST_S3").is_err() {
+        eprintln!("supertable_s3s_multi_commit_vector_no_hang: skipped (set INFINO_TEST_S3=1)");
+        return;
+    }
+    let endpoint = match std::env::var("INFINO_TEST_S3_ENDPOINT") {
+        Ok(ep) => ep,
+        Err(_) => {
+            eprintln!(
+                "supertable_s3s_multi_commit_vector_no_hang: skipped (needs \
+                 INFINO_TEST_S3_ENDPOINT = a conditional-PUT server such as MinIO; \
+                 in-process s3s-fs lacks If-Match and can't run multi-commit OCC)"
+            );
+            return;
+        }
+    };
+    eprintln!("[s3s-multicommit] endpoint={endpoint}");
+    const N_COMMITS: usize = 24;
+    const TIMEOUT_SECS: u64 = 180;
+
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache_root = cache_dir.path().to_path_buf();
+
+    // Drive commits on a PLAIN std::thread — it has no ambient tokio runtime, so
+    // commit() takes block_on_writer_future's `Err` branch onto `query_runtime`,
+    // exactly as the EC2 `build_on_storage` ingest harness does. (spawn_blocking
+    // would expose an ambient handle → the block_in_place branch instead, which
+    // could itself perturb spawn_blocking wakeups and confound the diagnosis.)
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
+    std::thread::spawn(move || {
+        let r = (|| -> Result<usize, String> {
+            let storage: Arc<dyn StorageProvider> = Arc::new(
+                S3StorageProvider::new_with_endpoint(
+                    &endpoint,
+                    TEST_BUCKET,
+                    TEST_ACCESS_KEY,
+                    TEST_SECRET_KEY,
+                    TEST_REGION,
+                )
+                .map_err(|e| format!("s3 provider: {e}"))?,
+            );
+            let cache = default_disk_cache(Arc::clone(&storage), &cache_root);
+            let dim = EMB_DIM;
+            let st = Supertable::create(
+                real_s3_options(dim)
+                    .with_storage(Arc::clone(&storage))
+                    .with_disk_cache(Arc::clone(&cache)),
+            )
+            .map_err(|e| format!("create: {e}"))?;
+            for i in 0..N_COMMITS {
+                let mut w = st.writer().map_err(|e| format!("writer {i}: {e}"))?;
+                w.append(&real_s3_batch(dim))
+                    .map_err(|e| format!("append {i}: {e}"))?;
+                w.commit().map_err(|e| format!("commit {i}: {e}"))?;
+                eprintln!(
+                    "[s3s-multicommit] commit {i} OK (manifest_id={})",
+                    st.manifest_id()
+                );
+            }
+            let mut q = vec![0.0f32; dim];
+            q[0] = 1.0;
+            let hits = st
+                .reader()
+                .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
+                .map_err(|e| format!("vector query: {e}"))?;
+            Ok(hits.len())
+        })();
+        let _ = tx.send(r);
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), rx).await {
+        Ok(Ok(Ok(n))) => {
+            eprintln!("[s3s-multicommit] COMPLETED — no hang ({n} hits after {N_COMMITS} commits)")
+        }
+        Ok(Ok(Err(e))) => panic!("multi-commit vector ingest failed: {e}"),
+        Ok(Err(_recv)) => panic!("commit thread died before sending a result"),
+        Err(_) => panic!(
+            "DEADLOCK: multi-commit vector ingest hung >{TIMEOUT_SECS}s \
+             — reproduced the EC2 hang locally (std::thread / Err-branch path)"
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -3,7 +3,7 @@
 
 //! Combined FTS + vector supertable ingest to object storage.
 
-use std::sync::Arc;
+use std::{env, mem::size_of, path::PathBuf, sync::Arc};
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
@@ -14,7 +14,7 @@ use infino::{
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+        vector::distance::Metric,
     },
     supertable::{Supertable, SupertableOptions, storage::StorageProvider},
     test_helpers::default_tokenizer,
@@ -24,6 +24,8 @@ use crate::{
     corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus},
     harness::{emb_for, scatter_key, sql_options, sql_schema},
     markdown::fmt_count,
+    rss::fmt_bytes,
+    storage_meter::{self, ObjectStoreMeter},
     tiers,
 };
 
@@ -54,10 +56,14 @@ pub fn n_commits() -> usize {
         .max(MIN_COMMIT_CHUNKS)
 }
 
+/// Rows in one normal ingest commit at the configured scale.
+pub fn docs_per_commit() -> usize {
+    n_docs().div_ceil(n_commits())
+}
+
 /// Writer-pool thread count for ingest — the machine's logical core
-/// count by default, overridable with `INFINO_BENCH_WRITERS` (same
-/// knob the superfile build honors). Each commit's per-shard build
-/// fans out across this pool.
+/// count (same policy the superfile build uses). Each commit's
+/// per-shard build fans out across this pool.
 pub fn n_writers() -> usize {
     corpus::parallel_writers()
 }
@@ -66,8 +72,10 @@ pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
-const CORPUS_VEC_SEED: u64 = 1;
+pub(crate) const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
+/// Existing base-only vector corpus used instead of synthetic generation.
+const VECTOR_CORPUS_PATH_ENV: &str = "INFINO_BENCH_VECTOR_CORPUS_PATH";
 
 /// Random-rotation RNG seed for the bench vector index.
 const ROT_SEED: u64 = 7;
@@ -76,11 +84,10 @@ const GIB_BYTES: u64 = 1u64 << 30;
 
 /// Distance metric for the bench vector index.
 const BENCH_METRIC: Metric = Metric::Cosine;
-/// Rerank residual codec for the bench vector index.
-const BENCH_RERANK: RerankCodec = RerankCodec::Sq8ResidualEpsilon;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
-/// Producer memory budget in GiB, capping resident RSS during ingest.
+/// Producer memory budget in GiB — steers the attached disk cache's
+/// post-commit madvise sweep only; it does not cap ingest/build RSS.
 const WRITER_MEMORY_BUDGET_GIB: u64 = 8;
 /// Producer memory budget in bytes, derived from [`WRITER_MEMORY_BUDGET_GIB`].
 const WRITER_MEMORY_BUDGET_BYTES: u64 = WRITER_MEMORY_BUDGET_GIB * GIB_BYTES;
@@ -91,6 +98,12 @@ pub struct IngestResult {
     pub storage_label: &'static str,
     pub n_superfiles: usize,
     pub total_index_bytes: u64,
+    /// Measured object-store requests + bytes during the ingest window
+    /// (superfile uploads incl. multipart parts, manifest writes, pointer
+    /// CAS). `None` when the table was opened pre-built (dataset /
+    /// existing-prefix modes) — the cost model then says "not metered"
+    /// instead of guessing.
+    pub ingest_io: Option<ObjectStoreMeter>,
     /// Remote prefix this build wrote under, to delete when the run ends.
     pub cleanup: Option<tiers::PrefixCleanup>,
     pub sql_sample_title: Option<String>,
@@ -210,12 +223,13 @@ pub fn options_for(
     };
     let vector = if modality.has_vector() {
         vec![VectorConfig {
+            provided_centroids: None,
             column: VEC_COLUMN.into(),
             dim: DIM,
             n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
-            rerank_codec: BENCH_RERANK,
+            rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC),
         }]
     } else {
         vec![]
@@ -245,7 +259,7 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
         text_seed: CORPUS_TEXT_SEED,
         rot_seed: ROT_SEED,
         metric: format!("{BENCH_METRIC:?}"),
-        rerank_codec: format!("{BENCH_RERANK:?}"),
+        rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC).name().to_string(),
         modality: format!("{modality:?}"),
     }
 }
@@ -278,7 +292,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|v| std::mem::size_of_val(v.as_slice()) as u64)
+            .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
             .unwrap_or(0);
         text + vec
     }
@@ -288,6 +302,12 @@ impl PreparedCorpus {
 /// Call this BEFORE starting the build RSS sampler.
 pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let n_docs = n_docs();
+    let explicit_vector_path = env::var_os(VECTOR_CORPUS_PATH_ENV).map(PathBuf::from);
+    let vector_docs = if modality == Modality::Vector {
+        n_docs + docs_per_commit()
+    } else {
+        n_docs
+    };
     let text = modality.has_text().then(|| {
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
@@ -296,22 +316,60 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
         MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED)
     });
     let vectors = modality.has_vector().then(|| {
-        eprintln!(
-            "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-            fmt_count(n_docs)
-        );
-        MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+        if let Some(path) = explicit_vector_path.as_deref() {
+            eprintln!(
+                "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
+                fmt_count(n_docs),
+                path.display()
+            );
+            MmapVectorCorpus::open(path, n_docs).unwrap_or_else(|error| {
+                panic!(
+                    "failed to open {VECTOR_CORPUS_PATH_ENV}={}: {error}",
+                    path.display()
+                )
+            })
+        } else {
+            eprintln!(
+                "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
+                fmt_count(vector_docs)
+            );
+            MmapVectorCorpus::generate(vector_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+        }
     });
     PreparedCorpus { text, vectors }
 }
 
+/// The next normal vector commit after the measured base ingest.
+pub fn vector_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    let start = n_docs();
+    let len = docs_per_commit();
+    let end = start + len;
+    let vectors = corpus
+        .vectors()
+        .expect("vector delta requires a prepared vector corpus");
+    let schema = schema_for(Modality::Vector);
+    if vectors.n_docs() >= end {
+        return chunk_batch(Modality::Vector, corpus, &schema, start, end, len);
+    }
+    assert_eq!(
+        vectors.n_docs(),
+        start,
+        "base-only persisted vector corpus must contain exactly n_docs rows"
+    );
+    let tail =
+        MmapVectorCorpus::generate_range(start, len, corpus::n_cent(start), CORPUS_VEC_SEED, true);
+    RecordBatch::try_new(schema, vec![vector_array(tail.as_slice())])
+        .expect("vector delta RecordBatch")
+}
+
 /// Stream the prepared on-disk corpus → append → commit → object
 /// storage, building only the index shapes named by `modality`. One
-/// loop for every modality — the corpus chunks are borrowed straight
-/// off the mmap, and SQL's extra columns are derived inline from
-/// `doc_id`. The text/vector corpus is identical across modalities
-/// (same seeds), so each shape is directly comparable to its
-/// single-modality competitor.
+/// loop for every modality — each chunk is copied into Arrow heap
+/// buffers in [`chunk_batch`], then corpus mmap pages are dropped
+/// before commit so ingest RSS reflects the engine, not harness
+/// dead weight. SQL's extra columns are derived inline from `doc_id`.
+/// The text/vector corpus is identical across modalities (same seeds),
+/// so each shape is directly comparable to its single-modality competitor.
 pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();
@@ -328,12 +386,17 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         }
     });
     let cleanup = storage_backend.cleanup.clone();
+    // Meter the whole ingest window so the cost model prices measured PUT
+    // counts (multipart parts included), never the old superfiles+commits
+    // estimate. The wrapper forwards everything; the producer is dropped
+    // right after ingest so later phases meter their own windows.
+    let ingest_meter = storage_meter::wrap(Arc::clone(&storage_backend.storage));
     // Disk cache attached only to keep superfile bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
-    let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
+    let (cache_dir, cache) = tiers::fresh_disk_cache(ingest_meter.provider());
 
-    let opts = options_for(modality, Some(storage_backend.storage.clone()))
+    let opts = options_for(modality, Some(ingest_meter.provider()))
         .with_disk_cache(cache.clone())
         .with_memory_budget(WRITER_MEMORY_BUDGET_BYTES)
         .with_cache_prepopulation(false);
@@ -359,17 +422,23 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             );
         }
         let batch = chunk_batch(modality, corpus, &schema, start, end, len);
-        w.append(&batch).expect("append");
-        w.commit().expect("commit");
-        // The chunk is committed; drop its corpus pages from RSS so the
-        // build sampler measures the engine, not the streamed harness
-        // pages (clean file-backed pages — they'd re-fault if touched).
+        // `chunk_batch` materializes the chunk into Arrow heap buffers
+        // (vector `to_vec()`, text into UTF-8 values). Drop the now-dead
+        // corpus mmap pages before commit so the build plateau is not
+        // carrying an extra ~2.5 GiB of file-backed dead weight.
         if let Some(text) = &corpus.text {
             text.advise_consumed(start, len);
         }
         if let Some(vectors) = &corpus.vectors {
             vectors.advise_consumed(start, len);
         }
+        let commit_t0 = std::time::Instant::now();
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        eprintln!(
+            "[supertable_ingest] commit {commit_idx}/{commits} took {} ms ({len} docs)",
+            commit_t0.elapsed().as_millis(),
+        );
         // Anonymous-vs-file split per commit: a monotonic anonymous
         // climb = producer-side retention (heap); a file-backed climb
         // = freshly written cache mmaps staying resident.
@@ -389,13 +458,27 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         .map(|off| off.total_size)
         .sum();
     drop(reader);
+    if let Some((total, max_per_cell)) = st.hidden_vector_superfile_stats() {
+        eprintln!(
+            "[supertable_ingest] hidden vector index at ingest end: {total} superfiles, max {max_per_cell} per cell"
+        );
+    }
     drop(st);
     drop(cache);
     drop(cache_dir);
+    let ingest_io = ingest_meter.snapshot();
     eprintln!(
         "[supertable_ingest] ingest complete: {n_superfiles} superfiles, {:.2} GiB index bytes on {}",
         total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
+    );
+    eprintln!(
+        "[supertable_ingest] object-store I/O during ingest: {} PUT ({} up), {} GET ({} down), {} HEAD",
+        ingest_io.put_count,
+        fmt_bytes(ingest_io.put_bytes),
+        ingest_io.get_count,
+        fmt_bytes(ingest_io.get_bytes),
+        ingest_io.head_count,
     );
     // SQL query predicates sample the mid-corpus row (one mmap page
     // touch — not a corpus materialization).
@@ -424,6 +507,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         storage_label: storage_backend.storage_label,
         n_superfiles,
         total_index_bytes,
+        ingest_io: Some(ingest_io),
         cleanup,
         sql_sample_title,
         sql_sample_key,
@@ -479,6 +563,7 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         storage_label: storage_backend.storage_label,
         n_superfiles: meta.n_superfiles,
         total_index_bytes: meta.total_index_bytes,
+        ingest_io: None,
         cleanup: None,
         sql_sample_title: meta.sql_sample_title,
         sql_sample_key: meta.sql_sample_key,
@@ -496,14 +581,9 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
     let st =
         Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
     let reader = st.reader();
-    let n_superfiles = reader.n_superfiles();
-    let total_index_bytes: u64 = reader
-        .manifest()
-        .superfiles
-        .iter()
-        .filter_map(|e| e.subsection_offsets.as_ref())
-        .map(|off| off.total_size)
-        .sum();
+    let (n_superfiles, total_index_bytes) = reader
+        .load_superfile_storage_stats()
+        .expect("load existing supertable manifest entries");
     drop(reader);
     drop(st);
     drop(cache_dir);
@@ -518,6 +598,7 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
         storage_label: fixture.storage_label,
         n_superfiles,
         total_index_bytes,
+        ingest_io: None,
         cleanup: None,
         sql_sample_title: None,
         sql_sample_key: None,
@@ -609,17 +690,21 @@ fn chunk_batch(
             .expect("vector modality has a vector corpus")
             .as_slice();
         let flat = &all[start * DIM..end * DIM];
-        columns.push(Arc::new(
-            FixedSizeListArray::try_new(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-                Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
-                None,
-            )
-            .expect("FSL"),
-        ));
+        columns.push(vector_array(flat));
     }
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
+}
+
+fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
+    Arc::new(
+        FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+            Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
+            None,
+        )
+        .expect("FSL"),
+    )
 }
 
 /// Combined FTS + vector build (search consumer + combined ingest row).

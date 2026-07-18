@@ -80,6 +80,7 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
+            vector::user_placement_for_scalar_resolve,
         },
     },
 };
@@ -139,7 +140,7 @@ impl SupertableReader {
         // inherits its own manifest skip and returns hits best-first.
         let (bm25_res, vector_res) = future::join(
             self.bm25_search_async(text_col, q_text, k, mode),
-            self.vector_search_async(vec_col, q_vec, k, options),
+            self.vector_search_user_table_async(vec_col, q_vec, k, options),
         )
         .await;
         Ok(rrf_fuse(&bm25_res?, &vector_res?, k))
@@ -196,12 +197,16 @@ impl Supertable {
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "hybrid_search",
-            ))
+            .block_on_query(async {
+                // Boundary-replica stubs carry an IVF local that does not
+                // address a Parquet row; remap to the owning placement by
+                // stable id before the scalar decode, exactly as the
+                // hybrid TVF and `vector_search` paths do.
+                let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
+                resolve_hits_named(&reader, &hits, projection, "hybrid_search")
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))
+            })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])
     }
@@ -468,6 +473,13 @@ impl ExecutionPlan for HybridSearchExec {
                 .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
                 .await
                 .map_err(search_query_df_error)?;
+            // Cell-packed user hits can be boundary stubs whose IVF local
+            // does not address a Parquet row; remap those to their owning
+            // placement by stable id before the scalar decode — the same
+            // step the vector TVF takes.
+            let fused = user_placement_for_scalar_resolve(&reader, &fused)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &fused,
@@ -490,28 +502,40 @@ impl ExecutionPlan for HybridSearchExec {
 /// fusion.
 ///
 /// Each list is assumed best-first. A hit at 0-based position `r`
-/// contributes `1 / (RRF_K + r + 1)` to its `(superfile, local_doc_id)`
-/// identity; contributions from the two lists are summed. The result
+/// contributes `1 / (RRF_K + r + 1)` to its stable `_id` identity when
+/// stamped, otherwise to its `(superfile, local_doc_id)` identity;
+/// contributions from the two lists are summed. Stable identity matters for
+/// cell-packed files because BM25 local ids follow Parquet order while vector
+/// local ids follow packed-cell order. The result
 /// is sorted by fused score descending — `(superfile, local_doc_id)` as
 /// a total tie-break so the order is deterministic regardless of the
 /// `HashMap`'s iteration order — and truncated to `k`. The returned
 /// hits carry the fused RRF score (higher is better).
 fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<SuperfileHit> {
-    let mut acc: HashMap<(SuperfileUri, u32), f32> =
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    enum HitIdentity {
+        Stable(i128),
+        Local(SuperfileUri, u32),
+    }
+
+    let mut acc: HashMap<HitIdentity, (SuperfileHit, f32)> =
         HashMap::with_capacity(bm25.len() + vector.len());
     for list in [bm25, vector] {
         for (rank, hit) in list.iter().enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            *acc.entry((hit.superfile, hit.local_doc_id)).or_insert(0.0) += contribution;
+            let identity = hit.stable_id.map_or(
+                HitIdentity::Local(hit.superfile, hit.local_doc_id),
+                HitIdentity::Stable,
+            );
+            acc.entry(identity).or_insert((*hit, 0.0)).1 += contribution;
         }
     }
 
     let mut fused: Vec<SuperfileHit> = acc
         .into_iter()
-        .map(|((superfile, local_doc_id), score)| SuperfileHit {
-            superfile,
-            local_doc_id,
-            score,
+        .map(|(_, (mut hit, score))| {
+            hit.score = score;
+            hit
         })
         .collect();
     fused.sort_by(|a, b| {
@@ -578,6 +602,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )
@@ -691,6 +716,7 @@ mod tests {
             superfile: seg,
             local_doc_id: doc,
             score,
+            stable_id: None,
         };
         // BM25 best-first: doc1, doc2, doc3. Vector best-first: doc2, doc4.
         let bm25 = vec![h(1, 9.0), h(2, 8.0), h(3, 7.0)];
@@ -715,6 +741,7 @@ mod tests {
             superfile: seg,
             local_doc_id: doc,
             score: 0.0,
+            stable_id: None,
         };
         let bm25 = vec![h(1), h(2), h(3)];
         let vector = vec![h(4), h(5)];
@@ -732,14 +759,39 @@ mod tests {
             superfile: seg_a,
             local_doc_id: 0,
             score: 1.0,
+            stable_id: None,
         }];
         let vector = vec![SuperfileHit {
             superfile: seg_b,
             local_doc_id: 0,
             score: 0.1,
+            stable_id: None,
         }];
         let fused = rrf_fuse(&bm25, &vector, 10);
         assert_eq!(fused.len(), 2, "distinct superfiles → distinct hits");
+    }
+
+    #[test]
+    fn rrf_fuse_joins_different_layout_locals_by_stable_id() {
+        let stable_id = 42i128;
+        let bm25 = vec![SuperfileHit {
+            superfile: SuperfileUri::new_v4(),
+            local_doc_id: 3,
+            score: 1.0,
+            stable_id: Some(stable_id),
+        }];
+        let vector = vec![SuperfileHit {
+            superfile: SuperfileUri::new_v4(),
+            local_doc_id: 17,
+            score: 0.1,
+            stable_id: Some(stable_id),
+        }];
+
+        let fused = rrf_fuse(&bm25, &vector, 10);
+        assert_eq!(fused.len(), 1, "one logical row must fuse once");
+        assert_eq!(fused[0].stable_id, Some(stable_id));
+        let expected = 2.0 / (RRF_K + 1.0);
+        assert!((fused[0].score - expected).abs() < 1e-6);
     }
 
     // ---- end-to-end through query_sql ----
@@ -1002,7 +1054,7 @@ mod tests {
     /// path and exercise its `TableProvider` metadata methods (`Debug`,
     /// `as_any`, `table_type`) plus the lowered `HybridSearchExec`'s
     /// `name` / `Debug` — none of which normal query execution touches.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hybrid_table_and_exec_trait_methods() {
         use datafusion::{execution::context::SessionContext, prelude::lit};
 
@@ -1100,6 +1152,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )
@@ -1107,8 +1160,21 @@ mod tests {
         .with_writer_pool(pool)
     }
 
-    /// Doc `i` (0-based within the batch) gets `cats[i]`, `titles[i]`,
-    /// and a one-hot embedding at *global* dim `base_dim + i`.
+    /// Shared base component of every dim in [`build_batch_cat`] embeddings.
+    /// Kept well inside the fixed Sq8 grid's `[-1, 1]` span so nothing
+    /// clamps during encode.
+    const CAT_EMB_BASE: f32 = 0.2;
+    /// Per-doc perturbation on the doc's active dim. Large enough that
+    /// adjacent docs' cosine scores separate well above Sq8 rerank noise,
+    /// small enough that every doc stays in one grid cell.
+    const CAT_EMB_EPSILON: f32 = 0.05;
+
+    /// Doc `i` (0-based within the batch) gets `cats[i]`, `titles[i]`, and an
+    /// embedding `base·1 + ε·e_{base_dim+i}`. Every doc shares the same
+    /// dominant direction, so the global cell grid assigns the whole corpus
+    /// to one cell — the routed default (one grid-nearest cell) then covers
+    /// every doc and `vector_search` stays exact for the oracle below — while
+    /// the ε one-hot component keeps the graded-query ranking strict in `i`.
     fn build_batch_cat(
         cats: &[&str],
         titles: &[&str],
@@ -1123,7 +1189,11 @@ mod tests {
         for i in 0..n {
             let active = base_dim + i;
             for d in 0..dim {
-                flat.push(if d == active { 1.0 } else { 0.0 });
+                flat.push(if d == active {
+                    CAT_EMB_BASE + CAT_EMB_EPSILON
+                } else {
+                    CAT_EMB_BASE
+                });
             }
         }
         let fsl = FixedSizeListArray::try_new(

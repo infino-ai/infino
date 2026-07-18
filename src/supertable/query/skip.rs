@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Manifest-level skip pruning helpers.
+//! ManifestSnapshot-level skip pruning helpers.
 //!
 //! Each helper takes a pinned [`ManifestSnapshot`] snapshot plus a query
 //! shape and returns a `Vec<bool>` mask — one slot per superfile, in
@@ -401,13 +401,13 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             SupertableOptions,
             manifest::{
-                ClusterCentroids, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
-                SuperfileUri, VectorSummary, bloom::BloomBuilder,
+                FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                VectorSummary, bloom::BloomBuilder,
             },
         },
         test_helpers::default_tokenizer,
@@ -455,6 +455,7 @@ mod tests {
                     rot_seed: 0,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Fp32,
+                    provided_centroids: None,
                 }],
                 None,
             )
@@ -465,6 +466,7 @@ mod tests {
     fn empty_superfile() -> SuperfileEntry {
         let uri = SuperfileUri::new_v4();
         SuperfileEntry {
+            birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri,
             n_docs: 0,
@@ -475,6 +477,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         }
     }
@@ -500,18 +503,13 @@ mod tests {
         Arc::new(e)
     }
 
-    fn superfile_with_centroid(
-        column: &str,
-        centroid: Vec<f32>,
-        radius: f32,
-    ) -> Arc<SuperfileEntry> {
+    fn superfile_with_centroid(column: &str, centroid: Vec<f32>) -> Arc<SuperfileEntry> {
         let mut e = empty_superfile();
         e.vector_summary.insert(
             column.to_string(),
             VectorSummary {
                 centroid,
-                radius,
-                clusters: ClusterCentroids::empty(),
+                cells: Vec::new(),
             },
         );
         Arc::new(e)
@@ -618,8 +616,8 @@ mod tests {
 
     #[test]
     fn vector_centroid_skip_v1_keeps_all_superfiles() {
-        let s_a = superfile_with_centroid("emb", vec![0.0; 16], 0.5);
-        let s_b = superfile_with_centroid("emb", vec![10.0; 16], 0.5);
+        let s_a = superfile_with_centroid("emb", vec![0.0; 16]);
+        let s_b = superfile_with_centroid("emb", vec![10.0; 16]);
         let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![s_a, s_b]);
         let q = vec![0.0f32; 16];
         let mask = vector_centroid_skip(&m, "emb", &q);
@@ -630,24 +628,16 @@ mod tests {
     fn superfiles_sorted_by_centroid_distance_orders_by_metric() {
         // L2-sq metric on simple 1-hot centroids.
         let opts = opts_with_vector();
-        let near = superfile_with_centroid(
-            "emb",
-            {
-                let mut v = vec![0.0f32; 16];
-                v[0] = 1.0;
-                v
-            },
-            0.0,
-        );
-        let far = superfile_with_centroid(
-            "emb",
-            {
-                let mut v = vec![0.0f32; 16];
-                v[7] = 1.0;
-                v
-            },
-            0.0,
-        );
+        let near = superfile_with_centroid("emb", {
+            let mut v = vec![0.0f32; 16];
+            v[0] = 1.0;
+            v
+        });
+        let far = superfile_with_centroid("emb", {
+            let mut v = vec![0.0f32; 16];
+            v[7] = 1.0;
+            v
+        });
         let m = ManifestSnapshot::new_from_superfiles(opts, vec![far.clone(), near.clone()]);
         let q = {
             let mut v = vec![0.0f32; 16];
@@ -661,7 +651,7 @@ mod tests {
 
     #[test]
     fn superfiles_sorted_by_centroid_distance_pushes_missing_summary_to_end() {
-        let with_v = superfile_with_centroid("emb", vec![1.0f32; 16], 0.0);
+        let with_v = superfile_with_centroid("emb", vec![1.0f32; 16]);
         let without_v = Arc::new(empty_superfile());
         let m = ManifestSnapshot::new_from_superfiles(opts_with_vector(), vec![without_v, with_v]);
         let q = vec![1.0f32; 16];
@@ -756,6 +746,7 @@ mod tests {
             null_count,
             sum: None,
             hll: None,
+            value_counts: None,
         };
 
         // No nulls: IS NULL drops, IS NOT NULL keeps.

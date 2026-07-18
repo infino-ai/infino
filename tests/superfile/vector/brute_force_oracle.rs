@@ -26,6 +26,8 @@
 //! corpus size where O(N) brute force is cheap (n=200, dim=32).
 //! Larger-scale recall tests live in `tests/recall.rs`.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use infino::superfile::vector::{
     builder::{VectorBuilder, VectorConfig},
@@ -128,6 +130,17 @@ fn build_reader(
     metric: Metric,
     rot_seed: u64,
 ) -> VectorReader {
+    build_reader_with_codec(corpus, dim, n_cent, metric, rot_seed, RerankCodec::Fp32)
+}
+
+fn build_reader_with_codec(
+    corpus: &[Vec<f32>],
+    dim: usize,
+    n_cent: usize,
+    metric: Metric,
+    rot_seed: u64,
+    rerank_codec: RerankCodec,
+) -> VectorReader {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         column: "v".into(),
@@ -135,7 +148,8 @@ fn build_reader(
         n_cent,
         rot_seed,
         metric,
-        rerank_codec: RerankCodec::Fp32,
+        rerank_codec,
+        provided_centroids: None,
     })
     .expect("register column");
     for v in corpus {
@@ -205,6 +219,30 @@ async fn oracle_cosine_full_nprobe_recovers_exact_topk() {
             exact_set, approx_set,
             "Cosine full-nprobe top-5 set diverges; query={q_idx}"
         );
+    }
+}
+
+#[tokio::test]
+async fn oracle_fixed_residual_cosine_full_nprobe_recovers_exact_topk() {
+    let corpus = generate_corpus(ORACLE_N_DOCS, ORACLE_DIM, COSINE_CORPUS_SEED, true);
+    let reader = build_reader_with_codec(
+        &corpus,
+        ORACLE_DIM,
+        ORACLE_N_CENT,
+        Metric::Cosine,
+        COSINE_ROT_SEED,
+        RerankCodec::Sq8FixedResidual,
+    );
+    for query_index in [0usize, 50, 100, 150, 199] {
+        let query = &corpus[query_index];
+        let exact = brute_force_top_k(&corpus, query, Metric::Cosine, ORACLE_TOP_K);
+        let approximate = reader
+            .search("v", query, ORACLE_TOP_K, ORACLE_N_CENT, ORACLE_RERANK_MULT)
+            .await
+            .expect("fixed residual search");
+        let exact_set: HashSet<u32> = exact.iter().map(|(doc, _)| *doc).collect();
+        let approximate_set: HashSet<u32> = approximate.iter().map(|(doc, _)| *doc).collect();
+        assert_eq!(approximate_set, exact_set, "query={query_index}");
     }
 }
 

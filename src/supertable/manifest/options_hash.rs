@@ -24,7 +24,7 @@
 //! "schema"       | n_fields u64 | for each field: name_len u64 | name | dt_str_len u64 | dt_str | nullable u8
 //! "id_column"    | len u64 | bytes
 //! "fts_columns"  | count u64 | for each: name_len u64 | name
-//! "vector_columns" | count u64 | for each: name_len u64 | name | dim u64 | n_cent u64 | rot_seed u64 | metric_len u64 | metric_str
+//! "vector_columns" | count u64 | for each: name_len u64 | name | dim u64 | n_cent u64 | rot_seed u64 | metric_len u64 | metric_str | codec
 //! "partition_strategy" | variant_tag | per-variant fields
 //! ```
 //!
@@ -50,7 +50,7 @@
 use std::{error::Error, fmt};
 
 use crate::supertable::{
-    manifest::{list::PartitionStrategy, part::ContentHash},
+    manifest::{encoding::encode_cluster_centroids, list::PartitionStrategy, part::ContentHash},
     options::SupertableOptions,
 };
 
@@ -97,6 +97,8 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
         // Debug form — so the hash stays in lockstep.
         let metric_str = format!("{:?}", v.metric).to_lowercase();
         push_str(&mut buf, &metric_str);
+        push_tag(&mut buf, b"rerank_codec");
+        push_str(&mut buf, v.rerank_codec.name());
     }
 
     // 5. partition_strategy.
@@ -123,6 +125,20 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
                 buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
                 buf.extend_from_slice(b);
             }
+        }
+        PartitionStrategy::VectorCell {
+            column,
+            clusters,
+            routing,
+        } => {
+            push_tag(&mut buf, b"vector_cell");
+            push_str(&mut buf, column);
+            let enc = encode_cluster_centroids(clusters);
+            buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&enc);
+            buf.extend_from_slice(&(routing.nprobe_min as u64).to_le_bytes());
+            buf.extend_from_slice(&(routing.nprobe_max as u64).to_le_bytes());
+            buf.extend_from_slice(&routing.slack.to_le_bytes());
         }
         PartitionStrategy::IngestionTime { granularity_secs } => {
             push_tag(&mut buf, b"ingestion_time");
@@ -207,7 +223,7 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            manifest::{list::PartitionStrategy, part::ContentHash},
+            manifest::{ClusterCentroids, list::PartitionStrategy, part::ContentHash},
             options::SupertableOptions,
         },
         test_helpers::default_tokenizer,
@@ -400,6 +416,7 @@ mod tests {
                 rot_seed: 0,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::default(),
+                provided_centroids: None,
             }],
             Some(default_tokenizer()),
         )
@@ -425,7 +442,8 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 0,
                     metric,
-                    rerank_codec: RerankCodec::default(),
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
                 }],
                 Some(default_tokenizer()),
             )
@@ -434,6 +452,35 @@ mod tests {
         let h_a = compute_options_hash(&mk(Metric::Cosine), &time_range());
         let h_b = compute_options_hash(&mk(Metric::NegDot), &time_range());
         assert_ne!(h_a.0, h_b.0);
+    }
+
+    #[test]
+    fn compute_options_hash_distinguishes_every_rerank_codec() {
+        let mk = |rerank_codec: RerankCodec| {
+            SupertableOptions::new(
+                schema_title_emb(16),
+                vec![],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: 16,
+                    n_cent: 4,
+                    rot_seed: 0,
+                    metric: Metric::Cosine,
+                    rerank_codec,
+                    provided_centroids: None,
+                }],
+                Some(default_tokenizer()),
+            )
+            .expect("opts")
+        };
+        let residual = compute_options_hash(&mk(RerankCodec::Sq8Residual), &time_range());
+        let fp32 = compute_options_hash(&mk(RerankCodec::Fp32), &time_range());
+        let fixed = compute_options_hash(&mk(RerankCodec::Sq8FixedResidual), &time_range());
+        assert_ne!(residual.0, fp32.0);
+        assert_ne!(
+            residual.0, fixed.0,
+            "fixed residual must not reopen with local residual write options"
+        );
     }
 
     // ---- PartitionStrategy variants ------------------------------------
@@ -469,6 +516,28 @@ mod tests {
         assert_ne!(h_time.0, h_hash.0);
         assert_ne!(h_hash.0, h_range.0);
         assert_ne!(h_time.0, h_range.0);
+    }
+
+    #[test]
+    fn compute_options_hash_distinguishes_vector_cell() {
+        let opts = fts_opts();
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let h_vc = compute_options_hash(
+            &opts,
+            &PartitionStrategy::VectorCell {
+                column: "emb".into(),
+                clusters: clusters.clone(),
+                routing: Default::default(),
+            },
+        );
+        let h_hash = compute_options_hash(
+            &opts,
+            &PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 16,
+            },
+        );
+        assert_ne!(h_vc.0, h_hash.0);
     }
 
     #[test]

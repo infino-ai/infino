@@ -98,13 +98,13 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
     config::{
-        CompactionSettings, Config, MemorySettings, StorageBackend, StorageColdFetchMode,
-        StorageSettings, SupertableSettings,
+        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
+        SupertableSettings,
     },
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::reader::BoolMode,
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+        vector::distance::Metric,
     },
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
@@ -118,6 +118,8 @@ use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, runtime::Runtime};
+
+use crate::corpus;
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -241,12 +243,13 @@ fn build_superfile_bytes() -> Bytes {
             column: FTS_COLUMN.into(),
         }],
         vec![VectorConfig {
+            provided_centroids: None,
             column: VEC_COLUMN.into(),
             dim,
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
         Some(default_tokenizer()),
     );
@@ -1348,7 +1351,7 @@ pub(crate) mod diag {
             let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
-                .block_on(cache.reader_with_hints(&uri, Some(&off_ref)))
+                .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
                 .expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
@@ -1395,7 +1398,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref))
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
@@ -1451,7 +1454,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref))
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 reader
@@ -1478,7 +1481,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, Some(&off_ref))
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 reader
@@ -1598,7 +1601,7 @@ pub(crate) mod diag {
                 let off_ref = offsets.clone();
                 let t0 = Instant::now();
                 let _reader = rt
-                    .block_on(cache.reader_with_hints(&uri, Some(&off_ref)))
+                    .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
                     .expect("real S3 cold reader");
                 let wall = t0.elapsed();
                 let snap = storage.snapshot().diff(&before);
@@ -1619,7 +1622,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, Some(&off_ref))
+                        .reader_with_hints(&uri, Some(&off_ref), None, true)
                         .await
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
@@ -1650,7 +1653,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, Some(&off_ref))
+                        .reader_with_hints(&uri, Some(&off_ref), None, true)
                         .await
                         .expect("real S3 cold reader");
                     reader
@@ -1879,7 +1882,7 @@ pub(crate) mod diag {
                 ..StorageSettings::default()
             },
             compaction: CompactionSettings::default(),
-            memory: MemorySettings::default(),
+            ..Config::default()
         }
     }
 
@@ -1901,12 +1904,13 @@ pub(crate) mod diag {
                 column: FTS_COLUMN.into(),
             }],
             vec![VectorConfig {
+                provided_centroids: None,
                 column: VEC_COLUMN.into(),
                 dim: crate::corpus::DIM,
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
                 rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
             }],
             Some(default_tokenizer()),
         )

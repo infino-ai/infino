@@ -160,12 +160,56 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
         "avg {got_avg} vs {expected_avg}"
     );
 
-    // The rewrite fired: plans aggregate the residual partials.
-    for sql in [&count_sql, &sum_sql, &min_sql, &max_sql, &avg_sql] {
+    // Exact low-cardinality counts fold all the way to a literal. The other
+    // aggregate kinds use the covered/residual plan.
+    let count_plan = explain(&st, &count_sql);
+    assert!(
+        !count_plan.contains("DataSourceExec") && !count_plan.contains("Parquet"),
+        "count should fold without a scan; plan was:\n{count_plan}"
+    );
+    for sql in [&sum_sql, &min_sql, &max_sql, &avg_sql] {
         let plan = explain(&st, sql);
         assert!(
             plan.contains("__resid_0"),
             "{sql}: expected the covered/residual rewrite; plan was:\n{plan}"
+        );
+    }
+}
+
+#[test]
+fn unfiltered_aggregates_avoid_the_parquet_scan() {
+    let st = build_table();
+    let expected_count = (COMMITS * ROWS_PER_COMMIT) as i64;
+    let expected_sum = commit_range_sum(0, COMMITS - 1);
+
+    assert_eq!(
+        scalar_i64(&st, "SELECT COUNT(*) FROM supertable"),
+        expected_count
+    );
+    assert_eq!(
+        scalar_i64(&st, "SELECT SUM(rating) FROM supertable"),
+        expected_sum
+    );
+    assert_eq!(scalar_i64(&st, "SELECT MIN(rating) FROM supertable"), 0);
+    assert_eq!(
+        scalar_i64(&st, "SELECT MAX(rating) FROM supertable"),
+        ((COMMITS - 1) * 1000 + ROWS_PER_COMMIT - 1) as i64
+    );
+    let expected_avg = expected_sum as f64 / expected_count as f64;
+    let got_avg = scalar_f64(&st, "SELECT AVG(rating) FROM supertable");
+    assert!((got_avg - expected_avg).abs() < 1e-9);
+
+    for sql in [
+        "SELECT COUNT(*) FROM supertable",
+        "SELECT SUM(rating) FROM supertable",
+        "SELECT MIN(rating) FROM supertable",
+        "SELECT MAX(rating) FROM supertable",
+        "SELECT AVG(rating) FROM supertable",
+    ] {
+        let plan = explain(&st, sql);
+        assert!(
+            !plan.contains("DataSourceExec") && !plan.contains("Parquet"),
+            "{sql}: manifest-only aggregate must not retain a Parquet scan:\n{plan}"
         );
     }
 }
@@ -192,8 +236,13 @@ fn boundary_cutting_range_mixes_covered_and_residual_exactly() {
 
     let plan = explain(&st, &count_sql);
     assert!(
-        plan.contains("__resid_0"),
-        "boundary-cutting range should still rewrite (covered middle); plan was:\n{plan}"
+        !plan.contains("DataSourceExec") && !plan.contains("Parquet"),
+        "exact count frequencies should eliminate the boundary scan; plan was:\n{plan}"
+    );
+    let sum_plan = explain(&st, &sum_sql);
+    assert!(
+        sum_plan.contains("__resid_0"),
+        "SUM still needs the covered/residual boundary scan; plan was:\n{sum_plan}"
     );
 }
 

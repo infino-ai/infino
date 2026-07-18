@@ -24,12 +24,26 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    env,
+    fs::File,
+    io::{Error, ErrorKind, Result as IoResult, Write},
+    mem::size_of,
+    os::unix::fs::FileExt,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::Instant,
+};
 
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    roaring::RoaringBitmap,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig},
@@ -77,6 +91,24 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 
 // ─── Scale constants ──────────────────────────────────────────────────
 
+/// Codec benches build vector columns with. Mirrors the engine default
+/// (`VectorConfig::new`): the fixed cosine grid for cosine, locally fitted
+/// residuals for unbounded metrics. Codec choice is engine configuration
+/// (`vector.rerank_codec` in YAML), not a bench env knob.
+pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
+    let codec = if metric == Metric::Cosine {
+        RerankCodec::default()
+    } else {
+        RerankCodec::Sq8Residual
+    };
+    assert!(
+        codec.supports_metric(metric),
+        "codec {} does not support metric {metric:?}",
+        codec.name()
+    );
+    codec
+}
+
 /// Tokens per doc — chosen to land in the same magnitude as a typical
 /// short article (~200 words). The product `n_docs * tokens_per_doc`
 /// drives FTS posting volume.
@@ -106,12 +138,15 @@ const DOC_ID_PAD_WIDTH: usize = 7;
 const TERM_BYTES: usize = 10;
 /// Docs assigned to one text corpus scheduling chunk. Each worker streams its
 /// chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than buffering
-/// the whole chunk in memory.
-const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
+/// the whole chunk in memory. `pub(crate)`: the sequential stream
+/// ([`combined::SequentialSyntheticCorpus`]) reseeds at these boundaries to
+/// stay bit-identical with the parallel writer.
+pub(crate) const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
 /// Docs assigned to one vector corpus scheduling chunk. Each worker streams
 /// its chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than
-/// buffering the whole chunk in memory.
-const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
+/// buffering the whole chunk in memory. `pub(crate)` for the same
+/// boundary-reseed reason as [`TEXT_CORPUS_CHUNK_DOCS`].
+pub(crate) const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
 /// Per-worker output buffer before a positioned write flushes to the corpus
 /// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
 /// still issuing large writes to NVMe.
@@ -123,7 +158,9 @@ const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
 /// index so independent chunks draw disjoint, reproducible streams.
-fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
+/// `pub(crate)`: the sequential stream reseeds with the same function so
+/// streamed docs match the parallel-written corpus bytes.
+pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
     seed.wrapping_add(
         (chunk_index as u64)
             .wrapping_add(1)
@@ -172,7 +209,7 @@ pub fn supertable_docs() -> usize {
 /// Parse a positive doc-count override from `var`, falling back to
 /// `default` when unset, empty, unparseable, or zero.
 fn docs_from_env(var: &str, default: usize) -> usize {
-    std::env::var(var)
+    env::var(var)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -182,10 +219,10 @@ fn docs_from_env(var: &str, default: usize) -> usize {
 /// Parallel-writer count for the "N writers" build row — how many
 /// writers build the corpus concurrently. Applied identically to every
 /// engine (infino shards across this many builders; Tantivy uses this
-/// many indexing threads). Defaults to the machine's logical core count;
-/// override with `INFINO_BENCH_WRITERS`.
+/// many indexing threads). Always the machine's logical core count so
+/// runs on the same box are comparable.
 pub fn parallel_writers() -> usize {
-    docs_from_env("INFINO_BENCH_WRITERS", num_cpus::get())
+    num_cpus::get()
 }
 
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a
@@ -539,7 +576,7 @@ pub fn generate_vector_corpus(
 /// ingestion, query generation, and brute-force recall share one deterministic
 /// corpus without keeping the whole corpus on the heap.
 pub struct MmapVectorCorpus {
-    _tmp: TempDir,
+    _tmp: Option<TempDir>,
     map: Mmap,
     n_docs: usize,
     dim: usize,
@@ -547,8 +584,23 @@ pub struct MmapVectorCorpus {
 
 impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
+        Self::generate_range(0, n_docs, n_cent, seed, normalize_each)
+    }
+
+    /// Generate only `[start_doc, start_doc + n_docs)` while preserving the
+    /// same global chunk seeds and RNG positions as a full corpus.
+    pub fn generate_range(
+        start_doc: usize,
+        n_docs: usize,
+        n_cent: usize,
+        seed: u64,
+        normalize_each: bool,
+    ) -> Self {
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
+        let end_doc = start_doc
+            .checked_add(n_docs)
+            .expect("vector corpus document range overflow");
 
         // Centers are derived from `seed` exactly as the sequential
         // builder did, so the planted IVF cluster structure — and hence
@@ -571,27 +623,26 @@ impl MmapVectorCorpus {
             })
             .collect();
 
-        let row_bytes = DIM * std::mem::size_of::<f32>();
-        let total = (n_docs as u64) * (row_bytes as u64);
+        let row_bytes = DIM * size_of::<f32>();
+        let total = vector_corpus_byte_len(n_docs).expect("vector corpus byte length");
         let file = File::create(&path).expect("create corpus file");
         file.set_len(total).expect("set_len vector corpus");
 
         // rayon fans the chunks across all cores; each writes a fixed-stride
         // row range via a positioned write and draws noise from its own
         // deterministic per-chunk RNG (shared centers keep clusters intact).
-        let n_chunks = n_docs.div_ceil(VECTOR_CORPUS_CHUNK_DOCS).max(1);
+        let first_chunk = start_doc / VECTOR_CORPUS_CHUNK_DOCS;
+        let end_chunk = end_doc.div_ceil(VECTOR_CORPUS_CHUNK_DOCS);
         let centers_ref = &centers;
         let file_ref = &file;
-        (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * VECTOR_CORPUS_CHUNK_DOCS;
-            if start >= n_docs {
-                return;
-            }
-            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
+        (first_chunk..end_chunk).into_par_iter().for_each(|c| {
+            let chunk_start = c * VECTOR_CORPUS_CHUNK_DOCS;
+            let start = chunk_start.max(start_doc);
+            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(end_doc);
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let dist = StandardNormal;
             let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
-            let base = (start as u64) * (row_bytes as u64);
+            let base = ((start - start_doc) as u64) * (row_bytes as u64);
             let expected = (end - start) * row_bytes;
             let mut written = 0usize;
             let flush = |buf: &mut Vec<u8>, written: &mut usize| {
@@ -604,6 +655,15 @@ impl MmapVectorCorpus {
                 *written += buf.len();
                 buf.clear();
             };
+            // The first requested row may begin partway through a global
+            // chunk. Advance that chunk's noise stream without materializing
+            // any preceding vectors so the requested rows remain bit-identical
+            // to a full corpus generated with the same knobs.
+            for _ in chunk_start..start {
+                for _ in 0..DIM {
+                    let _: f64 = dist.sample(&mut rng);
+                }
+            }
             let mut row = vec![0.0f32; DIM];
             for i in start..end {
                 let center = &centers_ref[i % n_cent];
@@ -627,15 +687,36 @@ impl MmapVectorCorpus {
         drop(file);
 
         let file = File::open(&path).expect("reopen corpus");
-        // SAFETY: this helper owns the temp file and never writes to it after
-        // the fsync above, so the read-only mmap cannot observe mutation.
-        let map = unsafe { Mmap::map(&file).expect("mmap corpus") };
-        Self {
+        Self::from_file(file, n_docs, Some(tmp)).expect("mmap generated vector corpus")
+    }
+
+    /// Open an existing raw f32 corpus without copying or modifying it.
+    ///
+    /// The file must contain exactly `n_docs * DIM` native-endian f32 values.
+    pub fn open(path: &Path, n_docs: usize) -> IoResult<Self> {
+        let file = File::open(path)?;
+        Self::from_file(file, n_docs, None)
+    }
+
+    fn from_file(file: File, n_docs: usize, tmp: Option<TempDir>) -> IoResult<Self> {
+        let expected = vector_corpus_byte_len(n_docs)?;
+        let actual = file.metadata()?.len();
+        if actual != expected {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("vector corpus size is {actual} bytes; expected exactly {expected} bytes"),
+            ));
+        }
+        // SAFETY: the mapping is read-only. Generated files are never written
+        // after their fsync; persisted benchmark inputs must likewise remain
+        // immutable while the benchmark owns this mapping.
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(Self {
             _tmp: tmp,
             map,
             n_docs,
             dim: DIM,
-        }
+        })
     }
 
     pub fn as_slice(&self) -> &[f32] {
@@ -658,7 +739,7 @@ impl MmapVectorCorpus {
         if start >= end {
             return;
         }
-        let row_bytes = self.dim * std::mem::size_of::<f32>();
+        let row_bytes = self.dim * size_of::<f32>();
         let lo = page_floor(start * row_bytes);
         let hi = end * row_bytes;
         // SAFETY: read-only shared file mapping — `MADV_DONTNEED` only
@@ -670,6 +751,24 @@ impl MmapVectorCorpus {
                     .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
         }
     }
+}
+
+fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
+    let row_bytes = DIM
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "vector corpus row size overflow"))?;
+    let total = n_docs.checked_mul(row_bytes).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "vector corpus byte length overflow",
+        )
+    })?;
+    u64::try_from(total).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "vector corpus byte length exceeds u64",
+        )
+    })
 }
 
 // ─── Query batteries ──────────────────────────────────────────────────
@@ -785,6 +884,132 @@ pub fn brute_force_topk_cosine(
 /// big enough to amortize per-chunk heap setup, small enough to
 /// load-balance the tail across the rayon pool.
 const GT_DOC_CHUNK: usize = 8192;
+/// Number of progress updates emitted by a large exact-oracle pass.
+const GT_PROGRESS_STEPS: usize = 20;
+/// Small oracles finish quickly enough that progress output is noise.
+const GT_PROGRESS_MIN_DOCS: usize = 1_000_000;
+
+type GroundTruthCandidate = (f32, u32);
+
+/// Exact top-k labels for the three logical corpus views exercised by the
+/// supertable vector lifecycle.
+#[derive(Debug)]
+pub struct LifecycleGroundTruth {
+    pub base: Vec<Vec<u32>>,
+    pub filtered: Vec<Vec<u32>>,
+    pub augmented: Vec<Vec<u32>>,
+}
+
+struct LifecycleTopLists {
+    base: Vec<Vec<GroundTruthCandidate>>,
+    filtered: Vec<Vec<GroundTruthCandidate>>,
+    augmented: Vec<Vec<GroundTruthCandidate>>,
+}
+
+impl LifecycleTopLists {
+    fn empty(n_queries: usize, n_correctness_queries: usize) -> Self {
+        Self {
+            base: vec![Vec::new(); n_queries],
+            filtered: vec![Vec::new(); n_correctness_queries],
+            augmented: vec![Vec::new(); n_correctness_queries],
+        }
+    }
+
+    fn merge(self, other: Self, k: usize) -> Self {
+        Self {
+            base: merge_ground_truth_tops(self.base, other.base, k),
+            filtered: merge_ground_truth_tops(self.filtered, other.filtered, k),
+            augmented: merge_ground_truth_tops(self.augmented, other.augmented, k),
+        }
+    }
+}
+
+fn compare_ground_truth_candidates(a: &GroundTruthCandidate, b: &GroundTruthCandidate) -> Ordering {
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+}
+
+fn insert_ground_truth_candidate(
+    top: &mut Vec<GroundTruthCandidate>,
+    candidate: GroundTruthCandidate,
+    k: usize,
+) {
+    if top.len() == k
+        && compare_ground_truth_candidates(
+            &candidate,
+            top.last().expect("ground-truth top-k is non-empty"),
+        )
+        .is_ge()
+    {
+        return;
+    }
+    let position =
+        top.partition_point(|entry| compare_ground_truth_candidates(entry, &candidate).is_lt());
+    top.insert(position, candidate);
+    top.truncate(k);
+}
+
+fn merge_ground_truth_tops(
+    mut accumulated: Vec<Vec<GroundTruthCandidate>>,
+    partial: Vec<Vec<GroundTruthCandidate>>,
+    k: usize,
+) -> Vec<Vec<GroundTruthCandidate>> {
+    for (top, candidates) in accumulated.iter_mut().zip(partial) {
+        top.extend(candidates);
+        top.sort_unstable_by(compare_ground_truth_candidates);
+        top.truncate(k);
+    }
+    accumulated
+}
+
+fn ground_truth_ids(tops: Vec<Vec<GroundTruthCandidate>>) -> Vec<Vec<u32>> {
+    tops.into_iter()
+        .map(|top| top.into_iter().map(|(_, id)| id).collect())
+        .collect()
+}
+
+fn transpose_queries(queries: &[Vec<f32>]) -> Vec<f32> {
+    let mut transposed = vec![0.0; DIM * queries.len()];
+    for (query_index, query) in queries.iter().enumerate() {
+        assert_eq!(query.len(), DIM);
+        for (dimension, value) in query.iter().enumerate() {
+            transposed[dimension * queries.len() + query_index] = *value;
+        }
+    }
+    transposed
+}
+
+fn report_ground_truth_progress(
+    processed: &AtomicUsize,
+    next_report: &AtomicUsize,
+    total: usize,
+    stride: usize,
+    chunk_docs: usize,
+) {
+    let done = processed.fetch_add(chunk_docs, AtomicOrdering::Relaxed) + chunk_docs;
+    loop {
+        let threshold = next_report.load(AtomicOrdering::Relaxed);
+        if done < threshold {
+            return;
+        }
+        let next = threshold.saturating_add(stride);
+        if next_report
+            .compare_exchange(
+                threshold,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            let bounded = done.min(total);
+            eprintln!(
+                "[vector ground truth] {bounded}/{total} docs ({:.0}%)",
+                bounded as f64 * 100.0 / total as f64
+            );
+            return;
+        }
+    }
+}
 
 /// Brute-force exact top-k for a whole query batch in ONE streaming
 /// pass over the corpus.
@@ -805,31 +1030,18 @@ pub fn ground_truth(
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    use rayon::prelude::*;
-
     assert_eq!(vectors.len(), n_docs * DIM);
     if queries.is_empty() || n_docs == 0 || k == 0 {
         return vec![Vec::new(); queries.len()];
     }
 
-    // Per-query candidate lists sorted ascending by (neg_dot, id) —
-    // best first, worst last, at most k entries.
-    let better = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    let merge = |mut acc: Vec<Vec<(f32, u32)>>, part: Vec<Vec<(f32, u32)>>| {
-        for (a, p) in acc.iter_mut().zip(part) {
-            a.extend(p);
-            a.sort_unstable_by(better);
-            a.truncate(k);
-        }
-        acc
-    };
-
-    vectors
+    let tops = vectors
         .par_chunks(GT_DOC_CHUNK * DIM)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let base = (chunk_idx * GT_DOC_CHUNK) as u32;
-            let mut tops: Vec<Vec<(f32, u32)>> = vec![Vec::with_capacity(k + 1); queries.len()];
+            let mut tops: Vec<Vec<GroundTruthCandidate>> =
+                vec![Vec::with_capacity(k + 1); queries.len()];
             for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
                 let id = base + j as u32;
                 for (top, q) in tops.iter_mut().zip(queries) {
@@ -837,21 +1049,149 @@ pub fn ground_truth(
                     for d in 0..DIM {
                         dot += doc[d] * q[d];
                     }
-                    let cand = (-dot, id);
-                    if top.len() == k && better(&cand, top.last().expect("non-empty at k")).is_ge()
-                    {
-                        continue;
-                    }
-                    let pos = top.partition_point(|e| better(e, &cand).is_lt());
-                    top.insert(pos, cand);
-                    top.truncate(k);
+                    insert_ground_truth_candidate(top, (-dot, id), k);
                 }
             }
             tops
         })
-        .reduce(|| vec![Vec::new(); queries.len()], merge)
-        .into_iter()
-        .map(|top| top.into_iter().map(|(_, id)| id).collect())
+        .reduce(
+            || vec![Vec::new(); queries.len()],
+            |accumulated, partial| merge_ground_truth_tops(accumulated, partial, k),
+        );
+    ground_truth_ids(tops)
+}
+
+/// Compute exact base, filtered, and post-delta top-k labels in one
+/// document-major pass.
+///
+/// Every base row is scored once against all `queries`; delta-only rows are
+/// scored only against the first `n_correctness_queries`, because calibration
+/// never runs against the augmented corpus. The same score updates the
+/// relevant base, filtered, and augmented top-k lists, avoiding the previous
+/// two full corpus passes plus one filtered pass.
+pub fn lifecycle_ground_truth(
+    vectors: &[f32],
+    n_docs: usize,
+    augmented_docs: usize,
+    queries: &[Vec<f32>],
+    n_correctness_queries: usize,
+    filter_keep_every: usize,
+    k: usize,
+) -> LifecycleGroundTruth {
+    assert_eq!(vectors.len(), augmented_docs * DIM);
+    assert!(n_docs <= augmented_docs);
+    assert!(augmented_docs <= u32::MAX as usize);
+    assert!(n_correctness_queries <= queries.len());
+    assert!(filter_keep_every > 0);
+    if queries.is_empty() || augmented_docs == 0 || k == 0 {
+        return LifecycleGroundTruth {
+            base: vec![Vec::new(); queries.len()],
+            filtered: vec![Vec::new(); n_correctness_queries],
+            augmented: vec![Vec::new(); n_correctness_queries],
+        };
+    }
+
+    let transposed_queries = transpose_queries(queries);
+    let processed = AtomicUsize::new(0);
+    let progress_stride = (augmented_docs >= GT_PROGRESS_MIN_DOCS)
+        .then(|| augmented_docs.div_ceil(GT_PROGRESS_STEPS));
+    let next_report = AtomicUsize::new(progress_stride.unwrap_or(usize::MAX));
+    let tops = vectors
+        .par_chunks(GT_DOC_CHUNK * DIM)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let base = chunk_index * GT_DOC_CHUNK;
+            let mut tops = LifecycleTopLists::empty(queries.len(), n_correctness_queries);
+            let mut dots = vec![0.0f32; queries.len()];
+            for (local_doc, doc) in chunk.chunks_exact(DIM).enumerate() {
+                let doc_id = base + local_doc;
+                let query_count = if doc_id < n_docs {
+                    queries.len()
+                } else {
+                    n_correctness_queries
+                };
+                dots[..query_count].fill(0.0);
+                for (dimension, value) in doc.iter().enumerate() {
+                    let query_offset = dimension * queries.len();
+                    for (dot, query_value) in dots[..query_count]
+                        .iter_mut()
+                        .zip(&transposed_queries[query_offset..query_offset + query_count])
+                    {
+                        *dot += *value * *query_value;
+                    }
+                }
+                let id = doc_id as u32;
+                for (query_index, dot) in dots[..query_count].iter().enumerate() {
+                    let candidate = (-*dot, id);
+                    if doc_id < n_docs {
+                        insert_ground_truth_candidate(&mut tops.base[query_index], candidate, k);
+                        if query_index < n_correctness_queries
+                            && doc_id.is_multiple_of(filter_keep_every)
+                        {
+                            insert_ground_truth_candidate(
+                                &mut tops.filtered[query_index],
+                                candidate,
+                                k,
+                            );
+                        }
+                    }
+                    if query_index < n_correctness_queries {
+                        insert_ground_truth_candidate(
+                            &mut tops.augmented[query_index],
+                            candidate,
+                            k,
+                        );
+                    }
+                }
+            }
+            if let Some(stride) = progress_stride {
+                report_ground_truth_progress(
+                    &processed,
+                    &next_report,
+                    augmented_docs,
+                    stride,
+                    chunk.len() / DIM,
+                );
+            }
+            tops
+        })
+        .reduce(
+            || LifecycleTopLists::empty(queries.len(), n_correctness_queries),
+            |accumulated, partial| accumulated.merge(partial, k),
+        );
+
+    LifecycleGroundTruth {
+        base: ground_truth_ids(tops.base),
+        filtered: ground_truth_ids(tops.filtered),
+        augmented: ground_truth_ids(tops.augmented),
+    }
+}
+
+/// Brute-force *filtered* top-k: exact nearest neighbors by NegDot, restricted
+/// to the rows in `allow`. Shared by the superfile and supertable vector benches
+/// so both compute the filtered ground truth identically (same sort key + tie
+/// break as [`ground_truth`]).
+pub fn filtered_ground_truth(
+    vectors: &[f32],
+    allow: &RoaringBitmap,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Vec<Vec<u32>> {
+    queries
+        .iter()
+        .map(|q| {
+            let mut dists: Vec<(f32, u32)> = allow
+                .iter()
+                .map(|id| {
+                    let row = &vectors[id as usize * DIM..(id as usize + 1) * DIM];
+                    let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                    (-dot, id)
+                })
+                .collect();
+            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            dists.truncate(k);
+            dists.into_iter().map(|(_, id)| id).collect()
+        })
         .collect()
 }
 
@@ -866,6 +1206,94 @@ pub fn recall_at_k(predicted: &[Hit], truth: &[u32]) -> f32 {
         .filter(|(id, _)| truth_set.contains(id))
         .count();
     hits as f32 / truth.len() as f32
+}
+
+/// Stable `_id` + score pairs from public [`SupertableReader::vector_search`]
+/// batches (`projection = None` → `_id` + `score`).
+pub fn id_scores_from_vector_search(batches: &[RecordBatch]) -> Vec<(i128, f32)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let id_idx = batch.schema().index_of("_id").unwrap_or(0);
+        let score_idx = batch.schema().index_of("score").unwrap_or(1);
+        let ids = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id column is Decimal128");
+        let scores = batch
+            .column(score_idx)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("score column is Float32");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), scores.value(i)));
+        }
+    }
+    out
+}
+
+/// Recall@k on stable table `_id`s (minted `i128` values).
+pub fn recall_at_k_stable(predicted: &[(i128, f32)], truth: &[i128]) -> f32 {
+    if truth.is_empty() {
+        return EMPTY_TRUTH_RECALL;
+    }
+    let truth_set: std::collections::HashSet<i128> = truth.iter().copied().collect();
+    let hits = predicted
+        .iter()
+        .filter(|(id, _)| truth_set.contains(id))
+        .count();
+    hits as f32 / truth.len() as f32
+}
+
+/// Map `vector_search` `_id` values to dense oracle row indices.
+///
+/// `_id`s are minted sequentially at `append()` (one snowflake generator per
+/// handle, buffer order), so ascending `_id` order IS ingest order: the row at
+/// position `d` of `ORDER BY _id` is corpus row `d`. The ORDER BY is load-
+/// bearing — an unordered scan returns DataFusion partitions interleaved.
+pub fn engine_id_to_dense(
+    table: &infino::supertable::Supertable,
+    n_docs: usize,
+) -> std::collections::HashMap<i128, u32> {
+    use arrow_array::Decimal128Array;
+
+    let batches = table
+        .reader()
+        .query_sql("SELECT _id FROM supertable ORDER BY _id")
+        .expect("SELECT _id FROM supertable ORDER BY _id");
+    let mut ids = Vec::with_capacity(n_docs);
+    for batch in batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id column is Decimal128");
+        ids.extend(col.values().iter().copied());
+    }
+    assert_eq!(
+        ids.len(),
+        n_docs,
+        "SELECT _id row count must match ingest doc count"
+    );
+    ids.into_iter()
+        .enumerate()
+        .map(|(d, id)| (id, d as u32))
+        .collect()
+}
+
+/// Brute-force oracle rows are corpus row indices; translate to engine `_id`s.
+/// `row_ids[d]` is the engine `_id` for corpus row `d`.
+pub fn oracle_to_engine_ids(gt: &[Vec<u32>], row_ids: &[i128]) -> Vec<Vec<i128>> {
+    gt.iter()
+        .map(|row| row.iter().map(|&d| row_ids[d as usize]).collect())
+        .collect()
+}
+
+/// Superfile oracle rows are already engine-local ids (`0..n-1`).
+pub fn oracle_to_i128(gt: &[Vec<u32>]) -> Vec<Vec<i128>> {
+    gt.iter()
+        .map(|row| row.iter().map(|&d| i128::from(d)).collect())
+        .collect()
 }
 
 /// Mean recall for one (engine, config) point across a query batch.
@@ -1075,12 +1503,13 @@ pub fn build_vector_index(
 ) -> VectorBuilder {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
+        provided_centroids: None,
         column: "v".into(),
         dim: DIM,
         n_cent,
         rot_seed: ROT_SEED,
         metric,
-        rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+        rerank_codec: bench_rerank_codec(metric),
     })
     .expect("register column");
     for i in 0..n_docs {
@@ -1127,12 +1556,13 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             column: "title".into(),
         }],
         vec![SfVectorConfig {
+            provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: bench_rerank_codec(Metric::Cosine),
         }],
         Some(default_tokenizer()),
     );
@@ -1173,12 +1603,13 @@ pub fn build_superfile_with_metric(
             column: "title".into(),
         }],
         vec![SfVectorConfig {
+            provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
             n_cent,
             rot_seed: ROT_SEED,
             metric,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: bench_rerank_codec(metric),
         }],
         Some(default_tokenizer()),
     );
@@ -1203,6 +1634,10 @@ pub fn open_superfile(bytes: Vec<u8>) -> SuperfileReader {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, io::ErrorKind};
+
+    use rand::RngExt;
+
     use super::*;
 
     /// Corpus size for the oracle-equivalence test — a few parallel
@@ -1214,10 +1649,81 @@ mod tests {
     const GT_TEST_K: usize = 10;
     /// Seed for the test's corpus + queries.
     const GT_TEST_SEED: u64 = 42;
+    /// Base corpus rows for the lifecycle-oracle equivalence test.
+    const LIFECYCLE_GT_TEST_DOCS: usize = 512;
+    /// Post-delta corpus rows for the lifecycle-oracle equivalence test.
+    const LIFECYCLE_GT_TEST_AUGMENTED_DOCS: usize = 576;
+    /// Correctness-query prefix graded against filtered and augmented views.
+    const LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES: usize = 3;
+    /// Deterministic allow-set stride for the filtered lifecycle view.
+    const LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY: usize = 7;
+    /// Rows in the persisted mmap open/size validation fixture.
+    const MMAP_OPEN_TEST_DOCS: usize = 3;
+    /// First global row generated by the range-equivalence fixture.
+    const MMAP_RANGE_TEST_START: usize = 13;
+    /// Rows generated by the range-equivalence fixture.
+    const MMAP_RANGE_TEST_DOCS: usize = 19;
+    /// Planted centers in the range-equivalence fixture.
+    const MMAP_RANGE_TEST_CENTERS: usize = 8;
+    /// Corpus seed in the range-equivalence fixture.
+    const MMAP_RANGE_TEST_SEED: u64 = 91;
+
+    #[test]
+    fn mmap_vector_corpus_opens_only_the_exact_expected_size() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("vectors.bin");
+        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * DIM)
+            .map(|value| value as f32)
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&values);
+        fs::write(&path, bytes).expect("write exact corpus");
+
+        let corpus = MmapVectorCorpus::open(&path, MMAP_OPEN_TEST_DOCS).expect("open exact corpus");
+        assert_eq!(corpus.n_docs(), MMAP_OPEN_TEST_DOCS);
+        assert_eq!(corpus.dim(), DIM);
+        assert_eq!(corpus.as_slice(), values);
+
+        let wrong_path = directory.path().join("wrong-size.bin");
+        fs::write(&wrong_path, &bytes[..bytes.len() - 1]).expect("write wrong-size corpus");
+        let wrong_size = MmapVectorCorpus::open(&wrong_path, MMAP_OPEN_TEST_DOCS)
+            .err()
+            .expect("wrong-size corpus must fail");
+        assert_eq!(wrong_size.kind(), ErrorKind::InvalidData);
+
+        let missing =
+            MmapVectorCorpus::open(&directory.path().join("missing.bin"), MMAP_OPEN_TEST_DOCS)
+                .err()
+                .expect("missing corpus must fail");
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn mmap_vector_corpus_generated_range_matches_full_corpus_slice() {
+        let full_docs = MMAP_RANGE_TEST_START + MMAP_RANGE_TEST_DOCS;
+        let full = MmapVectorCorpus::generate(
+            full_docs,
+            MMAP_RANGE_TEST_CENTERS,
+            MMAP_RANGE_TEST_SEED,
+            true,
+        );
+        let tail = MmapVectorCorpus::generate_range(
+            MMAP_RANGE_TEST_START,
+            MMAP_RANGE_TEST_DOCS,
+            MMAP_RANGE_TEST_CENTERS,
+            MMAP_RANGE_TEST_SEED,
+            true,
+        );
+        let start = MMAP_RANGE_TEST_START * DIM;
+        let end = full_docs * DIM;
+        let tail_bytes: &[u8] = bytemuck::cast_slice(tail.as_slice());
+        let expected_bytes: &[u8] = bytemuck::cast_slice(&full.as_slice()[start..end]);
+
+        assert_eq!(tail.n_docs(), MMAP_RANGE_TEST_DOCS);
+        assert_eq!(tail_bytes, expected_bytes);
+    }
 
     #[test]
     fn transposed_ground_truth_matches_reference() {
-        use rand::prelude::*;
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
         let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
         for v in vectors.iter_mut() {
@@ -1235,5 +1741,48 @@ mod tests {
                 "transposed oracle diverged from the per-query reference"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_ground_truth_matches_three_reference_oracles() {
+        let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
+        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * DIM];
+        for value in &mut vectors {
+            *value = rng.random::<f32>() - 0.5;
+        }
+        let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * DIM];
+        let base = ground_truth(base_vectors, LIFECYCLE_GT_TEST_DOCS, &queries, GT_TEST_K);
+        let mut allow = RoaringBitmap::new();
+        for id in (0..LIFECYCLE_GT_TEST_DOCS as u32).step_by(LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY) {
+            allow.insert(id);
+        }
+        let filtered = filtered_ground_truth(
+            base_vectors,
+            &allow,
+            &queries[..LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES],
+            GT_TEST_K,
+        );
+        let augmented = ground_truth(
+            &vectors,
+            LIFECYCLE_GT_TEST_AUGMENTED_DOCS,
+            &queries[..LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES],
+            GT_TEST_K,
+        );
+
+        let combined = lifecycle_ground_truth(
+            &vectors,
+            LIFECYCLE_GT_TEST_DOCS,
+            LIFECYCLE_GT_TEST_AUGMENTED_DOCS,
+            &queries,
+            LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES,
+            LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY,
+            GT_TEST_K,
+        );
+        assert_eq!(combined.base, base);
+        assert_eq!(combined.filtered, filtered);
+        assert_eq!(combined.augmented, augmented);
     }
 }

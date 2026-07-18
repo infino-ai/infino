@@ -28,6 +28,7 @@ pub mod fts;
 pub mod hierarchical_iter;
 pub mod provider;
 pub mod prune;
+pub(crate) mod scalar_cache;
 pub mod skip;
 pub mod sql;
 pub mod superfile_reader;
@@ -47,7 +48,8 @@ use super::manifest::SuperfileUri;
 /// superfile = ? AND doc_id = ?")` follow-up, or by carrying the
 /// caller's own surrogate key as a scalar column.
 ///
-/// Cheap to copy: 16 bytes for `SuperfileUri` (Uuid) + 4 + 4 = 24 B.
+/// Cheap to copy: `SuperfileUri` (16) + 4 + 4 + the optional inline `_id`
+/// (`Option<i128>`, 16-aligned) — a small, `Copy` value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SuperfileHit {
     /// Source superfile.
@@ -66,4 +68,11 @@ pub struct SuperfileHit {
     ///   L2-sq: squared L2). Smaller is better. Result vector is sorted
     ///   ascending.
     pub score: f32,
+    /// Inline stable `_id` resolved during search, when available. Hidden
+    /// vector-index hits carry the user `_id` here — resolved at the fan-out
+    /// tag site from the in-wave-prefetched `_id` region — so the remap step
+    /// reuses it instead of issuing a trailing region GET. `None` on every
+    /// other path (FTS, user-table, hits without an inline region); the remap
+    /// then falls back to the region/scalar read.
+    pub stable_id: Option<i128>,
 }

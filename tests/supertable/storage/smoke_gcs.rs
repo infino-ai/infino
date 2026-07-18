@@ -85,7 +85,8 @@ fn gcs_options(dim: usize) -> SupertableOptions {
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     )

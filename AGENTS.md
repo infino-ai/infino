@@ -82,7 +82,7 @@ One bench target (`[[bench]] name = "bench"`, `harness = false`, custom `main`) 
 - `**superfile` tier** — single-superfile, in-memory scale (default 1M docs): BM25, IVF + RaBitQ vector, and SQL over one superfile.
 - `**supertable` tier** — multi-superfile table over object storage (default 10M docs; backend chosen by `INFINO_BENCH_STORE`, in-process `s3s-fs` emulator by default): the warm/cold table paths for FTS, vector, and SQL.
 
-Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_SUPERFILE_DOCS` / `INFINO_BENCH_SUPERTABLE_DOCS` (plain integers, per tier) and `INFINO_BENCH_WRITERS`.
+Diagnostics are standalone programs sharing the same binary (tokens, not separate targets): `scale` (release-profile recall gates), `tombstone`, `update`, `sql-diag`, `object-store`. Scale knobs: `INFINO_BENCH_SUPERFILE_DOCS` / `INFINO_BENCH_SUPERTABLE_DOCS` (plain integers, per tier) — the only env-tunable bench knobs; engine behavior is configured in YAML only (env vars never override config).
 
 Recorded numbers live in `benches/README.md`; the structured source of truth is `target/infino-bench/<bench>.json`, written by the report layer after each run (the previous run's file is the delta baseline).
 
@@ -142,7 +142,11 @@ src/
 │   ├── query/             ← cross-superfile fanout (fts, vector, sql)
 │   ├── tombstones/        ← runtime tombstone cache (filtering deleted rows)
 │   ├── wal/               ← write-ahead log for update/delete pipeline
-│   └── reader_cache/      ← per-process superfile cache
+│   ├── reader_cache/      ← per-process superfile cache
+│   ├── opann.rs         ← MVCC OPANN maintenance for the hidden vector cell index
+│   ├── compaction/        ← merge small superfiles toward a packed base
+│   ├── gc/                ← post-commit cleanup of orphaned superfiles
+│   └── optimize/          ← explicit table optimize / full-compaction entry
 ├── config/                ← runtime tuning knobs (StorageSettings + defaults)
 ├── runtime_bridge.rs      ← sync ↔ async runtime glue
 └── test_helpers/          ← shared test fixtures (pub for integration tests)
@@ -171,6 +175,8 @@ Rule of thumb for landing a change in the right place:
 | Partition strategy                          | `src/supertable/manifest/partition.rs`                                |
 | Skip pruning (Bloom / min-max / term range) | `src/supertable/manifest/{bloom,aggregates,term_range,list_prune}.rs` |
 | Commit / writer slot / handle               | `src/supertable/writer.rs` + `src/supertable/handle.rs`               |
+| Hidden vector-index (OPANN) maintenance   | `src/supertable/opann.rs` + hidden-index path in `writer.rs`        |
+| Superfile merge / compaction                | `src/supertable/compaction/mod.rs`                                    |
 | Tombstones (delete-path / query-filter)     | `src/supertable/{wal,tombstones}/`                                    |
 | New storage backend                         | `src/storage/`                                                        |
 | File-format byte layout                     | `src/superfile/format/`                                               |
@@ -202,9 +208,20 @@ Rule of thumb for landing a change in the right place:
 - **Non-Parquet file format** (e.g. a proprietary columnar layout like Lance). Search-on-Parquet is the thesis; ecosystem reuse outweighs a 30-50% storage win.
 - **WAL-based ingest** (per-row durability before commit). Rejected as a different architectural model; commit-as-durability-boundary is deliberate. Note: a WAL *does* exist in `src/supertable/wal/` for the **updates/deletes** pipeline — that's orchestration state, not ingest durability. Don't conflate.
 - **HNSW graph inside each IVF partition.** Memory cost is 80 MB / 1M docs for an 18% warm-search win; not worth it given our high-`n_cent` + 1-bit-code shape.
-- **SPFresh-style in-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones.
+- **OPANN-style in-place IVF rebalance.** Superfiles are immutable by design. Updates = delete + insert via tombstones.
+- **In-place mutation of a committed superfile's bytes.** Superfiles are immutable by design; the user table stays append-only and time-ordered. Updates to user data = delete + insert via tombstones. (This is *not* a ban on OPANN maintenance — see below — only on rewriting committed user-superfile bytes in place.)
 - **Multi-vector / ColBERT-style per-token vectors.** Niche; better as a sidecar pattern than a format primitive.
 - `**range_concurrent(&[Range])` storage API.** `LazyByteSource::range` is already `async fn`; callers parallelize with `try_join_all` or `FuturesUnordered`.
+
+#### OPANN hidden vector index (implemented — was previously on this list)
+
+OPANN-style IVF maintenance used to be rejected as "in-place IVF rebalance." It now ships, but as an **MVCC, immutable-superfile** design that does *not* mutate anything in place — so the immutability principle above is preserved:
+
+- Vector search runs over a **hidden, derived vector-index supertable** (a cell-ordered acceleration layer), dual-written alongside the immutable, time-ordered user table. The user table is never rebalanced.
+- Maintenance (`src/supertable/opann.rs` + the hidden-index path in `writer.rs`/`handle.rs`) expresses OPANN logical updates as **physical append + MVCC swap**: each commit appends per-cell delta IVF superfiles; background maintenance merges small per-cell superfiles toward a packed base (via the standard `compaction::merge_superfiles` path), refreshes touched-cell centroids/radii, and splits overflow cells (Sq8+ε k-means, N→N+1 centroids) by writing new superfiles and atomically swapping the manifest — never editing existing bytes.
+- All split/reassign math stays on stored **Sq8+ε** bytes (`distance_encoded_to_centroid`, `encode_encoded_rows`), never a full-corpus fp32 decode.
+
+Revisiting the *thesis* (immutable superfiles, commit-as-durability) still needs an issue first; extending the existing hidden-index maintenance does not.
 
 If you have a strong reason to revisit any 🚫 item, open an issue with new evidence first; don't open a PR cold.
 

@@ -107,6 +107,343 @@ pub enum StorageError {
     },
 }
 
+pub mod io_counters {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static FETCHES: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static HIDDEN_FETCHES: AtomicU64 = AtomicU64::new(0);
+    static HIDDEN_BYTES: AtomicU64 = AtomicU64::new(0);
+    // Full per-op counters (read via [`snapshot`]; never reset by `take`, which
+    // stays scoped to the get-family for the existing timeline diagnostics).
+    static HEADS: AtomicU64 = AtomicU64::new(0);
+    static PUTS: AtomicU64 = AtomicU64::new(0);
+    static PUT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static LISTS: AtomicU64 = AtomicU64::new(0);
+    static DELETES: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one object-store range/get/tail fetch returning `bytes` bytes.
+    /// Every provider calls this on the successful result (after the retry
+    /// wrapper, so re-issues are not double-counted), so it counts the *total*.
+    pub fn record_get(bytes: u64) {
+        FETCHES.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one HEAD (metadata) request.
+    pub fn record_head() {
+        HEADS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one PUT (or conditional PUT) writing `bytes` bytes.
+    pub fn record_put(bytes: u64) {
+        PUTS.fetch_add(1, Ordering::Relaxed);
+        PUT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one LIST request.
+    pub fn record_list() {
+        LISTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one DELETE request.
+    pub fn record_delete() {
+        DELETES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tag a fetch as targeting the hidden vector index (prefixed namespace).
+    /// Called by `PrefixedStorageProvider` *in addition to* the inner provider's
+    /// `record_get`, so `hidden ⊆ total` and `user = total − hidden`.
+    pub fn record_hidden_get(bytes: u64) {
+        HIDDEN_FETCHES.fetch_add(1, Ordering::Relaxed);
+        HIDDEN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call;
+    /// resets those four. Derive the user-table share as `total − hidden`.
+    /// (Scoped to the get-family so the existing per-batch timeline diagnostics
+    /// keep working; use [`snapshot`] for the full, non-resetting picture.)
+    pub fn take() -> (u64, u64, u64, u64) {
+        (
+            FETCHES.swap(0, Ordering::Relaxed),
+            BYTES.swap(0, Ordering::Relaxed),
+            HIDDEN_FETCHES.swap(0, Ordering::Relaxed),
+            HIDDEN_BYTES.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Cumulative per-op counts since process start (never reset). The
+    /// complete engine-side I/O picture across every provider — the counterpart
+    /// of the bench's storage meter, for embedders that read engine counters
+    /// directly rather than wrapping the provider.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        pub get_count: u64,
+        pub get_bytes: u64,
+        pub hidden_get_count: u64,
+        pub hidden_get_bytes: u64,
+        pub head_count: u64,
+        pub put_count: u64,
+        pub put_bytes: u64,
+        pub list_count: u64,
+        pub delete_count: u64,
+    }
+
+    impl Snapshot {
+        /// Per-op counts accrued since an `earlier` snapshot — the window delta
+        /// to price. Makes window-scoped measurement first-class over the
+        /// process-global counters: snapshot, do work, `snapshot().since(&start)`.
+        /// Saturating, since a window never runs backwards.
+        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+            Snapshot {
+                get_count: self.get_count.saturating_sub(earlier.get_count),
+                get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
+                hidden_get_count: self
+                    .hidden_get_count
+                    .saturating_sub(earlier.hidden_get_count),
+                hidden_get_bytes: self
+                    .hidden_get_bytes
+                    .saturating_sub(earlier.hidden_get_bytes),
+                head_count: self.head_count.saturating_sub(earlier.head_count),
+                put_count: self.put_count.saturating_sub(earlier.put_count),
+                put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
+                list_count: self.list_count.saturating_sub(earlier.list_count),
+                delete_count: self.delete_count.saturating_sub(earlier.delete_count),
+            }
+        }
+    }
+
+    /// Read all counters without resetting any.
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            get_count: FETCHES.load(Ordering::Relaxed),
+            get_bytes: BYTES.load(Ordering::Relaxed),
+            hidden_get_count: HIDDEN_FETCHES.load(Ordering::Relaxed),
+            hidden_get_bytes: HIDDEN_BYTES.load(Ordering::Relaxed),
+            head_count: HEADS.load(Ordering::Relaxed),
+            put_count: PUTS.load(Ordering::Relaxed),
+            put_bytes: PUT_BYTES.load(Ordering::Relaxed),
+            list_count: LISTS.load(Ordering::Relaxed),
+            delete_count: DELETES.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
+    ///
+    /// Fetch counts/bytes tell us breadth; they can't tell us whether the cold
+    /// floor is a *serial dependent chain* (each read gated on the prior's
+    /// offsets — gaps = network RTT) or *parallel breadth* (many overlapping
+    /// reads — wall-time = slowest single chain). This records each
+    /// object-store op's `[start, end)` relative to a shared epoch, so a
+    /// post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
+    /// implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
+    /// no-op (one relaxed env check) otherwise so the hot path is unaffected.
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    /// One recorded object-store fetch on the timeline.
+    #[derive(Clone)]
+    pub struct FetchSpan {
+        pub op: &'static str,
+        pub uri: String,
+        pub off: u64,
+        pub len: u64,
+        /// microseconds since the epoch (first recorded span / last reset).
+        pub start_us: u64,
+        pub end_us: u64,
+        /// `true` if issued by a background cache-fill task (off the
+        /// query-critical path), `false` for foreground query reads.
+        pub background: bool,
+    }
+
+    tokio::task_local! {
+        /// Set to `true` inside a background cache-fill task so its
+        /// object-store reads are distinguishable from foreground
+        /// query reads. Absent (→ foreground) on the query path.
+        static IO_BACKGROUND: bool;
+    }
+
+    /// Whether the current task is a background cache-fill
+    /// (`false` unless the task-local flag is set).
+    pub fn io_is_background() -> bool {
+        IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
+    }
+
+    /// Run `fut` with [`io_is_background`] true for the current task.
+    ///
+    /// Background cache-fill GETs wrap their object-store calls in this
+    /// so meters and timelines can attribute them separately from
+    /// foreground query reads.
+    pub async fn scope_background<F>(fut: F) -> F::Output
+    where
+        F: Future,
+    {
+        IO_BACKGROUND.scope(true, fut).await
+    }
+
+    static TIMELINE_ON: OnceLock<bool> = OnceLock::new();
+    static PHASE_TRACE_ON: OnceLock<bool> = OnceLock::new();
+    static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
+    static SPANS: Mutex<Vec<FetchSpan>> = Mutex::new(Vec::new());
+
+    /// Whether timeline capture is active (`diagnostics.io_timeline` in YAML).
+    pub fn timeline_enabled() -> bool {
+        *TIMELINE_ON.get_or_init(|| crate::config::global().diagnostics.io_timeline)
+    }
+
+    /// Whether CPU phase spans are recorded.
+    ///
+    /// True when the YAML `diagnostics.io_timeline` flag is on, or when the
+    /// process sets `INFINO_TRACE_VECTOR_WARM_PHASES` (bench/diag opt-in;
+    /// engine YAML is never overridden by env — this is a separate tracer).
+    pub fn phase_enabled() -> bool {
+        *PHASE_TRACE_ON.get_or_init(|| {
+            timeline_enabled() || std::env::var_os("INFINO_TRACE_VECTOR_WARM_PHASES").is_some()
+        })
+    }
+
+    /// Capture an op-start `Instant` *iff* the timeline is active; `None`
+    /// disables recording for this op with zero overhead when off.
+    pub fn timeline_start() -> Option<Instant> {
+        if timeline_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Capture a phase-start `Instant` when [`phase_enabled`]; `None` otherwise.
+    pub fn phase_start() -> Option<Instant> {
+        if phase_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Record a completed op. `start` is the value from [`timeline_start`];
+    /// the end is stamped now. No-op when `start` is `None`.
+    pub fn timeline_record(
+        op: &'static str,
+        uri: &str,
+        off: u64,
+        len: u64,
+        start: Option<Instant>,
+    ) {
+        let Some(start) = start else { return };
+        let epoch = {
+            let mut e = match EPOCH.lock() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            *e.get_or_insert(start)
+        };
+        let to_us = |t: Instant| t.saturating_duration_since(epoch).as_micros() as u64;
+        if let Ok(mut spans) = SPANS.lock() {
+            spans.push(FetchSpan {
+                op,
+                uri: uri.to_string(),
+                off,
+                len,
+                start_us: to_us(start),
+                end_us: to_us(Instant::now()),
+                background: io_is_background(),
+            });
+        }
+    }
+
+    /// Drop all recorded spans AND reset the epoch — call right before the
+    /// unit of work to profile (e.g. one cold query or one drain batch).
+    pub fn timeline_reset() {
+        if let Ok(mut spans) = SPANS.lock() {
+            spans.clear();
+        }
+        // Re-arm the epoch off the next recorded span.
+        if let Ok(mut e) = EPOCH.lock() {
+            *e = None;
+        }
+    }
+
+    /// Take all spans recorded since the last reset, sorted by start time.
+    pub fn timeline_take() -> Vec<FetchSpan> {
+        let mut out = SPANS
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default();
+        out.sort_by_key(|s| s.start_us);
+        out
+    }
+
+    /// Coarse *phase* log — diagnostic for the non-I/O portion of a profiled
+    /// unit of work (the gap between its measured wall and the GET-timeline
+    /// wall). The timeline only sees object-store ops; this records named
+    /// CPU/await spans so a post-hoc dump shows where the non-read time goes.
+    /// Same gate (`INFINO_IO_TIMELINE`); ordered by insertion (caller-sequenced).
+    static PHASES: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+    /// Record `name` took `micros` µs. No-op unless [`phase_enabled`].
+    pub fn phase_record(name: &'static str, micros: u64) {
+        if !phase_enabled() {
+            return;
+        }
+        if let Ok(mut p) = PHASES.lock() {
+            p.push((name, micros));
+        }
+    }
+
+    /// Time `f` and record it under `name` (returns `f`'s value).
+    pub fn phase_timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+        if !phase_enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let out = f();
+        phase_record(name, t.elapsed().as_micros() as u64);
+        out
+    }
+
+    /// Async counterpart of [`phase_timed`]: await `fut` and record wall µs.
+    pub async fn phase_timed_async<T>(name: &'static str, fut: impl Future<Output = T>) -> T {
+        if !phase_enabled() {
+            return fut.await;
+        }
+        let t = Instant::now();
+        let out = fut.await;
+        phase_record(name, t.elapsed().as_micros() as u64);
+        out
+    }
+
+    /// Drop all recorded phases — call right before the unit of work to profile.
+    pub fn phase_reset() {
+        if let Ok(mut p) = PHASES.lock() {
+            p.clear();
+        }
+    }
+
+    /// Take all phases recorded since the last reset, in insertion order.
+    pub fn phase_take() -> Vec<(&'static str, u64)> {
+        PHASES
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
+    }
+
+    /// Sum recorded phases by name (concurrent fan-out units may emit the
+    /// same name more than once; callers usually want the sum).
+    pub fn phase_take_summed() -> Vec<(&'static str, u64)> {
+        let phases = phase_take();
+        let mut by_name: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for (name, us) in phases {
+            *by_name.entry(name).or_default() += us;
+        }
+        by_name.into_iter().collect()
+    }
+}
+
 /// Storage backend abstraction.
 ///
 /// Implementations wrap `object_store` crate types (or fakes
@@ -306,6 +643,142 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     }
 }
 
+/// Convert an object-store LIST result back into the provider-relative key
+/// accepted by the rest of [`StorageProvider`]. Remote providers prepend their
+/// configured root before listing; callers must not see or re-prefix it.
+pub(crate) fn logical_list_key(provider_prefix: &str, location: &str) -> String {
+    if provider_prefix.is_empty() {
+        return location.to_owned();
+    }
+    let prefix = format!("{provider_prefix}/");
+    location
+        .strip_prefix(&prefix)
+        .expect("listed object remains under provider prefix")
+        .to_owned()
+}
+
+/// A wrapper that prepends a sub-prefix to every URI before delegating to an
+/// inner `StorageProvider`. Used to give the hidden `VectorIndexSuperTable` its
+/// own namespace under the user table's storage prefix.
+#[derive(Debug)]
+pub struct PrefixedStorageProvider {
+    inner: Arc<dyn StorageProvider>,
+    sub_prefix: String,
+}
+
+impl PrefixedStorageProvider {
+    pub fn new(inner: Arc<dyn StorageProvider>, sub_prefix: impl Into<String>) -> Self {
+        let mut sub = sub_prefix.into();
+        if !sub.is_empty() && !sub.ends_with('/') {
+            sub.push('/');
+        }
+        Self {
+            inner,
+            sub_prefix: sub,
+        }
+    }
+
+    fn prefixed(&self, uri: &str) -> String {
+        format!("{}{}", self.sub_prefix, uri)
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageProvider for PrefixedStorageProvider {
+    async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+        self.inner.head(&self.prefixed(uri)).await
+    }
+
+    async fn get(&self, uri: &str) -> Result<(bytes::Bytes, ObjectMeta), StorageError> {
+        self.inner.get(&self.prefixed(uri)).await
+    }
+
+    async fn get_range(
+        &self,
+        uri: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<bytes::Bytes, StorageError> {
+        let out = self.inner.get_range(&self.prefixed(uri), range).await;
+        if let Ok(b) = &out {
+            io_counters::record_hidden_get(b.len() as u64);
+        }
+        out
+    }
+
+    async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {
+        self.inner.tail(&self.prefixed(uri), len).await
+    }
+
+    async fn put_atomic(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner.put_atomic(&self.prefixed(uri), bytes).await
+    }
+
+    async fn put_if_match(
+        &self,
+        uri: &str,
+        bytes: bytes::Bytes,
+        expected_etag: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner
+            .put_if_match(&self.prefixed(uri), bytes, expected_etag)
+            .await
+    }
+
+    async fn put_multipart(
+        &self,
+        uri: &str,
+    ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+        self.inner.put_multipart(&self.prefixed(uri)).await
+    }
+
+    async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        self.inner.delete(&self.prefixed(uri)).await
+    }
+
+    async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let full = self.prefixed(prefix);
+        let results = self.inner.list_with_prefix(&full).await?;
+        let strip_len = self.sub_prefix.len();
+        Ok(results
+            .into_iter()
+            .map(|s| s[strip_len..].to_owned())
+            .collect())
+    }
+
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        // Must mirror `list_with_prefix` (prepend sub-prefix, delegate, strip):
+        // GC on the hidden vector index lists via this method, so without the
+        // override the trait default returns an empty list and GC reclaims
+        // nothing under the prefixed namespace.
+        let full = self.prefixed(prefix);
+        let results = self.inner.list_with_prefix_metadata(&full).await?;
+        let strip_len = self.sub_prefix.len();
+        Ok(results
+            .into_iter()
+            .map(|(key, meta)| (key[strip_len..].to_owned(), meta))
+            .collect())
+    }
+
+    fn object_store_handle(
+        &self,
+        uri: &str,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+        // Delegate to the parent with the sub-prefix applied, so the hidden
+        // table's superfiles resolve to a real object-store handle for the
+        // async range-GET read paths (e.g. cold `_id`-column resolution).
+        // Without this override the default `None` forces those paths to error
+        // on lazily-opened hidden superfiles.
+        self.inner.object_store_handle(&self.prefixed(uri))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, error::Error, ops::Range, sync::Mutex};
@@ -317,6 +790,18 @@ mod tests {
 
     /// Fixed etag the mock reports for any stored object.
     const MOCK_ETAG: &str = "mock-etag";
+
+    #[test]
+    fn logical_list_key_strips_exact_provider_root() {
+        assert_eq!(
+            logical_list_key("table/root", "table/root/data/segment.parquet"),
+            "data/segment.parquet"
+        );
+        assert_eq!(
+            logical_list_key("", "table/root/data/segment.parquet"),
+            "table/root/data/segment.parquet"
+        );
+    }
 
     /// Minimal in-memory [`StorageProvider`] implementing only the
     /// required methods, leaving `tail`, `list_with_prefix`, and
@@ -522,6 +1007,28 @@ mod tests {
         ));
     }
 
+    /// The default `get_if_none_match` issues a plain `get` and compares etags
+    /// locally: a matching etag short-circuits to `None` ("not modified"), a
+    /// different one returns the full body + metadata.
+    #[tokio::test]
+    async fn default_get_if_none_match_reports_modified_state() {
+        let mock = InMemoryMock::with("k", b"payload");
+        assert!(
+            mock.get_if_none_match("k", MOCK_ETAG)
+                .await
+                .expect("conditional get")
+                .is_none(),
+            "a matching etag means not-modified",
+        );
+        let (bytes, meta) = mock
+            .get_if_none_match("k", "stale-etag")
+            .await
+            .expect("conditional get")
+            .expect("a mismatched etag returns the body");
+        assert_eq!(&bytes[..], b"payload");
+        assert_eq!(meta.etag.as_deref(), Some(MOCK_ETAG));
+    }
+
     #[tokio::test]
     async fn mock_put_multipart_surfaces_permanent_error() {
         let mock = InMemoryMock::default();
@@ -575,5 +1082,28 @@ mod tests {
         assert_eq!(cloned.size, 7);
         assert_eq!(cloned.etag.as_deref(), Some("e"));
         assert!(format!("{meta:?}").contains("ObjectMeta"));
+    }
+
+    /// Each per-op recorder advances its counter; `snapshot` reads them all
+    /// without resetting. Assertions are relative (before/after) because the
+    /// counters are process-global and other tests may increment concurrently.
+    #[test]
+    fn io_counters_record_and_snapshot_are_monotonic() {
+        use super::io_counters;
+        let before = io_counters::snapshot();
+        io_counters::record_get(100);
+        io_counters::record_head();
+        io_counters::record_put(50);
+        io_counters::record_list();
+        io_counters::record_delete();
+        let after = io_counters::snapshot();
+        let delta = after.since(&before);
+        assert!(delta.get_count >= 1);
+        assert!(delta.get_bytes >= 100);
+        assert!(delta.head_count >= 1);
+        assert!(delta.put_count >= 1);
+        assert!(delta.put_bytes >= 50);
+        assert!(delta.list_count >= 1);
+        assert!(delta.delete_count >= 1);
     }
 }

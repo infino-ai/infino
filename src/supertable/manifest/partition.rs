@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::supertable::{
     error::{CommitError, ManifestError},
+    handle::INCOMING_VECTOR_CELL,
     manifest::{SuperfileEntry, list::PartitionStrategy},
 };
 
@@ -36,6 +37,9 @@ pub enum PartitionKey {
     Hash(u32),
     /// `column_range` bucket = boundary index.
     ColumnRange(u16),
+    /// Cell id (legacy one-file-per-cell) or packed-shard id
+    /// (`cell_id % writer_pool`) for VectorCell strategy.
+    VectorCell(u32),
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
@@ -47,6 +51,7 @@ pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {
         PartitionKey::TimeRange(b) => b.to_le_bytes().to_vec(),
         PartitionKey::Hash(b) => b.to_le_bytes().to_vec(),
         PartitionKey::ColumnRange(b) => b.to_le_bytes().to_vec(),
+        PartitionKey::VectorCell(b) => b.to_le_bytes().to_vec(),
     }
 }
 
@@ -85,6 +90,15 @@ pub fn decode_partition_key(
                 ))
             })?;
             Ok(PartitionKey::ColumnRange(u16::from_le_bytes(arr)))
+        }
+        PartitionStrategy::VectorCell { .. } => {
+            let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                CommitError::PointerParse(format!(
+                    "VectorCell partition_key must be 4 bytes; got {}",
+                    bytes.len()
+                ))
+            })?;
+            Ok(PartitionKey::VectorCell(u32::from_le_bytes(arr)))
         }
         PartitionStrategy::IngestionTime { .. } => {
             let arr: [u8; 8] = bytes.try_into().map_err(|_| {
@@ -194,7 +208,51 @@ pub fn assign_partition(
                      no writer currently emits ColumnRange-partitioned commits"
                 .into(),
         }),
-
+        PartitionStrategy::VectorCell { clusters, .. } => {
+            let n_cells = clusters.n_cent;
+            let hint =
+                seg.partition_hint
+                    .ok_or_else(|| ManifestError::SuperfileSpansPartition {
+                        detail: format!(
+                            "VectorCell{{n_cells:{n_cells}}} requires pre-sharded superfiles; \
+                         partition_hint must be Some(shard_id or cell_id) (superfile {})",
+                            seg.uri.0
+                        ),
+                    })?;
+            // `INCOMING_VECTOR_CELL` (u32::MAX) is the reserved "incoming"
+            // append partition — deliberately outside `0..n_cells`.
+            //
+            // Packed multi-cell drain files use `partition_hint = shard_id`
+            // (`0..writer_pool_threads`). Legacy one-cell-per-file drains used
+            // `partition_hint = cell_id` (`0..n_cells`). Accept either:
+            // - MultiCellIvf: any hint except the incoming sentinel (shard
+            //   count is independent of n_cells and may be ≥ n_cells).
+            // - Legacy Ivf / other: hint must be a cell id or incoming.
+            match seg.vector_layout {
+                crate::superfile::vector::layout::VectorLayout::MultiCellIvf => {
+                    if hint == INCOMING_VECTOR_CELL {
+                        return Err(ManifestError::SuperfileSpansPartition {
+                            detail: format!(
+                                "VectorCell multi-cell pack cannot use INCOMING partition_hint \
+                                 (superfile {})",
+                                seg.uri.0
+                            ),
+                        });
+                    }
+                }
+                _ => {
+                    if hint != INCOMING_VECTOR_CELL && hint >= n_cells {
+                        return Err(ManifestError::SuperfileSpansPartition {
+                            detail: format!(
+                                "VectorCell{{n_cells:{n_cells}}} got partition_hint={hint} \
+                                 (out of range)"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(PartitionKey::VectorCell(hint))
+        }
         PartitionStrategy::IngestionTime { granularity_secs } => {
             if *granularity_secs <= 0 {
                 return Err(ManifestError::SuperfileSpansPartition {
@@ -312,12 +370,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri};
+    use crate::{
+        superfile::vector::layout::VectorLayout,
+        supertable::manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
+    };
 
     // ---- Helpers --------------------------------------------------------
 
     fn empty_seg() -> SuperfileEntry {
         SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid::Uuid::nil(),
             uri: SuperfileUri(uuid::Uuid::nil()),
             n_docs: 0,
@@ -328,6 +390,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         }
     }
@@ -670,6 +733,41 @@ mod tests {
         let mut seg = empty_seg();
         seg.partition_hint = Some(4); // == n_buckets, off-by-one
         let err = assign_partition(&seg, &strategy).expect_err("out of range");
+        assert_spans_partition(err, "out of range");
+    }
+
+    #[test]
+    fn assign_partition_vector_cell_accepts_shard_id_beyond_n_cells_for_multi_cell() {
+        use crate::supertable::manifest::ClusterCentroids;
+
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters,
+            routing: Default::default(),
+        };
+        let mut seg = empty_seg();
+        seg.vector_layout = VectorLayout::MultiCellIvf;
+        // writer_pool can exceed n_cells; shard_id=3 is valid for MultiCellIvf.
+        seg.partition_hint = Some(3);
+        let key = assign_partition(&seg, &strategy).expect("shard_id beyond n_cells");
+        assert_eq!(key, PartitionKey::VectorCell(3));
+    }
+
+    #[test]
+    fn assign_partition_vector_cell_rejects_shard_as_cell_on_legacy_ivf() {
+        use crate::supertable::manifest::ClusterCentroids;
+
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters,
+            routing: Default::default(),
+        };
+        let mut seg = empty_seg();
+        seg.vector_layout = VectorLayout::Ivf;
+        seg.partition_hint = Some(3); // >= n_cells=2
+        let err = assign_partition(&seg, &strategy).expect_err("legacy cell id out of range");
         assert_spans_partition(err, "out of range");
     }
 

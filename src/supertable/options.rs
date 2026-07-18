@@ -56,7 +56,7 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode, ThreadCount},
+    config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -66,6 +66,7 @@ use crate::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
+        vector::layout::VectorLayout,
     },
     supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
 };
@@ -161,9 +162,13 @@ const DEFAULT_READ_STALENESS_SECS: u64 = 1;
 const DEFAULT_TARGET_SUPERFILES_PER_PART: u64 = 10_000;
 /// Default soft cap on a manifest part's compressed size (10 MiB).
 const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
-/// Default: eager-load manifest parts at open when there are at most
-/// this many (open latency vs memory trade-off).
-const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Default: always eager-load every manifest part at open. Open pays the
+/// full (parallel) part fetch up front so search never issues a serial
+/// manifest GET wave before its data fetches; snapshot refreshes inherit
+/// loaded parts and fetch only the missing ones as part of the query that
+/// triggered them. Lazy load stays available as an explicit opt-in
+/// (`with_eager_load_threshold(0)`).
+const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -171,12 +176,15 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
+/// Default user-superfile batch size for the hidden-index drain. `1` streams
+/// one source superfile at a time to keep drain RAM bounded on large corpora.
+/// `-1` = unbounded (single merge), `0` = skip the drain.
+const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
-
 /// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
 ///
@@ -353,6 +361,7 @@ pub struct SupertableOptions {
     /// the persisted manifest list — config changes after
     /// creation have no effect.
     pub partition_strategy: Option<PartitionStrategy>,
+    pub(crate) vector_layout: VectorLayout,
     /// Soft cap on superfiles per `ManifestPart`.
     /// When a partition's existing part reaches this count,
     /// the next commit's superfiles for that partition go into
@@ -364,27 +373,46 @@ pub struct SupertableOptions {
     /// `target_superfiles_per_partition`. Default `10 * (1 << 20)`
     /// (10 MiB).
     pub part_size_threshold_bytes: u64,
+    /// Number of user superfiles the hidden-index drain materializes per batch
+    /// before publishing that batch's cell superfiles and freeing its working
+    /// set. Bounds drain RAM to O(batch) instead of O(corpus) — the lever for
+    /// draining at 10M/1B on a fixed-memory box. Each batch appends one
+    /// superfile per touched cell; compaction collapses them later.
+    ///
+    /// `-1` = unbounded (all user superfiles in one merge: lowest cell
+    /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
+    /// skip the drain entirely. Default [`DEFAULT_DRAIN_BATCH_SUPERFILES`].
+    /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
+    /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
+    pub drain_batch_superfiles: i64,
+    /// Per-cell consolidation op for the hidden-index drain. Default
+    /// [`DrainConsolidate::Kmeans`]. [`SupertableOptions::apply_config`] copies
+    /// `vector.drain_consolidate`; [`Self::with_drain_consolidate`] overrides
+    /// per table (identity tests use splice).
+    pub drain_consolidate: DrainConsolidate,
     /// Eager-load threshold for manifest parts at
     /// [`Supertable::open`] time. When the manifest list
     /// references this many parts or fewer, open parallel-
     /// fetches all parts up front + populates the
-    /// `Manifest.parts` cache. Above the threshold, parts are
+    /// `ManifestSnapshot.parts` cache. Above the threshold, parts are
     /// left in empty `OnceCell`s — the first
-    /// `Manifest::part(id).await` lazy-loads on demand.
+    /// `ManifestSnapshot::part(id).await` lazy-loads on demand.
     ///
-    /// Default `4`. Set to
-    /// `0` to force lazy-load even for tiny manifests
+    /// Default `u32::MAX` — open always eager-loads every part (in
+    /// parallel), so queries on a fresh handle pay zero serial manifest
+    /// GETs; cold open takes proportionally longer on huge tables instead.
+    /// Set to `0` to force lazy-load even for tiny manifests
     /// (useful for tests that want to verify the lazy path).
     ///
-    /// **Eager mode** populates `Manifest.superfile_list.superfiles`
+    /// **Eager mode** populates `ManifestSnapshot.superfile_list.superfiles`
     /// with the flat union of all loaded parts' superfiles —
     /// the legacy query paths (`bm25_search`,
     /// `vector_search`, `query_sql`) iterate this flat view.
     ///
-    /// **Lazy mode** leaves `Manifest.superfile_list.superfiles`
+    /// **Lazy mode** leaves `ManifestSnapshot.superfile_list.superfiles`
     /// empty until the hierarchical query path lands.
     /// Until then, callers using lazy mode must drive
-    /// `Manifest::part(id).await` directly; legacy
+    /// `ManifestSnapshot::part(id).await` directly; legacy
     /// flat-iteration queries return empty results.
     pub eager_load_threshold_parts: u32,
     /// Max OCC retry attempts before `writer.commit()` surfaces
@@ -571,8 +599,11 @@ impl SupertableOptions {
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
+            vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
+            drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
@@ -607,9 +638,9 @@ impl SupertableOptions {
     /// Resolve the effective partition strategy for this
     /// supertable. Called at [`Supertable::create`] time
     /// when nothing's been persisted yet. The default —
-    /// `Hash { column: id_column, n_buckets: 1 }` — is
-    /// observationally equivalent to "no partitioning";
-    /// callers wanting real partitioning set
+    /// `IngestionTime { granularity_secs: 86_400 }`, one-day buckets
+    /// keyed off the injected `_id`'s timestamp — groups each day's
+    /// commits; callers wanting different partitioning set
     /// [`Self::partition_strategy`] via
     /// [`Self::with_partition_strategy`].
     pub fn effective_partition_strategy(&self) -> PartitionStrategy {
@@ -756,6 +787,21 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the hidden-index drain batch size (user superfiles per batch).
+    /// `-1` = unbounded single merge, `0` = skip the drain. See
+    /// [`Self::drain_batch_superfiles`].
+    pub fn with_drain_batch_superfiles(mut self, n: i64) -> Self {
+        self.drain_batch_superfiles = n;
+        self
+    }
+
+    /// Override the hidden-index drain consolidation op. See
+    /// [`Self::drain_consolidate`].
+    pub fn with_drain_consolidate(mut self, mode: DrainConsolidate) -> Self {
+        self.drain_consolidate = mode;
+        self
+    }
+
     /// Override the soft cap on a manifest part's compressed
     /// size in bytes. Default `10 MiB`.
     pub fn with_part_size_threshold_bytes(mut self, n: u64) -> Self {
@@ -869,6 +915,8 @@ impl SupertableOptions {
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.drain_consolidate = cfg.vector.drain_consolidate;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
         // Note this replaces the budget outright: don't call `apply_config` on
@@ -977,6 +1025,12 @@ impl SupertableOptions {
         Ok(())
     }
 
+    /// Set the vector index layout passed through to the superfile builder.
+    pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
+        self.vector_layout = layout;
+        self
+    }
+
     /// Construct a `superfile::BuilderOptions` for one rayon
     /// shard worker at commit time. The shard worker constructs
     /// its own `SuperfileBuilder` from this and feeds its slice
@@ -995,6 +1049,7 @@ impl SupertableOptions {
             self.vector_columns.clone(),
             self.tokenizer.clone(),
         )
+        .with_vector_layout(self.vector_layout)
     }
 
     /// Effective scalar-only schema — the user's columns with
@@ -1097,6 +1152,7 @@ mod tests {
             rot_seed: 0,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }
     }
 

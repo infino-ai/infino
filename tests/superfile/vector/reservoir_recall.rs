@@ -127,6 +127,7 @@ fn build_reader_with_sample_size(
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec,
+            provided_centroids: None,
         })
         .expect("register column");
     b.set_kmeans_sample_size(cid, sample_size)
@@ -171,7 +172,7 @@ async fn recall_under_undersized_reservoir_matches_brute_force() {
     // because it skips the rerank step entirely and is covered
     // separately by `rabitq_only_self_query_ranks_self_first` in
     // reader.rs.
-    for codec in [RerankCodec::Fp32, RerankCodec::Sq8ResidualEpsilon] {
+    for codec in [RerankCodec::Fp32, RerankCodec::Sq8Residual] {
         let reader = build_reader_with_sample_size(&flat, dim, n_docs, n_cent, sample_size, codec);
         let mut total_recall = 0.0f32;
         for q_idx in queries {
@@ -243,6 +244,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         rot_seed: ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
     for i in 0..n_docs {

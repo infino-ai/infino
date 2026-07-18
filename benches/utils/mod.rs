@@ -11,6 +11,7 @@
 
 pub mod corpus;
 pub mod cost;
+pub mod cpu;
 pub mod dataset;
 pub mod executors;
 pub mod fixture;

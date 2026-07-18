@@ -734,6 +734,14 @@ fn backend_to_provider(
 /// Build a per-table disk cache from the connection's options, or `None`
 /// when no cache directory is configured. Rooted at `<cache_dir>/<name>`
 /// so tables don't share cache files; the byte budget applies per table.
+///
+/// Budget semantics: an explicit `cache_budget_bytes` is respected
+/// verbatim (the engine warns once if the table's footprint outgrows it).
+/// With no explicit budget the cache is marked engine-managed, and the
+/// supertable raises the budget to the table's real on-storage footprint
+/// — user superfiles plus the hidden vector index — at open and after
+/// maintenance, so vector tables don't silently churn a default-sized
+/// cache once the drain doubles their working set.
 fn build_disk_cache(
     options: &ConnectOptions,
     storage: &Arc<dyn StorageProvider>,
@@ -757,6 +765,9 @@ fn build_disk_cache(
             InfinoError::Io(e.to_string())
         }
     })?;
+    if options.cache_budget_bytes.is_none() {
+        cache.mark_budget_auto_sized();
+    }
     Ok(Some(cache))
 }
 

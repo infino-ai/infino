@@ -680,7 +680,7 @@ mod tests {
     /// exercise its `TableProvider` metadata methods (`Debug`,
     /// `as_any`, `table_type`) plus the lowered `Bm25Exec`'s `name` /
     /// `Debug` — none of which normal query execution touches.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bm25_table_and_exec_trait_methods() {
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo_corpus();

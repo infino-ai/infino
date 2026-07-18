@@ -11,7 +11,7 @@
 //!      the appropriate `prune_parts_for_*` for its query
 //!      shape.
 //!   2. [`load_kept_parts`] lazy-loads each kept part via
-//!      `Manifest::part(id).await`, in parallel. Already-
+//!      `ManifestSnapshot::part(id).await`, in parallel. Already-
 //!      loaded parts (eager mode, or warm OnceCells) cost
 //!      nothing.
 //!   3. [`flatten_superfiles`] concatenates the loaded parts'

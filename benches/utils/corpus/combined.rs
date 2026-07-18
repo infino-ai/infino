@@ -6,7 +6,10 @@
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::corpus::{DIM, TOKENS_PER_DOC, VOCAB_SIZE, ZipfDistribution, normalize};
+use crate::corpus::{
+    DIM, TEXT_CORPUS_CHUNK_DOCS, TOKENS_PER_DOC, VECTOR_CORPUS_CHUNK_DOCS, VOCAB_SIZE,
+    ZipfDistribution, chunk_seed, normalize,
+};
 
 /// Gaussian scale of a planted cluster center (matches `corpus.rs`).
 const CENTER_GAUSSIAN_SCALE: f32 = 3.0;
@@ -18,9 +21,21 @@ const AVG_BYTES_PER_TOKEN: usize = 8;
 /// Stream the same deterministic synthetic docs as [`super::MmapTextCorpus`] +
 /// [`super::MmapVectorCorpus`], one append chunk at a time.
 ///
-/// Advance docs strictly in order (doc 0, 1, 2, …).
+/// The mmap corpora generate in parallel by drawing each scheduling chunk
+/// from its own [`chunk_seed`]-derived RNG ([`TEXT_CORPUS_CHUNK_DOCS`] docs
+/// per text chunk, [`VECTOR_CORPUS_CHUNK_DOCS`] per vector chunk). To stay
+/// bit-identical, this stream reseeds its per-column RNG at the same chunk
+/// boundaries — otherwise streamed ground truth would grade vectors the
+/// build never ingested.
+///
+/// Advance docs strictly in order (doc 0, 1, 2, …). Column flags passed to
+/// [`Self::fill_chunk_modality`] must stay constant across a scheduling
+/// chunk (all callers fix them for the stream's lifetime): a skipped column
+/// stops advancing its RNG, and only the boundary reseed realigns it.
 pub struct SequentialSyntheticCorpus {
     doc_id: usize,
+    vec_seed: u64,
+    text_seed: u64,
     vec_rng: StdRng,
     text_rng: StdRng,
     centers: Vec<Vec<f32>>,
@@ -30,13 +45,16 @@ pub struct SequentialSyntheticCorpus {
 
 impl SequentialSyntheticCorpus {
     pub fn new(n_cent: usize, vec_seed: u64, text_seed: u64, normalize_vectors: bool) -> Self {
-        let mut vec_rng = StdRng::seed_from_u64(vec_seed);
+        // Centers come from the base seed, exactly as the mmap vector
+        // corpus draws them; per-doc noise/token streams are chunk-seeded
+        // below (the loop reseeds at every chunk boundary, including 0).
+        let mut center_rng = StdRng::seed_from_u64(vec_seed);
         let dist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
             .map(|_| {
                 (0..DIM)
                     .map(|_| {
-                        let s: f64 = dist.sample(&mut vec_rng);
+                        let s: f64 = dist.sample(&mut center_rng);
                         (s as f32) * CENTER_GAUSSIAN_SCALE
                     })
                     .collect()
@@ -44,8 +62,10 @@ impl SequentialSyntheticCorpus {
             .collect();
         Self {
             doc_id: 0,
-            vec_rng,
-            text_rng: StdRng::seed_from_u64(text_seed),
+            vec_seed,
+            text_seed,
+            vec_rng: StdRng::seed_from_u64(chunk_seed(vec_seed, 0)),
+            text_rng: StdRng::seed_from_u64(chunk_seed(text_seed, 0)),
             centers,
             zipf: ZipfDistribution::new(VOCAB_SIZE),
             normalize_vectors,
@@ -88,6 +108,14 @@ impl SequentialSyntheticCorpus {
         for _ in 0..len {
             let doc_id = self.doc_id;
             if gen_text {
+                // Reseed at the parallel text corpus's chunk boundary so the
+                // token stream matches the chunk-seeded mmap writer.
+                if doc_id.is_multiple_of(TEXT_CORPUS_CHUNK_DOCS) {
+                    self.text_rng = StdRng::seed_from_u64(chunk_seed(
+                        self.text_seed,
+                        doc_id / TEXT_CORPUS_CHUNK_DOCS,
+                    ));
+                }
                 let mut doc = String::with_capacity((TOKENS_PER_DOC + 1) * AVG_BYTES_PER_TOKEN);
                 doc.push_str(&format!("doc{doc_id:07}"));
                 for _ in 0..TOKENS_PER_DOC {
@@ -99,6 +127,14 @@ impl SequentialSyntheticCorpus {
             }
 
             if gen_vec {
+                // Same boundary alignment for the vector noise stream
+                // (vector chunks are smaller than text chunks).
+                if doc_id.is_multiple_of(VECTOR_CORPUS_CHUNK_DOCS) {
+                    self.vec_rng = StdRng::seed_from_u64(chunk_seed(
+                        self.vec_seed,
+                        doc_id / VECTOR_CORPUS_CHUNK_DOCS,
+                    ));
+                }
                 let center = &self.centers[doc_id % self.centers.len()];
                 for (j, slot) in row.iter_mut().enumerate() {
                     let s: f64 = dist.sample(&mut self.vec_rng);

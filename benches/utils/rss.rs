@@ -94,6 +94,14 @@ pub fn current_rss_bytes() -> Option<u64> {
 /// pages (the disk-cache mmap on free local NVMe) are excluded.
 pub fn current_anon_rss_bytes() -> Option<u64> {
     purge_allocator();
+    anon_rss_bytes_fast()
+}
+
+/// Anonymous resident bytes from `/proc/self/smaps_rollup` **without**
+/// purging the allocator. Cheap enough for the peak sampler's per-tick
+/// cadence (unlike [`current_anon_rss_bytes`], which purges). `None` when
+/// `smaps_rollup` is unavailable.
+fn anon_rss_bytes_fast() -> Option<u64> {
     let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
     rollup
         .lines()
@@ -108,31 +116,55 @@ pub fn current_anon_rss_bytes() -> Option<u64> {
 /// peak is the max VmRSS observed across the sampler's
 /// lifetime.
 ///
-/// The thread reads `/proc/self/status` at `interval`
-/// cadence. Each read is a ~10 µs syscall — negligible next
-/// to the work the sampler watches.
+/// The thread reads `/proc/self/status` (total) and
+/// `/proc/self/smaps_rollup` (anon) at `interval` cadence.
+/// Each read is a ~10 µs syscall — negligible next to the
+/// work the sampler watches. Cost billing still uses
+/// [`RssStats::peak_rss_bytes`] (total); anon/file peaks are
+/// diagnostic only.
 pub struct PeakSampler {
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Vec<u64>>>,
+    handle: Option<JoinHandle<Vec<(u64, u64)>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct RssStats {
+    /// Peak total VmRSS — what the cost model's RAM-hold leg bills.
     pub peak_rss_bytes: u64,
     pub median_rss_bytes: u64,
     pub p90_rss_bytes: u64,
+    /// Peak anonymous (private heap) RSS over the window — diagnostic
+    /// split vs file-backed mmap / disk-cache pages. Not used for $.
+    pub peak_anon_rss_bytes: u64,
+    /// Peak file-backed resident bytes (`total − anonymous`) over the
+    /// window — diagnostic only.
+    pub peak_file_rss_bytes: u64,
 }
 
 impl RssStats {
-    fn from_samples(mut samples: Vec<u64>) -> Self {
+    /// Build from `(total_rss, anon_rss)` samples. Totals drive
+    /// peak/median/p90 (and cost); anon/file take per-sample maxima.
+    fn from_samples(mut samples: Vec<(u64, u64)>) -> Self {
         if samples.is_empty() {
-            samples.push(current_rss_bytes().unwrap_or(0));
+            samples.push((
+                current_rss_bytes().unwrap_or(0),
+                anon_rss_bytes_fast().unwrap_or(0),
+            ));
         }
-        samples.sort_unstable();
+        let peak_anon = samples.iter().map(|(_, a)| *a).max().unwrap_or(0);
+        let peak_file = samples
+            .iter()
+            .map(|(t, a)| t.saturating_sub(*a))
+            .max()
+            .unwrap_or(0);
+        let mut totals: Vec<u64> = samples.iter().map(|(t, _)| *t).collect();
+        totals.sort_unstable();
         Self {
-            peak_rss_bytes: *samples.last().expect("rss samples is non-empty"),
-            median_rss_bytes: percentile_nearest_rank(&samples, RSS_MEDIAN_PERCENTILE),
-            p90_rss_bytes: percentile_nearest_rank(&samples, RSS_P90_PERCENTILE),
+            peak_rss_bytes: *totals.last().expect("rss samples is non-empty"),
+            median_rss_bytes: percentile_nearest_rank(&totals, RSS_MEDIAN_PERCENTILE),
+            p90_rss_bytes: percentile_nearest_rank(&totals, RSS_P90_PERCENTILE),
+            peak_anon_rss_bytes: peak_anon,
+            peak_file_rss_bytes: peak_file,
         }
     }
 }
@@ -158,7 +190,10 @@ impl PeakSampler {
         // window opens on the process's true working set.
         purge_allocator();
         let stop = Arc::new(AtomicBool::new(false));
-        let initial = current_rss_bytes().unwrap_or(0);
+        let initial = (
+            current_rss_bytes().unwrap_or(0),
+            anon_rss_bytes_fast().unwrap_or(0),
+        );
 
         let stop_t = Arc::clone(&stop);
         let handle = thread::Builder::new()
@@ -167,12 +202,12 @@ impl PeakSampler {
                 let mut samples = vec![initial];
                 while !stop_t.load(Ordering::Acquire) {
                     if let Some(rss) = current_rss_bytes() {
-                        samples.push(rss);
+                        samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
                     }
                     thread::sleep(interval);
                 }
                 if let Some(rss) = current_rss_bytes() {
-                    samples.push(rss);
+                    samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
                 }
                 samples
             })
@@ -192,14 +227,19 @@ impl PeakSampler {
     }
 
     /// Stop the sampler, join the background thread, and return
-    /// peak / median / p90 VmRSS observed over the sampler's lifetime.
+    /// peak / median / p90 total VmRSS plus anon/file peaks.
     pub fn stop_stats(mut self) -> RssStats {
         self.stop.store(true, Ordering::Release);
         let samples = self
             .handle
             .take()
             .and_then(|h| h.join().ok())
-            .unwrap_or_else(|| vec![current_rss_bytes().unwrap_or(0)]);
+            .unwrap_or_else(|| {
+                vec![(
+                    current_rss_bytes().unwrap_or(0),
+                    anon_rss_bytes_fast().unwrap_or(0),
+                )]
+            });
         RssStats::from_samples(samples)
     }
 }
@@ -289,11 +329,20 @@ mod tests {
     /// Pins the seed-with-current behavior in [`PeakSampler::start`].
     #[test]
     fn sampler_returns_at_least_start_rss() {
-        let start_rss = current_rss_bytes();
+        // Match the sampler's own seeding sequence (purge, then read), and
+        // bracket the seed with a second reading taken right after start.
+        // `start()` purges allocator-retained pages before seeding, and
+        // concurrent tests free memory at any time, so a single pre-start
+        // reading can legitimately exceed the seed; the seed is taken
+        // between these two reads, so it is at least their minimum.
+        purge_allocator();
+        let before = current_rss_bytes();
         let s = PeakSampler::start(Duration::from_millis(TEST_SAMPLER_INTERVAL_MS));
+        let after_start = current_rss_bytes();
         let peak = s.stop();
-        if let Some(start) = start_rss {
-            assert!(peak >= start, "peak {peak} < start {start} — seed missing");
+        if let (Some(before), Some(after)) = (before, after_start) {
+            let floor = before.min(after);
+            assert!(peak >= floor, "peak {peak} < floor {floor} — seed missing");
         }
     }
 
@@ -326,9 +375,12 @@ mod tests {
 
     #[test]
     fn rss_stats_use_nearest_rank_percentiles() {
-        let stats = RssStats::from_samples(vec![50, 10, 40, 20, 30]);
+        let stats = RssStats::from_samples(vec![(50, 5), (10, 1), (40, 30), (20, 2), (30, 3)]);
         assert_eq!(stats.peak_rss_bytes, 50);
         assert_eq!(stats.median_rss_bytes, 30);
         assert_eq!(stats.p90_rss_bytes, 50);
+        // Anon/file peaks are diagnostic maxima — not what cost bills.
+        assert_eq!(stats.peak_anon_rss_bytes, 30);
+        assert_eq!(stats.peak_file_rss_bytes, 45);
     }
 }

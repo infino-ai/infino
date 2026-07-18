@@ -73,7 +73,7 @@
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    env, fs,
+    fs,
     fs::File,
     hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -179,9 +179,9 @@ struct FinishProfile {
 }
 
 impl FinishProfile {
-    fn from_env() -> Self {
+    fn from_config() -> Self {
         Self {
-            enabled: env::var_os("INFINO_FTS_PROFILE").is_some(),
+            enabled: crate::config::global().diagnostics.fts_profile,
             ..Self::default()
         }
     }
@@ -1724,7 +1724,7 @@ impl FtsBuilder {
         let mut postings_crc_acc: u32 = 0;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
-        let mut finish_profile = FinishProfile::from_env();
+        let mut finish_profile = FinishProfile::from_config();
 
         // The in-RAM path's FST sink: collect (key, value) into a
         // `DictBuilder` and serialise once at assembly time. No
@@ -1857,7 +1857,7 @@ impl FtsBuilder {
         let mut postings_crc_acc: u32 = 0;
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
         let mut term_scratch = TermScratch::default();
-        let mut finish_profile = FinishProfile::from_env();
+        let mut finish_profile = FinishProfile::from_config();
 
         // Streaming FST: bytes flow to a scratch file as we insert
         // sorted keys, so the FST never lives in RAM in full.

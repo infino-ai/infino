@@ -7,8 +7,8 @@
 //! of the supertable: a reader pinned at time `t` continues to see
 //! the manifest as it existed at `t` for the lifetime of that
 //! reader, regardless of how many writer commits land afterwards.
-//! The mechanism is `ArcSwap<Manifest>` for lock-free swap-on-
-//! commit + `Arc<Manifest>` snapshot pinning at `Supertable::reader`
+//! The mechanism is `ArcSwap<ManifestSnapshot>` for lock-free swap-on-
+//! commit + `Arc<ManifestSnapshot>` snapshot pinning at `Supertable::reader`
 //! time.
 //!
 //! ## What's asserted
@@ -23,11 +23,11 @@
 //! 3. **Snapshot stability under concurrent commits.** While the
 //!    writer is committing, repeatedly polling a *single* pinned
 //!    reader observes a stable `manifest_id`. The reader's
-//!    `Arc<Manifest>` is the immutable point-in-time view; no
+//!    `Arc<ManifestSnapshot>` is the immutable point-in-time view; no
 //!    writer activity changes it.
 //!
 //! 4. **Arc identity sharing.** Two readers obtained between the
-//!    same two commits hold the same `Arc<Manifest>` pointer
+//!    same two commits hold the same `Arc<ManifestSnapshot>` pointer
 //!    (`Arc::ptr_eq`) — one allocation per commit, N+1 ref count
 //!    for N concurrent readers.
 //!
@@ -194,7 +194,7 @@ fn concurrent_readers_at_same_commit_share_arc_pointer() {
 
     // 4 reader threads, all racing to pin AFTER c1 but before any
     // further commit (none happens). All 4 should hold the same
-    // Arc<Manifest>.
+    // Arc<ManifestSnapshot>.
     let barrier = Arc::new(Barrier::new(CONTENDER_THREADS));
     let st = Arc::new(st);
     let mut handles = Vec::new();

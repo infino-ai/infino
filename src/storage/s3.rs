@@ -34,7 +34,10 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
+    retry,
+};
 
 /// Config key written by [`S3StorageProvider::new_with_endpoint`] to point
 /// at a custom endpoint. Detection accepts any object_store alias (see
@@ -266,6 +269,7 @@ impl StorageProvider for S3StorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -275,9 +279,10 @@ impl StorageProvider for S3StorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
+        let tl = crate::storage::io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        retry::with_reissue(|| async {
+        let out = retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
@@ -287,7 +292,12 @@ impl StorageProvider for S3StorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
         })
-        .await
+        .await;
+        if let Ok((b, _)) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+        }
+        out
     }
 
     async fn get_if_none_match(
@@ -325,13 +335,20 @@ impl StorageProvider for S3StorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        retry::complete_range(uri, range, |r| async {
+        let off = range.start;
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
                 .await
                 .map_err(|e| translate(uri, e))
         })
-        .await
+        .await;
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+        }
+        out
     }
 
     /// Tail-fetch path: — single-RTT tail fetch via S3's native
@@ -353,7 +370,8 @@ impl StorageProvider for S3StorageProvider {
             return Ok((Bytes::new(), meta.size));
         }
         let path = self.path(uri)?;
-        retry::with_reissue(|| async {
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::with_reissue(|| async {
             let opts = GetOptions {
                 range: Some(GetRange::Suffix(len)),
                 ..Default::default()
@@ -367,15 +385,26 @@ impl StorageProvider for S3StorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, size))
         })
-        .await
+        .await;
+        if let Ok((b, size)) = &out {
+            crate::storage::io_counters::timeline_record(
+                "tail",
+                uri,
+                size.saturating_sub(b.len() as u64),
+                b.len() as u64,
+                tl,
+            );
+        }
+        out
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
+        let n = bytes.len() as u64;
         // Re-issue transient failures like the read paths. Only
         // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` still
         // surfaces immediately; a create-only PUT that never landed is safe to retry.
-        retry::with_reissue(|| {
+        let out = retry::with_reissue(|| {
             let bytes = bytes.clone();
             async {
                 let opts = PutOptions {
@@ -389,7 +418,11 @@ impl StorageProvider for S3StorageProvider {
                     .map_err(|e| translate(uri, e))
             }
         })
-        .await
+        .await;
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -421,11 +454,17 @@ impl StorageProvider for S3StorageProvider {
                 ..Default::default()
             },
         };
-        self.store
+        let n = bytes.len() as u64;
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
@@ -438,6 +477,7 @@ impl StorageProvider for S3StorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
+        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -449,12 +489,14 @@ impl StorageProvider for S3StorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        let path = ObjPath::from(prefix);
+        crate::storage::io_counters::record_list();
+        let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            let location = meta.location.to_string();
             out.push((
-                meta.location.to_string(),
+                logical_list_key(&self.prefix, &location),
                 ObjectMeta {
                     size: meta.size,
                     etag: meta.e_tag,
@@ -656,9 +698,9 @@ mod tests {
     #[test]
     fn path_parses_nested_uri() {
         let p = endpoint_provider()
-            .path("manifest-lists/list-000042.json")
+            .path("manifest/manifest-000042.json")
             .expect("parse");
-        assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
+        assert_eq!(p.to_string(), "manifest/manifest-000042.json");
     }
 
     // ---- constructors --------------------------------------------------
@@ -827,6 +869,55 @@ mod tests {
         // not asserted here — the chained-token step is what matters.
         let (p, _guard) = harness_provider().await;
         crate::test_helpers::cas_conformance::cas_conformance(&p, "cas/conf", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_if_none_match_returns_body_on_etag_mismatch() {
+        let (p, _guard) = harness_provider().await;
+        let body = Bytes::from_static(b"conditional-v1");
+        let etag = p.put_atomic("k/cond", body.clone()).await.expect("put");
+
+        // A non-matching etag always returns the full body + metadata,
+        // regardless of whether the backend implements If-None-Match.
+        let (got, meta) = p
+            .get_if_none_match("k/cond", "\"does-not-match\"")
+            .await
+            .expect("conditional get")
+            .expect("mismatched etag returns the object");
+        assert_eq!(&got[..], &body[..]);
+        assert!(meta.etag.is_some(), "etag surfaced from the response");
+
+        // With the object's own etag: a backend honoring If-None-Match answers
+        // 304 (None); one that ignores it returns the body. Accept either, but
+        // require correctness in the returned-body case.
+        if let Some(etag) = etag {
+            match p
+                .get_if_none_match("k/cond", &etag)
+                .await
+                .expect("cond get")
+            {
+                None => {}
+                Some((b, _)) => assert_eq!(&b[..], &body[..]),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_multipart_round_trips_a_single_part() {
+        use object_store::PutPayload;
+        let (p, _guard) = harness_provider().await;
+        let body = Bytes::from(vec![0x5Au8; 4096]);
+        let mut upload = p
+            .put_multipart("k/multi.bin")
+            .await
+            .expect("start multipart upload");
+        upload
+            .put_part(PutPayload::from(body.clone()))
+            .await
+            .expect("upload part");
+        upload.complete().await.expect("complete multipart");
+        let (got, _) = p.get("k/multi.bin").await.expect("get multipart object");
+        assert_eq!(&got[..], &body[..], "multipart upload round-trips");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

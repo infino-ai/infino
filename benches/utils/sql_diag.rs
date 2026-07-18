@@ -64,7 +64,8 @@ use infino::{
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
 };
-use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use rayon::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -82,9 +83,9 @@ const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
 const TABLE: &str = "supertable";
 
 /// One SQL shape exercised across every path. `raw_cols` are the
-/// 0-based column indices in the baseline Parquet body (`title`=0,
-/// `category`=1, `rating`=2) the raw decoder must read; `keep` decides
-/// which decoded rows survive for the by-hand floor.
+/// 0-based column indices in Infino's actual Parquet body (`_id`=0,
+/// `title`=1, `category`=2, `rating`=3) the raw decoder must read; `keep`
+/// decides which decoded rows survive for the by-hand floor.
 struct Shape {
     name: &'static str,
     sql: &'static str,
@@ -96,19 +97,19 @@ const SHAPES: &[Shape] = &[
     Shape {
         name: "scan_all",
         sql: "SELECT title FROM supertable",
-        raw_cols: &[0],
+        raw_cols: &[1],
         keep: |_, _| true,
     },
     Shape {
         name: "filter_category",
         sql: "SELECT title FROM supertable WHERE category = 'rust'",
-        raw_cols: &[0, 1],
+        raw_cols: &[1, 2],
         keep: |c, _| c == "rust",
     },
     Shape {
         name: "filter_rating",
         sql: "SELECT title FROM supertable WHERE rating < 10",
-        raw_cols: &[0, 2],
+        raw_cols: &[1, 3],
         keep: |_, r| r < 10,
     },
 ];
@@ -158,16 +159,6 @@ fn chunk_batch(rows: &[(u64, &str)]) -> RecordBatch {
     .expect("chunk batch")
 }
 
-fn batch_to_parquet(batch: &RecordBatch) -> Bytes {
-    let mut buf = Vec::new();
-    {
-        let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), None).expect("parquet writer");
-        w.write(batch).expect("write batch");
-        w.close().expect("close writer");
-    }
-    Bytes::from(buf)
-}
-
 fn percentile(samples: &mut [Duration], p: usize) -> Duration {
     if samples.is_empty() {
         return Duration::ZERO;
@@ -207,46 +198,49 @@ fn time_path(iters: usize, mut f: impl FnMut() -> usize) -> (Duration, Duration,
 /// is projected (no filter columns) the per-row predicate is skipped
 /// entirely, matching a filterless scan.
 fn raw_decode(superfiles: &[Bytes], cols: &[usize], keep: fn(&str, i64) -> bool) -> usize {
-    let mut kept = 0usize;
-    for bytes in superfiles {
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).expect("parquet builder");
-        let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
-        let reader = builder.with_projection(mask).build().expect("reader");
-        for batch in reader {
-            let batch = batch.expect("batch");
-            let n = batch.num_rows();
-            // Locate the filter columns within the *projected* batch by
-            // name; absent ⇒ that predicate input wasn't projected, so
-            // there is no filter on it (e.g. scan_all projects title only).
-            let cat = batch.schema().index_of("category").ok().map(|i| {
-                batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .expect("category LargeUtf8")
-            });
-            let rating = batch.schema().index_of("rating").ok().map(|i| {
-                batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("rating Int64")
-            });
-            if cat.is_none() && rating.is_none() {
-                kept += n; // filterless scan
-                continue;
-            }
-            for r in 0..n {
-                let c = cat.map(|a| a.value(r)).unwrap_or("");
-                let rt = rating.map(|a| a.value(r)).unwrap_or(0);
-                if keep(c, rt) {
-                    kept += 1;
+    superfiles
+        .par_iter()
+        .map(|bytes| {
+            let mut kept = 0usize;
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).expect("parquet builder");
+            let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
+            let reader = builder.with_projection(mask).build().expect("reader");
+            for batch in reader {
+                let batch = batch.expect("batch");
+                let n = batch.num_rows();
+                // Locate the filter columns within the *projected* batch by
+                // name; absent ⇒ that predicate input wasn't projected, so
+                // there is no filter on it (e.g. scan_all projects title only).
+                let cat = batch.schema().index_of("category").ok().map(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("category LargeUtf8")
+                });
+                let rating = batch.schema().index_of("rating").ok().map(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("rating Int64")
+                });
+                if cat.is_none() && rating.is_none() {
+                    kept += n;
+                    continue;
+                }
+                for row in 0..n {
+                    let category = cat.map(|array| array.value(row)).unwrap_or("");
+                    let rating = rating.map(|array| array.value(row)).unwrap_or(0);
+                    if keep(category, rating) {
+                        kept += 1;
+                    }
                 }
             }
-        }
-    }
-    kept
+            kept
+        })
+        .sum()
 }
 
 fn count_rows(batches: &[RecordBatch]) -> usize {
@@ -277,12 +271,6 @@ pub fn run() {
     let corpus = MmapTextCorpus::generate(n, 1);
     let corpus_rows = corpus.rows();
     let batches: Vec<RecordBatch> = corpus_rows.chunks(WRITE_CHUNK).map(chunk_batch).collect();
-    let superfiles: Vec<Bytes> = batches.iter().map(batch_to_parquet).collect();
-    eprintln!(
-        "[sql-diag] {} superfile(s), {:.1} MiB parquet total",
-        batches.len(),
-        superfiles.iter().map(|b| b.len()).sum::<usize>() as f64 / (1024.0 * 1024.0)
-    );
 
     // ── infino Supertable (scalar + FTS), committed per chunk. ───────
     eprintln!("[sql-diag] building infino supertable...");
@@ -298,6 +286,27 @@ pub fn run() {
     eprintln!(
         "[sql-diag] supertable built in {:.1}s",
         build_t0.elapsed().as_secs_f64()
+    );
+    let reader = table.reader();
+    let manifest = reader.manifest();
+    let superfiles: Vec<Bytes> = manifest
+        .superfiles
+        .iter()
+        .map(|entry| {
+            manifest
+                .options
+                .store
+                .reader(&entry.uri)
+                .expect("in-memory superfile reader")
+                .parquet_bytes()
+                .cloned()
+                .expect("in-memory reader carries complete bytes")
+        })
+        .collect();
+    eprintln!(
+        "[sql-diag] {} Infino superfile(s), {:.1} MiB total",
+        superfiles.len(),
+        superfiles.iter().map(Bytes::len).sum::<usize>() as f64 / (1024.0 * 1024.0)
     );
 
     // Spill superfiles to a temp dir for the vanilla-DataFusion baseline.

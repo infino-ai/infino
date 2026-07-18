@@ -49,6 +49,8 @@
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
+use crate::config;
+
 /// Multiplier on a column's IVF centroid count to size its k-means
 /// training sample. Slightly above the FAISS-empirical 30–60× sweet
 /// spot for IVF training, picked for recall headroom.
@@ -82,9 +84,31 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
     target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
 }
 
+/// K-means training sample for a **per-partition sub-build** (the drain's
+/// per-cell IVF build): purely *points per centroid* (`mult × n_cent`), floored
+/// at one `mult` for tiny `n_cent` and sharing the upper cap; the caller bounds
+/// it by the row count (`.min(n_docs)`).
+///
+/// Unlike [`default_kmeans_sample_size`] there is no absolute representativeness
+/// floor — that floor suits the global build over the whole corpus, whereas a
+/// per-cell sub-build trains a few sub-centroids over one cell, so the sample
+/// need only scale with the sub-cluster count. `mult` is sourced from
+/// `vector.kmeans_pts_per_centroid` (falling back to the built-in default when
+/// it is set to zero).
+pub fn partition_kmeans_sample_size(n_cent: usize) -> usize {
+    let configured = config::global().vector.kmeans_pts_per_centroid;
+    let mult = if configured > 0 {
+        configured
+    } else {
+        KMEANS_SAMPLE_NCENT_MULT
+    };
+    mult.saturating_mul(n_cent)
+        .clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
+}
+
 /// Online reservoir for f32 vector samples.
 ///
-/// One instance per vector column in `VectorBuilder`. Holds at
+/// One instance per logical vector index in `VectorBuilder`. Holds at
 /// most `sample_size` vectors as contiguous f32s in a single
 /// `Vec<f32>` of capacity `sample_size × dim`. Update cost is
 /// O(1) while the reservoir is filling and O(1) amortized once

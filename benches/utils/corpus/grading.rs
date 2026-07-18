@@ -1,411 +1,471 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Recall grading for supertable vector benches: queries + brute-force top-k.
+//! Cached exact recall labels for the supertable vector lifecycle.
 //!
-//! Does **not** mmap the full corpus. Regenerates the same synthetic stream as
-//! ingest ([`SequentialSyntheticCorpus`]), collects query seeds, then one streaming
-//! pass over all docs with a per-query top-k heap. Optionally caches the small
-//! result (~120 queries + top-k ids) to a temp file for faster re-runs.
+//! One document-major pass computes the base, filtered, and post-delta
+//! top-k labels together. The result is tiny and deterministic, so subsequent
+//! runs load it from `TMPDIR` instead of rescanning the corpus.
 
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
-    fs,
-    path::PathBuf,
-    sync::OnceLock,
+    env, fs,
+    io::{Error, ErrorKind, Result},
+    path::{Path, PathBuf},
+    process,
+    time::Instant,
 };
 
-use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, StandardNormal};
+use crate::corpus::{self, DIM, LifecycleGroundTruth};
 
-use crate::corpus::{self, DIM, SUPERTABLE_DOCS, SequentialSyntheticCorpus, normalize};
+const CACHE_MAGIC: &[u8; 8] = b"INFLGT02";
+const CACHE_VERSION: u32 = 2;
+/// Existing lifecycle oracle loaded without fallback or recomputation.
+const GROUND_TRUTH_PATH_ENV: &str = "INFINO_BENCH_VECTOR_GROUND_TRUTH_PATH";
+/// FNV-1a offset basis used only for deterministic cache filenames.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a prime used only for deterministic cache filenames.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-const MAGIC: &[u8; 8] = b"INFBENCH";
-const CACHE_VERSION: u32 = 1;
-
-const VEC_SEED: u64 = 1;
-const TEXT_SEED: u64 = 1;
-
-const CORRECTNESS_QUERY_SEED: u64 = 17;
-const CALIBRATION_QUERY_SEED: u64 = 99;
-const QUERY_SIGMA: f32 = 0.05;
-
-const N_CORRECTNESS_QUERIES: usize = 20;
-const N_CALIBRATION_QUERIES: usize = 100;
-const TOP_K: usize = 10;
-
-/// Coprime stride spreading query base docs across the corpus
-/// (matches `corpus.rs`).
-const QUERY_BASE_DOC_STRIDE: usize = 7919;
-/// Doc count streamed per chunk when collecting vectors / computing
-/// ground truth.
-const STREAM_CHUNK_SIZE: usize = 65_536;
-
-/// Cached queries + ground truth for vector search benches.
-pub struct SupertableGrading {
-    pub correctness_queries: Vec<Vec<f32>>,
-    pub correctness_gt: Vec<Vec<u32>>,
-    pub calibration_queries: Vec<Vec<f32>>,
-    pub calibration_gt: Vec<Vec<u32>>,
+/// Inputs that define one exact lifecycle oracle.
+pub struct LifecycleGradingOptions<'a> {
+    pub vectors: &'a [f32],
+    pub n_docs: usize,
+    pub augmented_docs: usize,
+    pub corpus_seed: u64,
+    pub normalized_vectors: bool,
+    pub filter_keep_every: usize,
+    pub top_k: usize,
+    pub correctness_query_count: usize,
+    pub queries: &'a [Vec<f32>],
 }
 
-static GRADING: OnceLock<SupertableGrading> = OnceLock::new();
-
-pub const SUPERTABLE_N_DOCS: usize = SUPERTABLE_DOCS;
-pub const VECTOR_DIM: usize = DIM;
-
-pub fn supertable_grading() -> &'static SupertableGrading {
-    GRADING.get_or_init(|| {
-        eprintln!(
-            "[grading] building query set + brute-force top-{TOP_K} (streamed, no full-corpus mmap)..."
-        );
-        let t0 = std::time::Instant::now();
-        let g = load_or_compute(SUPERTABLE_DOCS);
-        eprintln!(
-            "[grading] OK: {} correctness + {} calibration queries ({:.1}s)",
-            g.correctness_queries.len(),
-            g.calibration_queries.len(),
-            t0.elapsed().as_secs_f64()
-        );
-        g
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheKey {
+    n_docs: u64,
+    augmented_docs: u64,
+    dim: u64,
+    n_cent: u64,
+    corpus_seed: u64,
+    normalized_vectors: bool,
+    filter_keep_every: u64,
+    top_k: u64,
+    correctness_query_count: u64,
+    query_count: u64,
 }
 
-pub fn realistic_queries(n_docs: usize, n_queries: usize, seed: u64, sigma: f32) -> Vec<Vec<f32>> {
-    let bases: HashSet<usize> = query_base_doc_ids(n_docs, n_queries).into_iter().collect();
-    let base_vectors = collect_doc_vectors(n_docs, &bases);
-    build_queries_from_bases(n_docs, n_queries, seed, sigma, &base_vectors)
-}
-
-pub fn ground_truth(n_docs: usize, queries: &[Vec<f32>], top_k: usize) -> Vec<Vec<u32>> {
-    streaming_ground_truth(n_docs, queries, top_k)
-}
-
-fn load_or_compute(n_docs: usize) -> SupertableGrading {
-    let path = cache_path(n_docs);
-    if let Ok(g) = read_cache(&path, n_docs) {
-        eprintln!("[grading] loaded cached labels from {}", path.display());
-        return g;
-    }
-    let g = compute(n_docs);
-    if let Err(e) = write_cache(&path, n_docs, &g) {
-        eprintln!("[grading] cache write skipped: {e}");
-    } else {
-        eprintln!("[grading] wrote cache {}", path.display());
-    }
-    g
-}
-
-fn compute(n_docs: usize) -> SupertableGrading {
-    let corr_bases = query_base_doc_ids(n_docs, N_CORRECTNESS_QUERIES);
-    let cal_bases = query_base_doc_ids(n_docs, N_CALIBRATION_QUERIES);
-    let all_bases: HashSet<usize> = corr_bases.iter().chain(cal_bases.iter()).copied().collect();
-
-    let base_vectors = collect_doc_vectors(n_docs, &all_bases);
-
-    let correctness_queries = build_queries_from_bases(
-        n_docs,
-        N_CORRECTNESS_QUERIES,
-        CORRECTNESS_QUERY_SEED,
-        QUERY_SIGMA,
-        &base_vectors,
-    );
-    let calibration_queries = build_queries_from_bases(
-        n_docs,
-        N_CALIBRATION_QUERIES,
-        CALIBRATION_QUERY_SEED,
-        QUERY_SIGMA,
-        &base_vectors,
-    );
-
-    let mut all_queries = correctness_queries.clone();
-    all_queries.extend(calibration_queries.clone());
-    let all_gt = streaming_ground_truth(n_docs, &all_queries, TOP_K);
-
-    let n_corr = N_CORRECTNESS_QUERIES;
-    SupertableGrading {
-        correctness_gt: all_gt[..n_corr].to_vec(),
-        calibration_gt: all_gt[n_corr..].to_vec(),
-        correctness_queries,
-        calibration_queries,
-    }
-}
-
-fn query_base_doc_ids(n_docs: usize, n_queries: usize) -> Vec<usize> {
-    (0..n_queries)
-        .map(|i| (i * QUERY_BASE_DOC_STRIDE) % n_docs)
-        .collect()
-}
-
-fn build_queries_from_bases(
-    n_docs: usize,
-    n_queries: usize,
-    seed: u64,
-    sigma: f32,
-    base_vectors: &HashMap<usize, Vec<f32>>,
-) -> Vec<Vec<f32>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let dist = StandardNormal;
-    let mut out = Vec::with_capacity(n_queries);
-    for i in 0..n_queries {
-        let base_idx = (i * QUERY_BASE_DOC_STRIDE) % n_docs;
-        let base = base_vectors
-            .get(&base_idx)
-            .unwrap_or_else(|| panic!("missing base vector for doc {base_idx}"));
-        let mut q: Vec<f32> = (0..DIM)
-            .map(|d| {
-                let s: f64 = dist.sample(&mut rng);
-                base[d] + (s as f32) * sigma
-            })
-            .collect();
-        normalize(&mut q);
-        out.push(q);
-    }
-    out
-}
-
-/// Stream the synthetic corpus once and retain vectors for the listed doc ids.
-fn collect_doc_vectors(n_docs: usize, doc_ids: &HashSet<usize>) -> HashMap<usize, Vec<f32>> {
-    let n_cent = corpus::n_cent(n_docs);
-    let mut synth = SequentialSyntheticCorpus::new(n_cent, VEC_SEED, TEXT_SEED, true);
-    let mut titles = Vec::new();
-    let mut flat = Vec::new();
-    let chunk_size = STREAM_CHUNK_SIZE.min(n_docs.max(1));
-    let mut found = HashMap::with_capacity(doc_ids.len());
-    let mut doc_id = 0usize;
-
-    while doc_id < n_docs && found.len() < doc_ids.len() {
-        let len = chunk_size.min(n_docs - doc_id);
-        synth.fill_chunk(len, &mut titles, &mut flat);
-        for local in 0..len {
-            let id = doc_id + local;
-            if doc_ids.contains(&id) {
-                let off = local * DIM;
-                found.insert(id, flat[off..off + DIM].to_vec());
-            }
+impl CacheKey {
+    fn from_options(options: &LifecycleGradingOptions<'_>) -> Self {
+        Self {
+            n_docs: options.n_docs as u64,
+            augmented_docs: options.augmented_docs as u64,
+            dim: DIM as u64,
+            n_cent: corpus::n_cent(options.n_docs) as u64,
+            corpus_seed: options.corpus_seed,
+            normalized_vectors: options.normalized_vectors,
+            filter_keep_every: options.filter_keep_every as u64,
+            top_k: options.top_k as u64,
+            correctness_query_count: options.correctness_query_count as u64,
+            query_count: options.queries.len() as u64,
         }
-        doc_id += len;
     }
+}
+
+/// Load exact lifecycle labels from the deterministic cache, or compute and
+/// atomically publish them when this corpus/query shape has not been graded.
+pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> LifecycleGroundTruth {
+    validate_options(&options);
+    let key = CacheKey::from_options(&options);
+    if let Some(path) = env::var_os(GROUND_TRUTH_PATH_ENV).map(PathBuf::from) {
+        let labels = read_cache(&path, key, options.queries).unwrap_or_else(|error| {
+            panic!(
+                "failed to load or validate {GROUND_TRUTH_PATH_ENV}={}: {error}",
+                path.display()
+            )
+        });
+        eprintln!(
+            "[vector ground truth] loaded exact lifecycle oracle from {}",
+            path.display()
+        );
+        return labels;
+    }
+
+    let path = cache_path(&key, options.queries);
+    match read_cache(&path, key, options.queries) {
+        Ok(labels) => {
+            eprintln!(
+                "[vector ground truth] loaded exact lifecycle oracle from {}",
+                path.display()
+            );
+            return labels;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!(
+                "[vector ground truth] ignoring stale cache {}: {error}",
+                path.display()
+            );
+        }
+    }
+
     assert_eq!(
-        found.len(),
-        doc_ids.len(),
-        "streamed corpus missing some base doc vectors"
+        options.vectors.len(),
+        options.augmented_docs * DIM,
+        "cannot recompute lifecycle ground truth from a base-only vector corpus; \
+         set {GROUND_TRUTH_PATH_ENV} to a valid existing oracle cache"
     );
-    found
-}
-
-/// One pass over all docs; maintain top-k largest dot product per query.
-fn streaming_ground_truth(n_docs: usize, queries: &[Vec<f32>], k: usize) -> Vec<Vec<u32>> {
-    let n_cent = corpus::n_cent(n_docs);
-    let mut synth = SequentialSyntheticCorpus::new(n_cent, VEC_SEED, TEXT_SEED, true);
-    let mut heaps: Vec<BinaryHeap<Reverse<Hit>>> =
-        queries.iter().map(|_| BinaryHeap::new()).collect();
-    let mut titles = Vec::new();
-    let mut flat = Vec::new();
-    let chunk_size = STREAM_CHUNK_SIZE.min(n_docs.max(1));
-    let mut doc_id = 0usize;
-
-    while doc_id < n_docs {
-        let len = chunk_size.min(n_docs - doc_id);
-        synth.fill_chunk(len, &mut titles, &mut flat);
-        for (qi, q) in queries.iter().enumerate() {
-            let heap = &mut heaps[qi];
-            for local in 0..len {
-                let off = local * DIM;
-                let mut dot = 0f32;
-                for d in 0..DIM {
-                    dot += flat[off + d] * q[d];
-                }
-                let global = (doc_id + local) as u32;
-                if heap.len() < k {
-                    heap.push(Reverse(Hit(dot, global)));
-                } else if let Some(Reverse(worst)) = heap.peek()
-                    && dot > worst.0
-                {
-                    heap.pop();
-                    heap.push(Reverse(Hit(dot, global)));
-                }
-            }
-        }
-        doc_id += len;
+    eprintln!(
+        "[vector ground truth] computing one exact pass over {} docs for {} queries...",
+        options.augmented_docs,
+        options.queries.len()
+    );
+    let started = Instant::now();
+    let labels = corpus::lifecycle_ground_truth(
+        options.vectors,
+        options.n_docs,
+        options.augmented_docs,
+        options.queries,
+        options.correctness_query_count,
+        options.filter_keep_every,
+        options.top_k,
+    );
+    match write_cache(&path, key, options.queries, &labels) {
+        Ok(()) => eprintln!(
+            "[vector ground truth] cached exact lifecycle oracle at {} ({:.1}s)",
+            path.display(),
+            started.elapsed().as_secs_f64()
+        ),
+        Err(error) => eprintln!(
+            "[vector ground truth] cache write skipped for {}: {error}",
+            path.display()
+        ),
     }
-
-    heaps
-        .into_iter()
-        .map(|mut h| {
-            let mut v: Vec<(f32, u32)> = h.drain().map(|Reverse(Hit(dot, id))| (dot, id)).collect();
-            v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            v.truncate(k);
-            v.into_iter().map(|(_, id)| id).collect()
-        })
-        .collect()
+    labels
 }
 
-#[derive(PartialEq)]
-struct Hit(f32, u32);
-
-impl Eq for Hit {}
-
-impl PartialOrd for Hit {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+fn validate_options(options: &LifecycleGradingOptions<'_>) {
+    assert!(options.n_docs > 0);
+    assert!(options.n_docs <= options.augmented_docs);
+    assert!(
+        options.vectors.len() == options.n_docs * DIM
+            || options.vectors.len() == options.augmented_docs * DIM,
+        "lifecycle vector corpus must contain either the base or augmented row count"
+    );
+    assert!(options.filter_keep_every > 0);
+    assert!(options.top_k > 0);
+    assert!(options.correctness_query_count <= options.queries.len());
+    for query in options.queries {
+        assert_eq!(query.len(), DIM);
     }
 }
 
-impl Ord for Hit {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
-fn cache_path(n_docs: usize) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "infino_supertable_grading_v{CACHE_VERSION}_{n_docs}_{VEC_SEED}_{TEXT_SEED}.bin"
+fn cache_path(key: &CacheKey, queries: &[Vec<f32>]) -> PathBuf {
+    let fingerprint = cache_fingerprint(key, queries);
+    env::temp_dir().join(format!(
+        "infino_vector_lifecycle_gt_v{CACHE_VERSION}_{}_{}_{fingerprint:016x}.bin",
+        key.n_docs, key.augmented_docs
     ))
 }
 
-fn write_cache(path: &PathBuf, n_docs: usize, g: &SupertableGrading) -> std::io::Result<()> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-    buf.extend_from_slice(&(n_docs as u64).to_le_bytes());
-    push_queries(&mut buf, &g.correctness_queries);
-    push_gt(&mut buf, &g.correctness_gt);
-    push_queries(&mut buf, &g.calibration_queries);
-    push_gt(&mut buf, &g.calibration_gt);
-    fs::write(path, buf)
+fn cache_fingerprint(key: &CacheKey, queries: &[Vec<f32>]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for value in [
+        key.n_docs,
+        key.augmented_docs,
+        key.dim,
+        key.n_cent,
+        key.corpus_seed,
+        u64::from(key.normalized_vectors),
+        key.filter_keep_every,
+        key.top_k,
+        key.correctness_query_count,
+        key.query_count,
+    ] {
+        hash_bytes(&mut hash, &value.to_le_bytes());
+    }
+    for query in queries {
+        for value in query {
+            hash_bytes(&mut hash, &value.to_bits().to_le_bytes());
+        }
+    }
+    hash
 }
 
-fn read_cache(path: &PathBuf, n_docs: usize) -> std::io::Result<SupertableGrading> {
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn write_cache(
+    path: &Path,
+    key: CacheKey,
+    queries: &[Vec<f32>],
+    labels: &LifecycleGroundTruth,
+) -> Result<()> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CACHE_MAGIC);
+    bytes.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+    push_key(&mut bytes, key);
+    push_queries(&mut bytes, queries);
+    push_ground_truth(&mut bytes, &labels.base, key.top_k as usize);
+    push_ground_truth(&mut bytes, &labels.filtered, key.top_k as usize);
+    push_ground_truth(&mut bytes, &labels.augmented, key.top_k as usize);
+
+    let temporary = path.with_extension(format!("{}.tmp", process::id()));
+    fs::write(&temporary, bytes)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn read_cache(
+    path: &Path,
+    expected_key: CacheKey,
+    expected_queries: &[Vec<f32>],
+) -> Result<LifecycleGroundTruth> {
     let bytes = fs::read(path)?;
-    let mut cursor = &bytes[..];
-    let mut magic = [0u8; 8];
+    let mut cursor = bytes.as_slice();
+    let mut magic = [0u8; CACHE_MAGIC.len()];
     read_exact(&mut cursor, &mut magic)?;
-    if &magic != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad grading cache magic",
-        ));
+    if &magic != CACHE_MAGIC {
+        return invalid_data("bad lifecycle ground-truth cache magic");
     }
-    let version = read_u32(&mut cursor)?;
-    if version != CACHE_VERSION {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "grading cache version mismatch",
-        ));
+    if read_u32(&mut cursor)? != CACHE_VERSION {
+        return invalid_data("lifecycle ground-truth cache version mismatch");
     }
-    let stored_docs = read_u64(&mut cursor)? as usize;
-    if stored_docs != n_docs {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "grading cache n_docs mismatch",
-        ));
+    if pull_key(&mut cursor)? != expected_key {
+        return invalid_data("lifecycle ground-truth cache key mismatch");
     }
-    Ok(SupertableGrading {
-        correctness_queries: pull_queries(&mut cursor)?,
-        correctness_gt: pull_gt(&mut cursor)?,
-        calibration_queries: pull_queries(&mut cursor)?,
-        calibration_gt: pull_gt(&mut cursor)?,
+    validate_queries(&mut cursor, expected_queries)?;
+    let top_k = expected_key.top_k as usize;
+    let base = pull_ground_truth(&mut cursor, expected_queries.len(), top_k)?;
+    let correctness = expected_key.correctness_query_count as usize;
+    let filtered = pull_ground_truth(&mut cursor, correctness, top_k)?;
+    let augmented = pull_ground_truth(&mut cursor, correctness, top_k)?;
+    if !cursor.is_empty() {
+        return invalid_data("lifecycle ground-truth cache has trailing bytes");
+    }
+    Ok(LifecycleGroundTruth {
+        base,
+        filtered,
+        augmented,
     })
 }
 
-fn push_queries(buf: &mut Vec<u8>, queries: &[Vec<f32>]) {
-    buf.extend_from_slice(&(queries.len() as u32).to_le_bytes());
-    for q in queries {
-        assert_eq!(q.len(), DIM);
-        for &v in q {
-            buf.extend_from_slice(&v.to_le_bytes());
+fn push_key(bytes: &mut Vec<u8>, key: CacheKey) {
+    for value in [
+        key.n_docs,
+        key.augmented_docs,
+        key.dim,
+        key.n_cent,
+        key.corpus_seed,
+        key.filter_keep_every,
+        key.top_k,
+        key.correctness_query_count,
+        key.query_count,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.push(u8::from(key.normalized_vectors));
+}
+
+fn pull_key(cursor: &mut &[u8]) -> Result<CacheKey> {
+    Ok(CacheKey {
+        n_docs: read_u64(cursor)?,
+        augmented_docs: read_u64(cursor)?,
+        dim: read_u64(cursor)?,
+        n_cent: read_u64(cursor)?,
+        corpus_seed: read_u64(cursor)?,
+        filter_keep_every: read_u64(cursor)?,
+        top_k: read_u64(cursor)?,
+        correctness_query_count: read_u64(cursor)?,
+        query_count: read_u64(cursor)?,
+        normalized_vectors: read_u8(cursor)? != 0,
+    })
+}
+
+fn push_queries(bytes: &mut Vec<u8>, queries: &[Vec<f32>]) {
+    bytes.extend_from_slice(&(queries.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&(DIM as u64).to_le_bytes());
+    for query in queries {
+        for value in query {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
 }
 
-fn push_gt(buf: &mut Vec<u8>, gt: &[Vec<u32>]) {
-    buf.extend_from_slice(&(gt.len() as u32).to_le_bytes());
-    for row in gt {
-        assert_eq!(row.len(), TOP_K);
-        for &id in row {
-            buf.extend_from_slice(&id.to_le_bytes());
+fn validate_queries(cursor: &mut &[u8], expected: &[Vec<f32>]) -> Result<()> {
+    if read_u64(cursor)? as usize != expected.len() || read_u64(cursor)? as usize != DIM {
+        return invalid_data("lifecycle ground-truth cache query shape mismatch");
+    }
+    for query in expected {
+        for value in query {
+            if read_u32(cursor)? != value.to_bits() {
+                return invalid_data("lifecycle ground-truth cache query mismatch");
+            }
         }
     }
-}
-
-fn pull_queries(cursor: &mut &[u8]) -> std::io::Result<Vec<Vec<f32>>> {
-    let n = read_u32(cursor)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut q = vec![0f32; DIM];
-        for slot in &mut q {
-            *slot = read_f32(cursor)?;
-        }
-        out.push(q);
-    }
-    Ok(out)
-}
-
-fn pull_gt(cursor: &mut &[u8]) -> std::io::Result<Vec<Vec<u32>>> {
-    let n = read_u32(cursor)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut row = vec![0u32; TOP_K];
-        for id in &mut row {
-            *id = read_u32(cursor)?;
-        }
-        out.push(row);
-    }
-    Ok(out)
-}
-
-fn read_exact(cursor: &mut &[u8], buf: &mut [u8]) -> std::io::Result<()> {
-    if cursor.len() < buf.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "grading cache truncated",
-        ));
-    }
-    buf.copy_from_slice(&cursor[..buf.len()]);
-    *cursor = &cursor[buf.len()..];
     Ok(())
 }
 
-fn read_u32(cursor: &mut &[u8]) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    read_exact(cursor, &mut b)?;
-    Ok(u32::from_le_bytes(b))
+fn push_ground_truth(bytes: &mut Vec<u8>, labels: &[Vec<u32>], top_k: usize) {
+    bytes.extend_from_slice(&(labels.len() as u64).to_le_bytes());
+    for row in labels {
+        assert_eq!(row.len(), top_k);
+        for id in row {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+    }
 }
 
-fn read_u64(cursor: &mut &[u8]) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    read_exact(cursor, &mut b)?;
-    Ok(u64::from_le_bytes(b))
+fn pull_ground_truth(
+    cursor: &mut &[u8],
+    expected_rows: usize,
+    top_k: usize,
+) -> Result<Vec<Vec<u32>>> {
+    if read_u64(cursor)? as usize != expected_rows {
+        return invalid_data("lifecycle ground-truth cache row count mismatch");
+    }
+    let mut labels = Vec::with_capacity(expected_rows);
+    for _ in 0..expected_rows {
+        let mut row = Vec::with_capacity(top_k);
+        for _ in 0..top_k {
+            row.push(read_u32(cursor)?);
+        }
+        labels.push(row);
+    }
+    Ok(labels)
 }
 
-fn read_f32(cursor: &mut &[u8]) -> std::io::Result<f32> {
-    let mut b = [0u8; 4];
-    read_exact(cursor, &mut b)?;
-    Ok(f32::from_le_bytes(b))
+fn read_exact(cursor: &mut &[u8], output: &mut [u8]) -> Result<()> {
+    if cursor.len() < output.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "lifecycle ground-truth cache truncated",
+        ));
+    }
+    output.copy_from_slice(&cursor[..output.len()]);
+    *cursor = &cursor[output.len()..];
+    Ok(())
+}
+
+fn read_u8(cursor: &mut &[u8]) -> Result<u8> {
+    let mut bytes = [0u8; 1];
+    read_exact(cursor, &mut bytes)?;
+    Ok(bytes[0])
+}
+
+fn read_u32(cursor: &mut &[u8]) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    read_exact(cursor, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(cursor: &mut &[u8]) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    read_exact(cursor, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn invalid_data<T>(message: &str) -> Result<T> {
+    Err(Error::new(ErrorKind::InvalidData, message))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use tempfile::tempdir;
 
-    /// Tiny corpus size for the stream-vs-brute-force ground-truth test.
+    use super::*;
+    use crate::corpus::{MmapVectorCorpus, generate_realistic_queries};
+
     const TEST_N_DOCS: usize = 512;
-    /// Query count for the tiny-corpus ground-truth test.
+    const TEST_AUGMENTED_DOCS: usize = 576;
     const TEST_N_QUERIES: usize = 4;
-    /// Top-k compared between streaming and brute-force ground truth.
+    const TEST_N_CORRECTNESS_QUERIES: usize = 3;
     const TEST_TOP_K: usize = 5;
+    const TEST_FILTER_KEEP_EVERY: usize = 7;
+    const TEST_CORPUS_SEED: u64 = 1;
+    const TEST_QUERY_SEED: u64 = 17;
+    const TEST_QUERY_SIGMA: f32 = 0.05;
+
+    fn fixture() -> (
+        MmapVectorCorpus,
+        Vec<Vec<f32>>,
+        CacheKey,
+        LifecycleGroundTruth,
+    ) {
+        let vectors = MmapVectorCorpus::generate(
+            TEST_AUGMENTED_DOCS,
+            corpus::n_cent(TEST_N_DOCS),
+            TEST_CORPUS_SEED,
+            true,
+        );
+        let queries = generate_realistic_queries(
+            vectors.as_slice(),
+            TEST_N_DOCS,
+            TEST_N_QUERIES,
+            TEST_QUERY_SEED,
+            true,
+            TEST_QUERY_SIGMA,
+        );
+        let options = LifecycleGradingOptions {
+            vectors: vectors.as_slice(),
+            n_docs: TEST_N_DOCS,
+            augmented_docs: TEST_AUGMENTED_DOCS,
+            corpus_seed: TEST_CORPUS_SEED,
+            normalized_vectors: true,
+            filter_keep_every: TEST_FILTER_KEEP_EVERY,
+            top_k: TEST_TOP_K,
+            correctness_query_count: TEST_N_CORRECTNESS_QUERIES,
+            queries: &queries,
+        };
+        let key = CacheKey::from_options(&options);
+        let labels = corpus::lifecycle_ground_truth(
+            options.vectors,
+            options.n_docs,
+            options.augmented_docs,
+            options.queries,
+            options.correctness_query_count,
+            options.filter_keep_every,
+            options.top_k,
+        );
+        (vectors, queries, key, labels)
+    }
 
     #[test]
-    fn streaming_gt_matches_brute_force_on_tiny_corpus() {
-        let n_docs = TEST_N_DOCS;
-        let queries =
-            realistic_queries(n_docs, TEST_N_QUERIES, CORRECTNESS_QUERY_SEED, QUERY_SIGMA);
-        let stream_gt = streaming_ground_truth(n_docs, &queries, TEST_TOP_K);
-        let mmap =
-            corpus::MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), VEC_SEED, true);
-        let brute = corpus::ground_truth(mmap.as_slice(), n_docs, &queries, TEST_TOP_K);
-        assert_eq!(stream_gt, brute);
+    fn cache_roundtrip_validates_full_key_and_queries() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("grading.bin");
+        let (_vectors, queries, key, labels) = fixture();
+        write_cache(&path, key, &queries, &labels).expect("write");
+        let restored = read_cache(&path, key, &queries).expect("read");
+        assert_eq!(restored.base, labels.base);
+        assert_eq!(restored.filtered, labels.filtered);
+        assert_eq!(restored.augmented, labels.augmented);
+
+        let stale_key = CacheKey {
+            filter_keep_every: key.filter_keep_every + 1,
+            ..key
+        };
+        assert_eq!(
+            read_cache(&path, stale_key, &queries)
+                .expect_err("stale key")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let mut stale_queries = queries.clone();
+        stale_queries[0][0] = f32::from_bits(stale_queries[0][0].to_bits() ^ 1);
+        assert_eq!(
+            read_cache(&path, key, &stale_queries)
+                .expect_err("stale query")
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 }

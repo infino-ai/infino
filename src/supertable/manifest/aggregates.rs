@@ -16,11 +16,6 @@
 //!   [`FtsSummaryAgg`]s — bloom bit-OR union + `(min(min_term),
 //!   max(max_term))` term-range union — folded via
 //!   [`FtsSummaryAgg::merge`].
-//! - `vector_summary_agg`: per vector column, mean-of-
-//!   centroids + max(distance + superfile_radius). Bounds every
-//!   superfile's vector ball with one outer ball, so the
-//!   list-level vector skip is correct by construction (no
-//!   false negatives).
 //!
 //! The bloom union is exact for "any superfile contained this term"
 //! (the block-and-mask scheme is positional). `n_terms_distinct` is a
@@ -33,19 +28,20 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::{ArrayRef, UInt64Array};
+
 use crate::supertable::manifest::{
     SuperfileEntry,
-    list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
+    list::{BIRTH_VERSION_AGGREGATE_COLUMN, FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
 };
 
-/// All four aggregate buckets for one [`ManifestPartEntry`].
+/// All three aggregate buckets for one [`ManifestPartEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
 #[derive(Debug, Default)]
 pub struct AggregateSet {
     pub id_range: (i128, i128),
     pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
-    pub vector_summary_agg: BTreeMap<String, VectorSummaryAgg>,
 }
 
 /// Build the aggregate set for one manifest part from its
@@ -65,7 +61,6 @@ pub fn compute(
                 id_range: (b.id_range.0, b.id_range.1),
                 scalar_stats_agg: b.scalar_stats_agg.clone(),
                 fts_summary_agg: b.fts_summary_agg.clone(),
-                vector_summary_agg: b.vector_summary_agg.clone(),
             })
             .unwrap_or_default();
     }
@@ -73,22 +68,40 @@ pub fn compute(
     let mut id_min = superfiles.iter().map(|s| s.id_min).min().unwrap_or(0);
     let mut id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
     let mut scalar_stats_agg = scalar_stats_agg(superfiles);
+    let birth_min = superfiles
+        .iter()
+        .map(|entry| entry.birth_version)
+        .min()
+        .unwrap_or(0);
+    let birth_max = superfiles
+        .iter()
+        .map(|entry| entry.birth_version)
+        .max()
+        .unwrap_or(0);
+    scalar_stats_agg.insert(
+        BIRTH_VERSION_AGGREGATE_COLUMN.into(),
+        ScalarStatsAgg {
+            min: Arc::new(UInt64Array::from(vec![birth_min])) as ArrayRef,
+            max: Arc::new(UInt64Array::from(vec![birth_max])) as ArrayRef,
+            null_count: None,
+            sum: None,
+            hll: None,
+            value_counts: None,
+        },
+    );
     let mut fts_summary_agg = fts_summary_agg(superfiles);
-    let mut vector_summary_agg = vector_summary_agg(superfiles);
 
     if let Some(base_part) = base_part {
         id_min = min(id_min, base_part.id_range.0);
         id_max = max(id_max, base_part.id_range.1);
         ScalarStatsAgg::merge(&mut scalar_stats_agg, &base_part.scalar_stats_agg);
         FtsSummaryAgg::merge(&mut fts_summary_agg, &base_part.fts_summary_agg);
-        VectorSummaryAgg::merge(&mut vector_summary_agg, &base_part.vector_summary_agg);
     }
 
     AggregateSet {
         id_range: (id_min, id_max),
         scalar_stats_agg,
         fts_summary_agg,
-        vector_summary_agg,
     }
 }
 
@@ -131,76 +144,6 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
     out
 }
 
-// ---------------------------------------------------------
-// Vector summary aggregate: mean centroid + envelope radius.
-// ---------------------------------------------------------
-
-fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, VectorSummaryAgg> {
-    let mut per_column: HashMap<String, Vec<(&[f32], f32)>> = HashMap::new();
-    for seg in superfiles {
-        for (col, summary) in &seg.vector_summary {
-            per_column
-                .entry(col.clone())
-                .or_default()
-                .push((summary.centroid.as_slice(), summary.radius));
-        }
-    }
-    let mut out = BTreeMap::new();
-    for (col, entries) in per_column {
-        let Some(first_dim) = entries.first().map(|(c, _)| c.len()) else {
-            continue;
-        };
-        if entries.iter().any(|(c, _)| c.len() != first_dim) {
-            // Skip columns with inconsistent dim (shouldn't
-            // happen — schema enforces a single dim per column).
-            continue;
-        }
-        let mut mean = vec![0.0_f64; first_dim];
-        for (centroid, _) in &entries {
-            for (i, v) in centroid.iter().enumerate() {
-                mean[i] += *v as f64;
-            }
-        }
-        let n = entries.len() as f64;
-        let mean_f32: Vec<f32> = mean.into_iter().map(|x| (x / n) as f32).collect();
-
-        // envelope_radius = max(distance(seg_centroid, mean) +
-        // seg_radius) over all superfiles. Distance = L2 — works
-        // for the L2sq/cosine/negdot metrics (cosine over
-        // normalized centroids is equivalent to L2 distance).
-        // Conservative: a metric-specific tightening is a
-        // follow-up optimization.
-        let mut envelope_radius: f32 = 0.0;
-        for (centroid, radius) in &entries {
-            let dist = l2_distance(centroid, &mean_f32);
-            envelope_radius = envelope_radius.max(dist + radius);
-        }
-
-        let centroid_envelope = mean_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-        out.insert(
-            col,
-            VectorSummaryAgg {
-                centroid_envelope,
-                // Per-column count of folded superfile centroids, so an
-                // incremental `merge` and this batch build agree on the mean.
-                n_vectors: entries.len() as u32,
-                envelope_radius,
-            },
-        );
-    }
-    out
-}
-
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "l2_distance: dim mismatch");
-    let mut sum = 0.0_f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum.sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -208,9 +151,12 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, LargeStringArray, StringArray};
 
     use super::*;
-    use crate::supertable::manifest::{
-        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-        part::{ContentHash, PartId},
+    use crate::{
+        superfile::vector::layout::VectorLayout,
+        supertable::manifest::{
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+            part::{ContentHash, PartId},
+        },
     };
 
     /// A `ManifestPartEntry` standing in for an existing part, carrying the
@@ -229,7 +175,6 @@ mod tests {
             id_range,
             scalar_stats_agg,
             fts_summary_agg: BTreeMap::new(),
-            vector_summary_agg: BTreeMap::new(),
         }
     }
 
@@ -242,6 +187,30 @@ mod tests {
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         m
+    }
+
+    #[test]
+    fn compute_stamps_part_birth_version_range() {
+        let mut first = (*seg_with_string_minmax("title", "a", "b", false)).clone();
+        first.birth_version = 3;
+        let mut second = (*seg_with_string_minmax("title", "c", "d", false)).clone();
+        second.birth_version = 9;
+        let aggregate = compute(&[Arc::new(first), Arc::new(second)], None);
+        let birth = aggregate
+            .scalar_stats_agg
+            .get(BIRTH_VERSION_AGGREGATE_COLUMN)
+            .expect("birth aggregate");
+        let min = birth
+            .min
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("u64 min");
+        let max = birth
+            .max
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("u64 max");
+        assert_eq!((min.value(0), max.value(0)), (3, 9));
     }
 
     fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {
@@ -259,6 +228,7 @@ mod tests {
         let mut cols = HashMap::new();
         cols.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
@@ -269,6 +239,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -320,6 +291,7 @@ mod tests {
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
@@ -330,6 +302,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -369,6 +342,7 @@ mod tests {
             let mut cols = HashMap::new();
             cols.insert("n".to_string(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: uuid::Uuid::new_v4(),
                 uri: SuperfileUri::new_v4(),
                 n_docs: 1,
@@ -379,6 +353,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                vector_layout: VectorLayout::Ivf,
                 subsection_offsets: None,
             })
         };
@@ -405,9 +380,8 @@ mod tests {
         let n = aggs.scalar_stats_agg.get("n").expect("n carried forward");
         assert_eq!(i64_val(&n.min), 5);
         assert_eq!(i64_val(&n.max), 9);
-        // fts/vector aggregates are carried over as-is (empty here).
+        // fts aggregates are carried over as-is (empty here).
         assert!(aggs.fts_summary_agg.is_empty());
-        assert!(aggs.vector_summary_agg.is_empty());
     }
 
     #[test]

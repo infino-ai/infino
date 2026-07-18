@@ -67,8 +67,8 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     VectorSearchOptions,
     config::{
-        CompactionSettings, Config, MemorySettings, OptimizeOptions, StorageBackend,
-        StorageColdFetchMode, StorageSettings, SupertableSettings, ThreadCount,
+        CompactionSettings, Config, OptimizeOptions, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings, ThreadCount,
     },
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -179,7 +179,7 @@ fn azure_compact_config(container: &str, prefix: &str, cache_root: &std::path::P
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
-        memory: MemorySettings::default(),
+        ..Config::default()
     }
 }
 
@@ -217,6 +217,7 @@ fn options_title_emb() -> SupertableOptions {
             rot_seed: VECTOR_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }],
         Some(default_tokenizer()),
     )

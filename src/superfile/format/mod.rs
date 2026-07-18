@@ -131,9 +131,27 @@ pub mod vec {
     /// of quantized code followed by [`DOC_ID_BYTES`] of doc-id, so the
     /// stride is `code_bytes + DOC_ID_BYTES`.
     pub const DOC_ID_BYTES: usize = 4;
-    /// Outer-blob version. Written at bytes [8..12] of the outer
-    /// header. Bump on outer-blob-shape changes (currently 1).
+    /// Width in bytes of an inline stable `_id` (an `i128` Snowflake value,
+    /// little-endian). The materialized (hidden-cell) build inserts an
+    /// `n_docs`-long region of these *between* the codec-meta region and the
+    /// per-cluster blocks, indexed by `local_doc_id`, so an id+score query (and
+    /// the drain) can read the stable `_id` straight from the cell blob instead
+    /// of resolving it through a scalar `_id` column. Placing it before the
+    /// per-cluster blocks keeps that (trailing) region the sole input to the
+    /// reader's `n_docs` derivation; the region's presence and size are then
+    /// self-describing from the offset gap `per_cluster_blocks_off −
+    /// codec_meta_end` (`0` or `n_docs * STABLE_ID_BYTES`), needing no header
+    /// flag. The streaming/merge builds emit no such region.
+    pub const STABLE_ID_BYTES: usize = 16;
+    /// Outer-blob version for the single-column IVF layout (one
+    /// subsection directory entry per vector column). Written at
+    /// bytes [8..12] of the outer header.
     pub const VERSION: u32 = 1;
+    /// Outer-blob version for the multi-cell IVF layout: one logical
+    /// vector column whose blob packs many complete cell-IVF
+    /// subsections behind a cell directory of
+    /// `(global_cell_id, subsection_off, subsection_len)`.
+    pub const VERSION_MULTI_CELL: u32 = 2;
 
     /// subsection layout version stamped at
     /// bytes [8..12] of each per-column sub-header.
@@ -170,8 +188,7 @@ pub mod vec {
     /// [12..16] codec_meta_size (u32 LE) — 0 when no codec_meta
     ///                                     (Fp32 / RabitqOnly)
     /// [16..24] summary_centroid_offset (u64 LE)
-    /// [24..28] summary_radius_x100 (u32 LE)
-    /// [28..32] reserved (u32)
+    /// [24..32] reserved (u64)
     /// [32..40] centroids_off (u64 LE)
     /// [40..48] cluster_idx_off (u64 LE)
     /// [48..56] per_cluster_blocks_off (u64 LE)
@@ -197,11 +214,17 @@ pub mod vec {
     /// Width of the 8-byte section/sub-section magic.
     pub const MAGIC_BYTES: usize = 8;
 
-    /// Outer-header size: magic + version + n_columns + n_docs +
-    /// dir_offset.
+    /// Outer-header size: magic + version + n_columns/n_cells + n_docs +
+    /// dir_offset. Same 32-byte shape for v1 and v2; the u32 at
+    /// [`outer_hdr::N_COLUMNS_OFF`] is `n_columns` for v1 and
+    /// `n_cells` for v2.
     pub const OUTER_HEADER_SIZE: usize = 32;
-    /// Per-column subsection-directory entry size in bytes.
+    /// Per-column subsection-directory entry size in bytes (v1).
     pub const DIR_ENTRY_SIZE: usize = 64;
+    /// Per-cell directory entry size in bytes (v2 multi-cell):
+    /// `global_cell_id (u32) + subsection_off (u64) + subsection_len (u64)
+    /// + codec_id (u32)` = 24 bytes.
+    pub const CELL_DIR_ENTRY_SIZE: usize = 24;
     /// Per-column sub-header size (inside each subsection).
     pub const SUB_HEADER_SIZE: usize = 56;
 
@@ -222,12 +245,28 @@ pub mod vec {
     pub mod outer_hdr {
         /// `[8..12]` outer-blob version (`u32` LE).
         pub const VERSION_OFF: usize = 8;
-        /// `[12..16]` column count (`u32` LE).
+        /// `[12..16]` column count (v1) or cell count (v2) (`u32` LE).
         pub const N_COLUMNS_OFF: usize = 12;
+        /// Alias for [`N_COLUMNS_OFF`] when reading a v2 multi-cell blob.
+        pub const N_CELLS_OFF: usize = 12;
         /// `[16..24]` document count (`u64` LE).
         pub const N_DOCS_OFF: usize = 16;
         /// `[24..32]` directory byte offset (`u64` LE).
         pub const DIR_OFFSET_OFF: usize = 24;
+    }
+
+    /// Per-cell directory-entry field offsets (24-byte entry, v2).
+    pub mod cell_dir_entry {
+        /// `[+0..+4]` global cell id (`u32` LE).
+        pub const CELL_ID_OFF: usize = 0;
+        /// `[+4..+12]` subsection byte offset relative to blob start (`u64` LE).
+        pub const SUBSECTION_OFF_OFF: usize = 4;
+        /// `[+12..+20]` subsection byte length (`u64` LE).
+        pub const SUBSECTION_LEN_OFF: usize = 12;
+        /// `[+20..+24]` rerank codec (`u32` LE).
+        pub const RESERVED_OFF: usize = 20;
+        /// Semantic alias for [`RESERVED_OFF`] used by new readers/writers.
+        pub const CODEC_ID_OFF: usize = RESERVED_OFF;
     }
 
     /// Per-column directory-entry field offsets (64-byte entry).
@@ -262,8 +301,7 @@ pub mod vec {
         pub const CODEC_META_SIZE_OFF: usize = 12;
         /// `[16..24]` summary-centroid offset (`u64` LE).
         pub const SUMMARY_OFF_OFF: usize = 16;
-        /// `[24..28]` summary radius ×100 (`u32` LE).
-        pub const SUMMARY_RADIUS_X100_OFF: usize = 24;
+        // `[24..32]` reserved (`u64`).
         /// `[32..40]` centroids offset (`u64` LE).
         pub const CENTROIDS_OFF_OFF: usize = 32;
         /// `[40..48]` cluster-index offset (`u64` LE).
@@ -301,14 +339,22 @@ pub mod kv {
     /// Present iff at least one FTS column: per-column FTS config JSON.
     pub const FTS_COLUMNS: &str = "inf.fts.columns";
 
-    /// Present iff at least one vector column: byte offset of vector blob.
+    /// Present iff at least one vector index: byte offset of vector blob.
     pub const VEC_OFFSET: &str = "inf.vec.offset";
 
-    /// Present iff at least one vector column: byte length of vector blob.
+    /// Present iff at least one vector index: byte length of vector blob.
     pub const VEC_LENGTH: &str = "inf.vec.length";
 
-    /// Present iff at least one vector column: per-column vector config JSON.
+    /// Present iff at least one vector index: per-index vector config JSON.
     pub const VEC_COLUMNS: &str = "inf.vec.columns";
+
+    /// Present iff vector blob uses a non-default layout (`ivf` default).
+    pub const VEC_LAYOUT: &str = "inf.vec.layout";
+
+    /// Optional: JSON array of global cell ids packed into a multi-cell
+    /// vector blob, in cell-directory order. Present when
+    /// `inf.vec.layout = multi_cell_ivf`.
+    pub const VEC_CELLS: &str = "inf.vec.cells";
 
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
@@ -335,10 +381,12 @@ pub mod kv {
         VEC_OFFSET,
         VEC_LENGTH,
         VEC_COLUMNS,
+        VEC_LAYOUT,
+        VEC_CELLS,
     ];
 }
 
-/// Reserved column-name prefix; user FTS / vector column names must not
+/// Reserved column-name prefix; user FTS column / vector index names must not
 /// start with this string. Defensive — keeps the user's namespace and our
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";

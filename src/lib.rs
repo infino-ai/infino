@@ -92,6 +92,14 @@ macro_rules! test_visible {
         $(#[$m])*
         pub(crate) fn $($rest)*
     };
+    ($(#[$m:meta])* const $($rest:tt)*) => {
+        #[cfg(feature = "test-helpers")]
+        $(#[$m])*
+        pub const $($rest)*
+        #[cfg(not(feature = "test-helpers"))]
+        $(#[$m])*
+        pub(crate) const $($rest)*
+    };
 }
 
 // Internal layers. `pub` in a `test-helpers` build so the layer-isolated

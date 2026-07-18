@@ -290,6 +290,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unseal_clears_seal_for_matching_compaction_id() {
+        let (_dir, ws) = fixture();
+        let sf = Uuid::from_u128(0x300);
+        let cid = Uuid::from_u128(0xBEEF);
+        let (sidecar, etag) = seal(&ws, sf, cid, Utc::now(), DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect("seal");
+        unseal(&ws, sf, sidecar.bitmap, &etag)
+            .await
+            .expect("unseal");
+        let (post, _etag) = ws.get_tombstones(sf).await.expect("get").expect("present");
+        assert!(post.seal.is_none(), "seal cleared");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn seal_on_different_compaction_id_surfaces_already_sealed() {
         let (_dir, ws) = fixture();
         let sf = Uuid::from_u128(0x400);

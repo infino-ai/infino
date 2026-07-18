@@ -14,6 +14,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(test)]
 use std::sync::Arc;
 
 use wide::f32x8;
@@ -22,7 +23,7 @@ use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
-/// Residual quantization step divisor for [`RerankCodec::Sq8ResidualEpsilon`].
+/// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
 /// The signed 8-bit residual code at dim `d` carries
 /// `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized steps around the Sq8
 /// dequant base. `16` hit the recall target with the best
@@ -40,23 +41,25 @@ const F32X8_LANES: usize = 8;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
 
+/// Centroid batch width for the transposed routing cache. Chosen to match the
+/// AVX-512 f32 lane count; the portable fallback consumes each 16-lane block as
+/// two 8-lane halves.
+pub(crate) const CENTROID_BATCH_LANES: usize = AVX512_F32_LANES;
+
 /// Byte width of one little-endian `f32`. A byte-backed vector of
 /// dimension `d` occupies `d * F32_BYTES` bytes.
 const F32_BYTES: usize = 4;
 
 /// Cosine distance is `COSINE_DISTANCE_BASE - dot` on unit vectors,
 /// so smaller means closer without re-normalizing at query time.
-/// `pub(crate)`: the manifest's folded Sq8 centroid scoring applies
-/// the same identity.
 pub(crate) const COSINE_DISTANCE_BASE: f32 = 1.0;
 
 /// Cross-term coefficient in the squared-L2 identity
 /// `‖q − x‖² = ‖q‖² − L2_CROSS_TERM_COEFF·(q·x) + ‖x‖²`, used by the
-/// Sq8 kernels that reconstruct L2 from a fused dot product (and by
-/// the manifest's folded Sq8 centroid scoring).
+/// Sq8 rerank kernels that reconstruct L2 from a fused dot product.
 pub(crate) const L2_CROSS_TERM_COEFF: f32 = 2.0;
 
-/// Distance metric for a vector column. Stored per-column in
+/// Distance metric for a vector index. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
@@ -106,6 +109,353 @@ pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
         return unsafe { l2_sq_avx512(a, b) };
     }
     l2_sq_wide(a, b)
+}
+
+/// Build the block-transposed centroid cache used by
+/// [`nearest_two_centroids_transposed`].
+///
+/// Canonical centroid storage is cluster-major (`centroid -> dim`). This derived
+/// cache is block-transposed in 16-centroid groups:
+/// `block -> dim -> centroid_lane`. That gives the AVX-512 hot loop contiguous
+/// loads for 16 centroid lanes at one query dimension.
+pub(crate) fn transpose_centroids_cluster_major(
+    centroids: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(centroids.len(), n_cent * dim);
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+    let mut transposed = vec![0f32; n_blocks * dim * CENTROID_BATCH_LANES];
+    for block in 0..n_blocks {
+        let centroid_base = block * CENTROID_BATCH_LANES;
+        let block_base = block * dim * CENTROID_BATCH_LANES;
+        for d in 0..dim {
+            let dst = block_base + d * CENTROID_BATCH_LANES;
+            for lane in 0..CENTROID_BATCH_LANES {
+                let centroid = centroid_base + lane;
+                if centroid < n_cent {
+                    transposed[dst + lane] = centroids[centroid * dim + d];
+                }
+            }
+        }
+    }
+    transposed
+}
+
+/// Widen a score by a relative slack: the shared "score window" used by the
+/// hidden/user cell-routing cutoff (probe cells while their score stays
+/// within `slack` of the nearest) and by replica closure (a cell is a
+/// replica candidate while the row's distance stays within the closure
+/// ratio of its primary). One definition keeps routing and replication
+/// interpreting boundary geometry identically.
+#[inline]
+pub(crate) fn relative_score_window(base: f32, slack: f32) -> f32 {
+    base + base.abs().max(f32::EPSILON) * slack.max(0.0)
+}
+
+/// Insert `(centroid, score)` into an ascending top-`k` vec, keeping the
+/// lowest-index winner on equal scores (matching the naive scalar scan).
+/// The one ranked-insertion shared by the blocked top-k reducers.
+#[inline]
+pub(crate) fn insert_ranked(top: &mut Vec<(u32, f32)>, k: usize, centroid: u32, score: f32) {
+    if top.len() == k && score >= top[k - 1].1 {
+        return;
+    }
+    let pos = top
+        .iter()
+        .position(|&(_, s)| score < s)
+        .unwrap_or(top.len());
+    top.insert(pos, (centroid, score));
+    top.truncate(k);
+}
+
+/// Drive the blocked centroid scorers over every block of a transposed
+/// centroid cache, feeding each block's lane scores to `reduce(base, scores)`.
+/// The single owner of the AVX-512 / `wide` dispatch skeleton — every
+/// nearest-centroid shape (argmin, top-k) is a reducer over this driver.
+#[inline]
+fn for_each_centroid_block_scores(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    mut reduce: impl FnMut(usize, &[f32]),
+) {
+    debug_assert_eq!(query.len(), dim);
+    debug_assert_eq!(
+        transposed.len(),
+        n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
+    );
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        for block in 0..n_blocks {
+            // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+            let scores = unsafe {
+                score_centroid_block16_transposed_avx512(metric, query, transposed, dim, block)
+            };
+            reduce(block * CENTROID_BATCH_LANES, &scores);
+        }
+        return;
+    }
+
+    for block in 0..n_blocks {
+        let base_centroid = block * CENTROID_BATCH_LANES;
+        for half in 0..CENTROID_BATCH_LANES / F32X8_LANES {
+            let lane_offset = half * F32X8_LANES;
+            let scores = score_centroid_block8_transposed_wide(
+                metric,
+                query,
+                transposed,
+                dim,
+                block,
+                lane_offset,
+            );
+            reduce(base_centroid + lane_offset, &scores);
+        }
+    }
+}
+
+/// Return the single closest centroid in a block-transposed fp32 centroid
+/// cache: the k-means assign step's hot call. Same blocked scoring kernels
+/// as [`nearest_k_centroids_transposed`], reduced with a scalar best tracker
+/// (no per-call allocation) and the same tie-breaking as the naive scalar
+/// loop — lowest centroid index wins on equal scores.
+pub(crate) fn nearest_centroid_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> (u32, f32) {
+    debug_assert!(n_cent > 0);
+    let mut best = (0u32, f32::INFINITY);
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent && score < best.1 {
+                best = (centroid as u32, score);
+            }
+        }
+    });
+    best
+}
+
+/// Return the closest two centroids in a block-transposed fp32 centroid cache.
+/// Thin wrapper over [`nearest_k_centroids_transposed`] with `k = 2` — kept
+/// for the scalar-reference equivalence tests that pin the top-k reduction.
+#[cfg(test)]
+pub(crate) fn nearest_two_centroids_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    counts: Option<&[u32]>,
+) -> Option<((u32, f32), Option<(u32, f32)>)> {
+    let top = nearest_k_centroids_transposed(metric, query, transposed, n_cent, dim, counts, 2);
+    let mut it = top.into_iter();
+    it.next().map(|best| (best, it.next()))
+}
+
+/// Return the closest `k` centroids (ascending by score) in a block-transposed
+/// fp32 centroid cache. Full blocks score multiple centroids per SIMD
+/// register: AVX-512 scores 16 centroids from contiguous loads, and the
+/// portable fallback scores each block as two contiguous `wide::f32x8`
+/// halves. `counts = Some(..)` skips zero-count centroids; `None` keeps every
+/// centroid eligible. `k` is expected to be small (replica closure / boundary
+/// assignment); the reduction is an insertion top-k.
+pub(crate) fn nearest_k_centroids_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    counts: Option<&[u32]>,
+    k: usize,
+) -> Vec<(u32, f32)> {
+    debug_assert!(counts.is_none_or(|counts| counts.len() >= n_cent));
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k.saturating_add(1));
+    if k == 0 {
+        return top;
+    }
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent && centroid_included(counts, centroid) {
+                insert_ranked(&mut top, k, centroid as u32, score);
+            }
+        }
+    });
+    top
+}
+
+#[inline]
+fn centroid_included(counts: Option<&[u32]>, centroid: usize) -> bool {
+    counts.is_none_or(|counts| counts[centroid] != 0)
+}
+
+/// Score `query` against every centroid in a block-transposed fp32 centroid
+/// cache and return the dense per-centroid score vector (`scores[c]` is
+/// centroid `c`'s distance). The full-scan reducer over
+/// [`for_each_centroid_block_scores`] — callers that need every score in
+/// centroid order (cell ranking, per-cluster candidate emission) use this
+/// instead of hand-rolling a `(0..n_cent).map(distance)` loop.
+pub(crate) fn all_centroid_scores_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0f32; n_cent];
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent {
+                out[centroid] = score;
+            }
+        }
+    });
+    out
+}
+
+/// Top-`k` nearest centroids over the *row-major fp32-bytes* layout — the
+/// on-disk shape of a superfile subsection's centroid region, scored in
+/// place with no decode or transpose copy. The row-major sibling of
+/// [`nearest_k_centroids_transposed`]: same ascending order, same
+/// deterministic lowest-index tie-break via [`insert_ranked`]. These are the
+/// only two centroid-scan owners; every caller routes through one of them
+/// according to its memory layout.
+pub(crate) fn nearest_k_centroids_bytes(
+    metric: Metric,
+    query: &[f32],
+    centroids_bytes: &[u8],
+    n_cent: usize,
+    dim: usize,
+    k: usize,
+) -> Vec<(u32, f32)> {
+    // Centroids are stored fp32 regardless of the column's rerank codec —
+    // only the per-doc `full[]` region compresses. `distance_bytes` assumes
+    // fp32, which is correct here.
+    let stride = dim * 4;
+    debug_assert!(centroids_bytes.len() >= n_cent * stride);
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k.saturating_add(1));
+    if k == 0 {
+        return top;
+    }
+    for c in 0..n_cent {
+        let bytes = &centroids_bytes[c * stride..(c + 1) * stride];
+        insert_ranked(&mut top, k, c as u32, distance_bytes(metric, query, bytes));
+    }
+    top
+}
+
+#[inline]
+fn score_centroid_block8_transposed_wide(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+    lane_offset: usize,
+) -> [f32; F32X8_LANES] {
+    let mut acc = f32x8::ZERO;
+    let block_base = block * dim * CENTROID_BATCH_LANES;
+    for (d, &q_scalar) in query[..dim].iter().enumerate() {
+        let q = f32x8::splat(q_scalar);
+        let row = block_base + d * CENTROID_BATCH_LANES + lane_offset;
+        let c = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&transposed[row..row + F32X8_LANES])
+                .expect("transposed centroid row has 8-lane half"),
+        );
+        match metric {
+            Metric::L2Sq => {
+                let diff = q - c;
+                acc += diff * diff;
+            }
+            Metric::Cosine | Metric::NegDot => {
+                acc += q * c;
+            }
+        }
+    }
+    let mut scores = acc.to_array();
+    match metric {
+        Metric::Cosine => {
+            for score in &mut scores {
+                *score = COSINE_DISTANCE_BASE - *score;
+            }
+        }
+        Metric::NegDot => {
+            for score in &mut scores {
+                *score = -*score;
+            }
+        }
+        Metric::L2Sq => {}
+    }
+    scores
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn score_centroid_block16_transposed_avx512(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+) -> [f32; AVX512_F32_LANES] {
+    // SAFETY: called only after `avx512_enabled()`. Each load reads one full
+    // 16-f32 transposed row. The transposed cache is allocated as
+    // `n_blocks * dim * 16`, and callers pass `block < n_blocks`.
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        let block_base = block * dim * CENTROID_BATCH_LANES;
+        for (d, &q_scalar) in query[..dim].iter().enumerate() {
+            let q = _mm512_set1_ps(q_scalar);
+            let row = block_base + d * CENTROID_BATCH_LANES;
+            let c = _mm512_loadu_ps(transposed.as_ptr().add(row));
+            match metric {
+                Metric::L2Sq => {
+                    let diff = _mm512_sub_ps(q, c);
+                    acc = _mm512_fmadd_ps(diff, diff, acc);
+                }
+                Metric::Cosine | Metric::NegDot => {
+                    acc = _mm512_fmadd_ps(q, c, acc);
+                }
+            }
+        }
+        let mut scores = [0f32; AVX512_F32_LANES];
+        _mm512_storeu_ps(scores.as_mut_ptr(), acc);
+        match metric {
+            Metric::Cosine => {
+                for score in &mut scores {
+                    *score = COSINE_DISTANCE_BASE - *score;
+                }
+            }
+            Metric::NegDot => {
+                for score in &mut scores {
+                    *score = -*score;
+                }
+            }
+            Metric::L2Sq => {}
+        }
+        scores
+    }
+}
+
+/// Horizontal sum `Σ a[d]`. Dispatches AVX-512 → `wide::f32x8` like
+/// [`dot`]. Precompute once per query for RaBitQ's `q_total` term.
+#[inline]
+pub(crate) fn sum_f32(a: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+        return unsafe { sum_f32_avx512(a) };
+    }
+    sum_f32_wide(a)
 }
 
 /// Portable `wide::f32x8` (256-bit) dot product. The universal kernel
@@ -159,6 +509,25 @@ fn l2_sq_wide(a: &[f32], b: &[f32]) -> f32 {
     for (x, y) in tail_a.iter().zip(tail_b.iter()) {
         let d = x - y;
         sum += d * d;
+    }
+    sum
+}
+
+/// Portable `wide::f32x8` horizontal sum. See [`dot_wide`].
+#[inline]
+fn sum_f32_wide(a: &[f32]) -> f32 {
+    let chunks = a.chunks_exact(F32X8_LANES);
+    let tail = chunks.remainder();
+    let mut acc = f32x8::ZERO;
+    for c in chunks {
+        let va = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(c).expect("chunks_exact(8) yields slices of length 8"),
+        );
+        acc += va;
+    }
+    let mut sum: f32 = acc.reduce_add();
+    for &x in tail {
+        sum += x;
     }
     sum
 }
@@ -232,6 +601,33 @@ unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
         while i < n {
             let d = a[i] - b[i];
             sum += d * d;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// AVX-512 16-lane horizontal sum. See [`dot_avx512`].
+///
+/// # Safety
+///
+/// Same contract as [`dot_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sum_f32_avx512(a: &[f32]) -> f32 {
+    let n = a.len();
+    // SAFETY: see `dot_avx512` — same bounds reasoning.
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= n {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i));
+            acc = _mm512_add_ps(va, acc);
+            i += AVX512_F32_LANES;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < n {
+            sum += a[i];
             i += 1;
         }
         sum
@@ -343,11 +739,9 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 /// Centroid scoring NEVER comes through here — centroids are always
 /// stored as fp32 regardless of the column's rerank codec.
 ///
-/// `Sq8` doesn't have a "flat" entry point because the decode needs
-/// the per-column scale/offset (and per-doc norm for L2Sq). Sq8
-/// callers go through [`Sq8Kernel`] which captures those once per
-/// query. `None` panics here — its column carries no `full[]` bytes
-/// to feed in.
+/// `Sq8Residual` doesn't have a "flat" entry point because decoding needs
+/// scale/offset and, for L2Sq/Cosine, a per-doc norm. Its callers use
+/// [`Sq8ResidualKernel`]. `RabitqOnly` carries no `full[]` bytes.
 #[inline]
 pub(crate) fn distance_bytes_codec(
     metric: Metric,
@@ -357,9 +751,9 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8ResidualEpsilon => {
+        RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
             unreachable!(
-                "distance_bytes_codec called with Sq8ResidualEpsilon — Sq8ResidualEpsilon rerank goes \
+                "distance_bytes_codec called with residual-family codec — rerank goes \
                  through dedicated kernels (need per-column scale/offset + per-doc \
                  norm context)"
             )
@@ -385,6 +779,7 @@ pub(crate) fn distance_bytes_codec(
 /// `q · offset`, plus `q · q` for L2Sq), amortized over
 /// `k × rerank_mult` candidates so it costs ≪ 1 % of search time
 /// at typical `rerank_mult = 256`.
+#[cfg(test)]
 pub(crate) struct Sq8Kernel {
     metric: Metric,
     dim: usize,
@@ -407,6 +802,7 @@ pub(crate) struct Sq8Kernel {
     per_doc_norms: Option<Arc<[f32]>>,
 }
 
+#[cfg(test)]
 impl Sq8Kernel {
     /// Build the per-query kernel. `scale` + `offset` are the
     /// per-dim quantizer arrays from the column's `codec_meta`.
@@ -508,16 +904,13 @@ impl Sq8Kernel {
     }
 }
 
-/// `Sq8ResidualEpsilon` rerank context — the residual-corrected sibling of
-/// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
-/// `offset[dim]`) plus the query-side precomputes for both the Sq8
-/// code leg and the i8 residual leg, so the per-candidate inner loop
-/// is two u8/i8 → f32 widens + SIMD dot.
+/// `Sq8Residual` rerank context. Captures the per-cluster quantizer
+/// (`scale[dim]`, `offset[dim]`) plus query-side precomputes for both stored
+/// bytes, so the per-candidate inner loop is two u8/i8 → f32 widens + SIMD dot.
 ///
-/// Applied only to the small final-refine set the Sq8 score selects,
-/// so it never runs over the full shortlist. One kernel per query +
-/// cluster, reused across that cluster's refine candidates.
-pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
+/// One kernel is built per query + cluster and reused across every RaBitQ
+/// shortlist survivor assigned to that cluster.
+pub(crate) struct Sq8ResidualKernel {
     metric: Metric,
     dim: usize,
     /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
@@ -530,23 +923,18 @@ pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
     q_dot_offset: f32,
     /// `Σ_d query[d]²`. L2Sq only.
     q_norm_sq: f32,
-    /// Per-doc `Σ_d x_corrected²` table (residual-corrected norms),
-    /// indexed by the shortlist's `pos`. `Some` for L2Sq + Cosine.
-    per_doc_norms: Option<&'a [f32]>,
 }
 
-impl<'a> Sq8ResidualEpsilonKernel<'a> {
-    /// Build the per-query residual kernel. `scale` + `offset` are
-    /// the per-cluster quantizer arrays; `residual_divisor` is
-    /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
-    /// and Cosine columns.
+impl Sq8ResidualKernel {
+    /// Build the per-query residual kernel. `scale` + `offset` are the
+    /// per-cluster quantizer arrays; `residual_divisor` is
+    /// [`SQ8_RESIDUAL_DIVISOR`].
     pub fn new(
         metric: Metric,
         query: &[f32],
         scale: &[f32],
         offset: &[f32],
         residual_divisor: f32,
-        per_doc_norms: Option<&'a [f32]>,
     ) -> Self {
         let dim = query.len();
         debug_assert_eq!(scale.len(), dim);
@@ -593,22 +981,11 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
             q_residual,
             q_dot_offset,
             q_norm_sq,
-            per_doc_norms,
         }
     }
 
-    /// Distance for one refine candidate at position `pos`, with
-    /// `dim` u8 Sq8 codes at `code_bytes` and `dim` i8 residual
-    /// codes at `residual_bytes`. Smaller = closer for every metric.
-    #[inline]
-    pub fn distance_at(&self, pos: u32, code_bytes: &[u8], residual_bytes: &[u8]) -> f32 {
-        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
-        self.distance_with_norm(code_bytes, residual_bytes, norm)
-    }
-
-    /// Like [`Self::distance_at`] but takes the per-doc decoded-norm
-    /// explicitly — for lazy object-store paths that fetch norms into
-    /// a sparse `pos → norm` map rather than a contiguous slice.
+    /// Score one candidate with both stored bytes and its decoded norm.
+    /// `norm` is absent only for NegDot, where the norm term cancels.
     #[inline]
     pub fn distance_with_norm(
         &self,
@@ -647,7 +1024,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
         match self.metric {
             Metric::Cosine => {
                 let x_norm = norm
-                    .expect("Sq8ResidualEpsilonKernel + Cosine requires per_doc_norms")
+                    .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
                     COSINE_DISTANCE_BASE - dot / x_norm
@@ -657,8 +1034,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                let x_norm_sq =
-                    norm.expect("Sq8ResidualEpsilonKernel + L2Sq requires per_doc_norms");
+                let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
@@ -690,6 +1066,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
 /// Inputs are pre-validated by `Sq8Kernel::distance_at`'s
 /// `debug_assert_eq!(code_bytes.len(), self.dim)`. `q_prime.len()`
 /// is guaranteed `== dim` by `Sq8Kernel::new`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -706,42 +1083,12 @@ pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     sq8_dot_wide(q_prime, code_bytes, dim)
 }
 
-/// Upper chunk length for [`u8_sum_sumsq`]'s u32 accumulators:
-/// `U8_SUMSQ_CHUNK · 255² < u32::MAX`, so a per-chunk Σcode² cannot
-/// overflow before it spills into the u64 total.
-const U8_SUMSQ_CHUNK: usize = 16_384;
-
-/// Σcode and Σcode² over one Sq8 code row, both as f32.
-///
-/// Exact integer accumulation: u32 lane math inside bounded chunks
-/// (u8-widening adds + `pmaddwd`-shaped squares that LLVM
-/// auto-vectorizes at the `x86-64-v3` baseline — 64-bit accumulators
-/// would defeat vectorization), spilled into u64 totals between
-/// chunks so no input length can overflow. Used by the manifest's
-/// folded Sq8 centroid scoring to reconstruct `‖centroid‖²` without
-/// dequantizing.
-pub(crate) fn u8_sum_sumsq(codes: &[u8]) -> (f32, f32) {
-    let mut sum: u64 = 0;
-    let mut sumsq: u64 = 0;
-    for chunk in codes.chunks(U8_SUMSQ_CHUNK) {
-        let mut s: u32 = 0;
-        let mut sq: u32 = 0;
-        for &b in chunk {
-            let v = b as u32;
-            s += v;
-            sq += v * v;
-        }
-        sum += u64::from(s);
-        sumsq += u64::from(sq);
-    }
-    (sum as f32, sumsq as f32)
-}
-
 /// Portable `wide::f32x8` (256-bit) Sq8 dot product. Same per-
 /// element math as the AVX-512 path, processed 8 lanes at a time
 /// with a per-lane scalar `u8 as f32` widen. Universal fallback
 /// for aarch64, SSE-only x86_64 hosts, and
 /// `INFINO_DISABLE_AVX2=1` / `INFINO_DISABLE_AVX512=1` A/B runs.
+#[cfg(test)]
 #[inline]
 fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     let mut acc = f32x8::ZERO;
@@ -780,7 +1127,7 @@ fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 ///
 /// Callers must ensure the target supports `avx2`. `avx2_enabled()`
 /// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     debug_assert_eq!(q_prime.len(), dim);
@@ -833,7 +1180,7 @@ unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 ///
 /// Callers must ensure the target supports `avx512f`. `avx512_enabled()`
 /// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     debug_assert_eq!(q_prime.len(), dim);
@@ -863,6 +1210,643 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
             i += 1;
         }
         dot
+    }
+}
+
+/// Dequantize one Sq8+ε vector: `out[d] = offset[d] + scale[d]·(code[d] +
+/// residual[d]/residual_divisor)`. Dispatches AVX-512 → AVX2 →
+/// `wide::f32x8` like [`dot`].
+#[inline]
+pub(crate) fn dequantize_sq8_residual_into(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    out: &mut [f32],
+) {
+    let dim = out.len();
+    debug_assert_eq!(scale.len(), dim);
+    debug_assert_eq!(offset.len(), dim);
+    debug_assert_eq!(codes.len(), dim);
+    debug_assert_eq!(residuals.len(), dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            unsafe {
+                dequantize_sq8_residual_avx512(
+                    scale,
+                    offset,
+                    codes,
+                    residuals,
+                    residual_divisor,
+                    out,
+                    dim,
+                );
+            }
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            unsafe {
+                dequantize_sq8_residual_avx2(
+                    scale,
+                    offset,
+                    codes,
+                    residuals,
+                    residual_divisor,
+                    out,
+                    dim,
+                );
+            }
+            return;
+        }
+    }
+    dequantize_sq8_residual_wide(scale, offset, codes, residuals, residual_divisor, out, dim);
+}
+
+#[inline]
+fn sq8_residual_component_scalar(
+    scale: f32,
+    offset: f32,
+    code: u8,
+    residual_byte: u8,
+    residual_divisor: f32,
+) -> f32 {
+    let inv_div = 1.0 / residual_divisor;
+    offset + scale * (code as f32 + (i8::from_le_bytes([residual_byte]) as f32) * inv_div)
+}
+
+#[inline]
+fn dequantize_sq8_residual_wide(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    out: &mut [f32],
+    dim: usize,
+) {
+    let inv_div = 1.0 / residual_divisor;
+    let inv_v = f32x8::splat(inv_div);
+    let mut i = 0;
+    while i + F32X8_LANES <= dim {
+        let off = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES])
+                .expect("offset[i..i+8] len 8"),
+        );
+        let sc = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES])
+                .expect("scale[i..i+8] len 8"),
+        );
+        let mut code_bc = [0f32; F32X8_LANES];
+        let mut res_bc = [0f32; F32X8_LANES];
+        for j in 0..F32X8_LANES {
+            code_bc[j] = codes[i + j] as f32;
+            res_bc[j] = i8::from_le_bytes([residuals[i + j]]) as f32;
+        }
+        let codes_v = f32x8::from(code_bc);
+        let res_v = f32x8::from(res_bc);
+        let term = codes_v + res_v * inv_v;
+        let decoded = off + sc * term;
+        out[i..i + F32X8_LANES].copy_from_slice(&decoded.to_array());
+        i += F32X8_LANES;
+    }
+    while i < dim {
+        out[i] = sq8_residual_component_scalar(
+            scale[i],
+            offset[i],
+            codes[i],
+            residuals[i],
+            residual_divisor,
+        );
+        i += 1;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`. [`avx2_enabled`] guarantees
+/// this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dequantize_sq8_residual_avx2(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    out: &mut [f32],
+    dim: usize,
+) {
+    // SAFETY: each iteration reads/writes 8-element windows; `i + 8 <= dim`
+    // keeps all pointers in bounds. Unaligned loads/stores throughout.
+    unsafe {
+        let inv_div = _mm256_set1_ps(1.0 / residual_divisor);
+        let mut i = 0;
+        while i + F32X8_LANES <= dim {
+            let codes_u8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadl_epi64(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(res_u8));
+            let term = _mm256_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm256_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm256_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm256_fmadd_ps(sc, term, off);
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), decoded);
+            i += F32X8_LANES;
+        }
+        while i < dim {
+            out[i] = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`. [`avx512_enabled`]
+/// guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dequantize_sq8_residual_avx512(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    out: &mut [f32],
+    dim: usize,
+) {
+    // SAFETY: each iteration reads/writes 16-element windows; `i + 16 <= dim`
+    // keeps all pointers in bounds. Unaligned loads/stores throughout.
+    unsafe {
+        let inv_div = _mm512_set1_ps(1.0 / residual_divisor);
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= dim {
+            let codes_u8 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadu_si128(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(res_u8));
+            let term = _mm512_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm512_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm512_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm512_fmadd_ps(sc, term, off);
+            _mm512_storeu_ps(out.as_mut_ptr().add(i), decoded);
+            i += AVX512_F32_LANES;
+        }
+        while i < dim {
+            out[i] = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
+            i += 1;
+        }
+    }
+}
+
+/// `||x||²` for one Sq8+ε vector without materializing fp32 storage.
+/// Dispatches AVX-512 → AVX2 → `wide::f32x8` like
+/// [`dequantize_sq8_residual_into`].
+#[inline]
+pub(crate) fn sq8_residual_norm_sq(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+) -> f32 {
+    let dim = scale.len();
+    debug_assert_eq!(offset.len(), dim);
+    debug_assert_eq!(codes.len(), dim);
+    debug_assert_eq!(residuals.len(), dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            return unsafe {
+                sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, residual_divisor, dim)
+            };
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            return unsafe {
+                sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, residual_divisor, dim)
+            };
+        }
+    }
+    sq8_residual_norm_sq_wide(scale, offset, codes, residuals, residual_divisor, dim)
+}
+
+#[inline]
+fn sq8_residual_norm_sq_wide(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    dim: usize,
+) -> f32 {
+    let inv_div = 1.0 / residual_divisor;
+    let inv_v = f32x8::splat(inv_div);
+    let mut acc = f32x8::ZERO;
+    let mut i = 0;
+    while i + F32X8_LANES <= dim {
+        let off = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&offset[i..i + F32X8_LANES])
+                .expect("offset[i..i+8] len 8"),
+        );
+        let sc = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&scale[i..i + F32X8_LANES])
+                .expect("scale[i..i+8] len 8"),
+        );
+        let mut code_bc = [0f32; F32X8_LANES];
+        let mut res_bc = [0f32; F32X8_LANES];
+        for j in 0..F32X8_LANES {
+            code_bc[j] = codes[i + j] as f32;
+            res_bc[j] = i8::from_le_bytes([residuals[i + j]]) as f32;
+        }
+        let codes_v = f32x8::from(code_bc);
+        let res_v = f32x8::from(res_bc);
+        let term = codes_v + res_v * inv_v;
+        let decoded = off + sc * term;
+        acc += decoded * decoded;
+        i += F32X8_LANES;
+    }
+    let mut sum = acc.reduce_add();
+    while i < dim {
+        let v = sq8_residual_component_scalar(
+            scale[i],
+            offset[i],
+            codes[i],
+            residuals[i],
+            residual_divisor,
+        );
+        sum += v * v;
+        i += 1;
+    }
+    sum
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`. [`avx2_enabled`] guarantees
+/// this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq8_residual_norm_sq_avx2(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    dim: usize,
+) -> f32 {
+    // SAFETY: each iteration reads 8-element windows; `i + 8 <= dim` keeps
+    // all pointers in bounds.
+    unsafe {
+        let inv_div = _mm256_set1_ps(1.0 / residual_divisor);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + F32X8_LANES <= dim {
+            let codes_u8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadl_epi64(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(res_u8));
+            let term = _mm256_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm256_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm256_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm256_fmadd_ps(sc, term, off);
+            acc = _mm256_fmadd_ps(decoded, decoded, acc);
+            i += F32X8_LANES;
+        }
+        let mut sum = horizontal_sum_avx256(acc);
+        while i < dim {
+            let v = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`. [`avx512_enabled`]
+/// guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_residual_norm_sq_avx512(
+    scale: &[f32],
+    offset: &[f32],
+    codes: &[u8],
+    residuals: &[u8],
+    residual_divisor: f32,
+    dim: usize,
+) -> f32 {
+    // SAFETY: each iteration reads 16-element windows; `i + 16 <= dim` keeps
+    // all pointers in bounds.
+    unsafe {
+        let inv_div = _mm512_set1_ps(1.0 / residual_divisor);
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= dim {
+            let codes_u8 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+            let codes_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes_u8));
+            let res_u8 = _mm_loadu_si128(residuals.as_ptr().add(i) as *const __m128i);
+            let res_f32 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(res_u8));
+            let term = _mm512_fmadd_ps(res_f32, inv_div, codes_f32);
+            let off = _mm512_loadu_ps(offset.as_ptr().add(i));
+            let sc = _mm512_loadu_ps(scale.as_ptr().add(i));
+            let decoded = _mm512_fmadd_ps(sc, term, off);
+            acc = _mm512_fmadd_ps(decoded, decoded, acc);
+            i += AVX512_F32_LANES;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < dim {
+            let v = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// Decode little-endian f32 bytes into `out`. On little-endian hosts the
+/// layout matches native `f32`, so the hot path is unaligned SIMD load/store.
+#[inline]
+pub(crate) fn decode_f32_le_into(bytes: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out.len() * F32_BYTES);
+    if let Ok(decoded) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+        out.copy_from_slice(decoded);
+        return;
+    }
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
+            unsafe {
+                decode_f32_le_avx512(bytes, out, n);
+            }
+            return;
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+            unsafe {
+                decode_f32_le_avx2(bytes, out, n);
+            }
+            return;
+        }
+    }
+    decode_f32_le_wide(bytes, out, n);
+}
+
+#[inline]
+fn decode_f32_le_wide(bytes: &[u8], out: &mut [f32], n: usize) {
+    let mut i = 0;
+    while i + F32X8_LANES <= n {
+        let mut lane = [0f32; F32X8_LANES];
+        for (j, slot) in lane.iter_mut().enumerate() {
+            let b = (i + j) * F32_BYTES;
+            *slot = f32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
+        }
+        out[i..i + F32X8_LANES].copy_from_slice(&lane);
+        i += F32X8_LANES;
+    }
+    while i < n {
+        let b = i * F32_BYTES;
+        out[i] = f32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
+        i += 1;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_f32_le_avx2(bytes: &[u8], out: &mut [f32], n: usize) {
+    // SAFETY: `i + 8 <= n` and each f32 is 4 bytes ⇒ byte offset `i*4+32`
+    // stays inside `bytes`.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = out.as_mut_ptr();
+        let mut i = 0;
+        while i + F32X8_LANES <= n {
+            let v = _mm256_loadu_ps(src.add(i * F32_BYTES) as *const f32);
+            _mm256_storeu_ps(dst.add(i), v);
+            i += F32X8_LANES;
+        }
+        while i < n {
+            let b = i * F32_BYTES;
+            *dst.add(i) = f32::from_le_bytes([
+                *src.add(b),
+                *src.add(b + 1),
+                *src.add(b + 2),
+                *src.add(b + 3),
+            ]);
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn decode_f32_le_avx512(bytes: &[u8], out: &mut [f32], n: usize) {
+    // SAFETY: `i + 16 <= n` keeps the 64-byte load inside `bytes`.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = out.as_mut_ptr();
+        let mut i = 0;
+        while i + AVX512_F32_LANES <= n {
+            let v = _mm512_loadu_ps(src.add(i * F32_BYTES) as *const f32);
+            _mm512_storeu_ps(dst.add(i), v);
+            i += AVX512_F32_LANES;
+        }
+        while i < n {
+            let b = i * F32_BYTES;
+            *dst.add(i) = f32::from_le_bytes([
+                *src.add(b),
+                *src.add(b + 1),
+                *src.add(b + 2),
+                *src.add(b + 3),
+            ]);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn horizontal_sum_avx256(v: __m256) -> f32 {
+    // SAFETY: `_mm256_*` shuffle/add intrinsics only touch `v`.
+    unsafe {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        let sums2 = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(sums2)
+    }
+}
+
+/// Decode little-endian f32 bytes into a new vector.
+#[inline]
+pub(crate) fn decode_f32_le_vec(bytes: &[u8]) -> Vec<f32> {
+    debug_assert_eq!(bytes.len() % F32_BYTES, 0);
+    let mut out = vec![0f32; bytes.len() / F32_BYTES];
+    decode_f32_le_into(bytes, &mut out);
+    out
+}
+
+/// Add `row` into `acc` element-wise (`acc[d] += row[d] as f64`). Keeps
+/// f64 precision for k-means / centroid-merge accumulators while using
+/// AVX2/AVX-512 for the fp32 load + widen.
+#[inline]
+pub(crate) fn add_f32_to_f64_acc(acc: &mut [f64], row: &[f32]) {
+    debug_assert_eq!(acc.len(), row.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: gated on `avx2_enabled()`.
+        unsafe {
+            add_f32_to_f64_acc_avx2(acc, row);
+        }
+        return;
+    }
+    add_f32_to_f64_acc_scalar(acc, row);
+}
+
+/// Like [`add_f32_to_f64_acc`] but scales each lane by `weight` first.
+#[inline]
+pub(crate) fn add_weighted_f32_to_f64_acc(acc: &mut [f64], row: &[f32], weight: f64) {
+    debug_assert_eq!(acc.len(), row.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: gated on `avx2_enabled()`.
+        unsafe {
+            add_weighted_f32_to_f64_acc_avx2(acc, row, weight);
+        }
+        return;
+    }
+    for (a, &x) in acc.iter_mut().zip(row.iter()) {
+        *a += x as f64 * weight;
+    }
+}
+
+/// Write `out[d] = (acc[d] * inv) as f32` after a f64 reduction pass.
+#[inline]
+pub(crate) fn f64_acc_mean_into_f32(acc: &[f64], inv: f64, out: &mut [f32]) {
+    debug_assert_eq!(acc.len(), out.len());
+    for (o, &a) in out.iter_mut().zip(acc.iter()) {
+        *o = (a * inv) as f32;
+    }
+}
+
+/// Mean of `n` cluster-major fp32 vectors (`vectors.len() == n * dim`).
+#[inline]
+pub(crate) fn mean_f32_cluster_major(vectors: &[f32], dim: usize, n: usize) -> Vec<f32> {
+    debug_assert_eq!(vectors.len(), n * dim);
+    let mut acc = vec![0f64; dim];
+    for i in 0..n {
+        add_f32_to_f64_acc(&mut acc, &vectors[i * dim..(i + 1) * dim]);
+    }
+    let mut out = vec![0f32; dim];
+    if n > 0 {
+        f64_acc_mean_into_f32(&acc, 1.0 / n as f64, &mut out);
+    }
+    out
+}
+
+#[inline]
+fn add_f32_to_f64_acc_scalar(acc: &mut [f64], row: &[f32]) {
+    for (a, &x) in acc.iter_mut().zip(row.iter()) {
+        *a += x as f64;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_f32_to_f64_acc_avx2(acc: &mut [f64], row: &[f32]) {
+    // SAFETY: each iteration touches 8 f32 / 4 f64 lanes; `i + 8 <= len`
+    // keeps all pointers in bounds.
+    unsafe {
+        let mut i = 0;
+        let n = acc.len();
+        while i + F32X8_LANES <= n {
+            let vf = _mm256_loadu_ps(row.as_ptr().add(i));
+            let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(vf));
+            let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(vf, 1));
+            let alo = _mm256_loadu_pd(acc.as_mut_ptr().add(i));
+            let ahi = _mm256_loadu_pd(acc.as_mut_ptr().add(i + 4));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i), _mm256_add_pd(alo, lo));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i + 4), _mm256_add_pd(ahi, hi));
+            i += F32X8_LANES;
+        }
+        while i < n {
+            acc[i] += row[i] as f64;
+            i += 1;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_weighted_f32_to_f64_acc_avx2(acc: &mut [f64], row: &[f32], weight: f64) {
+    // SAFETY: same bounds contract as [`add_f32_to_f64_acc_avx2`].
+    unsafe {
+        let w = _mm256_set1_pd(weight);
+        let mut i = 0;
+        let n = acc.len();
+        while i + F32X8_LANES <= n {
+            let vf = _mm256_loadu_ps(row.as_ptr().add(i));
+            let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(vf));
+            let hi = _mm256_cvtps_pd(_mm256_extractf128_ps(vf, 1));
+            let wlo = _mm256_mul_pd(lo, w);
+            let whi = _mm256_mul_pd(hi, w);
+            let alo = _mm256_loadu_pd(acc.as_mut_ptr().add(i));
+            let ahi = _mm256_loadu_pd(acc.as_mut_ptr().add(i + 4));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i), _mm256_add_pd(alo, wlo));
+            _mm256_storeu_pd(acc.as_mut_ptr().add(i + 4), _mm256_add_pd(ahi, whi));
+            i += F32X8_LANES;
+        }
+        while i < n {
+            acc[i] += row[i] as f64 * weight;
+            i += 1;
+        }
     }
 }
 
@@ -911,38 +1895,170 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
-/// Decode `Sq8ResidualEpsilon` per-vector bytes back to fp32.
-///
-/// `codes` — `dim` u8 quantization codes; `residuals` — `dim` i8 residuals
-/// stored as raw bytes (each byte reinterpreted as `i8`).
-/// `scale`/`offset` are the per-cluster quantizer arrays (length `dim`).
-pub(crate) fn decode_sq8_residual(
-    codes: &[u8],
-    residuals: &[u8],
-    dim: usize,
-    scale: &[f32],
-    offset: &[f32],
-    residual_divisor: f32,
-) -> Vec<f32> {
-    codes
-        .iter()
-        .zip(residuals.iter())
-        .enumerate()
-        .map(|(i, (&c, &r))| {
-            let d = i % dim;
-            (c as f32) * scale[d]
-                + offset[d]
-                + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() < eps
+    }
+
+    fn scalar_nearest_two_centroids(
+        metric: Metric,
+        query: &[f32],
+        centroids: &[f32],
+        n_cent: usize,
+        dim: usize,
+        counts: Option<&[u32]>,
+    ) -> Option<((u32, f32), Option<(u32, f32)>)> {
+        let mut best: Option<(u32, f32)> = None;
+        let mut second: Option<(u32, f32)> = None;
+        for c in 0..n_cent {
+            if counts.is_some_and(|counts| counts[c] == 0) {
+                continue;
+            }
+            let score = distance(metric, query, &centroids[c * dim..(c + 1) * dim]);
+            match best {
+                None => best = Some((c as u32, score)),
+                Some((_, best_score)) if score < best_score => {
+                    second = best;
+                    best = Some((c as u32, score));
+                }
+                _ => {
+                    if second.is_none_or(|(_, second_score)| score < second_score) {
+                        second = Some((c as u32, score));
+                    }
+                }
+            }
+        }
+        best.map(|best| (best, second))
+    }
+
+    fn assert_nearest_two_matches(
+        got: Option<((u32, f32), Option<(u32, f32)>)>,
+        expected: Option<((u32, f32), Option<(u32, f32)>)>,
+    ) {
+        let (got_best, got_second) = got.expect("nearest result");
+        let (expected_best, expected_second) = expected.expect("scalar nearest result");
+        assert_eq!(got_best.0, expected_best.0);
+        assert!(
+            approx(got_best.1, expected_best.1, 1e-3),
+            "best score got {} expected {}",
+            got_best.1,
+            expected_best.1
+        );
+        let got_second = got_second.expect("second result");
+        let expected_second = expected_second.expect("scalar second result");
+        assert_eq!(got_second.0, expected_second.0);
+        assert!(
+            approx(got_second.1, expected_second.1, 1e-3),
+            "second score got {} expected {}",
+            got_second.1,
+            expected_second.1
+        );
+    }
+
+    /// The k-means assign kernel must agree with the naive per-centroid
+    /// scan: same argmin on random data, and lowest-index winner on exact
+    /// ties (duplicated centroids). Covers lane-tail shapes (`n_cent` not a
+    /// multiple of the SIMD block width).
+    #[test]
+    fn nearest_centroid_transposed_matches_naive_scan() {
+        for n_cent in [128usize, 130, 144, 160] {
+            let dim = 33;
+            let mut centroids = Vec::with_capacity(n_cent * dim);
+            for c in 0..n_cent {
+                for d in 0..dim {
+                    centroids.push(((c * 31 + d * 17) % 29) as f32 * 0.04 - 0.5);
+                }
+            }
+            // Exact tie: centroid n-1 duplicates centroid 3; the naive
+            // scan keeps the lower index and the blocked kernel must too.
+            let dup = centroids[3 * dim..4 * dim].to_vec();
+            let last = (n_cent - 1) * dim;
+            centroids[last..last + dim].copy_from_slice(&dup);
+            let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+            for probe in 0..64 {
+                let query: Vec<f32> = (0..dim)
+                    .map(|d| ((probe * 13 + d * 7) % 23) as f32 * 0.05 - 0.4)
+                    .collect();
+                let mut naive = (0u32, f32::INFINITY);
+                for c in 0..n_cent {
+                    let dist = l2_sq(&query, &centroids[c * dim..(c + 1) * dim]);
+                    if dist < naive.1 {
+                        naive = (c as u32, dist);
+                    }
+                }
+                let blocked =
+                    nearest_centroid_transposed(Metric::L2Sq, &query, &transposed, n_cent, dim);
+                assert_eq!(
+                    blocked.0, naive.0,
+                    "n_cent {n_cent} probe {probe}: blocked argmin diverged from naive"
+                );
+            }
+            // Tie probe: query exactly at the duplicated centroid.
+            let tie_query = dup.clone();
+            let blocked =
+                nearest_centroid_transposed(Metric::L2Sq, &tie_query, &transposed, n_cent, dim);
+            assert_eq!(blocked.0, 3, "tie must resolve to the lowest index");
+        }
+    }
+
+    #[test]
+    fn nearest_two_centroids_transposed_matches_scalar_reference() {
+        let dim = 17;
+        let n_cent = 19;
+        let query: Vec<f32> = (0..dim)
+            .map(|d| ((d * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            for d in 0..dim {
+                centroids.push(((c * 13 + d * 7) % 31) as f32 * 0.02 - 0.3 + c as f32 * 0.001);
+            }
+        }
+        let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let got =
+                nearest_two_centroids_transposed(metric, &query, &transposed, n_cent, dim, None);
+            let expected =
+                scalar_nearest_two_centroids(metric, &query, &centroids, n_cent, dim, None);
+            assert_nearest_two_matches(got, expected);
+        }
+    }
+
+    #[test]
+    fn nearest_two_centroids_transposed_honors_zero_counts() {
+        let dim = 17;
+        let n_cent = 19;
+        let query: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            for d in 0..dim {
+                centroids.push(c as f32 + d as f32 * 0.001);
+            }
+        }
+        let mut counts = vec![1u32; n_cent];
+        counts[0] = 0;
+        let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+        let got = nearest_two_centroids_transposed(
+            Metric::L2Sq,
+            &query,
+            &transposed,
+            n_cent,
+            dim,
+            Some(&counts),
+        );
+        let expected = scalar_nearest_two_centroids(
+            Metric::L2Sq,
+            &query,
+            &centroids,
+            n_cent,
+            dim,
+            Some(&counts),
+        );
+        assert_nearest_two_matches(got, expected);
+        assert_ne!(got.expect("nearest result").0.0, 0);
     }
 
     // --- dot ------------------------------------------------------------
@@ -969,6 +2085,60 @@ mod tests {
         let v: Vec<f32> = (1..=16).map(|i| i as f32).collect();
         let want: f32 = (1..=16).map(|i| (i * i) as f32).sum();
         assert!(approx(dot(&v, &v), want, 1e-3));
+    }
+
+    #[test]
+    fn sum_f32_matches_scalar_reference() {
+        for len in [1, 7, 8, 15, 16, 17, 384] {
+            let v: Vec<f32> = (0..len).map(|i| (i as f32) * 0.25 - 1.0).collect();
+            let expected: f32 = v.iter().sum();
+            assert!(
+                approx(sum_f32(&v), expected, 1e-4),
+                "len={len}: got {} expected {expected}",
+                sum_f32(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn sq8_residual_norm_sq_matches_dequant_dot_self() {
+        let dim = 17;
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.5 + 0.03 * i as f32).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| (i * 17 % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| ((i as i8).wrapping_mul(3)).to_le_bytes()[0])
+            .collect();
+        let mut decoded = vec![0f32; dim];
+        dequantize_sq8_residual_into(
+            &scale,
+            &offset,
+            &codes,
+            &residuals,
+            SQ8_RESIDUAL_DIVISOR,
+            &mut decoded,
+        );
+        let expected = dot(&decoded, &decoded);
+        let got = sq8_residual_norm_sq(&scale, &offset, &codes, &residuals, SQ8_RESIDUAL_DIVISOR);
+        // Relative tolerance: the norm's magnitude here is ~1e4, where an
+        // absolute 1e-4 sits below f32 rounding noise — the SIMD kernel and
+        // the scalar dequant+dot reference sum in different orders (and CI's
+        // coverage build changes codegen), so they legitimately diverge past
+        // it. 1e-5 relative matches the cross-arch bound the cluster-scorer
+        // self-check uses.
+        assert!(
+            (got - expected).abs() <= 1e-5 * (1.0 + expected.abs()),
+            "norm {got} vs dequant-dot-self {expected}"
+        );
+    }
+
+    #[test]
+    fn decode_f32_le_into_round_trip() {
+        let values: Vec<f32> = (0..19).map(|i| i as f32 * 0.125 - 2.0).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![0f32; values.len()];
+        decode_f32_le_into(&bytes, &mut out);
+        assert_eq!(out, values);
     }
 
     #[test]
@@ -1112,6 +2282,30 @@ mod tests {
             .collect()
     }
 
+    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
+    /// * scale / divisor`) — the reference the residual kernel must
+    /// agree with.
+    fn decode_sq8_residual(
+        codes: &[u8],
+        residuals: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        residual_divisor: f32,
+    ) -> Vec<f32> {
+        codes
+            .iter()
+            .zip(residuals.iter())
+            .enumerate()
+            .map(|(i, (&c, &r))| {
+                let d = i % dim;
+                (c as f32) * scale[d]
+                    + offset[d]
+                    + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
+            })
+            .collect()
+    }
+
     #[test]
     fn sq8_residual_kernel_matches_corrected_reference() {
         let dim = 24usize;
@@ -1132,15 +2326,9 @@ mod tests {
                 Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
                 Metric::NegDot => None,
             };
-            let kernel = Sq8ResidualEpsilonKernel::new(
-                metric,
-                &query,
-                &scale,
-                &offset,
-                residual_divisor,
-                norms_arg,
-            );
-            let got = kernel.distance_at(0, &codes, &residuals);
+            let kernel = Sq8ResidualKernel::new(metric, &query, &scale, &offset, residual_divisor);
+            let got =
+                kernel.distance_with_norm(&codes, &residuals, norms_arg.map(|norms| norms[0]));
             let want = match metric {
                 Metric::Cosine => 1.0 - dot(&query, &corrected) / corrected_norm.sqrt(),
                 _ => distance(metric, &query, &corrected),
@@ -1165,15 +2353,9 @@ mod tests {
             .collect();
         let corrected =
             decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
-        let kernel = Sq8ResidualEpsilonKernel::new(
-            Metric::NegDot,
-            &query,
-            &scale,
-            &offset,
-            residual_divisor,
-            None,
-        );
-        let got = kernel.distance_at(0, &codes, &residuals);
+        let kernel =
+            Sq8ResidualKernel::new(Metric::NegDot, &query, &scale, &offset, residual_divisor);
+        let got = kernel.distance_with_norm(&codes, &residuals, None);
         let want = distance(Metric::NegDot, &query, &corrected);
         assert!(
             (want - got).abs() <= 1e-4,

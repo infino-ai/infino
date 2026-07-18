@@ -17,7 +17,7 @@ use infino::superfile::{
     SuperfileReader,
     builder::{BuilderOptions, SuperfileBuilder, VectorConfig},
     reader::VectorSearchOptions,
-    vector::{distance::Metric as InfinoMetric, rerank_codec::RerankCodec},
+    vector::distance::Metric as InfinoMetric,
 };
 use rayon::prelude::*;
 
@@ -45,6 +45,7 @@ fn build_superfile(
     id_base: usize,
 ) -> Vec<u8> {
     let n_docs = vectors.len() / dim;
+    let metric = map_metric(metric);
     let schema = Arc::new(Schema::new(vec![Field::new(
         ID_COLUMN,
         DataType::Decimal128(38, 0),
@@ -55,12 +56,13 @@ fn build_superfile(
         ID_COLUMN,
         vec![],
         vec![VectorConfig {
+            provided_centroids: None,
             column: column.into(),
             dim,
             n_cent,
             rot_seed: ROT_SEED,
-            metric: map_metric(metric),
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            metric,
+            rerank_codec: corpus::bench_rerank_codec(metric),
         }],
         None,
     );

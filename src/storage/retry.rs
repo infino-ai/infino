@@ -13,7 +13,7 @@ use object_store::RetryConfig;
 use tokio::time;
 use tracing::warn;
 
-use super::StorageError;
+use super::{ObjectMeta, StorageError};
 
 /// `object_store` retry depth. Deeper than the library default, which
 /// exhausts before a flaky/high-latency connection recovers.
@@ -57,10 +57,9 @@ fn backoff(attempt: u32) -> Duration {
 /// Permanent error: the object returned fewer bytes than requested and
 /// made no progress. Stable, so callers don't retry.
 fn short_read(uri: &str, start: u64, requested: u64, got: u64) -> StorageError {
-    let source: Box<dyn Error + Send + Sync> = format!(
-        "get_range short read: object returned {got} of {requested} bytes from offset {start}"
-    )
-    .into();
+    let source: Box<dyn Error + Send + Sync> =
+        format!("short read: object returned {got} of {requested} bytes from offset {start}")
+            .into();
     StorageError::Permanent {
         uri: uri.into(),
         source,
@@ -85,6 +84,54 @@ where
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Whole-object GET with truncated-body detection + transient re-issue.
+///
+/// `object_store`'s streamed body can come back short: a socket dropped
+/// mid-transfer surfaces as a *successful* but truncated `Bytes`, not an
+/// error — the same hazard [`complete_range`] guards the range path against.
+/// A truncated whole-object body silently corrupts every caller that hashes
+/// or parses it (an OPANN routing page fails its content-hash check; a
+/// manifest part or footer fails to parse). `fetch` performs one GET and
+/// returns the body paired with the object's declared size from the *same*
+/// response; this re-issues a fresh GET (a new dial also drops the dead
+/// socket) whenever the body is shorter than the declared size — or a
+/// transient error fires — and fails with a stable short-read error once the
+/// budget is spent, rather than hand back a partial object as success.
+pub(crate) async fn complete_get<F, Fut>(
+    uri: &str,
+    mut fetch: F,
+) -> Result<(Bytes, ObjectMeta), StorageError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(Bytes, ObjectMeta), StorageError>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        let (bytes, meta) = match fetch().await {
+            Ok(v) => v,
+            Err(e) if is_retryable(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+                time::sleep(backoff(attempt)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let got = bytes.len() as u64;
+        if got == meta.size {
+            return Ok((bytes, meta));
+        }
+        // A body shorter than the response's own declared size is a truncated
+        // read delivered as success. Re-issue rather than return it — a
+        // partial object would fail a downstream content-hash check or parse.
+        if attempt < MAX_TRANSIENT_RETRIES {
+            time::sleep(backoff(attempt)).await;
+            attempt += 1;
+            continue;
+        }
+        return Err(short_read(uri, 0, meta.size, got));
     }
 }
 
@@ -340,6 +387,66 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn range_propagates_non_retryable() {
         let r = complete_range("u", 0..3, |_| async { Err::<Bytes, _>(not_found()) }).await;
+        assert!(matches!(r, Err(StorageError::NotFound { .. })));
+    }
+
+    fn meta(size: u64) -> ObjectMeta {
+        ObjectMeta {
+            size,
+            etag: None,
+            last_modified: std::time::UNIX_EPOCH,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_get_returns_full_body_first_try() {
+        let calls = Cell::new(0u32);
+        let (bytes, _m) = complete_get("u", || {
+            calls.set(calls.get() + 1);
+            async { Ok((Bytes::from_static(b"hello"), meta(5))) }
+        })
+        .await
+        .expect("full body");
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_get_reissues_a_truncated_body() {
+        // First response is a body of 3 bytes while the response's own meta
+        // declares 5 (object_store's short-read-as-success hazard). The helper
+        // must NOT return it — it re-issues and returns the full object.
+        let calls = Cell::new(0u32);
+        let (bytes, _m) = complete_get("u", || {
+            let c = calls.get();
+            calls.set(c + 1);
+            async move {
+                if c == 0 {
+                    Ok((Bytes::from_static(b"hel"), meta(5)))
+                } else {
+                    Ok((Bytes::from_static(b"hello"), meta(5)))
+                }
+            }
+        })
+        .await
+        .expect("reissue then full");
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(calls.get(), 2, "must have re-issued exactly once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_get_persistent_truncation_is_short_read() {
+        // A body that stays short past the budget surfaces a stable short-read
+        // error rather than a silently-truncated object.
+        let r = complete_get("u", || async { Ok((Bytes::from_static(b"hel"), meta(5))) }).await;
+        let e = r.expect_err("persistent truncation must error");
+        assert!(matches!(e, StorageError::Permanent { .. }));
+        assert!(e.to_string().contains("short read"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_get_propagates_non_retryable() {
+        let r = complete_get("u", || async { Err::<(Bytes, ObjectMeta), _>(not_found()) }).await;
         assert!(matches!(r, Err(StorageError::NotFound { .. })));
     }
 }

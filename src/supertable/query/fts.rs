@@ -32,7 +32,7 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
+//! holds a pinned `Arc<ManifestSnapshot>`; for each visible superfile we:
 //!
 //!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::bm25_search` /
@@ -60,7 +60,7 @@
 //! within the set wiggles. Oracle tests assert set membership at
 //! `k = 10` against a single-superfile ground truth.
 //!
-//! Manifest-level skip pruning is wired in: each call computes a
+//! ManifestSnapshot-level skip pruning is wired in: each call computes a
 //! per-superfile keep/prune mask from the FTS bloom (exact-term
 //! mode) or the lex term range (prefix mode) before issuing
 //! per-superfile work, so pruned superfiles never trigger a
@@ -80,6 +80,7 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
 use tracing::debug;
 use uuid::Uuid;
@@ -97,9 +98,11 @@ use crate::{
         manifest::SuperfileEntry,
         query::{
             SuperfileHit, dispatch,
-            exec::common::resolve_hits_named,
+            exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
         },
+        reader_cache::disk::ForegroundQueryGuard,
+        tombstones::SidecarCache,
     },
 };
 
@@ -321,7 +324,16 @@ impl SupertableReader {
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
             async move {
-                let floor = shared.floor();
+                // A cross-file floor can suppress score-tied single-term hits
+                // according to task completion order. Local BMW still prunes
+                // those queries; share the global floor only for multi-term
+                // paths.
+                let n_terms = must_arc.len() + should_arc.len();
+                let floor = if n_terms == 1 {
+                    f32::NEG_INFINITY
+                } else {
+                    shared.floor()
+                };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
@@ -374,9 +386,10 @@ impl SupertableReader {
                 Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-
-        Ok(top_k_descending(per_unit, k))
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits = top_k_descending(per_unit, k);
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -406,7 +419,7 @@ impl SupertableReader {
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
 
-        // Manifest-level term-range skip uses the same
+        // ManifestSnapshot-level term-range skip uses the same
         // lowercased prefix bytes the v1 tokenizer +
         // FST-expansion path use, so the skip's
         // lex-range overlap test exactly matches the
@@ -456,9 +469,10 @@ impl SupertableReader {
                 }
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-
-        Ok(top_k_descending(per_unit, k))
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits = top_k_descending(per_unit, k);
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Parse `query` into positive and negated tokens, then select the
@@ -585,8 +599,10 @@ impl SupertableReader {
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-        Ok(per_unit.into_iter().flatten().collect())
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Count documents whose `column` matches `query`'s tokens under
@@ -633,6 +649,8 @@ impl SupertableReader {
         let per_superfile = dispatch::fanout_with(
             self,
             units,
+            true,
+            true,
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
@@ -721,7 +739,7 @@ impl SupertableReader {
         } else {
             vec![PruneLeaf::TermPresence {
                 column: column.to_owned(),
-                terms: term_strings,
+                terms: term_strings.clone(),
                 mode: BoolMode::And,
             }]
         };
@@ -732,19 +750,66 @@ impl SupertableReader {
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+        let tokens_arc = Arc::new(term_strings);
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
+            let tokens_arc = Arc::clone(&tokens_arc);
             async move {
-                let docs = r
-                    .exact_match(&column_arc, &value_arc)
-                    .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+                let candidates: Vec<u32> = if tokens_arc.is_empty() {
+                    (0..r.n_docs() as u32).collect()
+                } else {
+                    let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
+                    r.token_match(&column_arc, &refs, BoolMode::And)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                };
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let batch = if r.can_take_by_local_doc_ids() {
+                    r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                } else {
+                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                        .await
+                        .map_err(|e| QueryError::Execute(e.to_string()))?
+                };
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        QueryError::Execute(format!(
+                            "exact_match column '{}' is not LargeUtf8",
+                            column_arc
+                        ))
+                    })?;
+                let mut hits: Vec<SuperfileHit> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        !values.is_null(*index) && values.value(*index) == value_arc.as_str()
+                    })
+                    .map(|(_, &local_doc_id)| SuperfileHit {
+                        superfile: entry.uri,
+                        local_doc_id,
+                        score: 0.0,
+                        stable_id: None,
+                    })
+                    .collect();
+                dispatch::apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut hits, now)?;
+                Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-        Ok(per_unit.into_iter().flatten().collect())
+        let per_unit = dispatch::fanout_with(self, units, true, true, body).await?;
+        let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 }
 
@@ -764,6 +829,7 @@ impl SupertableReader {
         mode: BoolMode,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             // `projection` selects columns by name (any of `_id`, the
@@ -801,6 +867,7 @@ impl SupertableReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.bm25_search_async(column, query, k, mode))
     }
 
@@ -812,6 +879,7 @@ impl SupertableReader {
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.bm25_search_prefix_async(column, prefix, k))
     }
 
@@ -830,6 +898,7 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_async(column, query, mode))
     }
 
@@ -839,6 +908,7 @@ impl SupertableReader {
     /// resolves in O(1) from the stored document frequency. Drives the
     /// async kernel via the sync→async bridge.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_count_async(column, query, mode))
     }
 
@@ -849,6 +919,7 @@ impl SupertableReader {
     /// Returns the rows whose stored value equals `value` exactly;
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.exact_match_async(column, value))
     }
 }
@@ -1184,6 +1255,7 @@ mod tests {
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            vector::layout::VectorLayout,
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -1842,6 +1914,7 @@ mod tests {
         fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs,
@@ -1852,6 +1925,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                vector_layout: VectorLayout::Ivf,
                 subsection_offsets: None,
             })
         }
@@ -1890,6 +1964,7 @@ mod tests {
         let id = Uuid::new_v4();
         // One large superfile, well above SUBRANGE_MIN_DOCS (50k).
         let big = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 200_000,
@@ -1900,6 +1975,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         });
         let kept = vec![&big];

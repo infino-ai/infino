@@ -23,7 +23,11 @@
 //! means constructing a new `FileMetaData` with the patched KVs and
 //! rebuilding the `ParquetMetaData` around it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::{self, Cursor, Read, Write},
+    sync::Arc,
+};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
@@ -74,6 +78,33 @@ pub struct ParquetParts {
     pub vec_length: u64,
 }
 
+/// Absolute layout of a superfile written through
+/// [`splice_index_streams_to`].
+pub struct ParquetLayout {
+    pub total_size: u64,
+    pub fts_offset: u64,
+    pub fts_length: u64,
+    pub vec_offset: u64,
+    pub vec_length: u64,
+}
+
+struct CountingWriter<'a, W> {
+    output: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.output.write(buf)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
 /// Map of `inf.*` KV-metadata entries extracted from the Parquet footer.
 pub type KvMap = HashMap<String, String>;
 
@@ -84,6 +115,8 @@ pub enum FooterError {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
     #[error("malformed parquet: {0}")]
     Malformed(&'static str),
     /// surfaces a `LazyByteSource` failure during
@@ -188,19 +221,72 @@ pub fn splice_index_blobs(
     vec_blob: &[u8],
     extra_kv: &[(String, String)],
 ) -> Result<ParquetParts, FooterError> {
-    let EncodedBody { mut buf, metadata } = body;
+    let mut bytes = Vec::with_capacity(
+        body.buf
+            .len()
+            .saturating_add(fts_blob.len())
+            .saturating_add(vec_blob.len()),
+    );
+    let layout = splice_index_streams_to(
+        body,
+        Cursor::new(fts_blob),
+        fts_blob.len() as u64,
+        Cursor::new(vec_blob),
+        vec_blob.len() as u64,
+        extra_kv,
+        &mut bytes,
+    )?;
+    Ok(ParquetParts {
+        bytes,
+        fts_offset: layout.fts_offset,
+        fts_length: layout.fts_length,
+        vec_offset: layout.vec_offset,
+        vec_length: layout.vec_length,
+    })
+}
 
-    let fts_offset = if !fts_blob.is_empty() {
-        let off = buf.len() as u64;
-        buf.extend_from_slice(fts_blob);
-        off
+/// Stream the stripped Parquet body, optional FTS/vector blobs, and rewritten
+/// footer to `output`. This is the single superfile splice implementation:
+/// the in-memory [`splice_index_blobs`] wrapper and drain's disk-backed shard
+/// assembly both call here.
+pub(crate) fn splice_index_streams_to<W, F, V>(
+    body: EncodedBody,
+    mut fts_blob: F,
+    fts_length: u64,
+    mut vec_blob: V,
+    vec_length: u64,
+    extra_kv: &[(String, String)],
+    mut output: W,
+) -> Result<ParquetLayout, FooterError>
+where
+    W: Write,
+    F: Read,
+    V: Read,
+{
+    let EncodedBody { buf, metadata } = body;
+    let mut output = CountingWriter {
+        output: &mut output,
+        written: 0,
+    };
+    output.write_all(&buf)?;
+
+    let fts_offset = if fts_length > 0 {
+        let offset = output.written;
+        let copied = io::copy(&mut fts_blob, &mut output)?;
+        if copied != fts_length {
+            return Err(FooterError::Malformed("FTS stream length mismatch"));
+        }
+        offset
     } else {
         0
     };
-    let vec_offset = if !vec_blob.is_empty() {
-        let off = buf.len() as u64;
-        buf.extend_from_slice(vec_blob);
-        off
+    let vec_offset = if vec_length > 0 {
+        let offset = output.written;
+        let copied = io::copy(&mut vec_blob, &mut output)?;
+        if copied != vec_length {
+            return Err(FooterError::Malformed("vector stream length mismatch"));
+        }
+        offset
     } else {
         0
     };
@@ -216,24 +302,24 @@ pub fn splice_index_blobs(
     for (k, v) in extra_kv {
         kvs.push(KeyValue::new(k.clone(), Some(v.clone())));
     }
-    if !fts_blob.is_empty() {
+    if fts_length > 0 {
         kvs.push(KeyValue::new(
             kv::FTS_OFFSET.to_string(),
             Some(fts_offset.to_string()),
         ));
         kvs.push(KeyValue::new(
             kv::FTS_LENGTH.to_string(),
-            Some((fts_blob.len() as u64).to_string()),
+            Some(fts_length.to_string()),
         ));
     }
-    if !vec_blob.is_empty() {
+    if vec_length > 0 {
         kvs.push(KeyValue::new(
             kv::VEC_OFFSET.to_string(),
             Some(vec_offset.to_string()),
         ));
         kvs.push(KeyValue::new(
             kv::VEC_LENGTH.to_string(),
-            Some((vec_blob.len() as u64).to_string()),
+            Some(vec_length.to_string()),
         ));
     }
     let new_fm = FileMetaData::new(
@@ -252,15 +338,16 @@ pub fn splice_index_blobs(
 
     // Re-encode footer. `ParquetMetaDataWriter::finish` appends the
     // thrift-encoded metadata + the u32 length + the PAR1 magic in one
-    // call, leaving `buf` ready to read as a complete Parquet file.
-    ParquetMetaDataWriter::new(&mut buf, &new_meta).finish()?;
+    // call, leaving `output` ready to read as a complete Parquet file.
+    ParquetMetaDataWriter::new(&mut output, &new_meta).finish()?;
+    output.flush()?;
 
-    Ok(ParquetParts {
-        bytes: buf,
+    Ok(ParquetLayout {
+        total_size: output.written,
         fts_offset,
-        fts_length: fts_blob.len() as u64,
+        fts_length,
         vec_offset,
-        vec_length: vec_blob.len() as u64,
+        vec_length,
     })
 }
 

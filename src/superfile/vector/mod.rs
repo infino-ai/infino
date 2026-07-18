@@ -12,8 +12,11 @@
 //! subsection layout and the IVF + RaBitQ + rerank query pipeline.
 
 pub mod builder;
+pub mod cell_posting;
 pub mod distance;
+pub mod ivf_merge;
 pub mod kmeans;
+pub mod layout;
 pub mod quant;
 pub mod reader;
 pub mod rerank_codec;

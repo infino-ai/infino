@@ -60,9 +60,9 @@ use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;
 
-/// Manifest id used by the pointer-file round-trip fixture.
+/// ManifestSnapshot id used by the pointer-file round-trip fixture.
 const POINTER_ROUNDTRIP_MANIFEST_ID: u64 = 42;
-/// Manifest id used by the forward-compat parse fixture.
+/// ManifestSnapshot id used by the forward-compat parse fixture.
 const POINTER_FORWARD_COMPAT_MANIFEST_ID: u64 = 7;
 /// Byte filling a 32-byte fixture content hash.
 const FIXTURE_CONTENT_HASH_BYTE: u8 = 0xab;
@@ -84,7 +84,7 @@ async fn commit_manifest(
     new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
-    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
+    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p)).collect();
     let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
 
     // Start from an empty manifest (no superfiles) carrying the
@@ -166,6 +166,8 @@ fn fresh_part(seed: u8) -> ManifestPart {
 
 fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
     Manifest {
+        drained_ranges: Default::default(),
+        global_vector_index: None,
         tombstone_seqs: Default::default(),
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
@@ -178,31 +180,32 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
             column: "doc_id".into(),
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
+        vector_index_storage_prefix: None,
+        deleted_user_ids_inline: None,
+        slow_vector_state_uri: None,
+        slow_vector_state_content_hash: None,
         parts,
     }
 }
 
 /// Build a manifest list entry referencing an already-encoded
-/// part. Skip-summary aggregates left empty here.
+/// part. Skip-summary aggregates left empty here. Parts are stored as
+/// raw Avro now, so both size fields carry the stored byte count.
 fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
-    let encoded = part_mod::encode(part, 3);
+    let encoded = part_mod::encode(part);
     let hash = ContentHash::of(&encoded);
     let uri = part_uri(&hash);
-    let size_compressed = encoded.len() as u64;
-    let size_uncompressed = zstd::stream::decode_all(encoded.as_slice())
-        .expect("self-decode")
-        .len() as u64;
+    let size_bytes = encoded.len() as u64;
     ManifestPartEntry {
         part_id: part.part_id,
         uri,
         n_superfiles: part.superfiles.len() as u64,
-        size_bytes_compressed: size_compressed,
-        size_bytes_uncompressed: size_uncompressed,
+        size_bytes_compressed: size_bytes,
+        size_bytes_uncompressed: size_bytes,
         content_hash: hash,
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),
-        vector_summary_agg: Default::default(),
     }
 }
 
@@ -373,10 +376,10 @@ async fn idempotent_content_addressed_part_put() {
     let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
     let part = fresh_part(9);
 
-    let r1 = commit::write_manifest_part(&storage, &part, 3)
+    let r1 = commit::write_manifest_part(&storage, &part)
         .await
         .expect("first write");
-    let r2 = commit::write_manifest_part(&storage, &part, 3)
+    let r2 = commit::write_manifest_part(&storage, &part)
         .await
         .expect("second write (idempotent)");
     assert_eq!(r1.uri, r2.uri);

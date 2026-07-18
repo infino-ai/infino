@@ -170,6 +170,66 @@ pub(crate) enum Source {
     Lazy(Arc<dyn LazyByteSource>),
 }
 
+/// Plan for fetching nearby byte ranges as fewer contiguous spans and slicing
+/// the original ranges back out in caller order.
+///
+/// The caller supplies domain-specific overfetch limits. This keeps the
+/// request-count optimization shared between vector cluster blocks and FTS
+/// posting lists without forcing either subsystem's cost policy on the other.
+pub(crate) struct RangeCoalescePlan {
+    fetch_ranges: Vec<Range<usize>>,
+    /// Per original range: `(fetch_range_index, offset, length)`.
+    scatter: Vec<(usize, usize, usize)>,
+}
+
+impl RangeCoalescePlan {
+    pub(crate) fn new(ranges: &[Range<usize>], max_gap: usize, max_overfetch: usize) -> Self {
+        let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+        sorted.sort_unstable_by_key(|(_, range)| (range.start, range.end));
+
+        // (merged range, requested payload bytes, original members)
+        let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+        for (index, range) in sorted {
+            if let Some((merged, payload_bytes, members)) = groups.last_mut() {
+                let gap = range.start.saturating_sub(merged.end);
+                let merged_end = merged.end.max(range.end);
+                let new_payload_bytes = *payload_bytes + range.len();
+                let overfetch = (merged_end - merged.start).saturating_sub(new_payload_bytes);
+                if range.start <= merged.end || (gap <= max_gap && overfetch <= max_overfetch) {
+                    merged.end = merged_end;
+                    *payload_bytes = new_payload_bytes;
+                    members.push((index, range));
+                    continue;
+                }
+            }
+            groups.push((range.clone(), range.len(), vec![(index, range)]));
+        }
+
+        let fetch_ranges = groups.iter().map(|(range, _, _)| range.clone()).collect();
+        let mut scatter = vec![(0, 0, 0); ranges.len()];
+        for (fetch_index, (merged, _, members)) in groups.iter().enumerate() {
+            for (original_index, range) in members {
+                scatter[*original_index] = (fetch_index, range.start - merged.start, range.len());
+            }
+        }
+        Self {
+            fetch_ranges,
+            scatter,
+        }
+    }
+
+    pub(crate) fn fetch_ranges(&self) -> &[Range<usize>] {
+        &self.fetch_ranges
+    }
+
+    pub(crate) fn restore(&self, fetched: &[Bytes]) -> Vec<Bytes> {
+        self.scatter
+            .iter()
+            .map(|&(fetch_index, offset, len)| fetched[fetch_index].slice(offset..offset + len))
+            .collect()
+    }
+}
+
 impl fmt::Debug for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -413,7 +413,10 @@ async fn lazy_foreground_total_bandwidth_includes_background_fill() {
     let proxy = CountingProxy::new(local);
     let (_d, cache) = fresh_cache(Arc::clone(&proxy) as Arc<dyn StorageProvider>);
 
-    let _r = cache.reader(&uri).await.expect("cold");
+    // Background fill yields to a held foreground lazy reader (per-URI
+    // quiescence); drop it so the fill can proceed and promote to mmap.
+    let r = cache.reader(&uri).await.expect("cold");
+    drop(r);
     wait_for_mmap_promotion(
         &cache,
         uri,

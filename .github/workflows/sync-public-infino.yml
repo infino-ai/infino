@@ -1,0 +1,186 @@
+name: Sync public infino/main → main
+
+# Pulls commits from the PUBLIC engine (infino-ai/infino) into this private
+# open-core edition's `main`. This is a PULL, by necessity: the public repo must
+# not reference this private one, so the sync can only live here — nothing in
+# infino/ may name or trigger infino-enterprise.
+#
+# Latency: ideally instant, but GitHub's scheduler is capped at every-5-minutes
+# and often lags. For a hard sub-5-min bound, a GitHub App webhook on infino's
+# `push` event could `workflow_dispatch` this job — the App handler lives outside
+# infino, so the public repo stays clean. See the PR description for that path.
+#
+# Behaviour:
+#   - fast-forward (still a pure mirror of public) → push straight to main; no
+#     rebuild, since public/main already passed infino's CI.
+#   - real merge (infino-enterprise has diverged) → gate the merged tree on the
+#     full CI (`make ci`), then push only if it passes.
+#   - conflict, or a diverged merge that fails CI → open a PR for a human,
+#     request review from @infino-ai/infino-team, attribute the incoming public
+#     commit's author, and fail the run.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-public-infino
+  cancel-in-progress: false # never interrupt a mid-sync; queue instead
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  PUBLIC_REMOTE: https://github.com/infino-ai/infino.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Mint an sbg-ci token, used for everything below (checkout, push, PR ops).
+      # sbg-ci is the branch-protection bypass actor on main, so the sync's direct
+      # pushes skip the "require PR + 1 approval" ruleset that gates humans;
+      # checking out with it authenticates `origin` as sbg-ci so every `git push`
+      # bypasses. It also opens the resolution PR (contents + pull-requests write)
+      # — the default GITHUB_TOKEN can't, since the org disallows Actions creating
+      # PRs. The workflow only ever *creates* a PR, never approves, so the human
+      # approval gate holds.
+      - name: Mint sbg-ci token
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: "4121986" # sbg-ci
+          private-key: ${{ secrets.SBG_CI_PRIVATE_KEY }}
+          owner: infino-ai
+          repositories: infino-enterprise
+      - name: Check out main (full history, as sbg-ci)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch public infino/main
+        run: |
+          git remote add public "$PUBLIC_REMOTE"
+          git fetch --no-tags --prune public main
+
+      - name: Classify the sync
+        id: plan
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Pause while a prior conflict / CI-failure is still awaiting a human:
+          # if a sync resolution PR is open, do nothing (green no-op) instead of
+          # re-opening it and re-failing every 5 minutes. Resolving that PR
+          # (merge/close) lets main advance and clears this guard.
+          OPEN="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json headRefName \
+                  --jq '[.[] | select(.headRefName | startswith("sync/public-infino-"))] | length')"
+          if [ "$OPEN" != "0" ]; then
+            echo "mode=paused" >> "$GITHUB_OUTPUT"
+            echo "A sync resolution PR is already open — waiting for it to be merged/closed; skipping."
+            exit 0
+          fi
+          if git merge-base --is-ancestor public/main HEAD; then
+            echo "mode=uptodate" >> "$GITHUB_OUTPUT"
+            echo "main already contains public/main — nothing to sync."
+            exit 0
+          fi
+          SHA="$(git rev-parse public/main)"
+          SHORT="$(git rev-parse --short public/main)"
+          echo "public_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "public_short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/public-infino-$SHORT" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit public/main; then
+            if [ "$(git rev-parse HEAD)" = "$SHA" ]; then
+              echo "mode=ff" >> "$GITHUB_OUTPUT"    # pure fast-forward: still a mirror
+            else
+              echo "mode=merge" >> "$GITHUB_OUTPUT" # diverged: full-CI gate before landing
+            fi
+          else
+            git merge --abort
+            echo "mode=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push fast-forward to main
+        if: steps.plan.outputs.mode == 'ff'
+        run: git push origin HEAD:main
+
+      # ---- diverged merge: full CI must pass before it can land on main ----
+      - name: Free disk for the engine build
+        if: steps.plan.outputs.mode == 'merge'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - name: Rust toolchain
+        if: steps.plan.outputs.mode == 'merge'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      # `make ci`'s coverage target runs `cargo llvm-cov`, so the plugin must be
+      # present (prebuilt binary — no from-source cargo install).
+      - name: Install cargo-llvm-cov
+        if: steps.plan.outputs.mode == 'merge'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: CI gate (make ci)
+        if: steps.plan.outputs.mode == 'merge'
+        id: build
+        run: |
+          if make ci; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Push merge to main (CI passed)
+        if: steps.plan.outputs.mode == 'merge' && steps.build.outputs.ok == 'true'
+        run: git push origin HEAD:main
+
+      # ---- conflict OR diverged-merge CI failure: hand to a human ----
+      - name: Open resolution PR and fail
+        if: steps.plan.outputs.mode == 'conflict' || (steps.plan.outputs.mode == 'merge' && steps.build.outputs.ok == 'false')
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          BR="${{ steps.plan.outputs.branch }}"
+          SHA="${{ steps.plan.outputs.public_sha }}"
+          SHORT="${{ steps.plan.outputs.public_short }}"
+          if [ "${{ steps.plan.outputs.mode }}" = "conflict" ]; then
+            REASON="conflicts with"
+            # push the public tip so its merge (and the conflicts) resolve in the PR
+            git push origin "public/main:refs/heads/$BR" --force
+          else
+            REASON="is conflict-free but fails CI against"
+            git push origin "HEAD:refs/heads/$BR" --force # the merge commit itself
+          fi
+          AUTHOR="$(gh api "repos/infino-ai/infino/commits/$SHA" --jq '.author.login // ""')"
+          SUBJECT="$(gh api "repos/infino-ai/infino/commits/$SHA" --jq '.commit.message' | head -1)"
+          CC=""
+          [ -n "$AUTHOR" ] && CC="cc @$AUTHOR (originating author, for context — may not have access here)"
+          gh pr create --base main --head "$BR" \
+            --title "Sync: public infino/main ($SHORT) needs manual resolution" \
+            --body "Automated sync: public \`infino/main\` @ \`$SHORT\` $REASON \`main\`, so it can't land automatically.
+
+          Incoming commit: \`$SHORT\` — \"$SUBJECT\"${AUTHOR:+ by @$AUTHOR}.
+
+          @infino-ai/infino-team — please resolve on this branch (or via the GitHub
+          conflict editor) and merge into \`main\` (needs write access here).
+          $CC" || true
+          # Best-effort formal review request; the @mention above is the reliable
+          # notification (works for a read-only team).
+          gh pr edit "$BR" --add-reviewer infino-ai/infino-team || true
+          echo "::error::Sync from public infino/main needs manual resolution — see PR for $BR."
+          exit 1

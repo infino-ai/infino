@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+        vector::distance::Metric,
     },
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
@@ -29,6 +29,7 @@ use infino::{
 use rayon::prelude::*;
 
 use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};
+use crate::corpus;
 
 const TITLE_COLUMN: &str = "title";
 // Low-cardinality bucket label (`b0`..`b9` by `doc_id % 10`), so an
@@ -138,12 +139,13 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             },
         ],
         vec![VectorConfig {
+            provided_centroids: None,
             column: VECTOR_COLUMN.into(),
             dim: SQL_DIM,
             n_cent: n_cent_for(n_rows),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
         Some(default_tokenizer()),
     )

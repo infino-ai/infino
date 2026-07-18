@@ -8,13 +8,13 @@
 #   2. $XDG_CONFIG_HOME/infino/config.yaml (user; falls back to
 #                                            $HOME/.config/infino/...)
 #   3. ./infino.yaml                       (per-project / per-cwd)
-#   4. INFINO_<UPPERCASE_FIELD>            (per-process env var)
 #
 # Each layer is a partial override — keys not set in a higher layer
 # fall through to lower layers.
 #
-# Nested keys are addressed with `__` (double underscore) in env vars.
-# Examples below.
+# Environment variables never override this configuration: engine
+# behavior is set in YAML only, so a run's effective config is
+# readable from files instead of reconstructed from process env.
 
 # Supertable runtime knobs. Reader fan-out (skip + per-superfile
 # search + top-k merge) and writer commit-time rayon-shard run on
@@ -28,13 +28,6 @@
 #     and a 96-core production node.
 #   - a positive integer — explicit override. Use when you've
 #     measured a workload-specific tuning.
-#
-# Env overrides (note the double underscore for nesting):
-#   INFINO_SUPERTABLE__READER_THREADS=8
-#   INFINO_SUPERTABLE__WRITER_THREADS=4
-#   INFINO_SUPERTABLE__ID_COLUMN=row_id
-#   INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB=2048
-#   INFINO_SUPERTABLE__VERIFY_CRC_ON_OPEN=false
 supertable:
   reader_threads: auto
   writer_threads: auto
@@ -70,12 +63,6 @@ supertable:
 # naming the Azure container. `backend: gcs` attaches a
 # GcsStorageProvider, with `bucket` naming the GCS bucket and
 # `storage_options` carrying `google_*` config keys.
-#
-# Env overrides:
-#   INFINO_STORAGE__BACKEND=s3
-#   INFINO_STORAGE__BUCKET=my-bucket
-#   INFINO_STORAGE__PREFIX=tables/my-table
-#   INFINO_STORAGE__DISK_CACHE_ROOT=/mnt/nvme/infino-cache
 storage:
   backend: none
   local_root:
@@ -120,11 +107,6 @@ storage:
 # Compaction merges the small superfiles produced by individual
 # commits into one target-sized superfile, cutting query fan-out.
 # Sizes are in mb (1 MiB = 1024 × 1024 bytes).
-#
-# Env overrides (note the double underscore for nesting):
-#   INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB=2048
-#   INFINO_COMPACTION__MIN_FILL_PERCENT=80
-#   INFINO_COMPACTION__MAX_MEMORY_MB=3072
 compaction:
   # Size a compacted output aims for.
   target_superfile_size_mb: 1024
@@ -137,6 +119,130 @@ compaction:
   # Maximum memory budget for materializing inputs during a single merge, in MiB.
   max_memory_mb: 3072
 
+# Vector-index build / search / drain tuning. Every value below
+# defaults to the engine's built-in behavior — a fresh install never
+# needs to touch this section. These are the levers that used to be
+# one-off INFINO_* env vars; they are YAML-only now.
+vector:
+  # Default rerank codec for cosine vector columns. Non-cosine metrics
+  # still use locally fitted sq8_residual (values are not bounded to
+  # [-1, 1]). Override per column at table-create time when needed.
+  #   sq8_fixed_residual — fixed absolute grid (default; portable bytes)
+  #   sq8_residual       — per-cluster fitted quantizer
+  #   fp32               — full-precision rerank
+  #   rabitq_only        — no rerank column
+  rerank_codec: sq8_fixed_residual
+
+  # Absolute cap on fine IVF centroids probed per vector search.
+  # Empty (~) derives the budget from nprobe × eligible superfiles at
+  # query time; set an integer to force exactly that many.
+  inner_budget: ~
+
+  # K-means training points per centroid for the drain's per-cell
+  # sub-builds.
+  kmeans_pts_per_centroid: 64
+
+  # Doc count above which a merged cell superfile is split into two
+  # sub-cells during hidden-index maintenance.
+  #
+  # Max docs in a global cell before compaction splits it into two. A cell this
+  # size serves fine on its own (bench: ~500K docs/cell → recall 0.994, ~17 MiB
+  # per query, since the per-cell fine IVF prunes within the cell), so the cap is
+  # set high to keep the grid coarse and split-free at ≤10M (at 64 cells, cells
+  # stay ~156K even at 10M). The split only engages at 100M/1B, where it bounds
+  # cell size so build/query cost stays flat; lower this if higher-scale recall
+  # needs a finer grid.
+  cell_split_doc_cap: 500000
+
+  # How user-superfile clusters align to the global cell grid:
+  #   local  — per-superfile k-means (default).
+  #   global — cluster c == cell c, so the drain routes cluster → cell
+  #            without re-scoring.
+  user_centroids: local
+
+  # User superfiles the hidden-index drain materializes per batch
+  # before publishing that batch's cell superfiles (bounds drain RAM
+  # to O(batch)). -1 = unbounded (one merge, O(corpus) RAM);
+  # 0 = skip the drain entirely.
+  drain_batch_superfiles: 64
+
+  # Target storage amplification for boundary-only replication (shared
+  # by commit and drain). <= 1.0 disables replication (the default).
+  # Replication was measured a net loss at 10M: its extra boundary copies
+  # inflated cell size (159K -> 232K rows/cell), which crowded the RaBitQ
+  # shortlist and displaced true neighbors before rerank — dropping
+  # post-drain recall 0.997 -> 0.975 while adding ~50% storage and ~35%
+  # more GETs/query. Grid+fine union routing carries boundary coverage
+  # instead. Raise above 1.0 only with evidence it helps at your scale.
+  drain_replica_target_factor: 1.0
+
+  # Per-cell consolidation op the drain applies:
+  #   kmeans — re-cluster each cell's rows (default).
+  #   splice — keep each superfile's local clusters verbatim.
+  drain_consolidate: kmeans
+
+  # Read fan-out for the drain's superfile opens. `auto` resolves to
+  # one in-flight read per hardware thread, floored at the
+  # background-fill default and capped at 64; or set a positive
+  # integer.
+  drain_read_concurrency: auto
+
+  # Cell count for the USER table's grid, trained at the first commit —
+  # controls user-superfile cell packing and pre-drain query routing. Finer
+  # than the hidden grid on purpose: smaller cells make the single pre-drain
+  # probe more precise and cheaper. Stamped at create; changing it later
+  # affects new tables only.
+  user_cell_count: 256
+
+  # Cell count for the HIDDEN vector index grid, trained at the same first
+  # commit. The drain reads this grid verbatim; post-drain routing runs at
+  # this granularity. Equal to user_cell_count: one 256-cell grid drives
+  # packing, pre-drain routing, the drain, and post-drain routing (user_grid
+  # degenerates to None when the counts match).
+  hidden_cell_count: 256
+
+  # Hidden vector-index compaction (distinct from the top-level
+  # `compaction:` section, which governs the user table). A packed cell
+  # shard stays a merge candidate until it reaches compaction_target_mb,
+  # so incremental deltas are absorbed into it instead of being sealed
+  # off as separate fragments. compaction_max_memory_mb caps the input
+  # bytes packed into one merge pass and must stay >= the target, or the
+  # target is never reached.
+  #
+  # 0 disables the byte floor, so a cell consolidates on fragment count alone
+  # (the >= 2 merge floor): drain generations collapse and post-compact cold
+  # GET stays at the post-drain level. This is safe now that the post-compaction
+  # cell split is disabled (see cell_split_doc_cap) — merging no longer triggers
+  # the broken split path. Contrast the user table, which keeps an 80% floor to
+  # amortize writes on its transient data.
+  compaction_target_mb: 2048
+  compaction_min_fill_percent: 0
+  compaction_max_memory_mb: 4096
+
+# Diagnostic and hardware-capability toggles. Each gates
+# instrumentation or forces a slower code path for A/B measurement;
+# none of them change query results. Leave everything off unless you
+# are profiling or benchmarking.
+diagnostics:
+  # Accumulate per-phase timers during the vector drain build.
+  drain_build_timers: false
+
+  # Emit the FTS builder's finish-phase profile.
+  fts_profile: false
+
+  # Capture the object-store I/O timeline.
+  io_timeline: false
+
+  # Force the AVX2 vector-distance path even where AVX-512 is available.
+  disable_avx512: false
+
+  # Force the scalar vector-distance path even where AVX2 is available.
+  disable_avx2: false
+
+  # Skip the disk cache's lazy background fill so foreground-only read
+  # behavior can be measured.
+  disable_background_fill: false
+
 # Per-connection memory budget: a ceiling on the anonymous heap the query
 # and ingest paths allocate (result batches, the vector shortlist, ingest
 # buffers), so one connection can't grow memory until the process is OOM-
@@ -146,9 +252,6 @@ compaction:
 # Applies to connections built from this config file. Code that opens a
 # connection programmatically sets the budget on ConnectOptions
 # (with_connection_memory_budget_bytes) instead.
-#
-# Env override:
-#   INFINO_MEMORY__CONNECTION_BUDGET_BYTES=8589934592
 memory:
   # Bytes. 0 (default) is measure-only: usage is tracked but never refused.
   # A positive value enforces the ceiling (the engine reserves at 90% of it,

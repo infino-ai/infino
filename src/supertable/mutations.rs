@@ -263,3 +263,20 @@ impl CommitError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `over_budget` only surfaces a message when the failure was a
+    /// budget-refused predicate eval; other variants carry none.
+    #[test]
+    fn over_budget_only_from_predicate_eval() {
+        let budgeted = MutationError::PredicateEval(QueryError::OverBudget("cap".into()));
+        assert_eq!(budgeted.over_budget(), Some("cap"));
+        assert_eq!(
+            MutationError::MatchCountExceedsCap { matched: 5, cap: 3 }.over_budget(),
+            None
+        );
+    }
+}

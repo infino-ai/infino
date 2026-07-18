@@ -65,6 +65,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         rot_seed: TEXT_EMB_ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
     b.register_column(VectorConfig {
@@ -74,6 +75,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         rot_seed: IMAGE_EMB_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
 
@@ -228,13 +230,11 @@ fn end_to_end_summary_per_column() {
     let (blob, json) = build_two_column_blob(SUMMARY_TEST_N_DOCS);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
 
-    let (text_centroid, text_radius) = r.summary("text_emb").expect("vector summary");
+    let text_centroid = r.summary("text_emb").expect("vector summary");
     assert_eq!(text_centroid.len(), TEXT_EMB_DIM);
-    assert!(text_radius >= 0.0);
 
-    let (img_centroid, img_radius) = r.summary("image_emb").expect("vector summary");
+    let img_centroid = r.summary("image_emb").expect("vector summary");
     assert_eq!(img_centroid.len(), IMAGE_EMB_DIM);
-    assert!(img_radius >= 0.0);
 
     // Different columns should have different summary centroids
     // (different data, different dim). Just sanity-check shapes.
@@ -254,6 +254,7 @@ async fn end_to_end_planted_clusters_recovered() {
         rot_seed: CLUSTER_TEST_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
+        provided_centroids: None,
     })
     .expect("register column");
 

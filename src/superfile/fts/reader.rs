@@ -44,9 +44,15 @@ use crate::superfile::{
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
     },
-    lazy_source::{LazyByteSource, PrefetchedSource, Source},
+    lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
 
+/// Largest gap worth overfetching when adjacent term postings share a request.
+const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
+/// Maximum total gap bytes tolerated in one coalesced postings request.
+const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+
+/// Boolean-mode for multi-term queries.
 /// Default operator for a query's bare (sigil-less) terms. Terms
 /// carrying an explicit clause sigil keep their polarity regardless
 /// of mode: `+term` is a must (every hit contains it), `-term` a
@@ -664,14 +670,21 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
-        self.source
-            .get_ranges_parallel_async(&ranges)
+        let plan = RangeCoalescePlan::new(
+            &ranges,
+            TERM_RANGE_COALESCE_MAX_GAP,
+            TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        let fetched = self
+            .source
+            .get_ranges_parallel_async(plan.fetch_ranges())
             .await
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "fts/postings term body range fetch failed: {e}"
                 )))
-            })
+            })?;
+        Ok(plan.restore(&fetched))
     }
 
     /// Resolve a column name to its dense column_id, or

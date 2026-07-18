@@ -3,15 +3,16 @@
 
 //! Reader-side tombstone-filter integration tests.
 //!
-//! Verifies that a row tombstoned by the WAL pipeline's
-//! tombstone-phase is invisible to subsequent FTS, vector, and
-//! SQL queries on the same supertable handle. Each test goes
-//! through the full production path:
+//! Verifies that a tombstoned row is invisible to subsequent FTS, vector, and
+//! SQL queries on the same supertable handle. FTS and SQL drive the WAL
+//! tombstone phase directly to pin sidecar-cache invalidation. Vector tests use
+//! the public delete orchestration, which additionally publishes the hidden
+//! index's stable-id delete set before querying through that index.
 //!
 //! 1. Real writer commit (`writer().append + commit`) publishes
 //!    a superfile.
-//! 2. The WAL pipeline drives a DELETE WAL through the tombstone
-//!    phase, landing a bit in the per-superfile sidecar.
+//! 2. A DELETE lands a bit in the per-superfile sidecar and, for vector
+//!    tables, publishes the hidden-index delete set.
 //! 3. A query runs against the same supertable handle; the
 //!    tombstoned row is absent.
 //!
@@ -207,12 +208,13 @@ async fn sql_query_excludes_tombstoned_row() {
 }
 
 // Deleting the row nearest a query must not shrink an unfiltered result
-// — the delete-then-kNN underflow, end to end through the WAL pipeline.
+// — the delete-then-kNN underflow, end to end through the public delete
+// orchestration (sidecar + hidden stable-id delete publication).
 //  - one superfile here: the underflow bites *within* a superfile (a
 //    multi-superfile merge backfills from other shards and hides it —
 //    that case is the next test). A single shard also makes a hit's
 //    `local_doc_id` its unambiguous row index.
-//  - tombstone the query's nearest row via `run_tombstone_phase`.
+//  - tombstone the query's nearest row via `Supertable::delete`.
 //  - `k=1` must return the next-nearest *live* row, never empty.
 // Pre-fix the filter ran on the already-truncated top-k with no
 // backfill, so a deleted row in the top-k just vanished.
@@ -328,14 +330,10 @@ async fn vector_query_excludes_tombstoned_row() {
         .get_all_superfiles()
         .first()
         .expect("at least one superfile");
-    let target = entry.id_min; // row 0
+    let target = entry.id_min; // stable `_id` for row 0
 
-    let ws = WalStore::new(Arc::clone(&storage));
-    let wal = build_delete_wal(target, 9_000_021);
-    let etag = ws.create(&wal).await.expect("wal create");
-    run_tombstone_phase(&st, &ws, &wal, &etag)
-        .await
-        .expect("tombstone phase");
+    let stats = st.delete(col("title").eq(lit("row-0"))).expect("delete");
+    assert_eq!(stats.n_tombstoned(), 1);
 
     // Query is the lane-0 unit vector — row 0 (now tombstoned) was its
     // exact nearest, row 1 (lane-0, lightly perturbed) is the nearest
@@ -355,7 +353,8 @@ async fn vector_query_excludes_tombstoned_row() {
         "k=1 underflowed after deleting the nearest row"
     );
     assert_eq!(
-        top1[0].local_doc_id, 1,
+        top1[0].stable_id,
+        Some(target + 1),
         "k=1 must return the nearest live row, not the tombstoned one"
     );
 
@@ -373,8 +372,9 @@ async fn vector_query_excludes_tombstoned_row() {
     assert!(!hits.is_empty(), "expected at least one un-tombstoned hit");
     for hit in &hits {
         assert_ne!(
-            hit.local_doc_id, 0,
-            "the tombstoned row (local doc_id 0) must not appear"
+            hit.stable_id,
+            Some(target),
+            "the tombstoned row's stable _id must not appear"
         );
     }
 }

@@ -30,17 +30,21 @@ use crate::{
     Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::builder::SuperfileBuilder,
+    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
     supertable::{
-        BuildError, CommitError, ManifestSnapshot, SuperfileEntry,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri,
         error::CompactionError,
-        query::dispatch::open_reader,
+        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        manifest::list::{DrainedVersionRanges, PartitionStrategy},
+        query::dispatch::open_compaction_input,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, prepare_superfile, try_commit_attempt,
+            NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
+            finalize_compaction_commit, prepare_superfile, refresh_slow_vector_state,
+            split_overflow_cells, try_commit_attempt,
         },
     },
 };
@@ -67,6 +71,11 @@ pub struct SuperfileStats {
     pub tombstoned_docs: u64,
     /// Already owned by another compaction so skip it.
     pub sealed_by_other: bool,
+    /// Commit version the superfile was born at. A merged superfile carries
+    /// the OLDEST input's `birth_version`, so user-table merge jobs must
+    /// never mix inputs from opposite sides of the hidden drain watermark
+    /// (see [`split_stats_at_drain_watermark`]).
+    pub birth_version: u64,
 }
 
 impl SuperfileStats {
@@ -83,6 +92,24 @@ impl SuperfileStats {
     }
 }
 
+/// Split merge candidates at the hidden drain watermark: inputs whose
+/// `birth_version` the hidden index has already drained versus inputs it has
+/// not. A merged superfile is stamped with the OLDEST input `birth_version`
+/// (see `run_compaction_job`), so a job mixing the two sides would inherit a
+/// drained version and the drain's `!drained.contains(birth_version)` filter
+/// would skip it — the undrained inputs' vectors would silently never enter
+/// the hidden index (a permanent recall hole). Merging within either side is
+/// safe: all-drained stays drained, all-undrained keeps an undrained version
+/// and is drained as one source.
+fn split_stats_at_drain_watermark(
+    stats: Vec<SuperfileStats>,
+    drained: &DrainedVersionRanges,
+) -> (Vec<SuperfileStats>, Vec<SuperfileStats>) {
+    stats
+        .into_iter()
+        .partition(|s| drained.contains(s.birth_version))
+}
+
 /// A set of superfiles to merge into one new superfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionJob {
@@ -97,8 +124,11 @@ pub struct CompactionJob {
 /// reach the floor are left for next time.
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+    // `0%` disables the size leg: a merge then fires on the fragment-count
+    // floor alone (>= 2 inputs), which is how the hidden index consolidates
+    // drain generations that are far below any byte threshold.
     let min_output_bytes =
-        (target_bytes as u128 * cfg.min_fill_percent.clamp(1, 100) as u128 / 100) as u64;
+        (target_bytes as u128 * cfg.min_fill_percent.clamp(0, 100) as u128 / 100) as u64;
     let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
@@ -200,7 +230,33 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        let inner = self.inner();
+        Self::compact_one_table(self, cfg).await?;
+        if matches!(
+            self.inner().manifest.load().get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            refresh_slow_vector_state(self.inner())
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+        } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
+            Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
+            // The hidden pass settled vector membership (merges + finalize +
+            // any cell splits); its `update`s cleared the slow-CAS ref, so
+            // republish the entry blob and restamp. Hidden tables have no
+            // manifest parts, so publication is required for reopen and a
+            // failure must be visible to the caller.
+            refresh_slow_vector_state(hidden.inner())
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn compact_one_table(
+        table: &Supertable,
+        cfg: &CompactionSettings,
+    ) -> Result<(), CompactionError> {
+        let inner = table.inner();
 
         match inner.compaction_outstanding.compare_exchange(
             false,
@@ -212,6 +268,17 @@ impl Supertable {
             Err(_) => return Err(CompactionError::AlreadyCompacting),
         }
         let _slot = CompactionSlot(&inner.compaction_outstanding);
+
+        // Phase 1 (split-then-merge): split every over-cap cell first, from the
+        // live grid, before merge-job selection. An over-cap cell is thus never
+        // merged just to be re-split (the merge output would be discarded), and
+        // the split runs as its own snapshot-consistent phase, so it can't remove
+        // a superfile a later merge job in this pass planned to use.
+        if is_hidden_vector_index_table(&inner.options) {
+            split_overflow_cells(Arc::clone(inner))
+                .await
+                .map_err(|e| CompactionError::Build(e.to_string()))?;
+        }
 
         let manifest = inner.manifest.load_full();
 
@@ -269,17 +336,32 @@ impl Supertable {
                     n_docs: entry.n_docs,
                     tombstoned_docs,
                     sealed_by_other,
+                    birth_version: entry.birth_version,
                 }
             })
             .collect();
 
-        let jobs = select(&stats, cfg);
-
-        for job in jobs {
-            self.run_compaction_job(job, stale_seal_timeout).await?;
-            self.refresh()
-                .await
-                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+        // A user table with a hidden vector index selects jobs per side of
+        // the drain watermark, never across it (see
+        // [`split_stats_at_drain_watermark`] for why a mixed merge loses
+        // vectors). Tables without a hidden sibling select over everything.
+        let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
+            Some(hidden) => {
+                let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+                let (drained_stats, undrained_stats) =
+                    split_stats_at_drain_watermark(stats, &drained);
+                vec![drained_stats, undrained_stats]
+            }
+            None => vec![stats],
+        };
+        for stats in &stat_groups {
+            for job in select(stats, cfg) {
+                table.run_compaction_job(job, stale_seal_timeout).await?;
+                table
+                    .refresh()
+                    .await
+                    .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            }
         }
 
         Ok(())
@@ -314,7 +396,8 @@ impl Supertable {
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
             let open_fut = async {
-                let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry).await;
+                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+                    .await;
                 (entry.superfile_id, r)
             };
             superfile_readers_fut.push(open_fut);
@@ -343,8 +426,24 @@ impl Supertable {
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
-        let (merged_bytes, superfile_stats) =
-            SuperfileBuilder::build_from_readers(&readers_with_tombstones)?;
+        let (merged_bytes, superfile_stats) = {
+            let first_vec = readers_with_tombstones
+                .first()
+                .and_then(|(reader, _)| reader.vec());
+            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+            let sq8_merge = first_vec.and_then(|v| {
+                v.vector_columns_config()
+                    .next()
+                    .map(|c| c.rerank_codec.is_sq8_residual_family())
+            });
+            if multi_cell && sq8_merge == Some(true) {
+                SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&readers_with_tombstones)?
+            } else if sq8_merge == Some(true) {
+                SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
+            } else {
+                SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
+            }
+        };
         let merged_bytes = Bytes::from(merged_bytes);
 
         let shard = ShardOutput::new_with_params(
@@ -434,11 +533,26 @@ impl Supertable {
         };
 
         let PreparedSuperfile {
-            entry: merged_entry,
+            entry: merged_prepared,
             bytes_for_store,
             bytes_for_storage,
             bytes_for_cache,
         } = merged_segment;
+        let merged_entry = Arc::new(SuperfileEntry {
+            // Carry the OLDEST input's birth_version so a merge of
+            // already-drained inputs stays <= the drain watermark (skipped, not
+            // re-drained). See the hidden-index `drained_ranges` design.
+            birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
+            // Left empty: the manifest's `update()` stamps the
+            // partition key at commit time from `partition_hint`.
+            partition_key: Vec::new(),
+            partition_hint: inputs.first().and_then(|e| e.partition_hint),
+            vector_layout: inputs
+                .first()
+                .map(|e| e.vector_layout)
+                .unwrap_or(VectorLayout::Ivf),
+            ..(*merged_prepared).clone()
+        });
         let merged_superfile_id = merged_entry.superfile_id;
         let new_entries = vec![merged_entry];
         let mut pending_storage_writes =
@@ -453,21 +567,26 @@ impl Supertable {
                 Err(_missing) => return Ok(()),
             };
 
+            let mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+
             match try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
                 current,
                 &new_entries,
                 &entries_to_remove,
+                NewEntryBirthVersions::Preserve,
                 &mut pending_storage_writes,
+                &mut pending_storage_replaces,
             )
             .await
             {
-                Ok(_) => {
-                    // Warm the merged superfile into the cache, same as a
-                    // normal writer commit does. Without this every query
-                    // against it misses and re-fetches + re-opens from
-                    // storage every single time.
+                Ok(new_manifest) => {
+                    inner.manifest.store(Arc::new(new_manifest));
+                    // Warm the merged superfile into the in-memory reader
+                    // cache, same as a normal writer commit does. Without
+                    // this every query against it misses and re-fetches +
+                    // re-opens from storage every single time.
                     if let Some((uri, bytes)) = bytes_for_store
                         && let Err(e) = opts.store.insert(uri, bytes)
                     {
@@ -477,15 +596,6 @@ impl Supertable {
                             "compact: failed to warm reader cache for merged superfile"
                         );
                     }
-                    // Same warm-up, disk-cache side: mirrors what a normal
-                    // write does when prepopulate_cache_on_commit is on.
-                    // Shares the writer's own insert_warm_or_warn so the
-                    // two paths can't drift out of sync again.
-                    if let Some((uri, bytes)) = bytes_for_cache
-                        && let Some(cache) = opts.disk_cache.as_ref()
-                    {
-                        cache.insert_warm_or_warn(&uri, bytes).await;
-                    }
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
                     // The disk cache is already size-bounded (LRU), so its
@@ -493,6 +603,18 @@ impl Supertable {
                     for entry in &entries_to_remove {
                         opts.store.remove(&entry.uri);
                     }
+                    // Disk-cache warm + background storage reclaim ride the
+                    // shared post-commit finalizer (the same path writer
+                    // commits use), so the two paths can't drift.
+                    let pending_cache_inserts = bytes_for_cache.into_iter().collect::<Vec<_>>();
+                    finalize_compaction_commit(
+                        Arc::clone(inner),
+                        &storage,
+                        &new_entries,
+                        &entries_to_remove,
+                        pending_cache_inserts,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
@@ -652,7 +774,56 @@ mod tests {
             n_docs,
             tombstoned_docs: tombstoned,
             sealed_by_other: false,
+            birth_version: 0,
         }
+    }
+
+    /// Two mergeable fragments on opposite sides of the drain watermark must
+    /// land in different selection groups: a single mixed job would stamp the
+    /// merged superfile with the drained input's (older) `birth_version` and
+    /// the drain would skip the undrained rows forever.
+    #[test]
+    fn drain_watermark_partition_never_mixes_drained_and_undrained() {
+        // Watermark: versions 0..=10 drained.
+        let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]);
+        let mut a = seg(1, 1, 1000, 0);
+        a.birth_version = 5; // drained
+        let mut b = seg(2, 1, 1000, 0);
+        b.birth_version = 20; // undrained
+        let mut c = seg(3, 1, 1000, 0);
+        c.birth_version = 21; // undrained
+
+        // Sanity: without the watermark split, selection would happily merge
+        // all three into one job — the exact F1 hazard.
+        let all = vec![a.clone(), b.clone(), c.clone()];
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 0,
+            ..CompactionSettings::default()
+        };
+        let mixed = select(&all, &cfg);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].inputs.len(), 3, "guard: unsplit selection mixes");
+
+        let (drained_side, undrained_side) = split_stats_at_drain_watermark(all, &drained);
+        assert_eq!(
+            drained_side
+                .iter()
+                .map(|s| s.superfile_id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from_u128(1)]
+        );
+        assert_eq!(undrained_side.len(), 2);
+        // Group-wise selection: the drained side alone can't merge (one
+        // input); the undrained side merges its two fragments.
+        assert!(select(&drained_side, &cfg).is_empty());
+        let jobs = select(&undrained_side, &cfg);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inputs.len(), 2);
+        assert!(
+            !jobs[0].inputs.contains(&Uuid::from_u128(1)),
+            "undrained job must not contain the drained input"
+        );
     }
 
     fn default_cfg() -> CompactionSettings {
@@ -1032,6 +1203,68 @@ mod tests {
                 assert!(after > before, "sync compact must have run a job");
             })
             .expect("compact");
+    }
+
+    #[test]
+    fn hidden_profile_select_merges_small_same_cell_files() {
+        let mut segs = Vec::new();
+        for i in 0..4 {
+            let mut s = seg(i, 1, 1000, 0);
+            s.partition_key = 3u32.to_le_bytes().to_vec();
+            segs.push(s);
+        }
+        // Exercises same-cell selection grouping independent of the
+        // production target; a small target keeps the 1 MiB fixtures under
+        // the ceiling while their combined size clears the fill floor.
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 8,
+            min_fill_percent: 40,
+            ..CompactionSettings::default()
+        };
+        let jobs = select(&segs, &cfg);
+        assert!(
+            !jobs.is_empty(),
+            "expected a merge job for 4×1MiB files in one cell partition"
+        );
+        assert_eq!(jobs[0].partition_key, 3u32.to_le_bytes().to_vec());
+        assert!(jobs[0].inputs.len() >= 2);
+    }
+
+    #[test]
+    fn zero_fill_floor_merges_tiny_fragments_on_count() {
+        // Hidden-index policy: a 0% fill floor drives consolidation on the
+        // >= 2 fragment count alone. Two sub-target fragments in one cell must
+        // merge even though their combined bytes are a tiny fraction of the
+        // target — each unmerged fragment is a drain generation that costs a
+        // query a fine-run. Under a byte floor the same fragments never merge.
+        let mut segs = Vec::new();
+        for i in 0..2 {
+            let mut s = seg(i, 1, 1000, 0); // 1 MiB each
+            s.partition_key = 7u32.to_le_bytes().to_vec();
+            segs.push(s);
+        }
+        let count_driven = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 0,
+            ..CompactionSettings::default()
+        };
+        let jobs = select(&segs, &count_driven);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "0% floor must merge 2 tiny fragments on count"
+        );
+        assert_eq!(jobs[0].inputs.len(), 2);
+
+        // 2 MiB is far below 40% of a 2 GiB target → the byte floor blocks it.
+        let byte_floored = CompactionSettings {
+            min_fill_percent: 40,
+            ..count_driven.clone()
+        };
+        assert!(
+            select(&segs, &byte_floored).is_empty(),
+            "a byte floor must block consolidation of tiny fragments"
+        );
     }
 
     #[test]
@@ -1567,6 +1800,13 @@ mod tests {
             .iter()
             .map(|s| s.superfile_id)
             .collect();
+        let expected_birth_version = before
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.birth_version)
+            .min()
+            .expect("at least one superfile before compaction");
         let expected_docs = before.n_docs_total();
         let expected_id_min = before
             .manifest()
@@ -1602,6 +1842,10 @@ mod tests {
         assert!(
             !sfs.iter().any(|s| input_ids.contains(&s.superfile_id)),
             "original superfile IDs must not appear after compaction"
+        );
+        assert_eq!(
+            sfs[0].birth_version, expected_birth_version,
+            "compaction must preserve the oldest input birth version"
         );
 
         // Doc count preserved across the merge
@@ -1955,7 +2199,7 @@ mod tests {
             "overall superfile count must have decreased from original 20"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 40.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 40.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 40);
@@ -2502,7 +2746,7 @@ mod tests {
             "overall superfile count must have decreased from original 30"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 245760.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 245760.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 245760);

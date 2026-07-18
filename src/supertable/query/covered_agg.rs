@@ -4,9 +4,10 @@
 //! Covered/residual evaluation for filter-aligned aggregates over the
 //! manifest-statistics "aggregation tree".
 //!
-//! For an ungrouped aggregate whose `WHERE` clause is a single-column
-//! range, the manifest already knows each segment's bounds for that
-//! column. Segments fall into three classes:
+//! Exact low-cardinality frequencies answer `COUNT(*)` over a
+//! single-column equality/range and `GROUP BY column, COUNT(*)` directly.
+//! Other ungrouped aggregates whose `WHERE` clause is a single-column range
+//! use the manifest's segment bounds. Segments fall into three classes:
 //!
 //!   * **disjoint** — bounds outside the range: contribute nothing;
 //!   * **covered** — bounds fully inside the range AND tombstone-free
@@ -39,7 +40,8 @@
 //!     boundary;
 //!   * a covered segment missing a required stat demotes to boundary;
 //!   * only `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG` over bare columns,
-//!     no DISTINCT / FILTER / ORDER BY, no GROUP BY;
+//!     no DISTINCT / FILTER / ORDER BY; the sole grouped shape is one
+//!     low-cardinality column plus `COUNT(*)`;
 //!   * a provider already restricted to a segment subset is the
 //!     rewrite's own residual — never rewritten again (idempotency).
 
@@ -54,14 +56,16 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
-    logical_expr::{Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit},
+    logical_expr::{
+        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
+    },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col},
 };
 use uuid::Uuid;
 
 use crate::supertable::{
-    manifest::{SuperfileEntry, add_sum_arrays},
+    manifest::{SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
 };
@@ -130,12 +134,68 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
     };
+    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg)? {
+        return Ok(Some(rewritten));
+    }
     if !agg.group_expr.is_empty() {
         return Ok(None);
     }
     let Some(kinds) = parse_aggregates(&agg.aggr_expr) else {
         return Ok(None);
     };
+
+    // Unfiltered aggregate over a complete, clean snapshot: every segment is
+    // covered, so emit one literal row directly. This handles SUM/AVG as well
+    // as COUNT/MIN/MAX and avoids invoking the provider's Parquet scan at all.
+    if let Some(scan) = peel_unfiltered_scan(agg.input.as_ref()) {
+        let Some(provider) = provider_of(scan) else {
+            return Ok(None);
+        };
+        if provider.is_segment_restricted() {
+            return Ok(None);
+        }
+        let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+            return Ok(None);
+        };
+        if !superfiles
+            .iter()
+            .all(|entry| provider.entry_is_clean(entry) && has_required_stats(entry, &kinds))
+        {
+            return Ok(None);
+        }
+        let covered: Vec<&Arc<SuperfileEntry>> = superfiles.iter().collect();
+        let mut partials = Vec::with_capacity(kinds.len());
+        for kind in &kinds {
+            let Some(partial) = accumulate_partial(kind, &covered) else {
+                return Ok(None);
+            };
+            partials.push(partial);
+        }
+        let out_names: Vec<String> = agg
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let mut expressions = Vec::with_capacity(kinds.len());
+        for ((kind, partial), name) in kinds.iter().zip(&partials).zip(out_names) {
+            let expression = match (kind, partial) {
+                (AggKind::CountStar, Partial::Count(count)) => lit(*count),
+                (AggKind::Sum(_), Partial::Sum(value))
+                | (AggKind::Min(_), Partial::Bound(value))
+                | (AggKind::Max(_), Partial::Bound(value)) => lit(value.clone()),
+                (AggKind::Avg(_), Partial::Avg { sum, count }) => {
+                    cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
+                }
+                _ => return Ok(None),
+            };
+            expressions.push(expression.alias(name));
+        }
+        let rewritten = LogicalPlanBuilder::empty(true)
+            .project(expressions)?
+            .build()?;
+        return Ok(Some(rewritten));
+    }
 
     // Input shape: Filter over TableScan (a pure-column Projection in
     // between is looked through).
@@ -154,18 +214,35 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
-    // Hierarchical manifests keep segments in lazily-loaded parts; the
-    // flat view may be partial, so classification would be unsound.
     let manifest = provider.manifest();
-    if !manifest.is_in_process_only() {
+    // Hierarchical manifests may expose a partial flat view. Rewrite only
+    // when the resident entries are provably complete; eagerly hydrated
+    // persisted tables then receive the same no-scan aggregate path as
+    // in-process tables, while genuinely lazy views decline safely.
+    let Some(superfiles) = manifest.complete_flat_superfiles() else {
         return Ok(None);
-    }
+    };
     let id_column = manifest.options.id_column.as_str();
+
+    if matches!(kinds.as_slice(), [AggKind::CountStar])
+        && superfiles
+            .iter()
+            .all(|entry| provider.entry_is_clean(entry))
+        && let Some(value_counts) = provider.exact_value_counts(&range.column)
+        && let Some(count) = count_range_from_value_counts(&value_counts, &range)
+    {
+        let name = agg.schema.field(0).name().clone();
+        return Ok(Some(
+            LogicalPlanBuilder::empty(true)
+                .project(vec![lit(count).alias(name)])?
+                .build()?,
+        ));
+    }
 
     // Classify every segment.
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
     let mut boundary: HashSet<Uuid> = HashSet::new();
-    for entry in &manifest.superfiles {
+    for entry in superfiles {
         let class = classify(entry, id_column, &range);
         match class {
             Class::Disjoint => {}
@@ -278,6 +355,94 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
 
     let rewritten = builder.project(final_exprs)?.build()?;
     Ok(Some(rewritten))
+}
+
+fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+    let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
+        return Ok(None);
+    };
+    let Some(kinds) = parse_aggregates(&aggregate.aggr_expr) else {
+        return Ok(None);
+    };
+    if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
+        return Ok(None);
+    }
+    let Some(scan) = peel_unfiltered_scan(aggregate.input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = provider_of(scan) else {
+        return Ok(None);
+    };
+    if provider.is_segment_restricted() {
+        return Ok(None);
+    }
+    let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        return Ok(None);
+    };
+    if !superfiles.iter().all(|entry| {
+        provider.entry_is_clean(entry)
+            && entry
+                .scalar_stats
+                .get(&group_column.name)
+                .is_some_and(|stats| stats.null_count == Some(0))
+    }) {
+        return Ok(None);
+    }
+
+    let Some(value_counts) = provider.exact_value_counts(&group_column.name) else {
+        return Ok(None);
+    };
+    let mut rows = Vec::with_capacity(value_counts.entries().len());
+    for (value, count) in value_counts.entries() {
+        let Ok(count) = i64::try_from(*count) else {
+            return Ok(None);
+        };
+        rows.push(vec![lit(value.clone()), lit(count)]);
+    }
+    let aliases: Vec<Expr> = aggregate
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| col(format!("column{}", index + 1)).alias(field.name()))
+        .collect();
+    Ok(Some(
+        LogicalPlanBuilder::values_with_schema(rows, &aggregate.schema)?
+            .project(aliases)?
+            .alias(scan.table_name.clone())?
+            .build()?,
+    ))
+}
+
+fn count_range_from_value_counts(
+    value_counts: &ScalarValueCounts,
+    range: &RangeFilter,
+) -> Option<i64> {
+    let mut total = 0u64;
+    for (value, count) in value_counts.entries() {
+        if value_matches_range(value, range)? {
+            total = total.checked_add(*count)?;
+        }
+    }
+    i64::try_from(total).ok()
+}
+
+fn value_matches_range(value: &ScalarValue, range: &RangeFilter) -> Option<bool> {
+    if let Some(lo) = &range.lo {
+        let bound = lo.value.cast_to(&value.data_type()).ok()?;
+        let ordering = value.partial_cmp(&bound)?;
+        if ordering == Ordering::Less || (ordering == Ordering::Equal && !lo.inclusive) {
+            return Some(false);
+        }
+    }
+    if let Some(hi) = &range.hi {
+        let bound = hi.value.cast_to(&value.data_type()).ok()?;
+        let ordering = value.partial_cmp(&bound)?;
+        if ordering == Ordering::Greater || (ordering == Ordering::Equal && !hi.inclusive) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Covered-side partial state per aggregate output.
@@ -448,6 +613,26 @@ fn peel_input(input: &LogicalPlan) -> Option<(Expr, &TableScan)> {
         return None;
     };
     Some((predicate.clone(), scan))
+}
+
+/// Peel an unfiltered aggregate input down to its table scan, looking through
+/// the same pure-column projection admitted by [`peel_input`].
+fn peel_unfiltered_scan(input: &LogicalPlan) -> Option<&TableScan> {
+    let mut node = input;
+    if let LogicalPlan::Projection(projection) = node {
+        if !projection
+            .expr
+            .iter()
+            .all(|expr| matches!(expr, Expr::Column(_)))
+        {
+            return None;
+        }
+        node = projection.input.as_ref();
+    }
+    match node {
+        LogicalPlan::TableScan(scan) => Some(scan),
+        _ => None,
+    }
 }
 
 /// The provider behind a scan, when it is ours.
@@ -638,6 +823,113 @@ mod tests {
     /// legacy `try_optimize`), and carries its registered name. Neither
     /// the `supports_rewrite` flag nor `name` is observed during a plain
     /// query, so assert them directly.
+    /// `classify` buckets a segment against an id-column range: disjoint when
+    /// the segment sits wholly outside, covered when wholly inside, boundary
+    /// when it straddles an edge or the column has no usable stats.
+    #[test]
+    fn classify_buckets_segment_against_id_range() {
+        use std::collections::HashMap;
+
+        use crate::{
+            superfile::vector::layout::VectorLayout, supertable::manifest::SuperfileEntry,
+        };
+        let entry = SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid::Uuid::new_v4(),
+            uri: crate::supertable::manifest::SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 10,
+            id_max: 20,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        };
+        let dec =
+            |v: i128| ScalarValue::Decimal128(Some(v), DECIMAL128_PRECISION, DECIMAL128_SCALE);
+        let bound = |v: i128, inclusive: bool| Bound {
+            value: dec(v),
+            inclusive,
+        };
+        let rf = |lo: Option<Bound>, hi: Option<Bound>| RangeFilter {
+            column: "_id".to_string(),
+            lo,
+            hi,
+        };
+
+        assert!(matches!(
+            classify(&entry, "_id", &rf(Some(bound(25, true)), None)),
+            Class::Disjoint
+        ));
+        assert!(matches!(
+            classify(&entry, "_id", &rf(None, Some(bound(5, true)))),
+            Class::Disjoint
+        ));
+        assert!(matches!(
+            classify(
+                &entry,
+                "_id",
+                &rf(Some(bound(0, true)), Some(bound(30, true)))
+            ),
+            Class::Covered
+        ));
+        assert!(matches!(
+            classify(&entry, "_id", &rf(Some(bound(15, true)), None)),
+            Class::Boundary
+        ));
+        // Unknown column with no scalar stats → boundary (can't prune).
+        assert!(matches!(
+            classify(
+                &entry,
+                "_id",
+                &RangeFilter {
+                    column: "other".to_string(),
+                    lo: None,
+                    hi: None
+                }
+            ),
+            Class::Boundary
+        ));
+    }
+
+    /// `typed_zero` maps each supported sum type to its zero and errors on
+    /// an unsupported type.
+    #[test]
+    fn typed_zero_maps_numeric_types_and_rejects_others() {
+        assert!(matches!(
+            typed_zero(&ScalarValue::Int64(Some(5))),
+            Ok(ScalarValue::Int64(Some(0)))
+        ));
+        assert!(matches!(
+            typed_zero(&ScalarValue::UInt64(Some(5))),
+            Ok(ScalarValue::UInt64(Some(0)))
+        ));
+        assert!(matches!(
+            typed_zero(&ScalarValue::Float64(Some(5.0))),
+            Ok(ScalarValue::Float64(Some(v))) if v == 0.0
+        ));
+        assert!(typed_zero(&ScalarValue::Utf8(Some("x".into()))).is_err());
+    }
+
+    /// `avg_column` reads the column name directly and through a wrapping
+    /// cast; a non-column argument yields `None`.
+    #[test]
+    fn avg_column_reads_through_cast_and_rejects_non_column() {
+        use arrow_schema::DataType;
+        use datafusion::{
+            logical_expr::{Cast, Expr},
+            prelude::{col, lit},
+        };
+
+        assert_eq!(avg_column(&col("price")), Some("price".to_string()));
+        let casted = Expr::Cast(Cast::new(Box::new(col("price")), DataType::Float64));
+        assert_eq!(avg_column(&casted), Some("price".to_string()));
+        assert_eq!(avg_column(&lit(1.0)), None);
+    }
+
     #[test]
     #[allow(deprecated)] // `supports_rewrite` is the targeted method.
     fn rule_opts_into_rewrite_and_reports_name() {

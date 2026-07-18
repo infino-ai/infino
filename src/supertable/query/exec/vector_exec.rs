@@ -66,6 +66,7 @@ use crate::{
                 arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
                 search_query_df_error,
             },
+            vector::{hits_id_score_batch, user_placement_for_scalar_resolve},
         },
     },
 };
@@ -349,6 +350,21 @@ impl ExecutionPlan for VectorSearchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
+        let id_idx = output_schema
+            .index_of(reader.options().id_column.as_str())
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let score_idx = scalar_schema.fields().len();
+        let requested: Vec<usize> = projection
+            .clone()
+            .unwrap_or_else(|| (0..output_schema.fields().len()).collect());
+        let id_score_projection: Option<Vec<usize>> = requested
+            .iter()
+            .map(|idx| match *idx {
+                idx if idx == id_idx => Some(0),
+                idx if idx == score_idx => Some(1),
+                _ => None,
+            })
+            .collect();
 
         let fut = async move {
             // Lower the pushed-down `WHERE` filters to an FTS candidate
@@ -381,6 +397,15 @@ impl ExecutionPlan for VectorSearchExec {
                 }
             }
             .map_err(search_query_df_error)?;
+            if let Some(indices) = id_score_projection {
+                return hits_id_score_batch(&reader, &hits)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    .project(&indices)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()));
+            }
+            let hits = user_placement_for_scalar_resolve(&reader, &hits)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &hits,
@@ -517,9 +542,12 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions},
+        supertable::{Supertable, SupertableOptions, manifest::ManifestSnapshot},
         test_helpers::default_tokenizer as tok,
     };
+
+    /// Moves manifest id ranges away from every real generated id.
+    const INVALID_ID_RANGE_OFFSET: i128 = 1_i128 << 100;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -553,6 +581,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )
@@ -680,6 +709,22 @@ mod tests {
 
     // ---- arg parsing (unit) ----
 
+    /// `array_to_f32` casts numeric elements to f32 and rejects null elements
+    /// (a query vector cannot carry missing components).
+    #[test]
+    fn array_to_f32_casts_ints_and_rejects_nulls() {
+        use std::sync::Arc;
+
+        use arrow_array::ArrayRef;
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(
+            super::array_to_f32(&ints).expect("cast ints"),
+            vec![1.0f32, 2.0, 3.0]
+        );
+        let with_null: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+        assert!(super::array_to_f32(&with_null).is_err());
+    }
+
     #[test]
     fn arg_to_query_vector_parses_csv_string() {
         let v = arg_to_query_vector(&lit("0.5, 1, -2.25")).expect("csv vector");
@@ -696,26 +741,32 @@ mod tests {
 
     #[test]
     fn vector_search_tvf_emits_id_and_score_in_distance_order() {
+        // 6 docs → 6 one-doc cells, within the default probe budget
+        // (`DEFAULT_NPROBE` = 6), so k = n_docs resolves every doc. Same IVF
+        // semantics as a drained hidden table of this shape; 8 docs would
+        // leave 2 cells unprobed by design (approximate search), which is not
+        // what this test is about.
         let dim = 16;
-        let st = supertable_one_superfile(dim, 8);
+        let n = 6;
+        let st = supertable_one_superfile(dim, n);
         let sql = format!(
-            "SELECT _id, title, score FROM vector_search('emb', '{}', 8)",
+            "SELECT _id, title, score FROM vector_search('emb', '{}', {n})",
             csv_one_hot(dim, 0)
         );
         let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 8, "single superfile, k=8 → all 8 docs resolved");
+        assert_eq!(total, n, "single superfile, k=n → all docs resolved");
 
         let b = &batches[0];
         assert_eq!(b.num_columns(), 3);
         // Doc 0 is the exact one-hot match at dim 0 → nearest. `title`
         // is the deterministic anchor (`_id` is generator-assigned).
         assert_eq!(col_str(b, "title").value(0), "doc 0");
-        // `_id` resolved for every row: 8 distinct, non-null keys.
+        // `_id` resolved for every row: n distinct, non-null keys.
         let ids = col_id(b, "_id");
         assert_eq!(ids.null_count(), 0);
         let unique: HashSet<i128> = (0..ids.len()).map(|i| ids.value(i)).collect();
-        assert_eq!(unique.len(), 8, "each hit resolves to a distinct _id");
+        assert_eq!(unique.len(), n, "each hit resolves to a distinct _id");
         // Native emission order (no ORDER BY) is ascending distance.
         let score = col_f32(b, "score");
         for i in 1..score.len() {
@@ -726,6 +777,63 @@ mod tests {
                 score.value(i)
             );
         }
+    }
+
+    #[test]
+    fn vector_search_tvf_id_only_uses_stable_ids_without_scalar_placement() {
+        let dim = 16;
+        let n = 6;
+        let st = supertable_one_superfile(dim, n);
+        let query = csv_one_hot(dim, 0);
+        let resolved = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT _id, title FROM vector_search('emb', '{query}', {n})"
+            ))
+            .expect("baseline scalar-resolved query");
+        let expected: Vec<i128> = (0..resolved[0].num_rows())
+            .map(|row| col_id(&resolved[0], "_id").value(row))
+            .collect();
+
+        // Make manifest range lookup unable to locate any generated id.
+        // MultiCell vector hits still carry their exact stable ids inline, so
+        // an id-only SQL projection must not enter scalar-placement lookup.
+        let manifest = st.inner().manifest.load_full();
+        let entries = manifest
+            .superfiles
+            .iter()
+            .map(|entry| {
+                let mut shifted = entry.as_ref().clone();
+                shifted.id_min += INVALID_ID_RANGE_OFFSET;
+                shifted.id_max += INVALID_ID_RANGE_OFFSET;
+                Arc::new(shifted)
+            })
+            .collect();
+        let altered = ManifestSnapshot::new(
+            manifest.manifest_id,
+            Arc::clone(&manifest.options),
+            entries,
+            None,
+            None,
+        )
+        .with_partition_strategy(manifest.get_partition_strategy());
+        let altered = match manifest.get_global_vector_index() {
+            Some(index) => altered.with_global_vector_index(index),
+            None => altered,
+        };
+        drop(manifest);
+        st.inner().manifest.store(Arc::new(altered));
+
+        let batches = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT _id FROM vector_search('emb', '{query}', {n})"
+            ))
+            .expect("id-only query must use inline stable ids");
+        let actual: Vec<i128> = (0..batches[0].num_rows())
+            .map(|row| col_id(&batches[0], "_id").value(row))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1004,7 +1112,7 @@ mod tests {
     /// path and exercise its `TableProvider` metadata methods (`Debug`,
     /// `as_any`, `table_type`) plus the lowered `VectorSearchExec`'s
     /// `name` / `Debug` — none of which normal query execution touches.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vector_table_and_exec_trait_methods() {
         let dim = 16;
         let st = supertable_one_superfile(dim, 8);

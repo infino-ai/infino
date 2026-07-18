@@ -7,10 +7,10 @@
 //! aggregate skip tests in [`ManifestPartEntry`] to identify
 //! candidate parts for a given query shape. Survivors are
 //! the parts the query layer should load (via
-//! [`Manifest::part`]) for per-superfile pruning.
+//! [`ManifestSnapshot::part`]) for per-superfile pruning.
 //!
 //! These functions are standalone — they don't depend on
-//! the in-memory `Manifest` or its `ManifestPartLoader`.
+//! the in-memory `ManifestSnapshot` or its `ManifestPartLoader`.
 //! That keeps them testable in isolation and lets the
 //! query-layer integration choose its own loading shape.
 //!
@@ -27,8 +27,8 @@
 //!   pre-aggregate manifests, or entries where a particular
 //!   column has no info).
 //!
-//! [`Manifest`]: super::Manifest
-//! [`Manifest::part`]: super::Manifest::part
+//! [`ManifestSnapshot`]: super::ManifestSnapshot
+//! [`ManifestSnapshot::part`]: super::ManifestSnapshot::part
 //! [`Manifest`]: super::list::Manifest
 //! [`ManifestPartEntry`]: super::list::ManifestPartEntry
 
@@ -185,72 +185,6 @@ pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i12
         .collect()
 }
 
-/// Filter parts whose `vector_summary_agg[column]` envelope
-/// can possibly contain a vector within `query_cutoff` of
-/// `query`. Conservative: a part survives iff
-/// `distance(query, envelope_center) ≤ envelope_radius +
-/// query_cutoff`. Parts with no vector summary for this
-/// column survive (no info).
-///
-/// Distance is L2; for cosine workloads, the query vector + centroids
-/// should be normalized at the caller layer (matching the convention the
-/// superfile-level vector skip already uses).
-pub fn prune_parts_for_vector(
-    list: &Manifest,
-    column: &str,
-    query: &[f32],
-    query_cutoff: f32,
-) -> Vec<PartId> {
-    list.parts
-        .iter()
-        .filter_map(|entry| {
-            let Some(agg) = entry.vector_summary_agg.get(column) else {
-                return Some(entry.part_id);
-            };
-            if agg.centroid_envelope.is_empty() {
-                // Empty envelope — no info; keep.
-                return Some(entry.part_id);
-            }
-            let envelope = decode_centroid_envelope(&agg.centroid_envelope);
-            if envelope.len() != query.len() {
-                // Dim mismatch — keep (the per-superfile prune
-                // will reject correctly).
-                return Some(entry.part_id);
-            }
-            let dist = l2_distance(query, &envelope);
-            if dist <= agg.envelope_radius + query_cutoff {
-                Some(entry.part_id)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn decode_centroid_envelope(bytes: &[u8]) -> Vec<f32> {
-    let dim = bytes.len() / 4;
-    let mut out = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let s = i * 4;
-        out.push(f32::from_le_bytes([
-            bytes[s],
-            bytes[s + 1],
-            bytes[s + 2],
-            bytes[s + 3],
-        ]));
-    }
-    out
-}
-
-fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0_f32;
-    for i in 0..a.len().min(b.len()) {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum.sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -262,7 +196,7 @@ mod tests {
     use crate::supertable::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         manifest::{
-            ClusterCentroids, aggregates,
+            aggregates,
             bloom::BloomBuilder,
             list::{FORMAT_VERSION, PartitionStrategy},
             part::ContentHash,
@@ -285,7 +219,6 @@ mod tests {
         id_max: i128,
         title_terms: &[&str],
         vec_centroid: Option<Vec<f32>>,
-        vec_radius: f32,
     ) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         let mut fts = HashMap::new();
@@ -320,12 +253,12 @@ mod tests {
                 "emb".into(),
                 VectorSummary {
                     centroid: c,
-                    radius: vec_radius,
-                    clusters: ClusterCentroids::empty(),
+                    cells: Vec::new(),
                 },
             );
         }
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: ((id_max - id_min) + 1) as u64,
@@ -336,6 +269,7 @@ mod tests {
             vector_summary: vec_summary,
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -352,12 +286,13 @@ mod tests {
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
-            vector_summary_agg: aggs.vector_summary_agg,
         }
     }
 
     fn list_with(entries: Vec<ManifestPartEntry>) -> Manifest {
         Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
             tombstone_seqs: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -370,6 +305,10 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 64,
             },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: entries,
         }
     }
@@ -382,14 +321,13 @@ mod tests {
         assert_eq!(aggs.id_range, (0, 0));
         assert!(aggs.scalar_stats_agg.is_empty());
         assert!(aggs.fts_summary_agg.is_empty());
-        assert!(aggs.vector_summary_agg.is_empty());
     }
 
     #[test]
     fn aggregates_compute_id_range_is_min_max_across_superfiles() {
-        let s_a = seg(100, 199, &["alpha"], None, 0.0);
-        let s_b = seg(0, 99, &["beta"], None, 0.0);
-        let s_c = seg(500, 599, &["gamma"], None, 0.0);
+        let s_a = seg(100, 199, &["alpha"], None);
+        let s_b = seg(0, 99, &["beta"], None);
+        let s_c = seg(500, 599, &["gamma"], None);
         let aggs = aggregates::compute(&[s_a, s_b, s_c], None);
         assert_eq!(aggs.id_range, (0, 599));
     }
@@ -398,8 +336,8 @@ mod tests {
     fn aggregates_compute_fts_term_range_union() {
         // Three superfiles with different term ranges; the
         // empty-FST one contributes nothing to the union.
-        let s_a = seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0);
-        let s_b = seg(11, 20, &["bravo", "charlie", "delta"], None, 0.0);
+        let s_a = seg(0, 10, &["alpha", "bravo", "charlie"], None);
+        let s_b = seg(11, 20, &["bravo", "charlie", "delta"], None);
         let id = Uuid::new_v4();
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
@@ -411,6 +349,7 @@ mod tests {
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 5,
@@ -421,6 +360,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         });
 
@@ -444,6 +384,7 @@ mod tests {
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 0,
@@ -454,6 +395,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         });
 
@@ -472,37 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_compute_vector_envelope_bounds_all_superfile_balls() {
-        let s_a = seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 0.5);
-        let s_b = seg(11, 20, &[], Some(vec![0.0, 1.0, 0.0]), 0.5);
-        let aggs = aggregates::compute(&[s_a.clone(), s_b.clone()], None);
-        let v = aggs.vector_summary_agg.get("emb").expect("vec agg");
-        let mean = [0.5, 0.5, 0.0];
-        // Each superfile's centroid is ~0.707 from the mean; +
-        // radius 0.5 → envelope_radius >= 1.207.
-        assert!(
-            v.envelope_radius >= 1.207 - 0.01,
-            "envelope radius must dominate each seg ball; got {}",
-            v.envelope_radius
-        );
-        let decoded: Vec<f32> = v
-            .centroid_envelope
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        assert_eq!(decoded.len(), 3);
-        for (i, x) in decoded.iter().enumerate() {
-            assert!(
-                (x - mean[i]).abs() < 1e-5,
-                "envelope[{}]={} expected {}",
-                i,
-                x,
-                mean[i]
-            );
-        }
-    }
-
-    #[test]
     fn aggregates_compute_scalar_min_max_per_column() {
         use std::collections::HashMap as Map;
         fn make(id_min: i128, ts_lo: i64, ts_hi: i64) -> Arc<SuperfileEntry> {
@@ -512,6 +423,7 @@ mod tests {
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
             cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
@@ -522,6 +434,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
                 subsection_offsets: None,
             })
         }
@@ -557,6 +470,7 @@ mod tests {
             );
             cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                birth_version: 0,
                 superfile_id: id,
                 uri: SuperfileUri(id),
                 n_docs: 1,
@@ -567,6 +481,7 @@ mod tests {
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
                 partition_hint: None,
+                vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
                 subsection_offsets: None,
             })
         }
@@ -580,10 +495,10 @@ mod tests {
 
     #[test]
     fn prune_parts_for_id_range_filters_non_overlapping_parts() {
-        let part0 = entry_from_superfiles(&[seg(0, 99, &[], None, 0.0)], 0);
-        let part1 = entry_from_superfiles(&[seg(100, 199, &[], None, 0.0)], 1);
-        let part2 = entry_from_superfiles(&[seg(200, 299, &[], None, 0.0)], 2);
-        let part3 = entry_from_superfiles(&[seg(300, 399, &[], None, 0.0)], 3);
+        let part0 = entry_from_superfiles(&[seg(0, 99, &[], None)], 0);
+        let part1 = entry_from_superfiles(&[seg(100, 199, &[], None)], 1);
+        let part2 = entry_from_superfiles(&[seg(200, 299, &[], None)], 2);
+        let part3 = entry_from_superfiles(&[seg(300, 399, &[], None)], 3);
         let list = list_with(vec![part0, part1.clone(), part2.clone(), part3]);
 
         let survivors = prune_parts_for_id_range(&list, 150, 250);
@@ -595,11 +510,9 @@ mod tests {
 
     #[test]
     fn prune_parts_for_fts_prefix_filters_disjoint_term_ranges() {
-        let part0 =
-            entry_from_superfiles(&[seg(0, 10, &["alpha", "bravo", "charlie"], None, 0.0)], 0);
-        let part1 =
-            entry_from_superfiles(&[seg(11, 20, &["delta", "echo", "foxtrot"], None, 0.0)], 1);
-        let part2 = entry_from_superfiles(&[seg(21, 30, &["hotel", "kilo", "lima"], None, 0.0)], 2);
+        let part0 = entry_from_superfiles(&[seg(0, 10, &["alpha", "bravo", "charlie"], None)], 0);
+        let part1 = entry_from_superfiles(&[seg(11, 20, &["delta", "echo", "foxtrot"], None)], 1);
+        let part2 = entry_from_superfiles(&[seg(21, 30, &["hotel", "kilo", "lima"], None)], 2);
         let list = list_with(vec![part0, part1.clone(), part2]);
 
         let survivors = prune_parts_for_fts_prefix(&list, "title", b"echo");
@@ -611,34 +524,10 @@ mod tests {
     fn prune_parts_for_fts_prefix_keeps_part_with_no_aggregate() {
         // Part has no FTS aggregate for the queried column —
         // always-keep.
-        let part = entry_from_superfiles(&[seg(0, 10, &[], None, 0.0)], 0);
+        let part = entry_from_superfiles(&[seg(0, 10, &[], None)], 0);
         let list = list_with(vec![part.clone()]);
         let survivors = prune_parts_for_fts_prefix(&list, "missing", b"any");
         assert_eq!(survivors, vec![part.part_id]);
-    }
-
-    #[test]
-    fn prune_parts_for_vector_filters_far_parts() {
-        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![10.0, 0.0, 0.0]), 0.5)], 0);
-        let part_b =
-            entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-10.0, 0.0, 0.0]), 0.5)], 1);
-        let list = list_with(vec![part_a.clone(), part_b]);
-        let survivors = prune_parts_for_vector(&list, "emb", &[10.0, 0.0, 0.0], 1.0);
-        assert_eq!(survivors.len(), 1);
-        assert_eq!(survivors[0], part_a.part_id);
-    }
-
-    #[test]
-    fn prune_parts_for_vector_keeps_overlapping_envelope() {
-        let part_a = entry_from_superfiles(&[seg(0, 10, &[], Some(vec![1.0, 0.0, 0.0]), 1.0)], 0);
-        let part_b = entry_from_superfiles(&[seg(11, 20, &[], Some(vec![-1.0, 0.0, 0.0]), 1.0)], 1);
-        let list = list_with(vec![part_a, part_b]);
-        let survivors = prune_parts_for_vector(&list, "emb", &[0.0, 0.0, 0.0], 1.0);
-        assert_eq!(
-            survivors.len(),
-            2,
-            "both envelopes contain origin within cutoff"
-        );
     }
 
     #[test]
@@ -648,12 +537,12 @@ mod tests {
         // list-level pruner keeps. Aggregates over-
         // approximate the superfile-level skip data.
         let segs_part0 = vec![
-            seg(0, 10, &["apple"], None, 0.0),
-            seg(11, 20, &["banana", "cherry"], None, 0.0),
+            seg(0, 10, &["apple"], None),
+            seg(11, 20, &["banana", "cherry"], None),
         ];
         let segs_part1 = vec![
-            seg(21, 30, &["alpha"], None, 0.0),
-            seg(31, 40, &["echo", "foxtrot"], None, 0.0),
+            seg(21, 30, &["alpha"], None),
+            seg(31, 40, &["echo", "foxtrot"], None),
         ];
         let part0 = entry_from_superfiles(&segs_part0, 0);
         let part1 = entry_from_superfiles(&segs_part1, 1);

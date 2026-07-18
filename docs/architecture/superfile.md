@@ -130,7 +130,14 @@ is built in the following stages:
 - **Rerank payload.** Each vector also carries a rerank representation
   used to order candidates precisely. It is configurable per column:
   full-precision floats, a compact quantized code with a residual
-  correction (the default), or none (binary codes only).
+  correction, or none (binary codes only). For cosine columns the
+  default is `Sq8FixedResidual`: the same two-byte row layout as
+  `Sq8Residual` on a fixed absolute grid (`offset = −1`,
+  `scale = 2/255`, residual divisor 256). Codec ID `3` and v2
+  cell-directory metadata distinguish it from the locally fitted
+  divisor-16 `Sq8Residual` codec, so maintenance can move rerank
+  bytes between clusters without requantization. Non-cosine metrics
+  still default to locally fitted `Sq8Residual`.
 - **Cluster-contiguous storage.** A cluster's centroid metadata, binary
   codes, document identifiers, and rerank payloads are laid out
   together, so evaluating a cluster is a contiguous read.

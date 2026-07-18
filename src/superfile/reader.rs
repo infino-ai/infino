@@ -20,7 +20,7 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{fmt, io, str, sync::Arc};
+use std::{collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -28,6 +28,7 @@ use arrow_array::{
 };
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
+use futures::{FutureExt, future::BoxFuture};
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -35,12 +36,15 @@ use parquet::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
             RowSelector,
         },
+        async_reader::MetadataFetch,
         parquet_to_arrow_schema,
     },
-    file::metadata::{PageIndexPolicy, ParquetMetaData},
+    errors::{ParquetError, Result as ParquetResult},
+    file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 
 use crate::{
     memory::ConnectionMemoryBudget,
@@ -51,16 +55,25 @@ use crate::{
             reader::{self as fts_reader, BoolMode, FtsReader},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
-        vector::reader::{self as vector_reader, VectorReader},
+        vector::{
+            layout::VectorLayout,
+            reader::{self as vector_reader, VectorReader},
+        },
     },
     supertable::query::provider::tombstone_access_plan,
 };
-
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
+pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
+    kv_map
+        .get(kv::VEC_LAYOUT)
+        .and_then(|s| VectorLayout::from_kv_value(s))
+        .unwrap_or(VectorLayout::Ivf)
+}
 
 /// Per-open knobs for [`SuperfileReader::open_with`]. Defaults to
 /// safe behavior (CRC verification on); flip `verify_crc` to `false`
@@ -106,6 +119,10 @@ pub struct SuperfileReader {
     /// row-group counts and DataFusion's parquet opener from one
     /// per-open parse instead of re-reading footers on every query.
     parquet_meta: Arc<ParquetMetaData>,
+    /// Lazy-reader metadata upgraded with Parquet offset indexes on the first
+    /// targeted scalar read. Offset-index bytes flow through the same
+    /// block-cached source and are decoded once per reader.
+    page_index_meta: OnceCell<Arc<ParquetMetaData>>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -120,6 +137,26 @@ pub struct SuperfileReader {
     n_docs: u64,
     fts: Option<FtsReader>,
     vec: Option<VectorReader>,
+}
+
+struct LazyMetadataFetch {
+    source: Arc<dyn LazyByteSource>,
+}
+
+impl MetadataFetch for &mut LazyMetadataFetch {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let source = Arc::clone(&self.source);
+        async move {
+            let len = range.end.checked_sub(range.start).ok_or_else(|| {
+                ParquetError::General(format!("invalid metadata range {range:?}"))
+            })?;
+            source
+                .range(range.start, len)
+                .await
+                .map_err(|error| ParquetError::General(error.to_string()))
+        }
+        .boxed()
+    }
 }
 
 impl fmt::Debug for SuperfileReader {
@@ -263,9 +300,13 @@ impl SuperfileReader {
             ));
         }
 
+        let vec_layout = vector_layout_from_kv(&kv_map);
         let vec_fut = async {
             if !vec_present {
                 return Ok::<_, ReadError>(None);
+            }
+            if vec_layout == VectorLayout::CellPosting {
+                return Ok(None);
             }
             let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
             let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
@@ -302,6 +343,7 @@ impl SuperfileReader {
             bytes: None,
             arrow_meta: None,
             parquet_meta,
+            page_index_meta: OnceCell::new(),
             source: Some(source),
             schema,
             id_column,
@@ -383,19 +425,24 @@ impl SuperfileReader {
             None
         };
 
-        // 5. Vector path mirrors FTS.
+        // 5. Vector path mirrors FTS (cell posting blobs are scanned separately).
+        let vec_layout = vector_layout_from_kv(&kv_map);
         let vec = if all_present(&kv_map, kv::VEC_KEYS) {
-            let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
-            let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
-            let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
-            let blob = slice_or_err(&bytes, off, len, "vector")?;
-            Some(VectorReader::open_with(
-                blob,
-                cols_json,
-                vector_reader::OpenOptions {
-                    verify_crc: opts.verify_crc,
-                },
-            )?)
+            if vec_layout == VectorLayout::CellPosting {
+                None
+            } else {
+                let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
+                let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+                let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
+                let blob = slice_or_err(&bytes, off, len, "vector")?;
+                Some(VectorReader::open_with(
+                    blob,
+                    cols_json,
+                    vector_reader::OpenOptions {
+                        verify_crc: opts.verify_crc,
+                    },
+                )?)
+            }
         } else if any_present(&kv_map, kv::VEC_KEYS) {
             return Err(ReadError::MalformedKv(
                 "partial inf.vec.* keys present".into(),
@@ -407,6 +454,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
+            page_index_meta: OnceCell::new_with(Some(Arc::clone(arrow_meta.metadata()))),
             arrow_meta: Some(arrow_meta),
             source: None,
             schema,
@@ -423,6 +471,43 @@ impl SuperfileReader {
     /// from this instead of re-reading the footer per query.
     pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
         &self.parquet_meta
+    }
+
+    /// Parquet metadata with offset indexes loaded when available.
+    ///
+    /// Eager readers return their open-time metadata. Lazy readers fetch only
+    /// the page-index metadata range through their existing byte source; a
+    /// [`OnceCell`] coalesces concurrent first callers and keeps all later
+    /// targeted row reads local.
+    pub(crate) async fn parquet_metadata_with_page_index(
+        &self,
+    ) -> Result<Arc<ParquetMetaData>, ReadError> {
+        if self.parquet_meta.offset_index().is_some() {
+            return Ok(Arc::clone(&self.parquet_meta));
+        }
+        let source = self.source.as_ref().map(Arc::clone);
+        let metadata = self
+            .page_index_meta
+            .get_or_try_init(|| async move {
+                let Some(source) = source else {
+                    return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(&self.parquet_meta));
+                };
+                let mut fetch = LazyMetadataFetch { source };
+                let mut loader =
+                    ParquetMetaDataReader::new_with_metadata((*self.parquet_meta).clone())
+                        .with_column_index_policy(PageIndexPolicy::Skip)
+                        .with_offset_index_policy(PageIndexPolicy::Optional);
+                loader
+                    .load_page_index(&mut fetch)
+                    .await
+                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
+                let metadata = loader
+                    .finish()
+                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
+                Ok(Arc::new(metadata))
+            })
+            .await?;
+        Ok(Arc::clone(metadata))
     }
 
     /// Arrow schema of the user-visible columns (Parquet rows).
@@ -480,6 +565,13 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
+    }
+
+    /// Whether synchronous targeted row materialization is ready. A cache
+    /// reader can expose resident bytes before its Arrow metadata is installed;
+    /// those readers must stay on the async object-store row path.
+    pub(crate) fn can_take_by_local_doc_ids(&self) -> bool {
+        self.bytes.is_some() && self.arrow_meta.is_some()
     }
     /// Returns a record batch containing all documents with all columns
     pub fn get_record_batch(
@@ -1144,11 +1236,6 @@ impl SuperfileReader {
     /// shortlist, so the returned top-k is the true k-nearest among
     /// matching rows — pushdown, not post-filter, with no underflow.
     /// `allow == None` is identical to [`Self::vector_hits_async`].
-    ///
-    /// `deny` (when `Some`) is a per-superfile tombstone set excluded
-    /// before ranking on the unfiltered path, so a delete never shrinks
-    /// the top-k. It is independent of `allow`; the filtered path passes
-    /// `None` because its `allow` already has tombstones subtracted.
     pub async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -1203,10 +1290,6 @@ impl SuperfileReader {
     /// ranking to the `local_doc_id`s in `allow` (a per-superfile
     /// predicate allow-set), applied inside the coarse shortlist.
     /// `allow == None` is identical to [`Self::vector_search_clusters`].
-    ///
-    /// `deny` (when `Some`) is a per-superfile tombstone set excluded
-    /// before ranking on the unfiltered path; see
-    /// [`Self::vector_hits_filtered_async`].
     pub async fn vector_search_clusters_filtered(
         &self,
         column: &str,
@@ -1245,7 +1328,9 @@ impl SuperfileReader {
 /// Each field is an optional override. `None` means “use the engine default”,
 /// which depends on whether the query is filtered:
 ///
-/// - unfiltered: `nprobe=6`, `rerank_mult=256`
+/// - unfiltered: `nprobe=6`, `rerank_mult=256` (the supertable user-table
+///   path widens its own coarse default independently — see
+///   `USER_COARSE_CELLS` in the supertable query layer)
 /// - filtered (`filter: Some(...)` or an internal allow-set): `nprobe=8`, `rerank_mult=256`
 ///
 /// Set a field with [`Self::with_nprobe`] / [`Self::with_rerank_mult`].
@@ -1827,6 +1912,31 @@ mod tests {
         let meta = r.parquet_metadata();
         let total: i64 = meta.row_groups().iter().map(|rg| rg.num_rows()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[tokio::test]
+    async fn lazy_parquet_metadata_loads_offset_index_once() {
+        let bytes = build_simple_fts_only_superfile();
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        let reader = SuperfileReader::open_lazy(source).await.expect("lazy open");
+        assert!(
+            reader.parquet_metadata().offset_index().is_none(),
+            "footer-only lazy open should not preload page indexes"
+        );
+
+        let first = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load offset index");
+        assert!(
+            first.offset_index().is_some(),
+            "targeted row reads require the Parquet offset index"
+        );
+        let second = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("reuse offset index");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

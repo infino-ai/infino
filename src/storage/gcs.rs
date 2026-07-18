@@ -24,7 +24,10 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
+    retry,
+};
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS
 /// sessions instead of re-handshaking on the cold tail.
@@ -329,12 +332,13 @@ impl StorageProvider for GcsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        let path = ObjPath::from(prefix);
+        let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            let location = meta.location.to_string();
             out.push((
-                meta.location.to_string(),
+                logical_list_key(&self.prefix, &location),
                 ObjectMeta {
                     size: meta.size,
                     etag: version_token(&meta),

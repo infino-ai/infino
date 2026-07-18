@@ -15,30 +15,37 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, take};
-use arrow_array::{
-    ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
-};
+use arrow::compute::{concat_batches, interleave_record_batch, take};
+use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
     logical_expr::Expr,
     scalar::ScalarValue,
 };
-use futures::{TryStreamExt, future::try_join_all};
-use object_store::{ObjectStore, path::Path};
-use parquet::arrow::{
-    ProjectionMask,
-    async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+use futures::{
+    FutureExt, TryStreamExt,
+    future::{BoxFuture, try_join_all},
+};
+use object_store::{ObjectStore, path::Path as ObjPath};
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::ArrowReaderOptions,
+        async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+    },
+    errors::{ParquetError, Result as ParquetResult},
+    file::metadata::ParquetMetaData,
 };
 use rayon::prelude::*;
 use tokio::sync::oneshot;
 
 use crate::{
     superfile::{
-        SuperfileReader,
+        LazyByteSource, SuperfileReader,
         reader::{rank_back_indices, row_selection_for_ids},
     },
     supertable::{
@@ -46,7 +53,9 @@ use crate::{
         handle::SupertableReader,
         manifest::SuperfileUri,
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
-        query::{SuperfileHit, superfile_reader::superfile_reader},
+        query::{
+            SuperfileHit, superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+        },
     },
 };
 
@@ -190,17 +199,46 @@ pub(crate) async fn resolve_hits(
     let resolved = if needed.is_empty() {
         None
     } else if needed == [id_column] {
-        // Hit → `_id` translation without touching the file: ids are
-        // minted in contiguous spans and the superfile body stores
-        // rows in id order, so a segment whose manifest stats satisfy
-        // `id_max - id_min + 1 == n_docs` maps `local_doc_id` to
-        // `id_min + local_doc_id` by arithmetic. Falls back to the
-        // id-page read for any segment where the span check fails
-        // (multi-span commits can gap the range).
+        // Hit → `_id` translation without touching the file: prefer
+        // `hit.stable_id` (inline on MultiCell / hidden IVF), else
+        // contiguous-span arithmetic. Falls back to the id-page read
+        // only when a hit has neither.
         match resolve_ids_arithmetic(reader, hits) {
             Some(batch) => Some(batch?),
             None => Some(resolve_columns(reader, hits, &needed).await?),
         }
+    } else if needed.contains(&id_column) {
+        // `_id` + scalars: never Parquet-decode `_id` for identity.
+        // MultiCell / hidden hits already carry stable `_id` on the hit;
+        // id-ordered files use span arithmetic. Only the non-id columns
+        // come from `take_by_local_doc_ids`.
+        let other: Vec<&str> = needed
+            .iter()
+            .copied()
+            .filter(|name| *name != id_column)
+            .collect();
+        let other_batch = resolve_columns(reader, hits, &other).await?;
+        let id_batch = resolve_ids_arithmetic(reader, hits).ok_or_else(|| {
+            DataFusionError::Execution(
+                "resolve_hits: hit set missing stable _id and span arithmetic \
+                 (cell-packed hits must carry stable_id from the search wave)"
+                    .into(),
+            )
+        })??;
+        let mut fields = vec![id_batch.schema().field(0).as_ref().clone()];
+        fields.extend(
+            other_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone()),
+        );
+        let mut columns = vec![Arc::clone(id_batch.column(0))];
+        columns.extend(other_batch.columns().iter().map(Arc::clone));
+        Some(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+        )
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
     };
@@ -256,6 +294,10 @@ fn resolve_ids_arithmetic(
     let mut memo: Vec<(SuperfileUri, i128)> = Vec::new();
     let mut ids: Vec<i128> = Vec::with_capacity(hits.len());
     for hit in hits {
+        if let Some(id) = hit.stable_id {
+            ids.push(id);
+            continue;
+        }
         let base = match memo.iter().find(|(uri, _)| *uri == hit.superfile) {
             Some((_, base)) => *base,
             None => {
@@ -263,13 +305,11 @@ fn resolve_ids_arithmetic(
                     .superfiles
                     .iter()
                     .find(|e| e.uri == hit.superfile)?;
-                let n_docs = i128::from(entry.n_docs);
-                let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
-                if n_docs == 0 || span != n_docs {
-                    return None;
-                }
-                memo.push((hit.superfile, entry.id_min));
-                entry.id_min
+                // `None` when the span is gapped (not contiguous single-append),
+                // in which case arithmetic id resolution doesn't apply.
+                let base = row_id_from_manifest_entry(entry, 0)?;
+                memo.push((hit.superfile, base));
+                base
             }
         };
         ids.push(base + i128::from(hit.local_doc_id));
@@ -290,6 +330,40 @@ fn resolve_ids_arithmetic(
         RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef])
             .map_err(|e| DataFusionError::Execution(e.to_string())),
     )
+}
+
+/// Build the engine-native `_id` + `score` batch directly from already-resolved
+/// stable ids and per-hit scores — the same two-column shape `resolve_hits_named`
+/// returns for a `None` projection, but synthesized without opening any
+/// superfile. Used by the hidden-index id-only fast path, which holds the
+/// stable `_id` after the remap's id-resolution step and so needs neither the
+/// user-superfile lookup nor a data-page read. `ids` and `scores` are parallel
+/// and already in global rank order.
+pub(crate) fn id_score_batch(
+    reader: &SupertableReader,
+    ids: &[i128],
+    scores: &[f32],
+) -> DfResult<RecordBatch> {
+    let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
+        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let score_array = Float32Array::from_iter_values(scores.iter().copied());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            reader.options().id_column.clone(),
+            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+            false,
+        ),
+        Field::new(SCORE_COLUMN, DataType::Float32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(id_array) as ArrayRef,
+            Arc::new(score_array) as ArrayRef,
+        ],
+    )
+    .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// Read `names` (scalar columns) at the `hits`' `(superfile,
@@ -333,14 +407,40 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
+    let decoded_cache = reader.decoded_scalar_cache();
+    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
+    let mut misses = Vec::new();
+    for (index, (&uri, locals)) in seg_order.iter().zip(&seg_locals).enumerate() {
+        if let Some(batch) = decoded_cache.get(uri, locals, names) {
+            slots[index] = Some(batch);
+        } else {
+            misses.push((index, uri));
+        }
+    }
 
-    let opened = try_join_all(
-        seg_order
-            .iter()
-            .map(|uri| superfile_reader(store, disk_cache, storage, uri, None)),
-    )
-    .await
-    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
+        let entry = manifest
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "resolve_hits: superfile {uri:?} missing from manifest"
+                ))
+            })?;
+        superfile_reader(
+            store,
+            disk_cache,
+            storage,
+            &entry.uri,
+            entry.subsection_offsets.as_ref(),
+            true,
+        )
+        .await
+        .map(|reader| (index, reader))
+        .map_err(|error| DataFusionError::Execution(error.to_string()))
+    }))
+    .await?;
 
     // Materialize each superfile's projected hit rows, split by tier:
     //
@@ -350,26 +450,22 @@ async fn resolve_columns(
     //     `options.reader_pool` (rayon) — the same pool the search
     //     kernels and the writer's shard builds use — bridged back via
     //     a oneshot so no tokio worker blocks under the compute.
-    //   - **Lazy readers** stream ONLY the projected hit rows through
-    //     parquet's async `ParquetObjectReader` (footer + projected
-    //     column pages via range GETs) — async I/O that belongs on the
-    //     query runtime; a cold read never materializes the superfile.
+    //   - **Lazy readers** stream only projected hit rows through their
+    //     existing `LazyByteSource`. That preserves the disk cache's block
+    //     layer: cold misses range-fetch, repeated warm reads hit local blocks.
+    //     Async I/O stays on the query runtime and never materializes the file.
     //
     // Both waves run concurrently and stitch back in `seg_order`
     // order. Superfile count here is bounded by the global top-k (one
     // entry per distinct hit-bearing superfile), so the fan-out is small.
     let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
-    let mut cold_units: Vec<(usize, &SuperfileUri, &Arc<SuperfileReader>, &[u32])> = Vec::new();
-    for (i, ((uri, rd), locals)) in seg_order
-        .iter()
-        .zip(opened.iter())
-        .zip(seg_locals.iter())
-        .enumerate()
-    {
-        if rd.parquet_bytes().is_some() {
-            warm_inputs.push((i, Arc::clone(rd), locals.clone()));
+    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32])> = Vec::new();
+    for (i, rd) in &opened {
+        let locals = &seg_locals[*i];
+        if rd.can_take_by_local_doc_ids() {
+            warm_inputs.push((*i, Arc::clone(rd), locals.clone()));
         } else {
-            cold_units.push((i, uri, rd, locals.as_slice()));
+            cold_units.push((*i, rd, locals.as_slice()));
         }
     }
 
@@ -400,92 +496,146 @@ async fn resolve_columns(
             .map_err(|e| DataFusionError::Execution(e.to_string()))
     };
 
-    let cold_wave = try_join_all(cold_units.into_iter().map(
-        |(i, uri, reader, locals)| {
-            let storage = storage.cloned();
-            let file_size = manifest
-                .superfiles
-                .iter()
-                .find(|e| e.uri == *uri)
-                .and_then(|e| e.subsection_offsets.as_ref())
-                .map(|o| o.total_size);
-            async move {
-                let storage = storage.ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "resolve_hits needs row bytes for {uri:?}, but the reader was lazy and no storage backend is attached"
-                    ))
-                })?;
-                let (store, path) =
-                    storage.object_store_handle(&uri.storage_path()).ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "resolve_hits: storage backend exposes no object_store handle for {uri:?}"
-                        ))
-                    })?;
-                take_rows_object_store(
-                    store,
-                    path,
-                    file_size,
-                    reader.schema(),
-                    reader.n_docs(),
-                    locals,
-                    names,
-                )
-                .await
-                .map(|batch| (i, batch))
-            }
-        },
-    ));
+    let cold_wave = try_join_all(
+        cold_units
+            .into_iter()
+            .map(|(i, reader, locals)| async move {
+                take_rows_byte_source(reader, locals, names)
+                    .await
+                    .map(|batch| (i, batch))
+            }),
+    );
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
-    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
+        decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
         slots[i] = Some(batch);
     }
     let per_superfile: Vec<RecordBatch> = slots
         .into_iter()
         .map(|s| s.expect("invariant: every superfile resolved by exactly one wave"))
         .collect();
-    // Concatenate, then reorder rows into global rank order.
-    let cat_schema = per_superfile[0].schema();
-    let combined = concat_batches(&cat_schema, &per_superfile)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-    let mut offsets: Vec<u32> = Vec::with_capacity(per_superfile.len());
-    let mut acc: u32 = 0;
-    for batch in &per_superfile {
-        offsets.push(acc);
-        acc += batch.num_rows() as u32;
-    }
-    let reorder =
-        UInt32Array::from_iter_values(placement.iter().map(|(s, r)| offsets[*s] + *r as u32));
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(combined.num_columns());
-    for column in combined.columns() {
-        columns.push(
-            take(column, &reorder, None).map_err(|e| DataFusionError::Execution(e.to_string()))?,
-        );
-    }
-    RecordBatch::try_new(combined.schema(), columns)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+    // Assemble directly into global rank order. `interleave_record_batch`
+    // gathers from the per-superfile arrays in one pass; the old
+    // concatenate-then-take path allocated and copied every projected column
+    // twice before producing the same top-k-sized output.
+    let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
+    interleave_record_batch(&batches, &placement)
+        .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
 
-/// Stream the projected `names` columns at `local_doc_ids` from a lazy
-/// object-store superfile via parquet's async `ParquetObjectReader`
-/// (footer + projected column pages fetched as range GETs). Mirrors
-/// [`SuperfileReader::take_by_local_doc_ids`]'s row-selection + rank-back,
-/// but never materializes the whole superfile — this is the cold/object-
-/// store row-resolution path.
+/// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
+/// For disk-cache readers this preserves the block-cache layer instead of
+/// bypassing it with a new object-store handle on every scalar projection.
+struct ByteSourceAsyncReader {
+    source: Arc<dyn LazyByteSource>,
+    metadata: Arc<ParquetMetaData>,
+}
+
+impl AsyncFileReader for ByteSourceAsyncReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let source = Arc::clone(&self.source);
+        async move {
+            let len = range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| ParquetError::General(format!("invalid byte range {range:?}")))?;
+            source
+                .range(range.start, len)
+                .await
+                .map_err(|error| ParquetError::General(error.to_string()))
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        let source = Arc::clone(&self.source);
+        async move {
+            try_join_all(ranges.into_iter().map(|range| {
+                let source = Arc::clone(&source);
+                async move {
+                    let len = range.end.checked_sub(range.start).ok_or_else(|| {
+                        ParquetError::General(format!("invalid byte range {range:?}"))
+                    })?;
+                    source
+                        .range(range.start, len)
+                        .await
+                        .map_err(|error| ParquetError::General(error.to_string()))
+                }
+            }))
+            .await
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        let metadata = Arc::clone(&self.metadata);
+        async move { Ok(metadata) }.boxed()
+    }
+}
+
+/// Stream projected rows through a reader's cache-aware byte source.
+pub(crate) async fn take_rows_byte_source(
+    reader: &SuperfileReader,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    let metadata = reader
+        .parquet_metadata_with_page_index()
+        .await
+        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+    let input = ByteSourceAsyncReader {
+        source: reader.byte_source(),
+        metadata,
+    };
+    take_rows_async(
+        input,
+        reader.schema(),
+        reader.n_docs(),
+        local_doc_ids,
+        names,
+    )
+    .await
+}
+
+/// Stream the projected `names` columns at `local_doc_ids` from an object-store
+/// superfile. Used when a MultiCell tombstone resolve must read `_id` pages
+/// without resident parquet bytes; also driven directly by parity tests.
 ///
 /// [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
-async fn take_rows_object_store(
+pub(crate) async fn take_rows_object_store(
     store: Arc<dyn ObjectStore>,
-    path: Path,
+    path: ObjPath,
     file_size: Option<u64>,
     file_schema: &SchemaRef,
     n_docs: u64,
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
+    let mut object_reader = ParquetObjectReader::new(store, path).with_preload_offset_index(true);
+    if let Some(size) = file_size.filter(|&s| s > 0) {
+        // Skip the size-discovery HEAD when the manifest already knows it.
+        object_reader = object_reader.with_file_size(size);
+    }
+    take_rows_async(object_reader, file_schema, n_docs, local_doc_ids, names).await
+}
+
+async fn take_rows_async<R>(
+    input: R,
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch>
+where
+    R: AsyncFileReader + Unpin + Send + 'static,
+{
     // Projected column indices (file order) + output fields (caller order).
     let mut col_indices = Vec::with_capacity(names.len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
@@ -515,12 +665,7 @@ async fn take_rows_object_store(
     // I/O model (async range GETs here vs resident-bytes decode there).
     let (sorted, selection) = row_selection_for_ids(local_doc_ids);
 
-    let mut object_reader = ParquetObjectReader::new(store, path);
-    if let Some(size) = file_size.filter(|&s| s > 0) {
-        // Skip the size-discovery HEAD when the manifest already knows it.
-        object_reader = object_reader.with_file_size(size);
-    }
-    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+    let builder = ParquetRecordBatchStreamBuilder::new(input)
         .await
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
@@ -613,6 +758,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread::sleep, time::Duration};
+
     use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
     use arrow_schema::Field;
     use bytes::Bytes;
@@ -627,7 +774,7 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::BoolMode,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -638,6 +785,9 @@ mod tests {
             default_tokenizer as tok,
         },
     };
+
+    /// Force Snowflake ids in one committed superfile across an ms boundary.
+    const ID_GAP_WAIT: Duration = Duration::from_millis(20);
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
@@ -730,6 +880,7 @@ mod tests {
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )
@@ -859,11 +1010,13 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: 0,
                 score: 1.5,
+                stable_id: None,
             },
             SuperfileHit {
                 superfile: entry.uri,
                 local_doc_id: (entry.n_docs - 1) as u32,
                 score: 0.5,
+                stable_id: None,
             },
         ]
     }
@@ -909,7 +1062,12 @@ mod tests {
         // the trailing synthesized `score`, in schema order.
         let st = demo(16);
         let reader = st.reader();
-        let hits = two_hits(&reader);
+        let mut hits = two_hits(&reader);
+        reader
+            .block_on(
+                crate::supertable::query::dispatch::attach_stable_ids_to_hits(&reader, &mut hits),
+            )
+            .expect("stamp stable ids before scalar resolution");
         let scalar_schema = reader.options().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
@@ -958,11 +1116,53 @@ mod tests {
     // ---- resolve_ids_arithmetic direct: the no-I/O span arithmetic
     //      and its fallback when the span check can't apply ----
 
+    /// FTS-only table (no vector column): commits stay id-ordered, so the
+    /// span-arithmetic fast path applies. Vector commits are cell-packed
+    /// (`MultiCellIvf`, Parquet reordered by cell) and are covered by
+    /// [`resolve_ids_arithmetic_declines_cell_packed_vector_superfiles`].
+    fn demo_fts_only() -> Supertable {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let titles = LargeStringArray::from(vec![
+            "rust async",
+            "python data",
+            "rust systems",
+            "go routines",
+        ]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles) as ArrayRef]).expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
     #[test]
     fn resolve_ids_arithmetic_maps_local_ids_via_manifest_span() {
-        // Single contiguous commit => `id_max - id_min + 1 == n_docs`,
-        // so row `local` resolves to `id_min + local` with no file read.
-        let st = demo(16);
+        // Single contiguous id-ordered commit => `id_max - id_min + 1 ==
+        // n_docs`, so row `local` resolves to `id_min + local` with no file
+        // read.
+        let st = demo_fts_only();
         let reader = st.reader();
         let entry = Arc::clone(&reader.manifest().superfiles[0]);
         let last = (entry.n_docs - 1) as u32;
@@ -971,11 +1171,13 @@ mod tests {
                 superfile: entry.uri,
                 local_doc_id: 0,
                 score: 0.0,
+                stable_id: None,
             },
             SuperfileHit {
                 superfile: entry.uri,
                 local_doc_id: last,
                 score: 0.0,
+                stable_id: None,
             },
         ];
 
@@ -994,6 +1196,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ids_arithmetic_declines_cell_packed_vector_superfiles() {
+        // Vector commits write cell-packed MultiCell superfiles whose Parquet
+        // rows are cell-ordered, not id-ordered — span arithmetic must bail
+        // to the id-page read even though the id span looks contiguous.
+        let st = demo(16);
+        let reader = st.reader();
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        let hits = vec![SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id: 0,
+            score: 0.0,
+            stable_id: None,
+        }];
+        assert!(
+            resolve_ids_arithmetic(&reader, &hits).is_none(),
+            "cell-packed superfiles must fall back to the id-page read",
+        );
+    }
+
+    #[test]
     fn resolve_ids_arithmetic_returns_none_when_superfile_absent() {
         // A hit naming a superfile not in the manifest fails the
         // lookup, so arithmetic bails to `None` and the caller falls
@@ -1004,6 +1227,7 @@ mod tests {
             superfile: SuperfileUri::new_v4(),
             local_doc_id: 0,
             score: 0.0,
+            stable_id: None,
         }];
         assert!(
             resolve_ids_arithmetic(&reader, &hits).is_none(),
@@ -1206,18 +1430,35 @@ mod tests {
 
     /// Commit four titled docs to `storage` via a throwaway producer.
     fn commit_titles_to(storage: &Arc<dyn StorageProvider>) {
-        let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(storage)))
-                .expect("create producer");
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single writer pool"),
+        );
+        let producer = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(storage))
+                .with_writer_pool(pool),
+        )
+        .expect("create producer");
         let mut w = producer.writer().expect("writer");
-        w.append(&build_title_batch(&[
-            "rust async",
-            "python data",
-            "rust systems",
-            "go routines",
-        ]))
-        .expect("append");
+        w.append(&build_title_batch(&["rust async", "python data"]))
+            .expect("first append");
+        sleep(ID_GAP_WAIT);
+        w.append(&build_title_batch(&["rust systems", "go routines"]))
+            .expect("second append");
         w.commit().expect("commit");
+        let reader = producer.reader();
+        let entry = reader
+            .manifest()
+            .superfiles
+            .first()
+            .expect("one committed superfile");
+        assert!(
+            row_id_from_manifest_entry(entry, 0).is_none(),
+            "fixture must force a gapped id span"
+        );
     }
 
     /// Reopen the supertable at `consumer_storage` with a lazy
@@ -1292,6 +1533,28 @@ mod tests {
             "scalar resolution must cold-fetch lazy readers; got {}",
             cache.stats().n_cold_fetches,
         );
+    }
+
+    #[test]
+    fn resolve_id_and_scalar_cold_path_uses_final_hit_stamps() {
+        let (_sd, _cd, _cache, consumer) = cold_consumer();
+
+        let batches = consumer
+            .reader()
+            .bm25_search(
+                "title",
+                "rust",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("cold bm25 with id and scalar projection");
+
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema().field(0).name(), "_id");
+        assert_eq!(batch.schema().field(1).name(), "title");
+        assert_eq!(batch.schema().field(2).name(), "score");
     }
 
     #[test]

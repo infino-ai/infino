@@ -376,6 +376,34 @@ mod tests {
 
     // ---- WalId hex encoding ---------------------------------------------
 
+    /// `IdSpan::len` counts inclusively; `is_empty` is true only for an
+    /// inverted (first > last) span.
+    #[test]
+    fn id_span_len_and_is_empty() {
+        assert_eq!(
+            IdSpan {
+                first: RowId(2),
+                last: RowId(4)
+            }
+            .len(),
+            3
+        );
+        assert!(
+            !IdSpan {
+                first: RowId(5),
+                last: RowId(5)
+            }
+            .is_empty()
+        );
+        assert!(
+            IdSpan {
+                first: RowId(6),
+                last: RowId(4)
+            }
+            .is_empty()
+        );
+    }
+
     #[test]
     fn wal_id_hex_round_trips() {
         let w = sample_wal_id();

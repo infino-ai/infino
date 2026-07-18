@@ -1,28 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Cost model for the bench — turns measured latency / footprint into
-//! dollars, per the rule "a resource costs money only to the extent that
-//! holding it blocks the next tenant."
+//! Cost model for the bench — turns measured latency, footprint, and
+//! object-store request counts into dollars, per the rule "a resource
+//! costs money only to the extent that holding it blocks the next
+//! tenant."
 //!
-//! Three buckets, kept separate:
+//! Four blocks, kept separate:
 //!
-//!   1. **Compute (instance-time).** Priced at the instance's marginal
-//!      rate on the *binding* resource. Ingest saturates cores → CPU-time
-//!      binds. Serving charges one core for `p50`, or resident anonymous
-//!      heap if that is tighter than `1/vCPU`.
-//!   2. **Object-store requests.** PUTs on ingest (counted). Cold GET/HEAD
-//!      are priced only when `CellCost::cold_store` is populated from a
-//!      metered cold iteration — otherwise cold object-store dollars are
-//!      omitted, not guessed.
-//!   3. **Object-store capacity.** `stored_GB · $/GB-month`.
+//!   1. **Rate card** — the headline dollars, every figure in one of two
+//!      units: **$/1M docs** (write path; storage over the stated
+//!      retention) and **$/1M queries** (serving; per-query costs are
+//!      sub-cent, so a per-query dollar figure would round to $0 and hide
+//!      the real number). RAM appears as an instance-sizing fact, not a
+//!      dollar line.
+//!   2. **Object-store I/O ledger** — measured HEAD/GET/PUT counts and
+//!      byte volumes per lifecycle phase, with per-unit normalization
+//!      (PUT/commit, GET/query). Counts come from the
+//!      [`crate::storage_meter`] wrapper; phases that did not run metered
+//!      are omitted, never guessed.
+//!   3. **Compute ledger** — one-time phases (ingest/drain/compaction)
+//!      and per-query phases priced from measured on-CPU seconds (never a
+//!      wall-clock approximation). One-time phases in absolute dollars,
+//!      per-query phases per 1M queries.
+//!   4. **Serving** — latency per dollar; cold rows include request cost.
 //!
 //! Local NVMe (file-backed disk-cache mmap) is treated as free.
 
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use crate::{
-    report::{Better, Block, Report, Section, context, text},
+    executors::{ColdTiming, fts::FtsQueryStat, sql::QuerySets, vector::RecallRow},
+    markdown::{fmt_count, fmt_time},
+    report::{Better, Block, Cell, Report, Section, metric, text},
+    rss::fmt_bytes,
     storage_meter::ObjectStoreMeter,
 };
 
@@ -42,6 +53,23 @@ const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 const BYTES_PER_GB: f64 = 1.0e9;
 /// Seconds per hour.
 const SECS_PER_HOUR: f64 = 3600.0;
+/// Hours per month for standing-cost lines (365.25 days / 12 months).
+const HOURS_PER_MONTH: f64 = 730.5;
+/// Queries per "per-million" pricing unit.
+const PER_MILLION: f64 = 1.0e6;
+/// Queries per month assumed by the monthly read line. The write line uses
+/// the cell's own corpus size (`n_docs`/month) so the summary prices writing
+/// THIS table, not a synthetic volume.
+const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
+/// Warm fraction of the blended monthly read line (the rest pay the cold
+/// per-query cost).
+const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
+/// Maintenance cadence assumed by the monthly summary: one drain pass per
+/// this many commits.
+const SUMMARY_COMMITS_PER_DRAIN: f64 = 16.0;
+/// Maintenance cadence assumed by the monthly summary: one compaction
+/// (optimize) pass per this many drains.
+const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -100,29 +128,63 @@ impl Instance {
         self.usd_per_hour / SECS_PER_HOUR
     }
 
-    fn ingest_compute_usd(&self, wall_s: f64, writers: u32) -> f64 {
-        self.ingest_vcpu_seconds(wall_s, writers) * self.usd_per_sec()
+    /// Dollar rate of one vCPU-second on this instance.
+    fn usd_per_vcpu_sec(&self) -> f64 {
+        self.usd_per_sec() / f64::from(self.vcpu.max(1))
     }
 
-    fn ingest_vcpu_seconds(&self, wall_s: f64, writers: u32) -> f64 {
-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
-        wall_s * cpu_share
+    /// Fraction of the instance's RAM a resident set occupies.
+    fn ram_share(&self, resident_bytes: u64) -> f64 {
+        resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
     }
 
-    fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
-        self.per_query_vcpu_seconds(p50_s, resident_anon_bytes) * self.usd_per_sec()
+    /// RAM-hold leg for a one-time phase, in aggregate vCPU-seconds: `wall ×
+    /// peak-RSS share × vcpu`. Expressed in the same aggregate-vCPU-second unit
+    /// as measured CPU so `phase_vcpu_seconds` / `compute_usd` price CPU- and
+    /// RAM-bound phases uniformly — `compute_usd` divides the `vcpu` back out,
+    /// so a RAM-bound phase still bills exactly RSS-share × wall.
+    fn ram_leg(&self, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
+        wall_s
+            * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0)
+            * f64::from(self.vcpu.max(1))
     }
 
-    fn per_query_vcpu_seconds(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
-        let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
-        let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
-        p50_s * cpu_share.max(ram_share)
+    /// Binding aggregate vCPU·s for a one-time phase from MEASURED on-CPU
+    /// seconds: `max(measured CPU, RAM-hold leg)`. CPU is never approximated
+    /// from wall time — schedstat is the only compute basis; a phase without a
+    /// measurement is reported NOT METERED by the caller (never a wall guess).
+    fn phase_vcpu_seconds(&self, cpu_s: f64, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
+        cpu_s.max(self.ram_leg(wall_s, peak_rss_bytes))
     }
 
-    fn ram_binds(&self, resident_anon_bytes: u64) -> bool {
-        let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
-        let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
-        ram_share > cpu_share
+    /// Dollars for measured on-CPU work: aggregate vCPU-seconds (summed across
+    /// cores via schedstat) priced at the per-vCPU rate, never the whole-
+    /// instance rate. Every measured-CPU row — one-time phases, table open, and
+    /// per-query compute — prices through here.
+    fn compute_usd(&self, vcpu_s: f64) -> f64 {
+        vcpu_s * self.usd_per_vcpu_sec()
+    }
+
+    /// RAM-hold leg for one query, in aggregate vCPU-seconds: the resident
+    /// heap's share of the box held for the query's COMPUTE window (`window ×
+    /// RSS-share × vcpu`). For a warm query the window is its own p50; for a
+    /// cold query it is the same-config warm p50 — once bytes are local the
+    /// scoring path holds the heap for about the warm window, while the rest
+    /// of the cold p50 is off-CPU I/O wait that holds no extra heap.
+    fn query_ram_leg(&self, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        window_s * self.ram_share(resident_anon_bytes) * f64::from(self.vcpu.max(1))
+    }
+
+    /// Aggregate vCPU·s a query bills: `max(measured on-CPU, RAM-hold leg)` —
+    /// the binding resource over its compute window.
+    fn per_query_vcpu_seconds(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        cpu_s.max(self.query_ram_leg(window_s, resident_anon_bytes))
+    }
+
+    /// Per-query dollars from the binding leg (see `per_query_vcpu_seconds`),
+    /// priced per-vCPU.
+    fn per_query_usd(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        self.compute_usd(self.per_query_vcpu_seconds(cpu_s, window_s, resident_anon_bytes))
     }
 }
 
@@ -131,22 +193,145 @@ pub struct ColdQuery {
     pub name: String,
     pub open_s: f64,
     pub search_s: f64,
+    /// Measured on-CPU seconds for the table-open window, when sampled.
+    pub open_cpu_s: Option<f64>,
+    /// Measured on-CPU seconds for the first-search window, when sampled.
+    /// Includes fetch-path on-CPU work (decompress, CRC, cache write) plus
+    /// scoring; excludes I/O wait. Priced separately — never copied from warm.
+    pub search_cpu_s: Option<f64>,
+}
+
+/// Warm query timing and measured on-CPU seconds.
+pub type WarmQueryCost = (String, f64, Option<f64>);
+
+/// One named query-residency state's warm/cold object-store windows.
+#[derive(Default, Clone, Copy)]
+pub struct QueryStateIo {
+    pub label: Option<&'static str>,
+    pub cold_open: Option<ObjectStoreMeter>,
+    pub cold_query: Option<ObjectStoreMeter>,
+    pub cold_repeat: Option<ObjectStoreMeter>,
+    pub warm: Option<ObjectStoreMeter>,
+    pub warm_iters: u64,
+}
+
+/// I/O plus CPU/wall timings for one named query-residency state.
+#[derive(Default, Clone, Copy)]
+pub struct QueryStateCost {
+    pub io: QueryStateIo,
+    pub warm_p50_s: Option<f64>,
+    pub warm_cpu_s: Option<f64>,
+    pub ram_bytes: Option<u64>,
+    pub cold_open_s: Option<f64>,
+    pub cold_open_cpu_s: Option<f64>,
+    pub cold_query_s: Option<f64>,
+    pub cold_query_cpu_s: Option<f64>,
+}
+
+/// Metered object-store I/O for the lifecycle phases of one bench cell.
+/// Every field is optional: a phase that wasn't metered is reported as
+/// such — the model never substitutes an estimate for a measurement.
+#[derive(Default, Clone, Copy)]
+pub struct StorePhases {
+    /// The ingest window (all commits): superfile uploads (multipart
+    /// parts included), manifest parts/lists, pointer CAS writes.
+    pub ingest: Option<ObjectStoreMeter>,
+    /// The hidden vector-index drain: reads user vector blobs, writes
+    /// per-cell superfiles + routing/manifest updates.
+    pub drain: Option<ObjectStoreMeter>,
+    /// Wall-clock seconds of the drain window, when it ran.
+    pub drain_wall_s: Option<f64>,
+    /// Measured on-CPU seconds (all-thread schedstat delta) over the drain
+    /// window. `Some` ⇒ price compute from this instead of `wall × share`;
+    /// `None` ⇒ fall back to the wall-clock model.
+    pub drain_cpu_s: Option<f64>,
+    /// Peak RSS sampled over the drain window — the drain is billed at
+    /// `max(pool CPU share, peak-RSS share)` for its wall duration.
+    pub drain_peak_rss_bytes: Option<u64>,
+    /// Diagnostic undrained commit inserted between post-drain and
+    /// post-delta query states.
+    pub delta_commit: Option<ObjectStoreMeter>,
+    pub delta_commit_wall_s: Option<f64>,
+    pub delta_commit_cpu_s: Option<f64>,
+    pub delta_commit_peak_rss_bytes: Option<u64>,
+    /// Maintenance compaction (`optimize()`: user + hidden tables) —
+    /// reads the small superfiles, writes merged replacements.
+    pub compaction: Option<ObjectStoreMeter>,
+    /// Wall-clock seconds of the compaction window, when it ran.
+    pub compaction_wall_s: Option<f64>,
+    /// Measured on-CPU seconds over the compaction window (same semantics as
+    /// [`Self::drain_cpu_s`]).
+    pub compaction_cpu_s: Option<f64>,
+    /// Peak RSS sampled over the compaction window (same billing rule).
+    pub compaction_peak_rss_bytes: Option<u64>,
+    /// One cold table open on a fresh cache (manifest + pointer + open
+    /// blobs) — one-time, amortized across queries on a supertable.
+    pub cold_open: Option<ObjectStoreMeter>,
+    /// The first query on the cold cache — the per-query cold fetch.
+    /// This is the "GETs per query" number.
+    pub cold_query: Option<ObjectStoreMeter>,
+    /// Pre-drain counterparts of `cold_open` / `cold_query`: the transient
+    /// shape a fresh table serves (hidden IVF still in INCOMING) until
+    /// maintenance drains it. Priced so the cost of querying *before*
+    /// maintenance catches up is visible next to the steady state.
+    pub cold_open_pre: Option<ObjectStoreMeter>,
+    pub cold_query_pre: Option<ObjectStoreMeter>,
+    /// The same query repeated on the same *fresh* consumer. Probes
+    /// cache fill lag: if the disk cache absorbed the first query this
+    /// is ~0 GETs; a repeat of the full fan means foreground reads are
+    /// not retained (or background fill has not landed yet).
+    pub cold_repeat_query: Option<ObjectStoreMeter>,
+    /// Steady-state warm window: [`Self::warm_query_iters`] queries on
+    /// the shared, cache-hot consumer — the same consumer the warm
+    /// latency battery timed, so I/O and CPU describe the same path.
+    pub warm_query: Option<ObjectStoreMeter>,
+    pub warm_query_iters: u64,
+    /// Explicit lifecycle query states. When populated, the I/O ledger renders
+    /// these rows instead of the legacy pre/steady pair above.
+    pub query_states: [QueryStateCost; 4],
+    /// Filtered-search window ([`Self::filtered_query_iters`] queries)
+    /// on the same shared consumer — filtered vs unfiltered GET/query.
+    pub filtered_query: Option<ObjectStoreMeter>,
+    pub filtered_query_iters: u64,
 }
 
 /// Everything one cell (one tier × modality) needs to be priced.
 pub struct CellCost<'a> {
     pub ingest_wall_s: f64,
     pub writers: u32,
-    pub put_count: u64,
+    /// Peak RSS during the ingest window, when sampled. Ingest is billed
+    /// on the *binding* resource — `max(writer-pool CPU share, peak-RSS
+    /// share of RAM)` — same rule queries use; `None` bills CPU share.
+    pub ingest_peak_rss_bytes: Option<u64>,
+    /// Measured on-CPU seconds over the ingest window. `Some` ⇒ price the
+    /// CPU leg from this instead of `wall × pool-share`; `None` ⇒ wall model.
+    pub ingest_cpu_s: Option<f64>,
+    /// Commits in the ingest window, for PUT-per-commit normalization.
+    pub n_commits: u64,
+    /// Exact PUT count for write paths that are known without metering
+    /// (the superfile tier's single `put_atomic`). `None` + no metered
+    /// ingest ⇒ the write-request line reports "not metered".
+    pub unmetered_put_count: Option<u64>,
     pub stored_bytes: u64,
     pub corpus_bytes: u64,
     pub n_docs: usize,
     pub resident_anon_bytes: u64,
-    pub warm: &'a [(String, f64)],
-    /// Cold latency rows (open and search timed separately).
+    /// Steady-state (post-drain, on a vector cell) warm latency battery.
+    pub warm: &'a [WarmQueryCost],
+    /// Cold latency rows (open and search timed separately), steady state.
     pub cold: Option<&'a [ColdQuery]>,
-    /// Object-store HEAD/GET counts from one metered cold iteration (supertable only).
-    pub cold_store: Option<ObjectStoreMeter>,
+    /// Pre-drain warm battery — the transient shape before maintenance.
+    pub warm_pre: Option<&'a [WarmQueryCost]>,
+    /// Pre-drain cold latency rows.
+    pub cold_pre: Option<&'a [ColdQuery]>,
+    /// Measured object-store I/O per phase.
+    pub store: StorePhases,
+    /// Whether this cell has the vector maintenance lifecycle (drain,
+    /// compaction, filtered search, pre/post-drain split). Those ledger
+    /// rows always render on such a cell — as "NOT METERED" when the
+    /// harness failed to measure them — and never render elsewhere
+    /// (an FTS cell has no drain to meter).
+    pub vector_cell: bool,
     /// Assumed retention for the capacity line (GB-months). Default 1 month.
     pub storage_months: Option<f64>,
     /// Whether a cold `open` is a one-time table/namespace open that is
@@ -156,19 +341,61 @@ pub struct CellCost<'a> {
     pub cold_open_amortized: bool,
 }
 
+/// `$X` with adaptive precision: two decimals at or above one cent,
+/// otherwise two significant digits — sub-cent values never collapse to
+/// a meaningless "$0.0000".
 fn usd(v: f64) -> String {
-    if v < 0.01 {
-        format!("${:.4}", v)
+    if v == 0.0 {
+        return "$0".into();
+    }
+    if v >= 0.01 {
+        return format!("${v:.2}");
+    }
+    let decimals = ((-v.log10()).ceil() as usize + 1).min(9);
+    format!("${v:.decimals$}")
+}
+
+/// Per-query dollars expressed at the meaningful scale: `$X/1M`.
+fn usd_per_million(per_unit: f64) -> String {
+    format!("{}/1M", usd(per_unit * PER_MILLION))
+}
+
+/// Per-query cost with both scales visible — prevents comparing $/open to $/1M.
+fn usd_per_query_both_scales(per_query: f64) -> String {
+    format!("{}/query ({})", usd(per_query), usd_per_million(per_query))
+}
+
+/// Latency per dollar: seconds of query latency per dollar of per-query
+/// cost (`p50 ÷ $/query`). Not delta-tracked — cost and latency pull it in
+/// opposite directions, so neither day-over-day direction is "better".
+fn latency_secs_per_usd(per_query_usd: f64, latency_s: f64) -> f64 {
+    latency_s / per_query_usd.max(f64::MIN_POSITIVE)
+}
+
+/// `s/$` cell rendered at count scale (`11.7K`).
+fn latency_per_usd_cell(per_query_usd: f64, latency_s: f64) -> Cell {
+    text(fmt_count(
+        latency_secs_per_usd(per_query_usd, latency_s) as usize
+    ))
+}
+
+/// Event count for the maintenance cadence line: integers plain, fractional
+/// cadences with two decimals (`1` / `0.06`).
+fn fmt_events(n: f64) -> String {
+    if (n - n.round()).abs() < 1e-9 {
+        format!("{n:.0}")
     } else {
-        format!("${:.2}", v)
+        format!("{n:.2}")
     }
 }
 
 fn usd_per_gb(v: f64) -> String {
-    if v < 0.01 {
-        format!("${:.4}/GB", v)
+    // Three decimals below $0.10: the S3 capacity rate is $0.023/GB-mo and
+    // a two-decimal "$0.02/GB" would misstate the rate the math applies.
+    if v < 0.1 {
+        format!("${v:.3}/GB")
     } else {
-        format!("${:.2}/GB", v)
+        format!("${v:.2}/GB")
     }
 }
 
@@ -184,17 +411,72 @@ fn storage_months() -> f64 {
 
 fn fmt_vcpu_seconds(s: f64) -> String {
     if s >= 10.0 {
-        format!("{s:.1} vCPU·s")
+        format!("{s:.1}")
+    } else if s >= 0.01 {
+        format!("{s:.2}")
+    } else if s > 0.0 {
+        // Sub-centi vCPU·s: show enough digits that vCPU·s × per-vCPU-rate
+        // visibly reconciles with the $ column (0.00068 must not read "0.00").
+        let decimals = ((-s.log10()).ceil() as usize + 1).min(6);
+        format!("{s:.decimals$}")
     } else {
-        format!("{s:.2} vCPU·s")
+        "0.00".into()
     }
 }
 
 fn fmt_wall_seconds(s: f64) -> String {
     if s >= 10.0 {
-        format!("{s:.1}s wall")
+        format!("{s:.1} s")
     } else {
-        format!("{s:.2}s wall")
+        format!("{s:.2} s")
+    }
+}
+
+/// Request dollars for one metered window: PUT + LIST at the PUT/list rate,
+/// HEAD + GET at the GET rate. DELETE is free on S3, so it is counted but not
+/// priced.
+fn request_usd(io: &ObjectStoreMeter) -> f64 {
+    (io.put_count + io.list_count) as f64 * USD_PER_PUT + io.read_requests() as f64 * USD_PER_GET
+}
+
+/// "N PUT + M GET (+ K HEAD / LIST / DELETE)" — the request-count cell of an I/O row.
+fn fmt_requests(io: &ObjectStoreMeter) -> String {
+    let mut parts = Vec::new();
+    if io.put_count > 0 {
+        parts.push(format!("{} PUT", io.put_count));
+    }
+    if io.get_count > 0 {
+        parts.push(format!("{} GET", io.get_count));
+    }
+    if io.head_count > 0 {
+        parts.push(format!("{} HEAD", io.head_count));
+    }
+    if io.list_count > 0 {
+        parts.push(format!("{} LIST", io.list_count));
+    }
+    if io.delete_count > 0 {
+        parts.push(format!("{} DELETE", io.delete_count));
+    }
+    if parts.is_empty() {
+        "0".into()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+fn fmt_uploaded(io: &ObjectStoreMeter) -> String {
+    if io.put_bytes == 0 {
+        "—".into()
+    } else {
+        fmt_bytes(io.put_bytes)
+    }
+}
+
+fn fmt_downloaded(io: &ObjectStoreMeter) -> String {
+    if io.get_bytes == 0 {
+        "—".into()
+    } else {
+        fmt_bytes(io.get_bytes)
     }
 }
 
@@ -202,35 +484,86 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let inst = Instance::current();
     let retention_months = c.storage_months.unwrap_or_else(storage_months);
 
-    let ingest_vcpu_s = inst.ingest_vcpu_seconds(c.ingest_wall_s, c.writers);
-    let compute = inst.ingest_compute_usd(c.ingest_wall_s, c.writers);
-    let requests = c.put_count as f64 * USD_PER_PUT;
-    let ingest_total = compute + requests;
-    let per_million = if c.n_docs > 0 {
-        ingest_total / (c.n_docs as f64 / 1.0e6)
+    // ---- Write path: ingest + drain + compaction (compute and requests).
+    // Each phase is billed at its binding share — pool CPU or peak-RSS
+    // share of RAM, whichever is larger — for its full wall duration.
+    // Compute is priced ONLY from measured on-CPU seconds (schedstat, I/O
+    // wait excluded). A phase that ran but whose CPU wasn't sampled is
+    // reported NOT METERED — never back-filled with a wall-clock guess.
+    let ingest_compute = c
+        .ingest_cpu_s
+        .map(|cpu| inst.phase_vcpu_seconds(cpu, c.ingest_wall_s, c.ingest_peak_rss_bytes))
+        .map(|vcpu| inst.compute_usd(vcpu));
+    let drain_wall_s = c.store.drain_wall_s.unwrap_or(0.0);
+    let drain_compute = c
+        .store
+        .drain_cpu_s
+        .map(|cpu| inst.phase_vcpu_seconds(cpu, drain_wall_s, c.store.drain_peak_rss_bytes))
+        .map(|vcpu| inst.compute_usd(vcpu));
+    let delta_wall_s = c.store.delta_commit_wall_s.unwrap_or(0.0);
+    let delta_compute = c
+        .store
+        .delta_commit_cpu_s
+        .map(|cpu| inst.phase_vcpu_seconds(cpu, delta_wall_s, c.store.delta_commit_peak_rss_bytes))
+        .map(|vcpu| inst.compute_usd(vcpu));
+    let compaction_wall_s = c.store.compaction_wall_s.unwrap_or(0.0);
+    let compaction_compute = c
+        .store
+        .compaction_cpu_s
+        .map(|cpu| {
+            inst.phase_vcpu_seconds(cpu, compaction_wall_s, c.store.compaction_peak_rss_bytes)
+        })
+        .map(|vcpu| inst.compute_usd(vcpu));
+
+    let ingest_req_usd = match (c.store.ingest, c.unmetered_put_count) {
+        (Some(io), _) => request_usd(&io),
+        (None, Some(puts)) => puts as f64 * USD_PER_PUT,
+        (None, None) => 0.0,
+    };
+    let drain_req_usd = c.store.drain.map(|io| request_usd(&io)).unwrap_or(0.0);
+    let delta_req_usd = c
+        .store
+        .delta_commit
+        .map(|io| request_usd(&io))
+        .unwrap_or(0.0);
+    let compaction_req_usd = c.store.compaction.map(|io| request_usd(&io)).unwrap_or(0.0);
+
+    let write_compute = ingest_compute.unwrap_or(0.0)
+        + drain_compute.unwrap_or(0.0)
+        + delta_compute.unwrap_or(0.0)
+        + compaction_compute.unwrap_or(0.0);
+    let write_requests = ingest_req_usd + drain_req_usd + delta_req_usd + compaction_req_usd;
+    let write_total = write_compute + write_requests;
+    let write_per_million_docs = if c.n_docs > 0 {
+        write_total / (c.n_docs as f64 / PER_MILLION)
     } else {
         0.0
     };
+    // "$X per 1M docs" for a one-time maintenance phase's requests.
+    let per_million_docs = |usd_total: f64| {
+        if c.n_docs > 0 {
+            usd_total / (c.n_docs as f64 / PER_MILLION)
+        } else {
+            0.0
+        }
+    };
+
+    // ---- Storage capacity ----
     let stored_gb = c.stored_bytes as f64 / BYTES_PER_GB;
     let gb_months = stored_gb * retention_months;
     let storage_month = gb_months * USD_PER_GB_MONTH;
-    let storage_per_million_docs_month = if c.n_docs > 0 {
-        storage_month / (c.n_docs as f64 / 1.0e6)
-    } else {
-        0.0
-    };
-    let write_rate_per_gb = if stored_gb > 0.0 {
-        ingest_total / stored_gb
-    } else {
-        0.0
-    };
 
+    // ---- Warm query battery (priced from MEASURED on-CPU seconds) ----
+    // Only entries with a sampled cpu are priced; an unmetered warm query is
+    // omitted from the battery rather than back-filled with a wall guess.
     let warm_costs: Vec<(f64, f64, String)> = c
         .warm
         .iter()
-        .map(|(name, p50_s)| {
-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
-            (per_q, *p50_s, name.clone())
+        .filter_map(|(name, p50_s, cpu_s)| {
+            cpu_s.map(|cpu| {
+                let per_q = inst.per_query_usd(cpu, *p50_s, c.resident_anon_bytes);
+                (per_q, *p50_s, name.clone())
+            })
         })
         .collect();
     let (min_q_cost, max_q_cost, fastest_name, fastest_p50) = if warm_costs.is_empty() {
@@ -248,31 +581,56 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             },
         )
     };
-    let min_per_million_q = min_q_cost * 1.0e6;
-    let max_per_million_q = max_q_cost * 1.0e6;
 
+    // Anchor cold row: the shape whose open/search latency and metered I/O
+    // represent "one cold query" in the rate card and ledgers.
     let anchor_cold = c.cold.and_then(|rows| {
         rows.iter()
             .find(|q| q.name == "ten_term_or")
             .or_else(|| rows.first())
     });
 
+    // The same-config warm p50 — the cold query's RAM-hold window (the heap
+    // is held for the compute portion of a cold query, about the warm window;
+    // the rest of the cold p50 is off-CPU I/O wait holding no extra heap).
+    let warm_window_for = |name: &str| -> Option<f64> {
+        c.warm
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .or_else(|| c.warm.first())
+            .map(|(_, p50_s, _)| *p50_s)
+    };
+
+    // Per-query cold dollars = binding(MEASURED cold-search on-CPU, RAM leg
+    // over the warm-scale compute window) + measured object-store requests
+    // for the first-query fetch window. Cold search CPU is metered separately
+    // (includes decompress/decode/scoring); it is never copied from warm.
+    let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
+    let cold_query_usd = anchor_cold.map(|q| {
+        let window = warm_window_for(&q.name).unwrap_or(0.0);
+        q.search_cpu_s
+            .map(|cpu| inst.per_query_usd(cpu, window, c.resident_anon_bytes))
+            .unwrap_or(0.0)
+            + cold_query_req_usd.unwrap_or(0.0)
+    });
+
+    // ---- Block 1: rate card ----
     let warm_query_cell = if warm_costs.is_empty() {
         "—".into()
-    } else if (max_per_million_q - min_per_million_q).abs() < 1e-9 {
+    } else if (max_q_cost - min_q_cost).abs() < f64::EPSILON {
         format!(
-            "{}/1M queries @ {} p50 ({})",
-            usd(min_per_million_q),
-            crate::markdown::fmt_time(fastest_p50 * 1e9),
+            "{} queries @ {} p50 ({})",
+            usd_per_million(min_q_cost),
+            fmt_time(fastest_p50 * 1e9),
             fastest_name,
         )
     } else {
         format!(
-            "{}–{}/1M queries ({}–{} p50 battery)",
-            usd(min_per_million_q),
-            usd(max_per_million_q),
-            crate::markdown::fmt_time(fastest_p50 * 1e9),
-            crate::markdown::fmt_time(
+            "{}–{} queries ({}–{} p50 battery)",
+            usd(min_q_cost * PER_MILLION),
+            usd_per_million(max_q_cost),
+            fmt_time(fastest_p50 * 1e9),
+            fmt_time(
                 warm_costs
                     .iter()
                     .map(|(_, p50, _)| *p50)
@@ -282,57 +640,95 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         )
     };
 
+    let has_drain = c.store.drain.is_some() || c.store.drain_wall_s.is_some();
+    let has_delta = c.store.delta_commit.is_some() || c.store.delta_commit_wall_s.is_some();
+    let has_compaction = c.store.compaction.is_some() || c.store.compaction_wall_s.is_some();
+    let write_label = match (has_drain, has_delta, has_compaction) {
+        (true, true, true) => "Write path (ingest + drain + delta + optimize)",
+        (true, false, true) => "Write path (ingest + drain + optimize)",
+        (true, _, false) => "Write path (ingest + hidden-index drain)",
+        (false, true, true) => "Write path (ingest + delta + optimize)",
+        (false, _, true) => "Write path (ingest + optimize)",
+        (false, true, false) => "Write path (ingest + delta)",
+        (false, false, false) => "Write path (ingest)",
+    };
+    let query_states: Vec<&QueryStateCost> = c
+        .store
+        .query_states
+        .iter()
+        .filter(|state| state.io.label.is_some())
+        .collect();
     let mut rate_rows = vec![
         vec![
             text("Storage"),
             text(format!(
-                "{} × {:.0} mo → {}/mo",
+                "{}/1M docs ({} × {retention_months:.0} mo retention)",
+                usd(per_million_docs(storage_month)),
                 usd_per_gb(USD_PER_GB_MONTH),
-                retention_months,
-                usd(storage_month),
             )),
         ],
         vec![
-            text("Write once (ingest)"),
+            text(write_label),
             text(format!(
-                "{} → {} total",
-                usd_per_gb(write_rate_per_gb),
-                usd(ingest_total),
+                "{} compute + {} requests → {} total ({}/1M docs)",
+                usd(write_compute),
+                usd(write_requests),
+                usd(write_total),
+                usd(write_per_million_docs),
             )),
         ],
-        vec![text("Warm query (marginal CPU)"), text(warm_query_cell)],
     ];
+    if query_states.is_empty() {
+        rate_rows.push(vec![
+            text("Warm query (marginal, binding resource)"),
+            text(warm_query_cell),
+        ]);
+    }
 
-    // A supertable's cold `open` is the one-time table/namespace open
-    // (manifest load + consumer setup), amortized across every query — it is
-    // not per-query latency. Show it as its own one-time line and price the
-    // cold *query* on `search` alone. A single superfile pays the open on
-    // each cold read, so there the cold query is `open + search`.
-    if let Some(q) = anchor_cold {
-        if c.cold_open_amortized {
+    if query_states.is_empty()
+        && let Some(q) = anchor_cold
+    {
+        if let Some(per_q) = cold_query_usd.filter(|_| cold_query_req_usd.is_some()) {
+            let io = c.store.cold_query.expect("guarded by cold_query_req_usd");
             rate_rows.push(vec![
-                text("Table open (one-time, amortized)"),
+                text("Cold query (CPU + requests)"),
                 text(format!(
-                    "{} — manifest + consumer, paid once per open",
-                    crate::markdown::fmt_time(q.open_s * 1e9),
-                )),
-            ]);
-            rate_rows.push(vec![
-                text("Cold query (latency only — see search table)"),
-                text(format!(
-                    "{} search ({})",
-                    crate::markdown::fmt_time(q.search_s * 1e9),
+                    "{} queries — {} GET/query, {}/query fetched ({} search, {})",
+                    usd_per_million(per_q),
+                    io.get_count,
+                    fmt_bytes(io.get_bytes),
+                    fmt_time(q.search_s * 1e9),
                     q.name,
                 )),
             ]);
         } else {
             rate_rows.push(vec![
-                text("Cold query (latency only — see search table)"),
+                text("Cold query (latency only — requests not metered)"),
                 text(format!(
                     "{} open + {} search ({})",
-                    crate::markdown::fmt_time(q.open_s * 1e9),
-                    crate::markdown::fmt_time(q.search_s * 1e9),
+                    fmt_time(q.open_s * 1e9),
+                    fmt_time(q.search_s * 1e9),
                     q.name,
+                )),
+            ]);
+        }
+        if c.cold_open_amortized {
+            let open_io = c
+                .store
+                .cold_open
+                .map(|io| {
+                    format!(
+                        " · {} GET, {} fetched",
+                        io.read_requests(),
+                        fmt_bytes(io.get_bytes)
+                    )
+                })
+                .unwrap_or_default();
+            rate_rows.push(vec![
+                text("Table open (one-time, amortized)"),
+                text(format!(
+                    "{}{open_io} — manifest + consumer, paid once per open",
+                    fmt_time(q.open_s * 1e9),
                 )),
             ]);
         }
@@ -340,298 +736,855 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
 
     let rate_card = Block {
         subtitle: format!(
-            "Rate card — {} docs, {} stored (Infino measured; latency lives in the \
-             search table — warm vs cold are not interchangeable)",
-            crate::markdown::fmt_count(c.n_docs),
-            crate::rss::fmt_bytes(c.stored_bytes),
+            "Rate card — {} docs, {} stored",
+            fmt_count(c.n_docs),
+            fmt_bytes(c.stored_bytes),
         ),
         headers: vec!["Line".into(), "Infino (measured)".into()],
         rows: rate_rows,
     };
 
-    let writers_used = c.writers.min(inst.vcpu);
-    let vcpu_share = format!("{writers_used}/{}/vCPU share", inst.vcpu);
-    let ingest_cpu_row = vec![
-        text(format!("Ingest CPU ({}w on {} vCPU)", c.writers, inst.vcpu)),
-        text(format!(
-            "{} = {} × {vcpu_share}",
-            fmt_vcpu_seconds(ingest_vcpu_s),
-            fmt_wall_seconds(c.ingest_wall_s),
-        )),
-        text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(compute))),
-        context(compute, usd(compute), Better::Lower),
-    ];
-    let put_row = vec![
-        text(format!("Ingest PUT ({} requests)", c.put_count)),
-        text("once at commit"),
-        text(format!("@ $5/1M → {}", usd(requests))),
-        context(requests, usd(requests), Better::Lower),
-    ];
-    let storage_row = vec![
-        text(format!(
-            "Stored capacity ({})",
-            crate::rss::fmt_bytes(c.stored_bytes)
-        )),
-        text(format!(
-            "{stored_gb:.2} GB × {retention_months:.0} mo = {gb_months:.2} GB·mo",
-        )),
-        text(format!("@ $0.023/GB·mo → {}/mo", usd(storage_month))),
-        context(
-            storage_month,
-            format!("{}/mo", usd(storage_month)),
-            Better::Lower,
-        ),
-    ];
-
-    let mut meter_rows = vec![ingest_cpu_row, put_row, storage_row];
-
-    if let Some(q) = anchor_cold {
-        let open_vcpu = inst.per_query_vcpu_seconds(q.open_s, c.resident_anon_bytes);
-        let search_vcpu = inst.per_query_vcpu_seconds(q.search_s, c.resident_anon_bytes);
-        let open_usd = open_vcpu * inst.usd_per_sec();
-        let search_usd = search_vcpu * inst.usd_per_sec();
-        let open_label = if c.cold_open_amortized {
-            format!("Table open CPU (one-time, {})", q.name)
-        } else {
-            format!("Cold open CPU ({})", q.name)
-        };
-        meter_rows.push(vec![
-            text(open_label),
-            text(format!(
-                "{} × {}",
-                fmt_wall_seconds(q.open_s),
-                fmt_vcpu_seconds(open_vcpu),
-            )),
-            text(format!(
-                "@ ${:.4}/hr → {}",
-                inst.usd_per_hour,
-                usd(open_usd)
-            )),
-            context(open_usd, usd(open_usd), Better::Lower),
-        ]);
-        meter_rows.push(vec![
-            text(format!("Cold search CPU ({})", q.name)),
-            text(format!(
-                "{} × {}",
-                fmt_wall_seconds(q.search_s),
-                fmt_vcpu_seconds(search_vcpu),
-            )),
-            text(format!(
-                "@ ${:.4}/hr → {}",
-                inst.usd_per_hour,
-                usd(search_usd)
-            )),
-            context(search_usd, usd(search_usd), Better::Lower),
-        ]);
-    }
-
-    if let Some(store) = c.cold_store {
-        let head_usd = store.head_count as f64 * USD_PER_GET;
-        let get_usd = store.get_count as f64 * USD_PER_GET;
-        let req_usd = head_usd + get_usd;
-        meter_rows.push(vec![
-            text(format!(
-                "Cold S3 HEAD ({} calls, one metered iter)",
-                store.head_count
-            )),
-            text("one cold open + search"),
-            text(format!("@ $0.40/1M → {}", usd(head_usd))),
-            context(head_usd, usd(head_usd), Better::Lower),
-        ]);
-        meter_rows.push(vec![
-            text(format!(
-                "Cold S3 GET ({} calls, {} fetched)",
-                store.get_count,
-                crate::rss::fmt_bytes(store.get_bytes),
-            )),
-            text("one cold open + search"),
-            text(format!("@ $0.40/1M → {}", usd(get_usd))),
-            context(get_usd, usd(get_usd), Better::Lower),
-        ]);
-        meter_rows.push(vec![
-            text("Cold object-store requests (total)"),
-            text(format!(
-                "{} HEAD + {} GET",
-                store.head_count, store.get_count
-            )),
-            text(usd(req_usd)),
-            context(req_usd, usd(req_usd), Better::Lower),
-        ]);
-    } else if c.cold.is_some() {
-        meter_rows.push(vec![
-            text("Cold S3 HEAD/GET"),
-            text("not metered in this cell yet"),
-            text("cold object-store $ omitted"),
+    // ---- Block 2: object-store I/O ledger ----
+    let mut io_rows: Vec<Vec<Cell>> = Vec::new();
+    // A lifecycle phase this cell *has* but the harness failed to measure
+    // renders as a loud placeholder — a phase must never silently vanish.
+    let not_metered_row = |label: &str| -> Vec<Cell> {
+        vec![
+            text(label),
+            text("NOT METERED"),
             text("—"),
-        ]);
+            text("—"),
+            text("—"),
+            text("—"),
+        ]
+    };
+    match (c.store.ingest, c.unmetered_put_count) {
+        (Some(io), _) => {
+            io_rows.push(vec![
+                text(format!("Ingest ({} commits)", c.n_commits)),
+                text(fmt_requests(&io)),
+                text(fmt_uploaded(&io)),
+                text(fmt_downloaded(&io)),
+                text(format!(
+                    "{}/1M docs",
+                    usd(per_million_docs(request_usd(&io)))
+                )),
+                metric(request_usd(&io), usd(request_usd(&io)), Better::Lower),
+            ]);
+        }
+        (None, Some(puts)) => {
+            let req = puts as f64 * USD_PER_PUT;
+            io_rows.push(vec![
+                text(format!("Ingest ({} commits)", c.n_commits)),
+                text(format!("{puts} PUT (exact, unmetered)")),
+                text(fmt_bytes(c.stored_bytes)),
+                text("—"),
+                text(format!("{}/1M docs", usd(per_million_docs(req)))),
+                metric(req, usd(req), Better::Lower),
+            ]);
+        }
+        (None, None) => io_rows.push(not_metered_row("Ingest (opened pre-built)")),
     }
-
-    if let Some((name, p50_s)) = c
-        .warm
-        .iter()
-        .find(|(n, _)| n == "ten_term_or")
-        .or_else(|| c.warm.first())
-    {
-        let vcpu_s = inst.per_query_vcpu_seconds(*p50_s, c.resident_anon_bytes);
-        let q_usd = vcpu_s * inst.usd_per_sec();
-        meter_rows.push(vec![
-            text(format!("Warm query CPU ({name})")),
-            text(format!(
-                "{} × {}",
-                fmt_wall_seconds(*p50_s),
-                fmt_vcpu_seconds(vcpu_s),
-            )),
-            text(format!("@ ${:.4}/hr → {}", inst.usd_per_hour, usd(q_usd))),
-            context(q_usd, usd(q_usd), Better::Lower),
-        ]);
+    let one_time_row =
+        |rows: &mut Vec<Vec<Cell>>, label: &str, io: Option<ObjectStoreMeter>, per_unit: &str| {
+            match io {
+                Some(io) => {
+                    let per_unit = if per_unit.is_empty() {
+                        format!("{}/1M docs", usd(per_million_docs(request_usd(&io))))
+                    } else {
+                        per_unit.to_string()
+                    };
+                    rows.push(vec![
+                        text(label),
+                        text(fmt_requests(&io)),
+                        text(fmt_uploaded(&io)),
+                        text(fmt_downloaded(&io)),
+                        text(per_unit),
+                        metric(request_usd(&io), usd(request_usd(&io)), Better::Lower),
+                    ]);
+                }
+                None if c.vector_cell => rows.push(not_metered_row(label)),
+                None => {}
+            }
+        };
+    let per_query_row =
+        |rows: &mut Vec<Vec<Cell>>, label: &str, io: Option<ObjectStoreMeter>| match io {
+            Some(io) => {
+                let per_million = request_usd(&io) * PER_MILLION;
+                rows.push(vec![
+                    text(label),
+                    text(fmt_requests(&io)),
+                    text(fmt_uploaded(&io)),
+                    text(fmt_downloaded(&io)),
+                    metric(
+                        io.get_count as f64,
+                        format!("{}/query", io.get_count),
+                        Better::Lower,
+                    ),
+                    metric(
+                        per_million,
+                        format!("{}/1M queries", usd(per_million)),
+                        Better::Lower,
+                    ),
+                ]);
+            }
+            None if c.vector_cell => rows.push(not_metered_row(label)),
+            None => {}
+        };
+    one_time_row(&mut io_rows, "Drain", c.store.drain, "");
+    one_time_row(&mut io_rows, "Delta commit", c.store.delta_commit, "");
+    one_time_row(&mut io_rows, "Optimize", c.store.compaction, "");
+    // Averaged multi-query windows on the shared cache-hot consumer: the
+    // same consumer the warm latency battery timed, so the ledger's warm
+    // I/O and the compute ledger's warm CPU describe one path.
+    let averaged_row =
+        |rows: &mut Vec<Vec<Cell>>, label: &str, io: Option<ObjectStoreMeter>, iters: u64| match io
+        {
+            Some(io) => {
+                let iters = iters.max(1);
+                let per_query_get = io.get_count as f64 / iters as f64;
+                let per_query_usd = request_usd(&io) / iters as f64;
+                let per_million = per_query_usd * PER_MILLION;
+                // Enough decimals that e.g. 1 GET / 20 queries reads 0.05,
+                // not a doubled-looking "0.1".
+                let get_cell = if per_query_get > 0.0 && per_query_get < 0.1 {
+                    format!("{per_query_get:.2}/query")
+                } else {
+                    format!("{per_query_get:.1}/query")
+                };
+                rows.push(vec![
+                    text(label),
+                    text(format!("{} / {iters}q", fmt_requests(&io))),
+                    text(fmt_uploaded(&io)),
+                    text(fmt_downloaded(&io)),
+                    metric(per_query_get, get_cell, Better::Lower),
+                    metric(
+                        per_million,
+                        format!("{}/1M queries", usd(per_million)),
+                        Better::Lower,
+                    ),
+                ]);
+            }
+            None if c.vector_cell => rows.push(not_metered_row(label)),
+            None => {}
+        };
+    if query_states.is_empty() {
+        if c.vector_cell {
+            one_time_row(
+                &mut io_rows,
+                "Cold table open (pre-drain)",
+                c.store.cold_open_pre,
+                "1/open",
+            );
+            per_query_row(
+                &mut io_rows,
+                "Cold query (pre-drain, transient)",
+                c.store.cold_query_pre,
+            );
+        }
+        one_time_row(&mut io_rows, "Cold table open", c.store.cold_open, "1/open");
+        per_query_row(
+            &mut io_rows,
+            "Cold query (first on cold cache)",
+            c.store.cold_query,
+        );
+        let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
+            (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
+            (Some(q), None) => Some(q.background_fill_meter()),
+            (None, Some(r)) => Some(r.background_fill_meter()),
+            (None, None) => None,
+        };
+        per_query_row(&mut io_rows, "Cache fill (during cold query)", fill);
+        per_query_row(
+            &mut io_rows,
+            "Repeat query on cold consumer",
+            c.store.cold_repeat_query,
+        );
+        averaged_row(
+            &mut io_rows,
+            "Warm query (shared consumer, cache hot)",
+            c.store.warm_query,
+            c.store.warm_query_iters,
+        );
+    } else {
+        for state in &query_states {
+            let label = state.io.label.expect("filtered query state has a label");
+            one_time_row(
+                &mut io_rows,
+                &format!("Open — {label}"),
+                state.io.cold_open,
+                "1/open",
+            );
+            per_query_row(
+                &mut io_rows,
+                &format!("Cold — {label}"),
+                state.io.cold_query,
+            );
+            // Background lazy→mmap fill concurrent with the cold/repeat
+            // windows — counted separately so query GETs stay foreground-only.
+            let fill = match (state.io.cold_query, state.io.cold_repeat) {
+                (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
+                (Some(q), None) => Some(q.background_fill_meter()),
+                (None, Some(r)) => Some(r.background_fill_meter()),
+                (None, None) => None,
+            };
+            per_query_row(&mut io_rows, &format!("Fill — {label}"), fill);
+            per_query_row(
+                &mut io_rows,
+                &format!("Repeat — {label}"),
+                state.io.cold_repeat,
+            );
+            averaged_row(
+                &mut io_rows,
+                &format!("Warm — {label}"),
+                state.io.warm,
+                state.io.warm_iters,
+            );
+        }
     }
-
-    let resource_meter = Block {
-        subtitle: format!(
-            "Resource meter — quantities behind the dollars ({}, retention {:.0} mo assumed for storage)",
-            inst.name, retention_months,
-        ),
+    averaged_row(
+        &mut io_rows,
+        "Filtered warm (~10%)",
+        c.store.filtered_query,
+        c.store.filtered_query_iters,
+    );
+    let io_ledger = (!io_rows.is_empty()).then(|| Block {
+        subtitle: "Object-store I/O — measured requests and transfer bytes.".into(),
         headers: vec![
-            "Resource".into(),
-            "Quantity".into(),
-            "Rate".into(),
+            "Phase".into(),
+            "Requests".into(),
+            "Uploaded".into(),
+            "Downloaded".into(),
+            "Per-unit".into(),
             "Cost".into(),
         ],
-        rows: meter_rows,
-    };
+        rows: io_rows,
+    });
 
-    let ingest_storage = Block {
-        subtitle: format!(
-            "Ingest & storage — priced on {} ({} vCPU / {:.0} GiB / {:.0} GB NVMe @ ${:.4}/hr)",
-            inst.name, inst.vcpu, inst.ram_gib, inst.nvme_gb, inst.usd_per_hour,
-        ),
-        headers: vec!["Component".into(), "Cost".into(), "Per-unit".into()],
-        rows: vec![
+    // ---- Block 3: compute ledger ----
+    // One-time-phase row from MEASURED on-CPU seconds. `None` cpu ⇒ NOT
+    // METERED (the phase ran but schedstat was unavailable) — never a
+    // wall-clock substitute. Shared by ingest / drain / compaction so the
+    // Some/None handling and cell layout live in one place.
+    let phase_row =
+        |label: String, wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> Vec<Cell> {
+            let Some(cpu) = cpu_s else {
+                return vec![
+                    text(label),
+                    text(fmt_wall_seconds(wall_s)),
+                    text("N/A"),
+                    text("N/A"),
+                    text("N/A"),
+                    text("N/A"),
+                ];
+            };
+            let ram = inst.ram_leg(wall_s, peak_rss);
+            let vcpu = inst.phase_vcpu_seconds(cpu, wall_s, peak_rss);
+            let usd_v = inst.compute_usd(vcpu);
+            let binding = if ram > cpu { "RAM" } else { "CPU" };
             vec![
-                text(format!(
-                    "Ingest compute ({}w × {:.1}s)",
-                    c.writers, c.ingest_wall_s
-                )),
-                context(compute, usd(compute), Better::Lower),
-                text(format!("{}/1M docs", usd(per_million))),
+                text(label),
+                text(fmt_wall_seconds(wall_s)),
+                text(fmt_vcpu_seconds(cpu)),
+                text(peak_rss.map(fmt_bytes).unwrap_or_else(|| "N/A".into())),
+                text(binding),
+                metric(usd_v, usd(usd_v), Better::Lower),
+            ]
+        };
+    let mut compute_rows = vec![phase_row(
+        "Ingest".into(),
+        c.ingest_wall_s,
+        c.ingest_peak_rss_bytes,
+        c.ingest_cpu_s,
+    )];
+    if c.store.drain_wall_s.is_some() {
+        compute_rows.push(phase_row(
+            "Drain".to_string(),
+            drain_wall_s,
+            c.store.drain_peak_rss_bytes,
+            c.store.drain_cpu_s,
+        ));
+    } else if c.vector_cell {
+        compute_rows.push(phase_row("Drain".to_string(), 0.0, None, None));
+    }
+    if c.store.delta_commit_wall_s.is_some() {
+        compute_rows.push(phase_row(
+            "Delta commit".to_string(),
+            delta_wall_s,
+            c.store.delta_commit_peak_rss_bytes,
+            c.store.delta_commit_cpu_s,
+        ));
+    }
+    if c.store.compaction_wall_s.is_some() {
+        compute_rows.push(phase_row(
+            "Optimize".to_string(),
+            compaction_wall_s,
+            c.store.compaction_peak_rss_bytes,
+            c.store.compaction_cpu_s,
+        ));
+    } else if c.vector_cell {
+        compute_rows.push(phase_row("Optimize".to_string(), 0.0, None, None));
+    }
+    if query_states.is_empty()
+        && let Some(q) = anchor_cold
+    {
+        let open_label = format!("Open — {}", q.name);
+        // Table open is compute-bound (manifest parse + reader CRC: measured
+        // cpu ≈ wall), so it's priced from its MEASURED on-CPU seconds. NOT
+        // METERED (never latency × share) when unsampled.
+        compute_rows.push(match q.open_cpu_s {
+            Some(cpu) => {
+                let open_usd = inst.compute_usd(cpu);
+                vec![
+                    text(open_label),
+                    text(fmt_wall_seconds(q.open_s)),
+                    text(fmt_vcpu_seconds(cpu)),
+                    text(fmt_bytes(c.resident_anon_bytes)),
+                    text("CPU"),
+                    metric(open_usd, usd(open_usd), Better::Lower),
+                ]
+            }
+            None => vec![
+                text(open_label),
+                text(fmt_wall_seconds(q.open_s)),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
             ],
-            vec![
-                text(format!("Ingest requests (~{} PUT)", c.put_count)),
-                context(requests, usd(requests), Better::Lower),
-                text(String::new()),
+        });
+        // Cold search CPU: MEASURED on-CPU during the search window (decompress,
+        // decode, scoring — not copied from warm), with the RAM leg over the
+        // warm-scale compute window. NOT METERED when unsampled.
+        compute_rows.push(match q.search_cpu_s {
+            Some(cpu) => {
+                let window = warm_window_for(&q.name).unwrap_or(0.0);
+                let ram = inst.query_ram_leg(window, c.resident_anon_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(cpu, window, c.resident_anon_bytes);
+                let per_q = inst.compute_usd(vcpu);
+                let binding = if ram > cpu { "RAM" } else { "CPU" };
+                vec![
+                    text(format!("Cold — {}", q.name)),
+                    text(fmt_time(q.search_s * 1e9)),
+                    text(fmt_vcpu_seconds(cpu)),
+                    text(fmt_bytes(c.resident_anon_bytes)),
+                    text(binding),
+                    metric(
+                        per_q * PER_MILLION,
+                        usd_per_query_both_scales(per_q),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            None => vec![
+                text(format!("Cold — {}", q.name)),
+                text(fmt_time(q.search_s * 1e9)),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
             ],
-            vec![
-                text(format!(
-                    "Stored capacity ({})",
-                    crate::rss::fmt_bytes(c.stored_bytes)
-                )),
-                context(
-                    storage_month,
-                    format!("{}/mo", usd(storage_month)),
-                    Better::Lower,
+        });
+    }
+    if query_states.is_empty()
+        && let Some((name, p50_s, cpu_s)) = c
+            .warm
+            .iter()
+            .find(|(n, _, _)| n == "ten_term_or")
+            .or_else(|| c.warm.first())
+    {
+        // Warm query priced from MEASURED on-CPU seconds (per-vCPU) with the
+        // RAM leg over its own p50 window. NOT METERED when unsampled.
+        compute_rows.push(match cpu_s {
+            Some(cpu) => {
+                let ram = inst.query_ram_leg(*p50_s, c.resident_anon_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(*cpu, *p50_s, c.resident_anon_bytes);
+                let per_q = inst.compute_usd(vcpu);
+                let binding = if ram > *cpu { "RAM" } else { "CPU" };
+                vec![
+                    text(format!("Warm — {name}")),
+                    text(fmt_time(*p50_s * 1e9)),
+                    text(fmt_vcpu_seconds(*cpu)),
+                    text(fmt_bytes(c.resident_anon_bytes)),
+                    text(binding),
+                    metric(
+                        per_q * PER_MILLION,
+                        usd_per_query_both_scales(per_q),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            None => vec![
+                text(format!("Warm — {name}")),
+                text(fmt_time(*p50_s * 1e9)),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+            ],
+        });
+    }
+    for state in &query_states {
+        let label = state.io.label.expect("filtered query state has a label");
+        compute_rows.push(match (state.cold_open_s, state.cold_open_cpu_s) {
+            (Some(wall_s), Some(cpu_s)) => {
+                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram = inst.ram_leg(wall_s, Some(ram_bytes));
+                let billed = cpu_s.max(ram);
+                let usd_v = inst.compute_usd(billed);
+                vec![
+                    text(format!("Open — {label}")),
+                    text(fmt_wall_seconds(wall_s)),
+                    text(fmt_vcpu_seconds(cpu_s)),
+                    text(fmt_bytes(ram_bytes)),
+                    text(if ram > cpu_s { "RAM" } else { "CPU" }),
+                    metric(usd_v, usd(usd_v), Better::Lower),
+                ]
+            }
+            _ => vec![
+                text(format!("Open — {label}")),
+                text(
+                    state
+                        .cold_open_s
+                        .map(fmt_wall_seconds)
+                        .unwrap_or_else(|| "N/A".into()),
                 ),
-                text(format!(
-                    "{}/1M docs·mo",
-                    usd(storage_per_million_docs_month)
-                )),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
             ],
+        });
+        compute_rows.push(match (state.cold_query_s, state.cold_query_cpu_s) {
+            (Some(wall_s), Some(cpu_s)) => {
+                let warm_window = state.warm_p50_s.unwrap_or(0.0);
+                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram = inst.query_ram_leg(warm_window, ram_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes);
+                let per_q = inst.compute_usd(vcpu);
+                vec![
+                    text(format!("Cold — {label}")),
+                    text(fmt_time(wall_s * 1e9)),
+                    text(fmt_vcpu_seconds(cpu_s)),
+                    text(fmt_bytes(ram_bytes)),
+                    text(if ram > cpu_s { "RAM" } else { "CPU" }),
+                    metric(
+                        per_q * PER_MILLION,
+                        usd_per_query_both_scales(per_q),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            _ => vec![
+                text(format!("Cold — {label}")),
+                text(
+                    state
+                        .cold_query_s
+                        .map(|seconds| fmt_time(seconds * 1e9))
+                        .unwrap_or_else(|| "N/A".into()),
+                ),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+            ],
+        });
+        compute_rows.push(match (state.warm_p50_s, state.warm_cpu_s) {
+            (Some(p50_s), Some(cpu_s)) => {
+                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram = inst.query_ram_leg(p50_s, ram_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(cpu_s, p50_s, ram_bytes);
+                let per_q = inst.compute_usd(vcpu);
+                vec![
+                    text(format!("Warm — {label}")),
+                    text(fmt_time(p50_s * 1e9)),
+                    text(fmt_vcpu_seconds(cpu_s)),
+                    text(fmt_bytes(ram_bytes)),
+                    text(if ram > cpu_s { "RAM" } else { "CPU" }),
+                    metric(
+                        per_q * PER_MILLION,
+                        usd_per_query_both_scales(per_q),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            _ => vec![
+                text(format!("Warm — {label}")),
+                text(
+                    state
+                        .warm_p50_s
+                        .map(|seconds| fmt_time(seconds * 1e9))
+                        .unwrap_or_else(|| "N/A".into()),
+                ),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+                text("N/A"),
+            ],
+        });
+    }
+    let compute_ledger = Block {
+        subtitle: "Compute — actual CPU time and resident RAM; binding determines cost.".into(),
+        headers: vec![
+            "Phase".into(),
+            "Wall / p50".into(),
+            "CPU (s)".into(),
+            "RAM".into(),
+            "Binding".into(),
+            "Cost".into(),
         ],
+        rows: compute_rows,
     };
 
-    let binding = if inst.ram_binds(c.resident_anon_bytes) {
-        "DRAM"
-    } else {
-        "CPU"
-    };
-    let serving_rows: Vec<Vec<_>> = c
-        .warm
-        .iter()
-        .map(|(name, p50_s)| {
-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
-            let per_q_usd = per_q.max(f64::MIN_POSITIVE);
-            let queries_per_usd = 1.0 / per_q_usd;
-            let per_million_q = per_q * 1.0e6;
-            vec![
-                text(name.clone()),
-                text(crate::markdown::fmt_time(p50_s * 1.0e9)),
-                context(
+    // ---- Block 4: serving ----
+    let mut serving_rows: Vec<Vec<Cell>> = Vec::new();
+    // Steady-state per-query dollars for the monthly summary: the LAST
+    // populated query state (post-compact when the lifecycle ran) is the
+    // shape a long-lived table serves.
+    let mut steady_warm: Option<(String, f64)> = None;
+    let mut steady_cold: Option<(String, f64)> = None;
+    if query_states.is_empty() {
+        serving_rows.extend(c.warm.iter().filter_map(|(name, p50_s, cpu_s)| {
+            let cpu = (*cpu_s)?;
+            let per_q = inst.per_query_usd(cpu, *p50_s, c.resident_anon_bytes);
+            let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+            Some(vec![
+                text(format!("{name} — warm")),
+                text(fmt_time(p50_s * 1e9)),
+                metric(
                     queries_per_usd,
-                    format!("{:.0}", queries_per_usd),
+                    format!("{queries_per_usd:.0}"),
                     Better::Higher,
                 ),
-                text(usd(per_million_q)),
-            ]
-        })
-        .collect();
-
+                latency_per_usd_cell(per_q, *p50_s),
+                text(usd(per_q * PER_MILLION)),
+            ])
+        }));
+        if let Some((name, p50_s, Some(cpu))) = c
+            .warm
+            .iter()
+            .find(|(n, _, _)| n == "ten_term_or")
+            .or_else(|| c.warm.first())
+        {
+            let per_q = inst.per_query_usd(*cpu, *p50_s, c.resident_anon_bytes);
+            steady_warm = Some((format!("warm ({name})"), per_q));
+        }
+        if let (Some(q), Some(per_q)) = (anchor_cold, cold_query_usd) {
+            let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+            serving_rows.push(vec![
+                text(format!("{} — cold", q.name)),
+                text(fmt_time(q.search_s * 1e9)),
+                metric(
+                    queries_per_usd,
+                    format!("{queries_per_usd:.0}"),
+                    Better::Higher,
+                ),
+                latency_per_usd_cell(per_q, q.search_s),
+                text(usd(per_q * PER_MILLION)),
+            ]);
+            steady_cold = Some((format!("cold ({})", q.name), per_q));
+        }
+    } else {
+        for state in &query_states {
+            let label = state.io.label.expect("filtered query state has a label");
+            if let (Some(p50_s), Some(cpu_s)) = (state.warm_p50_s, state.warm_cpu_s) {
+                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let per_q = inst.per_query_usd(cpu_s, p50_s, ram_bytes);
+                let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+                serving_rows.push(vec![
+                    text(format!("warm — {label}")),
+                    text(fmt_time(p50_s * 1e9)),
+                    metric(
+                        queries_per_usd,
+                        format!("{queries_per_usd:.0}"),
+                        Better::Higher,
+                    ),
+                    latency_per_usd_cell(per_q, p50_s),
+                    text(usd(per_q * PER_MILLION)),
+                ]);
+                steady_warm = Some((format!("warm — {label}"), per_q));
+            }
+            if let (Some(wall_s), Some(cpu_s), Some(io)) = (
+                state.cold_query_s,
+                state.cold_query_cpu_s,
+                state.io.cold_query,
+            ) {
+                let warm_window = state.warm_p50_s.unwrap_or(0.0);
+                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let per_q = inst.per_query_usd(cpu_s, warm_window, ram_bytes) + request_usd(&io);
+                let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+                serving_rows.push(vec![
+                    text(format!("cold — {label} ({} GET)", io.get_count)),
+                    text(fmt_time(wall_s * 1e9)),
+                    metric(
+                        queries_per_usd,
+                        format!("{queries_per_usd:.0}"),
+                        Better::Higher,
+                    ),
+                    latency_per_usd_cell(per_q, wall_s),
+                    text(usd(per_q * PER_MILLION)),
+                ]);
+                steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+            }
+        }
+    }
     let serving = Block {
-        subtitle: format!(
-            "Serving — latency per dollar (binding: {binding}; resident heap {}, file-backed cache free on NVMe)",
-            crate::rss::fmt_bytes(c.resident_anon_bytes),
-        ),
+        subtitle: "Serving — query latency and cost by lifecycle state; s/$ is \
+                   latency per dollar (p50 seconds ÷ $/query)."
+            .into(),
         headers: vec![
             "Query".into(),
             "p50".into(),
             "queries/$".into(),
+            "s/$".into(),
             "$/1M queries".into(),
         ],
         rows: serving_rows,
     };
 
+    // ---- Block 5: monthly cost summary ----
+    // The standing bill for one table at an assumed steady load: capacity,
+    // reads, writes, and the RAM residency an open table pins. Reads/writes
+    // price the measured steady-state per-unit costs at 1M units/month;
+    // residency prices the resident set's share of the instance for a full
+    // month. All inputs are measured — a line without a measurement is
+    // omitted, never guessed.
+    let steady_ram_bytes = query_states
+        .last()
+        .and_then(|state| state.ram_bytes)
+        .unwrap_or(c.resident_anon_bytes);
+    let residency_month = inst.ram_share(steady_ram_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
+        text("Storage"),
+        text(format!(
+            "{} stored for {} docs, {retention_months:.0} mo retention",
+            fmt_bytes(c.stored_bytes),
+            fmt_count(c.n_docs),
+        )),
+        metric(storage_month, usd(storage_month), Better::Lower),
+    ]];
+    // Warm and cold read lines are rate references (empty $/month); the
+    // blended line — most queries warm, a small tail paying the cold fetch —
+    // is the billed monthly read cost.
+    let blended_read_q = match (&steady_warm, &steady_cold) {
+        (Some((_, warm_q)), Some((_, cold_q))) => {
+            Some(warm_q * SUMMARY_READ_WARM_FRACTION + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION))
+        }
+        (Some((_, warm_q)), None) => Some(*warm_q),
+        _ => None,
+    };
+    if let Some((label, per_q)) = &steady_warm {
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {label}",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
+            )),
+            text(usd_per_million(*per_q)),
+            text(""),
+        ]);
+    }
+    if let Some((label, per_q)) = &steady_cold {
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {label}",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
+            )),
+            text(usd_per_million(*per_q)),
+            text(""),
+        ]);
+    }
+    if steady_warm.is_some()
+        && steady_cold.is_some()
+        && let Some(blended_q) = blended_read_q
+    {
+        let month = blended_q * SUMMARY_QUERIES_PER_MONTH;
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {:.0}% warm / {:.0}% cold blend",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+                SUMMARY_READ_WARM_FRACTION * 100.0,
+                (1.0 - SUMMARY_READ_WARM_FRACTION) * 100.0,
+            )),
+            text(usd_per_million(blended_q)),
+            metric(month, usd(month), Better::Lower),
+        ]);
+    }
+    // Writes priced at the corpus scale the bench actually measured — the
+    // whole table written once per month — covering COMMITS only (ingest +
+    // the delta commit). Drain and compaction move to the maintenance lines
+    // below so the total never double-counts them.
+    let writes_month = ingest_compute.unwrap_or(0.0)
+        + ingest_req_usd
+        + delta_compute.unwrap_or(0.0)
+        + delta_req_usd;
+    summary_rows.push(vec![
+        text(format!(
+            "Writes — {} docs/mo (commits)",
+            fmt_count(c.n_docs)
+        )),
+        text(format!("{}/1M docs", usd(per_million_docs(writes_month)))),
+        metric(writes_month, usd(writes_month), Better::Lower),
+    ]);
+    // Maintenance: per-event rates for open / drain / compaction, then one
+    // billed line at the stated cadence — a drain pass every
+    // `SUMMARY_COMMITS_PER_DRAIN` commits, a compaction pass every
+    // `SUMMARY_DRAINS_PER_COMPACTION` drains, one table open per pass.
+    let drain_pass_usd = has_drain.then(|| drain_compute.unwrap_or(0.0) + drain_req_usd);
+    let compact_pass_usd =
+        has_compaction.then(|| compaction_compute.unwrap_or(0.0) + compaction_req_usd);
+    let steady_open_usd = query_states
+        .last()
+        .map(|state| {
+            let compute = match (state.cold_open_s, state.cold_open_cpu_s) {
+                (Some(wall_s), Some(cpu_s)) => {
+                    let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                    inst.compute_usd(cpu_s.max(inst.ram_leg(wall_s, Some(ram_bytes))))
+                }
+                _ => 0.0,
+            };
+            let req = state.io.cold_open.map(|io| request_usd(&io)).unwrap_or(0.0);
+            compute + req
+        })
+        .or_else(|| {
+            anchor_cold.map(|q| {
+                q.open_cpu_s.map(|cpu| inst.compute_usd(cpu)).unwrap_or(0.0)
+                    + c.store.cold_open.map(|io| request_usd(&io)).unwrap_or(0.0)
+            })
+        });
+    if let Some(open) = steady_open_usd {
+        summary_rows.push(vec![
+            text("Open — cold table open"),
+            text(format!("{}/open", usd(open))),
+            text(""),
+        ]);
+    }
+    if let Some(drain) = drain_pass_usd {
+        summary_rows.push(vec![
+            text(format!(
+                "Drain — one pass over {} commits",
+                fmt_events(SUMMARY_COMMITS_PER_DRAIN)
+            )),
+            text(format!("{}/pass", usd(drain))),
+            text(""),
+        ]);
+    }
+    if let Some(compact) = compact_pass_usd {
+        summary_rows.push(vec![
+            text("Compaction — one optimize pass"),
+            text(format!("{}/pass", usd(compact))),
+            text(""),
+        ]);
+    }
+    let maintenance_month = drain_pass_usd.map(|drain| {
+        let drains_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_DRAIN;
+        let compacts_mo = drains_mo / SUMMARY_DRAINS_PER_COMPACTION;
+        let opens_mo = drains_mo + compacts_mo;
+        let month = drains_mo * drain
+            + compacts_mo * compact_pass_usd.unwrap_or(0.0)
+            + opens_mo * steady_open_usd.unwrap_or(0.0);
+        summary_rows.push(vec![
+            text(format!(
+                "Maintenance — drain / {} commits, compaction / {} drains",
+                fmt_events(SUMMARY_COMMITS_PER_DRAIN),
+                fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
+            )),
+            text(format!(
+                "{} drains + {} compactions + {} opens/mo",
+                fmt_events(drains_mo),
+                fmt_events(compacts_mo),
+                fmt_events(opens_mo),
+            )),
+            metric(month, usd(month), Better::Lower),
+        ]);
+        month
+    });
+    summary_rows.push(vec![
+        text("Open table — RAM residency"),
+        text(format!(
+            "{} resident ({:.0}% of {})",
+            fmt_bytes(steady_ram_bytes),
+            inst.ram_share(steady_ram_bytes) * 100.0,
+            inst.name,
+        )),
+        metric(residency_month, usd(residency_month), Better::Lower),
+    ]);
+    let monthly_total = storage_month
+        + blended_read_q
+            .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
+            .unwrap_or(0.0)
+        + writes_month
+        + maintenance_month.unwrap_or(0.0)
+        + residency_month;
+    summary_rows.push(vec![
+        text("Total (storage + blended reads + writes + maintenance + residency)"),
+        text("—"),
+        metric(monthly_total, usd(monthly_total), Better::Lower),
+    ]);
+    let monthly_summary = Block {
+        subtitle: format!(
+            "Monthly cost summary — one open table, {} queries served + {} docs \
+             written per month, steady state.",
+            fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+            fmt_count(c.n_docs),
+        ),
+        headers: vec!["Line".into(), "Basis".into(), "$/month".into()],
+        rows: summary_rows,
+    };
+
+    let mut blocks = vec![rate_card];
+    if let Some(io_ledger) = io_ledger {
+        blocks.push(io_ledger);
+    }
+    blocks.push(compute_ledger);
+    blocks.push(serving);
+    blocks.push(monthly_summary);
+
     report.emit(&Section {
         anchor: anchor.into(),
         title,
-        note: "Cost model on measured bench rows. The **Resource meter** lists vCPU·seconds, \
-               PUT counts, stored GB·months, and wall times. Cold S3 HEAD/GET counts and \
-               dollars appear only when a metered cold iteration ran (`cold_store` set). \
-               For a supertable the cold `open` is the one-time table open (manifest + \
-               consumer), amortized across queries — it is a separate line, not per-query \
-               latency. Warm vs cold latency is in the search table. Δ is vs the previous run."
-            .into(),
-        blocks: vec![rate_card, resource_meter, ingest_storage, serving],
+        note:
+            "Measured values only; N/A means the phase was not sampled. Δ is vs the previous run."
+                .into(),
+        blocks,
     });
 }
 
-/// Approximate object-store PUT count for one supertable ingest: one PUT
-/// per committed superfile plus one manifest PUT per commit.
-pub fn supertable_ingest_puts(n_superfiles: usize) -> u64 {
-    n_superfiles as u64 + crate::ingest::supertable::n_commits() as u64
-}
-
-/// Flatten cold FTS timings into cost rows.
-pub fn cold_from_fts(
-    cold: &std::collections::HashMap<&'static str, crate::executors::ColdTiming>,
-) -> Vec<ColdQuery> {
+/// Flatten cold `(open, search)` timings keyed by query name into cost
+/// rows. Shared by the FTS and SQL runners (both measure per-query
+/// `ColdTiming` maps).
+pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQuery> {
     cold.iter()
         .map(|(name, t)| ColdQuery {
             name: (*name).to_string(),
             open_s: t.open.as_secs_f64(),
             search_s: t.search.as_secs_f64(),
+            open_cpu_s: t.open_cpu_s,
+            search_cpu_s: t.search_cpu_s,
         })
         .collect()
 }
 
-/// Flatten warm FTS stats into `(name, min_seconds)` for the cost model.
-pub fn warm_from_fts(stats: &[crate::executors::fts::FtsQueryStat]) -> Vec<(String, f64)> {
+/// Flatten warm FTS stats into `(name, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_fts(stats: &[FtsQueryStat]) -> Vec<WarmQueryCost> {
     stats
         .iter()
-        .map(|s| (s.name.to_string(), s.warm.min.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.warm.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
-/// Flatten warm SQL query sets into `(name, min_seconds)`.
-pub fn warm_from_sql(sets: &crate::executors::sql::QuerySets) -> Vec<(String, f64)> {
+/// Flatten warm SQL query sets into `(name, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_sql(sets: &QuerySets) -> Vec<WarmQueryCost> {
     sets.scalar
         .iter()
         .chain(&sets.tvf)
         .chain(&sets.fts_pushdown)
         .chain(&sets.agg_idx)
-        .map(|s| (s.name.to_string(), s.warm.min.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.warm.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
-/// Flatten warm vector recall rows into `(label, min_seconds)`.
-pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(String, f64)> {
+/// Flatten warm vector recall rows into `(label, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<WarmQueryCost> {
     rows.iter()
         .filter_map(|r| {
             r.warm.as_ref().map(|w| {
@@ -640,7 +1593,29 @@ pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(St
                 } else {
                     format!("{} ({})", r.target, r.params)
                 };
-                (label, w.warm.min.as_secs_f64())
+                (label, w.warm.p50.as_secs_f64(), w.cpu_s)
+            })
+        })
+        .collect()
+}
+
+/// Flatten cold vector recall rows into `(label, open, search)` for the cost model.
+pub fn cold_from_vector(rows: &[RecallRow]) -> Vec<ColdQuery> {
+    rows.iter()
+        .filter_map(|r| {
+            r.cold.map(|t| {
+                let label = if r.params.is_empty() || r.params == "—" {
+                    r.target.clone()
+                } else {
+                    format!("{} ({})", r.target, r.params)
+                };
+                ColdQuery {
+                    name: label,
+                    open_s: t.open.as_secs_f64(),
+                    search_s: t.search.as_secs_f64(),
+                    open_cpu_s: t.open_cpu_s,
+                    search_cpu_s: t.search_cpu_s,
+                }
             })
         })
         .collect()
@@ -661,26 +1636,99 @@ mod tests {
     }
 
     #[test]
-    fn parallel_ingest_costs_more_per_second_than_single_writer() {
+    fn phase_bills_measured_cpu_when_it_exceeds_ram() {
         let inst = test_instance();
-        let single = inst.ingest_compute_usd(10.0, 1);
-        let full = inst.ingest_compute_usd(10.0, 8);
-        assert!((full / single - 8.0).abs() < 1e-9);
+        // Measured on-CPU is billed verbatim (I/O wait already excluded) when
+        // it exceeds the RAM-hold leg — no wall-clock substitution.
+        assert!((inst.phase_vcpu_seconds(5.0, 10.0, None) - 5.0).abs() < 1e-9);
     }
 
     #[test]
-    fn lower_latency_yields_more_queries_per_dollar() {
+    fn ram_bound_phase_bills_rss_share_for_full_wall() {
         let inst = test_instance();
-        let fast = inst.per_query_usd(0.001, 1 << 20);
-        let slow = inst.per_query_usd(0.010, 1 << 20);
-        assert!(slow > fast);
-        assert!((slow / fast - 10.0).abs() < 1e-6);
+        // 8 GiB peak on 16 GiB = 50% RAM share over a 10s wall on an 8-vCPU
+        // box = 0.5 × 10 × 8 = 40 aggregate vCPU·s of RAM hold; a smaller
+        // measured CPU is dominated by it → phase is RAM-bound.
+        let eight_gib = 8u64 << 30;
+        assert!((inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)) - 40.0).abs() < 1e-9);
+        // Measured CPU above the RAM leg binds on CPU and is billed as-is.
+        assert!((inst.phase_vcpu_seconds(41.0, 10.0, Some(eight_gib)) - 41.0).abs() < 1e-9);
+        // A RAM-bound phase still bills exactly RSS-share × wall in dollars —
+        // compute_usd divides the vcpu back out: 40 vCPU·s ⇒ 0.5 × 10 × $/s.
+        let ram_bound_usd = inst.compute_usd(inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)));
+        assert!((ram_bound_usd - 0.5 * 10.0 * inst.usd_per_sec()).abs() < 1e-12);
     }
 
     #[test]
-    fn ram_binds_only_when_heap_exceeds_per_core_budget() {
+    fn query_cpu_priced_per_vcpu_from_measured_seconds() {
         let inst = test_instance();
-        assert!(!inst.ram_binds(1 << 30));
-        assert!(inst.ram_binds(3 * (1 << 30)));
+        // Tiny resident heap ⇒ RAM leg negligible ⇒ measured compute binds. A
+        // query measured at 10× the on-CPU seconds costs 10× more, and it's
+        // priced at the PER-VCPU rate (whole-instance rate ÷ vcpu), never the
+        // whole-instance rate — the bug that inflated cold queries.
+        let small = 1u64 << 20;
+        let cheap = inst.per_query_usd(0.001, 0.001, small);
+        let dear = inst.per_query_usd(0.010, 0.001, small);
+        assert!(dear > cheap);
+        assert!((dear / cheap - 10.0).abs() < 1e-6);
+        assert!((dear - 0.010 * inst.usd_per_sec() / 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fmt_vcpu_seconds_reconciles_with_per_vcpu_rate() {
+        // 0.00542 vCPU·s must not display as "0.00" — the user audits by
+        // multiplying vCPU·s × rate and comparing to the $ column.
+        assert_eq!(fmt_vcpu_seconds(0.00542), "0.0054");
+        assert_eq!(fmt_vcpu_seconds(0.000678), "0.00068");
+        assert_eq!(fmt_vcpu_seconds(0.05), "0.05");
+    }
+
+    #[test]
+    fn cold_search_cpu_priced_from_measured_not_warm() {
+        let inst = test_instance();
+        // 0.05 vCPU·s measured cold search @ per-vCPU rate — NOT copied from warm.
+        let cold = inst.compute_usd(0.05);
+        assert!(
+            (cold * PER_MILLION - 0.63).abs() < 0.05,
+            "got ${}/1M",
+            cold * PER_MILLION
+        );
+        // Whole-instance rate would 8× overcharge to ~$5/1M — the old bug.
+        assert!(cold * PER_MILLION < 1.0);
+    }
+
+    #[test]
+    fn usd_never_collapses_sub_cent_values_to_zero() {
+        assert_eq!(usd(0.0), "$0");
+        assert_eq!(usd(1.014), "$1.01");
+        assert_eq!(usd(0.02), "$0.02");
+        // Two significant digits below one cent instead of "$0.0000".
+        assert_eq!(usd(2.8e-5), "$0.000028");
+        assert_eq!(usd(7.0e-5), "$0.000070");
+        assert_eq!(usd(0.0028), "$0.0028");
+    }
+
+    #[test]
+    fn per_million_scales_per_query_dollars() {
+        // 175 GET/query at $0.40/1M requests = $70 per 1M queries.
+        let per_query = 175.0 * USD_PER_GET;
+        assert_eq!(usd_per_million(per_query), "$70.00/1M");
+    }
+
+    #[test]
+    fn request_usd_prices_puts_lists_and_reads() {
+        let io = ObjectStoreMeter {
+            head_count: 10,
+            get_count: 90,
+            get_bytes: 0,
+            put_count: 1000,
+            put_bytes: 0,
+            list_count: 50,
+            delete_count: 20,
+            ..Default::default()
+        };
+        // (1000 PUT + 50 LIST) × $5e-6 + 100 reads × $4e-7; DELETE unpriced.
+        let expected = 1050.0 * 5.0e-6 + 100.0 * 4.0e-7;
+        assert!((request_usd(&io) - expected).abs() < 1e-12);
     }
 }

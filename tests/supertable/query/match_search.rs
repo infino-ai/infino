@@ -150,10 +150,21 @@ fn one_hot(active: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Stable per-row identity: the `(superfile, local_doc_id)` pair RRF and
-/// the resolve path both key on.
+/// Per-row identity within one retriever family: the `(superfile,
+/// local_doc_id)` pair. Valid for FTS-vs-FTS comparisons where every hit
+/// addresses a parquet row.
 fn hit_ids(hits: &[SuperfileHit]) -> HashSet<(SuperfileUri, u32)> {
     hits.iter().map(|h| (h.superfile, h.local_doc_id)).collect()
+}
+
+/// Cross-retriever identity: the stable `_id`, the key RRF fuses on. With
+/// boundary replication on by default a vector hit may be a stub row whose
+/// local differs from the BM25 primary for the same document, so raw
+/// `(superfile, local)` pairs are not comparable across retrievers.
+fn stable_ids(hits: &[SuperfileHit]) -> HashSet<i128> {
+    hits.iter()
+        .map(|h| h.stable_id.expect("search hits carry stable _id"))
+        .collect()
 }
 
 #[test]
@@ -267,10 +278,12 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
     );
     assert!(!vector.is_empty(), "vector retriever returned nothing");
 
-    let expected: HashSet<(SuperfileUri, u32)> =
-        hit_ids(&bm25).union(&hit_ids(&vector)).copied().collect();
+    let expected: HashSet<i128> = stable_ids(&bm25)
+        .union(&stable_ids(&vector))
+        .copied()
+        .collect();
     assert_eq!(
-        hit_ids(&hybrid),
+        stable_ids(&hybrid),
         expected,
         "hybrid identity set must equal bm25 ∪ vector at the same k"
     );

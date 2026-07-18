@@ -186,10 +186,15 @@ fn fresh_cache(
 // ============================================================
 
 #[tokio::test]
-async fn hybrid_mode_is_default() {
-    // Just construct via Default and read the mode back.
+async fn lazy_foreground_mode_is_default() {
+    // Just construct via Default and read the mode back. The default
+    // moved from HybridWithPrefetch to LazyForegroundWithBackgroundFill
+    // (the object-storage-native shape config.yaml ships); this pins it.
     let cfg = DiskCacheConfig::default();
-    assert_eq!(cfg.cold_fetch_mode, ColdFetchMode::HybridWithPrefetch);
+    assert_eq!(
+        cfg.cold_fetch_mode,
+        ColdFetchMode::LazyForegroundWithBackgroundFill
+    );
 }
 
 #[tokio::test]

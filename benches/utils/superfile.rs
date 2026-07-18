@@ -59,7 +59,7 @@ fn emit_cost_warm(
     stored_bytes: u64,
     corpus_bytes: u64,
     n_docs: usize,
-    warm: &[(String, f64)],
+    warm: &[cost::WarmQueryCost],
 ) {
     if warm.is_empty() {
         return;
@@ -72,14 +72,21 @@ fn emit_cost_warm(
         &cost::CellCost {
             ingest_wall_s,
             writers,
-            put_count: 1,
+            ingest_peak_rss_bytes: None,
+            ingest_cpu_s: None,
+            // A single-superfile commit is exactly one `put_atomic`.
+            n_commits: 1,
+            unmetered_put_count: Some(1),
             stored_bytes,
             corpus_bytes,
             n_docs,
             resident_anon_bytes: resident,
             warm,
             cold: None,
-            cold_store: None,
+            warm_pre: None,
+            cold_pre: None,
+            store: cost::StorePhases::default(),
+            vector_cell: false,
             storage_months: None,
             cold_open_amortized: false,
         },
@@ -912,7 +919,7 @@ pub mod vector {
     };
 
     use bytes::Bytes;
-    use infino::roaring::RoaringBitmap;
+    use infino::{roaring::RoaringBitmap, superfile::reader::VectorSearchOptions};
 
     use crate::{
         corpus::{self, DIM},
@@ -938,8 +945,8 @@ pub mod vector {
 
     /// Default options for the user-facing "what does it cost in
     /// production?" baseline reported in the search markdown.
-    const UNFILTERED_DEFAULT_NPROBE: usize = 6;
-    const UNFILTERED_DEFAULT_RERANK_MULT: usize = 256;
+    const UNFILTERED_DEFAULT_NPROBE: usize = VectorSearchOptions::DEFAULT_NPROBE;
+    const UNFILTERED_DEFAULT_RERANK_MULT: usize = VectorSearchOptions::RERANK_MULT;
     /// Filtered kNN defaults (nominal config before selectivity boost).
     const FILTERED_DEFAULT_NPROBE: usize = 8;
     const FILTERED_DEFAULT_RERANK_MULT: usize = 256;
@@ -948,7 +955,6 @@ pub mod vector {
     /// ~10% selective predicate. Latency depends on the allow-set's density,
     /// not which rows it holds, so a simple stride suffices.
     const FILTER_KEEP_EVERY: usize = 10;
-
     /// Nanoseconds per second, for latency markdown.
     const NS_PER_SEC: f64 = 1e9;
     /// Deterministic rotation seed for the vector corpus fixture.
@@ -1076,30 +1082,19 @@ pub mod vector {
     const SWEEP_START_RERANK: usize = 256;
 
     fn sweep_start_probe() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SWEEP_START_PROBE)
+        SWEEP_START_PROBE
     }
 
     fn sweep_start_rerank() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_RERANK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SWEEP_START_RERANK)
+        SWEEP_START_RERANK
     }
 
     fn sweep_probe_min() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(sweep_start_probe)
+        sweep_start_probe()
     }
 
     fn sweep_probe_max() -> Option<usize> {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        None
     }
 
     fn sweep_rerank_ladder(start: usize) -> Vec<usize> {
@@ -1124,24 +1119,7 @@ pub mod vector {
     }
 
     fn filtered_ground_truth(allow: &RoaringBitmap) -> Vec<Vec<u32>> {
-        let q_corr = queries_correctness();
-        let vecs = vectors();
-        q_corr
-            .iter()
-            .map(|q| {
-                let mut dists: Vec<(f32, u32)> = allow
-                    .iter()
-                    .map(|id| {
-                        let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                        let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                        (-dot, id)
-                    })
-                    .collect();
-                dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                dists.truncate(TOP_K);
-                dists.into_iter().map(|(_, id)| id).collect()
-            })
-            .collect()
+        corpus::filtered_ground_truth(vectors(), allow, queries_correctness(), TOP_K)
     }
 
     fn mean_filtered_recall(
@@ -1212,6 +1190,8 @@ pub mod vector {
         eprintln!("|   p |    r | unfiltered | filtered (~10%) |");
         eprintln!("| --- | ---- | ---------- | ----------------- |");
 
+        let gt_stable = gt;
+
         let mut table_rows = Vec::new();
         let mut best_dual: Option<(usize, usize, f32, f32)> = None;
 
@@ -1219,7 +1199,7 @@ pub mod vector {
             let p_eff = p.min(n_cent).max(1);
             for &r in &reranks {
                 let unfiltered =
-                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, gt, TOP_K, p_eff, r);
+                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, gt_stable, TOP_K, p_eff, r);
                 let filtered = mean_filtered_recall(reader, &allow, &filtered_gt, p_eff, r);
                 let pass = unfiltered >= floor && filtered >= floor;
                 eprintln!(
@@ -1392,6 +1372,13 @@ pub mod vector {
                     committed.object_size,
                 )
             };
+            let (default_nprobe, default_rerank) = {
+                let o = VectorSearchOptions::default();
+                (
+                    o.nprobe.unwrap_or(VectorSearchOptions::DEFAULT_NPROBE),
+                    o.rerank_mult().unwrap_or(VectorSearchOptions::RERANK_MULT),
+                )
+            };
             let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
@@ -1399,8 +1386,8 @@ pub mod vector {
                 VEC_COLUMN,
                 n_docs,
                 TOP_K,
-                UNFILTERED_DEFAULT_NPROBE,
-                UNFILTERED_DEFAULT_RERANK_MULT,
+                default_nprobe,
+                default_rerank,
                 queries_correctness(),
                 ground_truth_correctness(),
                 queries_calibration(),
@@ -1457,24 +1444,8 @@ pub mod vector {
                 // against that filtered ground truth.
                 {
                     let q_corr = queries_correctness();
-                    let vecs = vectors();
-                    let filtered_gt: Vec<Vec<u32>> = q_corr
-                        .iter()
-                        .map(|q| {
-                            let mut dists: Vec<(f32, u32)> = allow
-                                .iter()
-                                .map(|id| {
-                                    let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                    let dot: f32 =
-                                        row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                                    (-dot, id)
-                                })
-                                .collect();
-                            dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                            dists.truncate(TOP_K);
-                            dists.into_iter().map(|(_, id)| id).collect()
-                        })
-                        .collect();
+                    let filtered_gt: Vec<Vec<u32>> =
+                        corpus::filtered_ground_truth(vectors(), &allow, q_corr, TOP_K);
                     let mut recalls = Vec::new();
                     for (q, gt) in q_corr.iter().zip(&filtered_gt) {
                         let hits = tiers::block_on(reader.vector_hits_filtered_async(
@@ -1507,22 +1478,8 @@ pub mod vector {
                 let vecs = vectors();
                 let q_corr = queries_correctness();
                 let unfiltered_gt = ground_truth_correctness();
-                let filtered_gt: Vec<Vec<u32>> = q_corr
-                    .iter()
-                    .map(|q| {
-                        let mut dists: Vec<(f32, u32)> = allow
-                            .iter()
-                            .map(|id| {
-                                let row = &vecs[id as usize * DIM..(id as usize + 1) * DIM];
-                                let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-                                (-dot, id)
-                            })
-                            .collect();
-                        dists.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                        dists.truncate(TOP_K);
-                        dists.into_iter().map(|(_, id)| id).collect()
-                    })
-                    .collect();
+                let filtered_gt: Vec<Vec<u32>> =
+                    corpus::filtered_ground_truth(vecs, &allow, q_corr, TOP_K);
 
                 /// Maximum multiplier applied by filtered search's
                 /// selectivity boost in the vector reader.

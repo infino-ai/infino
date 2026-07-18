@@ -1,36 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Run-to-run delta tracking + pretty rendering for benches.
+//! Fact reporting + pretty rendering for benches.
 //!
 //! A bench builds [`Section`]s of [`Block`]s of [`Cell`]s; every metric
-//! cell carries its raw comparable
-//! value and a "lower/higher is better" direction. [`Report`]:
+//! cell carries its raw comparable value and its human form. [`Report`]:
 //!
 //!   - persists **every** metric this run produced to one JSON file per
-//!     bench (in the target dir),
-//!   - diffs each metric against the **previous run's** file,
-//!   - renders each table to the terminal with a per-cell delta
-//!     (`+6.5% better` / `-4.1% worse` / `~`; `(new)` on first run),
-//!     coloring the delta when stderr is a TTY,
-//!   - and, when `INFINO_BENCH_UPDATE_README=1`, writes the same tables
-//!     (plain) into `benches/README.md`.
+//!     bench (in the target dir) — the structured source of truth,
+//!   - renders each table of measured values to the terminal, and
+//!   - when `INFINO_BENCH_UPDATE_README=1`, writes the same tables into
+//!     `benches/README.md`.
 //!
-//! Each section is stamped with the host (CPU / cores / RAM / OS) so a
-//! committed table says what machine produced it.
-//!
-//! Baseline is the machine-local previous run — the edit/build/compare
-//! loop. There is no bootstrap-statistics layer: build, RSS, and cold-tier
-//! numbers need "is this run better or worse than my last one, on every
-//! number".
+//! Tables report the run's numbers as-is: no run-over-run comparison,
+//! no delta annotations. Each section is stamped with the host
+//! (CPU / cores / RAM / OS) so a committed table says what machine
+//! produced it.
 
-use std::{collections::HashMap, io::IsTerminal, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde_json::Value;
 
 use crate::markdown::{self, MarkdownSection};
 
-/// Which direction is an improvement for a metric.
+/// Which direction is an improvement for a metric. Retained as
+/// metric-direction metadata on [`Cell::Metric`]; the report itself no
+/// longer annotates deltas.
 #[derive(Clone, Copy)]
 pub enum Better {
     /// Smaller is better — latency, build time, memory.
@@ -44,10 +39,8 @@ pub enum Cell {
     /// A row/label cell with no tracked metric.
     Text(String),
     /// A measured value: `raw` is the comparable quantity (ns, bytes,
-    /// items/s …) used for the delta; `shown` is its human form. `gate`
-    /// metrics carry a Δ and are surfaced; context metrics (`gate = false`)
-    /// are shown and saved but not Δ-tracked — spread/derived numbers that
-    /// would otherwise drown the signal.
+    /// items/s …) persisted to the JSON source of truth; `shown` is its
+    /// human form displayed in the table.
     Metric {
         raw: f64,
         shown: String,
@@ -99,80 +92,33 @@ pub struct Section {
     pub blocks: Vec<Block>,
 }
 
-/// Percent band inside which a change is reported as noise (`~`).
-const NOISE_BAND_PCT: f64 = 3.0;
-
-const C_GREEN: &str = "\x1b[32m";
-const C_RED: &str = "\x1b[31m";
 const C_DIM: &str = "\x1b[2m";
 const C_RESET: &str = "\x1b[0m";
 
-/// A rendered cell, split into the value and its delta so the assembler
-/// can right-align values and left-align deltas into aligned columns.
+/// A rendered cell — just its displayed text. (No delta column: the
+/// report shows measured values, not run-over-run comparisons.)
 struct Rendered {
     value: String,
-    delta: String,
-    delta_color: &'static str,
-}
-
-fn compute_delta(prev: Option<f64>, new: f64, better: Better) -> (String, &'static str) {
-    let Some(base) = prev.filter(|&b| b != 0.0) else {
-        return ("new".into(), C_DIM);
-    };
-    let pct = (new - base) / base * 100.0;
-    if pct.abs() < NOISE_BAND_PCT {
-        return (format!("{pct:+.1}% ~"), C_DIM);
-    }
-    let improved = match better {
-        Better::Lower => pct < 0.0,
-        Better::Higher => pct > 0.0,
-    };
-    (
-        format!("{pct:+.1}% {}", if improved { "better" } else { "worse" }),
-        if improved { C_GREEN } else { C_RED },
-    )
 }
 
 pub struct Report {
     bench: String,
-    prev: HashMap<String, f64>,
     cur: HashMap<String, f64>,
-    color: bool,
     host: String,
-    /// When false (comparison sections), cells render as plain values —
-    /// no run-over-run delta annotations, no baseline persistence.
-    track_deltas: bool,
 }
 
 impl Report {
-    /// Load the previous run's metrics for `bench` (empty on first run).
+    /// Start a report for `bench`. The run's metrics are recorded and
+    /// persisted to the JSON source of truth by [`Report::save`].
     pub fn load(bench: &str) -> Self {
         Self {
             bench: bench.to_string(),
-            prev: read_map(&store_path(bench)).unwrap_or_default(),
             cur: HashMap::new(),
-            color: std::io::stderr().is_terminal(),
             host: machine_info(),
-            track_deltas: true,
         }
     }
 
-    /// A report without run-over-run deltas: cells render as plain
-    /// values, nothing is loaded or persisted as a baseline. Used by the
-    /// cross-engine comparison sections, whose only meaningful delta is
-    /// engine-vs-engine (computed by the caller as its own column).
-    pub fn load_plain(bench: &str) -> Self {
-        Self {
-            bench: bench.to_string(),
-            prev: HashMap::new(),
-            cur: HashMap::new(),
-            color: std::io::stderr().is_terminal(),
-            host: machine_info(),
-            track_deltas: false,
-        }
-    }
-
-    /// Render `section` to the terminal (with per-cell deltas) and, when
+    /// Render `section` to the terminal and, when
     /// `INFINO_BENCH_UPDATE_README` is set, into `benches/README.md`.
     /// Records every metric for [`Report::save`].
     pub fn emit(&mut self, section: &Section) {
@@ -198,8 +144,8 @@ impl Report {
             // manual padding — keeps the committed source clean).
             md.push_str(&assemble_markdown(&block.headers, &grid));
             md.push('\n');
-            // Terminal: padded + colored for monospace readability.
-            eprint!("{}", assemble_terminal(&block.headers, &grid, self.color));
+            // Terminal: padded for monospace readability.
+            eprint!("{}", assemble_terminal(&block.headers, &grid));
         }
 
         markdown::maybe_update_readme(&MarkdownSection {
@@ -209,8 +155,8 @@ impl Report {
     }
 
     /// Render one block into a grid of [`Rendered`] cells, recording each
-    /// metric under a stable `anchor|subtitle|label|header` key so the
-    /// next run can diff against it.
+    /// metric under a stable `anchor|subtitle|label|header` key for the
+    /// JSON source of truth.
     fn render_block(&mut self, section: &Section, block: &Block) -> Vec<Vec<Rendered>> {
         let mut grid = Vec::with_capacity(block.rows.len());
         for row in &block.rows {
@@ -224,32 +170,14 @@ impl Report {
             let mut rrow = Vec::with_capacity(row.len());
             for (ci, cell) in row.iter().enumerate() {
                 match cell {
-                    Cell::Text(s) => rrow.push(Rendered {
-                        value: s.clone(),
-                        delta: String::new(),
-                        delta_color: "",
-                    }),
-                    Cell::Metric {
-                        raw,
-                        shown,
-                        better,
-                        gate,
-                    } => {
+                    Cell::Text(s) => rrow.push(Rendered { value: s.clone() }),
+                    Cell::Metric { raw, shown, .. } => {
                         let header = block.headers.get(ci).map(String::as_str).unwrap_or("");
                         let key =
                             format!("{}|{}|{}|{}", section.anchor, block.subtitle, label, header);
-                        // Only gate metrics carry a Δ; context metrics render
-                        // as a plain value (still saved, for the full picture).
-                        let (delta, color) = if self.track_deltas && *gate {
-                            compute_delta(self.prev.get(&key).copied(), *raw, *better)
-                        } else {
-                            (String::new(), "")
-                        };
                         self.cur.insert(key, *raw);
                         rrow.push(Rendered {
                             value: shown.clone(),
-                            delta,
-                            delta_color: color,
                         });
                     }
                 }
@@ -259,33 +187,25 @@ impl Report {
         grid
     }
 
-    /// Persist this run's metrics, becoming the next run's baseline.
+    /// Persist this run's metrics to the JSON source of truth.
     ///
-    /// Merges over the previous file rather than overwriting, so a
+    /// Merges over the existing file rather than overwriting, so a
     /// partial run (e.g. `-- superfile_fts_build`) updates only the
-    /// metrics it measured and leaves the rest of the baseline intact.
+    /// metrics it measured and leaves the rest of the file intact.
     pub fn save(&self) {
-        // Plain (comparison) reports keep no baseline: nothing to diff
-        // against next run, so don't write one.
-        if !self.track_deltas {
-            return;
-        }
-        let mut merged = self.prev.clone();
+        let mut merged = read_map(&store_path(&self.bench)).unwrap_or_default();
         for (k, v) in &self.cur {
             merged.insert(k.clone(), *v);
         }
         if let Err(e) = write_map(&store_path(&self.bench), &merged) {
-            eprintln!(
-                "[report] failed to persist baseline for {}: {e}",
-                self.bench
-            );
+            eprintln!("[report] failed to persist metrics for {}: {e}", self.bench);
         }
     }
 }
 
 /// Compact GFM table for markdown. No manual alignment padding (GitHub
-/// renders the columns aligned); each metric cell is `value (delta)`,
-/// each text cell is just its value. Clean committed source.
+/// renders the columns aligned); each cell is just its value. Clean
+/// committed source.
 fn assemble_markdown(headers: &[String], grid: &[Vec<Rendered>]) -> String {
     let mut s = String::new();
     s.push('|');
@@ -301,42 +221,27 @@ fn assemble_markdown(headers: &[String], grid: &[Vec<Rendered>]) -> String {
     for row in grid {
         s.push('|');
         for cell in row {
-            let c = if cell.delta.is_empty() {
-                cell.value.clone()
-            } else {
-                format!("{} ({})", cell.value, cell.delta)
-            };
-            s.push_str(&format!(" {c} |"));
+            s.push_str(&format!(" {} |", cell.value));
         }
         s.push('\n');
     }
     s
 }
 
-/// Assemble an aligned table for the terminal. Per column: values are
-/// right-aligned in a value sub-field, deltas left-aligned after a
-/// 2-space gutter, so both line up vertically. Widths are computed from
-/// **visible** length (ANSI escapes and multibyte glyphs excluded).
-fn assemble_terminal(headers: &[String], grid: &[Vec<Rendered>], color: bool) -> String {
+/// Assemble an aligned table for the terminal: values right-aligned per
+/// column under a left-aligned header. Widths are computed from
+/// **visible** length (multibyte glyphs like `µ` counted as one).
+fn assemble_terminal(headers: &[String], grid: &[Vec<Rendered>]) -> String {
     let ncol = headers.len();
     let mut value_w = vec![0usize; ncol];
-    let mut delta_w = vec![0usize; ncol];
     for row in grid {
         for (c, cell) in row.iter().enumerate().take(ncol) {
             value_w[c] = value_w[c].max(visible_len(&cell.value));
-            delta_w[c] = delta_w[c].max(visible_len(&cell.delta));
         }
     }
-    // Column width = max(header, value field + gutter + delta field).
+    // Column width = max(header, value).
     let col_w: Vec<usize> = (0..ncol)
-        .map(|c| {
-            let content = if delta_w[c] > 0 {
-                value_w[c] + 2 + delta_w[c]
-            } else {
-                value_w[c]
-            };
-            visible_len(&headers[c]).max(content)
-        })
+        .map(|c| visible_len(&headers[c]).max(value_w[c]))
         .collect();
 
     let mut s = String::new();
@@ -351,39 +256,15 @@ fn assemble_terminal(headers: &[String], grid: &[Vec<Rendered>], color: bool) ->
         s.push_str(&format!(" {} |", "-".repeat(*w)));
     }
     s.push('\n');
-    // Data rows.
+    // Data rows: values right-aligned.
     for row in grid {
         s.push('|');
         for (c, w) in col_w.iter().enumerate() {
-            let cell = &row[c];
-            let inner = render_cell(cell, value_w[c], delta_w[c], color);
-            s.push_str(&format!(" {} |", pad_right(&inner, *w)));
+            s.push_str(&format!(" {} |", pad_left(&row[c].value, *w)));
         }
         s.push('\n');
     }
     s
-}
-
-/// Build one cell's inner text: value right-aligned in `value_w`, then a
-/// 2-space gutter and the (optionally colored) delta left-aligned in
-/// `delta_w`. Text cells with no delta just get the right-aligned value.
-fn render_cell(cell: &Rendered, value_w: usize, delta_w: usize, color: bool) -> String {
-    let value = pad_left(&cell.value, value_w);
-    if delta_w == 0 {
-        return value;
-    }
-    let delta = if color && !cell.delta_color.is_empty() {
-        format!(
-            "{}{}{}{}",
-            cell.delta_color,
-            cell.delta,
-            C_RESET,
-            " ".repeat(delta_w.saturating_sub(visible_len(&cell.delta)))
-        )
-    } else {
-        pad_right(&cell.delta, delta_w)
-    };
-    format!("{value}  {delta}")
 }
 
 fn pad_right(s: &str, width: usize) -> String {

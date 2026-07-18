@@ -26,7 +26,7 @@
 //!     pre-loaded (n_parts ≤ eager_load_threshold), the
 //!     hierarchical iterator is observationally identical
 //!     to the flat iteration (every
-//!     `Manifest::part().await` hits a populated
+//!     `ManifestSnapshot::part().await` hits a populated
 //!     OnceCell).
 
 #![deny(clippy::unwrap_used)]

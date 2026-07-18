@@ -13,15 +13,15 @@
 //! Each gate is a `OnceLock<bool>` cached on first call. The cost
 //! per call after the first is one relaxed atomic load (~1 ns)
 //! and an inlined `&*` deref — negligible next to the kernel work
-//! it gates. Initialization reads `INFINO_DISABLE_AVX512` (or
-//! `INFINO_DISABLE_AVX2`) first (the env overrides for A/B perf /
+//! it gates. Initialization consults `diagnostics.disable_avx512` (or
+//! `diagnostics.disable_avx2`) first (the config toggles for A/B perf /
 //! regression isolation), then runs the appropriate
 //! `is_x86_feature_detected!` chain.
 //!
-//! Flipping the env var after the first call has **no effect** —
-//! gates are sticky once cached.
+//! The gates are sticky once cached, so changing the config after the
+//! first call has **no effect**.
 
-use std::{env, sync::OnceLock};
+use std::sync::OnceLock;
 
 /// True iff this binary should use AVX-512 fast-path kernels.
 /// Checks the CPUID baseline that *every* AVX-512 kernel in the
@@ -35,9 +35,9 @@ use std::{env, sync::OnceLock};
 /// not in our fleet but cheap to be correct about) that lack the
 /// extensions.
 ///
-/// Set `INFINO_DISABLE_AVX512=1` to force the AVX2 / wide path on
+/// Set `diagnostics.disable_avx512` to force the AVX2 / wide path on
 /// hosts that *do* support AVX-512 — for A/B perf comparison or
-/// regression isolation without rebuilding. Reads the env var
+/// regression isolation without rebuilding. Consults the config
 /// exactly once on the first call.
 // Every dispatch site that calls this is itself x86-gated, so on other
 // targets the function is unused in the library build (it stays defined
@@ -47,7 +47,7 @@ use std::{env, sync::OnceLock};
 pub(crate) fn avx512_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if disable_env_set() {
+        if avx512_disabled_by_config() {
             return false;
         }
         #[cfg(target_arch = "x86_64")]
@@ -103,17 +103,17 @@ pub(crate) fn has_vpopcntdq() -> bool {
 /// always also have AVX2, but [`avx512_enabled`] gets checked first
 /// at every dispatch site, so the AVX2 gate is only consulted when
 /// AVX-512 is off (either no AVX-512 silicon, or
-/// `INFINO_DISABLE_AVX512=1`).
+/// `diagnostics.disable_avx512`).
 ///
-/// Set `INFINO_DISABLE_AVX2=1` to force the portable scalar-widen
+/// Set `diagnostics.disable_avx2` to force the portable scalar-widen
 /// path on hosts that *do* support AVX2 — for A/B perf comparison
 /// or pinning the universal fallback path under test without
-/// rebuilding. Reads the env var exactly once on the first call.
+/// rebuilding. Consults the config exactly once on the first call.
 #[inline]
 pub fn avx2_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if disable_avx2_env_set() {
+        if avx2_disabled_by_config() {
             return false;
         }
         #[cfg(target_arch = "x86_64")]
@@ -127,52 +127,26 @@ pub fn avx2_enabled() -> bool {
     })
 }
 
-/// Parses `INFINO_DISABLE_AVX512` from the environment. Accepts `1`
-/// or `true` (case-insensitive); everything else (including unset)
-/// is false. Pulled into its own helper so the parsing logic is
-/// shared across the gates above and exercised by unit tests.
+/// Whether `diagnostics.disable_avx512` forces the AVX2 / wide path.
+/// Pulled into its own helper so the gates above read a single named
+/// source.
 // Reached only through the x86-gated `avx512_enabled`, so it is unused
-// in a non-x86 library build (its sibling `disable_avx2_env_set` is
+// in a non-x86 library build (its sibling `avx2_disabled_by_config` is
 // reached on all targets via the `pub` `avx2_enabled`, hence no allowance).
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
-fn disable_env_set() -> bool {
-    env::var("INFINO_DISABLE_AVX512")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+fn avx512_disabled_by_config() -> bool {
+    crate::config::global().diagnostics.disable_avx512
 }
 
-/// Parses `INFINO_DISABLE_AVX2` from the environment. Same accepted
-/// values as [`disable_env_set`]; see that function for the contract.
+/// Whether `diagnostics.disable_avx2` forces the scalar-widen path.
 #[inline]
-fn disable_avx2_env_set() -> bool {
-    env::var("INFINO_DISABLE_AVX2")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+fn avx2_disabled_by_config() -> bool {
+    crate::config::global().diagnostics.disable_avx2
 }
 
 #[cfg(test)]
 mod tests {
-    /// Pin the env-var → boolean mapping in isolation. The full
-    /// `avx512_enabled()` parser caches via `OnceLock`, so we can't
-    /// flip its return value mid-process; this test reproduces the
-    /// parse step exactly and asserts the documented contract:
-    /// only `1` and `true` (case-insensitive) count as truthy.
-    #[test]
-    fn disable_env_var_parses_truthy_values() {
-        fn parse(v: &str) -> bool {
-            v == "1" || v.eq_ignore_ascii_case("true")
-        }
-        assert!(parse("1"));
-        assert!(parse("true"));
-        assert!(parse("TRUE"));
-        assert!(parse("True"));
-        assert!(!parse("0"));
-        assert!(!parse("false"));
-        assert!(!parse(""));
-        assert!(!parse("yes"));
-    }
-
     /// Per-feature gates must imply the AVX-512 foundation gate —
     /// otherwise a host that lacks F but reports an extension
     /// (impossible in practice, but cheap to be defensive about)

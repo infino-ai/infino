@@ -7,18 +7,19 @@
 
 use std::{
     collections::HashSet,
-    env, fmt, fs, io,
+    fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
 use futures::{
@@ -29,15 +30,20 @@ use memmap2::{Mmap, UncheckedAdvice};
 use thiserror::Error;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{OnceCell, Semaphore, oneshot},
+    sync::{Notify, OnceCell, Semaphore, oneshot},
     task::{JoinHandle, spawn_blocking},
 };
 
-use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
+use super::{
+    block_source::BlockCachedSource,
+    config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate},
+};
 use crate::{
-    storage::{StorageError, StorageProvider},
+    config::global as global_config,
+    storage::{StorageError, StorageProvider, io_counters::scope_background},
     superfile::{
-        LazyByteSource, PrefetchedSource,
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
+        format::{footer, kv},
         reader::{OpenOptions, SuperfileReader},
     },
     supertable::{
@@ -67,11 +73,55 @@ const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Yield cadence in the background-fill upgrade loop. Gives a
-/// short-lived caller (e.g. a cold benchmark with a fresh cache per
-/// iteration) a scheduling turn to drop the cache before a
-/// full-superfile fill starts.
+/// Yield cadence while a background fill waits for its foreground reader.
 const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Filename suffix for per-superfile sparse block-cache files.
+const BLOCKS_FILE_SUFFIX: &str = ".blocks";
+
+/// Process-global count of in-flight foreground queries. Used with
+/// [`foreground_notify`] so a fill's `select!` wakes promptly when a query
+/// begins and can re-check its per-URI pause condition; it is **not** a
+/// process-wide pause signal (unrelated URI fills keep running).
+static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
+/// Wakes background fills so they re-check per-URI quiescence when a
+/// foreground query arrives.
+static FOREGROUND_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+fn foreground_notify() -> &'static Notify {
+    FOREGROUND_NOTIFY.get_or_init(Notify::new)
+}
+
+/// RAII guard marking a foreground query in flight for its lifetime.
+///
+/// Entering the guard notifies waiting fills so a same-URI fill can yield
+/// to lazy query reads. Unrelated URI fills are not paused by this guard —
+/// only by that URI's own reader hold ([`reader_blocks_background_fill`]).
+pub struct ForegroundQueryGuard(());
+
+impl ForegroundQueryGuard {
+    pub fn enter() -> Self {
+        FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        foreground_notify().notify_waiters();
+        ForegroundQueryGuard(())
+    }
+}
+
+impl Drop for ForegroundQueryGuard {
+    fn drop(&mut self) {
+        FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+        // Wake fills waiting on the notify so they can resume after the
+        // query releases same-URI readers.
+        foreground_notify().notify_waiters();
+    }
+}
+
+/// Pause this URI's background full-object fill while a caller besides the
+/// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
+/// are unaffected — that is the per-URI quiescence contract.
+fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
+    reader.strong_count() > 1
+}
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
@@ -129,8 +179,33 @@ struct CachedEntry {
     /// on either path affects the cached entry's resident
     /// pages.
     mmap: Option<Arc<Mmap>>,
-    size_bytes: u64,
+    /// Accounted bytes for this entry. For eager entries this is fixed at
+    /// insertion; for block-backed lazy entries this points at the block
+    /// source's live filled-bytes counter.
+    size_bytes: Arc<AtomicU64>,
+    /// Who owns accounting release for this entry.
+    accounting: EntryAccounting,
+    /// Identity of the sparse source currently allowed to grow this lazy
+    /// entry. `None` for eager and fully mmap-backed entries.
+    block_token: Option<Arc<()>>,
+    /// Live block-cache source for lazy (and hybrid mmap+hole) entries.
+    /// Retained across vector-excluding background fill so touched vector
+    /// ranges stay local after parquet/FTS promote to mmap.
+    block_source: Option<Arc<BlockCachedSource>>,
+    /// Whether a background fill task has been spawned for this URI.
+    /// Vector opens leave this false (block-cache only); an later FTS/SQL
+    /// open may flip it and start fill.
+    fill_spawned: AtomicBool,
     last_access_us: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryAccounting {
+    /// Store-reserved entry; removal releases `size_bytes`.
+    Eager,
+    /// Block-source-reserved entry; source drop releases bytes.
+    #[cfg(test)]
+    SourceOwned,
 }
 
 /// Coalescing cell — concurrent cold readers on the same URI
@@ -170,6 +245,20 @@ pub struct DiskCacheStore {
     /// `get_or_try_init`.
     coordinators: DashMap<SuperfileUri, Coordinator>,
     current_bytes: AtomicU64,
+    /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
+    /// An engine-managed (auto-sized) budget is raised — never lowered —
+    /// by [`Self::reconcile_budget_floor`] as the table's on-storage
+    /// footprint grows (the hidden vector index roughly doubles a vector
+    /// table's working set after the drain). An explicitly configured
+    /// budget never changes.
+    budget_bytes: AtomicU64,
+    /// Whether the budget is engine-managed (the user configured a cache
+    /// directory but no byte budget). Set via
+    /// [`Self::mark_budget_auto_sized`] at construction time.
+    budget_auto_sized: AtomicBool,
+    /// One-shot latch so an explicit budget smaller than the table
+    /// footprint warns once, not on every reconcile.
+    budget_warned: AtomicBool,
     n_cold_fetches: AtomicU64,
     n_evictions: AtomicU64,
     n_madvise_calls: AtomicU64,
@@ -190,10 +279,7 @@ pub struct DiskCacheStore {
     /// mutex and invoke it lock-free, so the mutex is held
     /// only for the Arc bump.
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
-    /// Global cap on concurrent background superfile fills. Each
-    /// background fill acquires one permit for its whole
-    /// duration; foreground per-query range reads don't. Sized
-    /// `config.prefetch_concurrency` at construction.
+    /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
 }
 
@@ -201,7 +287,7 @@ impl fmt::Debug for DiskCacheStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiskCacheStore")
             .field("cache_root", &self.config.cache_root)
-            .field("budget_bytes", &self.config.disk_budget_bytes)
+            .field("budget_bytes", &self.disk_budget_bytes())
             .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
             .field("n_entries", &self.cached.len())
             .field(
@@ -233,6 +319,7 @@ impl DiskCacheStore {
         fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
+        let configured_budget = config.disk_budget_bytes;
         let prefetch_semaphore = Arc::new(Semaphore::new(config.prefetch_concurrency.max(1)));
         let store = Arc::new(Self {
             storage,
@@ -241,6 +328,9 @@ impl DiskCacheStore {
             cached: DashMap::new(),
             coordinators: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            budget_bytes: AtomicU64::new(configured_budget),
+            budget_auto_sized: AtomicBool::new(false),
+            budget_warned: AtomicBool::new(false),
             n_cold_fetches: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
@@ -248,6 +338,11 @@ impl DiskCacheStore {
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
         });
+
+        // Reuse any cache files a prior run (or another handle) left on disk:
+        // rebuild the in-memory index so reads hit the NVMe bytes instead of
+        // cold-fetching them back from object storage.
+        store.restore_from_cache_root();
 
         // Idle-threshold sweep thread. Library-not-service
         // shape: holds a Weak<Self> and exits naturally when the last Arc
@@ -356,11 +451,27 @@ impl DiskCacheStore {
         Self::new(storage, config, Arc::new(HashSet::new))
     }
 
+    /// Storage used for cold fetch when the caller does not override it.
+    fn resolve_storage(
+        &self,
+        storage: Option<&Arc<dyn StorageProvider>>,
+    ) -> Arc<dyn StorageProvider> {
+        storage
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(&self.storage))
+    }
+
     /// Hot path. Cached → cloned `Arc<SuperfileReader>`; cold
     /// → coalesced cold-fetch coordinator. Dispatches by
     /// `config.cold_fetch_mode`:
     ///
-    /// - [`ColdFetchMode::HybridWithPrefetch`] (default):
+    /// - [`ColdFetchMode::LazyForegroundWithBackgroundFill`] (default):
+    ///   foreground returns a lazy reader over a `StorageRangeSource`
+    ///   that pays only the per-query range budget; a background task
+    ///   downloads the full superfile to NVMe and swaps in the mmap'd
+    ///   entry, so subsequent (warm) queries are resident. Minimizes
+    ///   cold-query p50 on object-storage-native deployments.
+    /// - [`ColdFetchMode::HybridWithPrefetch`]:
     ///   parallel range-GETs feed the foreground reader (built
     ///   from in-memory bytes) and a fire-and-forget cache fill
     ///   (mmap'd, registered on completion). Foreground returns
@@ -375,7 +486,9 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        self.reader_with_hints(uri, None).await
+        // Default allows fill — same as FTS/SQL. Vector search must call
+        // [`Self::reader_with_hints`] with `allow_background_fill = false`.
+        self.reader_with_hints(uri, None, None, true).await
     }
 
     /// like [`Self::reader`] but takes a precomputed
@@ -388,6 +501,10 @@ impl DiskCacheStore {
     /// instead of doing the parquet footer first and the
     /// subsection fetches second (2 RTTs).
     ///
+    /// `allow_background_fill` is the modality gate: FTS/SQL pass `true`
+    /// so parquet/FTS bytes can promote to mmap (vector blob skipped);
+    /// vector search passes `false` and retains only the block cache.
+    ///
     /// `None` falls back to the 2-RTT shape — same shape,
     /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
     /// `RangeOnly`) ignore the hint today.
@@ -395,17 +512,24 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
+        storage: Option<&Arc<dyn StorageProvider>>,
+        allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         match self.config.cold_fetch_mode {
-            ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri).await,
+            ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri, storage).await,
             ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
                 "ColdFetchMode::RangeOnly bypasses the disk cache; \
                  construct StorageRangeSource + open_lazy directly"
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                self.reader_lazy_with_bg_fill_hinted(uri, offsets.cloned())
-                    .await
+                self.reader_lazy_with_bg_fill_hinted(
+                    uri,
+                    offsets.cloned(),
+                    storage,
+                    allow_background_fill,
+                )
+                .await
             }
         }
     }
@@ -424,16 +548,18 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
+        storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        let fetch_storage = self.resolve_storage(storage);
         let storage_uri = Self::storage_path(uri);
         let range_src: Arc<dyn LazyByteSource> = match offsets {
             Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
-                Arc::clone(&self.storage),
+                fetch_storage,
                 storage_uri,
                 o.total_size,
             )),
             _ => Arc::new(StorageRangeSource::with_unknown_size(
-                Arc::clone(&self.storage),
+                fetch_storage,
                 storage_uri,
             )),
         };
@@ -453,9 +579,33 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        let storage = Arc::clone(&self.storage);
+        self.reader_synchronous_with_storage(uri, storage).await
+    }
+
+    /// Like [`Self::reader_synchronous`], but fetches a cache miss through
+    /// `fetch_storage` instead of the cache's own `self.storage`. Needed for
+    /// the hidden vector-index, whose superfiles live behind a prefixed storage
+    /// provider that the shared (user-keyed) cache's `self.storage` can't
+    /// resolve — without this the cold-fetch reads the wrong path. On a cache
+    /// hit it returns the resident mmap-backed reader regardless of storage.
+    pub async fn reader_synchronous_with_storage(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        fetch_storage: Arc<dyn StorageProvider>,
+    ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
-            entry.last_access_us.store(self.now_us(), Ordering::Release);
-            return Ok(Arc::clone(&entry.reader));
+            if entry.mmap.is_some() {
+                entry.last_access_us.store(self.now_us(), Ordering::Release);
+                return Ok(Arc::clone(&entry.reader));
+            }
+            drop(entry);
+            if let Some((_, removed)) = self.cached.remove(uri) {
+                self.release_entry_accounting(&removed);
+            }
+            self.coordinators.remove(uri);
+            let replacement = self.cold_fetch(uri, Arc::clone(&fetch_storage)).await?;
+            return Ok(Arc::clone(&replacement.reader));
         }
         let cell = self
             .coordinators
@@ -463,7 +613,7 @@ impl DiskCacheStore {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let result = cell
-            .get_or_init(|| async { self.cold_fetch(uri).await })
+            .get_or_init(|| async { self.cold_fetch(uri, Arc::clone(&fetch_storage)).await })
             .await;
         match result {
             Ok(entry) => {
@@ -473,7 +623,7 @@ impl DiskCacheStore {
             Err(_e) => {
                 self.coordinators.remove(uri);
                 Err(self
-                    .cold_fetch(uri)
+                    .cold_fetch(uri, Arc::clone(&fetch_storage))
                     .await
                     .err()
                     .unwrap_or(DiskCacheError::SuperfileOpen("cold fetch error".into())))
@@ -488,6 +638,7 @@ impl DiskCacheStore {
     async fn reader_hybrid(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
@@ -505,7 +656,10 @@ impl DiskCacheStore {
         // background task replaces the entry in `cached` with a
         // mmap-backed reader once the disk file is finalized.
         let result = cell
-            .get_or_init(|| async { self.cold_fetch_hybrid(uri).await })
+            .get_or_init(|| async {
+                let fetch_storage = self.resolve_storage(storage);
+                self.cold_fetch_hybrid(uri, fetch_storage).await
+            })
             .await;
         match result {
             Ok(entry) => Ok(Arc::clone(&entry.reader)),
@@ -514,12 +668,22 @@ impl DiskCacheStore {
                 Err(DiskCacheError::BudgetExceeded)
             }
             Err(_) => {
+                // Only the retry path needs the resolved storage handle; the Ok
+                // and BudgetExceeded arms skip the clone.
                 self.coordinators.remove(uri);
-                self.cold_fetch_hybrid(uri)
+                let fetch_storage = self.resolve_storage(storage);
+                self.cold_fetch_hybrid(uri, fetch_storage)
                     .await
                     .map(|entry| Arc::clone(&entry.reader))
             }
         }
+    }
+
+    /// Whether `uri` has any cache entry — including a still-lazy
+    /// `LazyForegroundWithBackgroundFill` reader whose `mmap` is `None`.
+    /// Use [`Self::is_mmap_promoted`] to test for residency.
+    pub fn is_cached(&self, uri: &SuperfileUri) -> bool {
+        self.cached.contains_key(uri)
     }
 
     /// Whether `uri` is cached with a finished mmap promotion
@@ -559,10 +723,65 @@ impl DiskCacheStore {
         CacheStats {
             n_entries: self.cached.len() as u64,
             current_bytes: self.current_bytes.load(Ordering::Acquire),
-            budget_bytes: self.config.disk_budget_bytes,
+            budget_bytes: self.disk_budget_bytes(),
             n_cold_fetches: self.n_cold_fetches.load(Ordering::Acquire),
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
+        }
+    }
+
+    /// Current disk budget in bytes — the live value, not the
+    /// construction-time config (see [`Self::reconcile_budget_floor`]).
+    pub fn disk_budget_bytes(&self) -> u64 {
+        self.budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Mark this cache's budget as engine-managed: the user configured a
+    /// cache directory but no explicit byte budget, so the engine may
+    /// raise (never lower) the budget as the table's on-storage footprint
+    /// grows. Without this, a vector table silently outgrows any fixed
+    /// default the moment the drain writes the hidden index — a second
+    /// on-storage copy of the vector payload the user cannot be expected
+    /// to size for.
+    pub fn mark_budget_auto_sized(&self) {
+        self.budget_auto_sized.store(true, Ordering::Release);
+    }
+
+    /// Reconcile the budget against the table's current on-storage
+    /// footprint. `floor_bytes` is the caller-computed budget floor
+    /// (footprint + headroom); `footprint_bytes` is the raw footprint,
+    /// used for the undersized-budget warning.
+    ///
+    /// - **Auto-sized budget** ([`Self::mark_budget_auto_sized`]): raised
+    ///   to `floor_bytes` when larger. Never lowered — shrinking under
+    ///   live readers would force an eviction storm for no benefit.
+    /// - **Explicit budget**: respected verbatim. If the footprint
+    ///   exceeds it, warn once that steady-state reads will evict and
+    ///   re-fetch instead of staying cache-resident.
+    pub fn reconcile_budget_floor(&self, floor_bytes: u64, footprint_bytes: u64) {
+        if self.budget_auto_sized.load(Ordering::Acquire) {
+            let mut current = self.budget_bytes.load(Ordering::Acquire);
+            while floor_bytes > current {
+                match self.budget_bytes.compare_exchange_weak(
+                    current,
+                    floor_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+            return;
+        }
+        let budget = self.disk_budget_bytes();
+        if footprint_bytes > budget && !self.budget_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "disk cache budget ({budget} B) is below the table's on-storage footprint \
+                 ({footprint_bytes} B, hidden vector index included): steady-state queries \
+                 will evict and re-fetch. Raise ConnectOptions::with_cache_budget_bytes (or \
+                 storage.disk_budget_bytes), or omit the budget to let the engine size it."
+            );
         }
     }
 
@@ -636,7 +855,7 @@ impl DiskCacheStore {
                     *e.key(),
                     mmap,
                     e.value().last_access_us.load(Ordering::Acquire),
-                    e.value().size_bytes,
+                    e.value().size_bytes.load(Ordering::Acquire),
                 ))
             })
             .collect();
@@ -747,27 +966,8 @@ impl DiskCacheStore {
             }
             tokio::fs::rename(&tmp, &final_path).await?;
 
-            // mmap the freshly-written file. Same Arc<Mmap>
-            // shared between CachedEntry.mmap and the
-            // reader's Bytes::from_owner so a later
-            // MADV_DONTNEED sweep touches the same mapping.
-            let mmap = open_readonly_mmap(&final_path).map_err(DiskCacheError::Io)?;
-            let mmap_arc = Arc::new(mmap);
-            let reader_bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
-            let reader = SuperfileReader::open_with(
-                reader_bytes,
-                OpenOptions {
-                    verify_crc: self.config.verify_crc_on_open,
-                },
-            )?;
-
-            let entry = Arc::new(CachedEntry {
-                reader: Arc::new(reader),
-                mmap: Some(mmap_arc),
-                size_bytes: size,
-                last_access_us: AtomicU64::new(self.now_us()),
-            });
-            Ok(entry)
+            // mmap the freshly-written file + open it as a superfile reader.
+            self.open_cached_entry(&final_path, size)
         }
         .await;
 
@@ -803,27 +1003,99 @@ impl DiskCacheStore {
         Ok(())
     }
 
-    /// `insert_warm`, but best-effort: logs and swallows the error
-    /// instead of returning it. Shared by every committer (writer,
-    /// compaction) that pre-populates the cache after a superfile is
-    /// already durable in storage. A failure here just means the
-    /// next query cold-fetches instead of hitting a warm cache, it
-    /// never fails the commit itself.
-    pub async fn insert_warm_or_warn(self: &Arc<Self>, uri: &SuperfileUri, bytes: Bytes) {
-        if let Err(e) = self.insert_warm(uri, bytes).await {
-            tracing::warn!(uri = %uri.0, error = %e, "failed to warm disk cache");
-        }
-    }
-
     // ----- internals -----
 
     fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
     }
 
+    /// mmap a cache file and open it as a [`SuperfileReader`], building the
+    /// `CachedEntry`. Shared by the warm-insert path and the open-time index
+    /// rebuild ([`Self::restore_from_cache_root`]); the caller owns budget
+    /// accounting and the `cached`-map insert. The reader's bytes and
+    /// `CachedEntry.mmap` share one `Arc<Mmap>` so a later `MADV_DONTNEED`
+    /// sweep touches the same mapping.
+    fn open_cached_entry(
+        &self,
+        path: &Path,
+        size: u64,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+        let mmap = open_readonly_mmap(path).map_err(DiskCacheError::Io)?;
+        let mmap_arc = Arc::new(mmap);
+        let reader_bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+        let reader = SuperfileReader::open_with(
+            reader_bytes,
+            OpenOptions {
+                verify_crc: self.config.verify_crc_on_open,
+            },
+        )?;
+        Ok(Arc::new(CachedEntry {
+            reader: Arc::new(reader),
+            mmap: Some(mmap_arc),
+            size_bytes: Arc::new(AtomicU64::new(size)),
+            accounting: EntryAccounting::Eager,
+            block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
+            last_access_us: AtomicU64::new(self.now_us()),
+        }))
+    }
+
+    /// Rebuild the in-memory index from cache files a prior run (or another
+    /// handle) left under `cache_root`, so a fresh `DiskCacheStore` reuses the
+    /// NVMe bytes instead of cold-fetching them back from object storage. Each
+    /// complete `seg-<uuid>.sf.parquet` is mmap'd, opened (CRC-verified per
+    /// config), and inserted; `.tmp` in-flight files and anything that fails to
+    /// open (truncated / incompatible) are skipped and unlinked. Best-effort:
+    /// a scan error leaves the index empty (every read just cold-fetches, as
+    /// before). The budget is enforced lazily — entries are mmap-lazy (no RSS
+    /// until touched) and the first `sweep_for_budget` trims any excess.
+    fn restore_from_cache_root(self: &Arc<Self>) {
+        let dir = match fs::read_dir(&self.config.cache_root) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(BLOCKS_FILE_SUFFIX) {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+                continue; // `.tmp` in-flight or foreign file — skip.
+            };
+            let size = match entry.metadata() {
+                Ok(m) if m.len() > 0 => m.len(),
+                _ => continue,
+            };
+            match self.open_cached_entry(&path, size) {
+                Ok(cached_entry) => {
+                    if self.cached.insert(uri, cached_entry).is_none() {
+                        self.current_bytes.fetch_add(size, Ordering::Release);
+                    }
+                }
+                Err(_) => {
+                    // Truncated / corrupt / incompatible: drop it so the next
+                    // read cold-fetches a clean copy.
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
     /// Build a per-URI cache file path under `cache_root`.
     fn cache_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_filename())
+    }
+
+    /// Build a per-URI sparse block-cache path under `cache_root`.
+    fn blocks_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config
+            .cache_root
+            .join(format!("{}{BLOCKS_FILE_SUFFIX}", uri.cache_filename()))
     }
 
     /// Build a per-URI tempfile path (sparse destination
@@ -848,9 +1120,10 @@ impl DiskCacheStore {
     async fn cold_fetch_hybrid(
         self: &Arc<Self>,
         uri: &SuperfileUri,
+        fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-        let head = self.storage.head(&storage_uri).await?;
+        let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
         // Don't use the borrow-lifetimed Reservation guard
         // because it would tie the future to `&self` and block
@@ -890,7 +1163,7 @@ impl DiskCacheStore {
         for i in 0..n_chunks {
             let start = i * chunk_size;
             let end = (start + chunk_size).min(size);
-            let storage = Arc::clone(&self.storage);
+            let storage = Arc::clone(&fetch_storage);
             let file = Arc::clone(&file);
             let chunks = Arc::clone(&chunks);
             let uri_s = storage_uri.clone();
@@ -960,7 +1233,11 @@ impl DiskCacheStore {
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&foreground_reader),
             mmap: None, // hybrid foreground entry is in-memory; finalizer mmaps later
-            size_bytes: size,
+            size_bytes: Arc::new(AtomicU64::new(size)),
+            accounting: EntryAccounting::Eager,
+            block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
@@ -1012,9 +1289,14 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
         offsets: Option<SubsectionOffsets>,
+        storage: Option<&Arc<dyn StorageProvider>>,
+        allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
+            if allow_background_fill {
+                self.maybe_spawn_background_fill(uri, &entry, storage);
+            }
             return Ok(Arc::clone(&entry.reader));
         }
         let cell = self
@@ -1023,21 +1305,77 @@ impl DiskCacheStore {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
         let result = cell
-            .get_or_init(|| async { self.cold_fetch_lazy(uri, offsets.as_ref()).await })
+            .get_or_init(|| async {
+                let fetch_storage = self.resolve_storage(storage);
+                self.cold_fetch_lazy(uri, offsets.as_ref(), fetch_storage)
+                    .await
+            })
             .await;
+        let fetch_storage = self.resolve_storage(storage);
         match result {
-            Ok(entry) => Ok(Arc::clone(&entry.reader)),
+            Ok(entry) => {
+                if allow_background_fill {
+                    self.maybe_spawn_background_fill(uri, entry, storage);
+                }
+                Ok(Arc::clone(&entry.reader))
+            }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                Err(self
-                    .cold_fetch_lazy(uri, offsets.as_ref())
+                match self
+                    .cold_fetch_lazy(uri, offsets.as_ref(), fetch_storage)
                     .await
-                    .err()
-                    .unwrap_or(DiskCacheError::SuperfileOpen(
-                        "lazy cold fetch error".into(),
-                    )))
+                {
+                    Ok(entry) => {
+                        if allow_background_fill {
+                            self.maybe_spawn_background_fill(uri, &entry, storage);
+                        }
+                        Ok(Arc::clone(&entry.reader))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
+    }
+
+    /// Start parquet/FTS background fill once per URI when an FTS/SQL open
+    /// asks for it. Vector opens never call this — they keep block-cache
+    /// retention only. Fill skips the vector blob range.
+    fn maybe_spawn_background_fill(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        entry: &CachedEntry,
+        storage: Option<&Arc<dyn StorageProvider>>,
+    ) {
+        if skip_background_fill() || entry.mmap.is_some() {
+            return;
+        }
+        if entry
+            .fill_spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let size = entry.size_bytes.load(Ordering::Acquire);
+        let skip_vec = vector_blob_range(&entry.reader);
+        let store = Arc::downgrade(self);
+        let reader = Arc::downgrade(&entry.reader);
+        let uri_owned = *uri;
+        let storage_uri_owned = Self::storage_path(uri);
+        let fetch_storage = self.resolve_storage(storage);
+        tokio::spawn(async move {
+            let _ = lazy_background_fill(
+                store,
+                reader,
+                uri_owned,
+                storage_uri_owned,
+                size,
+                size,
+                fetch_storage,
+                skip_vec,
+            )
+            .await;
+        });
     }
 
     /// Lazy cold-fetch path. Foreground builds a reader via
@@ -1059,8 +1397,10 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
+        fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
+        let block_source_arc: Arc<BlockCachedSource>;
         let (lazy_reader, size) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
 
@@ -1094,16 +1434,21 @@ impl DiskCacheStore {
                 }
             };
 
-            // Build the lazy source: a `StorageRangeSource` with the
-            // size baked in (no HEAD, no suffix-range discovery)
-            // wrapped in a `PrefetchedSource` overlay carrying the
-            // open-time byte ranges at their absolute offsets.
+            // Build the lazy source with the size baked in (no HEAD or suffix
+            // discovery), then overlay the open-time byte ranges.
             let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
-                Arc::clone(&self.storage),
+                Arc::clone(&fetch_storage),
                 storage_uri.clone(),
                 total_size,
             ));
-            let mut overlay = PrefetchedSource::new(inner);
+            let block_source = BlockCachedSource::new_pre_reserved(
+                inner,
+                Arc::downgrade(self),
+                *uri,
+                self.blocks_path(uri),
+            );
+            block_source_arc = Arc::clone(&block_source);
+            let mut overlay = PrefetchedSource::new(block_source);
 
             if !offsets.open_blob.is_empty() {
                 // The open-batch bytes (parquet tail + vector + FTS open
@@ -1117,9 +1462,9 @@ impl DiskCacheStore {
                 // Fallback when no captured open blob is present:
                 // fetch the open batch over the wire
                 // (parquet tail + vec + fts ranges in parallel, 1 RTT).
-                let storage_for_parquet = Arc::clone(&self.storage);
-                let storage_for_vec = Arc::clone(&self.storage);
-                let storage_for_fts = Arc::clone(&self.storage);
+                let storage_for_parquet = Arc::clone(&fetch_storage);
+                let storage_for_vec = Arc::clone(&fetch_storage);
+                let storage_for_fts = Arc::clone(&fetch_storage);
                 let parquet_uri = storage_uri.clone();
                 let vec_uri = storage_uri.clone();
                 let fts_uri = storage_uri.clone();
@@ -1173,60 +1518,57 @@ impl DiskCacheStore {
             // object size, then patches the source's size atomic.
             let range_src: Arc<dyn LazyByteSource> =
                 Arc::new(StorageRangeSource::with_unknown_size(
-                    Arc::clone(&self.storage),
+                    Arc::clone(&fetch_storage),
                     storage_uri.clone(),
                 ));
+            let block_source = BlockCachedSource::new_pre_reserved(
+                range_src,
+                Arc::downgrade(self),
+                *uri,
+                self.blocks_path(uri),
+            );
+            block_source_arc = Arc::clone(&block_source);
+            let source: Arc<dyn LazyByteSource> = block_source;
             let lazy_reader = SuperfileReader::open_lazy_with(
-                Arc::clone(&range_src),
+                Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
             .await?;
-            let size = range_src.size();
+            let size = source.size();
             (lazy_reader, size)
         };
 
         self.reserve_manual(size).await?;
-        let reserved_bytes = size;
 
         let lazy_reader = Arc::new(lazy_reader);
+        let block_token = block_source_arc.entry_token();
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             mmap: None,
-            size_bytes: size,
+            size_bytes: Arc::new(AtomicU64::new(size)),
+            accounting: EntryAccounting::Eager,
+            block_token: Some(block_token),
+            block_source: Some(block_source_arc),
+            // Fill is modality-gated via [`Self::maybe_spawn_background_fill`]
+            // after the open returns — vector never starts it.
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         self.cached.insert(*uri, Arc::clone(&entry));
-
-        // Background promotion waits until foreground lazy readers
-        // release before starting full-superfile fetch, so cache fill
-        // does not compete with query-critical range GETs.
-        if !skip_background_fill() {
-            let store = Arc::downgrade(self);
-            let reader = Arc::downgrade(&lazy_reader);
-            let uri_owned = *uri;
-            let storage_uri_owned = storage_uri;
-            tokio::spawn(async move {
-                let _ = lazy_background_fill(
-                    store,
-                    reader,
-                    uri_owned,
-                    storage_uri_owned,
-                    size,
-                    reserved_bytes,
-                )
-                .await;
-            });
-        }
 
         Ok(entry)
     }
 
     /// Run the cold-fetch coordinator for `uri`. Reserves
     /// budget, fetches, mmap's, registers in `cached`.
-    async fn cold_fetch(&self, uri: &SuperfileUri) -> Result<Arc<CachedEntry>, DiskCacheError> {
+    async fn cold_fetch(
+        &self,
+        uri: &SuperfileUri,
+        fetch_storage: Arc<dyn StorageProvider>,
+    ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-        let head = self.storage.head(&storage_uri).await?;
+        let head = fetch_storage.head(&storage_uri).await?;
         let size = head.size;
 
         // Reserve budget (CAS-loop with eviction on miss).
@@ -1235,7 +1577,8 @@ impl DiskCacheStore {
         // Pump bytes from storage to a sparse destination.
         let tmp = self.tmp_path(uri);
         let final_path = self.cache_path(uri);
-        self.cold_fetch_to_disk(&storage_uri, &tmp, size).await?;
+        self.cold_fetch_to_disk(&fetch_storage, &storage_uri, &tmp, size)
+            .await?;
 
         // Promote to final path + open as mmap.
         tokio::fs::rename(&tmp, &final_path).await?;
@@ -1253,7 +1596,11 @@ impl DiskCacheStore {
         let entry = Arc::new(CachedEntry {
             reader: Arc::new(reader),
             mmap: Some(mmap_arc),
-            size_bytes: size,
+            size_bytes: Arc::new(AtomicU64::new(size)),
+            accounting: EntryAccounting::Eager,
+            block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.cached.insert(*uri, Arc::clone(&entry));
@@ -1273,8 +1620,9 @@ impl DiskCacheStore {
     /// `tokio::spawn`-ed background finalizer.
     async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
         loop {
+            let budget = self.disk_budget_bytes();
             let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= self.config.disk_budget_bytes {
+            if cur + bytes <= budget {
                 if self
                     .current_bytes
                     .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
@@ -1284,9 +1632,69 @@ impl DiskCacheStore {
                 }
                 continue;
             }
-            let needed = (cur + bytes).saturating_sub(self.config.disk_budget_bytes);
+            let needed = (cur + bytes).saturating_sub(budget);
             self.evict_at_least(needed).await?;
         }
+    }
+
+    /// Reserve bytes for block-cache growth.
+    pub(super) async fn reserve_block_bytes(&self, bytes: u64) -> Result<(), DiskCacheError> {
+        self.reserve_manual(bytes).await
+    }
+
+    /// Release previously reserved block-cache bytes.
+    pub(super) fn release_block_bytes(&self, bytes: u64) {
+        self.current_bytes.fetch_sub(bytes, Ordering::Release);
+    }
+
+    /// True when `token` still identifies the live lazy entry for `uri`.
+    pub(super) fn lazy_block_entry_is_current(&self, uri: &SuperfileUri, token: &Arc<()>) -> bool {
+        self.cached
+            .get(uri)
+            .and_then(|entry| {
+                entry
+                    .block_token
+                    .as_ref()
+                    .map(|current| Arc::ptr_eq(current, token))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Release accounting for one removed cache entry.
+    fn release_entry_accounting(&self, entry: &CachedEntry) {
+        if entry.accounting == EntryAccounting::Eager {
+            self.current_bytes
+                .fetch_sub(entry.size_bytes.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_block_entry_for_test(
+        &self,
+        uri: SuperfileUri,
+        filled: Arc<AtomicU64>,
+        block_token: Arc<()>,
+    ) {
+        let reader =
+            SuperfileReader::open(tests::tiny_superfile_bytes()).expect("tiny superfile opens");
+        self.cached.insert(
+            uri,
+            Arc::new(CachedEntry {
+                reader: Arc::new(reader),
+                mmap: None,
+                size_bytes: filled,
+                accounting: EntryAccounting::SourceOwned,
+                block_token: Some(block_token),
+                block_source: None,
+                fill_spawned: AtomicBool::new(false),
+                last_access_us: AtomicU64::new(self.now_us()),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
+        let _ = self.cached.remove(uri);
     }
 
     /// Reserve `bytes` of disk budget via CAS-loop on
@@ -1294,8 +1702,9 @@ impl DiskCacheStore {
     /// retries until either reserved or `BudgetExceeded`.
     async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
         loop {
+            let budget = self.disk_budget_bytes();
             let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= self.config.disk_budget_bytes {
+            if cur + bytes <= budget {
                 if self
                     .current_bytes
                     .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
@@ -1315,7 +1724,7 @@ impl DiskCacheStore {
             // Over budget — try eviction. If eviction frees
             // enough, the next loop iteration's CAS will
             // succeed.
-            let needed = (cur + bytes).saturating_sub(self.config.disk_budget_bytes);
+            let needed = (cur + bytes).saturating_sub(budget);
             self.evict_at_least(needed).await?;
         }
     }
@@ -1340,7 +1749,7 @@ impl DiskCacheStore {
             .iter()
             .map(|e| EvictionCandidate {
                 uri: *e.key(),
-                size_bytes: e.value().size_bytes,
+                size_bytes: e.value().size_bytes.load(Ordering::Acquire),
                 last_access_us: e.value().last_access_us.load(Ordering::Acquire),
             })
             .collect();
@@ -1360,8 +1769,7 @@ impl DiskCacheStore {
             if let Some((_, entry)) = self.cached.remove(&uri) {
                 let path = self.cache_path(&uri);
                 let _ = fs::remove_file(&path);
-                self.current_bytes
-                    .fetch_sub(entry.size_bytes, Ordering::Release);
+                self.release_entry_accounting(&entry);
                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
             }
         }
@@ -1374,6 +1782,7 @@ impl DiskCacheStore {
     /// contention is negligible.
     async fn cold_fetch_to_disk(
         &self,
+        fetch_storage: &Arc<dyn StorageProvider>,
         storage_uri: &str,
         dest_path: &Path,
         size: u64,
@@ -1410,7 +1819,7 @@ impl DiskCacheStore {
         for i in 0..n_chunks {
             let start = i * chunk_size;
             let end = (start + chunk_size).min(size);
-            let storage = Arc::clone(&self.storage);
+            let storage = Arc::clone(fetch_storage);
             let file = Arc::clone(&file);
             let uri = storage_uri.to_string();
             let stream_sem = Arc::clone(&stream_sem);
@@ -1533,7 +1942,11 @@ async fn finalize_to_mmap(
                 *occ.get_mut() = Arc::new(CachedEntry {
                     reader: Arc::new(reader),
                     mmap: Some(mmap_arc),
-                    size_bytes: size,
+                    size_bytes: Arc::new(AtomicU64::new(size)),
+                    accounting: EntryAccounting::Eager,
+                    block_token: None,
+                    block_source: None,
+                    fill_spawned: AtomicBool::new(false),
                     last_access_us: AtomicU64::new(store.started_at.elapsed().as_micros() as u64),
                 });
             }
@@ -1551,9 +1964,7 @@ async fn finalize_to_mmap(
         // decrement when a racing eviction already removed
         // this entry + released its bytes.
         if let Some((_, entry)) = store.cached.remove(&uri) {
-            store
-                .current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Release);
+            store.release_entry_accounting(&entry);
         }
         store.coordinators.remove(&uri);
     }
@@ -1603,17 +2014,9 @@ async fn wait_for_lazy_foreground_release(
             return Some(strong);
         }
         if reader.strong_count() <= 1 {
-            // Give short-lived callers (notably cold benchmarks with a
-            // fresh cache per iteration) a scheduling turn to drop the
-            // cache before we start a full-superfile background fill.
+            // `strong_count == 1` also occurs briefly while a caller is
+            // acquiring the cache entry, so re-check after one scheduler turn.
             tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-            // Re-check after the grace sleep: `strong_count == 1` is
-            // also what acquisition looks like from outside — between
-            // `cold_fetch_lazy` dropping its local Arc and the caller
-            // cloning out of the cache entry, the entry briefly holds
-            // the only reference. A poll landing in that window (or a
-            // caller re-acquiring during the sleep) must NOT start the
-            // fill while the reader is held; keep waiting instead.
             if reader.strong_count() <= 1 {
                 return store.upgrade();
             }
@@ -1623,110 +2026,203 @@ async fn wait_for_lazy_foreground_release(
     }
 }
 
+/// Wait until this URI's lazy reader is held only by the cache entry.
+/// Unrelated table/URI fills are not gated here — only this reader's
+/// strong-count. A grace re-check covers the open→query handoff.
+async fn wait_for_reader_quiescence(
+    store: &Arc<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
+) -> bool {
+    loop {
+        while reader_blocks_background_fill(reader) {
+            if background_store_abandoned(store) {
+                return false;
+            }
+            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+        }
+        if reader.strong_count() == 0 {
+            return false;
+        }
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+        if reader.strong_count() == 0 {
+            return false;
+        }
+        if !reader_blocks_background_fill(reader) {
+            return !background_store_abandoned(store);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundFillOutcome {
+    Complete,
+    Paused,
+    Abandoned,
+}
+
 async fn cold_fetch_to_disk_cancelable(
     store: &Arc<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
+    fetch_storage: &Arc<dyn StorageProvider>,
     storage_uri: &str,
     dest_path: &Path,
     size: u64,
-) -> Result<bool, DiskCacheError> {
+    filled: &mut Vec<bool>,
+    skip_vec: Option<(u64, u64)>,
+) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
-    let file = {
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(dest_path)?;
-        f.set_len(size)?;
-        Arc::new(f)
-    };
-
     let n_chunks = if size == 0 {
         0
     } else {
         size.div_ceil(chunk_size)
     };
+    // `filled` is the resume cursor, owned by the caller across pause/resume:
+    // an entry is `true` once its chunk is durably written. On the first
+    // attempt it is empty; size it and truncate the destination. On a resume
+    // (a same-URI reader paused the previous attempt) it carries the
+    // already-written chunks, so the fetch skips them instead of
+    // re-downloading the whole object from byte 0.
+    let first_attempt = filled.len() != n_chunks as usize;
+    if first_attempt {
+        filled.clear();
+        filled.resize(n_chunks as usize, false);
+    }
+    let file = {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true);
+        if first_attempt {
+            opts.truncate(true);
+        }
+        let file = opts.open(dest_path)?;
+        if first_attempt {
+            file.set_len(size)?;
+        }
+        Arc::new(file)
+    };
+
     let mut next_chunk = 0u64;
     let mut in_flight = FuturesUnordered::new();
 
-    // Fetch the full superfile in bounded chunks instead of a whole-object
-    // `get()`: large superfiles can be hundreds of MiB to many GiB, and
-    // materializing them as one `Bytes` would reintroduce the RSS spike
-    // this disk-cache path is meant to avoid.
+    // Bound memory by `n_streams × chunk_size` and stop promptly when the
+    // short-lived cache that requested this background fill is dropped.
     loop {
         while next_chunk < n_chunks && in_flight.len() < n_streams {
-            if background_store_abandoned(store) {
-                return Ok(false);
+            // Skip chunks a prior attempt already wrote (resume cursor).
+            if filled[next_chunk as usize] {
+                next_chunk += 1;
+                continue;
             }
-            let start = next_chunk * chunk_size;
+            if background_store_abandoned(store) {
+                return Ok(BackgroundFillOutcome::Abandoned);
+            }
+            if reader.strong_count() == 0 {
+                return Ok(BackgroundFillOutcome::Abandoned);
+            }
+            if reader_blocks_background_fill(reader) {
+                return Ok(BackgroundFillOutcome::Paused);
+            }
+            let chunk_idx = next_chunk;
+            let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(size);
-            let storage = Arc::clone(&store.storage);
+            // Vector blob stays on the block cache: leave those bytes sparse
+            // in the fill file (no GET). Parquet + FTS ranges still download.
+            let fetch_ranges = chunk_fetch_ranges(start, end, skip_vec);
+            if fetch_ranges.is_empty() {
+                filled[chunk_idx as usize] = true;
+                next_chunk += 1;
+                continue;
+            }
+            let storage = Arc::clone(fetch_storage);
             let file = Arc::clone(&file);
             let uri = storage_uri.to_string();
+            // Tag fill ranges as background so query-window meters attribute
+            // only foreground lazy/probe GETs to the cold query cost.
             in_flight.push(async move {
-                let bytes = storage.get_range(&uri, start..end).await?;
-                spawn_blocking(move || file.write_all_at(&bytes, start))
-                    .await
-                    .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
-                Ok::<(), DiskCacheError>(())
+                for (range_start, range_end) in fetch_ranges {
+                    let len = range_end - range_start;
+                    let bytes =
+                        scope_background(storage.get_range(&uri, range_start..range_end)).await?;
+                    let file = Arc::clone(&file);
+                    spawn_blocking(move || file.write_all_at(&bytes, range_start))
+                        .await
+                        .map_err(|error| {
+                            DiskCacheError::SuperfileOpen(format!("write join: {error}"))
+                        })??;
+                    let _ = len;
+                }
+                Ok::<u64, DiskCacheError>(chunk_idx)
             });
             next_chunk += 1;
         }
 
-        match in_flight.next().await {
-            Some(res) => res?,
-            None => break,
+        let foreground = foreground_notify().notified();
+        tokio::pin!(foreground);
+        let _ = foreground.as_mut().enable();
+        if reader.strong_count() == 0 {
+            return Ok(BackgroundFillOutcome::Abandoned);
+        }
+        if reader_blocks_background_fill(reader) {
+            return Ok(BackgroundFillOutcome::Paused);
+        }
+        tokio::select! {
+            biased;
+            _ = &mut foreground => {
+                // A query started: re-check same-URI hold. Unrelated fills
+                // (strong_count == 1) fall through and keep downloading.
+                if reader.strong_count() == 0 {
+                    return Ok(BackgroundFillOutcome::Abandoned);
+                }
+                if reader_blocks_background_fill(reader) {
+                    return Ok(BackgroundFillOutcome::Paused);
+                }
+            }
+            result = in_flight.next() => match result {
+                // Mark the chunk durable only once its write completes, so a
+                // pause mid-flight re-fetches just the unfinished chunks.
+                Some(result) => filled[result? as usize] = true,
+                None => break,
+            }
         }
         if background_store_abandoned(store) {
-            return Ok(false);
+            return Ok(BackgroundFillOutcome::Abandoned);
         }
     }
 
     if background_store_abandoned(store) {
-        return Ok(false);
+        return Ok(BackgroundFillOutcome::Abandoned);
     }
-    // `write_all_at` writes directly through an unbuffered `std::fs::File`;
-    // there is no `BufWriter` layer to flush before syncing durability.
+    if reader.strong_count() == 0 {
+        return Ok(BackgroundFillOutcome::Abandoned);
+    }
+    if reader_blocks_background_fill(reader) {
+        return Ok(BackgroundFillOutcome::Paused);
+    }
     spawn_blocking(move || file.sync_all())
         .await
-        .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
-    Ok(true)
+        .map_err(|error| DiskCacheError::SuperfileOpen(format!("fsync join: {error}")))??;
+    Ok(BackgroundFillOutcome::Complete)
 }
 
 fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
     if let Some((_, entry)) = store.cached.remove(uri) {
-        store
-            .current_bytes
-            .fetch_sub(entry.size_bytes, Ordering::Release);
+        store.release_entry_accounting(&entry);
     }
     store.coordinators.remove(uri);
     let _ = fs::remove_file(tmp);
 }
 
-/// background promotion path for the
-/// `LazyForegroundWithBackgroundFill` cold-fetch mode.
-/// Waits for foreground lazy readers to release, downloads the
-/// full superfile via cancelable parallel range-GETs to NVMe,
-/// mmaps the resulting file, and atomically replaces the lazy
-/// cache entry with a mmap-backed reader. Subsequent
-/// `reader(uri)` calls hit the promoted entry — every query
-/// resolves from mmap (zero S3 GETs).
-/// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
-/// full-superfile promotion. When `INFINO_DISABLE_BG_FILL=1` (or
-/// `true`), the cold-fetch path installs the open-blob overlay
-/// and serves the foreground query over range GETs, but never
-/// spawns the full-superfile background download. Lets us measure
-/// the cold fan-out cost in isolation from the competing
-/// full-superfile fills.
+/// Diagnostic gate for measuring lazy foreground reads without promotion,
+/// from `diagnostics.disable_background_fill` (YAML-only; no env override).
 pub(crate) fn skip_background_fill() -> bool {
-    static SKIP: OnceLock<bool> = OnceLock::new();
-    *SKIP.get_or_init(|| {
-        env::var("INFINO_DISABLE_BG_FILL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    global_config().diagnostics.disable_background_fill
 }
 
+/// Promote one released lazy reader to an mmap-backed cache entry.
+///
+/// When `skip_vec` is set, the fill file leaves the vector blob sparse and
+/// promotion opens a hybrid reader: mmap for parquet/FTS, the preserved
+/// block-cache source for vector ranges.
 async fn lazy_background_fill(
     store: Weak<DiskCacheStore>,
     reader: Weak<SuperfileReader>,
@@ -1734,6 +2230,8 @@ async fn lazy_background_fill(
     storage_uri: String,
     size: u64,
     reserved_bytes: u64,
+    fetch_storage: Arc<dyn StorageProvider>,
+    skip_vec: Option<(u64, u64)>,
 ) -> Result<(), DiskCacheError> {
     let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
         return Ok(());
@@ -1747,62 +2245,126 @@ async fn lazy_background_fill(
         return Ok(());
     }
 
-    // Global background-fill concurrency cap. Held for the whole
-    // fill so process-wide background memory is bounded by
-    // `prefetch_concurrency × (cold_fetch_streams ×
-    // cold_fetch_chunk_bytes)`. Acquired before any GET; foreground
-    // per-query reads never touch this semaphore.
     let _prefetch_permit = match Arc::clone(&store.prefetch_semaphore).acquire_owned().await {
-        Ok(p) => p,
-        Err(e) => {
-            store.coordinators.remove(&uri);
-            if let Some((_, entry)) = store.cached.remove(&uri) {
-                store
-                    .current_bytes
-                    .fetch_sub(entry.size_bytes, Ordering::Release);
-            }
+        Ok(permit) => permit,
+        Err(error) => {
+            rollback_lazy_background_fill(&store, &uri, &tmp);
             return Err(DiskCacheError::SuperfileOpen(format!(
-                "prefetch semaphore closed: {e}"
+                "prefetch semaphore closed: {error}"
             )));
         }
     };
+    // Resume cursor: chunks durably written so far, preserved across
+    // pause/resume so a same-URI reader interrupting the fill costs only
+    // the unfinished chunks rather than a re-download of the whole object.
+    let mut filled: Vec<bool> = Vec::new();
+    loop {
+        if !wait_for_reader_quiescence(&store, &reader).await {
+            rollback_lazy_background_fill(&store, &uri, &tmp);
+            return Ok(());
+        }
+        match cold_fetch_to_disk_cancelable(
+            &store,
+            &reader,
+            &fetch_storage,
+            &storage_uri,
+            &tmp,
+            size,
+            &mut filled,
+            skip_vec,
+        )
+        .await?
+        {
+            BackgroundFillOutcome::Complete => break,
+            // Keep the partial `tmp` and the `filled` cursor: the next attempt
+            // resumes from the first unwritten chunk.
+            BackgroundFillOutcome::Paused => {}
+            BackgroundFillOutcome::Abandoned => {
+                rollback_lazy_background_fill(&store, &uri, &tmp);
+                return Ok(());
+            }
+        }
+    }
 
-    let res: Result<(), DiskCacheError> = async {
+    let result: Result<(), DiskCacheError> = async {
         if background_store_abandoned(&store) {
             return Ok(());
         }
-        // 1. Parallel range-GETs into the temp file (existing
-        //    cold_fetch_to_disk shape, but cancelable for
-        //    short-lived caches).
-        if !cold_fetch_to_disk_cancelable(&store, &storage_uri, &tmp, size).await? {
-            return Ok(());
-        }
-        if background_store_abandoned(&store) {
-            return Ok(());
-        }
 
-        // 2. Promote to final path + mmap.
         tokio::fs::rename(&tmp, &final_path).await?;
         let mmap = open_readonly_mmap(&final_path)?;
         let mmap_arc = Arc::new(mmap);
         let bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
-        let reader = SuperfileReader::open_with(
-            bytes,
-            OpenOptions {
-                verify_crc: store.config.verify_crc_on_open,
-            },
-        )?;
 
-        // 3. Atomically replace the lazy entry with the
-        //    mmap-backed one — but only if it's still
-        //    present (a racing eviction may have removed it
-        //    + released the reservation in the meantime).
+        // Reuse the live block-cache source when excluding the vector blob so
+        // touched vector ranges from the cold query stay local after promote.
+        let prior_block = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source.clone());
+        let (promoted_reader, block_token, block_source) = match (skip_vec, prior_block) {
+            (Some((vec_off, vec_len)), Some(block_source)) => {
+                let block_token = block_source.entry_token();
+                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+                    local,
+                    hole_start: vec_off,
+                    hole_len: vec_len,
+                    fallback: Arc::clone(&block_source),
+                });
+                let reader =
+                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+                        .await?;
+                (reader, Some(block_token), Some(block_source))
+            }
+            (Some((vec_off, vec_len)), None) => {
+                // Evicted mid-fill: fresh block cache over storage for the hole.
+                let remote: Arc<dyn LazyByteSource> =
+                    Arc::new(StorageRangeSource::with_known_size(
+                        Arc::clone(&fetch_storage),
+                        storage_uri.clone(),
+                        size,
+                    ));
+                let block_source = BlockCachedSource::new_pre_reserved(
+                    remote,
+                    Arc::downgrade(&store),
+                    uri,
+                    store.blocks_path(&uri),
+                );
+                let block_token = block_source.entry_token();
+                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+                    local,
+                    hole_start: vec_off,
+                    hole_len: vec_len,
+                    fallback: Arc::clone(&block_source),
+                });
+                let reader =
+                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+                        .await?;
+                (reader, Some(block_token), Some(block_source))
+            }
+            (None, _) => {
+                let reader = SuperfileReader::open_with(
+                    bytes,
+                    OpenOptions {
+                        verify_crc: store.config.verify_crc_on_open,
+                    },
+                )?;
+                (reader, None, None)
+            }
+        };
+
         match store.cached.entry(uri) {
-            Entry::Occupied(mut occ) => {
-                *occ.get_mut() = Arc::new(CachedEntry {
-                    reader: Arc::new(reader),
+            Entry::Occupied(mut occupied) => {
+                *occupied.get_mut() = Arc::new(CachedEntry {
+                    reader: Arc::new(promoted_reader),
                     mmap: Some(mmap_arc),
-                    size_bytes: size,
+                    size_bytes: Arc::new(AtomicU64::new(size)),
+                    accounting: EntryAccounting::Eager,
+                    block_token,
+                    block_source,
+                    fill_spawned: AtomicBool::new(true),
                     last_access_us: AtomicU64::new(store.now_us()),
                 });
             }
@@ -1811,21 +2373,135 @@ async fn lazy_background_fill(
             }
         }
         store.coordinators.remove(&uri);
-        Ok::<(), DiskCacheError>(())
+        Ok(())
     }
     .await;
 
-    if res.is_err() || background_store_abandoned(&store) {
-        // Rollback — same atomic gate as eviction so we don't
-        // double-decrement when a racing eviction already
-        // removed this entry + released its bytes.
+    if result.is_err() || background_store_abandoned(&store) {
         rollback_lazy_background_fill(&store, &uri, &tmp);
-        // Clean up the temp file if cold_fetch_to_disk failed
-        // mid-way.
         let _ = fs::remove_file(&tmp);
     }
-    let _ = reserved_bytes; // retained for future observability
-    res
+    let _ = reserved_bytes;
+    result
+}
+
+/// Absolute `(offset, length)` of the vector blob from Parquet KV metadata.
+fn vector_blob_range(reader: &SuperfileReader) -> Option<(u64, u64)> {
+    let kv_map = footer::extract_kv_map(reader.parquet_metadata()).ok()?;
+    let off: u64 = kv_map.get(kv::VEC_OFFSET)?.parse().ok()?;
+    let len: u64 = kv_map.get(kv::VEC_LENGTH)?.parse().ok()?;
+    (len > 0).then_some((off, len))
+}
+
+/// Sub-ranges of `[start, end)` that are outside an optional skip hole.
+///
+/// Empty means the whole chunk lies inside the hole (no GET).
+fn chunk_fetch_ranges(start: u64, end: u64, skip: Option<(u64, u64)>) -> Vec<(u64, u64)> {
+    debug_assert!(start <= end);
+    let Some((hole_start, hole_len)) = skip else {
+        return vec![(start, end)];
+    };
+    if hole_len == 0 || start == end {
+        return vec![(start, end)];
+    }
+    let hole_end = hole_start.saturating_add(hole_len);
+    if end <= hole_start || start >= hole_end {
+        return vec![(start, end)];
+    }
+    let mut out = Vec::with_capacity(2);
+    if start < hole_start {
+        out.push((start, hole_start.min(end)));
+    }
+    if end > hole_end {
+        out.push((hole_end.max(start), end));
+    }
+    out
+}
+
+/// Local mmap/bytes source with a hole that falls through to another source.
+///
+/// Used after background fill excludes the vector blob: parquet + FTS come
+/// from the filled mmap; vector ranges keep using the block cache.
+struct HoleFallbackSource {
+    local: Arc<dyn LazyByteSource>,
+    hole_start: u64,
+    hole_len: u64,
+    fallback: Arc<BlockCachedSource>,
+}
+
+impl HoleFallbackSource {
+    fn hole_end(&self) -> u64 {
+        self.hole_start.saturating_add(self.hole_len)
+    }
+
+    fn overlaps_hole(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len);
+        end > self.hole_start && start < self.hole_end()
+    }
+
+    fn fully_in_hole(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len);
+        start >= self.hole_start && end <= self.hole_end()
+    }
+}
+
+#[async_trait]
+impl LazyByteSource for HoleFallbackSource {
+    fn size(&self) -> u64 {
+        self.local.size()
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        if !self.overlaps_hole(start, len) {
+            return self.local.range(start, len).await;
+        }
+        if self.fully_in_hole(start, len) {
+            return self.fallback.range(start, len).await;
+        }
+        // Spanning request: stitch local and fallback pieces in order.
+        let end = start + len;
+        let hole_end = self.hole_end();
+        let mut pieces = Vec::with_capacity(3);
+        let mut cursor = start;
+        if cursor < self.hole_start {
+            let piece_end = self.hole_start.min(end);
+            pieces.push(self.local.range(cursor, piece_end - cursor).await?);
+            cursor = piece_end;
+        }
+        if cursor < end && cursor < hole_end {
+            let piece_end = hole_end.min(end);
+            pieces.push(self.fallback.range(cursor, piece_end - cursor).await?);
+            cursor = piece_end;
+        }
+        if cursor < end {
+            pieces.push(self.local.range(cursor, end - cursor).await?);
+        }
+        if pieces.len() == 1 {
+            return Ok(pieces.pop().expect("one piece"));
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        for piece in pieces {
+            out.extend_from_slice(&piece);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        if len == 0 {
+            return Some(Bytes::new());
+        }
+        if !self.overlaps_hole(start, len) {
+            return self.local.try_get_range_sync(start, len);
+        }
+        if self.fully_in_hole(start, len) {
+            return self.fallback.try_get_range_sync(start, len);
+        }
+        // Spanning sync reads are rare; force the async path.
+        None
+    }
 }
 
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
@@ -1853,6 +2529,17 @@ fn open_readonly_mmap(path: &Path) -> io::Result<Mmap> {
     unsafe { Mmap::map(&file) }
 }
 
+/// Open a completed local superfile as zero-copy mmap-backed [`Bytes`].
+///
+/// Drain assembles very large packed shards in temporary files and maps the
+/// finished file through this helper before handing it to the ordinary
+/// `prepare_superfile`/publish path. Keeping the unsafe mmap construction in
+/// this module preserves the repository's documented mmap safety boundary.
+pub(crate) fn mmap_readonly_bytes(path: &Path) -> io::Result<Bytes> {
+    let mmap = Arc::new(open_readonly_mmap(path)?);
+    Ok(Bytes::from_owner(ArcMmapOwner(mmap)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Error as IoError;
@@ -1860,30 +2547,26 @@ mod tests {
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
+    use tokio::{spawn, task::yield_now, time::timeout};
 
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
-        superfile::{
-            SuperfileReader,
-            builder::{BuilderOptions, SuperfileBuilder},
-        },
+        superfile::builder::{BuilderOptions, SuperfileBuilder},
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
 
-    /// Poll turns the test lets elapse while the reader is held — the
-    /// pre-fix code returned after a single grace sleep, so anything
-    /// > 1 distinguishes "kept waiting" from "barreled ahead".
-    const HELD_POLL_TURNS: u32 = 5;
-
-    /// Generous timeout for [`DiskCacheStore::wait_until_mmap_promoted`]
-    /// in tests — the background fill is local-fs only, so promotion
-    /// lands in well under a second; this just bounds a hang.
+    /// Local-filesystem background promotion should finish well within this.
     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Long enough to cover several background quiet-interval checks.
+    const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
+    /// Large enough that one-byte sequential range reads cannot finish before
+    /// the preemption test enters its foreground guard.
+    const PREEMPT_TEST_BYTES: usize = 1 << 20;
 
     /// Build the raw bytes of a minimal superfile (one scalar batch,
     /// no indexes).
-    fn tiny_superfile_bytes() -> Bytes {
+    pub(super) fn tiny_superfile_bytes() -> Bytes {
         let schema = Arc::new(Schema::new(vec![
             decimal128_id_field("doc_id"),
             Field::new("title", DataType::LargeUtf8, false),
@@ -1896,11 +2579,6 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
-    }
-
-    /// Minimal eager superfile reader (one scalar batch, no indexes).
-    fn tiny_reader() -> Arc<SuperfileReader> {
-        Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("open"))
     }
 
     fn test_store() -> (TempDir, Arc<DiskCacheStore>) {
@@ -1937,54 +2615,6 @@ mod tests {
             .put_atomic(&uri.storage_path(), bytes)
             .await
             .expect("put superfile");
-    }
-
-    /// Regression: `strong_count == 1` is also what *acquisition*
-    /// looks like — between `cold_fetch_lazy` dropping its local Arc
-    /// and the caller cloning out of the cache entry, the entry
-    /// briefly holds the only reference. The pre-fix wait returned
-    /// unconditionally after its grace sleep, so a poll landing in
-    /// that window started the full-segment fill while the foreground
-    /// reader was held (the CI flake in
-    /// `lazy_background_fill_waits_for_foreground_reader_drop`).
-    /// The wait must re-check after the grace sleep and keep waiting.
-    #[tokio::test(start_paused = true)]
-    async fn wait_for_release_rechecks_reader_after_grace_sleep() {
-        let (_dir, store) = test_store();
-        let reader = tiny_reader();
-
-        let weak_store = Arc::downgrade(&store);
-        let weak_reader = Arc::downgrade(&reader);
-        // At spawn the only strong ref is `reader` itself — the exact
-        // shape of the acquisition window (the entry's ref, caller's
-        // clone not yet taken).
-        let waiter = tokio::spawn(async move {
-            wait_for_lazy_foreground_release(&weak_store, &weak_reader).await
-        });
-
-        // Let the waiter observe count == 1 and enter its grace sleep.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        // The caller's clone lands while the waiter is mid-grace: the
-        // reader is now genuinely held.
-        let held = Arc::clone(&reader);
-
-        // Let several poll intervals elapse (paused time auto-advances
-        // through every sleep). The buggy wait returned after ONE.
-        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL * HELD_POLL_TURNS).await;
-        assert!(
-            !waiter.is_finished(),
-            "background fill must keep waiting while the foreground reader is held"
-        );
-
-        // Release the hold (one strong ref — the entry's — remains):
-        // the wait must now complete and hand back the store.
-        drop(held);
-        let got = waiter.await.expect("waiter join");
-        assert!(
-            got.is_some(),
-            "wait must yield the store once the foreground hold releases"
-        );
-        drop(reader);
     }
 
     // ----- construction / config -----
@@ -2054,6 +2684,37 @@ mod tests {
     async fn is_mmap_promoted_false_for_unknown_uri() {
         let (_dir, store) = test_store();
         assert!(!store.is_mmap_promoted(&SuperfileUri::new_v4()));
+    }
+
+    /// `rollback_lazy_background_fill` undoes an in-flight promotion: it drops
+    /// the cache entry, forgets the coordinator, and deletes the tmp scratch
+    /// file left by the partial download.
+    #[tokio::test]
+    async fn rollback_lazy_background_fill_evicts_entry_and_tmp() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+
+        // Seed a cache entry the way a lazy fill would, plus a leftover tmp
+        // scratch file for the partial download.
+        store.install_block_entry_for_test(uri, Arc::new(AtomicU64::new(0)), Arc::new(()));
+        assert!(
+            store.is_cached(&uri),
+            "entry must be cached before rollback"
+        );
+        let tmp = store.tmp_path(&uri);
+        std::fs::write(&tmp, b"partial-download-bytes").expect("seed tmp scratch file");
+        assert!(tmp.exists(), "tmp scratch file must exist before rollback");
+
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+
+        assert!(
+            !store.is_cached(&uri),
+            "cached entry must be gone after rollback"
+        );
+        assert!(
+            !tmp.exists(),
+            "tmp scratch file must be deleted after rollback"
+        );
     }
 
     // ----- warm insert path (insert_warm + cold-free path) -----
@@ -2131,6 +2792,107 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 0);
     }
 
+    // ----- engine-managed (auto-sized) budget reconciliation -----
+
+    /// Tiny explicit budget used to prove reconciliation raises (or
+    /// refuses to raise) it; smaller than any real superfile.
+    const TEST_TINY_BUDGET_BYTES: u64 = 4;
+    /// A comfortably large budget floor for the raise paths.
+    const TEST_RAISED_FLOOR_BYTES: u64 = 1 << 20;
+
+    #[tokio::test]
+    async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
+        });
+        store.mark_budget_auto_sized();
+        // Undersized: the tiny superfile cannot be admitted.
+        let uri = SuperfileUri::new_v4();
+        let err = store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect_err("undersized budget must reject");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded));
+
+        // Reconcile raises the auto-sized budget; the same insert succeeds.
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("raised budget admits the entry");
+
+        // Raise-only: a smaller floor later never lowers the budget.
+        store.reconcile_budget_floor(TEST_TINY_BUDGET_BYTES, TEST_TINY_BUDGET_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_is_never_changed_by_reconcile() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
+        });
+        // No mark_budget_auto_sized(): the budget is explicit. Reconcile
+        // must warn (once) but leave the budget verbatim.
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_TINY_BUDGET_BYTES);
+        assert_eq!(store.stats().budget_bytes, TEST_TINY_BUDGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_from_cache_root_on_open() {
+        // A prior handle's cache files on `cache_root` must be reused by a fresh
+        // store: the constructor rebuilds the in-memory index from them, so a
+        // restart / second handle serves reads off NVMe with no cold-fetch.
+        let dir = TempDir::new().expect("tempdir");
+        let cache_root = dir.path().join("cache");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let size = bytes.len() as u64;
+
+        // First handle: warm-insert a superfile, then drop it (files persist).
+        {
+            let cfg = DiskCacheConfig {
+                cache_root: cache_root.clone(),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            };
+            let store = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("store1");
+            store.insert_warm(&uri, bytes).await.expect("insert_warm");
+            assert!(store.cache_path(&uri).is_file());
+        }
+
+        // Second handle on the SAME cache_root: constructor rebuilds the index.
+        let cfg2 = DiskCacheConfig {
+            cache_root: cache_root.clone(),
+            mmap_cold_threshold_secs: 0,
+            ..Default::default()
+        };
+        let store2 = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
+
+        let s = store2.stats();
+        assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
+        assert_eq!(s.current_bytes, size, "rebuilt byte accounting matches");
+        assert_eq!(
+            s.n_cold_fetches, 0,
+            "rebuild mmaps locally, never cold-fetches"
+        );
+
+        // A read is served from the rebuilt entry — still zero cold fetches.
+        let _r = store2
+            .reader(&uri)
+            .await
+            .expect("reader from rebuilt index");
+        assert_eq!(
+            store2.stats().n_cold_fetches,
+            0,
+            "read served from NVMe via rebuilt index, no object-store GET"
+        );
+    }
+
     // ----- cold fetch: synchronous path -----
 
     #[tokio::test]
@@ -2168,25 +2930,21 @@ mod tests {
     // ----- cold fetch: hybrid path (default mode) -----
 
     #[tokio::test]
-    async fn reader_hybrid_cold_then_promotes_to_mmap() {
-        let (_dir, store) = test_store(); // default = HybridWithPrefetch
+    async fn reader_hybrid_cold_then_stays_lazy_without_full_promotion() {
+        let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
-        // reader() dispatches to reader_hybrid.
+        // reader() dispatches by config default.
         let r = store.reader(&uri).await.expect("cold hybrid");
         assert_eq!(r.n_docs(), 1);
         assert_eq!(store.stats().n_cold_fetches, 1);
         assert_eq!(store.stats().n_entries, 1);
 
-        // Background finalizer eventually swaps in the mmap entry.
-        store
-            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
-            .await
-            .expect("promotion");
-        assert!(store.is_mmap_promoted(&uri));
+        // Warm path remains lazy/block-backed by design (no full-file barrier).
+        assert!(!store.is_mmap_promoted(&uri));
 
-        // Warm hit after promotion.
+        // Warm hit reuses cached reader; no extra cold fetch.
         let _r2 = store.reader(&uri).await.expect("warm");
         assert_eq!(store.stats().n_cold_fetches, 1);
     }
@@ -2202,7 +2960,148 @@ mod tests {
         let err = store.reader(&uri).await.expect_err("empty not a superfile");
         let _ = format!("{err}");
     }
-    // ----- RangeOnly mode constructor rejection + bypass -----
+    #[tokio::test]
+    async fn cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
+        use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
+        let hidden_root = dir.path().join("hidden_prefix");
+        std::fs::create_dir_all(&hidden_root).expect("hidden root");
+        let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&user_storage),
+            "hidden_prefix",
+        ));
+
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&user_storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        hidden_storage
+            .put_atomic(&uri.storage_path(), bytes.clone())
+            .await
+            .expect("put at hidden prefix");
+
+        let reader = cache
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .await
+            .expect("cold fetch via caller storage");
+        assert_eq!(reader.n_docs(), 1);
+        assert_eq!(cache.stats().n_cold_fetches, 1);
+    }
+
+    /// Bench default (`LazyForegroundWithBackgroundFill`): the lazy inner
+    /// `StorageRangeSource` must honor the caller's prefixed storage, not
+    /// the cache's embedded user-root provider.
+    #[tokio::test]
+    async fn lazy_cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
+        use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
+        let hidden_root = dir.path().join("hidden_prefix");
+        std::fs::create_dir_all(&hidden_root).expect("hidden root");
+        let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&user_storage),
+            "hidden_prefix",
+        ));
+
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&user_storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        hidden_storage
+            .put_atomic(&uri.storage_path(), bytes.clone())
+            .await
+            .expect("put at hidden prefix");
+
+        let reader = cache
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .await
+            .expect("lazy cold fetch via caller storage");
+        assert_eq!(reader.n_docs(), 1);
+        assert_eq!(cache.stats().n_cold_fetches, 1);
+    }
+
+    /// Compaction opens hidden superfiles through
+    /// `reader_synchronous_with_storage`, which must return an eager reader
+    /// even when the cache currently holds a lazy entry from query fan-out.
+    #[tokio::test]
+    async fn reader_synchronous_with_storage_upgrades_lazy_hidden_entry() {
+        use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
+        let hidden_root = dir.path().join("hidden_prefix");
+        std::fs::create_dir_all(&hidden_root).expect("hidden root");
+        let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&user_storage),
+            "hidden_prefix",
+        ));
+
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&user_storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+
+        let uri = SuperfileUri::new_v4();
+        hidden_storage
+            .put_atomic(&uri.storage_path(), tiny_superfile_bytes())
+            .await
+            .expect("put at hidden prefix");
+
+        // Query path admission: lazy reader with no resident parquet bytes.
+        let lazy = cache
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
+            .await
+            .expect("lazy cold fetch via caller storage");
+        assert!(
+            lazy.parquet_bytes().is_none(),
+            "lazy mode should not materialize full parquet bytes"
+        );
+
+        // Compaction path must force an eager reopen via caller storage.
+        let eager = cache
+            .reader_synchronous_with_storage(&uri, Arc::clone(&hidden_storage))
+            .await
+            .expect("synchronous compaction open");
+        assert!(
+            eager.parquet_bytes().is_some(),
+            "compaction input must have resident parquet bytes"
+        );
+        let batch = eager
+            .get_record_batch(None)
+            .expect("compaction should read full RecordBatch");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    // ----- RangeOnly mode rejects + open_range_only bypass -----
 
     #[test]
     fn reader_range_only_mode_is_rejected() {
@@ -2225,7 +3124,10 @@ mod tests {
         let uri = SuperfileUri::new_v4();
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
         // offsets = None → unknown-size StorageRangeSource.
-        let r = store.open_range_only(&uri, None).await.expect("range open");
+        let r = store
+            .open_range_only(&uri, None, None)
+            .await
+            .expect("range open");
         assert_eq!(r.n_docs(), 1);
         // Bypasses the cache entirely — nothing admitted.
         assert_eq!(store.stats().n_entries, 0);
@@ -2248,7 +3150,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .open_range_only(&uri, Some(&offsets))
+            .open_range_only(&uri, Some(&offsets), None)
             .await
             .expect("known-size range open");
         assert_eq!(r.n_docs(), 1);
@@ -2257,7 +3159,7 @@ mod tests {
     // ----- lazy-foreground-with-background-fill mode -----
 
     #[tokio::test]
-    async fn reader_lazy_unknown_size_cold_then_promotes() {
+    async fn reader_lazy_unknown_size_promotes_after_release() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -2269,17 +3171,21 @@ mod tests {
         assert_eq!(r.n_docs(), 1);
         assert_eq!(store.stats().n_cold_fetches, 1);
 
-        // Drop the foreground reader so the background fill can start.
+        // Releasing the foreground reader permits the full-file background
+        // fill to replace the lazy entry with an mmap-backed reader.
         drop(r);
         store
             .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
             .await
-            .expect("lazy promotion");
+            .expect("background promotion");
+        let r2 = store.reader(&uri).await.expect("warm mmap");
+        assert_eq!(store.stats().n_cold_fetches, 1);
         assert!(store.is_mmap_promoted(&uri));
+        assert!(r2.parquet_bytes().is_some());
     }
 
     #[tokio::test]
-    async fn reader_lazy_with_hints_known_size_promotes() {
+    async fn reader_lazy_with_hints_known_size_promotes_after_release() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -2300,7 +3206,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .reader_with_hints(&uri, Some(&offsets))
+            .reader_with_hints(&uri, Some(&offsets), None, true)
             .await
             .expect("lazy hinted cold");
         assert_eq!(r.n_docs(), 1);
@@ -2309,8 +3215,260 @@ mod tests {
         store
             .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
             .await
-            .expect("lazy hinted promotion");
+            .expect("background promotion");
+        let r2 = store
+            .reader_with_hints(&uri, Some(&offsets), None, true)
+            .await
+            .expect("warm hinted mmap");
+        assert_eq!(store.stats().n_cold_fetches, 1);
         assert!(store.is_mmap_promoted(&uri));
+        assert!(r2.parquet_bytes().is_some());
+    }
+
+    #[tokio::test]
+    async fn vector_open_skips_fill_fts_open_starts_it() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Vector modality: block-cache only — no background fill.
+        let vector_reader = store
+            .reader_with_hints(&uri, None, None, false)
+            .await
+            .expect("vector lazy open");
+        drop(vector_reader);
+        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        assert!(
+            !store.is_mmap_promoted(&uri),
+            "vector open must not spawn background fill"
+        );
+
+        // FTS/SQL modality on the same URI starts fill after the fact.
+        let fts_reader = store
+            .reader_with_hints(&uri, None, None, true)
+            .await
+            .expect("fts lazy open");
+        drop(fts_reader);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("FTS open must start background fill");
+        assert!(store.is_mmap_promoted(&uri));
+    }
+
+    #[tokio::test]
+    async fn background_fill_waits_for_same_uri_reader() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        let reader = store.reader(&uri).await.expect("lazy cold");
+        let _foreground = ForegroundQueryGuard::enter();
+        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        assert!(
+            !store.is_mmap_promoted(&uri),
+            "background promotion must yield while this URI's lazy reader is held"
+        );
+
+        drop(reader);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promotion resumes after the URI reader is released");
+    }
+
+    #[tokio::test]
+    async fn reader_for_one_uri_does_not_pause_another_uri_fill() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.prefetch_concurrency = 2;
+        });
+        let held_uri = SuperfileUri::new_v4();
+        let fill_uri = SuperfileUri::new_v4();
+        put_superfile(&store, &held_uri, tiny_superfile_bytes()).await;
+        put_superfile(&store, &fill_uri, tiny_superfile_bytes()).await;
+
+        let held_reader = store.reader(&held_uri).await.expect("held lazy reader");
+        let _fill_reader = store.reader(&fill_uri).await.expect("fill lazy reader");
+        drop(_fill_reader);
+        let _foreground = ForegroundQueryGuard::enter();
+        store
+            .wait_until_mmap_promoted(&fill_uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("unrelated URI fill must proceed while another URI is held");
+        assert!(
+            !store.is_mmap_promoted(&held_uri),
+            "held URI must still wait for its own reader release"
+        );
+        drop(held_reader);
+    }
+
+    /// `HoleFallbackSource` serves ranges outside the vector hole from the
+    /// local (filled) bytes and ranges inside the hole from the fallback block
+    /// cache, stitching a spanning read from both halves. Covers the geometry
+    /// helpers (`overlaps_hole` / `fully_in_hole` / `hole_end`) alongside
+    /// `size`, `range`, and the `try_get_range_sync` fast path.
+    #[tokio::test]
+    async fn hole_fallback_source_routes_local_and_fallback_by_hole() {
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        // local = the "filled" bytes (0xAA); the fallback's inner = the block
+        // cache side (0xBB) that serves the excluded vector hole.
+        let local: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(Bytes::from(vec![0xAAu8; 100])));
+        let remote: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(Bytes::from(vec![0xBBu8; 100])));
+        let fallback = BlockCachedSource::new_pre_reserved(
+            remote,
+            Arc::downgrade(&store),
+            uri,
+            store.blocks_path(&uri),
+        );
+        let hfs = HoleFallbackSource {
+            local,
+            hole_start: 40,
+            hole_len: 20,
+            fallback,
+        };
+
+        assert_eq!(hfs.size(), 100, "size reflects the local (full) source");
+
+        // Wholly before the hole → local bytes.
+        assert_eq!(
+            &hfs.range(0, 10).await.expect("pre-hole")[..],
+            &[0xAAu8; 10]
+        );
+        // Wholly inside the hole → fallback bytes.
+        assert_eq!(
+            &hfs.range(40, 20).await.expect("in-hole")[..],
+            &[0xBBu8; 20]
+        );
+        // Spanning: local[30..40] + fallback[40..60] + local[60..70].
+        let mut want = vec![0xAAu8; 10];
+        want.extend_from_slice(&[0xBBu8; 20]);
+        want.extend_from_slice(&[0xAAu8; 10]);
+        assert_eq!(
+            &hfs.range(30, 40).await.expect("spanning")[..],
+            &want[..],
+            "spanning read stitches local + fallback + local in order",
+        );
+
+        // Sync fast path: a read outside the hole resolves locally; a spanning
+        // read returns None to force the async path.
+        assert_eq!(
+            hfs.try_get_range_sync(0, 10).as_deref(),
+            Some(&[0xAAu8; 10][..]),
+            "sync read outside the hole comes from local",
+        );
+        assert!(
+            hfs.try_get_range_sync(30, 40).is_none(),
+            "spanning sync read forces the async path",
+        );
+    }
+
+    #[test]
+    fn chunk_fetch_ranges_skips_vector_hole() {
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, None),
+            vec![(0, 100)],
+            "no hole ⇒ full chunk"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((100, 50))),
+            vec![(0, 100)],
+            "hole after chunk ⇒ full chunk"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((0, 100))),
+            Vec::<(u64, u64)>::new(),
+            "chunk fully inside hole ⇒ no GET"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(50, 150, Some((0, 200))),
+            Vec::<(u64, u64)>::new(),
+            "chunk fully inside larger hole ⇒ no GET"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((40, 20))),
+            vec![(0, 40), (60, 100)],
+            "hole splits chunk into two fetch ranges"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((80, 40))),
+            vec![(0, 80)],
+            "hole overlapping chunk end ⇒ leading fetch only"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((0, 40))),
+            vec![(40, 100)],
+            "hole overlapping chunk start ⇒ trailing fetch only"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_uri_reader_pauses_in_flight_background_ranges() {
+        let (dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_streams = 1;
+            cfg.cold_fetch_chunk_bytes = 1;
+        });
+        let uri = SuperfileUri::new_v4();
+        let storage_uri = uri.storage_path();
+        store
+            .storage
+            .put_atomic(&storage_uri, Bytes::from(vec![7u8; PREEMPT_TEST_BYTES]))
+            .await
+            .expect("put background-fill payload");
+        let destination = dir.path().join("preempt.tmp");
+        let fill_store = Arc::clone(&store);
+        let fill_storage = Arc::clone(&store.storage);
+        let fill_destination = destination.clone();
+        let signal_reader = Arc::new(
+            SuperfileReader::open(tiny_superfile_bytes()).expect("foreground signal reader"),
+        );
+        let signal_weak = Arc::downgrade(&signal_reader);
+        let fill = spawn(async move {
+            let mut filled = Vec::new();
+            let outcome = cold_fetch_to_disk_cancelable(
+                &fill_store,
+                &signal_weak,
+                &fill_storage,
+                &storage_uri,
+                &fill_destination,
+                PREEMPT_TEST_BYTES as u64,
+                &mut filled,
+                None,
+            )
+            .await;
+            (outcome, filled)
+        });
+
+        timeout(PROMOTE_TIMEOUT, async {
+            while !destination.exists() {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("background fill started");
+        // Holding the signal reader (strong_count > 1) is the per-URI pause.
+        let foreground = Arc::clone(&signal_reader);
+        let _ = ForegroundQueryGuard::enter();
+        let (outcome, filled) = fill.await.expect("background task joined");
+        let outcome = outcome.expect("background fill returned an outcome");
+        assert_eq!(outcome, BackgroundFillOutcome::Paused);
+        // Resume cursor is sized to the object's chunk count and preserved
+        // across the pause so a later attempt resumes rather than restarting.
+        assert_eq!(filled.len(), PREEMPT_TEST_BYTES);
+        assert!(
+            filled.iter().any(|&done| !done),
+            "a same-URI pause must leave unfinished chunks for the resume"
+        );
+        drop(foreground);
     }
 
     // ----- wait_until_mmap_promoted timeout path -----

@@ -21,7 +21,10 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
+    retry,
+};
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.
@@ -187,6 +190,7 @@ impl StorageProvider for AzureStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -196,9 +200,10 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
+        let tl = crate::storage::io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        retry::with_reissue(|| async {
+        let out = retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
@@ -208,7 +213,12 @@ impl StorageProvider for AzureStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
         })
-        .await
+        .await;
+        if let Ok((b, _)) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+        }
+        out
     }
 
     async fn get_if_none_match(
@@ -246,13 +256,20 @@ impl StorageProvider for AzureStorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        retry::complete_range(uri, range, |r| async {
+        let off = range.start;
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
                 .await
                 .map_err(|e| translate(uri, e))
         })
-        .await
+        .await;
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+        }
+        out
     }
 
     /// Tail fetch on Azure. Unlike S3, object_store's Azure backend
@@ -276,10 +293,11 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
+        let n = bytes.len() as u64;
         // Re-issue transient failures like the read paths. Only
         // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` still
         // surfaces immediately; a create-only PUT that never landed is safe to retry.
-        retry::with_reissue(|| {
+        let out = retry::with_reissue(|| {
             let bytes = bytes.clone();
             async {
                 let opts = PutOptions {
@@ -293,7 +311,11 @@ impl StorageProvider for AzureStorageProvider {
                     .map_err(|e| translate(uri, e))
             }
         })
-        .await
+        .await;
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -320,11 +342,17 @@ impl StorageProvider for AzureStorageProvider {
                 ..Default::default()
             },
         };
-        self.store
+        let n = bytes.len() as u64;
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
@@ -337,6 +365,7 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
+        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -348,12 +377,14 @@ impl StorageProvider for AzureStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        let path = ObjPath::from(prefix);
+        crate::storage::io_counters::record_list();
+        let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            let location = meta.location.to_string();
             out.push((
-                meta.location.to_string(),
+                logical_list_key(&self.prefix, &location),
                 ObjectMeta {
                     size: meta.size,
                     etag: meta.e_tag,
@@ -461,9 +492,9 @@ mod tests {
     #[test]
     fn path_parses_nested_uri() {
         let p = test_provider()
-            .path("manifest-lists/list-000042.json")
+            .path("manifest/manifest-000042.json")
             .expect("parse");
-        assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
+        assert_eq!(p.to_string(), "manifest/manifest-000042.json");
     }
 
     #[test]

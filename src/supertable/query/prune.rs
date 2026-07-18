@@ -268,7 +268,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        superfile::builder::FtsConfig,
+        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             SupertableOptions,
             manifest::{
@@ -294,6 +294,7 @@ mod tests {
             ),
         );
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -304,6 +305,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -320,12 +322,13 @@ mod tests {
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
-            vector_summary_agg: aggs.vector_summary_agg,
         }
     }
 
     fn list_with(parts: Vec<ManifestPartEntry>) -> Manifest {
         Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
             tombstone_seqs: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
@@ -338,6 +341,10 @@ mod tests {
                 column: "_id".into(),
                 n_buckets: 64,
             },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts,
         }
     }
@@ -496,6 +503,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: titles.len() as u64,
@@ -506,6 +514,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -602,6 +611,7 @@ mod tests {
         );
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: bloom_tokens.len().max(1) as u64,
@@ -612,6 +622,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }

@@ -26,11 +26,14 @@
 //!
 //! [`SuperfileReader::byte_source`]: crate::superfile::SuperfileReader::byte_source
 
-use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::{fmt, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::{
     Attributes, CopyOptions, Error as OsError, GetOptions, GetRange, GetResult, GetResultPayload,
@@ -49,14 +52,13 @@ const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
 
 /// Read-only [`ObjectStore`] backed by per-superfile [`LazyByteSource`]s.
 ///
-/// Construct via [`from_sources`](Self::from_sources) with the byte
-/// sources the provider pulled from `superfile_reader`, register it on
-/// the DataFusion session, and point each `PartitionedFile` at the
-/// matching path. See the module docs.
+/// A pinned provider constructs one registry with [`Self::new`], fills it via
+/// [`Self::insert_source`] as immutable files are first opened, and reuses it
+/// for every DataFusion scan of that manifest.
 pub(crate) struct SuperfileObjectStore {
     /// One byte source per surviving superfile, keyed by the same path
     /// used to build the superfile's `PartitionedFile`.
-    sources: HashMap<ObjPath, Arc<dyn LazyByteSource>>,
+    sources: Arc<DashMap<ObjPath, Arc<dyn LazyByteSource>>>,
 }
 
 impl fmt::Debug for SuperfileObjectStore {
@@ -74,18 +76,39 @@ impl fmt::Display for SuperfileObjectStore {
 }
 
 impl SuperfileObjectStore {
+    /// Empty registry filled lazily as a pinned provider prepares files.
+    pub(crate) fn new() -> Self {
+        Self {
+            sources: Arc::new(DashMap::new()),
+        }
+    }
+
     /// Build the store from the superfile byte sources gathered during a
     /// scan. Each key is the path the matching `PartitionedFile` is
     /// created with.
+    #[cfg(test)]
     pub(crate) fn from_sources(sources: HashMap<ObjPath, Arc<dyn LazyByteSource>>) -> Self {
-        Self { sources }
+        let store = Self::new();
+        for (path, source) in sources {
+            store.insert_source(path, source);
+        }
+        store
     }
 
-    fn source(&self, location: &ObjPath) -> OsResult<&Arc<dyn LazyByteSource>> {
-        self.sources.get(location).ok_or_else(|| OsError::NotFound {
-            path: location.to_string(),
-            source: format!("superfile {location} not registered in SuperfileObjectStore").into(),
-        })
+    /// Register or refresh one immutable superfile's byte source.
+    pub(crate) fn insert_source(&self, location: ObjPath, source: Arc<dyn LazyByteSource>) {
+        self.sources.insert(location, source);
+    }
+
+    fn source(&self, location: &ObjPath) -> OsResult<Arc<dyn LazyByteSource>> {
+        self.sources
+            .get(location)
+            .map(|source| Arc::clone(source.value()))
+            .ok_or_else(|| OsError::NotFound {
+                path: location.to_string(),
+                source: format!("superfile {location} not registered in SuperfileObjectStore")
+                    .into(),
+            })
     }
 }
 

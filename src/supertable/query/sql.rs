@@ -19,7 +19,7 @@
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Use the reader's already-pinned `Arc<Manifest>`.
+//!   1. Use the reader's already-pinned `Arc<ManifestSnapshot>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.
@@ -51,7 +51,14 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::SchemaRef;
-use datafusion::{error::DataFusionError, execution::context::SessionContext, prelude::Expr};
+use std::{sync::Arc, time::Instant};
+use datafusion::{
+    datasource::DefaultTableSource,
+    error::DataFusionError,
+    execution::context::SessionContext,
+    logical_expr::{Expr, LogicalPlan},
+    prelude::Expr,
+};
 
 use crate::{
     memory::budgeted_session_context,
@@ -67,6 +74,7 @@ use crate::{
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
+        reader_cache::disk::ForegroundQueryGuard,
     },
 };
 
@@ -106,6 +114,37 @@ pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
         .collect();
     let scan = view_string_schema(&scalar, &fts);
     SqlSchemas { scalar, scan }
+
+/// Maximum distinct scalar SQL statements cached per manifest snapshot.
+const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
+
+/// Cache only plans whose table scans all use [`SupertableProvider`].
+///
+/// Search TVF providers hold a live reader in their logical plan. Caching
+/// those plans on `SupertableInner` would create a reference cycle; scalar
+/// providers own only the pinned manifest and storage/cache handles.
+fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
+    fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
+        if let LogicalPlan::TableScan(scan) = plan {
+            let Some(source) = scan.source.downcast_ref::<DefaultTableSource>() else {
+                return false;
+            };
+            if source
+                .table_provider
+                .downcast_ref::<SupertableProvider>()
+                .is_none()
+            {
+                return false;
+            }
+            *found_scan = true;
+        }
+        plan.inputs()
+            .into_iter()
+            .all(|input| visit(input, found_scan))
+    }
+
+    let mut found_scan = false;
+    visit(plan, &mut found_scan) && found_scan
 }
 
 /// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
@@ -118,6 +157,35 @@ fn exec_query_error(e: DataFusionError) -> QueryError {
 }
 
 impl SupertableReader {
+    fn cached_sql_logical_plan(&self, sql: &str) -> Option<LogicalPlan> {
+        let guard = self
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("sql logical-plan cache mutex poisoned");
+        let (manifest, plans) = guard.as_ref()?;
+        Arc::ptr_eq(manifest, self.manifest())
+            .then(|| plans.get(sql).cloned())
+            .flatten()
+    }
+
+    fn cache_sql_logical_plan(&self, sql: String, plan: LogicalPlan) {
+        let mut guard = self
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("sql logical-plan cache mutex poisoned");
+        if guard
+            .as_ref()
+            .is_none_or(|(manifest, _)| !Arc::ptr_eq(manifest, self.manifest()))
+        {
+            *guard = Some((Arc::clone(self.manifest()), Default::default()));
+        }
+        let (_, plans) = guard.as_mut().expect("cache initialized above");
+        if plans.len() >= SQL_LOGICAL_PLAN_CACHE_ENTRIES && !plans.contains_key(&sql) {
+            plans.clear();
+        }
+        plans.insert(sql, plan);
+    }
+
     /// Run a SQL query against this reader's pinned snapshot.
     ///
     /// The snapshot is captured at `query_sql` entry — concurrent
@@ -140,6 +208,7 @@ impl SupertableReader {
         tracing::instrument(skip_all, fields(sql = sql))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Read-consistency was applied when `Supertable::reader()` created
         // this pinned reader. SQL therefore observes the same snapshot as
         // `bm25_search` and `vector_search` on this handle.
@@ -148,6 +217,13 @@ impl SupertableReader {
         // snapshot — the pushdown-aware SupertableProvider plus the
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
+        let tombstone_prefetch = self.tombstone_cache.as_ref().and_then(|cache| {
+            let entries = self.manifest().complete_flat_superfiles()?;
+            let ids: Vec<_> = entries.iter().map(|entry| entry.superfile_id).collect();
+            Some((Arc::clone(cache), ids))
+        });
+        let cached_plan = self.cached_sql_logical_plan(sql);
+        let cache_reader = self.clone();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -159,6 +235,31 @@ impl SupertableReader {
             // The scan runs strings as `Utf8View`; `expand_views_at_output`
             // (set in `budgeted_session_context`) coerces them back to
             // `LargeUtf8` at the plan output, so the result carries no view.
+            // Exact manifest statistics can eliminate an unfiltered aggregate
+            // before `TableProvider::scan` runs, but only after every
+            // superfile's delete view is known. The ordinary scan performs the
+            // same prefetch; doing it before planning lets repeated aggregate
+            // queries avoid constructing a Parquet plan altogether.
+            if let Some((cache, ids)) = tombstone_prefetch {
+                cache.prefetch(&ids, Instant::now()).await;
+            }
+            let df = match cached_plan {
+                Some(plan) => ctx
+                    .execute_logical_plan(plan)
+                    .await
+                    .map_err(|e| QueryError::Plan(e.to_string()))?,
+                None => {
+                    let df = ctx
+                        .sql(&sql)
+                        .await
+                        .map_err(|e| QueryError::Plan(e.to_string()))?;
+                    let plan = df.logical_plan().clone();
+                    if cacheable_scalar_plan(&plan) {
+                        cache_reader.cache_sql_logical_plan(sql.clone(), plan);
+                    }
+                    df
+                }
+            };
             df.collect().await.map_err(exec_query_error)
         };
 
@@ -262,6 +363,7 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
@@ -369,6 +471,9 @@ mod tests {
         test_helpers::default_tokenizer as tok,
     };
 
+    /// One more than the manifest's exact-value cardinality cap.
+    const HIGH_CARDINALITY_ROWS: usize = 257;
+
     /// Schema with id + scalar + FTS column. No vector; query_sql
     /// is scalar-only by design.
     fn schema_id_cat_title() -> Arc<Schema> {
@@ -444,6 +549,30 @@ mod tests {
         w.append(&build_cat_batch(0, cats, titles)).expect("append");
         w.commit().expect("commit");
         st
+    fn rating_table(ratings: &[i64]) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "rating",
+            DataType::Int64,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool"),
+        );
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+            .expect("rating options")
+            .with_writer_pool(pool);
+        let table = Supertable::create(options).expect("create rating table");
+        let mut writer = table.writer().expect("rating writer");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ratings.to_vec()))])
+                .expect("rating batch");
+        writer.append(&batch).expect("append ratings");
+        writer.commit().expect("commit ratings");
+        drop(writer);
+        table
     }
 
     /// Convenience: run a query and pull a single `Int64` aggregate
@@ -457,6 +586,41 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("count column is Int64");
         n.value(0)
+    }
+
+    /// `extract_id_column` collects non-null Decimal128 `_id`s from single-column
+    /// batches and rejects a batch that isn't exactly one column.
+    #[test]
+    fn extract_id_column_reads_decimal128_and_rejects_multi_column() {
+        use arrow_array::ArrayRef;
+        let ids: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(1i128), Some(2), None, Some(3)])
+                .with_precision_and_scale(38, 0)
+                .expect("decimal"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "_id",
+            DataType::Decimal128(38, 0),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![ids]).expect("batch");
+        assert_eq!(
+            super::extract_id_column(&[batch]).expect("ids"),
+            vec![1i128, 2, 3]
+        );
+
+        let two = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+        )
+        .expect("two-col batch");
+        assert!(super::extract_id_column(&[two]).is_err());
     }
 
     #[test]
@@ -480,6 +644,44 @@ mod tests {
 
         let n = run_count(&st, "SELECT COUNT(*) FROM supertable");
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn query_sql_caches_scalar_plan_but_not_search_tvf_plan() {
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_cat_batch(0, &["rust"], &["searchable"]))
+            .expect("append");
+        writer.commit().expect("commit");
+        let reader = st.reader();
+        let scalar_sql = "SELECT COUNT(*) FROM supertable";
+
+        reader.query_sql(scalar_sql).expect("first scalar query");
+        reader.query_sql(scalar_sql).expect("cached scalar query");
+        {
+            let guard = reader
+                .sql_logical_plan_cache()
+                .lock()
+                .expect("plan cache lock");
+            let (_, plans) = guard.as_ref().expect("scalar plan cached");
+            assert_eq!(plans.len(), 1);
+            assert!(plans.contains_key(scalar_sql));
+        }
+
+        reader
+            .query_sql("SELECT _id FROM bm25_search('title', 'searchable', 10)")
+            .expect("search TVF query");
+        let guard = reader
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("plan cache lock");
+        let (_, plans) = guard.as_ref().expect("scalar plan remains cached");
+        assert_eq!(
+            plans.len(),
+            1,
+            "search TVF plans hold readers and must not enter the inner cache"
+        );
     }
 
     /// Regression test for the cold-reopen consumer leak. Running
@@ -537,14 +739,52 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_range_count_uses_exact_value_frequencies() {
+        let table = rating_table(&[0, 5, 9, 10, 10, 20, 99]);
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating < 10"),
+            3
+        );
+        assert_eq!(
+            run_count(
+                &table,
+                "SELECT COUNT(*) FROM supertable WHERE rating BETWEEN 10 AND 20"
+            ),
+            3
+        );
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating > 100"),
+            0
+        );
+    }
+
+    #[test]
+    fn query_sql_range_count_falls_back_above_value_count_cap() {
+        let ratings: Vec<i64> = (0..HIGH_CARDINALITY_ROWS)
+            .map(|value| value as i64)
+            .collect();
+        let table = rating_table(&ratings);
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating < 10"),
+            10
+        );
+    }
+
+    #[test]
     fn query_sql_group_by_over_budget_is_refused() {
         // The reader path (second production ctx site) is gated too: a 0-byte
-        // gate refuses the aggregate and surfaces as QueryError::OverBudget.
-        let (_dir, st) = zero_gate_reader_after_ingest(&build_cat_batch(
-            0,
-            &["rust", "python", "rust"],
-            &["a", "b", "c"],
-        ));
+        // gate refuses an aggregate that cannot fold from exact manifest
+        // value counts and surfaces as QueryError::OverBudget. High
+        // cardinality keeps the count-fold fast path out of play: a
+        // low-cardinality batch would fold COUNT DISTINCT from the
+        // manifest's exact value counts and never hit the gate.
+        let categories: Vec<String> = (0..HIGH_CARDINALITY_ROWS)
+            .map(|value| format!("category-{value}"))
+            .collect();
+        let category_refs: Vec<&str> = categories.iter().map(String::as_str).collect();
+        let titles = vec!["title"; HIGH_CARDINALITY_ROWS];
+        let (_dir, st) =
+            zero_gate_reader_after_ingest(&build_cat_batch(0, &category_refs, &titles));
 
         let err = st
             .reader()
@@ -1013,6 +1253,45 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_group_by_with_nulls_falls_back_and_keeps_null_group() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "category",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+            .expect("nullable category options");
+        let table = Supertable::create(options).expect("create");
+        let mut writer = table.writer().expect("writer");
+        let categories = LargeStringArray::from(vec![Some("rust"), None, Some("rust")]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(categories)]).expect("batch");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+
+        let batches = table
+            .reader()
+            .query_sql(
+                "SELECT category, COUNT(*) AS n FROM supertable \
+                 GROUP BY category ORDER BY category NULLS FIRST",
+            )
+            .expect("group by nullable category");
+        let categories = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("large utf8 category");
+        let counts = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 count");
+        assert!(categories.is_null(0));
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(categories.value(1), "rust");
+        assert_eq!(counts.value(1), 2);
+    }
+
+    #[test]
     fn query_sql_scans_across_multiple_superfiles() {
         // Three commits → three superfiles. SQL must aggregate across
         // all of them.
@@ -1396,6 +1675,7 @@ mod tests {
                 rot_seed: 0,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
+                provided_centroids: None,
             }],
             Some(tok()),
         )

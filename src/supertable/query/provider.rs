@@ -45,7 +45,7 @@
 
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     ops::Range,
     sync::{Arc, atomic},
@@ -56,6 +56,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{ColumnStatistics, DFSchema, Statistics, stats::Precision},
@@ -75,7 +76,10 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, try_join_all},
+};
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
@@ -88,11 +92,12 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::{
     superfile::{
-        LazyByteSource,
+        SuperfileReader,
         fts::{
             reader::BoolMode,
             tokenize::{Tokenizer, unique_tokens},
@@ -100,7 +105,7 @@ use crate::{
     },
     supertable::{
         SuperfileEntry,
-        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch},
+        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::CandidatePlan,
@@ -133,6 +138,22 @@ const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// One immutable superfile's query-independent Parquet scan inputs.
+///
+/// A provider is already pinned to one manifest, so these values cannot change
+/// during its lifetime. Caching them avoids reopening every surviving
+/// superfile, recreating byte-source wrappers, and rebuilding row-group counts
+/// on every SQL statement.
+struct PreparedScanFile {
+    reader: Arc<SuperfileReader>,
+    path: ObjPath,
+    size: u64,
+    row_counts: Arc<[u32]>,
+}
+
+/// Concurrent first-open coalescing for one immutable superfile.
+type PreparedScanCell = Arc<OnceCell<Arc<PreparedScanFile>>>;
 
 /// Selectivity gate for the FTS `WHERE` pushdown: only push an index
 /// candidate set into the scan when the estimated match count is at
@@ -190,6 +211,19 @@ pub(crate) struct SupertableProvider {
     /// rewrite's idempotency guard: a restricted provider is never
     /// rewritten again.
     segment_filter: Option<HashSet<Uuid>>,
+    /// Query-independent scan setup, filled lazily per superfile. Residual
+    /// providers share this cache with their parent because both pin the same
+    /// manifest and immutable files.
+    prepared_scan_files: Arc<DashMap<Uuid, PreparedScanCell>>,
+    /// Stable DataFusion object-store registry for this pinned manifest.
+    /// Prepared files populate it once; scans reuse it rather than rebuilding
+    /// a path→source map for every SQL statement.
+    scan_store: Arc<SuperfileObjectStore>,
+    /// Open-time Parquet metadata shared by every scan and residual provider.
+    scan_metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    /// Exact table-level low-cardinality frequencies, merged lazily per
+    /// column from this provider's immutable manifest snapshot.
+    scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -202,6 +236,7 @@ impl fmt::Debug for SupertableProvider {
             .field("n_superfiles", &self.manifest.superfiles.len())
             .field("has_disk_cache", &self.disk_cache.is_some())
             .field("has_tombstone_cache", &self.tombstone_cache.is_some())
+            .field("prepared_scan_files", &self.prepared_scan_files.len())
             .finish()
     }
 }
@@ -254,6 +289,10 @@ impl SupertableProvider {
             tombstone_cache,
             store_url,
             segment_filter: None,
+            prepared_scan_files: Arc::new(DashMap::new()),
+            scan_store: Arc::new(SuperfileObjectStore::new()),
+            scan_metas: Arc::new(DashMap::new()),
+            scalar_value_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -270,6 +309,10 @@ impl SupertableProvider {
             self.tombstone_cache.clone(),
         );
         restricted.segment_filter = Some(segments);
+        restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
+        restricted.scan_store = Arc::clone(&self.scan_store);
+        restricted.scan_metas = Arc::clone(&self.scan_metas);
+        restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
         restricted
     }
 
@@ -295,6 +338,31 @@ impl SupertableProvider {
                 .map(|bitmap| bitmap.is_empty())
                 .unwrap_or(false),
         }
+    }
+
+    /// Exact table-wide frequencies for one low-cardinality column. Merged
+    /// once per immutable provider snapshot and cached for later statements.
+    pub(crate) fn exact_value_counts(&self, column: &str) -> Option<Arc<ScalarValueCounts>> {
+        if let Some(cached) = self.scalar_value_counts.get(column) {
+            return cached.value().clone();
+        }
+        let merged = self
+            .manifest
+            .complete_flat_superfiles()
+            .and_then(|entries| {
+                let mut merged: Option<ScalarValueCounts> = None;
+                for entry in entries {
+                    let counts = entry.scalar_stats.get(column)?.value_counts.as_ref()?;
+                    merged = Some(match merged {
+                        None => counts.clone(),
+                        Some(current) => current.merged_with(counts)?,
+                    });
+                }
+                merged.map(Arc::new)
+            });
+        self.scalar_value_counts
+            .insert(column.to_string(), merged.clone());
+        merged
     }
 
     /// Lower scalar predicates to prune leaves. Each predicate yields a
@@ -369,6 +437,64 @@ impl SupertableProvider {
             .iter()
             .map(|c| c.column.as_str())
             .collect()
+    }
+
+    /// Open and prepare one superfile once for this pinned manifest.
+    ///
+    /// The [`OnceCell`] coalesces concurrent first scans. Errors are not
+    /// cached, so a transient storage failure can be retried by the next query.
+    async fn prepared_scan_file(
+        &self,
+        entry: &Arc<SuperfileEntry>,
+    ) -> DfResult<Arc<PreparedScanFile>> {
+        let cell = self
+            .prepared_scan_files
+            .entry(entry.superfile_id)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+        if let Some(prepared) = cell.get() {
+            return Ok(Arc::clone(prepared));
+        }
+
+        let store = Arc::clone(&self.store);
+        let disk_cache = self.disk_cache.clone();
+        let storage = self.manifest.options.storage.clone();
+        let scan_store = Arc::clone(&self.scan_store);
+        let scan_metas = Arc::clone(&self.scan_metas);
+        let entry = Arc::clone(entry);
+        let prepared = cell
+            .get_or_try_init(|| async move {
+                let reader = superfile_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry.uri,
+                    entry.subsection_offsets.as_ref(),
+                    true,
+                )
+                .await
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let path = ObjPath::from(entry.uri.storage_path());
+                let source = reader.byte_source();
+                let size = source.size();
+                let parquet_meta = Arc::clone(reader.parquet_metadata());
+                let row_counts: Arc<[u32]> = parquet_meta
+                    .row_groups()
+                    .iter()
+                    .map(|row_group| row_group.num_rows() as u32)
+                    .collect::<Vec<_>>()
+                    .into();
+                scan_store.insert_source(path.clone(), source);
+                scan_metas.insert(path.clone(), parquet_meta);
+                Ok::<Arc<PreparedScanFile>, DataFusionError>(Arc::new(PreparedScanFile {
+                    path,
+                    size,
+                    row_counts,
+                    reader,
+                }))
+            })
+            .await?;
+        Ok(Arc::clone(prepared))
     }
 
     /// Test hook: how many superfiles survive pruning for `filters` — the
@@ -600,19 +726,18 @@ impl TableProvider for SupertableProvider {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
-    /// Whole-table statistics from the manifest (no I/O) — feeds
-    /// logical planning; the physical fold reads the scan node's
+    /// Whole-table statistics from a complete resident manifest view (no I/O)
+    /// — feeds logical planning; the physical fold reads the scan node's
     /// statistics, attached in [`scan`](Self::scan).
     fn statistics(&self) -> Option<Statistics> {
-        // Hierarchical manifests keep segments inside lazily-loaded
-        // parts; the flat `superfiles` view may be empty or partial
-        // there, so whole-table claims would be wrong. The scan-level
-        // statistics (computed from the actually-flattened survivors)
-        // still apply in that mode.
-        if !self.manifest.is_in_process_only() {
-            return None;
-        }
-        Some(self.statistics_for(&self.manifest.superfiles))
+        // A persisted table often has already hydrated every part at open.
+        // Expose exact stats in that case so DataFusion can fold unfiltered
+        // COUNT/MIN/MAX before it invokes `scan`. A genuinely lazy partial
+        // view still returns `None`; claiming whole-table stats there would
+        // silently under-count.
+        self.manifest
+            .complete_flat_superfiles()
+            .map(|entries| self.statistics_for(entries))
     }
 
     async fn scan(
@@ -667,42 +792,20 @@ impl TableProvider for SupertableProvider {
             &self.fts_cols_set(),
             self.manifest.options.tokenizer.as_ref(),
         );
-
-        // Every surviving superfile is read through the one byte path the
-        // FTS/vector resolve path uses: `superfile_reader(...)` ->
-        // `SuperfileReader::byte_source()`. Warm / mmap superfiles slice
-        // their resident bytes zero-copy; cold superfiles range-fetch from
-        // object storage through the same source. The provider never
-        // branches on which — that distinction lives entirely inside the
-        // byte source.
-        let mut sources: HashMap<ObjPath, Arc<dyn LazyByteSource>> = HashMap::new();
+        let prepared_files =
+            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's
         // footer through the same byte source).
         struct SuperfileScan {
-            path: ObjPath,
-            size: u64,
+            prepared: Arc<PreparedScanFile>,
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
-            /// Footer metadata the segment's reader parsed at open —
-            /// row-group counts and DataFusion's opener both read from
-            /// this; the scan never re-parses a footer.
-            parquet_meta: Arc<ParquetMetaData>,
         }
         let mut superfiles: Vec<SuperfileScan> = Vec::with_capacity(survivors.len());
 
-        for entry in &survivors {
-            let reader = superfile_reader(
-                &self.store,
-                self.disk_cache.as_ref(),
-                self.manifest.options.storage.as_ref(),
-                &entry.uri,
-                entry.subsection_offsets.as_ref(),
-            )
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
+        for (entry, prepared) in survivors.iter().zip(prepared_files) {
             // Pass 1 (per superfile): resolve candidate rows from the
             // index. `None` => no usable bound, scan the superfile.
             //
@@ -716,17 +819,17 @@ impl TableProvider for SupertableProvider {
             // superfiles; the density cap binds even under the floor so
             // an all-matching predicate never takes the index path.
             let est = candidate_plan
-                .estimate(reader.as_ref())
+                .estimate(prepared.reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let gate =
-                ((reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64).max(PUSHDOWN_MIN_ROWS);
-            let density_cap = (reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
+                .max(PUSHDOWN_MIN_ROWS);
+            let density_cap = (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
             let candidates = if est > gate || est >= density_cap {
                 None
             } else {
                 candidate_plan
-                    .evaluate(reader.as_ref())
+                    .evaluate(prepared.reader.as_ref())
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
             };
@@ -739,21 +842,15 @@ impl TableProvider for SupertableProvider {
                 None => Arc::new(RoaringBitmap::new()),
             };
 
-            let source = reader.byte_source();
-            let size = source.size();
-            let path = ObjPath::from(entry.uri.storage_path());
-            sources.insert(path.clone(), source);
             superfiles.push(SuperfileScan {
-                path,
-                size,
+                prepared,
                 candidates,
                 tombstones,
-                parquet_meta: Arc::clone(reader.parquet_metadata()),
             });
         }
 
         // The single object store DataFusion reads every survivor through.
-        let store: Arc<dyn OsObjectStore> = Arc::new(SuperfileObjectStore::from_sources(sources));
+        let store: Arc<dyn OsObjectStore> = self.scan_store.clone();
 
         // Build each superfile's PartitionedFile + access plan. An access
         // plan exists only when the index bounded the rows or tombstones
@@ -763,17 +860,15 @@ impl TableProvider for SupertableProvider {
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(superfiles.len());
         for seg in &superfiles {
             let access_plan = if seg.candidates.is_some() || !seg.tombstones.is_empty() {
-                let row_counts: Vec<u32> = seg
-                    .parquet_meta
-                    .row_groups()
-                    .iter()
-                    .map(|rg| rg.num_rows() as u32)
-                    .collect();
-                build_access_plan(&row_counts, &seg.candidates, &seg.tombstones)
+                build_access_plan(
+                    seg.prepared.row_counts.as_ref(),
+                    &seg.candidates,
+                    &seg.tombstones,
+                )
             } else {
                 None
             };
-            let mut file = PartitionedFile::new(seg.path.to_string(), seg.size);
+            let mut file = PartitionedFile::new(seg.prepared.path.to_string(), seg.prepared.size);
             if let Some(plan) = access_plan {
                 // DataFusion 54 keys file extensions by concrete type and reads
                 // the access plan via `extensions.get::<ParquetAccessPlan>()`, so
@@ -820,16 +915,12 @@ impl TableProvider for SupertableProvider {
         // parsed — without this the opener re-reads + re-parses every
         // superfile's footer on every query (~half the warm flat cost
         // at 256 superfiles).
-        let metas: HashMap<ObjPath, Arc<ParquetMetaData>> = superfiles
-            .iter()
-            .map(|s| (s.path.clone(), Arc::clone(&s.parquet_meta)))
-            .collect();
         source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
             store: Arc::clone(&store),
-            metas,
+            metas: Arc::clone(&self.scan_metas),
         }));
 
-        // Manifest-derived statistics for the scan node. Exact only
+        // ManifestSnapshot-derived statistics for the scan node. Exact only
         // when the scan emits exactly the survivor rows minus
         // tombstones — i.e. no filters (no index candidate bounding,
         // no FilterExec re-verification above). With filters the scan
@@ -978,7 +1069,7 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
 struct CachedMetadataReaderFactory {
     store: Arc<dyn OsObjectStore>,
-    metas: HashMap<ObjPath, Arc<ParquetMetaData>>,
+    metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
 }
 
 impl fmt::Debug for CachedMetadataReaderFactory {
@@ -1037,7 +1128,10 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
             inner = inner.with_footer_size_hint(hint);
         }
         Ok(Box::new(CachedMetadataReader {
-            meta: self.metas.get(location).cloned(),
+            meta: self
+                .metas
+                .get(location)
+                .map(|meta| Arc::clone(meta.value())),
             inner,
         }))
     }
@@ -1431,6 +1525,8 @@ fn row_group_predicate(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -1443,7 +1539,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        superfile::builder::FtsConfig,
+        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri},
@@ -1560,6 +1656,41 @@ mod tests {
             }
         }
         got
+    }
+
+    /// `flip_op` swaps a comparison to read column-on-right as column-on-left;
+    /// equality operators are unchanged.
+    #[test]
+    fn flip_op_swaps_directional_comparisons() {
+        use super::{ScalarOp, flip_op};
+        assert!(matches!(flip_op(ScalarOp::Lt), ScalarOp::Gt));
+        assert!(matches!(flip_op(ScalarOp::LtEq), ScalarOp::GtEq));
+        assert!(matches!(flip_op(ScalarOp::Gt), ScalarOp::Lt));
+        assert!(matches!(flip_op(ScalarOp::GtEq), ScalarOp::LtEq));
+        assert!(matches!(flip_op(ScalarOp::Eq), ScalarOp::Eq));
+        assert!(matches!(flip_op(ScalarOp::NotEq), ScalarOp::NotEq));
+    }
+
+    /// `collect_null_leaves` emits a leaf per `IS [NOT] NULL` on a known
+    /// column, descends `AND`, and declines unknown columns.
+    #[test]
+    fn collect_null_leaves_emits_for_known_columns_under_and() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema, SchemaRef};
+        use datafusion::prelude::col;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let expr = col("a").is_null().and(col("b").is_not_null());
+        let mut out = Vec::new();
+        super::collect_null_leaves(&expr, &schema, &mut out);
+        assert_eq!(out.len(), 2, "one leaf per null-check on a known column");
+
+        let mut unknown = Vec::new();
+        super::collect_null_leaves(&col("missing").is_null(), &schema, &mut unknown);
+        assert!(unknown.is_empty(), "unknown column declines");
     }
 
     #[test]
@@ -2167,6 +2298,31 @@ mod tests {
         assert_eq!(rt.block_on(restricted.surviving_superfile_count(&[])), 1);
     }
 
+    #[test]
+    fn prepared_scan_file_is_shared_with_residual_provider() {
+        let (provider, rt) = provider_over_two_superfiles();
+        let entry = Arc::clone(&provider.manifest().superfiles[0]);
+        let prepared = rt
+            .block_on(provider.prepared_scan_file(&entry))
+            .expect("prepare parent scan file");
+        assert_eq!(provider.prepared_scan_files.len(), 1);
+        assert_eq!(
+            prepared.row_counts.iter().copied().sum::<u32>() as u64,
+            entry.n_docs
+        );
+
+        let restricted =
+            provider.restricted_to([entry.superfile_id].into_iter().collect::<HashSet<_>>());
+        let reused = rt
+            .block_on(restricted.prepared_scan_file(&entry))
+            .expect("reuse prepared scan file");
+        assert!(Arc::ptr_eq(&prepared, &reused));
+        assert!(Arc::ptr_eq(
+            &provider.prepared_scan_files,
+            &restricted.prepared_scan_files
+        ));
+    }
+
     // ---- Scalar aggregate helpers over a numeric column -------------
 
     fn num_schema() -> SchemaRef {
@@ -2237,6 +2393,7 @@ mod tests {
         let mut scalar_stats = HashMap::new();
         scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: Uuid::new_v4(),
             uri: SuperfileUri::new_v4(),
             n_docs: 1,
@@ -2247,6 +2404,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -2285,7 +2443,7 @@ mod tests {
         let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
         let factory = CachedMetadataReaderFactory {
             store,
-            metas: HashMap::new(),
+            metas: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(

@@ -37,7 +37,14 @@ use std::{
     thread,
 };
 
-use tokio::{runtime, task::block_in_place};
+use tokio::{
+    runtime::{self, Handle, Runtime},
+    task::block_in_place,
+};
+
+/// Fallback worker count for [`build_query_runtime`] when the host's available
+/// parallelism can't be determined.
+const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
 
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
@@ -64,10 +71,17 @@ where
 /// one-shot one per call.
 ///
 /// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
-pub(crate) fn bridge_on_runtime<F: Future>(fut: F, fallback: &runtime::Runtime) -> F::Output {
-    match runtime::Handle::try_current() {
-        Ok(handle) => block_in_place(|| handle.block_on(fut)),
-        Err(_) => fallback.block_on(fut),
+pub(crate) fn bridge_on_runtime<F: Future>(fut: F, runtime: &Runtime) -> F::Output {
+    // Always drive on the passed `runtime` — callers hand us the runtime the
+    // future's async resources are bound to (e.g. `query_runtime`, where the
+    // disk cache's coordination lives). Driving on a *different* ambient
+    // runtime instead awaits those resources cross-runtime and can lose the
+    // wakeup → deadlock (e.g. a cold disk-cache fetch during search). When an
+    // ambient runtime is present, escape its worker via `block_in_place` so the
+    // nested `block_on` is legal.
+    match Handle::try_current() {
+        Ok(_ambient) => block_in_place(|| runtime.handle().block_on(fut)),
+        Err(_) => runtime.block_on(fut),
     }
 }
 
@@ -120,7 +134,6 @@ pub(crate) fn shared_io_runtime() -> Arc<runtime::Runtime> {
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
 fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
-    const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
     let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);

@@ -34,6 +34,7 @@
 //! layer below in [`crate::storage::StorageProvider`]; the
 //! `DiskCacheStore` is built on top of it.
 
+pub mod block_source;
 pub mod config;
 pub mod disk;
 pub mod in_memory;

@@ -5,7 +5,7 @@
 //!
 //! Regression coverage for the commit-path manifest the writer
 //! installs in `inner.manifest` after a commit (via
-//! `Manifest::rebalance`). The producer handle keeps querying its
+//! `ManifestSnapshot::rebalance`). The producer handle keeps querying its
 //! own committed state without reopening, so the post-commit
 //! manifest must be able to resolve the parts it just wrote:
 //!
@@ -207,12 +207,92 @@ fn parts_cache_stays_bounded_across_repeated_commits() {
     }
 }
 
-/// Storage proxy that counts `get`s into the manifest-parts
-/// namespace, delegating everything else to the inner provider.
+// ============================================================
+// Metadata-GET law: open costs a fixed pointer + list + part
+// fetch. On the read path the ONLY metadata I/O is the
+// BoundedStaleness freshness check — one pointer GET at most
+// once per window, which short-circuits (`AlreadyLoaded`)
+// before any list/part fetch when the pointer hasn't advanced.
+// Lists and parts are never re-fetched by reads.
+// ============================================================
+
+/// Staleness window wide enough that only the FIRST query's freshness
+/// check can fire during the test — every later read must be GET-free.
+const WIDE_STALENESS_SECS: u64 = 3600;
+
+#[test]
+fn open_metadata_cost_is_fixed_and_reads_check_pointer_once_per_window() {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+    // Producer: two commits so multiple parts/entries exist.
+    {
+        let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+            .expect("create");
+        for text in ["alpha bravo", "charlie delta"] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&[text])).expect("append");
+            w.commit().expect("commit");
+        }
+    }
+
+    // Consumer behind the counting proxy.
+    let counter = Arc::new(PartGetCounter::new(local));
+    let storage: Arc<dyn StorageProvider> = Arc::clone(&counter) as Arc<dyn StorageProvider>;
+    let st = Supertable::open(
+        default_supertable_options()
+            .with_storage(storage)
+            .with_read_consistency(Consistency::BoundedStaleness(
+                std::time::Duration::from_secs(WIDE_STALENESS_SECS),
+            )),
+    )
+    .expect("open");
+
+    // Open cost is fixed and small: one pointer GET, one list GET, and the
+    // eager part fetch.
+    assert_eq!(
+        counter.pointer_gets(),
+        1,
+        "open must read the pointer object exactly once"
+    );
+    assert_eq!(counter.list_gets(), 1, "open fetches the list by URI once");
+    assert_eq!(
+        counter.part_gets(),
+        1,
+        "single-bucket table: open eager-loads exactly one part"
+    );
+
+    // Reads: the FIRST query pays the one freshness check for the
+    // staleness window — a single pointer GET whose unchanged pointer
+    // short-circuits (`AlreadyLoaded`) before any list/part fetch.
+    // Every further read inside the window issues zero metadata GETs;
+    // the resident flat view serves them all.
+    for _ in 0..3 {
+        let hits = st
+            .reader()
+            .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
+            .expect("query");
+        assert_eq!(hits.len(), 1);
+    }
+    assert_eq!(
+        counter.pointer_gets(),
+        2,
+        "reads perform exactly one freshness pointer check per staleness window"
+    );
+    assert_eq!(counter.list_gets(), 1, "reads must never fetch a list");
+    assert_eq!(counter.part_gets(), 1, "reads must never fetch a part");
+}
+
+/// Storage proxy that counts `get`s into the manifest metadata
+/// namespaces (pointer / lists / parts), delegating everything else
+/// to the inner provider.
 #[derive(Debug)]
 struct PartGetCounter {
     inner: Arc<dyn StorageProvider>,
     part_gets: AtomicUsize,
+    list_gets: AtomicUsize,
+    pointer_gets: AtomicUsize,
 }
 
 impl PartGetCounter {
@@ -220,11 +300,21 @@ impl PartGetCounter {
         Self {
             inner,
             part_gets: AtomicUsize::new(0),
+            list_gets: AtomicUsize::new(0),
+            pointer_gets: AtomicUsize::new(0),
         }
     }
 
     fn part_gets(&self) -> usize {
         self.part_gets.load(Ordering::Acquire)
+    }
+
+    fn list_gets(&self) -> usize {
+        self.list_gets.load(Ordering::Acquire)
+    }
+
+    fn pointer_gets(&self) -> usize {
+        self.pointer_gets.load(Ordering::Acquire)
     }
 }
 
@@ -235,8 +325,14 @@ impl StorageProvider for PartGetCounter {
     }
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        if uri.starts_with(MANIFEST_PARTS_PREFIX) {
+        if uri.starts_with(MANIFEST_PARTS_PREFIX) || uri.starts_with("manifest-parts/") {
             self.part_gets.fetch_add(1, Ordering::AcqRel);
+        }
+        if uri.starts_with("manifest/") {
+            self.list_gets.fetch_add(1, Ordering::AcqRel);
+        }
+        if uri == "_supertable/current" {
+            self.pointer_gets.fetch_add(1, Ordering::AcqRel);
         }
         self.inner.get(uri).await
     }

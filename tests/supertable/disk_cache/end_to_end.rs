@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use infino::{
     supertable::{
         Supertable,
@@ -83,10 +84,9 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     // disk cache → cold-fetch from storage.
     let batches = consumer
         .reader()
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .query_sql("SELECT title FROM supertable ORDER BY _id")
         .expect("first query");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
     let mid_stats = cache.stats();
     assert!(
@@ -108,7 +108,7 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     // Second query against the same superfile — warm hit.
     let _batches = consumer
         .reader()
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
+        .query_sql("SELECT title FROM supertable ORDER BY _id")
         .expect("second query");
     let post_stats = cache.stats();
     assert_eq!(

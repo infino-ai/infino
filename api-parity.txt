@@ -25,4 +25,3 @@ Supertable::update	covered	(&self, Expr, &RecordBatch) -> Result<MutationStats, 
 Supertable::vector_search	covered	(&self, &str, &[f32], usize, VectorSearchOptions, Option<VectorFilter<'_>>, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 connect	covered	(impl AsRef<str>) -> Result<Connection, InfinoError>
 connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, InfinoError>
-

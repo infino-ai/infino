@@ -25,11 +25,14 @@ use thiserror::Error;
 use uuid::Uuid;
 use zstd::stream;
 
-use crate::supertable::manifest::{
-    SubsectionOffsets, SuperfileEntry, SuperfileUri,
-    encoding::{
-        DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
-        encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+use crate::{
+    superfile::vector::layout::VectorLayout,
+    supertable::manifest::{
+        SubsectionOffsets, SuperfileEntry, SuperfileUri,
+        encoding::{
+            DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
+            encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+        },
     },
 };
 
@@ -239,7 +242,9 @@ fn schema() -> &'static AvroSchema {
                 {"name": "scalar_stats", "type": "bytes"},
                 {"name": "fts_summary", "type": "bytes"},
                 {"name": "vector_summary", "type": "bytes"},
-                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null}
+                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
+                {"name": "vector_layout", "type": ["null", "string"], "default": null},
+                {"name": "birth_version", "type": "long", "default": 0}
               ]
             }}}
           ]
@@ -249,18 +254,19 @@ fn schema() -> &'static AvroSchema {
     })
 }
 
-/// Encode a [`ManifestPart`] to Avro bytes wrapped in a zstd
-/// frame, returning the bytes + their `ContentHash`.
+/// Encode a [`ManifestPart`] to raw Avro datum bytes.
 ///
-/// The hash is the blake3 of the **compressed** bytes — the
-/// URI uses the same form, so a re-write of bit-identical
-/// content produces the same URI (the load-bearing property
-/// for cross-version part sharing).
+/// Deliberately uncompressed: part payloads are dominated by fp32
+/// centroid summaries and open-blob bytes that compress poorly, byte
+/// volume is not the priced dimension (requests are), and the zstd
+/// decode used to serialize the cold-open path (measured: 18 parts /
+/// 507 MiB decoded one-at-a-time ≈ 27 s of open latency at 10M docs).
+/// [`decode`] still reads legacy zstd-framed parts by magic-byte sniff.
 ///
-/// `zstd_level` is the compression level (1..=22); v1 default
-/// is 3 (matches Iceberg's manifest-file default; good
-/// time/space trade for sub-MB Avro payloads).
-pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
+/// Content addressing hashes the stored bytes — a re-encode of
+/// bit-identical logical content produces the same URI (the
+/// load-bearing property for cross-version part sharing).
+pub fn encode(part: &ManifestPart) -> Vec<u8> {
     // Use schemaless Avro datum encoding (no OCF container).
     // The OCF wrapper carries a random 16-byte sync marker, which
     // would break content-addressing: encoding the same logical
@@ -317,6 +323,17 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
                         None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
                     },
                 ),
+                (
+                    "vector_layout".into(),
+                    AvroValue::Union(
+                        AVRO_UNION_VALUE_INDEX,
+                        Box::new(AvroValue::String(seg.vector_layout.as_kv_value().into())),
+                    ),
+                ),
+                (
+                    "birth_version".into(),
+                    AvroValue::Long(seg.birth_version as i64),
+                ),
             ])
         })
         .collect();
@@ -333,22 +350,36 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
         ("superfiles".into(), AvroValue::Array(superfile_records)),
     ]);
 
-    let avro_bytes = to_avro_datum(schema(), record).expect("avro datum encode");
-    stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
+    to_avro_datum(schema(), record).expect("avro datum encode")
 }
 
-/// Decode a manifest-part byte buffer (zstd-wrapped Avro)
-/// back into a [`ManifestPart`].
+/// Leading magic of a zstd frame (little-endian `0xFD2FB528`). Parts
+/// written before compression was dropped start with it; raw Avro datum
+/// bytes cannot (the first byte is a record field's string length, and the
+/// full four-byte sequence never prefixes our schema's encoding).
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Decode a manifest-part byte buffer back into a [`ManifestPart`].
+///
+/// Accepts both encodings: raw Avro datum bytes (current writers) and
+/// legacy zstd-framed Avro (sniffed by the frame magic).
 ///
 /// Verifies format-version compatibility (major must match
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    let avro_bytes = stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+    let legacy_decompressed;
+    let avro_bytes: &[u8] = if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
+        legacy_decompressed =
+            stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+        &legacy_decompressed
+    } else {
+        bytes
+    };
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
     // reader doesn't need a wire-side schema.
-    let mut cursor = Cursor::new(avro_bytes.as_slice());
+    let mut cursor = Cursor::new(avro_bytes);
     let value = from_avro_datum(schema(), &mut cursor, None)
         .map_err(|e| PartParseError::Avro(e.to_string()))?;
 
@@ -420,6 +451,15 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     let subsection_offsets = take_optional_bytes(&mut map, "subsection_offsets")?
         .map(|b| decode_subsection_offsets(&b))
         .transpose()?;
+    let vector_layout = take_optional_string(&mut map, "vector_layout")?
+        .and_then(|s| VectorLayout::from_kv_value(&s))
+        .unwrap_or(VectorLayout::Ivf);
+    // Tolerant of absence (0 = genesis) so parts written before the field
+    // decode losslessly.
+    let birth_version = match map.remove("birth_version") {
+        Some(AvroValue::Long(n)) => n as u64,
+        _ => 0,
+    };
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -433,6 +473,8 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         partition_key,
         partition_hint,
         subsection_offsets,
+        vector_layout,
+        birth_version,
     })
 }
 
@@ -509,6 +551,26 @@ fn take_optional_int(
         AvroValue::Null => Ok(None),
         AvroValue::Int(v) => Ok(Some(v)),
         _ => Err(PartParseError::WrongFieldType(name)),
+    }
+}
+
+/// Pull an optional string field. Missing-key returns `Ok(None)` so
+/// new schema fields stay backward-compatible with parts emitted
+/// before they were added.
+fn take_optional_string(
+    map: &mut HashMap<String, AvroValue>,
+    name: &'static str,
+) -> Result<Option<String>, PartParseError> {
+    match map.remove(name) {
+        None => Ok(None),
+        Some(AvroValue::Union(_, boxed)) => match *boxed {
+            AvroValue::Null => Ok(None),
+            AvroValue::String(s) => Ok(Some(s)),
+            _ => Err(PartParseError::WrongFieldType(name)),
+        },
+        Some(AvroValue::Null) => Ok(None),
+        Some(AvroValue::String(s)) => Ok(Some(s)),
+        Some(_) => Err(PartParseError::WrongFieldType(name)),
     }
 }
 
@@ -728,14 +790,13 @@ mod tests {
     use super::*;
     use crate::supertable::{
         SuperfileEntry, SuperfileUri,
-        manifest::{
-            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder,
-        },
+        manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder},
     };
 
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs,
@@ -746,6 +807,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
     }
@@ -771,8 +833,7 @@ mod tests {
         let centroid: Vec<f32> = (0..dim).map(|i| seed + i as f32 * 0.001).collect();
         VectorSummary {
             centroid,
-            radius: seed * 1.7,
-            clusters: ClusterCentroids::empty(),
+            cells: Vec::new(),
         }
     }
 
@@ -828,6 +889,7 @@ mod tests {
         vec_summary.insert("img".into(), make_vector_summary(16, 1.25));
 
         Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 12_345,
@@ -838,6 +900,7 @@ mod tests {
             vector_summary: vec_summary,
             partition_key: vec![0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             partition_hint: Some(13),
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(SubsectionOffsets {
                 total_size: 12_345_678,
                 vec: Some((123_456, 78_910)),
@@ -902,11 +965,6 @@ mod tests {
                 .vector_summary
                 .get(k)
                 .unwrap_or_else(|| panic!("missing vec col {k}"));
-            assert_eq!(
-                av.radius.to_bits(),
-                bv.radius.to_bits(),
-                "vec {k} radius bits"
-            );
             assert_eq!(av.centroid.len(), bv.centroid.len(), "vec {k} dim");
             for (i, (af, bf)) in av.centroid.iter().zip(bv.centroid.iter()).enumerate() {
                 assert_eq!(
@@ -921,7 +979,7 @@ mod tests {
     #[test]
     fn empty_part_roundtrip() {
         let part = fresh_part(vec![]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode empty");
         assert_eq!(decoded.format_version, FORMAT_VERSION);
         assert_eq!(decoded.part_id, part.part_id);
@@ -931,7 +989,7 @@ mod tests {
     #[test]
     fn single_minimal_superfile_roundtrip() {
         let part = fresh_part(vec![fresh_superfile(100)]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode minimal");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_superfiles_equal(&decoded.superfiles[0], &part.superfiles[0]);
@@ -941,7 +999,7 @@ mod tests {
     fn multi_superfile_with_full_summaries_roundtrip() {
         let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_superfile()).collect();
         let part = fresh_part(superfiles);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode rich");
         assert_eq!(decoded.superfiles.len(), 5);
         for (a, b) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
@@ -952,7 +1010,7 @@ mod tests {
     #[test]
     fn content_hash_covers_all_bytes() {
         let part = fresh_part(vec![make_rich_superfile()]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let hash = ContentHash::of(&bytes);
 
         let mut tampered = bytes.clone();
@@ -982,8 +1040,8 @@ mod tests {
             superfiles,
         };
 
-        let bytes_a = encode(&part_a, 3);
-        let bytes_b = encode(&part_b, 3);
+        let bytes_a = encode(&part_a);
+        let bytes_b = encode(&part_b);
         assert_eq!(bytes_a, bytes_b, "same logical content → same bytes");
         assert_eq!(
             ContentHash::of(&bytes_a),
@@ -996,6 +1054,7 @@ mod tests {
     fn partition_hint_some_and_none_both_roundtrip() {
         let id = Uuid::new_v4();
         let seg_with = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 1,
@@ -1006,10 +1065,12 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
             partition_hint: Some(0xdead_beef),
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         });
         let id2 = Uuid::new_v4();
         let seg_without = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id2,
             uri: SuperfileUri(id2),
             n_docs: 1,
@@ -1020,10 +1081,11 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg_with.clone(), seg_without.clone()]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode mixed-hint");
         assert_eq!(decoded.superfiles.len(), 2);
         assert_eq!(decoded.superfiles[0].partition_hint, Some(0xdead_beef));
@@ -1036,7 +1098,7 @@ mod tests {
     fn incompatible_major_version_rejected() {
         let mut part = fresh_part(vec![fresh_superfile(1)]);
         part.format_version = "2.0".into();
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let err = decode(&bytes).expect_err("major 2 must reject");
         assert!(
             matches!(err, PartParseError::IncompatibleMajorVersion { .. }),
@@ -1048,7 +1110,7 @@ mod tests {
     fn minor_version_compatible() {
         let mut part = fresh_part(vec![fresh_superfile(7)]);
         part.format_version = "1.99".into();
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("minor 99 must accept");
         assert_eq!(decoded.format_version, "1.99");
         assert_eq!(decoded.superfiles.len(), 1);
@@ -1057,7 +1119,7 @@ mod tests {
     #[test]
     fn zstd_corruption_surfaces_typed_error() {
         let part = fresh_part(vec![fresh_superfile(1)]);
-        let mut bytes = encode(&part, 3);
+        let mut bytes = encode(&part);
         bytes[0] ^= 0xff;
         bytes[1] ^= 0xff;
         let err = decode(&bytes).expect_err("corrupt zstd must fail");
@@ -1067,12 +1129,38 @@ mod tests {
         );
     }
 
+    /// Parts written before compression was dropped are zstd-framed;
+    /// `decode` must keep reading them by magic-byte sniff, and a framed
+    /// part with a corrupt body must surface the typed zstd error.
+    #[test]
+    fn legacy_zstd_framed_part_round_trips() {
+        let part = fresh_part(vec![make_rich_superfile()]);
+        let raw = encode(&part);
+        let legacy = stream::encode_all(raw.as_slice(), 3).expect("zstd encode");
+        assert!(
+            legacy.starts_with(&ZSTD_FRAME_MAGIC),
+            "legacy frame must carry the zstd magic"
+        );
+        let decoded = decode(&legacy).expect("legacy zstd part must decode");
+        assert_eq!(decoded.part_id, part.part_id);
+        assert_eq!(decoded.superfiles.len(), part.superfiles.len());
+
+        let mut corrupt = legacy.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        let err = decode(&corrupt).expect_err("corrupt legacy frame must fail");
+        assert!(
+            matches!(err, PartParseError::Zstd(_)),
+            "expected Zstd error for corrupt legacy frame, got {err:?}"
+        );
+    }
+
     #[test]
     fn bytes_payload_is_well_formed_use_via_bytes_type() {
         // Sanity: wire shape is acceptable to bytes::Bytes
         // for the storage layer downstream.
         let part = fresh_part(vec![make_rich_superfile()]);
-        let raw = encode(&part, 3);
+        let raw = encode(&part);
         let wrapped = Bytes::from(raw.clone());
         let decoded = decode(&wrapped).expect("decode from Bytes");
         assert_eq!(decoded.superfiles.len(), 1);
@@ -1133,6 +1221,7 @@ mod tests {
             open_blob: vec![(50, vec![1, 2, 3, 4]), (9000, vec![9, 9])],
         };
         let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 3,
@@ -1143,10 +1232,11 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let decoded = decode(&encode(&part)).expect("decode");
         let got = decoded.superfiles[0]
             .subsection_offsets
             .as_ref()
@@ -1155,6 +1245,32 @@ mod tests {
         // Signed id range survives big-endian fixed encoding.
         assert_eq!(decoded.superfiles[0].id_min, -5);
         assert_eq!(decoded.superfiles[0].id_max, 7);
+    }
+
+    #[test]
+    fn vector_layout_cell_posting_roundtrip_through_part() {
+        let id = Uuid::new_v4();
+        let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::CellPosting,
+            subsection_offsets: None,
+        });
+        let part = fresh_part(vec![seg]);
+        let decoded = decode(&encode(&part)).expect("decode");
+        assert_eq!(
+            decoded.superfiles[0].vector_layout,
+            VectorLayout::CellPosting
+        );
     }
 
     #[test]
@@ -1171,6 +1287,7 @@ mod tests {
             open_blob: vec![],
         };
         let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
             superfile_id: id,
             uri: SuperfileUri(id),
             n_docs: 0,
@@ -1181,10 +1298,11 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let decoded = decode(&encode(&part)).expect("decode");
         assert_eq!(
             *decoded.superfiles[0]
                 .subsection_offsets
@@ -1577,5 +1695,126 @@ mod tests {
         let same = ContentHash(h.0);
         assert_eq!(h, same);
         assert_eq!(h.to_hex().len(), BLAKE3_HEX_LEN);
+    }
+
+    // -----------------------------------------------------------------
+    // Cold-open decode cost attribution (scratch diagnostic, run
+    // manually with `--ignored --nocapture` in release). Builds one
+    // manifest part at the measured 10M-doc shape (7 superfile entries,
+    // each carrying ~4000 cells × 1 cluster × dim 1024 fp32) and times
+    // each stage of the decode pipeline separately so the cold-open
+    // CPU bill can be attributed: zstd frame, Avro value walk, and the
+    // per-summary binary decode.
+    // -----------------------------------------------------------------
+
+    /// Entries per synthetic part (measured: 128 superfiles / 18 parts).
+    const TIMING_ENTRIES_PER_PART: usize = 7;
+    /// Populated cells per superfile summary at 10M docs / 4096-cell grid.
+    const TIMING_CELLS_PER_SF: usize = 4000;
+    /// Vector dim of the measured corpus.
+    const TIMING_DIM: usize = 1024;
+    /// Parts in the measured 10M user manifest (18 GET at open).
+    const TIMING_PARTS_PER_MANIFEST: usize = 18;
+
+    fn timing_superfile() -> Arc<SuperfileEntry> {
+        use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids};
+        let id = Uuid::new_v4();
+        let cells: Vec<CellVectorSummary> = (0..TIMING_CELLS_PER_SF)
+            .map(|cell| {
+                let centroids: Vec<f32> = (0..TIMING_DIM)
+                    .map(|d| (cell * 31 + d) as f32 * 1e-3)
+                    .collect();
+                CellVectorSummary {
+                    cell_id: Some(cell as u32),
+                    clusters: ClusterCentroids::from_fp32(
+                        1,
+                        TIMING_DIM as u32,
+                        &centroids,
+                        vec![19],
+                    ),
+                }
+            })
+            .collect();
+        let mut vec_summary = HashMap::new();
+        vec_summary.insert(
+            "emb".to_string(),
+            VectorSummary {
+                centroid: vec![0.5; TIMING_DIM],
+                cells,
+            },
+        );
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 78_000,
+            id_min: 0,
+            id_max: 77_999,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: vec_summary,
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic: attributes cold-open manifest decode cost by stage"]
+    fn timing_manifest_part_decode_stages() {
+        use std::time::Instant;
+
+        use crate::supertable::manifest::encoding::decode_vector_summary_map;
+
+        let entries: Vec<Arc<SuperfileEntry>> = (0..TIMING_ENTRIES_PER_PART)
+            .map(|_| timing_superfile())
+            .collect();
+        let summary_bytes_one = encode_vector_summary_map(&entries[0].vector_summary);
+        let part = fresh_part(entries);
+
+        let t = Instant::now();
+        let encoded = encode(&part);
+        let t_encode = t.elapsed();
+
+        let t = Instant::now();
+        let mut cursor = Cursor::new(encoded.as_slice());
+        let value = from_avro_datum(schema(), &mut cursor, None).expect("avro");
+        let t_avro = t.elapsed();
+        drop(value);
+
+        let t = Instant::now();
+        let mut summaries = 0usize;
+        for _ in 0..TIMING_ENTRIES_PER_PART {
+            summaries += decode_vector_summary_map(&summary_bytes_one)
+                .expect("summary")
+                .len();
+        }
+        let t_summary = t.elapsed();
+
+        let t = Instant::now();
+        let decoded = decode(&encoded).expect("full decode");
+        let t_full = t.elapsed();
+
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "[part-timing] shape: {} entries × {} cells × dim {} — raw part {:.3} GiB",
+            TIMING_ENTRIES_PER_PART,
+            TIMING_CELLS_PER_SF,
+            TIMING_DIM,
+            gib(encoded.len()),
+        );
+        eprintln!(
+            "[part-timing] encode {:?} | avro-walk {:?} | summary-decode {:?} ({} summaries) | full decode {:?}",
+            t_encode, t_avro, t_summary, summaries, t_full,
+        );
+        eprintln!(
+            "[part-timing] manifest-scale (×{} parts): avro {:.1?} | summary {:.1?} | full {:.1?}",
+            TIMING_PARTS_PER_MANIFEST,
+            t_avro * TIMING_PARTS_PER_MANIFEST as u32,
+            t_summary * TIMING_PARTS_PER_MANIFEST as u32,
+            t_full * TIMING_PARTS_PER_MANIFEST as u32,
+        );
+        assert_eq!(decoded.superfiles.len(), TIMING_ENTRIES_PER_PART);
     }
 }

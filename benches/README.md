@@ -34,10 +34,11 @@ selected cell runs inline (its process is the isolation).
 - **Supertable** — multi-artifact table committed to object storage and read
   through warm/cold table paths. Default scale: `10M` docs, controlled by
   `INFINO_BENCH_SUPERTABLE_DOCS`.
-- Doc counts are plain integers — `100K`/`1M` suffixes do not parse.
-- **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
-  to the machine's logical core count and is controlled by
-  `INFINO_BENCH_WRITERS`.
+- Doc counts are plain integers — `100K`/`1M` suffixes do not parse. They are
+  the **only** env-tunable bench knobs; everything else that changes engine
+  behavior lives in the config YAML.
+- **Writer count** — build rows report `1 writer` and `N writers`. `N` is the
+  machine's logical core count.
 
 ## Invocation
 
@@ -63,9 +64,6 @@ cargo bench -- supertable vector build warm
 
 # Smaller local loop (plain integer; K/M suffixes do not parse).
 INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench -- superfile fts warm
-
-# Override the N-writers build row.
-INFINO_BENCH_WRITERS=4 cargo bench -- superfile fts build
 
 # Refresh the markdown sections in this file.
 INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
@@ -110,27 +108,21 @@ emulator self-cleans and reproduces request/byte volume, not network latency.
 
 ## Vector search tuning
 
-The vector benches calibrate each recall target by sweeping a probe/refine
-grid, then report a user-facing `default` row. Three knobs control that row
-and let you skip the sweep:
+The supertable vector benches report the user-facing `default` row, which
+always measures the engine defaults — probe count, rerank multiplier, and
+codec are deliberately **not** env-tunable, so a leaked shell variable can
+never skew recorded numbers. Engine behavior changes belong in the config
+YAML (`vector:` section), never in the environment.
 
-- `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
-- `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
-  (default 256 at the 1M×1024 bench scale; clears the 0.80 default-config gate).
-- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure **only** the fixed
-  `(nprobe, rerank)` `default` row: skips the correctness gate, the
-  recall-target calibration sweep, and brute-force ground-truth generation.
-  This is the fast path for a fixed-config **cold-only** latency number on a
-  many-segment supertable, where sweeping the full grid over a cold table is
-  prohibitively slow.
-- `INFINO_BENCH_PREFETCH_CONCURRENCY` — disk-cache prefetch fan-out for the
-  cold-fill / promotion path on many-segment tables (default 8).
-
-```sh
-# Fast fixed-config cold vector latency (no calibration sweep):
-INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SKIP_CALIBRATION=1 \
-  INFINO_BENCH_VECTOR_NPROBE=8 INFINO_BENCH_VECTOR_RERANK=4 cargo bench -- supertable vector cold
-```
+The recall-target calibration sweep (probe/refine grid per target) is **off
+by default**: the shipped search process routes p=1 over the cell grid and
+buys recall with write-side replication plus config defaults, so there is no
+per-query nprobe/rerank surface left to tune. Default and filtered recall
+are still measured on brute-force ground truth every run. To run the legacy
+sweep for a tuning investigation, flip `RUN_CALIBRATION_GRID` in
+`benches/utils/supertable.rs` (it still auto-offs above 1M docs). The
+superfile tier keeps its calibration: single-superfile search has a real
+`nprobe` knob.
 
 ## Prepared datasets
 
@@ -299,7 +291,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Warm = shared consumer + disk cache (untimed prewarm + wait_until_warm, then per-query p50 over repeated bm25_search). Cold = fresh disk cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.
+Warm = shared consumer + disk cache; each query runs once untimed (cache fill for probed superfiles only), then p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.
 
 **OR queries**
 
@@ -374,7 +366,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = hot disk cache sized to the index; cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.
+Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.
 
 | Recall target | (p, r) | recall | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -511,7 +503,7 @@ Build path: `SupertableWriter::append` + `commit` to object storage (production 
 
 _Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
 
-Warm = committed table reopened with a disk cache sized to the index; p50 over repeated `query_sql` calls. The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.
+Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls (only touched superfiles are cached). The headline comparison is Plain Scan vs FTS-pushdown (same selective equality). Δ is vs the previous run.
 
 **Aggregations & count-filters (read + compute, return few rows — not the index A/B)**
 

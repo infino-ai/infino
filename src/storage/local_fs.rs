@@ -14,11 +14,14 @@
 //! `<root>/data/seg-abc.sf.parquet`. No upward traversal — paths with
 //! `..` get rejected by `object_store::path::Path`.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use fs4::tokio::AsyncFileExt;
 use futures::TryStreamExt;
 use object_store::{
     Error as ObjError, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
@@ -106,6 +109,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -124,6 +128,7 @@ impl StorageProvider for LocalFsStorageProvider {
             last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_get(bytes.len() as u64);
         Ok((bytes, meta))
     }
 
@@ -133,23 +138,34 @@ impl StorageProvider for LocalFsStorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = Self::path(uri)?;
-        self.store
+        let out = self
+            .store
             .get_range(&path, range)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+        }
+        out
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
+        let n = bytes.len() as u64;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -162,15 +178,21 @@ impl StorageProvider for LocalFsStorageProvider {
         match expected_etag {
             // None == create-only-if-absent. Same as put_atomic.
             None => {
+                let n = bytes.len() as u64;
                 let opts = PutOptions {
                     mode: PutMode::Create,
                     ..Default::default()
                 };
-                self.store
+                let out = self
+                    .store
                     .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                     .await
                     .map(|r| r.e_tag)
-                    .map_err(|e| translate(uri, e))
+                    .map_err(|e| translate(uri, e));
+                if out.is_ok() {
+                    crate::storage::io_counters::record_put(n);
+                }
+                out
             }
             // Some(tag) == update-if-etag-matches.
             //
@@ -187,7 +209,21 @@ impl StorageProvider for LocalFsStorageProvider {
             // don't need this scaffolding — see
             // `S3StorageProvider::put_if_match`.
             Some(expected) => {
-                let lock_path = self.root.join("_supertable").join(".lock");
+                use fs4::tokio::AsyncFileExt;
+                // Scope the advisory lock to the *pointer's own directory*, not
+                // a single root-level `_supertable/.lock`. A `PrefixedStorageProvider`
+                // (e.g. the hidden vector index) delegates here with a prefixed
+                // `uri`, so a root-level lock would be SHARED across the user table
+                // and the hidden table. The dual-write commit
+                // `join!(persist_user, publish_hidden)` then deadlocks: both write
+                // their (distinct) pointer, both `flock` the *same* file on one
+                // thread, and the blocking `flock` (held across the head+put awaits)
+                // never releases. Per-directory locks keep distinct pointers
+                // independent while still serializing writers to the *same* pointer.
+                let lock_path = Path::new(uri)
+                    .parent()
+                    .map(|d| self.root.join(d).join(".lock"))
+                    .unwrap_or_else(|| self.root.join("_supertable").join(".lock"));
                 // The pointer commit path already creates
                 // `_supertable/` on the first write; doing it
                 // here too is idempotent + makes the lock
@@ -231,15 +267,21 @@ impl StorageProvider for LocalFsStorageProvider {
                     if current_etag != expected {
                         return Err(StorageError::PreconditionFailed { uri: uri.into() });
                     }
+                    let put_bytes = bytes.len() as u64;
                     let opts = PutOptions {
                         mode: PutMode::Overwrite,
                         ..Default::default()
                     };
-                    self.store
+                    let out = self
+                        .store
                         .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                         .await
                         .map(|r| r.e_tag)
-                        .map_err(|e| translate(uri, e))
+                        .map_err(|e| translate(uri, e));
+                    if out.is_ok() {
+                        crate::storage::io_counters::record_put(put_bytes);
+                    }
+                    out
                 }
                 .await;
                 // `lock_file` drops here → POSIX flock
@@ -262,6 +304,7 @@ impl StorageProvider for LocalFsStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = Self::path(uri)?;
+        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -273,6 +316,7 @@ impl StorageProvider for LocalFsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        crate::storage::io_counters::record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -409,12 +453,12 @@ mod tests {
     async fn put_atomic_rejects_existing() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(b"first writer wins");
-        p.put_atomic("manifest-lists/list-1.json", payload.clone())
+        p.put_atomic("manifest/manifest-1.json", payload.clone())
             .await
             .expect("first put");
 
         let err = p
-            .put_atomic("manifest-lists/list-1.json", Bytes::from_static(b"second"))
+            .put_atomic("manifest/manifest-1.json", Bytes::from_static(b"second"))
             .await
             .expect_err("second put must fail");
         assert!(
@@ -423,7 +467,7 @@ mod tests {
         );
 
         let (got, _) = p
-            .get("manifest-lists/list-1.json")
+            .get("manifest/manifest-1.json")
             .await
             .expect("get after losing put");
         assert_eq!(got, payload);
@@ -541,14 +585,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_if_match_creates_supertable_lock_file() {
-        // `put_if_match`'s Some(etag) branch acquires an
-        // advisory flock on `<root>/_supertable/.lock` to
-        // close the read-then-overwrite TOCTOU window. The
-        // lock file persists (best-effort cleanup is not
-        // attempted), so its presence after a successful
-        // conditional update is a direct signal the lock
-        // path was exercised.
+    async fn put_if_match_creates_pointer_directory_lock_file() {
+        // `put_if_match`'s Some(etag) branch acquires an advisory flock on
+        // `<root>/<pointer-parent>/.lock` (not a single root-level lock) so
+        // distinct pointer paths — e.g. user table vs hidden index — do not
+        // serialize each other. The lock file persists after the update.
         let dir = TempDir::new().expect("tempdir");
         let p = LocalFsStorageProvider::new(dir.path()).expect("provider");
         p.put_atomic("ptr/current", Bytes::from_static(b"v1"))
@@ -564,7 +605,7 @@ mod tests {
             .await
             .expect("conditional update");
 
-        let lock_path = dir.path().join("_supertable").join(".lock");
+        let lock_path = dir.path().join("ptr").join(".lock");
         assert!(
             lock_path.exists(),
             "expected advisory lock file at {lock_path:?}"

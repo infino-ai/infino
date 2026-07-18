@@ -52,6 +52,17 @@ fn count_dir(dir: &std::path::Path) -> usize {
         .count()
 }
 
+/// Count tombstone sidecar objects only. LocalFS `put_if_match` drops an
+/// advisory `superfiles/.lock` next to them; a raw directory count would
+/// treat that lock as a sidecar and flake the post-optimize assertion.
+fn count_tombstone_sidecars(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .expect("readdir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "tombstones"))
+        .count()
+}
+
 fn commit_titles(st: &Supertable, titles: &[&str]) {
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(titles)).expect("append");
@@ -212,7 +223,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
 
     let superfiles_dir = dir.path().join("superfiles");
     assert_eq!(
-        count_dir(&superfiles_dir),
+        count_tombstone_sidecars(&superfiles_dir),
         1,
         "delete writes exactly one tombstone sidecar"
     );
@@ -222,7 +233,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
     // 10 input superfiles now have a `.tombstones` file, all orphaned since
     // none of those superfiles are in the manifest anymore.
     assert_eq!(
-        count_dir(&superfiles_dir),
+        count_tombstone_sidecars(&superfiles_dir),
         markers.len(),
         "sidecars for merged-away superfiles aren't reaped yet: \
          optimize's default gc safety gap is 24h"
@@ -234,7 +245,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
         "gc must delete the orphaned sidecars"
     );
     assert_eq!(
-        count_dir(&superfiles_dir),
+        count_tombstone_sidecars(&superfiles_dir),
         0,
         "orphaned tombstone sidecars reaped once their superfiles are gone from the manifest"
     );

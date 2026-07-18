@@ -72,8 +72,8 @@ use crate::{
         ManifestSnapshot, SupertableOptions,
         handle::{Supertable, SupertableInner},
         manifest::{
-            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-            VectorSummary, bloom::BloomBuilder,
+            CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry,
+            SuperfileUri, VectorSummary, bloom::BloomBuilder,
         },
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
@@ -86,7 +86,10 @@ use crate::{
             tombstones_admin,
             tombstones_codec::TombstonesSidecar,
         },
-        writer::{build_subsection_offsets, persist_commit, stamp_tombstone_seqs},
+        writer::{
+            CommitListMetadata, build_subsection_offsets, persist_commit,
+            read_vector_layout_from_bytes, stamp_tombstone_seqs,
+        },
     },
 };
 
@@ -411,6 +414,8 @@ async fn do_apply(
 
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
+        // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
+        birth_version: 0,
         superfile_id: preallocated_superfile_id,
         uri,
         n_docs: flat_ids.len() as u64,
@@ -426,10 +431,12 @@ async fn do_apply(
         // which is correct for the Hash{n_buckets=1} default.
         partition_key: Vec::new(),
         partition_hint: None,
+
         // Mirror the commit path's 1-RTT cold-open hint; `None`
         // only if the bytes don't parse (same fallback as the
         // writer).
         subsection_offsets: build_subsection_offsets(&bytes),
+        vector_layout: read_vector_layout_from_bytes(&bytes),
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----
@@ -437,17 +444,24 @@ async fn do_apply(
     // The writer's `persist_commit` handles the actual PUT of
     // the superfile bytes (via `pending_storage_writes`), the
     // OCC retry on the pointer file, and the partition-aware
-    // part rewrite. It returns the new in-memory `Manifest`
+    // part rewrite. It returns the new in-memory `ManifestSnapshot`
     // that reflects the persisted state, but it does NOT swap
     // `inner.manifest` itself — the caller owns that final
     // visibility barrier, mirroring how the synchronous
     // `Writer::commit` path arms it. We swap here so subsequent
     // reads + the idempotency probe on a retry both see the
     // new superfile.
-    persist_commit(inner, storage, vec![entry], &[], vec![(uri, bytes.clone())]).map_err(|e| {
-        AppendPhaseError::ManifestCommit {
-            message: format!("{e}"),
-        }
+    persist_commit(
+        inner,
+        storage,
+        vec![entry],
+        &[],
+        vec![(uri, bytes.clone())],
+        Vec::new(),
+        CommitListMetadata::empty(),
+    )
+    .map_err(|e| AppendPhaseError::ManifestCommit {
+        message: format!("{e}"),
     })?;
 
     // Warm the in-memory reader cache with the freshly-published
@@ -581,7 +595,7 @@ fn build_fts_summary(
     out
 }
 
-/// Per-vector-column centroid + radius summary. `None` from the
+/// Per-vector-column centroid summary. `None` from the
 /// reader → column absent from this superfile's vector blob → no
 /// entry in the summary map.
 fn build_vector_summary(
@@ -593,21 +607,17 @@ fn build_vector_summary(
         return out;
     };
     for vc in &options.vector_columns {
-        if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
-            let clusters = vec_reader
-                .cluster_centroids(&vc.column)
-                .map(|(n_cent, dim, fp32, counts)| {
-                    ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
+        if let Some(centroid) = vec_reader.summary(&vc.column) {
+            let cells = vec_reader
+                .cluster_centroids_by_cell(&vc.column)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
+                    cell_id,
+                    clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
                 })
-                .unwrap_or_default();
-            out.insert(
-                vc.column.clone(),
-                VectorSummary {
-                    centroid,
-                    radius,
-                    clusters,
-                },
-            );
+                .collect();
+            out.insert(vc.column.clone(), VectorSummary { centroid, cells });
         }
     }
     out
@@ -1103,6 +1113,7 @@ fn resolve_target_id_in_manifest(
             inner.options.storage.as_ref(),
             &entry.uri,
             entry.subsection_offsets.as_ref(),
+            true,
         )) {
             Ok(r) => r,
             Err(_) => {
@@ -1312,6 +1323,40 @@ mod tests {
         assert!(!manifest_contains(&empty, Uuid::nil()));
     }
 
+    /// The storage-fallback fetch surfaces a typed "no storage" string when
+    /// the supertable has no storage attached, before any I/O is attempted.
+    #[test]
+    fn fetch_superfile_bytes_for_id_scan_errors_without_storage() {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        assert!(
+            st.inner().options.storage.is_none(),
+            "fixture-free supertable has no storage"
+        );
+        let err = fetch_superfile_bytes_for_id_scan(st.inner(), Uuid::from_u128(7))
+            .expect_err("must error without storage");
+        assert!(err.contains("no storage"), "got {err}");
+    }
+
+    /// With storage attached, the fallback fetch returns exactly the bytes
+    /// written at the superfile's storage path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_superfile_bytes_for_id_scan_reads_written_bytes() {
+        let (_dir, st, _ws, _wal, _etag) = fixture().await;
+        let id = Uuid::from_u128(0xFEED_FACE);
+        let payload = Bytes::from_static(b"superfile-scan-payload");
+        st.inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("fixture attaches storage")
+            .put_atomic(&SuperfileUri(id).storage_path(), payload.clone())
+            .await
+            .expect("put superfile");
+
+        let got = fetch_superfile_bytes_for_id_scan(st.inner(), id).expect("fetch bytes");
+        assert_eq!(got, payload, "fetched bytes match what was written");
+    }
+
     // ---- End-to-end Applied path ----------------------------------------
 
     /// Encode a RecordBatch as Arrow IPC stream bytes — same
@@ -1399,7 +1444,7 @@ mod tests {
         assert_eq!(new_wal.state, WalState::Appended);
         assert_ne!(new_etag, etag, "etag must advance after the state change");
 
-        // Manifest now contains the preallocated superfile.
+        // ManifestSnapshot now contains the preallocated superfile.
         let manifest = st.inner().manifest.load_full();
         assert!(
             manifest_contains(&manifest, pre_uuid),

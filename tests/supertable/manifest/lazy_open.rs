@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Lazy part-load above the eager-load
-//! threshold.
+//! Lazy part-load machinery behind the explicit
+//! `with_eager_load_threshold` opt-in.
 //!
-//! Covers the load-bearing invariants:
+//! The DEFAULT is always-eager (open fetches every part in parallel so
+//! search pays no serial manifest GETs); lazy mode remains reachable by
+//! setting the threshold below the part count. Covers the load-bearing
+//! invariants:
 //!
-//!   - **Tiny manifest stays eager.** A supertable with 1
-//!     part + default threshold (4) eager-fetches: the
-//!     manifest's flat `superfile_list.superfiles` is
-//!     populated after open, and the parts cache has the
-//!     `OnceCell` initialized.
-//!   - **Large manifest goes lazy.** With > threshold
-//!     parts, open populates empty `OnceCell`s only — no
-//!     part bytes fetched. `superfile_list.superfiles` stays
-//!     empty until the hierarchical query path lands.
-//!   - **First `Manifest::part(id).await` lazy-loads
+//!   - **Default open is eager.** The manifest's flat
+//!     `superfile_list.superfiles` is populated after open, and the parts
+//!     cache has the `OnceCell`s initialized.
+//!   - **Forced-lazy open loads nothing.** With the threshold below the
+//!     part count, open populates empty `OnceCell`s only — no part bytes
+//!     fetched. `superfile_list.superfiles` stays empty.
+//!   - **First `ManifestSnapshot::part(id).await` lazy-loads
 //!     one.** Single storage GET for that part; the
 //!     OnceCell stays populated for subsequent calls (no
 //!     re-fetch on the second call).
@@ -36,8 +36,13 @@ use infino::{
 
 /// One superfile per manifest part (forces a multi-part list).
 const TARGET_SUPERFILES_PER_PARTITION: u64 = 1;
-/// Number of parts produced to exceed the default eager threshold.
+/// Multi-part shape for the forced-lazy tests. The always-eager default
+/// loads any part count at open, so lazy mode is entered via
+/// `with_eager_load_threshold` below this count.
 const LAZY_MODE_PART_COUNT: usize = 5;
+/// Threshold below [`LAZY_MODE_PART_COUNT`] that forces the multi-part
+/// fixtures into lazy mode.
+const EAGER_LOAD_THRESHOLD_BELOW_PARTS: u32 = 4;
 /// Which 0-based part to lazy-load in the targeted-load test.
 const LAZY_LOAD_TARGET_PART_INDEX: usize = 2;
 /// Eager-load threshold of 0 forces lazy mode on a 1-part manifest.
@@ -87,8 +92,9 @@ fn one_part_eager_fetches_under_default_threshold() {
 fn many_parts_skip_eager_fetch() {
     // target_superfiles_per_partition=1 + 5 single-superfile
     // commits → 5 list entries, all sharing the same
-    // partition_key (the partition-split path). With default
-    // threshold=4, 5 > 4 → lazy.
+    // partition_key (the partition-split path). The default is
+    // always-eager, so lazy mode is forced with a threshold below
+    // the part count.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -104,11 +110,13 @@ fn many_parts_skip_eager_fetch() {
     }
     drop(producer);
 
-    // Consumer with default threshold (4) — 5 parts triggers
-    // lazy mode.
-    let consumer =
-        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .expect("open");
+    // Consumer forced lazy: threshold 4 < 5 parts.
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_BELOW_PARTS),
+    )
+    .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
@@ -133,8 +141,8 @@ fn many_parts_skip_eager_fetch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_part_lazy_loads_on_first_access() {
-    // Same setup as above (5 parts, lazy mode). Calling
-    // `Manifest::part(id).await` on a specific part should
+    // Same setup as above (5 parts, forced-lazy). Calling
+    // `ManifestSnapshot::part(id).await` on a specific part should
     // load exactly that one part. A second call on the
     // same part should be a OnceCell hit (no second
     // storage GET — verifiable by checking the OnceCell is
@@ -153,9 +161,12 @@ async fn manifest_part_lazy_loads_on_first_access() {
     }
     drop(producer);
 
-    let consumer =
-        Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .expect("open");
+    let consumer = Supertable::open(
+        default_supertable_options()
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_BELOW_PARTS),
+    )
+    .expect("open");
     let r = consumer.reader();
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();

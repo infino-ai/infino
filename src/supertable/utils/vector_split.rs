@@ -226,6 +226,7 @@ mod tests {
             rot_seed: 0,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
+            provided_centroids: None,
         }
     }
 

@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //! ```text
-//! INFINO_FTS_PROFILE=1 cargo run --release --example profile_fts_build
+//! INFINO_DIAGNOSTICS__FTS_PROFILE=true cargo run --release --example profile_fts_build
 //! ```
 
 use std::time::Instant;

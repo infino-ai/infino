@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Manifest-level skip pruning end-to-end.
+//! ManifestSnapshot-level skip pruning end-to-end.
 //!
 //! These tests are the load-bearing perf claim of the skip
 //! layer: a superfile that doesn't match a query must never
