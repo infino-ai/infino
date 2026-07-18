@@ -1179,6 +1179,18 @@ impl Supertable {
     /// the docs containing `climate` and ranks those also mentioning
     /// `policy` higher.
     ///
+    /// A double-quoted run of words is an **exact phrase** atom: the
+    /// words must appear adjacent and in order, verified against
+    /// token positions. A phrase takes any clause polarity —
+    /// `"new york" hotel`, `+"new york" +hotel`, `-"new york"` — and
+    /// scores as one BM25 atom whose `tf` is the number of phrase
+    /// occurrences and whose `idf` is the sum of its members'. Phrase
+    /// queries require the column to be indexed with token positions
+    /// (the `positions` flag on the column's FTS build config, off by
+    /// default); against a positionless column they return a typed
+    /// error rather than silently degrading to a bag-of-words match.
+    /// A single-word phrase (`"york"`) is just that term.
+    ///
     /// `score` is a similarity (higher is better) — the opposite
     /// direction from [`Supertable::vector_search`]'s distance. Fuse the
     /// two with [`Supertable::hybrid_search`], not by raw score.
@@ -1233,7 +1245,10 @@ impl Supertable {
     /// `column` matches `query`'s tokens under `mode` (`Or` = any token,
     /// `And` = every token). With a `+must` clause the match set is
     /// the musts' intersection and bare terms are ignored (no scores
-    /// for a should to raise); `-term` exclusions apply. Returns
+    /// for a should to raise); `-term` exclusions apply. Quoted
+    /// phrases participate as atoms exactly as in
+    /// [`Supertable::bm25_search`]: an exact-adjacency match against
+    /// token positions, requiring a positions-indexed column. Returns
     /// Arrow rows like [`Supertable::bm25_search`], but the `score`
     /// column is `0.0` and row order is unspecified — a candidate
     /// set, not a ranking. `projection` follows the same rules as
@@ -1307,7 +1322,10 @@ impl Supertable {
     /// cardinality — bare (should) terms affect only scores, never
     /// which docs count, so `count("+climate policy")` is the number
     /// of docs containing `climate`. A lone must keeps the O(1) df
-    /// fast path. `-term` exclusions apply as in search.
+    /// fast path. `-term` exclusions apply as in search. Quoted
+    /// phrases count exact-adjacency matches (verified against token
+    /// positions, so the column must be positions-indexed) — every
+    /// match is verified, giving exact phrase counts.
     ///
     /// ```
     /// # use std::sync::Arc;

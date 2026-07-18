@@ -93,6 +93,13 @@ more text columns. It is built in the following stages:
   and each block carries the maximum BM25 contribution any document in
   it can produce. This upper bound lets search skip whole blocks that
   cannot enter the top results.
+- **Token positions (opt-in).** A column configured with positions
+  additionally stores, for every (term, document) pair, the ordinals at
+  which the term occurs — delta-encoded variable-length runs in a
+  dedicated region, addressed from the term dictionary so a query
+  fetches only the runs it needs. Positions roughly double the column's
+  full-text footprint, so they are a per-column choice; they are what
+  make exact phrase queries answerable.
 
 A query runs in two stages:
 
@@ -101,6 +108,17 @@ A query runs in two stages:
 2. Walk the posting lists in document order, using the per-block upper
    bounds to skip blocks that cannot improve the current top results,
    and rank the surviving documents with BM25.
+
+A **phrase query** (a double-quoted run of words) adds a third step on
+a positions-indexed column: the member terms' posting lists are
+intersected, and each candidate document is verified by checking the
+members' position runs for an adjacent, in-order occurrence. The number
+of verified occurrences is the phrase's term frequency, and the phrase
+then ranks as a single BM25 atom. Ranked search skips verification for
+candidates whose score bound cannot reach the current top results;
+counting verifies every candidate, so phrase counts are exact. On a
+column built without positions, a phrase query is a typed error, never
+a silent bag-of-words approximation.
 
 The same inverted index also answers **unranked token matching**:
 resolve the query tokens to their posting lists and intersect them (all
@@ -188,10 +206,11 @@ first.
   table layer's responsibility (see [supertable](./supertable.md)).
 - A superfile is immutable and is queryable only once it is fully
   written.
-- Full-text search is bag-of-words: BM25 ranking and unranked token
-  matching (AND/OR) both run over the same posting lists. The format
-  stores **no token positions**, so there is no positional/phrase index.
-  Exact-string matching is therefore done as a two-pass operation — a
+- Full-text search is bag-of-words by default: BM25 ranking and
+  unranked token matching (AND/OR) both run over the same posting
+  lists, and token positions are stored only for columns that opt in.
+  On a positions-indexed column, quoted phrases are first-class query
+  atoms (see the full-text index section); on any column,
+  exact-string matching of a whole value is a two-pass operation — a
   token-AND prune on the index to gather candidate rows, then a
-  raw-value verification against the stored column — not by storing
-  positions.
+  raw-value verification against the stored column.
