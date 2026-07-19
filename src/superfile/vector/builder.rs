@@ -42,7 +42,10 @@ use crate::{
             kmeans::{assign_to_centroids, kmeans},
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+            reservoir::{
+                CONSOLIDATED_CELL_ROWS_THRESHOLD, Reservoir, default_kmeans_sample_size,
+                partition_kmeans_sample_size,
+            },
             rotation::RandomRotation,
             spill::{
                 ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
@@ -1119,10 +1122,19 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
         return (n_cent, global.to_vec());
     }
     // Cell packs trust the caller's row-derived `n_cent` (the fine-run byte
-    // target) — no row-count cap here; the split below bounds run sizes.
+    // target) — no row-count cap here.
     let requested = cfg.n_cent.max(1).min(n_docs.max(1));
     let mut centroids = kmeans(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
-    let n_cent = split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed);
+    // The run-size bound engages only in the consolidated-cell regime,
+    // alongside the row-fraction sample boost keyed to the same threshold.
+    // Below it the trained layout ships untouched: 1M/10M cells measured
+    // full fine coverage with their benign imbalance, and splitting them
+    // over-fragmented the runs and scattered the cold probe (2 → 3 GETs).
+    let n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed)
+    } else {
+        requested
+    };
     order_centroids_geometrically(&mut centroids, dim, n_cent);
     (n_cent, centroids)
 }
