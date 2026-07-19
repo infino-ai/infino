@@ -75,6 +75,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     if let Some(routing) = manifest.slow_vector_state_routing_blob() {
         live.insert(routing.uri.clone());
     }
+    if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
+        live.insert(centroids.uri.clone());
+    }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
         live.insert(WalStore::tombstones_path(sf.superfile_id));
@@ -275,6 +278,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_routing: None,
+                slow_vector_state_centroids: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -347,6 +351,7 @@ mod tests {
                     uri: routing_uri.clone(),
                     content_hash: routing_hash,
                 }),
+                slow_vector_state_centroids: None,
                 parts: Vec::new(),
             }),
         );

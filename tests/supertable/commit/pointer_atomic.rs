@@ -185,6 +185,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         slow_vector_state_uri: None,
         slow_vector_state_content_hash: None,
         slow_vector_state_routing: None,
+        slow_vector_state_centroids: None,
         parts,
     }
 }

@@ -23,17 +23,18 @@
 //! decoded entries live in the hydrated `ManifestSnapshot` (there is deliberately no
 //! separate cache).
 
-use std::{mem::size_of, ops::Range, sync::Arc};
+use std::{collections::HashMap, io, mem::size_of, ops::Range, os::unix::fs::FileExt, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
+use tempfile::NamedTempFile;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
     supertable::manifest::{
-        SuperfileEntry,
+        SuperfileEntry, VectorSummary,
         encoding::SummaryWireMode,
         list::RoutingRef,
         part::{self, ContentHash, ManifestPart, PartId},
@@ -208,14 +209,176 @@ async fn write_bytes(
 }
 
 /// References to one published slow-state generation: the full blob
-/// (writers, GC, and knob-off consumers read it) plus its routing
-/// sibling (what consumer opens with `summary_centroids_from_superfiles`
-/// fetch — same visible entries, cluster blocks as counts + admit slab).
+/// (writers, GC, and knob-off consumers read it), its routing sibling
+/// (what consumer opens with `summary_centroids_from_superfiles` fetch —
+/// same visible entries, cluster blocks as counts + admit slab), and the
+/// centroid-section sibling (contiguous fp32 fine centroids the admit
+/// rescore hydrates in one fetch on the first cold query).
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedState {
     pub uri: String,
     pub content_hash: ContentHash,
     pub routing: RoutingRef,
+    pub centroids: RoutingRef,
+}
+
+/// Contiguous fp32 fine-centroid section for the stripped-summary admit
+/// rescore: every visible entry's summary cells' centroids concatenated
+/// in `(entry order, column name order, cell order)` — cluster-major
+/// f32 LE per cell. No embedded index: the routing sibling carries each
+/// cell's `n_cent`/`dim`, so a consumer walking the same order computes
+/// identical offsets ([`section_len`] is the cross-check).
+pub(crate) fn encode_centroid_section(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(section_len(entries));
+    for entry in entries {
+        for (_, summary) in sorted_summaries(entry) {
+            for cell in &summary.cells {
+                for &v in &cell.clusters.centroids {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Byte length [`encode_centroid_section`] produces for `entries`,
+/// computable from stripped summaries (`n_cent`/`dim` survive the strip)
+/// — consumers verify their walk against the published blob size.
+pub(crate) fn section_len(entries: &[Arc<SuperfileEntry>]) -> usize {
+    let mut total = 0usize;
+    for entry in entries {
+        for (_, summary) in sorted_summaries(entry) {
+            for cell in &summary.cells {
+                total += cell.clusters.n_cent as usize * cell.clusters.dim as usize * 4;
+            }
+        }
+    }
+    total
+}
+
+/// One entry's vector summaries in column-name order — the deterministic
+/// iteration both the section encoder and the consumer offset walk share.
+pub(crate) fn sorted_summaries(
+    entry: &SuperfileEntry,
+) -> impl Iterator<Item = (&String, &VectorSummary)> {
+    let mut summaries: Vec<_> = entry.vector_summary.iter().collect();
+    summaries.sort_by(|a, b| a.0.cmp(b.0));
+    summaries.into_iter()
+}
+
+/// One cell's slice inside a spilled centroid section.
+struct SectionCell {
+    cell_id: Option<u32>,
+    offset: u64,
+    n_cent: u32,
+    dim: u32,
+}
+
+/// One hydrated centroid-section generation: the section bytes spilled to
+/// a local temp file (served by `pread` — page-cache-backed, evictable,
+/// no `unsafe`) plus the per-`(superfile, column)` cell offsets from the
+/// shared deterministic walk. Content-addressed by `uri`; a new drain
+/// generation publishes a new URI and replaces the cached instance.
+pub(crate) struct CentroidSection {
+    uri: String,
+    spill: NamedTempFile,
+    cells: HashMap<(Uuid, String), Vec<SectionCell>>,
+}
+
+impl CentroidSection {
+    /// Content-addressed URI this section was fetched from.
+    pub(crate) fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
+    /// `None` when the `(superfile, column, cell)` triple is not in the
+    /// section — the caller falls back to the per-superfile read.
+    pub(crate) fn read_cell(
+        &self,
+        superfile_id: Uuid,
+        column: &str,
+        cell_id: Option<u32>,
+    ) -> Option<Vec<f32>> {
+        let cells = self.cells.get(&(superfile_id, column.to_owned()))?;
+        let cell = cells.iter().find(|c| c.cell_id == cell_id)?;
+        let len = cell.n_cent as usize * cell.dim as usize * 4;
+        let mut buf = vec![0u8; len];
+        self.spill
+            .as_file()
+            .read_exact_at(&mut buf, cell.offset)
+            .ok()?;
+        Some(
+            buf.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        )
+    }
+}
+
+/// Fetch the centroid-section sibling, verify its hash, spill it to a
+/// local temp file, and index it with the shared offset walk over
+/// `entries` (which must be the same visible membership, in the same
+/// order, that [`write_state`] published — the size cross-check fails
+/// loudly on any drift and callers fall back to per-superfile reads).
+pub(crate) async fn fetch_centroid_section(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<CentroidSection, SlowVectorStateError> {
+    let store_err = |e: StorageError| SlowVectorStateError::Storage(e.to_string());
+    let io_err = |e: io::Error| SlowVectorStateError::Storage(format!("section spill: {e}"));
+    let expected_len = section_len(entries) as u64;
+    let meta = storage.head(&reference.uri).await.map_err(store_err)?;
+    if meta.size != expected_len {
+        return Err(SlowVectorStateError::Parse(format!(
+            "centroid section is {} bytes, membership walk expects {expected_len}",
+            meta.size
+        )));
+    }
+    let spill = NamedTempFile::new().map_err(io_err)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+    while offset < meta.size {
+        let end = (offset + STRIPED_FETCH_CHUNK_BYTES).min(meta.size);
+        let bytes = storage
+            .get_range(&reference.uri, offset..end)
+            .await
+            .map_err(store_err)?;
+        hasher.update(&bytes);
+        spill
+            .as_file()
+            .write_all_at(&bytes, offset)
+            .map_err(io_err)?;
+        offset = end;
+    }
+    if ContentHash(*hasher.finalize().as_bytes()) != reference.content_hash {
+        return Err(SlowVectorStateError::HashMismatch);
+    }
+
+    let mut cells: HashMap<(Uuid, String), Vec<SectionCell>> = HashMap::new();
+    let mut cursor = 0u64;
+    for entry in entries {
+        for (column, summary) in sorted_summaries(entry) {
+            let mut list = Vec::with_capacity(summary.cells.len());
+            for cell in &summary.cells {
+                list.push(SectionCell {
+                    cell_id: cell.cell_id,
+                    offset: cursor,
+                    n_cent: cell.clusters.n_cent,
+                    dim: cell.clusters.dim,
+                });
+                cursor += cell.clusters.n_cent as u64 * cell.clusters.dim as u64 * 4;
+            }
+            cells.insert((entry.superfile_id, column.clone()), list);
+        }
+    }
+    Ok(CentroidSection {
+        uri: reference.uri.clone(),
+        spill,
+        cells,
+    })
 }
 
 /// Content-address and PUT the blob for `entries` plus its routing
@@ -242,26 +405,33 @@ pub(crate) async fn write_state_with_pending_drain(
     write_full_and_routing(storage, encode_checkpoint_state(entries, pending), entries).await
 }
 
-/// PUT the pre-encoded full blob and the routing sibling of `entries`
-/// concurrently.
+/// PUT the pre-encoded full blob, the routing sibling, and the centroid
+/// section of `entries` concurrently.
 async fn write_full_and_routing(
     storage: &dyn StorageProvider,
     full_bytes: Vec<u8>,
     entries: &[Arc<SuperfileEntry>],
 ) -> Result<PublishedState, SlowVectorStateError> {
     let routing_bytes = encode_entries_with_mode(entries, SummaryWireMode::RoutingOnly);
-    let (full, routing) = tokio::join!(
+    let centroid_bytes = encode_centroid_section(entries);
+    let (full, routing, centroids) = tokio::join!(
         write_bytes(storage, full_bytes),
-        write_bytes(storage, routing_bytes)
+        write_bytes(storage, routing_bytes),
+        write_bytes(storage, centroid_bytes)
     );
     let (uri, content_hash) = full?;
     let (routing_uri, routing_hash) = routing?;
+    let (centroids_uri, centroids_hash) = centroids?;
     Ok(PublishedState {
         uri,
         content_hash,
         routing: RoutingRef {
             uri: routing_uri,
             content_hash: routing_hash,
+        },
+        centroids: RoutingRef {
+            uri: centroids_uri,
+            content_hash: centroids_hash,
         },
     })
 }
@@ -444,6 +614,43 @@ mod tests {
     fn decode_garbage_is_parse_error() {
         let err = decode_entries(&[0u8; 16]).expect_err("garbage");
         assert!(matches!(err, SlowVectorStateError::Parse(_)), "{err:?}");
+    }
+
+    /// The centroid section round-trips through publish + fetch: the walk
+    /// length matches the encoded bytes, `write_state` publishes the
+    /// sibling, and `fetch_centroid_section` serves each cell's fp32
+    /// exactly as the summary carried it.
+    #[tokio::test]
+    async fn centroid_section_roundtrip_serves_cell_fp32() {
+        let entries = vec![
+            entry_with_summary(FIRST_N_DOCS, 1),
+            entry_with_summary(SECOND_N_DOCS, 6),
+        ];
+        let section = encode_centroid_section(&entries);
+        assert_eq!(section.len(), section_len(&entries));
+        assert!(!section.is_empty(), "fixture summaries carry fp32");
+
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
+        let published = write_state(&storage, &entries).await.expect("publish");
+        assert_eq!(published.centroids.content_hash, ContentHash::of(&section));
+
+        let fetched = fetch_centroid_section(&storage, &published.centroids, &entries)
+            .await
+            .expect("fetch section");
+        for entry in &entries {
+            let cell = &entry.vector_summary["emb"].cells[0];
+            let got = fetched
+                .read_cell(entry.superfile_id, "emb", cell.cell_id)
+                .expect("cell served");
+            assert_eq!(got, cell.clusters.centroids, "fp32 must round-trip");
+        }
+        // Unknown cells miss cleanly (caller falls back).
+        assert!(
+            fetched
+                .read_cell(entries[0].superfile_id, "emb", Some(999))
+                .is_none()
+        );
     }
 
     #[test]

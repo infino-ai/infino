@@ -55,6 +55,8 @@ use super::{
         SuperfileReaderCache,
     },
 };
+use tokio::sync::Mutex as TokioMutex;
+
 use crate::{
     config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,
@@ -68,7 +70,10 @@ use crate::{
         fts::tokenize::Tokenizer,
         vector::layout::VectorLayout,
     },
-    supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
+    supertable::{
+        manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
+        slow_vector_state::CentroidSection,
+    },
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -335,6 +340,12 @@ pub struct SupertableOptions {
     /// that bounds the mmap resident set, this bounds anonymous heap. See
     /// [`crate::memory`].
     pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// Single-slot cache for the slow-CAS centroid-section spill, shared by
+    /// every manifest snapshot of this table handle and keyed by the
+    /// section's content-addressed URI (a new drain generation replaces
+    /// it). Serves the stripped-summary admit rescore from a local
+    /// temp-file spill instead of per-cell object-store reads.
+    pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -619,6 +630,7 @@ impl SupertableOptions {
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
+            centroid_section_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             vector_layout: VectorLayout::Ivf,

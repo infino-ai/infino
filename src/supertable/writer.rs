@@ -5528,12 +5528,17 @@ async fn stamp_slow_vector_state(
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_routing_blob() == Some(&published.routing)
+            && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
         {
             // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest =
-            old.with_slow_vector_state(published.uri, published.content_hash, published.routing);
+        let new_manifest = old.with_slow_vector_state(
+            published.uri,
+            published.content_hash,
+            published.routing,
+            published.centroids,
+        );
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -6015,6 +6020,7 @@ pub(crate) async fn try_commit_attempt(
                 published.uri,
                 published.content_hash,
                 published.routing,
+                published.centroids,
             );
         }
     }

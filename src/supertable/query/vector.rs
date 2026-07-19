@@ -94,7 +94,7 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, relative_score_window},
+            distance::{Metric, distance, relative_score_window},
             layout::VectorLayout,
         },
     },
@@ -108,6 +108,7 @@ use crate::{
             list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
+        slow_vector_state::{CentroidSection, fetch_centroid_section},
         tombstones::SidecarCache,
     },
 };
@@ -1021,22 +1022,100 @@ pub(crate) async fn user_placement_for_scalar_resolve(
 }
 
 impl SupertableReader {
+    /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
+    /// table: one streamed fetch of a single content-addressed object on
+    /// the first cold rescore, then local `pread`s forever — instead of
+    /// one block GET per shortlisted cell per query. `None` when the
+    /// manifest carries no section ref (legacy) or the fetch failed
+    /// (callers fall back to per-superfile centroid reads).
+    async fn centroid_section(&self) -> Option<Arc<CentroidSection>> {
+        let manifest = self.manifest();
+        let reference = manifest.slow_vector_state_centroids_blob()?.clone();
+        let storage = manifest.options.storage.as_ref()?;
+        let slot = Arc::clone(&manifest.options.centroid_section_cache);
+        let mut guard = slot.lock().await;
+        if let Some(section) = guard.as_ref()
+            && section.uri() == reference.uri
+        {
+            return Some(Arc::clone(section));
+        }
+        let entries = manifest.get_all_superfiles();
+        match fetch_centroid_section(storage.as_ref(), &reference, entries).await {
+            Ok(section) => {
+                let section = Arc::new(section);
+                *guard = Some(Arc::clone(&section));
+                Some(section)
+            }
+            Err(error) => {
+                eprintln!(
+                    "[supertable] centroid section {} unavailable ({error}); falling back to \
+                     per-superfile centroid reads",
+                    reference.uri
+                );
+                None
+            }
+        }
+    }
+
     /// Exact admit scores for summary cells whose fp32 was dropped at
-    /// hydration (`summary_centroids_from_superfiles`): open each involved
-    /// superfile through the tiered reader cache and score its on-disk
-    /// centroid region (mmap-served warm; bounded range fetches cold).
-    /// One concurrent wave across superfiles, cells within a superfile
-    /// fetched concurrently too. Background fills stay off — an admit
-    /// touch of a cell's centroid bytes must not trigger whole-file pulls
-    /// for files the fan-out may never probe.
+    /// hydration (`summary_centroids_from_superfiles`). Preferred source:
+    /// the slow-CAS centroid-section spill (one object, hydrated once —
+    /// see [`Self::centroid_section`]). Cells the section cannot serve
+    /// (legacy manifests, membership drift) fall back to opening each
+    /// involved superfile through the tiered reader cache and scoring its
+    /// on-disk centroid region. One concurrent wave across superfiles,
+    /// cells within a superfile fetched concurrently too. Background
+    /// fills stay off — an admit touch of a cell's centroid bytes must
+    /// not trigger whole-file pulls for files the fan-out may never
+    /// probe.
     async fn rescore_deferred_cells(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
         column: &str,
         query: &[f32],
+        metric: Metric,
         candidates: &mut Vec<FineCandidate>,
         deferred: Vec<DeferredCellRescore>,
     ) -> Result<(), QueryError> {
+        let deferred = if deferred.is_empty() {
+            deferred
+        } else if let Some(section) = self.centroid_section().await {
+            let mut leftovers = Vec::new();
+            for d in deferred {
+                let entry = &superfiles[d.si];
+                let Some(fp32) = section.read_cell(entry.superfile_id, column, d.cell_id) else {
+                    leftovers.push(d);
+                    continue;
+                };
+                let Some(cell) = entry
+                    .vector_summary
+                    .get(column)
+                    .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
+                else {
+                    leftovers.push(d);
+                    continue;
+                };
+                let dim = cell.clusters.dim as usize;
+                if dim == 0 || fp32.len() != cell.clusters.n_cent as usize * dim {
+                    leftovers.push(d);
+                    continue;
+                }
+                for (local, centroid) in fp32.chunks_exact(dim).enumerate() {
+                    let count = cell.clusters.counts.get(local).copied().unwrap_or(0) as u64;
+                    if count == 0 {
+                        continue;
+                    }
+                    let score = distance(metric, query, centroid);
+                    candidates.push((d.si, d.flat_base + local as u32, score, d.cell_id, count));
+                }
+            }
+            leftovers
+        } else {
+            deferred
+        };
+        if deferred.is_empty() {
+            return Ok(());
+        }
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
@@ -1288,8 +1367,15 @@ impl SupertableReader {
                 stripped_policy,
             )?;
             if !deferred.is_empty() {
-                self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
-                    .await?;
+                self.rescore_deferred_cells(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    &mut candidates,
+                    deferred,
+                )
+                .await?;
             }
             candidate_counts = candidates
                 .iter()
@@ -1389,8 +1475,15 @@ impl SupertableReader {
                 StrippedScorePolicy::Defer,
             )?;
             if !deferred.is_empty() {
-                self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
-                    .await?;
+                self.rescore_deferred_cells(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    &mut candidates,
+                    deferred,
+                )
+                .await?;
             }
             candidate_counts = candidates
                 .iter()

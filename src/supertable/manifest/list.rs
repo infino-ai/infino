@@ -152,6 +152,15 @@ pub struct Manifest {
     /// with the full ref; absent on manifests written before the sibling
     /// existed (consumers fall back to the full blob).
     pub slow_vector_state_routing: Option<RoutingRef>,
+    /// Centroid-section sibling: every visible entry's fp32 fine centroids
+    /// concatenated contiguously in `(entry, column, cell)` order. The
+    /// stripped-summary admit rescore hydrates it in one fetch on the
+    /// first cold query (NVMe-spilled, page-cache-evictable) instead of
+    /// fanning one block GET per shortlisted cell per query — measured 53
+    /// then 43 GETs on the first two post-drain cold queries at 1M/256.
+    /// Stamped and cleared together with the full ref; absent on older
+    /// manifests (consumers fall back to per-superfile centroid reads).
+    pub slow_vector_state_centroids: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1056,6 +1065,10 @@ struct ManifestDto {
     slow_vector_state_routing_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_routing_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1586,6 +1599,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_routing
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_vector_state_centroids_uri: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroids_content_hash: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1668,6 +1689,16 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         slow_vector_state_routing: match (
             d.slow_vector_state_routing_uri,
             d.slow_vector_state_routing_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        slow_vector_state_centroids: match (
+            d.slow_vector_state_centroids_uri,
+            d.slow_vector_state_centroids_content_hash.as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -2271,6 +2302,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_routing: None,
+            slow_vector_state_centroids: None,
             parts: vec![],
         }
     }

@@ -787,6 +787,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_routing: None,
+            slow_vector_state_centroids: None,
             parts: Vec::new(),
         };
         let res = write_manifest(storage.as_ref(), &list)
