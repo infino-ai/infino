@@ -1458,10 +1458,10 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 buffer,
                 vc.dim,
-                super::handle::hidden_vector_cell_count(),
+                super::handle::hidden_vector_cell_count(&self.inner.options),
             ) {
-            let hidden_cells = super::handle::hidden_vector_cell_count();
-            let user_cells = super::handle::user_vector_cell_count();
+            let hidden_cells = super::handle::hidden_vector_cell_count(&self.inner.options);
+            let user_cells = super::handle::user_vector_cell_count(&self.inner.options);
             let user_grid = (user_cells != hidden_cells)
                 .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
                 .flatten();

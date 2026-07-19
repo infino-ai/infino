@@ -86,6 +86,25 @@ const GIB_BYTES: u64 = 1u64 << 30;
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Scale boundary for the bench's fixed cell-count shape: runs strictly
+/// under this doc count pin the grids below; at and above it the YAML
+/// config (`vector.user_cell_count` / `vector.hidden_cell_count`) stays
+/// in charge while the large-scale shape is still being calibrated.
+const SMALL_SCALE_MAX_DOCS: usize = 20_000_000;
+/// User-grid cells pinned for sub-[`SMALL_SCALE_MAX_DOCS`] runs. Finer
+/// user packing measured pre-drain warm 13.4 ms at 10M/512c vs 23.1 ms
+/// at 10M/256c with recall parity (0.997).
+const SMALL_SCALE_USER_CELLS: usize = 512;
+/// Hidden-grid cells pinned for sub-[`SMALL_SCALE_MAX_DOCS`] runs. The
+/// 256-cell hidden shape measured best post-drain: 0.995–0.997 recall
+/// with 1-GET cold probes at 1M and 10M.
+const SMALL_SCALE_HIDDEN_CELLS: usize = 256;
+
+/// Per-table grid cell counts for this run's scale, or `None` to let the
+/// YAML config decide (≥ [`SMALL_SCALE_MAX_DOCS`] docs).
+fn bench_cell_counts() -> Option<(usize, usize)> {
+    (n_docs() < SMALL_SCALE_MAX_DOCS).then_some((SMALL_SCALE_USER_CELLS, SMALL_SCALE_HIDDEN_CELLS))
+}
 /// Producer memory budget in GiB — steers the attached disk cache's
 /// post-commit madvise sweep only; it does not cap ingest/build RSS.
 const WRITER_MEMORY_BUDGET_GIB: u64 = 8;
@@ -200,6 +219,9 @@ pub fn options_for(
             .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
             .with_reader_pool(Arc::clone(&pool))
             .with_writer_pool(pool);
+        if let Some((user, hidden)) = bench_cell_counts() {
+            opts = opts.with_vector_cell_counts(user, hidden);
+        }
         if let Some(s) = storage {
             opts = opts.with_storage(s);
         }
@@ -239,6 +261,9 @@ pub fn options_for(
         .with_reader_pool(pool.clone())
         .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
         .with_writer_pool(pool);
+    if let Some((user, hidden)) = bench_cell_counts() {
+        opts = opts.with_vector_cell_counts(user, hidden);
+    }
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }

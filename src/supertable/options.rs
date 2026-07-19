@@ -478,6 +478,14 @@ pub struct SupertableOptions {
     /// encode path asserts against that. Grid (routing) centroids and
     /// summary `counts` stay resident regardless. Default `false`.
     pub summary_centroids_from_superfiles: bool,
+    /// Per-table override for the **user** grid's cell count (trained at
+    /// the first commit and stamped into the manifest; changing it later
+    /// affects new tables only). `None` → `vector.user_cell_count` from
+    /// the YAML config.
+    pub user_cell_count: Option<usize>,
+    /// Per-table override for the **hidden** vector-index grid's cell
+    /// count. `None` → `vector.hidden_cell_count` from the YAML config.
+    pub hidden_cell_count: Option<usize>,
 }
 
 impl SupertableOptions {
@@ -625,6 +633,8 @@ impl SupertableOptions {
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
             summary_centroids_from_superfiles: false,
+            user_cell_count: None,
+            hidden_cell_count: None,
         })
     }
 
@@ -874,6 +884,16 @@ impl SupertableOptions {
     /// [`Self::summary_centroids_from_superfiles`].
     pub fn with_summary_centroids_from_superfiles(mut self, v: bool) -> Self {
         self.summary_centroids_from_superfiles = v;
+        self
+    }
+
+    /// Per-table cell counts for the user and hidden vector grids,
+    /// overriding the YAML config's `vector.user_cell_count` /
+    /// `vector.hidden_cell_count`. Grids are trained at the first commit
+    /// and stamped into the manifest, so this only affects table create.
+    pub fn with_vector_cell_counts(mut self, user: usize, hidden: usize) -> Self {
+        self.user_cell_count = Some(user);
+        self.hidden_cell_count = Some(hidden);
         self
     }
 

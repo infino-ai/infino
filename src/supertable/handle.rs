@@ -1058,18 +1058,25 @@ impl Supertable {
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
 /// Cell count for the **user** table's grid, trained at the first commit —
-/// used to cell-pack user superfiles and route the pre-drain query. From
-/// `vector.user_cell_count` (YAML-only; no env override).
-pub(crate) fn user_vector_cell_count() -> usize {
-    config::global().vector.user_cell_count.max(1)
+/// used to cell-pack user superfiles and route the pre-drain query. The
+/// per-table option wins when set; otherwise `vector.user_cell_count`
+/// from the YAML config (no env override).
+pub(crate) fn user_vector_cell_count(options: &SupertableOptions) -> usize {
+    options
+        .user_cell_count
+        .unwrap_or_else(|| config::global().vector.user_cell_count)
+        .max(1)
 }
 
 /// Cell count for the **hidden** vector index: `global_vector_index.grid` is
 /// trained at this count and the drain reads it verbatim; post-drain routing
-/// runs at this granularity. From `vector.hidden_cell_count` (YAML-only; no
-/// env override).
-pub(crate) fn hidden_vector_cell_count() -> usize {
-    config::global().vector.hidden_cell_count.max(1)
+/// runs at this granularity. The per-table option wins when set; otherwise
+/// `vector.hidden_cell_count` from the YAML config (no env override).
+pub(crate) fn hidden_vector_cell_count(options: &SupertableOptions) -> usize {
+    options
+        .hidden_cell_count
+        .unwrap_or_else(|| config::global().vector.hidden_cell_count)
+        .max(1)
 }
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
@@ -1255,12 +1262,16 @@ fn build_vector_index_options(
     // fp32 centroids live; a read-only consumer's memory mode must ride
     // along to its hydration.
     hidden_opts.summary_centroids_from_superfiles = user_opts.summary_centroids_from_superfiles;
+    // Per-table cell-count overrides ride along too: the hidden handle's
+    // paths resolve counts through its own options.
+    hidden_opts.user_cell_count = user_opts.user_cell_count;
+    hidden_opts.hidden_cell_count = user_opts.hidden_cell_count;
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, hidden_vector_cell_count())
+            train_global_centroids(user_opts, manifest, hidden_vector_cell_count(user_opts))
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -2181,7 +2192,7 @@ mod tests {
             });
         assert_eq!(
             user_grid_trained,
-            user_vector_cell_count() != hidden_vector_cell_count(),
+            user_vector_cell_count(&st.options()) != hidden_vector_cell_count(&st.options()),
             "user-side grid must be trained exactly when the cell counts differ"
         );
         assert_eq!(
@@ -2303,6 +2314,25 @@ mod tests {
             after_compaction, before_compaction,
             "fixed residual payloads must survive compaction"
         );
+    }
+
+    /// The per-table cell-count overrides win over the YAML config; the
+    /// `.max(1)` floor still applies. No assertion on the config-backed
+    /// default value itself — the test environment's YAML may override it.
+    #[test]
+    fn vector_cell_count_options_override_config() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "text",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let base = SupertableOptions::new(schema, vec![], vec![], None).expect("options");
+        let overridden = base.with_vector_cell_counts(7, 9);
+        assert_eq!(user_vector_cell_count(&overridden), 7);
+        assert_eq!(hidden_vector_cell_count(&overridden), 9);
+        let floored = overridden.with_vector_cell_counts(0, 0);
+        assert_eq!(user_vector_cell_count(&floored), 1);
+        assert_eq!(hidden_vector_cell_count(&floored), 1);
     }
 
     /// Read-only consumer memory mode (`summary_centroids_from_superfiles`):
