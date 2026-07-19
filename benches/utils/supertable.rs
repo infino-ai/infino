@@ -456,27 +456,32 @@ fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
     let fill_gets = split
         .first_query
         .bg_get_count
+        .saturating_add(split.second_query.bg_get_count)
         .saturating_add(split.repeat_query.bg_get_count);
     let fill_bytes = split
         .first_query
         .bg_get_bytes
+        .saturating_add(split.second_query.bg_get_bytes)
         .saturating_add(split.repeat_query.bg_get_bytes);
     eprintln!(
-        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down), repeat query {} GET ({} down), cache fill {} GET ({} down)",
+        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down, one-time warmup), second query {} GET ({} down, steady), repeat query {} GET ({} down), cache fill {} GET ({} down)",
         split.open.get_count,
         split.open.head_count,
         rss::fmt_bytes(split.open.get_bytes),
         split.first_query.get_count,
         rss::fmt_bytes(split.first_query.get_bytes),
+        split.second_query.get_count,
+        rss::fmt_bytes(split.second_query.get_bytes),
         split.repeat_query.get_count,
         rss::fmt_bytes(split.repeat_query.get_bytes),
         fill_gets,
         rss::fmt_bytes(fill_bytes),
     );
     eprintln!(
-        "[{prefix}]   open: {} | first query: {} | repeat query: {}",
+        "[{prefix}]   open: {} | first query: {} | second query: {} | repeat query: {}",
         split.open.fmt_get_class_breakdown(),
         split.first_query.fmt_get_class_breakdown(),
+        split.second_query.fmt_get_class_breakdown(),
         split.repeat_query.fmt_get_class_breakdown(),
     );
 }
@@ -528,6 +533,7 @@ fn store_phases_from_split(split: Option<storage_meter::ColdStoreSplit>) -> cost
     cost::StorePhases {
         cold_open: split.map(|s| s.open),
         cold_query: split.map(|s| s.first_query),
+        cold_second_query: split.map(|s| s.second_query),
         cold_repeat_query: split.map(|s| s.repeat_query),
         ..Default::default()
     }
@@ -741,9 +747,12 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
 
 pub mod fts {
     use super::*;
-    use crate::executors::{
-        fts as exec_fts,
-        fts::{FTS_BATTERY, FtsRead},
+    use crate::{
+        executors::{
+            fts as exec_fts,
+            fts::{FTS_BATTERY, FtsRead},
+        },
+        harness::driver::FtsQuery,
     };
 
     /// Large top-k for the serving-scale query-phase scaling gate —
@@ -1007,6 +1016,12 @@ pub mod fts {
         built: &supertable::IngestResult,
     ) -> Option<storage_meter::ColdStoreSplit> {
         let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
+        // A different battery entry probes the steady cold rate: the first
+        // query's one-time metadata warmup must not recur.
+        let second = FTS_BATTERY
+            .iter()
+            .find(|q| q.name != query.name)
+            .unwrap_or(query);
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let (cache_dir, cache) =
             tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
@@ -1019,27 +1034,31 @@ pub mod fts {
         crate::executors::open_all_superfiles(&consumer);
         let open = meter.snapshot();
         let reader = consumer.reader();
-        let terms = query.terms.join(" ");
-        let mode = exec_fts::to_infino_mode(query.mode);
+        let search = |q: &FtsQuery| {
+            let terms = q.terms.join(" ");
+            let mode = exec_fts::to_infino_mode(q.mode);
+            let _ = reader
+                .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                .expect("metered cold bm25_search");
+        };
         let trace_enabled = cold_trace_enabled();
         if trace_enabled {
             meter.start_trace();
         }
-        let _ = reader
-            .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
-            .expect("metered cold bm25_search");
+        search(query);
         let first_query_trace = trace_enabled.then(|| meter.take_trace());
         let after_first = meter.snapshot();
-        let _ = reader
-            .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
-            .expect("metered repeat bm25_search");
+        search(second);
+        let after_second = meter.snapshot();
+        search(query);
         let after_repeat = meter.snapshot();
         drop(consumer);
         drop(cache_dir);
         let split = storage_meter::ColdStoreSplit {
             open,
             first_query: after_first.since(&open),
-            repeat_query: after_repeat.since(&after_first),
+            second_query: after_second.since(&after_first),
+            repeat_query: after_repeat.since(&after_second),
         };
         log_cold_split("supertable_fts", &split);
         if let Some(trace) = first_query_trace {
@@ -1204,37 +1223,52 @@ pub mod vector {
     /// pre-routing search path.
     const RUN_CALIBRATION_GRID: bool = false;
 
-    /// Regression gates on the first cold query's **data** GET fan (user +
+    /// Regression gates on the cold consumer's **data** GET fan (user +
     /// hidden classes together), by routing state and scale tier, with the
-    /// pinned <20M grid shape (512 user / 256 hidden cells).
+    /// pinned <20M grid shape (512 user / 256 hidden cells). Two windows,
+    /// gated separately because they price differently:
     ///
-    /// PROVISIONAL after the v1 open discipline landed for multi-cell
-    /// superfiles: open no longer hydrates Sq8 meta, per-row norms, or the
-    /// inline stable-id region, so the first cold query per touched file
-    /// carries those two extra concurrent fetches (same round-trip
-    /// envelope). Prior eager-open ceilings measured: post-drain 1/2,
-    /// post-delta 2/3, post-compact 1/3. The provisional values add the
-    /// meta + stable-id fetch per touched data file; tighten to the
-    /// re-measured numbers once the validation ladder records them. At and
-    /// above [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being
-    /// calibrated, so no ceiling applies yet.
+    /// * **first cold query** — the one-time metadata warmup under the v1
+    ///   open discipline: the admit-window centroid regions (~20% of cells,
+    ///   one block GET each), Sq8 meta, and stable-id blocks ride in with
+    ///   the first probe (all concurrent). Measured at 1M/256: 53 GETs.
+    ///   Bounded loosely so a fan regression (e.g. the pre-drain 848-class
+    ///   blowup reaching a routed state) still trips.
+    /// * **second, distinct cold query** — the steady cold per-query fetch
+    ///   with the warmup resident: its own probe blocks plus any
+    ///   newly-touched cells. This is the number the cost model's cold
+    ///   read leg prices, so it gates tight.
+    ///
+    /// PROVISIONAL until the validation ladder re-measures both windows;
+    /// tighten to the recorded numbers. At and above
+    /// [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being calibrated,
+    /// so no ceiling applies yet.
     const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
     /// Upper doc bound for the mid-scale ceilings (exclusive).
     const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
-    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on first-cold-query
-    /// data GETs.
-    const COLD_GET_CEILINGS: &[(&str, u64, u64)] = &[
-        ("post-drain", 3, 4),
-        ("post-delta", 6, 7),
-        ("post-compact", 3, 5),
+    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
+    /// query's data GETs (probe + one-time metadata warmup).
+    const COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
+        ("post-drain", 64, 96),
+        ("post-delta", 96, 128),
+        ("post-compact", 64, 96),
+    ];
+    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
+    /// (steady) cold query's data GETs.
+    const COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
+        ("post-drain", 8, 10),
+        ("post-delta", 10, 12),
+        ("post-compact", 8, 10),
     ];
 
-    /// Ceiling on `label`'s first cold query data GETs for `n_docs`, when
-    /// one applies to that state at this scale.
-    fn cold_data_get_ceiling(label: &str, n_docs: usize) -> Option<u64> {
-        let (_, small, mid) = COLD_GET_CEILINGS
-            .iter()
-            .find(|(state, _, _)| *state == label)?;
+    /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
+    /// when one applies to that state at this scale.
+    fn cold_data_get_ceiling(
+        table: &[(&str, u64, u64)],
+        label: &str,
+        n_docs: usize,
+    ) -> Option<u64> {
+        let (_, small, mid) = table.iter().find(|(state, _, _)| *state == label)?;
         if n_docs < COLD_GET_SMALL_MAX_DOCS {
             Some(*small)
         } else if n_docs < COLD_GET_MID_MAX_DOCS {
@@ -1308,6 +1342,10 @@ pub mod vector {
         open_cpu_s: Option<f64>,
         query_wall_s: f64,
         query_cpu_s: Option<f64>,
+        /// Wall/CPU of the second, distinct cold query — the steady cold
+        /// per-query cost once the first query's metadata warmup landed.
+        second_wall_s: f64,
+        second_cpu_s: Option<f64>,
     }
 
     struct TransitionStat {
@@ -1406,16 +1444,33 @@ pub mod vector {
             valid,
             "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
         );
-        // Lock in the cold-probe gains: each gated state's total data fetch
-        // (user + hidden GETs) must stay within its per-scale ceiling (see
-        // `cold_data_get_ceiling`).
-        if let Some(ceiling) = cold_data_get_ceiling(label, n_docs) {
+        // Lock in the cold-probe gains, per window: the first query's
+        // one-time warmup fan and the second query's steady per-query fetch
+        // each stay within their per-scale ceilings.
+        if let Some(ceiling) = cold_data_get_ceiling(COLD_GET_CEILINGS_FIRST, label, n_docs) {
             let total = user_data + hidden_data;
             assert!(
                 total <= ceiling,
-                "{label}: cold data fetch regressed — {total} GETs ({user_data} user + \
-                 {hidden_data} hidden) on the first cold query, ceiling {ceiling} at {n_docs} \
-                 docs (see COLD_GET_CEILINGS; provisional post-v1-open values)"
+                "{label}: first cold query (metadata warmup) regressed — {total} data GETs \
+                 ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs \
+                 (see COLD_GET_CEILINGS_FIRST; provisional post-v1-open values)"
+            );
+        }
+        if let Some(ceiling) = cold_data_get_ceiling(COLD_GET_CEILINGS_SECOND, label, n_docs) {
+            let second_user = split
+                .second_query
+                .class_io(storage_meter::UriClass::UserData)
+                .get_count;
+            let second_hidden = split
+                .second_query
+                .class_io(storage_meter::UriClass::HiddenData)
+                .get_count;
+            let total = second_user + second_hidden;
+            assert!(
+                total <= ceiling,
+                "{label}: second (steady) cold query regressed — {total} data GETs \
+                 ({second_user} user + {second_hidden} hidden), ceiling {ceiling} at {n_docs} \
+                 docs (see COLD_GET_CEILINGS_SECOND; provisional post-v1-open values)"
             );
         }
     }
@@ -2210,6 +2265,7 @@ pub mod vector {
         label: &str,
         built: &supertable::IngestResult,
         query: &[f32],
+        second_query: &[f32],
         nprobe: usize,
         rerank: usize,
         cache_budget_bytes: u64,
@@ -2229,11 +2285,11 @@ pub mod vector {
         let open_cpu_s = cpu::cpu_seconds_since(open_cpu0);
         let open = meter.snapshot();
         let reader = consumer.reader();
-        let search = |label: &str| {
+        let search = |label: &str, q: &[f32]| {
             let _ = reader
                 .vector_search(
                     supertable::VEC_COLUMN,
-                    query,
+                    q,
                     TOP_K,
                     exec_vec::search_opts(nprobe, rerank),
                     None,
@@ -2245,25 +2301,44 @@ pub mod vector {
         if trace_enabled {
             meter.start_trace();
         }
+        // First cold query: pays the one-time metadata warmup (admit-window
+        // centroid regions, Sq8 meta, stable-id blocks) alongside its probe.
         let query_cpu0 = cpu::process_cpu_ns();
         let query_started = Instant::now();
-        search("cold");
+        search("cold-first", query);
         let query_wall_s = query_started.elapsed().as_secs_f64();
         let query_cpu_s = cpu::cpu_seconds_since(query_cpu0);
         let first_query_trace = trace_enabled.then(|| meter.take_trace());
         let after_first = meter.snapshot();
-        search("repeat");
+        // Second, DISTINCT cold query: the steady cold per-query fetch —
+        // warmup blocks are resident, so it pays only its own probe.
+        if trace_enabled {
+            meter.start_trace();
+        }
+        let second_cpu0 = cpu::process_cpu_ns();
+        let second_started = Instant::now();
+        search("cold-second", second_query);
+        let second_wall_s = second_started.elapsed().as_secs_f64();
+        let second_cpu_s = cpu::cpu_seconds_since(second_cpu0);
+        let second_query_trace = trace_enabled.then(|| meter.take_trace());
+        let after_second = meter.snapshot();
+        // First query repeated verbatim: cache fill-lag probe.
+        search("repeat", query);
         let after_repeat = meter.snapshot();
         drop(consumer);
         drop(cache_dir);
         let split = storage_meter::ColdStoreSplit {
             open,
             first_query: after_first.since(&open),
-            repeat_query: after_repeat.since(&after_first),
+            second_query: after_second.since(&after_first),
+            repeat_query: after_repeat.since(&after_second),
         };
         log_cold_split(label, &split);
         if let Some(trace) = first_query_trace {
             log_query_read_trace(label, "first cold query", &trace);
+        }
+        if let Some(trace) = second_query_trace {
+            log_query_read_trace(label, "second cold query", &trace);
         }
         Some(RoutingColdStat {
             split,
@@ -2271,6 +2346,8 @@ pub mod vector {
             open_cpu_s,
             query_wall_s,
             query_cpu_s,
+            second_wall_s,
+            second_cpu_s,
         })
     }
 
@@ -2283,6 +2360,7 @@ pub mod vector {
         consumer_meter: &storage_meter::MeteredStorage,
         built: &supertable::IngestResult,
         query: &[f32],
+        second_query: &[f32],
         nprobe: usize,
         rerank: usize,
         cache_budget_bytes: u64,
@@ -2361,17 +2439,29 @@ pub mod vector {
         });
         let settled_file_bytes = settled.map(|(_, _, file, _)| file);
         let cold = include_cold
-            .then(|| measure_cold_store(label, built, query, nprobe, rerank, cache_budget_bytes))
+            .then(|| {
+                measure_cold_store(
+                    label,
+                    built,
+                    query,
+                    second_query,
+                    nprobe,
+                    rerank,
+                    cache_budget_bytes,
+                )
+            })
             .flatten();
         if let Some(cold) = &cold {
             assert_expected_cold_reads(label, expected, &cold.split, supertable::n_docs());
         }
         eprintln!(
-            "[supertable_vector/{label}] expected {}; top-k {user_hits} user + {hidden_hits} hidden; warm {}; cold {}",
+            "[supertable_vector/{label}] expected {}; top-k {user_hits} user + {hidden_hits} hidden; warm {}; cold 1st {}; cold 2nd {}",
             expected.label(),
             warm.map(|(p50, _, _, _)| fmt_time(p50))
                 .unwrap_or_else(|| "not measured".into()),
             cold.map(|value| value.split.first_query.fmt_get_class_breakdown())
+                .unwrap_or_else(|| "not measured".into()),
+            cold.map(|value| value.split.second_query.fmt_get_class_breakdown())
                 .unwrap_or_else(|| "not measured".into()),
         );
         RoutingStateStat {
@@ -2540,6 +2630,7 @@ pub mod vector {
                     label: Some(state.label),
                     cold_open: cold.map(|value| value.split.open),
                     cold_query: cold.map(|value| value.split.first_query),
+                    cold_second: cold.map(|value| value.split.second_query),
                     cold_repeat: cold.map(|value| value.split.repeat_query),
                     warm: state.warm_io,
                     warm_iters: state
@@ -2556,6 +2647,8 @@ pub mod vector {
                 cold_open_cpu_s: cold.and_then(|value| value.open_cpu_s),
                 cold_query_s: cold.map(|value| value.query_wall_s),
                 cold_query_cpu_s: cold.and_then(|value| value.query_cpu_s),
+                cold_second_s: cold.map(|value| value.second_wall_s),
+                cold_second_cpu_s: cold.and_then(|value| value.second_cpu_s),
             };
         }
         out
@@ -2843,6 +2936,7 @@ pub mod vector {
                     &consumer_meter,
                     &built,
                     &q_correct[0],
+                    &q_correct[1],
                     nprobe,
                     rerank,
                     built.total_index_bytes,
@@ -2914,6 +3008,7 @@ pub mod vector {
                     &consumer_meter,
                     &built,
                     &q_correct[0],
+                    &q_correct[1],
                     nprobe,
                     rerank,
                     built
@@ -3206,6 +3301,7 @@ pub mod vector {
                         &consumer_meter,
                         &built,
                         &q_correct[0],
+                        &q_correct[1],
                         nprobe,
                         rerank,
                         built
@@ -3285,6 +3381,7 @@ pub mod vector {
                         &consumer_meter,
                         &built,
                         &q_correct[0],
+                        &q_correct[1],
                         nprobe,
                         rerank,
                         built
@@ -3364,6 +3461,7 @@ pub mod vector {
                                 "steady-state",
                                 &built,
                                 &q_cal[0],
+                                q_cal.get(1).map(Vec::as_slice).unwrap_or(&q_cal[0]),
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
@@ -3595,6 +3693,11 @@ pub mod sql {
         let open = meter.snapshot();
         let _ = consumer.query_rows(query.sql);
         let after_first = meter.snapshot();
+        // Second, distinct battery entry probes the steady cold rate; falls
+        // back to the first when the battery has one query.
+        let second = exec_sql::SQL_BATTERY.get(1).unwrap_or(query);
+        let _ = consumer.query_rows(second.sql);
+        let after_second = meter.snapshot();
         let _ = consumer.query_rows(query.sql);
         let after_repeat = meter.snapshot();
         drop(consumer);
@@ -3602,7 +3705,8 @@ pub mod sql {
         let split = storage_meter::ColdStoreSplit {
             open,
             first_query: after_first.since(&open),
-            repeat_query: after_repeat.since(&after_first),
+            second_query: after_second.since(&after_first),
+            repeat_query: after_repeat.since(&after_second),
         };
         log_cold_split("supertable_sql", &split);
         Some(split)

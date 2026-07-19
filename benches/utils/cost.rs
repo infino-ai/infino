@@ -222,6 +222,10 @@ pub struct QueryStateIo {
     pub label: Option<&'static str>,
     pub cold_open: Option<ObjectStoreMeter>,
     pub cold_query: Option<ObjectStoreMeter>,
+    /// A second, distinct query on the same cold consumer: the steady cold
+    /// per-query fetch once the first query's one-time metadata warmup
+    /// (admit-window centroids, Sq8 meta, stable-id blocks) is resident.
+    pub cold_second: Option<ObjectStoreMeter>,
     pub cold_repeat: Option<ObjectStoreMeter>,
     pub warm: Option<ObjectStoreMeter>,
     pub warm_iters: u64,
@@ -247,6 +251,10 @@ pub struct QueryStateCost {
     pub cold_open_cpu_s: Option<f64>,
     pub cold_query_s: Option<f64>,
     pub cold_query_cpu_s: Option<f64>,
+    /// Wall/CPU of the second, distinct cold query — the steady cold
+    /// per-query cost once the first query's metadata warmup is resident.
+    pub cold_second_s: Option<f64>,
+    pub cold_second_cpu_s: Option<f64>,
 }
 
 impl QueryStateCost {
@@ -317,9 +325,15 @@ pub struct StorePhases {
     /// One cold table open on a fresh cache (manifest + pointer + open
     /// blobs) — one-time, amortized across queries on a supertable.
     pub cold_open: Option<ObjectStoreMeter>,
-    /// The first query on the cold cache — the per-query cold fetch.
-    /// This is the "GETs per query" number.
+    /// The first query on the cold cache. Under the v1 open discipline
+    /// this includes the one-time metadata warmup (admit-window centroid
+    /// regions, Sq8 meta, stable-id blocks) alongside the probe — a
+    /// once-per-consumer cost, not the steady cold rate.
     pub cold_query: Option<ObjectStoreMeter>,
+    /// A second, distinct query on the same cold consumer — the steady
+    /// cold per-query fetch once the first query's metadata warmup is
+    /// resident. This is the "GETs per query" number for cold traffic.
+    pub cold_second_query: Option<ObjectStoreMeter>,
     /// Pre-drain counterparts of `cold_open` / `cold_query`: the transient
     /// shape a fresh table serves (hidden IVF still in INCOMING) until
     /// maintenance drains it. Priced so the cost of querying *before*
@@ -935,8 +949,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         one_time_row(&mut io_rows, "Cold table open", c.store.cold_open, "1/open");
         per_query_row(
             &mut io_rows,
-            "Cold query (first on cold cache)",
+            "Cold query (first on cold cache, +metadata warmup)",
             c.store.cold_query,
+        );
+        per_query_row(
+            &mut io_rows,
+            "Cold query (second, steady cold)",
+            c.store.cold_second_query,
         );
         let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
             (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
@@ -967,8 +986,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             );
             per_query_row(
                 &mut io_rows,
-                &format!("Cold — {label}"),
+                &format!("Cold 1st (+metadata warmup) — {label}"),
                 state.io.cold_query,
+            );
+            per_query_row(
+                &mut io_rows,
+                &format!("Cold 2nd (steady cold) — {label}"),
+                state.io.cold_second,
             );
             // Background lazy→mmap fill concurrent with the cold/repeat
             // windows — counted separately so query GETs stay foreground-only.
@@ -1213,7 +1237,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 let vcpu = inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes);
                 let per_q = inst.compute_usd(vcpu);
                 vec![
-                    text(format!("Cold — {label}")),
+                    text(format!("Cold 1st (warmup) — {label}")),
                     text(fmt_time(wall_s * 1e9)),
                     text(fmt_vcpu_seconds(cpu_s)),
                     text(state.serving_ram_label(c.resident_anon_bytes)),
@@ -1226,7 +1250,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 ]
             }
             _ => vec![
-                text(format!("Cold — {label}")),
+                text(format!("Cold 1st (warmup) — {label}")),
                 text(
                     state
                         .cold_query_s
@@ -1239,6 +1263,25 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 text("N/A"),
             ],
         });
+        if let (Some(wall_s), Some(cpu_s)) = (state.cold_second_s, state.cold_second_cpu_s) {
+            let warm_window = state.warm_p50_s.unwrap_or(0.0);
+            let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
+            let ram = inst.query_ram_leg(warm_window, ram_bytes);
+            let vcpu = inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes);
+            let per_q = inst.compute_usd(vcpu);
+            compute_rows.push(vec![
+                text(format!("Cold 2nd (steady) — {label}")),
+                text(fmt_time(wall_s * 1e9)),
+                text(fmt_vcpu_seconds(cpu_s)),
+                text(state.serving_ram_label(c.resident_anon_bytes)),
+                text(if ram > cpu_s { "RAM" } else { "CPU" }),
+                metric(
+                    per_q * PER_MILLION,
+                    usd_per_query_both_scales(per_q),
+                    Better::Lower,
+                ),
+            ]);
+        }
         compute_rows.push(match (state.warm_p50_s, state.warm_cpu_s) {
             (Some(p50_s), Some(cpu_s)) => {
                 let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
@@ -1354,6 +1397,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 ]);
                 steady_warm = Some((format!("warm — {label}"), per_q));
             }
+            // First cold query: one-time metadata warmup — a rate reference,
+            // never the blended cold leg.
             if let (Some(wall_s), Some(cpu_s), Some(io)) = (
                 state.cold_query_s,
                 state.cold_query_cpu_s,
@@ -1364,7 +1409,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 let per_q = inst.per_query_usd(cpu_s, warm_window, ram_bytes) + request_usd(&io);
                 let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
                 serving_rows.push(vec![
-                    text(format!("cold — {label} ({} GET)", io.get_count)),
+                    text(format!(
+                        "cold 1st, one-time warmup — {label} ({} GET)",
+                        io.get_count
+                    )),
                     text(fmt_time(wall_s * 1e9)),
                     metric(
                         queries_per_usd,
@@ -1374,7 +1422,37 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     latency_per_usd_cell(per_q, wall_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
-                steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+                // Fallback steady leg when no second-query window was metered.
+                if state.io.cold_second.is_none() {
+                    steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+                }
+            }
+            // Second (steady) cold query: the per-query price cold traffic
+            // actually pays — this is the blended cold leg.
+            if let (Some(wall_s), Some(cpu_s), Some(io)) = (
+                state.cold_second_s,
+                state.cold_second_cpu_s,
+                state.io.cold_second,
+            ) {
+                let warm_window = state.warm_p50_s.unwrap_or(0.0);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
+                let per_q = inst.per_query_usd(cpu_s, warm_window, ram_bytes) + request_usd(&io);
+                let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+                serving_rows.push(vec![
+                    text(format!("cold steady — {label} ({} GET)", io.get_count)),
+                    text(fmt_time(wall_s * 1e9)),
+                    metric(
+                        queries_per_usd,
+                        format!("{queries_per_usd:.0}"),
+                        Better::Higher,
+                    ),
+                    latency_per_usd_cell(per_q, wall_s),
+                    text(usd(per_q * PER_MILLION)),
+                ]);
+                steady_cold = Some((
+                    format!("cold steady — {label} ({} GET)", io.get_count),
+                    per_q,
+                ));
             }
         }
     }

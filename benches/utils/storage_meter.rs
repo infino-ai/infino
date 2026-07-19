@@ -216,15 +216,20 @@ impl ObjectStoreMeter {
 }
 
 /// One cold consumer's metered windows, split at the phase boundaries the
-/// cost model prices separately: the one-time table open, the first query
-/// on the cold cache (the per-query cold fetch), and the same query
-/// repeated immediately on the same fresh consumer — a cache fill-lag
-/// probe, *not* a steady-state warm number (steady-state warm is metered
-/// separately on a cache-hot consumer).
+/// cost model prices separately: the one-time table open; the first query
+/// on the cold cache (the one-time metadata warmup — under the v1 open
+/// discipline it hydrates the admit-window centroid regions, Sq8 meta,
+/// and stable-id blocks alongside its probe); a **second, distinct**
+/// query on the same consumer (the steady cold per-query fetch — the
+/// warmup blocks are resident, so it pays only its own probe and any
+/// newly-touched cells); and the first query repeated verbatim — a cache
+/// fill-lag probe, *not* a steady-state warm number (steady-state warm is
+/// metered separately on a cache-hot consumer).
 #[derive(Debug, Clone, Copy)]
 pub struct ColdStoreSplit {
     pub open: ObjectStoreMeter,
     pub first_query: ObjectStoreMeter,
+    pub second_query: ObjectStoreMeter,
     pub repeat_query: ObjectStoreMeter,
 }
 
