@@ -867,13 +867,52 @@ impl FtsReader {
                 out.push(None);
                 continue;
             }
-            let pos_ranges: Vec<(u64, u32)> = cursors
+            // Positional extras per member, kept off the term cursors
+            // (whose footprint the term-only kernels depend on): PFOR
+            // members re-parse their metadata header from their own
+            // bytes; an inline (df=1) member recovers its single
+            // position from the FST slot the tf-reinterpretation
+            // dropped during cursor build.
+            let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
+                Vec::with_capacity(cursors.len());
+            for (cursor, term) in cursors.iter().zip(&member_refs) {
+                match cursor.bytes.is_empty() {
+                    false => {
+                        let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
+                        positional.push((Some(term_meta), None));
+                    }
+                    true => {
+                        let fst_bytes = self.dict_bytes_async().await?;
+                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+                            FtsError::Read(ReadError::MalformedVersion(format!(
+                                "FST parse failed: {e}"
+                            )))
+                        })?;
+                        let key = make_key(&col_meta.name, term);
+                        let packed = dict
+                            .lookup(&key)
+                            .expect("inline member cursor was built from this dict");
+                        let position = match FstValue::unpack(packed) {
+                            FstValue::Inline { tf: slot, .. } => slot,
+                            FstValue::Pfor { .. } => {
+                                unreachable!("inline cursor from a PFOR FST value")
+                            }
+                        };
+                        positional.push((None, Some(position)));
+                    }
+                }
+            }
+            let pos_ranges: Vec<(u64, u32)> = positional
                 .iter()
-                .map(|c| (c.positions_offset, c.positions_length))
+                .map(|(term_meta, _)| {
+                    term_meta
+                        .map(|tm| (tm.positions_offset, tm.positions_length))
+                        .unwrap_or((0, 0))
+                })
                 .collect();
             let positions = self.fetch_term_positions(&pos_ranges).await?;
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors, positions,
+                cursors, positions, positional,
             )?)));
         }
         Ok(out)
@@ -1824,9 +1863,11 @@ impl FtsReader {
                     // the term's single position, tf implied 1 — the
                     // builder only inlines tf == 1 postings there.
                     // Scoring must use the implied tf, never the slot.
-                    let (tf, inline_position) = match col_meta.positions {
-                        true => (1, Some(tf)),
-                        false => (tf, None),
+                    // (Phrase members recover the position itself with
+                    // their own FST lookup — see `build_atom_cursors`.)
+                    let tf = match col_meta.positions {
+                        true => 1,
+                        false => tf,
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                     cursors.push(TermCursor::new_inline(
@@ -1834,7 +1875,6 @@ impl FtsReader {
                         tf,
                         self.n_docs as u64,
                         dl_norm_k1,
-                        inline_position,
                     ));
                 }
                 Resolved::Pfor => {
@@ -3362,8 +3402,19 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
 struct PhraseMember {
     cursor: TermCursor,
     /// The term's complete position runs (empty for an inline df=1
-    /// member, whose single position rides on the cursor).
+    /// member, whose single position is `inline_position`).
     positions: Bytes,
+    /// The term's parsed metadata header, re-parsed from the cursor's
+    /// own bytes at member build — the source of the per-block
+    /// position-run offsets. `None` for an inline member (no postings
+    /// bytes). Kept here, not on [`TermCursor`] or [`BlockMeta`]:
+    /// plain term queries never touch positions, and their hot
+    /// structures must not grow for the phrase path's benefit.
+    term_meta: Option<TermMeta>,
+    /// The single position of an inline (df=1, tf=1) member — the
+    /// inline FST value's slot carries it instead of a tf. `None` for
+    /// PFOR members.
+    inline_position: Option<u32>,
     /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
     idf: f32,
     /// Byte offset of each decoded-block pair's run within
@@ -3385,17 +3436,20 @@ impl PhraseMember {
     /// (not exhausted).
     fn decode_current_positions(&mut self) -> Result<(), FtsError> {
         self.pos_scratch.clear();
-        if let Some(p) = self.cursor.inline_position {
+        if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
             return Ok(());
         }
         let block = self.cursor.current_block;
         if self.run_offsets_block != block {
             // One forward walk locates every pair's run in this
-            // block: start at the block's recorded first-run offset,
-            // then skip each pair's `tf` varints.
+            // block: start at the block's recorded first-run offset
+            // (the skip entry's fourth field), then skip each pair's
+            // `tf` varints.
             self.run_offsets.clear();
-            let mut at = self.cursor.blocks[block].positions_block_offset as usize;
+            let term_meta = self.term_meta.as_ref().expect("PFOR member has term meta");
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
             for i in 0..self.cursor.block_n {
                 self.run_offsets.push(at as u32);
                 skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
@@ -3446,23 +3500,33 @@ struct PhraseCursor {
 }
 
 impl PhraseCursor {
-    /// Build from member cursors (query order) and their fetched
-    /// position runs, then seek to the first matching doc.
-    fn new(cursors: Vec<TermCursor>, positions: Vec<Bytes>) -> Result<Self, FtsError> {
+    /// Build from member cursors (query order), their fetched
+    /// position runs, and their positional metadata — `(term_meta,
+    /// inline_position)` per member, exactly one of the two present —
+    /// then seek to the first matching doc.
+    fn new(
+        cursors: Vec<TermCursor>,
+        positions: Vec<Bytes>,
+        positional: Vec<(Option<TermMeta>, Option<u32>)>,
+    ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
+        debug_assert_eq!(cursors.len(), positional.len());
         let mut idf_sum = 0.0f32;
         let mut min_scaled_bound = f32::INFINITY;
         let members: Vec<PhraseMember> = cursors
             .into_iter()
             .zip(positions)
-            .map(|(cursor, positions)| {
+            .zip(positional)
+            .map(|((cursor, positions), (term_meta, inline_position))| {
                 let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
                 min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
                 idf_sum += idf;
                 PhraseMember {
                     cursor,
                     positions,
+                    term_meta,
+                    inline_position,
                     idf,
                     run_offsets: Vec::new(),
                     run_offsets_block: NO_BLOCK_CACHED,
@@ -4327,10 +4391,6 @@ struct BlockMeta {
     /// Per-block BM25 upper bound, recovered from the skip table's
     /// fixed-point `max_bm25_x1000` field.
     block_max_bm25: f32,
-    /// Byte offset of this block's first position run within the
-    /// term's positions bytes (positional columns; zero otherwise —
-    /// the field is the skip entry's formerly-reserved slot).
-    positions_block_offset: u32,
 }
 
 /// Per-query-term cursor used by [`FtsReader::run_max_score_bmm`]
@@ -4392,18 +4452,14 @@ struct TermCursor {
     /// Mirrors the vector reader's per-probed-cluster buffers: the
     /// search hot loops index only the bytes this term touches, never
     /// the whole postings region.
+    ///
+    /// Deliberately carries NO positional state: term cursors are the
+    /// hot per-query unit the multi-cursor kernels iterate over, and
+    /// the positional extras matter only to phrase members —
+    /// [`PhraseMember`] re-derives them from these bytes instead, so
+    /// plain term queries never pay for them in cursor or block-meta
+    /// footprint.
     bytes: Bytes,
-    /// This term's byte range in the positions region (positional
-    /// columns; zeros otherwise). The phrase path fetches the range
-    /// and locates per-doc runs via the blocks'
-    /// `positions_block_offset`.
-    positions_offset: u64,
-    positions_length: u32,
-    /// The single position of an inline (df=1, tf=1) term of a
-    /// positional column — the inline FST value's slot carries it
-    /// instead of a tf. `None` on PFOR cursors and on positionless
-    /// columns.
-    inline_position: Option<u32>,
 }
 
 impl TermCursor {
@@ -4431,7 +4487,6 @@ impl TermCursor {
                 block_byte_offset: metadata_offset + block_offset_in_term,
                 block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
                 block_max_bm25,
-                positions_block_offset: term_meta.positions_block_offset(postings, i),
             });
         }
 
@@ -4447,9 +4502,6 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: term_bytes,
-            positions_offset: term_meta.positions_offset,
-            positions_length: term_meta.positions_length,
-            inline_position: None,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -4464,13 +4516,7 @@ impl TermCursor {
     /// doc means min_dl = dl and max_tf = tf, so the per-block UB
     /// formula collapses to the score itself). Computed at query time
     /// since there's no skip-table entry stored for inline terms.
-    fn new_inline(
-        doc_id: u32,
-        tf: u32,
-        n_docs: u64,
-        dl_norm_k1: f32,
-        inline_position: Option<u32>,
-    ) -> Self {
+    fn new_inline(doc_id: u32, tf: u32, n_docs: u64, dl_norm_k1: f32) -> Self {
         let idf = bm25::idf(n_docs, 1);
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
@@ -4483,7 +4529,6 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
-            positions_block_offset: 0,
         }];
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
@@ -4503,9 +4548,6 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: Bytes::new(),
-            positions_offset: 0,
-            positions_length: 0,
-            inline_position,
         }
     }
 
