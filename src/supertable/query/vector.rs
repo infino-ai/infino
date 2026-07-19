@@ -158,18 +158,9 @@ const RABITQ_ADMIT_CELL_SHORTLIST_MIN: usize = 48;
 /// caller probe width larger than this takes precedence.
 const UNION_FINE_PICKS_MIN: usize = 2;
 
-/// Cell-probe floor for filtered (allow-set) queries over the hidden cell
-/// index. The manifest's default routing (fine-first p=1) is calibrated
-/// for unfiltered search, where fine p1 cell coverage measures 1.000; an
-/// allow-set thins each cell's matching postings (~10% selectivity in the
-/// bench), so the nearest *matching* neighbors spread past the top cell
-/// and a narrow probe caps filtered recall well below the unfiltered
-/// number (p=1 measured 0.756 vs 0.997 at 10M). Probe 4 cells: filtered
-/// recall tracks the row mass probed, not the probe count — p=8 on a
-/// 512-cell grid measured *lower* (0.850 / 10.35 ms at 10M) than p=4 on
-/// the 256-cell grid (0.866 / 9.79 ms), because halving the cells halves
-/// each probe's mass.
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
+// Filtered (allow-set) queries never fan the hidden cell index — see
+// `route_filtered_vector_hits_async` for the measurements behind that
+// routing rule — so no filtered widening of hidden cell routing exists.
 
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
@@ -593,25 +584,21 @@ pub struct VectorFilter<'a> {
     pub mode: BoolMode,
 }
 
-/// Prepared per-superfile allow-set for filtered vector kNN.
-///
-/// When `use_hidden_index` is true, `allow_by_uri` is keyed by hidden-index
-/// superfile URIs (file-local ids). Otherwise it is keyed by user-table URIs.
+/// Prepared per-superfile allow-set for filtered vector kNN, keyed by
+/// user-table URIs (filtered search always fans the user fragments — see
+/// `route_filtered_vector_hits_async`).
 #[derive(Clone)]
 #[cfg(feature = "test-helpers")]
 pub struct PreparedGlobalAllow {
-    use_hidden_index: bool,
     allow_by_uri: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
 }
 
-/// Prepared per-superfile allow-set for filtered vector kNN.
-///
-/// When `use_hidden_index` is true, `allow_by_uri` is keyed by hidden-index
-/// superfile URIs (file-local ids). Otherwise it is keyed by user-table URIs.
+/// Prepared per-superfile allow-set for filtered vector kNN, keyed by
+/// user-table URIs (filtered search always fans the user fragments — see
+/// `route_filtered_vector_hits_async`).
 #[derive(Clone)]
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) struct PreparedGlobalAllow {
-    use_hidden_index: bool,
     allow_by_uri: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
 }
 
@@ -1104,13 +1091,15 @@ impl SupertableReader {
         // read Copy `CellRoutingParams` (that clone used to drop the transposed
         // SIMD cache and force a per-query scalar transpose rebuild).
         let hidden_routing = manifest.vector_cell_routing();
-        // The user-table path owns its coarse default (16 cells). Explicit
-        // caller overrides and the filtered path keep the resolved value;
+        // The user-table path owns its coarse default (16 cells), and a
+        // filtered fan never probes narrower than that: an allow-set thins
+        // each cell's matching mass, so the filtered default is the floor,
+        // not a cap. Explicit caller overrides keep the resolved value;
         // hidden routing ignores `nprobe` entirely (persisted
         // CellRoutingParams). The single-superfile tier is untouched — this
         // widening lives only in the supertable fan-out.
-        let nprobe = if !hidden_vector_index && !filtered && options.nprobe.is_none() {
-            USER_COARSE_CELLS
+        let nprobe = if !hidden_vector_index && options.nprobe.is_none() {
+            resolved_nprobe.max(USER_COARSE_CELLS)
         } else {
             resolved_nprobe
         };
@@ -1195,19 +1184,12 @@ impl SupertableReader {
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
+            debug_assert!(
+                !(hidden_vector_index && filtered),
+                "filtered vector search never fans the hidden index"
+            );
             let cell_routing = if hidden_vector_index {
-                let base = hidden_routing.expect("hidden manifest carries routing");
-                if filtered {
-                    // Allow-set queries widen to the filtered floor; the
-                    // manifest's persisted routing still wins if broader.
-                    CellRoutingParams {
-                        nprobe_min: base.nprobe_min.max(FILTERED_HIDDEN_CELL_NPROBE),
-                        nprobe_max: base.nprobe_max.max(FILTERED_HIDDEN_CELL_NPROBE),
-                        ..base
-                    }
-                } else {
-                    base
-                }
+                hidden_routing.expect("hidden manifest carries routing")
             } else if filtered || options.nprobe.is_some() {
                 CellRoutingParams {
                     nprobe_min: nprobe.max(1),
@@ -1581,10 +1563,10 @@ impl SupertableReader {
     /// those matching a text predicate**, by pushdown.
     ///
     /// The predicate is resolved on the **user** table (FTS postings /
-    /// blooms). When the hidden vector index is drained, kNN then ranks
-    /// among matching rows on the **hidden** index — same post-drain path
-    /// as unfiltered search and the bench. Pre-drain keeps the user-table
-    /// fan-out. Superfiles whose predicate matches nothing are skipped.
+    /// blooms), and kNN fans the user fragments — drained and undrained
+    /// alike, never the hidden index (see
+    /// [`Self::route_filtered_vector_hits_async`] for the measurements).
+    /// Superfiles whose predicate matches nothing are skipped.
     ///
     /// An empty `filter_query` (tokenizes to nothing) or a predicate
     /// that matches no row anywhere returns an empty `Vec`.
@@ -1714,8 +1696,8 @@ impl SupertableReader {
     /// the caller routes `Unbounded` to the unfiltered
     /// [`Self::vector_search_async`], where DataFusion's `FilterExec`
     /// re-applies the predicate. For a bounded plan, the predicate is
-    /// resolved on the user table and kNN runs on the hidden index when
-    /// drained (same routing as [`Self::vector_hits_filtered_async`]).
+    /// resolved on the user table and kNN fans the user fragments (same
+    /// routing as [`Self::vector_hits_filtered_async`]).
     ///
     /// Manifest-only leaf survival runs before any superfile opens: bounded
     /// FTS leaves are lowered to term-bloom prunes and intersected with the
@@ -1755,38 +1737,23 @@ impl SupertableReader {
             .await
     }
 
-    /// Convert user-table allow bitmaps (local doc ids) to stable `_id`s.
-    async fn stable_ids_from_user_allow_async(
-        &self,
-        user_allow: &HashMap<SuperfileUri, Arc<RoaringBitmap>>,
-    ) -> Result<Vec<i128>, QueryError> {
-        let mut out: HashSet<i128> = HashSet::new();
-        let manifest = self.manifest();
-        let id_column = self.options().id_column.as_str();
-        for (uri, bm) in user_allow {
-            let entry = manifest
-                .lookup_superfile_entry(*uri)
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .ok_or_else(|| {
-                    QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
-                })?;
-            if row_id_from_manifest_entry(&entry, 0).is_some() {
-                for local in bm.iter() {
-                    out.insert(entry.id_min + i128::from(local));
-                }
-                continue;
-            }
-            let locals: Vec<u32> = bm.iter().collect();
-            let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, false).await?;
-            out.extend(ids);
-        }
-        Ok(out.into_iter().collect())
-    }
-
-    /// Filtered kNN: resolve the predicate on the user table, then search the
-    /// hidden index when drained (same path as the bench). Pre-drain (no
-    /// hidden superfiles) keeps the user-table fan-out.
+    /// Filtered kNN fans the user fragments — drained and undrained alike —
+    /// and never the hidden index. The rows physically stay in the immutable
+    /// user superfiles after a drain (only the *unfiltered* planner skips
+    /// them), and the fragment fan is the shape a filter needs: an allow-set
+    /// thins each hidden cell's matching rows, so the nearest matching
+    /// neighbors scatter past any fixed cell probe — filtered recall
+    /// measured 0.866 (256 cells) / 0.808 (512 cells) at 10M against 0.997
+    /// unfiltered, and widening the probe made it *worse* (p=8 on 512
+    /// cells: 0.850) because each probe's row mass halved. Per-fragment
+    /// probing has no such choke point, each row exists exactly once (no
+    /// replica dedup), and manifest pruning (blooms / ranges) skips
+    /// fragments for correlated predicates — locality the cell-ordered
+    /// hidden table destroys by construction.
+    ///
+    /// One call into the same fan the user path uses; the allow bitmaps
+    /// already exclude tombstones (`candidate_bitmaps` subtracts them), so
+    /// rows deleted after their drain never resurface.
     async fn route_filtered_vector_hits_async(
         &self,
         user_superfiles: Vec<Arc<SuperfileEntry>>,
@@ -1799,54 +1766,15 @@ impl SupertableReader {
         if user_allow.is_empty() {
             return Ok(Vec::new());
         }
-        let drained = self
-            .vector_index_table()
-            .map(|hidden| hidden.pinned_reader().manifest().get_drained_ranges())
-            .unwrap_or_default();
-        let mut drained_allow = HashMap::new();
-        let mut undrained_user = Vec::new();
-        for entry in user_superfiles {
-            if drained.contains(entry.birth_version) {
-                if let Some(bitmap) = user_allow.get(&entry.uri) {
-                    drained_allow.insert(entry.uri, Arc::clone(bitmap));
-                }
-            } else {
-                undrained_user.push(entry);
-            }
-        }
-        let user_hits = if undrained_user.is_empty() {
-            Vec::new()
-        } else {
-            self.vector_fanout_over_superfiles(
-                undrained_user,
-                column,
-                query,
-                k,
-                options,
-                Some(user_allow.clone()),
-            )
-            .await?
-        };
-        let stable_ids = self
-            .stable_ids_from_user_allow_async(&drained_allow)
-            .await?;
-        let hidden_hits = if stable_ids.is_empty() {
-            Vec::new()
-        } else {
-            let prepared = self
-                .prepare_vector_stable_allow_async(Arc::new(stable_ids))
-                .await?;
-            if !prepared.use_hidden_index {
-                return Err(QueryError::Execute(
-                    "drained filtered-vector ids resolved to a user allow-set instead of the \
-                     hidden index"
-                        .into(),
-                ));
-            }
-            self.vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
-                .await?
-        };
-        Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
+        self.vector_fanout_over_superfiles(
+            user_superfiles,
+            column,
+            query,
+            k,
+            options,
+            Some(user_allow),
+        )
+        .await
     }
 
     /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
@@ -1869,10 +1797,9 @@ impl SupertableReader {
             .await
     }
 
-    /// Build the per-superfile allow-set once from corpus-global ids.
-    ///
-    /// User-table path maps by contiguous ingest order. Post-drain path maps
-    /// against hidden-cell stable ids and returns a hidden-index allow-set.
+    /// Build the per-superfile allow-set once from corpus-global ids, mapped
+    /// by contiguous ingest order over the user table — drained superfiles
+    /// included, since filtered kNN always fans the user fragments.
     #[cfg(feature = "test-helpers")]
     pub async fn prepare_vector_global_allow_async(
         &self,
@@ -1880,60 +1807,9 @@ impl SupertableReader {
     ) -> Result<PreparedGlobalAllow, QueryError> {
         if allow_global.is_empty() {
             return Ok(PreparedGlobalAllow {
-                use_hidden_index: self.vector_index_table().is_some(),
                 allow_by_uri: HashMap::new(),
             });
         }
-        if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
-            let hidden_manifest = Arc::clone(hidden_reader.manifest());
-            let drained = hidden_manifest.get_drained_ranges();
-            let superfiles = hidden_manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?;
-            if !superfiles.is_empty() {
-                let allow_for_cell = Arc::clone(&allow_global);
-                let manifest_for_ids = Arc::clone(&hidden_manifest);
-                let allow_by_uri = hidden_reader
-                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                        let allow_for_cell = Arc::clone(&allow_for_cell);
-                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                        async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
-                            let mut local = RoaringBitmap::new();
-                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                                if let Ok(global_id) = u32::try_from(stable_id)
-                                    && allow_for_cell.contains(global_id)
-                                {
-                                    local.insert(local_doc_id as u32);
-                                }
-                            }
-                            Ok(local)
-                        }
-                    })
-                    .await?;
-                if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
-                        "global allow ids for drained filtered-vector rows did not map to any \
-                         hidden superfile"
-                            .into(),
-                    ));
-                }
-                return Ok(PreparedGlobalAllow {
-                    use_hidden_index: true,
-                    allow_by_uri,
-                });
-            }
-            if !drained.is_empty() {
-                return Err(QueryError::Execute(
-                    "hidden vector manifest has drained ranges but no hidden superfiles".into(),
-                ));
-            }
-        }
-
         let manifest = self.manifest();
         let superfiles = manifest
             .get_all_superfiles_loaded()
@@ -1962,7 +1838,6 @@ impl SupertableReader {
             base = end;
         }
         Ok(PreparedGlobalAllow {
-            use_hidden_index: false,
             allow_by_uri: allow_by_uri
                 .into_iter()
                 .map(|(uri, bm)| (uri, Arc::new(bm)))
@@ -1970,12 +1845,10 @@ impl SupertableReader {
         })
     }
 
-    /// Build a per-superfile allow-set from stable `_id` values.
-    ///
-    /// Post-drain: every supplied id is expected to describe a drained row and
-    /// must map against hidden-cell stable ids; an empty mapping is an
-    /// invariant error. Pre-drain (empty hidden membership and drained range)
-    /// maps against the user table.
+    /// Build a per-user-superfile allow-set from stable `_id` values —
+    /// drained superfiles included, since filtered kNN always fans the user
+    /// fragments. Contiguous id-span entries map arithmetically; the rest
+    /// resolve through their `_id` pages.
     #[cfg(feature = "test-helpers")]
     pub async fn prepare_vector_stable_allow_async(
         &self,
@@ -2000,59 +1873,11 @@ impl SupertableReader {
     ) -> Result<PreparedGlobalAllow, QueryError> {
         if allow_stable_ids.is_empty() {
             return Ok(PreparedGlobalAllow {
-                use_hidden_index: false,
                 allow_by_uri: HashMap::new(),
             });
         }
         let allow_set: Arc<HashSet<i128>> =
             Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
-        if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
-            let hidden_manifest = Arc::clone(hidden_reader.manifest());
-            let drained = hidden_manifest.get_drained_ranges();
-            let superfiles = hidden_manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?;
-            if !superfiles.is_empty() {
-                let allow_for_cell = Arc::clone(&allow_set);
-                let manifest_for_ids = Arc::clone(&hidden_manifest);
-                let allow_by_uri = hidden_reader
-                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                        let allow_for_cell = Arc::clone(&allow_for_cell);
-                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                        async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
-                            let mut local = RoaringBitmap::new();
-                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                                if allow_for_cell.contains(&stable_id) {
-                                    local.insert(local_doc_id as u32);
-                                }
-                            }
-                            Ok(local)
-                        }
-                    })
-                    .await?;
-                if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
-                        "stable ids for drained filtered-vector rows did not map to any hidden \
-                         superfile"
-                            .into(),
-                    ));
-                }
-                return Ok(PreparedGlobalAllow {
-                    use_hidden_index: true,
-                    allow_by_uri,
-                });
-            }
-            if !drained.is_empty() {
-                return Err(QueryError::Execute(
-                    "hidden vector manifest has drained ranges but no hidden superfiles".into(),
-                ));
-            }
-        }
         let manifest = self.manifest();
         let superfiles = manifest
             .get_all_superfiles_loaded()
@@ -2060,7 +1885,6 @@ impl SupertableReader {
             .map_err(QueryError::ManifestLoad)?;
         if superfiles.is_empty() {
             return Ok(PreparedGlobalAllow {
-                use_hidden_index: false,
                 allow_by_uri: HashMap::new(),
             });
         }
@@ -2083,14 +1907,11 @@ impl SupertableReader {
                 }
             })
             .await?;
-        Ok(PreparedGlobalAllow {
-            use_hidden_index: false,
-            allow_by_uri,
-        })
+        Ok(PreparedGlobalAllow { allow_by_uri })
     }
 
-    /// Run filtered vector fan-out from a precomputed allow-set (user or
-    /// hidden, as selected by [`PreparedGlobalAllow::use_hidden_index`]).
+    /// Run filtered vector fan-out from a precomputed user-table allow-set —
+    /// the same user-fragment fan `route_filtered_vector_hits_async` uses.
     #[cfg(feature = "test-helpers")]
     pub async fn vector_hits_prepared_global_allow_async(
         &self,
@@ -2127,30 +1948,6 @@ impl SupertableReader {
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 || prepared.allow_by_uri.is_empty() {
             return Ok(Vec::new());
-        }
-        if prepared.use_hidden_index {
-            let vit = self.vector_index_table().ok_or_else(|| {
-                QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
-            })?;
-            let hidden_reader = vit.pinned_reader();
-            let superfiles = hidden_reader
-                .manifest()
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?;
-            if superfiles.is_empty() {
-                return Ok(Vec::new());
-            }
-            return hidden_reader
-                .vector_fanout_over_superfiles(
-                    superfiles,
-                    column,
-                    query,
-                    k,
-                    options,
-                    Some(prepared.allow_by_uri.clone()),
-                )
-                .await;
         }
         let superfiles = self
             .manifest()
@@ -3712,10 +3509,9 @@ mod tests {
         );
     }
 
-    /// `prepare_vector_stable_allow_async` on a *valid* drained id resolves it
-    /// to a hidden-cell allow-set (the success path; the existing test only
-    /// covers the unknown-id error). Post-drain it must key the allow-set by
-    /// hidden-index URIs and be non-empty.
+    /// `prepare_vector_stable_allow_async` on a *valid* drained id resolves
+    /// it to a user-table allow-set: filtered kNN fans the user fragments,
+    /// so post-drain the mapping stays keyed by user URIs and non-empty.
     #[test]
     fn prepare_vector_stable_allow_maps_valid_drained_id() {
         use arrow_array::Decimal128Array;
@@ -3764,13 +3560,22 @@ mod tests {
         )
         .expect("valid drained id must map");
         assert!(
-            prepared.use_hidden_index,
-            "post-drain allow-set is keyed by the hidden index"
-        );
-        assert!(
             !prepared.allow_by_uri.is_empty(),
-            "a valid id resolves to a non-empty hidden-cell allow-set"
+            "a valid id resolves to a non-empty user-table allow-set"
         );
+        let user_uris: HashSet<_> = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| e.uri)
+            .collect();
+        for uri in prepared.allow_by_uri.keys() {
+            assert!(
+                user_uris.contains(uri),
+                "allow-set must be keyed by user-table URIs, got {uri:?}"
+            );
+        }
     }
 
     /// Row-returning vector search AFTER a drain resolves hidden-cell hits back
@@ -3954,10 +3759,11 @@ mod tests {
         );
     }
 
-    /// Post-drain filtered search must fan out on the hidden index (same as
-    /// the bench), not the user table. Predicate still resolves on user FTS.
+    /// Post-drain filtered search fans the user fragments (drained rows
+    /// included) and never the hidden index — the fragment fan is the shape
+    /// an allow-set needs. Predicate still resolves on user FTS.
     #[test]
-    fn filtered_vector_search_post_drain_uses_hidden_index() {
+    fn filtered_vector_search_post_drain_fans_user_fragments() {
         use crate::superfile::vector::rerank_codec::RerankCodec;
 
         let dim = 16usize;
@@ -4032,27 +3838,33 @@ mod tests {
         assert!(!hits.is_empty(), "filtered search must return hits");
         for hit in &hits {
             assert!(
-                hidden_uris.contains(&hit.superfile),
-                "post-drain filtered hits must come from hidden superfiles, got {:?} \
+                user_uris.contains(&hit.superfile),
+                "post-drain filtered hits must come from user superfiles, got {:?} \
                  (user={user_uris:?}, hidden={hidden_uris:?})",
                 hit.superfile
             );
             assert!(
-                !user_uris.contains(&hit.superfile),
-                "post-drain filtered hits must not come from user superfiles"
+                !hidden_uris.contains(&hit.superfile),
+                "post-drain filtered hits must never come from the hidden index"
             );
         }
 
-        let mapping_error =
+        // An unknown stable id maps to no superfile: empty allow-set, no
+        // error — and a search over it returns nothing.
+        let prepared =
             block_on(reader.prepare_vector_stable_allow_async(Arc::new(vec![i128::MAX])))
-                .err()
-                .expect("unknown drained id must fail hidden mapping");
-        assert!(
-            mapping_error
-                .to_string()
-                .contains("did not map to any hidden superfile"),
-            "unexpected mapping error: {mapping_error}"
-        );
+                .expect("unknown id yields an empty allow-set");
+        let mut q2 = vec![0.0f32; dim];
+        q2[0] = 1.0;
+        let empty = block_on(reader.vector_hits_prepared_global_allow_async(
+            "emb",
+            &q2,
+            5,
+            VectorSearchOptions::new(),
+            &prepared,
+        ))
+        .expect("empty allow-set search");
+        assert!(empty.is_empty(), "no allowed rows ⇒ no hits");
     }
 
     /// A post-drain vector search resolves hidden hits back to user `_id`s and
