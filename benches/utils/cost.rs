@@ -1397,24 +1397,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // is NOT a standing line: the resident set a query needs in order to be
     // served — pinned heap (manifest, routing state) plus the page-cache
     // working set — is billed inside each query's price through the RAM-hold
-    // leg (`query_ram_leg`: resident share × fudged query window). Memory
+    // leg (`query_ram_leg`: resident share × fudged query window), and its
+    // per-layer bytes are shown on the compute ledger's query rows. Memory
     // cost therefore scales with queries actually served, never with
     // calendar hours; idle processes are reaped, and any keep-warm-while-
-    // idle policy is the operator's line item, priced from the
-    // $/serving-hour rate quoted below. All inputs are measured — a line
-    // without a measurement is omitted, never guessed.
-    let last_state = query_states.last();
-    let steady_pinned_bytes = last_state
-        .and_then(|state| state.ram_anon_bytes)
-        .unwrap_or(c.resident_anon_bytes);
-    let steady_working_set_bytes = last_state
-        .and_then(|state| state.ram_file_settled_bytes)
-        .or_else(|| {
-            last_state
-                .and_then(|state| state.ram_bytes)
-                .map(|total| total.saturating_sub(steady_pinned_bytes))
-        })
-        .unwrap_or(0);
+    // idle policy is the operator's line item. All inputs are measured — a
+    // line without a measurement is omitted, never guessed.
     let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
         text("Storage"),
         text(format!(
@@ -1560,24 +1548,6 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
         month
     });
-    // Rate references only (no $/month): the resident set is billed inside
-    // each query's RAM-hold leg above. The $/serving-hour rate is quoted so
-    // an operator can price a keep-warm-while-idle policy separately.
-    let serving_set_bytes = steady_pinned_bytes + steady_working_set_bytes;
-    let serving_set_hour = inst.ram_share(serving_set_bytes) * inst.usd_per_hour;
-    summary_rows.push(vec![
-        text("Serving memory — resident set (billed per query via RAM-hold leg)"),
-        text(format!(
-            "{} pinned heap + {} page cache = {} ({:.0}% of {}), {} per serving hour",
-            fmt_bytes(steady_pinned_bytes),
-            fmt_bytes(steady_working_set_bytes),
-            fmt_bytes(serving_set_bytes),
-            inst.ram_share(serving_set_bytes) * 100.0,
-            inst.name,
-            usd(serving_set_hour),
-        )),
-        text(""),
-    ]);
     let monthly_total = storage_month
         + blended_read_q
             .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
