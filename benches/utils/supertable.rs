@@ -432,10 +432,29 @@ const SLOW_VECTOR_STATE_PREFIX: &str = "slow-vector-state/";
 /// reflects what is actually durable (a superseded blob not yet GC'd counts,
 /// deliberately). `None` when the table has no storage attached.
 fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
+    listed_bytes_under(table, SLOW_VECTOR_STATE_PREFIX)
+}
+
+/// EVERY durable byte under the table's storage root, LISTed from the
+/// object store: superfiles, manifest lists/parts/routing siblings,
+/// pointers, slow-CAS state, the nested hidden vector-index subtree, and
+/// any superseded objects GC has not yet reclaimed (deliberately counted
+/// — they are billed bytes until reclaim). This is what the cost model
+/// prices; the manifest-metadata superfile sums remain as the printed
+/// breakdown. `None` when the table has no storage attached; empty
+/// listings (providers without metadata listing) fall back to the
+/// manifest sums at the call site.
+fn bucket_stored_bytes(table: &Supertable) -> Option<u64> {
+    listed_bytes_under(table, "")
+}
+
+/// Sum of object sizes under `prefix`, listed from the table's provider.
+fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
     let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
+    let prefix = prefix.to_owned();
     let total = tiers::block_on(async move {
         storage
-            .list_with_prefix_metadata(SLOW_VECTOR_STATE_PREFIX)
+            .list_with_prefix_metadata(&prefix)
             .await
             .map(|objs| objs.iter().map(|(_, meta)| meta.size).sum::<u64>())
             .unwrap_or(0)
@@ -3543,13 +3562,28 @@ pub mod vector {
                     .vector_index_table()
                     .and_then(|h| slow_state_stored_bytes(h))
                     .unwrap_or(0);
+                // The PRICED capacity is a real object-store LIST over the
+                // table root (superfiles + manifest lists/parts/siblings +
+                // pointers + slow-CAS state + not-yet-GC'd objects — every
+                // byte the store bills). The manifest-metadata sums above
+                // remain the printed breakdown; superfile sums alone
+                // under-counted the bucket by ~25% at 1M (the slow-CAS trio
+                // and manifest parts were printed but never priced).
+                let bucket_stored = bucket_stored_bytes(&consumer)
+                    .filter(|&bytes| bytes > 0)
+                    .unwrap_or(post_drain_stored + slow_state_stored);
+                let manifest_overhead = bucket_stored
+                    .saturating_sub(post_drain_stored)
+                    .saturating_sub(slow_state_stored);
                 eprintln!(
-                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} (ingest-time user-only was {}); slow vector-state blob {}",
+                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} superfiles (ingest-time user-only was {}); slow vector-state {}; manifests + not-yet-GC'd {}; PRICED bucket total (listed) {}",
                     rss::fmt_bytes(user_stored),
                     rss::fmt_bytes(hidden_stored),
                     rss::fmt_bytes(post_drain_stored),
                     rss::fmt_bytes(built.total_index_bytes),
                     rss::fmt_bytes(slow_state_stored),
+                    rss::fmt_bytes(manifest_overhead),
+                    rss::fmt_bytes(bucket_stored),
                 );
                 // Retained tables keep everything the run wrote — including
                 // the drained hidden index — so a follow-up run can iterate
@@ -3646,7 +3680,7 @@ pub mod vector {
                         .then_some((warm_pre_vec.as_slice(), cold_pre_vec.as_slice())),
                     true,
                     store,
-                    Some(post_drain_stored),
+                    Some(bucket_stored),
                 );
             }
 
