@@ -131,6 +131,41 @@ test_visible! {
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
 
+/// Fraction of the ranked tagged cells the 1-bit admit prefilter keeps
+/// for exact fp32 rescoring (floored by
+/// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`]). A cell's rank is its best fine
+/// centroid's 1-bit estimate, and every fine inside a kept cell is
+/// rescored exactly — so the window only has to land the exact-best cell
+/// (plus near-tie companions) *somewhere* inside it. 3/16 is the ratio
+/// recall-validated at 1M/10M (48 of 256 cells: post-drain recall matched
+/// the exact-everything scan at 0.995); a fixed 48 under-covers larger
+/// grids (under 5% of 1024 cells), so the window scales with the ranked
+/// population instead.
+const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 3.0 / 16.0;
+
+/// Window floor: below this many ranked cells the prefilter degenerates
+/// to scoring everything — identical to the exact path. Also the
+/// validated absolute window at the 256-cell shapes, so small tables
+/// never see a narrower window than the measured one.
+const RABITQ_ADMIT_CELL_SHORTLIST_MIN: usize = 48;
+
+/// Minimum fine-ranked picks in the union cell selection used by the
+/// non-default paths (filtered search, explicit caller nprobe). The fine
+/// ranking's second pick closes the last coverage gap when the grid is
+/// very coarse — measured at 10M/64c: fine p1 coverage 0.919 (union recall
+/// landed exactly on it at 0.921) vs fine p2 coverage 0.997. An explicit
+/// caller probe width larger than this takes precedence.
+const UNION_FINE_PICKS_MIN: usize = 2;
+
+/// Cell-probe floor for filtered (allow-set) queries over the hidden cell
+/// index. The manifest's default routing (fine-first p=1) is calibrated
+/// for unfiltered search, where fine p1 cell coverage measures 1.000; an
+/// allow-set thins each cell's matching postings (~10% selectivity in the
+/// bench), so the nearest *matching* neighbors spread past the top cell
+/// and p=1 caps filtered recall well below the unfiltered number
+/// (measured 0.756 vs 0.997 at 10M). Probe 4 cells instead.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
+
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
 /// for the flat (non-cell) path.
@@ -320,16 +355,13 @@ fn postings_by_cell_from_summaries(
     (postings, any_tagged)
 }
 
-/// Cells kept by the 1-bit admit prefilter before exact fp32 rescoring.
-/// The prefilter only has to land the exact-best cell (plus its near-tie
-/// companions) *somewhere* in this window — final selection reruns on
-/// exact scores, so estimate noise can only cost recall if the true best
-/// cell falls outside the window entirely. Measured at 1M/256c with this
-/// window: post-drain recall matches the exact-everything scan (0.995)
-/// while exact-scanning under a fifth of the cells. When a table has
-/// fewer cells than the window plus the grid picks, the prefilter
-/// degenerates to scoring everything — identical to the exact path.
-const RABITQ_ADMIT_CELL_SHORTLIST: usize = 48;
+/// 1-bit admit window for `ranked_cells` distinct tagged cells: the
+/// [`RABITQ_ADMIT_CELL_SHORTLIST_FRACTION`] slice of the ranked
+/// population, floored by [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`].
+fn admit_shortlist_window(ranked_cells: usize) -> usize {
+    let scaled = (ranked_cells as f64 * RABITQ_ADMIT_CELL_SHORTLIST_FRACTION).ceil() as usize;
+    scaled.max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
+}
 
 /// One admit fine-centroid candidate:
 /// `(superfile index, flat cluster id, score, cell id, indexed doc count)`.
@@ -385,12 +417,12 @@ fn eligible_summary<'e>(
 ///
 /// With `admit` set (`(prefilter query, must-include cells)`), a 1-bit
 /// XOR+popcount pass first ranks tagged cells by their best estimated
-/// score and keeps the top [`RABITQ_ADMIT_CELL_SHORTLIST`] plus the
-/// caller's grid picks; the exact fp32 scan below then skips instances
-/// outside that set. Every *emitted* score is exact fp32, so routing and
-/// near-tie logic never see 1-bit noise — the estimates only bound which
-/// cells get exact-scored. Untagged (`cell_id: None`) summaries are
-/// always exact-scored.
+/// fine-centroid score and keeps the [`admit_shortlist_window`] top
+/// slice plus the caller's grid picks; the exact fp32 scan below then
+/// skips instances outside that set. Every *emitted* score is exact
+/// fp32, so routing and near-tie logic never see 1-bit noise — the
+/// estimates only bound which cells get exact-scored. Untagged
+/// (`cell_id: None`) summaries are always exact-scored.
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
@@ -430,7 +462,7 @@ fn score_fine_candidates(
         });
         let mut keep: HashSet<u32> = ranked
             .iter()
-            .take(RABITQ_ADMIT_CELL_SHORTLIST)
+            .take(admit_shortlist_window(ranked.len()))
             .map(|(cell, _)| *cell)
             .collect();
         keep.extend(must_include.iter().copied());
@@ -481,23 +513,6 @@ fn score_fine_candidates(
     }
     Ok((candidates, deferred))
 }
-
-/// Minimum fine-ranked picks in the union cell selection used by the
-/// non-default paths (filtered search, explicit caller nprobe). The fine
-/// ranking's second pick closes the last coverage gap when the grid is
-/// very coarse — measured at 10M/64c: fine p1 coverage 0.919 (union recall
-/// landed exactly on it at 0.921) vs fine p2 coverage 0.997. An explicit
-/// caller probe width larger than this takes precedence.
-const UNION_FINE_PICKS_MIN: usize = 2;
-
-/// Cell-probe floor for filtered (allow-set) queries over the hidden cell
-/// index. The manifest's default routing (fine-first p=1) is calibrated
-/// for unfiltered search, where fine p1 cell coverage measures 1.000; an
-/// allow-set thins each cell's matching postings (~10% selectivity in the
-/// bench), so the nearest *matching* neighbors spread past the top cell
-/// and p=1 caps filtered recall well below the unfiltered number
-/// (measured 0.756 vs 0.997 at 10M). Probe 4 cells instead.
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
 
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
@@ -2623,9 +2638,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        SCORE_COLUMN, VectorFilter, VectorSearchOptions, cells_ranked_by_fine_score,
-        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
+        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
+        hidden_hits_user_ids, is_hidden_vector_manifest, projection_is_id_score_only,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2671,6 +2687,21 @@ mod tests {
             Some(&["other", SCORE_COLUMN]),
             id
         ));
+    }
+
+    /// The admit window scales with the ranked cell population (3/16
+    /// slice) and never narrows below the validated floor: the 256-cell
+    /// shape keeps its measured 48, larger grids widen proportionally,
+    /// and small tables degenerate to exact-everything.
+    #[test]
+    fn admit_shortlist_window_scales_with_cell_population() {
+        assert_eq!(admit_shortlist_window(0), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(16), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(256), 48);
+        assert_eq!(admit_shortlist_window(512), 96);
+        assert_eq!(admit_shortlist_window(1024), 192);
+        // Ceil, not floor: a fractional slice rounds up.
+        assert_eq!(admit_shortlist_window(257), 49);
     }
 
     #[test]
