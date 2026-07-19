@@ -2273,19 +2273,19 @@ mod tests {
     }
 
     #[test]
-    fn summarize_picks_min_median_p90() {
+    fn summarize_picks_median_p90_p99() {
         let mut s = [ms(5), ms(1), ms(3), ms(2), ms(4)];
         let out = summarize(&mut s);
-        assert_eq!(out.min, ms(1));
         assert_eq!(out.p50, ms(3)); // lower-median of 5
         assert_eq!(out.p90, ms(5)); // nearest-rank ceil(0.9*5)=5
+        assert_eq!(out.p99, ms(5)); // nearest-rank ceil(0.99*5)=5
     }
 
     #[test]
     fn summarize_single_and_empty() {
         assert_eq!(summarize(&mut [ms(7)]).p90, ms(7));
         let z = summarize(&mut []);
-        assert_eq!((z.min, z.p50, z.p90), (ms(0), ms(0), ms(0)));
+        assert_eq!((z.p50, z.p90, z.p99), (ms(0), ms(0), ms(0)));
     }
 
     #[test]
