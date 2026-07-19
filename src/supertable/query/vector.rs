@@ -164,9 +164,12 @@ const UNION_FINE_PICKS_MIN: usize = 2;
 /// allow-set thins each cell's matching postings (~10% selectivity in the
 /// bench), so the nearest *matching* neighbors spread past the top cell
 /// and a narrow probe caps filtered recall well below the unfiltered
-/// number (p=1 measured 0.756 vs 0.997 at 10M; p=4 measured 0.866 at
-/// 10M/256c). Probe 8 cells.
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 8;
+/// number (p=1 measured 0.756 vs 0.997 at 10M). Probe 4 cells: filtered
+/// recall tracks the row mass probed, not the probe count — p=8 on a
+/// 512-cell grid measured *lower* (0.850 / 10.35 ms at 10M) than p=4 on
+/// the 256-cell grid (0.866 / 9.79 ms), because halving the cells halves
+/// each probe's mass.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
 
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
