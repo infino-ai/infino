@@ -251,8 +251,10 @@ pub struct QueryStateCost {
     pub cold_open_cpu_s: Option<f64>,
     pub cold_query_s: Option<f64>,
     pub cold_query_cpu_s: Option<f64>,
-    /// Wall/CPU of the second, distinct cold query — the steady cold
-    /// per-query cost once the first query's metadata warmup is resident.
+    /// Wall/CPU of the steady cold query — the per-query cost once the
+    /// first query's metadata warmup is resident. Median across the
+    /// distinct steady-cold samples (a single draw is the max of a
+    /// concurrent GET fan and one object-store straggler can triple it).
     pub cold_second_s: Option<f64>,
     pub cold_second_cpu_s: Option<f64>,
 }

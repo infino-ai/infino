@@ -1260,6 +1260,13 @@ pub mod vector {
         ("post-delta", 10, 12),
         ("post-compact", 8, 10),
     ];
+    /// Distinct steady-cold queries sampled per state. A steady cold query
+    /// fans concurrent range GETs and its wall is the max of the fan — one
+    /// object-store straggler can triple a single draw (measured 792 ms vs
+    /// a 115 ms sibling run on the same state). The reported steady wall is
+    /// the median across samples; the metered GET/byte window is the sample
+    /// with the median GET count.
+    const STEADY_COLD_SAMPLES: usize = 3;
 
     /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
     /// when one applies to that state at this scale.
@@ -2265,11 +2272,15 @@ pub mod vector {
         label: &str,
         built: &supertable::IngestResult,
         query: &[f32],
-        second_query: &[f32],
+        steady_queries: &[Vec<f32>],
         nprobe: usize,
         rerank: usize,
         cache_budget_bytes: u64,
     ) -> Option<RoutingColdStat> {
+        assert!(
+            !steady_queries.is_empty(),
+            "steady-cold measurement needs at least one distinct query"
+        );
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let open_cpu0 = cpu::process_cpu_ns();
         let open_started = Instant::now();
@@ -2309,36 +2320,60 @@ pub mod vector {
         let query_wall_s = query_started.elapsed().as_secs_f64();
         let query_cpu_s = cpu::cpu_seconds_since(query_cpu0);
         let first_query_trace = trace_enabled.then(|| meter.take_trace());
-        let after_first = meter.snapshot();
-        // Second, DISTINCT cold query: the steady cold per-query fetch —
-        // warmup blocks are resident, so it pays only its own probe.
-        if trace_enabled {
-            meter.start_trace();
+        let mut window_start = meter.snapshot();
+        let after_first = window_start;
+        // Steady cold: DISTINCT queries with the warmup resident, each
+        // paying only its own probe. One draw's wall is the max of a
+        // concurrent GET fan — a single object-store straggler can triple
+        // it — so sample [`STEADY_COLD_SAMPLES`] queries and report the
+        // median wall; the metered window kept for gates/pricing is the
+        // sample with the median GET count.
+        let mut steady: Vec<(f64, Option<f64>, storage_meter::ObjectStoreMeter)> =
+            Vec::with_capacity(STEADY_COLD_SAMPLES);
+        let mut steady_trace = None;
+        for (index, q) in steady_queries.iter().take(STEADY_COLD_SAMPLES).enumerate() {
+            if trace_enabled && index == 0 {
+                meter.start_trace();
+            }
+            let cpu0 = cpu::process_cpu_ns();
+            let started = Instant::now();
+            search("cold-steady", q);
+            let wall_s = started.elapsed().as_secs_f64();
+            let cpu_s = cpu::cpu_seconds_since(cpu0);
+            if trace_enabled && index == 0 {
+                steady_trace = Some(meter.take_trace());
+            }
+            let now = meter.snapshot();
+            steady.push((wall_s, cpu_s, now.since(&window_start)));
+            window_start = now;
         }
-        let second_cpu0 = cpu::process_cpu_ns();
-        let second_started = Instant::now();
-        search("cold-second", second_query);
-        let second_wall_s = second_started.elapsed().as_secs_f64();
-        let second_cpu_s = cpu::cpu_seconds_since(second_cpu0);
-        let second_query_trace = trace_enabled.then(|| meter.take_trace());
-        let after_second = meter.snapshot();
+        let after_steady = window_start;
         // First query repeated verbatim: cache fill-lag probe.
         search("repeat", query);
         let after_repeat = meter.snapshot();
         drop(consumer);
         drop(cache_dir);
+        let median_wall_s = {
+            let mut walls: Vec<f64> = steady.iter().map(|(wall, _, _)| *wall).collect();
+            walls.sort_unstable_by(f64::total_cmp);
+            walls[walls.len() / 2]
+        };
+        let (_, median_cpu_s, median_io) = {
+            steady.sort_unstable_by_key(|(_, _, io)| io.get_count);
+            steady[steady.len() / 2]
+        };
         let split = storage_meter::ColdStoreSplit {
             open,
             first_query: after_first.since(&open),
-            second_query: after_second.since(&after_first),
-            repeat_query: after_repeat.since(&after_second),
+            second_query: median_io,
+            repeat_query: after_repeat.since(&after_steady),
         };
         log_cold_split(label, &split);
         if let Some(trace) = first_query_trace {
             log_query_read_trace(label, "first cold query", &trace);
         }
-        if let Some(trace) = second_query_trace {
-            log_query_read_trace(label, "second cold query", &trace);
+        if let Some(trace) = steady_trace {
+            log_query_read_trace(label, "steady cold query", &trace);
         }
         Some(RoutingColdStat {
             split,
@@ -2346,8 +2381,8 @@ pub mod vector {
             open_cpu_s,
             query_wall_s,
             query_cpu_s,
-            second_wall_s,
-            second_cpu_s,
+            second_wall_s: median_wall_s,
+            second_cpu_s: median_cpu_s,
         })
     }
 
@@ -2360,7 +2395,7 @@ pub mod vector {
         consumer_meter: &storage_meter::MeteredStorage,
         built: &supertable::IngestResult,
         query: &[f32],
-        second_query: &[f32],
+        steady_queries: &[Vec<f32>],
         nprobe: usize,
         rerank: usize,
         cache_budget_bytes: u64,
@@ -2444,7 +2479,7 @@ pub mod vector {
                     label,
                     built,
                     query,
-                    second_query,
+                    steady_queries,
                     nprobe,
                     rerank,
                     cache_budget_bytes,
@@ -2936,7 +2971,7 @@ pub mod vector {
                     &consumer_meter,
                     &built,
                     &q_correct[0],
-                    &q_correct[1],
+                    &q_correct[1..],
                     nprobe,
                     rerank,
                     built.total_index_bytes,
@@ -3008,7 +3043,7 @@ pub mod vector {
                     &consumer_meter,
                     &built,
                     &q_correct[0],
-                    &q_correct[1],
+                    &q_correct[1..],
                     nprobe,
                     rerank,
                     built
@@ -3301,7 +3336,7 @@ pub mod vector {
                         &consumer_meter,
                         &built,
                         &q_correct[0],
-                        &q_correct[1],
+                        &q_correct[1..],
                         nprobe,
                         rerank,
                         built
@@ -3381,7 +3416,7 @@ pub mod vector {
                         &consumer_meter,
                         &built,
                         &q_correct[0],
-                        &q_correct[1],
+                        &q_correct[1..],
                         nprobe,
                         rerank,
                         built
@@ -3461,7 +3496,7 @@ pub mod vector {
                                 "steady-state",
                                 &built,
                                 &q_cal[0],
-                                q_cal.get(1).map(Vec::as_slice).unwrap_or(&q_cal[0]),
+                                if q_cal.len() > 1 { &q_cal[1..] } else { &q_cal[..] },
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
