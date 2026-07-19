@@ -2783,12 +2783,14 @@ impl VectorReader {
             // Cold: fetch only the codes+doc_ids prefixes (coalesced)
             // plus the Sq8 meta in one batch. Full vectors are fetched
             // later, for survivors only.
-            get_cluster_ranges_coalesced_with_extra(
+            let extras: Vec<Range<usize>> = lazy_sq8_meta_range.clone().into_iter().collect();
+            let (blocks, mut extra_bytes) = get_cluster_ranges_coalesced_with_extras(
                 &self.source,
                 &cluster_prefix_ranges,
-                lazy_sq8_meta_range,
+                &extras,
             )
-            .map_err(|e| VectorError::LazySource(e.to_string()))?
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            (blocks, extra_bytes.pop())
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
@@ -3205,28 +3207,36 @@ impl VectorReader {
                 _cold_guard =
                     reserve_cold_fetch(&self.source, &cluster_full_ranges, ctx.budget.as_ref())?;
 
-                // Piggyback the inline stable-`_id` region onto THIS wave:
-                // fetch it concurrently with the cluster-block GETs (same
-                // round-trip envelope) and stash it on the reader. The remap
-                // step then resolves hidden→user `_id` from the stash (sync,
-                // at the fan-out tag site) instead of issuing a trailing
-                // region GET — removing a serial cold wave. `None` when the
-                // column has no inline region (e.g. incoming superfiles).
+                // The metadata legs (lazy Sq8 meta + inline stable-`_id`
+                // region) ride the SAME coalesce plan as the cluster
+                // blocks. On multi-cell (pre-drain user) files the probed
+                // cell's subsection is contiguous — subheader, meta, ids,
+                // blocks within ~100 KiB — so all three legs merge into
+                // ONE GET per file instead of three; on packed files the
+                // regions are megabytes apart and the plan naturally
+                // keeps them as separate ranges in the same concurrent
+                // round-trip envelope. The remap step then resolves
+                // hidden→user `_id` from the stash (sync, at the fan-out
+                // tag site) instead of issuing a trailing region GET.
                 let region_range = col.stable_ids_region_range();
-                let cluster_fut = get_cluster_ranges_coalesced_with_extra_async(
+                let mut extras: Vec<Range<usize>> = Vec::new();
+                let meta_slot = lazy_sq8_meta_range.clone().map(|r| {
+                    extras.push(r);
+                    extras.len() - 1
+                });
+                let region_slot = region_range.map(|r| {
+                    extras.push(r);
+                    extras.len() - 1
+                });
+                let (blocks, extra_bytes) = get_cluster_ranges_coalesced_with_extras_async(
                     &self.source,
                     &cluster_full_ranges,
-                    lazy_sq8_meta_range,
-                );
-                let region_fut = async {
-                    match &region_range {
-                        Some(r) => self.source.range_async(r.clone()).await.map(Some),
-                        None => Ok(None),
-                    }
-                };
-                let ((blocks, meta), region_bytes) = futures::try_join!(cluster_fut, region_fut)
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                if let Some(bytes) = region_bytes
+                    &extras,
+                )
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let meta = meta_slot.map(|i| extra_bytes[i].clone());
+                if let Some(bytes) = region_slot.map(|i| extra_bytes[i].clone())
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
                 {
                     *slot = Some(bytes);
@@ -4538,50 +4548,60 @@ fn reserve_cold_fetch(
         .map_err(|e| VectorError::OverBudget(format!("vector search, {e}")))
 }
 
-fn get_cluster_ranges_coalesced_with_extra(
-    source: &Source,
-    ranges: &[Range<usize>],
-    extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
-    let Some(extra) = extra else {
-        return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
-    };
-    let plan = RangeCoalescePlan::new(
-        ranges,
+/// Build the one-plan input for a cold probe wave: the cluster block
+/// ranges PLUS the per-column metadata legs (`extras`: lazy Sq8 meta,
+/// inline stable-id region). Metadata rides the SAME coalesce plan as the
+/// blocks, so on multi-cell (pre-drain user) files — where a cell's whole
+/// subsection spans ~100 KiB — all legs merge into one GET, while on
+/// packed single-cell files the meta/ids regions sit megabytes before the
+/// blocks and the plan keeps them as separate ranges (same fetches as
+/// issuing them apart, never worse). Returns `(blocks, extras)` in input
+/// order.
+fn probe_wave_plan(ranges: &[Range<usize>], extras: &[Range<usize>]) -> RangeCoalescePlan {
+    let mut all: Vec<Range<usize>> = Vec::with_capacity(ranges.len() + extras.len());
+    all.extend(ranges.iter().cloned());
+    all.extend(extras.iter().cloned());
+    RangeCoalescePlan::new(
+        &all,
         CLUSTER_RANGE_COALESCE_MAX_GAP,
         CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let mut fetch = plan.fetch_ranges().to_vec();
-    fetch.push(extra);
-    let mut fetched = source.get_ranges_parallel(&fetch)?;
-    let extra_bytes = fetched.pop();
-    Ok((plan.restore(&fetched), extra_bytes))
+    )
 }
 
-/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
-/// coalescing plan, dispatched as one `try_join_all` batch on the
-/// caller's runtime so connections pool and the fan-out is concurrent.
-async fn get_cluster_ranges_coalesced_with_extra_async(
+fn get_cluster_ranges_coalesced_with_extras(
     source: &Source,
     ranges: &[Range<usize>],
-    extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
-    let Some(extra) = extra else {
+    extras: &[Range<usize>],
+) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
+    if extras.is_empty() {
+        return Ok((get_cluster_ranges_coalesced(source, ranges)?, Vec::new()));
+    }
+    let plan = probe_wave_plan(ranges, extras);
+    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    let mut restored = plan.restore(&fetched);
+    let extra_bytes = restored.split_off(ranges.len());
+    Ok((restored, extra_bytes))
+}
+
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extras`]. Same
+/// coalescing plan, dispatched as one `try_join_all` batch on the
+/// caller's runtime so connections pool and the fan-out is concurrent.
+async fn get_cluster_ranges_coalesced_with_extras_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+    extras: &[Range<usize>],
+) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
+    if extras.is_empty() {
         return Ok((
             get_cluster_ranges_coalesced_async(source, ranges).await?,
-            None,
+            Vec::new(),
         ));
-    };
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let mut fetch = plan.fetch_ranges().to_vec();
-    fetch.push(extra);
-    let mut fetched = source.get_ranges_parallel_async(&fetch).await?;
-    let extra_bytes = fetched.pop();
-    Ok((plan.restore(&fetched), extra_bytes))
+    }
+    let plan = probe_wave_plan(ranges, extras);
+    let fetched = source.get_ranges_parallel_async(plan.fetch_ranges()).await?;
+    let mut restored = plan.restore(&fetched);
+    let extra_bytes = restored.split_off(ranges.len());
+    Ok((restored, extra_bytes))
 }
 
 fn get_cluster_ranges_coalesced(
@@ -7924,30 +7944,32 @@ mod tests {
         );
     }
 
-    /// cold first search must dispatch its
-    /// per-cluster block fetches **concurrently**, not
-    /// serially. The total range-GET count was already
-    /// pinned by the range-budget test above; this test pins
-    /// the round-trip count.
+    /// A cold probe wave with multiple surviving ranges must dispatch
+    /// them **concurrently**, not serially. The end-to-end search GET
+    /// budget is pinned by the range-budget test above; the probe wave
+    /// itself now merges all legs (blocks + Sq8 meta + stable-ids) into
+    /// one coalesce plan, so on small fixtures the wave collapses to a
+    /// single range and a search-side probe can no longer exhibit the
+    /// property. Pin it at the layer that owns it instead:
+    /// `get_ranges_parallel_async` over disjoint uncoalescible ranges.
     ///
-    /// Each `range()` call holds an in-flight slot (RAII
-    /// guard); peak in-flight ≥ 2 proves the cluster fetches
-    /// overlapped. We pad `range()` with a small artificial
-    /// latency so a serial implementation completes each
-    /// future before the next is awaited — without the
-    /// latency, the trivial `bytes.slice(...)` body
-    /// resolves instantly and even a serial caller looks
-    /// concurrent (in-flight peaks at 1 indistinguishably).
+    /// Each `range()` call holds an in-flight slot (RAII guard); peak
+    /// in-flight ≥ 2 proves the fetches overlapped. `range()` is padded
+    /// with a small artificial latency so a serial implementation
+    /// completes each future before the next is awaited — without the
+    /// latency, the trivial `bytes.slice(...)` body resolves instantly
+    /// and even a serial caller looks concurrent (in-flight peaks at 1
+    /// indistinguishably).
     ///
-    /// Runs on the multi-thread runtime for the same
-    /// `block_in_place` reason as the range-budget test above.
+    /// Runs on the multi-thread runtime for the same `block_in_place`
+    /// reason as the range-budget test above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cold_first_search_dispatches_cluster_gets_concurrently() {
-        let (blob, json, all) =
+    async fn cold_range_wave_dispatches_gets_concurrently() {
+        let (blob, json, _all) =
             build_small_superfile(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let blob_len = blob.len();
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
-        let async_counter = counting.async_counter();
         let max_in_flight = counting.max_in_flight_counter();
         counting.disable_sync();
         counting.set_async_latency(Duration::from_millis(5));
@@ -7960,39 +7982,32 @@ mod tests {
         .await
         .expect("open_lazy");
 
-        // Reset max_in_flight after open (we only want to
-        // pin the search-side dispatch shape; open is its
-        // own budget exercise).
+        // Reset max_in_flight after open (we only want to pin the wave
+        // dispatch shape; open is its own budget exercise).
         max_in_flight.store(0, AtomicOrdering::Release);
-        let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
 
-        let nprobe = 8usize;
-        let q = all[0].clone();
-        let hits = r_lazy
-            .search("v", &q, 5, nprobe, 5)
+        // Three disjoint slices spread across the blob — the wave shape a
+        // cold probe produces when coalescing leaves multiple ranges.
+        let slice = (blob_len / 8).max(1);
+        let ranges = vec![
+            0..slice,
+            (blob_len / 2)..(blob_len / 2 + slice),
+            (blob_len - slice)..blob_len,
+        ];
+        let fetched = r_lazy
+            .source
+            .get_ranges_parallel_async(&ranges)
             .await
-            .expect("cold first search");
-        assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
+            .expect("parallel range wave");
+        assert_eq!(fetched.len(), ranges.len(), "one slice per input range");
 
         let peak = max_in_flight.load(AtomicOrdering::Acquire);
-        let search_calls = async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
-        if search_calls >= 3 {
-            // When coalescing still leaves multiple search-side
-            // ranges, they must overlap. A serial dispatch
-            // peaks at exactly 1.
-            assert!(
-                peak >= 2,
-                "cold first search per-cluster fetches must overlap when multiple \
-                 search-side ranges remain (peak in-flight ≥ 2); observed {peak} \
-                 across {search_calls} calls",
-            );
-        } else {
-            assert!(
-                peak >= 1,
-                "coalesced cold first search should still issue at least one \
-                 search-side async range; observed peak={peak}, calls={search_calls}",
-            );
-        }
+        assert!(
+            peak >= 2,
+            "a multi-range cold wave must overlap its fetches (peak in-flight ≥ 2); \
+             observed {peak} across {} ranges",
+            ranges.len(),
+        );
     }
 
     /// round-trip parity for the unified
