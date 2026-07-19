@@ -2192,7 +2192,7 @@ mod tests {
             });
         assert_eq!(
             user_grid_trained,
-            user_vector_cell_count(&st.options()) != hidden_vector_cell_count(&st.options()),
+            user_vector_cell_count(st.options()) != hidden_vector_cell_count(st.options()),
             "user-side grid must be trained exactly when the cell counts differ"
         );
         assert_eq!(
