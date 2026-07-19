@@ -1437,7 +1437,25 @@ impl VectorReader {
         overlay.install(0, header_bytes.clone());
         overlay.install(dir_offset as u64, dir_prefetch.clone());
 
-        let mut open_ranges: Vec<(u64, u64)> = Vec::with_capacity(n_cells);
+        // v1 open discipline: fetch each cell's sub-header + cluster index
+        // only. Centroids, Sq8 meta/norms, and the stable-id region stay on
+        // disk and are read per probed cell through the block cache (the
+        // parse below takes its lazy Sq8-meta arm when the bytes are not
+        // resident). The multi-cell contract is one logical column, whose
+        // dim bounds the cluster index.
+        let cols: Vec<VectorColumnConfig> = serde_json::from_str(columns_json).map_err(|e| {
+            VectorError::Read(ReadError::MalformedVersion(format!(
+                "inf.vec.columns JSON: {e}"
+            )))
+        })?;
+        let dim = match cols.as_slice() {
+            [only] if only.dim > 0 => only.dim,
+            _ => {
+                return Err(VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell blob requires exactly one logical column".into(),
+                )));
+            }
+        };
         for i in 0..n_cells {
             let entry_off = i * CELL_DIR_ENTRY_SIZE;
             let subsection_off = read_u64_le(
@@ -1453,7 +1471,6 @@ impl VectorReader {
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
-            // Fetch sub-header first to learn open-time end.
             let sub_hdr_bytes = source
                 .range(subsection_off, SUB_HEADER_SIZE as u64)
                 .await
@@ -1463,28 +1480,36 @@ impl VectorReader {
                     )))
                 })?;
             overlay.install(subsection_off, sub_hdr_bytes.clone());
-            let per_cluster_blocks_off = read_u64_le(
-                &sub_hdr_bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
-                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+            let centroids_off = read_u64_le(
+                &sub_hdr_bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
             );
-            open_ranges.push((subsection_off, per_cluster_blocks_off));
-        }
-        for (subsection_off, open_len) in open_ranges {
-            if open_len <= SUB_HEADER_SIZE as u64 {
-                continue;
+            let cluster_idx_off = read_u64_le(
+                &sub_hdr_bytes
+                    [sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+            );
+            let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell subsection {i}: cluster_idx_off precedes centroids_off"
+                )))
+            })?;
+            if !centroids_span.is_multiple_of(dim as u64 * 4) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell subsection {i}: centroids region not divisible by dim*4"
+                ))));
             }
-            let rest = source
-                .range(
-                    subsection_off + SUB_HEADER_SIZE as u64,
-                    open_len - SUB_HEADER_SIZE as u64,
-                )
-                .await
-                .map_err(|e| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "lazy multi-cell: open-time region: {e}"
-                    )))
-                })?;
-            overlay.install(subsection_off + SUB_HEADER_SIZE as u64, rest);
+            let n_cent = centroids_span / (dim as u64 * 4);
+            let idx_len = n_cent * CLUSTER_IDX_ENTRY_BYTES as u64;
+            if idx_len > 0 {
+                let idx_bytes = source
+                    .range(subsection_off + cluster_idx_off, idx_len)
+                    .await
+                    .map_err(|e| {
+                        VectorError::Read(ReadError::MalformedVersion(format!(
+                            "lazy multi-cell: cluster index {i}: {e}"
+                        )))
+                    })?;
+                overlay.install(subsection_off + cluster_idx_off, idx_bytes);
+            }
         }
 
         Self::open_multi_cell_with_source(

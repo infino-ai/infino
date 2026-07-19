@@ -132,6 +132,7 @@ use crate::{
             },
         },
         reader::vector_layout_from_kv,
+        vector::reader::VectorColumnConfig,
         vector::{
             builder::{
                 MultiCellSubsectionSource, build_merged_subsection_from_fp32,
@@ -1898,8 +1899,18 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
             open_blob: Vec::new(),
         });
     }
+    // Multi-cell open ranges need the column dim to bound the cluster index
+    // (the cell directory carries no n_cent); a single logical column is the
+    // multi-cell contract.
+    let vec_dim = kvs
+        .get(kv::VEC_COLUMNS)
+        .and_then(|json| serde_json::from_str::<Vec<VectorColumnConfig>>(json).ok())
+        .and_then(|cols| match cols.as_slice() {
+            [only] => Some(only.dim),
+            _ => None,
+        });
     let vec_open_ranges = vec
-        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len, vec_dim))
         .unwrap_or_default();
     let fts_open_ranges = fts
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
@@ -1966,7 +1977,12 @@ fn build_open_blob(
     blob
 }
 
-fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+fn vector_open_ranges(
+    bytes: &Bytes,
+    off: u64,
+    len: u64,
+    dim: Option<usize>,
+) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
@@ -1976,7 +1992,7 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
     let version =
         read_u32_le(blob.get(outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES)?);
     if version == crate::superfile::format::vec::VERSION_MULTI_CELL {
-        return vector_open_ranges_multi_cell(blob, off);
+        return vector_open_ranges_multi_cell(blob, off, dim?);
     }
     // Reject any version we don't recognize instead of falling through to the
     // v1 layout (a future/corrupt version would otherwise be mis-parsed).
@@ -2060,10 +2076,21 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
 }
 
 /// Open-time ranges for a v2 multi-cell vector blob: outer header, cell
-/// directory, and each cell's open-time region (sub-header through
-/// `per_cluster_blocks_off`).
-fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)>> {
+/// directory, and each cell's sub-header + cluster index — the same v1
+/// discipline as the single-cell path above. The fp32 centroids, Sq8
+/// scale/offset meta, per-row norms, and the inline stable-id region all
+/// stay on disk: they are read per probed cell through the block cache
+/// (deferred rescore, the lazy Sq8-meta arm, and the probe wave's
+/// stable-id piggyback). Staging them here made the open footprint —
+/// manifest-inline open blobs *and* the cold-open hint fetch — grow with
+/// per-row data: measured 318 MiB of hidden-data open fetch at 10M and
+/// 3.62 GiB / 12.3 s at 100M, with user manifest parts at 3.28 GiB from
+/// the embedded copies.
+fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Vec<(u64, u64)>> {
     use crate::superfile::format::vec::U64_BYTES;
+    if dim == 0 {
+        return None;
+    }
     let n_cells =
         read_u32_le(blob.get(outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES)?) as usize;
     let dir_offset =
@@ -2095,13 +2122,27 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)
             return None;
         }
         let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
-        let per_cluster_blocks_off = read_u64_le(sub.get(
-            sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES,
-        )?) as usize;
-        if per_cluster_blocks_off < SUB_HEADER_SIZE || per_cluster_blocks_off > subsection_len {
+        let centroids_off = read_u64_le(
+            sub.get(sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let cluster_idx_off = read_u64_le(
+            sub.get(sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let centroids_span = cluster_idx_off.checked_sub(centroids_off)?;
+        if centroids_off < SUB_HEADER_SIZE || !centroids_span.is_multiple_of(dim * 4) {
             return None;
         }
-        ranges.push((off + subsection_off as u64, per_cluster_blocks_off as u64));
+        let n_cent = centroids_span / (dim * 4);
+        let cluster_idx_end =
+            cluster_idx_off.checked_add(n_cent.checked_mul(CLUSTER_IDX_ENTRY_BYTES)?)?;
+        if cluster_idx_end > subsection_len {
+            return None;
+        }
+        ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+        ranges.push((
+            off + (subsection_off + cluster_idx_off) as u64,
+            (cluster_idx_end - cluster_idx_off) as u64,
+        ));
     }
     Some(merge_ranges(ranges))
 }
@@ -6725,6 +6766,77 @@ mod tests {
             !hits.is_empty(),
             "docs survive the cross-batch splice concatenate"
         );
+    }
+
+    /// Row count for the open-footprint regression fixture: large enough
+    /// that row-proportional staging (stable ids at 16 B/row + norms at
+    /// 4 B/row ≈ 100 KB here) is unmistakable against the v1-discipline
+    /// footprint (headers + cluster index, a few KB).
+    const OPEN_RANGES_FIXTURE_ROWS: usize = 5_000;
+    /// Ceiling on the staged vector open bytes for the fixture — generous
+    /// against headers + cluster index, far below any per-row region.
+    const OPEN_RANGES_FIXTURE_CEILING_BYTES: u64 = 16 * 1024;
+
+    /// Multi-cell superfiles stage only sub-headers + cluster indexes in
+    /// their open ranges (the v1 discipline): the open footprint must not
+    /// scale with row count. Staging the full open-time region embedded
+    /// per-row stable ids / norms / Sq8 meta into manifest open blobs and
+    /// the cold-open hint fetch — measured 3.62 GiB of hidden-data open
+    /// fetch and 3.28 GiB of manifest parts at 100M.
+    #[test]
+    fn multi_cell_open_ranges_exclude_row_proportional_regions() {
+        let dim = COMMIT_AS_DRAIN_TEST_DIM;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            options_title_emb_serial(dim, COMMIT_AS_DRAIN_TEST_ROWS).with_storage(storage),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_axis_vector_batch(OPEN_RANGES_FIXTURE_ROWS, dim))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let mut checked = 0usize;
+        for entry in walkdir(dir.path()) {
+            let bytes = Bytes::from(fs::read(&entry).expect("read superfile"));
+            let Some(offsets) = build_subsection_offsets(&bytes) else {
+                continue;
+            };
+            if offsets.vec_open_ranges.is_empty() {
+                continue;
+            }
+            let staged: u64 = offsets.vec_open_ranges.iter().map(|&(_, len)| len).sum();
+            assert!(
+                staged <= OPEN_RANGES_FIXTURE_CEILING_BYTES,
+                "{entry:?}: staged vector open bytes {staged} scale with rows \
+                 (ceiling {OPEN_RANGES_FIXTURE_CEILING_BYTES})"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "fixture must produce vector superfiles");
+    }
+
+    /// Recursively collect the `.sf.parquet` superfiles under a temp root.
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.to_string_lossy().ends_with(".sf.parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     fn options_title_emb_serial(dim: usize, n_cent: usize) -> SupertableOptions {

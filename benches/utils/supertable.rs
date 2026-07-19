@@ -1206,22 +1206,27 @@ pub mod vector {
 
     /// Regression gates on the first cold query's **data** GET fan (user +
     /// hidden classes together), by routing state and scale tier, with the
-    /// pinned <20M grid shape (512 user / 256 hidden cells). Measured on
-    /// the interleaved layout with geometric fine ordering: post-drain
-    /// 1 GET at 1M / 2 at 10M; post-delta 2 (1 user + 1 hidden) at 1M /
-    /// 3 at 10M; post-compact 1 at 1M / 3 at 10M (the merge currently
-    /// costs one extra GET at 10M vs post-drain). At and above
-    /// [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being calibrated,
-    /// so no ceiling applies yet.
+    /// pinned <20M grid shape (512 user / 256 hidden cells).
+    ///
+    /// PROVISIONAL after the v1 open discipline landed for multi-cell
+    /// superfiles: open no longer hydrates Sq8 meta, per-row norms, or the
+    /// inline stable-id region, so the first cold query per touched file
+    /// carries those two extra concurrent fetches (same round-trip
+    /// envelope). Prior eager-open ceilings measured: post-drain 1/2,
+    /// post-delta 2/3, post-compact 1/3. The provisional values add the
+    /// meta + stable-id fetch per touched data file; tighten to the
+    /// re-measured numbers once the validation ladder records them. At and
+    /// above [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being
+    /// calibrated, so no ceiling applies yet.
     const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
     /// Upper doc bound for the mid-scale ceilings (exclusive).
     const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on first-cold-query
     /// data GETs.
     const COLD_GET_CEILINGS: &[(&str, u64, u64)] = &[
-        ("post-drain", 1, 2),
-        ("post-delta", 2, 3),
-        ("post-compact", 1, 3),
+        ("post-drain", 3, 4),
+        ("post-delta", 6, 7),
+        ("post-compact", 3, 5),
     ];
 
     /// Ceiling on `label`'s first cold query data GETs for `n_docs`, when
@@ -1410,7 +1415,7 @@ pub mod vector {
                 total <= ceiling,
                 "{label}: cold data fetch regressed — {total} GETs ({user_data} user + \
                  {hidden_data} hidden) on the first cold query, ceiling {ceiling} at {n_docs} \
-                 docs (post-drain 1/2, post-delta 2/3, post-compact 1/3 for <5M / 5M-20M)"
+                 docs (see COLD_GET_CEILINGS; provisional post-v1-open values)"
             );
         }
     }
