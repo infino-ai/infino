@@ -1375,7 +1375,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let pinned_month = inst.ram_share(steady_pinned_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
     let working_set_month =
         inst.ram_share(steady_working_set_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
-    let residency_month = pinned_month + working_set_month;
+    // The page cache exists to serve warm queries — it's held exactly while
+    // warm SLOs are being delivered, so its rent is attributed INTO the warm
+    // read unit price instead of standing as a flat monthly line. The
+    // per-query share is the cache's serving-window rent divided by the warm
+    // query volume, so it scales inversely with utilization: more queries
+    // over the same working set cost less each. Only the pinned heap stays
+    // a standing line (held for every hour the process exists).
+    let warm_queries_month = SUMMARY_QUERIES_PER_MONTH * SUMMARY_READ_WARM_FRACTION;
+    let working_set_per_warm_q = (steady_warm.is_some() && warm_queries_month > 0.0)
+        .then_some(working_set_month / warm_queries_month);
     let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
         text("Storage"),
         text(format!(
@@ -1387,21 +1396,30 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     ]];
     // Warm and cold read lines are rate references (empty $/month); the
     // blended line — most queries warm, a small tail paying the cold fetch —
-    // is the billed monthly read cost.
+    // is the billed monthly read cost. Warm carries its page-cache share.
     let blended_read_q = match (&steady_warm, &steady_cold) {
-        (Some((_, warm_q)), Some((_, cold_q))) => {
-            Some(warm_q * SUMMARY_READ_WARM_FRACTION + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION))
-        }
-        (Some((_, warm_q)), None) => Some(*warm_q),
+        (Some((_, warm_q)), Some((_, cold_q))) => Some(
+            (warm_q + working_set_per_warm_q.unwrap_or(0.0)) * SUMMARY_READ_WARM_FRACTION
+                + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION),
+        ),
+        (Some((_, warm_q)), None) => Some(warm_q + working_set_per_warm_q.unwrap_or(0.0)),
         _ => None,
     };
     if let Some((label, per_q)) = &steady_warm {
+        let basis = match working_set_per_warm_q {
+            Some(ram_q) => format!(
+                "{} compute+requests + {} page-cache hold at this volume",
+                usd_per_million(*per_q),
+                usd_per_million(ram_q),
+            ),
+            None => usd_per_million(*per_q),
+        };
         summary_rows.push(vec![
             text(format!(
                 "Reads — {} queries/mo, {label}",
                 fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
             )),
-            text(usd_per_million(*per_q)),
+            text(basis),
             text(""),
         ]);
     }
@@ -1533,8 +1551,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         )),
         metric(pinned_month, usd(pinned_month), Better::Lower),
     ]);
+    // Rate reference only: the cache's rent is billed through the warm read
+    // line above (attributed per warm query); repeating it here as $/month
+    // would double-count. Falls back to a billed standing line only when no
+    // warm read rate exists to attribute it to.
+    let working_set_unattributed = working_set_per_warm_q.is_none();
     summary_rows.push(vec![
-        text("Serving memory — mmap page cache (evictable)"),
+        text(if working_set_unattributed {
+            "Serving memory — mmap page cache (evictable)"
+        } else {
+            "Serving memory — mmap page cache (evictable; billed via warm reads)"
+        }),
         text(format!(
             "{} ({:.0}% of {}), {} per serving hour",
             fmt_bytes(steady_working_set_bytes),
@@ -1542,7 +1569,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             inst.name,
             usd(working_set_hour),
         )),
-        metric(working_set_month, usd(working_set_month), Better::Lower),
+        if working_set_unattributed {
+            metric(working_set_month, usd(working_set_month), Better::Lower)
+        } else {
+            text("")
+        },
     ]);
     let monthly_total = storage_month
         + blended_read_q
@@ -1550,9 +1581,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             .unwrap_or(0.0)
         + writes_month
         + maintenance_month.unwrap_or(0.0)
-        + residency_month;
+        + pinned_month
+        + if working_set_unattributed {
+            working_set_month
+        } else {
+            0.0
+        };
     summary_rows.push(vec![
-        text("Total (storage + blended reads + writes + maintenance + residency)"),
+        text("Total (storage + blended reads incl. page-cache + writes + maintenance + pinned)"),
         text("—"),
         metric(monthly_total, usd(monthly_total), Better::Lower),
     ]);
