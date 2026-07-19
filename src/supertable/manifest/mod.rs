@@ -3158,27 +3158,10 @@ impl ClusterCentroids {
         metric: Metric,
         admit: &RabitqAdmitQuery,
     ) -> Option<f32> {
-        debug_assert_eq!(admit.cos_table.len(), self.dim as usize + 1);
-        let cache = self.admit_codes(admit);
-        let w = cache.words_per_code;
         let mut best: Option<f32> = None;
-        for c in 0..self.n_cent as usize {
-            if self.counts[c] == 0 {
-                continue;
-            }
-            let code = &cache.codes[c * w..(c + 1) * w];
-            let h = hamming_words(&admit.q_words, code) as usize;
-            let est_dot = admit.cos_table[h] * admit.q_norm * cache.norms[c];
-            let score = match metric {
-                Metric::Cosine => COSINE_DISTANCE_BASE - est_dot,
-                Metric::NegDot => -est_dot,
-                Metric::L2Sq => {
-                    let c_norm = cache.norms[c];
-                    admit.q_l2sq + c_norm * c_norm - L2_CROSS_TERM_COEFF * est_dot
-                }
-            };
+        self.estimate_admit_scores_into(metric, admit, |_, score| {
             best = Some(best.map_or(score, |b: f32| b.min(score)));
-        }
+        });
         best
     }
 
@@ -3194,10 +3177,27 @@ impl ClusterCentroids {
         admit: &RabitqAdmitQuery,
         window: usize,
     ) -> Vec<(u32, f32)> {
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(window.saturating_add(1));
+        self.estimate_admit_scores_into(metric, admit, |c, score| {
+            insert_ranked(&mut top, window, c, score);
+        });
+        top
+    }
+
+    /// Emit every populated cluster's estimated admit score — the shared
+    /// XOR+popcount estimator behind [`Self::estimate_min_admit_score`],
+    /// [`Self::admit_shortlist`], and the user-path stripped-summary fine
+    /// scoring (which ranks fragments on the resident 1-bit slab instead
+    /// of fetching fp32 per (file, cell)).
+    pub(crate) fn estimate_admit_scores_into(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+        mut emit: impl FnMut(u32, f32),
+    ) {
         debug_assert_eq!(admit.cos_table.len(), self.dim as usize + 1);
         let cache = self.admit_codes(admit);
         let w = cache.words_per_code;
-        let mut top: Vec<(u32, f32)> = Vec::with_capacity(window.saturating_add(1));
         for c in 0..self.n_cent as usize {
             if self.counts[c] == 0 {
                 continue;
@@ -3213,9 +3213,8 @@ impl ClusterCentroids {
                     admit.q_l2sq + c_norm * c_norm - L2_CROSS_TERM_COEFF * est_dot
                 }
             };
-            insert_ranked(&mut top, window, c as u32, score);
+            emit(c as u32, score);
         }
-        top
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid

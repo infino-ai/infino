@@ -375,6 +375,24 @@ struct DeferredCellRescore {
     flat_base: u32,
 }
 
+/// How [`score_fine_candidates`] scores a stripped summary cell (fp32
+/// dropped at hydration).
+///
+/// * `Defer` — the hidden path: exact scores come from a windowed rescore
+///   of the superfile centroid regions (one wave, admit-window cells only).
+/// * `Estimate` — the user path: emit the resident 1-bit admit estimates
+///   directly. User fragments are ranked and gated per (file, cell), so a
+///   deferred exact rescore fans one tiny GET per (file, shortlisted cell)
+///   — measured 848 GETs / 427 MiB on a 1M pre-drain first cold query —
+///   while the scores that decide the final top-k are computed inside the
+///   probed blocks regardless. Estimates only steer which runs get probed;
+///   the knob strips summaries uniformly, so scores stay mutually
+///   comparable within a query.
+enum StrippedScorePolicy<'a> {
+    Defer,
+    Estimate(&'a RabitqAdmitQuery),
+}
+
 /// Validate one superfile's vector summary for `column` (present,
 /// non-empty, dims matching the query) and hand it back. Shared by the
 /// prefilter and exact passes of [`score_fine_candidates`].
@@ -428,6 +446,7 @@ fn score_fine_candidates(
     metric: Metric,
     admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    stripped_policy: StrippedScorePolicy<'_>,
 ) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
     let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
 
@@ -496,14 +515,40 @@ fn score_fine_candidates(
                             candidates.push((si, flat_base + local, score, cell.cell_id, count));
                         });
                 } else {
-                    // Stripped summary (read-only consumer memory mode):
-                    // exact scores come from the superfile's centroid
-                    // region, fetched in one wave after this scan.
-                    deferred.push(DeferredCellRescore {
-                        si,
-                        cell_id: cell.cell_id,
-                        flat_base,
-                    });
+                    match stripped_policy {
+                        // Hidden path: exact scores come from the
+                        // superfile's centroid region, fetched in one
+                        // wave after this scan.
+                        StrippedScorePolicy::Defer => deferred.push(DeferredCellRescore {
+                            si,
+                            cell_id: cell.cell_id,
+                            flat_base,
+                        }),
+                        // User path: rank on the resident 1-bit slab —
+                        // see [`StrippedScorePolicy`].
+                        StrippedScorePolicy::Estimate(admit_q) => {
+                            cell.clusters.estimate_admit_scores_into(
+                                metric,
+                                admit_q,
+                                |local, score| {
+                                    let count = cell
+                                        .clusters
+                                        .counts
+                                        .get(local as usize)
+                                        .copied()
+                                        .unwrap_or(0)
+                                        as u64;
+                                    candidates.push((
+                                        si,
+                                        flat_base + local,
+                                        score,
+                                        cell.cell_id,
+                                        count,
+                                    ));
+                                },
+                            );
+                        }
+                    }
                 }
             }
             flat_base = flat_base.saturating_add(cell.clusters.n_cent);
@@ -1217,22 +1262,30 @@ impl SupertableReader {
             // 1-bit prefilter for the exact fine scan: the grid's cutoff
             // picks are must-include so every cell the beam can select has
             // exact candidate scores (near-tie checks included). Filtered
-            // queries bypass the prefilter — an allow-set thins each cell's
-            // matching postings, so the nearest *matching* neighbors spread
-            // across far more cells than the unfiltered estimate window is
-            // sized for; the filtered path keeps the exact-everything scan.
-            let admit_q = (!filtered).then(|| RabitqAdmitQuery::new(query.len(), rot_seed, query));
+            // queries bypass the prefilter's shortlist — an allow-set thins
+            // each cell's matching postings, so the nearest *matching*
+            // neighbors spread across far more cells than the unfiltered
+            // estimate window is sized for — but stripped user summaries
+            // still score on the 1-bit slab (see [`StrippedScorePolicy`]).
+            let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
+            let admit = (!filtered).then_some(());
             let must_include: Vec<u32> = ranked_for_beam[..cutoff]
                 .iter()
                 .map(|(cell, _)| *cell)
                 .collect();
+            let stripped_policy = if hidden_vector_index {
+                StrippedScorePolicy::Defer
+            } else {
+                StrippedScorePolicy::Estimate(&admit_q)
+            };
             let (mut candidates, deferred) = score_fine_candidates(
                 &superfiles,
                 column,
                 query,
                 metric,
-                admit_q.as_ref().map(|aq| (aq, must_include.as_slice())),
+                admit.map(|()| (&admit_q, must_include.as_slice())),
                 allow_ref,
+                stripped_policy,
             )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
@@ -1323,9 +1376,18 @@ impl SupertableReader {
             }
         } else {
             // No grid, or untagged summaries: score every fine centroid
-            // (legacy flat path, no prefilter).
-            let (mut candidates, deferred) =
-                score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
+            // (legacy flat path, no prefilter). Stripped summaries defer to
+            // the exact rescore — untagged legacy tables have no per-cell
+            // gating to absorb estimate noise.
+            let (mut candidates, deferred) = score_fine_candidates(
+                &superfiles,
+                column,
+                query,
+                metric,
+                None,
+                allow_ref,
+                StrippedScorePolicy::Defer,
+            )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
                     .await?;
