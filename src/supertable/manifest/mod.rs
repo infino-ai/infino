@@ -721,18 +721,16 @@ impl ManifestSnapshot {
                 list.slow_vector_state_content_hash,
             ) {
                 (Some(uri), Some(hash)) => {
-                    // Consumer memory mode fetches the routing sibling when
-                    // the publisher stamped one: same visible entries, but
-                    // each summary's cluster blocks are counts + 1-bit admit
-                    // slab (no fp32) — GiBs → MiBs at 100M docs. The decoded
-                    // entries land directly in the stripped shape, so the
-                    // strip pass below is a no-op for them.
-                    let (uri, hash) = match (
-                        options.summary_centroids_from_superfiles,
-                        list.slow_vector_state_routing.as_ref(),
-                    ) {
-                        (true, Some(routing)) => (routing.uri.as_str(), routing.content_hash),
-                        _ => (uri, hash),
+                    // Two-object model: the primary blob is routing-shaped
+                    // (counts + 1-bit admit slab, no fp32 — GiBs → MiBs at
+                    // 100M docs) and EVERYONE hydrates from it; exact
+                    // centroid scores come from the section. Lists written
+                    // by the three-object era stamp a routing sibling next
+                    // to a full-form primary — prefer it there so legacy
+                    // full blobs are never fetched.
+                    let (uri, hash) = match list.slow_vector_state_routing.as_ref() {
+                        Some(routing) => (routing.uri.as_str(), routing.content_hash),
+                        None => (uri, hash),
                     };
                     let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
                         .await
@@ -851,27 +849,23 @@ impl ManifestSnapshot {
             }
         }
 
-        // Read-only-consumer memory mode: derive the 1-bit admit slab and
-        // drop each summary's fp32 fine centroids. Best-effort per entry —
-        // `Arc::get_mut` succeeds for freshly decoded entries (the slow-blob
-        // hydration path, where the bulk of the centroid bytes live) and
-        // skips entries shared with a previous snapshot or a loaded part
-        // (already stripped, or referenced by maintenance state that needs
-        // fp32). Grid centroids in the list are untouched.
-        //
-        // HIDDEN manifests only (VectorCell partitioning): their fine fp32
-        // is the residency pig (~620 MB at 100M) and their exact rescore is
-        // served by the slow-CAS centroid section. User-table summaries
-        // stay resident — they are small (~100 MB at 100M, per-fragment
-        // cells), and stripping them forced pre-drain and filtered routing
-        // onto 1-bit estimates, which measured filtered recall 0.722
-        // against the 0.95 bar (exact fp32 measured 0.995 at 100M).
-        if options.summary_centroids_from_superfiles
-            && matches!(
-                list.partition_strategy,
-                PartitionStrategy::VectorCell { .. }
-            )
-        {
+        // HIDDEN manifests (VectorCell partitioning) never hold summary
+        // fp32 in RAM — the two-object slow-CAS model stores it once, in
+        // the centroid section, and every exact rescore (consumer or
+        // maintenance) reads from there. New-era blobs decode straight
+        // into the stripped shape (routing wire); this pass covers legacy
+        // full-form blobs and inherited entries so the resident shape is
+        // uniform regardless of what was fetched. Unconditional — not
+        // knob-gated: hidden fine fp32 is the residency pig (~620 MB at
+        // 100M). User-table summaries stay resident — they are small
+        // (~100 MB at 100M, per-fragment cells), and stripping them
+        // forced pre-drain and filtered routing onto 1-bit estimates,
+        // which measured filtered recall 0.722 against the 0.95 bar.
+        // Grid centroids in the list are untouched.
+        if matches!(
+            list.partition_strategy,
+            PartitionStrategy::VectorCell { .. }
+        ) {
             strip_summary_centroids(&mut all_superfiles, &options.vector_columns);
         }
         // Build the remaining resident summaries' admit slabs now (parallel)
@@ -1193,7 +1187,6 @@ impl ManifestSnapshot {
         &self,
         uri: String,
         hash: part::ContentHash,
-        routing: RoutingRef,
         centroids: RoutingRef,
     ) -> Self {
         let next_id = self.get_next_manifest_id();
@@ -1202,7 +1195,11 @@ impl ManifestSnapshot {
             list.manifest_id = next_id;
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
-            list.slow_vector_state_routing = Some(routing);
+            // Two-object model: the primary blob IS routing-shaped, so no
+            // routing sibling is stamped. The field stays for decoding
+            // lists written by the three-object era (hydration prefers it
+            // there, keeping old full blobs unfetched).
+            list.slow_vector_state_routing = None;
             list.slow_vector_state_centroids = Some(centroids);
             list
         });
@@ -1234,14 +1231,15 @@ impl ManifestSnapshot {
         &self,
         uri: String,
         hash: part::ContentHash,
-        routing: RoutingRef,
         centroids: RoutingRef,
     ) -> Self {
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
-            list.slow_vector_state_routing = Some(routing);
+            // See `with_slow_vector_state`: routing-shaped primary, no
+            // sibling stamped under the two-object model.
+            list.slow_vector_state_routing = None;
             list.slow_vector_state_centroids = Some(centroids);
             list
         });
@@ -1855,7 +1853,18 @@ fn rebuild_part_and_entry(
     new_superfiles: Vec<Arc<SuperfileEntry>>,
     base_part: Option<&ManifestPartEntry>,
 ) -> (ManifestPartEntry, EncodedPart) {
-    let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
+    // Hidden (VectorCell) manifests write parts in ROUTING wire form and
+    // skip the sibling: their fp32 is stored once per generation in the
+    // slow-CAS centroid section, and their entries hydrate stripped for
+    // everyone — a full-form part would be a fourth fp32 copy nothing
+    // reads. User manifests keep both forms: the full part is the fp32
+    // store the first rescore hydrates from (3 GETs vs the measured
+    // 848-GET per-superfile fan), the routing sibling is what serving
+    // opens fetch.
+    let hidden = matches!(
+        opts.effective_partition_strategy(),
+        PartitionStrategy::VectorCell { .. }
+    );
 
     let aggregates = aggregates::compute(&new_superfiles, base_part);
     let superfiles = old_superfiles
@@ -1867,12 +1876,22 @@ fn rebuild_part_and_entry(
         part_id: PartId::new_v4(),
         superfiles,
     };
-    let compressed = part::encode(&part);
+    let primary_mode = if hidden {
+        SummaryWireMode::RoutingOnly
+    } else {
+        SummaryWireMode::Full
+    };
+    let compressed = part::encode_with_mode(&part, primary_mode);
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
-    let routing_encoded = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
-    let routing_hash = ContentHash::of(&routing_encoded);
+    let routing = if hidden {
+        None
+    } else {
+        let routing_encoded = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
+        let routing_hash = ContentHash::of(&routing_encoded);
+        Some((routing_encoded, routing_hash))
+    };
     let entry = ManifestPartEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),
@@ -1880,9 +1899,9 @@ fn rebuild_part_and_entry(
         size_bytes_compressed: size_compressed,
         size_bytes_uncompressed: size_uncompressed,
         content_hash,
-        routing: Some(RoutingRef {
-            uri: part_uri(&routing_hash),
-            content_hash: routing_hash,
+        routing: routing.as_ref().map(|(_, hash)| RoutingRef {
+            uri: part_uri(hash),
+            content_hash: *hash,
         }),
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
@@ -1893,7 +1912,7 @@ fn rebuild_part_and_entry(
         EncodedPart {
             part,
             encoded: compressed,
-            routing_encoded,
+            routing_encoded: routing.map(|(bytes, _)| bytes),
         },
     )
 }
@@ -4778,10 +4797,6 @@ mod tests {
         assert!(manifest.slow_vector_state_blob().is_none());
 
         let hash = ContentHash([3u8; 32]);
-        let routing = RoutingRef {
-            uri: "slow-vector-state/state-r.bin".into(),
-            content_hash: ContentHash([4u8; 32]),
-        };
         let centroids = RoutingRef {
             uri: "slow-vector-state/state-c.bin".into(),
             content_hash: ContentHash([5u8; 32]),
@@ -4789,7 +4804,6 @@ mod tests {
         let stamped = manifest.with_slow_vector_state(
             "slow-vector-state/state-x.bin".into(),
             hash,
-            routing.clone(),
             centroids.clone(),
         );
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
@@ -4797,13 +4811,13 @@ mod tests {
         assert_eq!(got_hash, hash);
         assert_eq!(
             stamped.slow_vector_state_routing_blob(),
-            Some(&routing),
-            "routing sibling stamped with the full ref"
+            None,
+            "two-object model: primary blob is routing-shaped, no sibling stamped"
         );
         assert_eq!(
             stamped.slow_vector_state_centroids_blob(),
             Some(&centroids),
-            "centroid-section sibling stamped with the full ref"
+            "centroid-section sibling stamped with the state ref"
         );
         assert_eq!(stamped.get_manifest_id(), manifest.get_next_manifest_id());
         assert_eq!(
@@ -4820,8 +4834,8 @@ mod tests {
             "deleted-ids stamp must preserve the slow-state ref"
         );
         assert!(
-            deleted_stamped.slow_vector_state_routing_blob().is_some(),
-            "deleted-ids stamp must preserve the routing sibling ref"
+            deleted_stamped.slow_vector_state_centroids_blob().is_some(),
+            "deleted-ids stamp must preserve the centroid-section ref"
         );
 
         // A membership change (update) must CLEAR the ref: the blob no
@@ -4999,7 +5013,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);
@@ -5061,24 +5075,23 @@ mod tests {
         Arc::new(entry)
     }
 
-    /// Consumer memory mode picks the routing sibling at hydration: the
-    /// decoded summaries arrive stripped (no fp32) with the write-time slab
-    /// seeded. The fixture options carry no vector columns, so the
-    /// hydration-time strip pass is inert — stripped entries can only have
-    /// come from the routing blob, not from a full-blob decode + strip.
-    /// Knob-off consumers and knob-on consumers of pre-sibling manifests
-    /// keep the full blob (resident fp32).
+    /// Two-object slow-CAS model: the state blob is routing-shaped, so
+    /// EVERY consumer — knob on or off — hydrates stripped entries (no
+    /// fp32) with the write-time slab seeded; exact centroid scores come
+    /// from the published section. The fixture options carry no vector
+    /// columns, so the hydration-time strip pass is inert — stripped
+    /// entries can only have come from the blob's wire form itself.
     #[tokio::test]
-    async fn consumer_mode_hydrates_from_routing_sibling() {
+    async fn state_blob_hydrates_stripped_for_all_consumers() {
         let (_dir, storage) = local_storage();
         let entries = vec![make_summary_entry(100), make_summary_entry(50)];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
             .await
             .expect("write blobs");
         persist_two_entry_table_with_routing(
             &storage,
             Some((published.uri.clone(), published.content_hash)),
-            Some(published.routing.clone()),
+            None,
         )
         .await;
 
@@ -5106,7 +5119,7 @@ mod tests {
         assert_eq!(
             resident(&knob_on),
             vec![false, false],
-            "knob-on consumer must hydrate stripped entries from the routing sibling"
+            "the routing-shaped state blob hydrates stripped entries"
         );
 
         let knob_off =
@@ -5115,30 +5128,36 @@ mod tests {
                 .expect("knob-off load");
         assert_eq!(
             resident(&knob_off),
-            vec![true, true],
-            "knob-off consumer must keep the full blob's resident fp32"
+            vec![false, false],
+            "knob-off hydrates the same routing-shaped blob — fp32 lives in the section"
         );
 
-        // Pre-sibling manifest (no routing ref): knob-on falls back to the
-        // full blob — old tables stay openable, just without the byte win.
+        // Three-object-era list (routing sibling stamped next to a
+        // full-form primary): hydration must prefer the sibling, never
+        // fetching the legacy full blob.
         let (_dir2, storage2) = local_storage();
-        let republished = slow_vector_state::write_state(storage2.as_ref(), &entries)
+        let republished = slow_vector_state::write_state(storage2.as_ref(), &entries, None)
             .await
             .expect("write blobs");
         persist_two_entry_table_with_routing(
             &storage2,
-            Some((republished.uri.clone(), republished.content_hash)),
-            None,
+            Some((
+                "slow-vector-state/legacy-full-not-present.bin".into(),
+                ContentHash([9u8; 32]),
+            )),
+            Some(RoutingRef {
+                uri: republished.uri.clone(),
+                content_hash: republished.content_hash,
+            }),
         )
         .await;
-        let fallback =
-            ManifestSnapshot::load(None, Arc::clone(&storage2), Some(consumer_opts(true)))
-                .await
-                .expect("fallback load");
+        let legacy = ManifestSnapshot::load(None, Arc::clone(&storage2), Some(consumer_opts(true)))
+            .await
+            .expect("legacy-era load");
         assert_eq!(
-            resident(&fallback),
-            vec![true, true],
-            "knob-on without a routing ref must fall back to the full blob"
+            resident(&legacy),
+            vec![false, false],
+            "a stamped routing sibling is preferred over the legacy primary"
         );
     }
 
@@ -5284,24 +5303,62 @@ mod tests {
         );
     }
 
-    /// [`rebuild_part_and_entry`] stamps the routing sibling: the entry's
-    /// ref addresses exactly the sibling bytes returned for the commit PUT.
+    /// [`rebuild_part_and_entry`] stamps the routing sibling on USER
+    /// manifests: the entry's ref addresses exactly the sibling bytes
+    /// returned for the commit PUT. Hidden (VectorCell) manifests write
+    /// the part routing-shaped and skip the sibling entirely — the
+    /// primary IS the slim form and fp32 lives in the slow-CAS section.
     #[tokio::test]
     async fn rebuild_part_and_entry_stamps_routing_sibling() {
         let opts = make_opts();
         let (entry, encoded_part) =
             rebuild_part_and_entry(opts, vec![], vec![make_summary_entry(10)], None);
         let routing = entry.routing.expect("sibling stamped");
+        let routing_encoded = encoded_part
+            .routing_encoded
+            .as_ref()
+            .expect("user part carries sibling bytes");
         assert_eq!(
             routing.content_hash,
-            ContentHash::of(&encoded_part.routing_encoded),
+            ContentHash::of(routing_encoded),
             "entry ref must address the returned sibling bytes"
         );
         assert_eq!(routing.uri, part_uri(&routing.content_hash));
         assert_eq!(entry.content_hash, ContentHash::of(&encoded_part.encoded));
         assert!(
-            encoded_part.routing_encoded.len() < encoded_part.encoded.len(),
+            routing_encoded.len() < encoded_part.encoded.len(),
             "sibling must shed the fp32 payload"
+        );
+
+        let hidden_opts = Arc::new(
+            SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                .expect("valid options")
+                .with_partition_strategy(PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters: ClusterCentroids::from_fp32(
+                        1,
+                        ROUTING_TEST_DIM as u32,
+                        &[0.0; ROUTING_TEST_DIM],
+                        vec![0],
+                    ),
+                    routing: Default::default(),
+                }),
+        );
+        let (hidden_entry, hidden_encoded) =
+            rebuild_part_and_entry(hidden_opts, vec![], vec![make_summary_entry(10)], None);
+        assert!(
+            hidden_entry.routing.is_none(),
+            "hidden part must not stamp a sibling — its primary is routing-shaped"
+        );
+        assert!(
+            hidden_encoded.routing_encoded.is_none(),
+            "hidden part must not carry sibling bytes"
+        );
+        assert!(
+            hidden_encoded.encoded.len() < encoded_part.encoded.len(),
+            "hidden primary must shed the fp32 payload ({} vs {} bytes)",
+            hidden_encoded.encoded.len(),
+            encoded_part.encoded.len()
         );
     }
 
@@ -5316,7 +5373,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);

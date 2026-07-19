@@ -99,16 +99,26 @@ pub(crate) struct SlowVectorState {
     pub pending_drain: Option<PendingDrainState>,
 }
 
-/// Serialize `entries` verbatim through the manifest-part codec. The part id
-/// is the nil UUID: the blob is not a real part, and a constant id keeps the
-/// encoding deterministic (same entries ⇒ same bytes ⇒ same [`ContentHash`]).
+/// Serialize `entries` through the manifest-part codec in ROUTING wire
+/// form — cluster blocks as counts + 1-bit admit slab, no fp32. This is
+/// the ONLY entry encoding the state blob uses: fp32 lives in exactly one
+/// CAS object per generation (the centroid section), and every reader —
+/// consumer or writer — hydrates entries from this routing-shaped blob
+/// and reaches fp32 through the section. The part id is the nil UUID:
+/// the blob is not a real part, and a constant id keeps the encoding
+/// deterministic (same entries ⇒ same bytes ⇒ same [`ContentHash`]).
 pub(crate) fn encode_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
+    encode_entries_with_mode(entries, SummaryWireMode::RoutingOnly)
+}
+
+/// Full-wire encoding (fp32 inline) — ONLY for the drain checkpoint's
+/// PENDING segment: pending entries are writer-only crash-resume state,
+/// not consumer-visible membership, and the resume path needs their fp32
+/// before any section covering them exists.
+fn encode_entries_full(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
     encode_entries_with_mode(entries, SummaryWireMode::Full)
 }
 
-/// [`encode_entries`] with an explicit summary wire mode — `RoutingOnly`
-/// produces the routing sibling blob (cluster blocks as counts + 1-bit
-/// admit slab, no fp32).
 fn encode_entries_with_mode(entries: &[Arc<SuperfileEntry>], mode: SummaryWireMode) -> Vec<u8> {
     let synthetic = ManifestPart {
         format_version: part::FORMAT_VERSION.into(),
@@ -131,7 +141,10 @@ fn encode_checkpoint_state(
     pending: &PendingDrainState,
 ) -> Vec<u8> {
     let visible = encode_entries(entries);
-    let pending_entries = encode_entries(&pending.entries);
+    // Pending entries keep fp32 inline: they are the crash-resume state a
+    // restarted drain continues from, and the published section covers
+    // only the VISIBLE membership.
+    let pending_entries = encode_entries_full(&pending.entries);
     let mut bytes = Vec::with_capacity(
         CHECKPOINT_HEADER_BYTES + visible.len() + pending.metadata.len() + pending_entries.len(),
     );
@@ -208,38 +221,81 @@ async fn write_bytes(
     Ok((uri, content_hash))
 }
 
-/// References to one published slow-state generation: the full blob
-/// (writers, GC, and knob-off consumers read it), its routing sibling
-/// (what consumer opens with `summary_centroids_from_superfiles` fetch —
-/// same visible entries, cluster blocks as counts + admit slab), and the
-/// centroid-section sibling (contiguous fp32 fine centroids the admit
-/// rescore hydrates in one fetch on the first cold query).
+/// References to one published slow-state generation — exactly TWO
+/// content-addressed objects, each byte stored once in the layout its
+/// reader needs:
+///
+/// * the state blob (`uri`/`content_hash`) — routing-shaped entries
+///   (counts + 1-bit admit slabs, no fp32) plus any drain checkpoint
+///   state. Everyone hydrates from it: consumer opens and writer opens
+///   alike.
+/// * the centroid section (`centroids`) — every summary cell's fp32
+///   fine centroids, raw and contiguous. Anyone needing exact centroid
+///   scores (the admit rescore, grid bootstrap, maintenance) fetches it
+///   once per generation and reads cells locally.
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedState {
     pub uri: String,
     pub content_hash: ContentHash,
-    pub routing: RoutingRef,
     pub centroids: RoutingRef,
 }
 
 /// Contiguous fp32 fine-centroid section for the stripped-summary admit
 /// rescore: every visible entry's summary cells' centroids concatenated
 /// in `(entry order, column name order, cell order)` — cluster-major
-/// f32 LE per cell. No embedded index: the routing sibling carries each
+/// f32 LE per cell. No embedded index: the state blob carries each
 /// cell's `n_cent`/`dim`, so a consumer walking the same order computes
 /// identical offsets ([`section_len`] is the cross-check).
-pub(crate) fn encode_centroid_section(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
+///
+/// fp32 is stored ONCE per generation (here — entries hydrate stripped),
+/// so a republish composes each cell from the first available source:
+/// resident fp32 (entries built by this maintenance pass) or the
+/// PREVIOUS generation's section (carried-forward entries — superfiles
+/// are immutable, so their centroids never change between generations).
+/// A cell reachable from neither is a caller bug: membership only ever
+/// adds freshly-built entries or carries forward sectioned ones.
+pub(crate) fn compose_centroid_section(
+    entries: &[Arc<SuperfileEntry>],
+    previous: Option<&CentroidSection>,
+) -> Result<Vec<u8>, SlowVectorStateError> {
     let mut out = Vec::with_capacity(section_len(entries));
     for entry in entries {
-        for (_, summary) in sorted_summaries(entry) {
+        for (column, summary) in sorted_summaries(entry) {
             for cell in &summary.cells {
-                for &v in &cell.clusters.centroids {
-                    out.extend_from_slice(&v.to_le_bytes());
+                let expected = cell.clusters.n_cent as usize * cell.clusters.dim as usize;
+                if expected == 0 {
+                    continue;
+                }
+                if cell.clusters.vectors_resident() {
+                    for &v in &cell.clusters.centroids {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    continue;
+                }
+                let carried = previous
+                    .and_then(|section| {
+                        section.read_cell(entry.superfile_id, column, cell.cell_id)
+                    })
+                    .filter(|fp32| fp32.len() == expected);
+                match carried {
+                    Some(fp32) => {
+                        for &v in &fp32 {
+                            out.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    None => {
+                        return Err(SlowVectorStateError::Parse(format!(
+                            "centroid section compose: no fp32 source for superfile {} column \
+                             {column} cell {:?} (stripped entry and no covering previous \
+                             section)",
+                            entry.superfile_id, cell.cell_id
+                        )));
+                    }
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Byte length [`encode_centroid_section`] produces for `entries`,
@@ -389,46 +445,49 @@ pub(crate) async fn fetch_centroid_section(
 pub(crate) async fn write_state(
     storage: &dyn StorageProvider,
     entries: &[Arc<SuperfileEntry>],
+    previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
-    write_full_and_routing(storage, encode_entries(entries), entries).await
+    write_blob_and_section(storage, encode_entries(entries), entries, previous_section).await
 }
 
 /// Publish current visible membership plus an in-progress drain checkpoint in
 /// the same content-addressed slow-CAS state referenced by the hidden manifest.
-/// The routing sibling carries only the visible entries — consumers never read
-/// checkpoint (pending) state.
+/// Checkpoint (pending) state rides the routing-shaped blob; consumers ignore
+/// it, the drain-resume path reads it.
 pub(crate) async fn write_state_with_pending_drain(
     storage: &dyn StorageProvider,
     entries: &[Arc<SuperfileEntry>],
     pending: &PendingDrainState,
+    previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
-    write_full_and_routing(storage, encode_checkpoint_state(entries, pending), entries).await
+    write_blob_and_section(
+        storage,
+        encode_checkpoint_state(entries, pending),
+        entries,
+        previous_section,
+    )
+    .await
 }
 
-/// PUT the pre-encoded full blob, the routing sibling, and the centroid
-/// section of `entries` concurrently.
-async fn write_full_and_routing(
+/// PUT the routing-shaped state blob and the fp32 centroid section
+/// concurrently — the two-object generation described on
+/// [`PublishedState`].
+async fn write_blob_and_section(
     storage: &dyn StorageProvider,
-    full_bytes: Vec<u8>,
+    blob_bytes: Vec<u8>,
     entries: &[Arc<SuperfileEntry>],
+    previous_section: Option<&CentroidSection>,
 ) -> Result<PublishedState, SlowVectorStateError> {
-    let routing_bytes = encode_entries_with_mode(entries, SummaryWireMode::RoutingOnly);
-    let centroid_bytes = encode_centroid_section(entries);
-    let (full, routing, centroids) = tokio::join!(
-        write_bytes(storage, full_bytes),
-        write_bytes(storage, routing_bytes),
+    let centroid_bytes = compose_centroid_section(entries, previous_section)?;
+    let (blob, centroids) = tokio::join!(
+        write_bytes(storage, blob_bytes),
         write_bytes(storage, centroid_bytes)
     );
-    let (uri, content_hash) = full?;
-    let (routing_uri, routing_hash) = routing?;
+    let (uri, content_hash) = blob?;
     let (centroids_uri, centroids_hash) = centroids?;
     Ok(PublishedState {
         uri,
         content_hash,
-        routing: RoutingRef {
-            uri: routing_uri,
-            content_hash: routing_hash,
-        },
         centroids: RoutingRef {
             uri: centroids_uri,
             content_hash: centroids_hash,
@@ -626,13 +685,13 @@ mod tests {
             entry_with_summary(FIRST_N_DOCS, 1),
             entry_with_summary(SECOND_N_DOCS, 6),
         ];
-        let section = encode_centroid_section(&entries);
+        let section = compose_centroid_section(&entries, None).expect("compose from resident");
         assert_eq!(section.len(), section_len(&entries));
         assert!(!section.is_empty(), "fixture summaries carry fp32");
 
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
-        let published = write_state(&storage, &entries).await.expect("publish");
+        let published = write_state(&storage, &entries, None).await.expect("publish");
         assert_eq!(published.centroids.content_hash, ContentHash::of(&section));
 
         let fetched = fetch_centroid_section(&storage, &published.centroids, &entries)
@@ -679,7 +738,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("localfs");
         let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 1)];
-        let uri = write_state(&storage, &entries).await.expect("write").uri;
+        let uri = write_state(&storage, &entries, None)
+            .await
+            .expect("write")
+            .uri;
         let whole = storage.get(&uri).await.expect("whole get").0;
         assert!(
             whole.len() as u64 > TINY_STRIPE_CHUNK_BYTES,
@@ -697,14 +759,14 @@ mod tests {
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry(FIRST_N_DOCS, 1)];
 
-        let published = write_state(&storage, &entries).await.expect("write");
+        let published = write_state(&storage, &entries, None).await.expect("write");
         let (uri, hash) = (published.uri, published.content_hash);
         // Re-publishing identical content must succeed (PreconditionFailed
         // from the hash-derived URI is benign by construction).
-        let republished = write_state(&storage, &entries).await.expect("rewrite");
+        let republished = write_state(&storage, &entries, None).await.expect("rewrite");
         assert_eq!(uri, republished.uri);
         assert_eq!(hash, republished.content_hash);
-        assert_eq!(published.routing, republished.routing);
+        assert_eq!(published.centroids, republished.centroids);
 
         let loaded = load_state(&storage, &uri, &hash).await.expect("load");
         assert_eq!(loaded.len(), 1);
@@ -725,11 +787,11 @@ mod tests {
         );
     }
 
-    /// The routing sibling is a second durable object: smaller than the
-    /// full blob, same entries, summaries decoded straight into the
-    /// stripped shape with the write-time admit slab intact.
+    /// The state blob is routing-shaped: entries decode straight into the
+    /// stripped shape with the write-time admit slab intact, and fp32
+    /// lives only in the section object next to it.
     #[tokio::test]
-    async fn routing_sibling_decodes_stripped_entries_with_slab() {
+    async fn state_blob_decodes_stripped_entries_with_slab() {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
@@ -739,36 +801,34 @@ mod tests {
             .expect("write-time slab")
             .clone();
 
-        let published = write_state(&storage, &entries).await.expect("write");
+        let published = write_state(&storage, &entries, None).await.expect("write");
         assert_ne!(
-            published.uri, published.routing.uri,
-            "full and routing blobs are distinct objects"
+            published.uri, published.centroids.uri,
+            "state blob and centroid section are distinct objects"
         );
-        let full_len = storage.get(&published.uri).await.expect("full get").0.len();
-        let routing_len = storage
-            .get(&published.routing.uri)
+        let blob_len = storage.get(&published.uri).await.expect("blob get").0.len();
+        let section_len_bytes = storage
+            .get(&published.centroids.uri)
             .await
-            .expect("routing get")
+            .expect("section get")
             .0
             .len();
-        assert!(
-            routing_len < full_len,
-            "routing sibling must shed the fp32 payload ({routing_len} vs {full_len} bytes)"
+        assert_eq!(
+            section_len_bytes,
+            section_len(&entries),
+            "section carries exactly the summaries' fp32 bytes"
         );
+        assert!(blob_len > 0, "state blob must be non-empty");
 
-        let loaded = load_state(
-            &storage,
-            &published.routing.uri,
-            &published.routing.content_hash,
-        )
-        .await
-        .expect("load routing");
+        let loaded = load_state(&storage, &published.uri, &published.content_hash)
+            .await
+            .expect("load blob");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
         let clusters = &loaded[0].vector_summary["emb"].cells[0].clusters;
         assert!(
             !clusters.vectors_resident(),
-            "routing entries land in the stripped shape"
+            "state-blob entries land in the stripped shape"
         );
         assert_eq!(
             *clusters.admit_codes_built().expect("slab seeded"),
@@ -776,26 +836,89 @@ mod tests {
             "slab survives the routing wire form"
         );
 
-        // Checkpoint publications carry the sibling too — consumers opening
-        // mid-drain still fetch only the routing layer.
+        // Checkpoint publications keep the same shape — consumers opening
+        // mid-drain fetch only the routing layer; PENDING entries keep
+        // fp32 inline (writer-only crash-resume state).
         let pending = PendingDrainState {
             metadata: b"epoch".to_vec(),
             entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
         };
-        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending)
+        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
             .await
             .expect("checkpoint write");
-        let visible = load_state(
-            &storage,
-            &checkpoint.routing.uri,
-            &checkpoint.routing.content_hash,
-        )
-        .await
-        .expect("load checkpoint routing");
+        let state = load_full_state(&storage, &checkpoint.uri, &checkpoint.content_hash)
+            .await
+            .expect("load checkpoint");
         assert_eq!(
-            visible.len(),
+            state.entries.len(),
             entries.len(),
-            "checkpoint routing sibling carries only visible entries"
+            "checkpoint blob carries the visible entries"
+        );
+        assert!(
+            !state.entries[0].vector_summary["emb"].cells[0]
+                .clusters
+                .vectors_resident(),
+            "visible checkpoint entries are stripped"
+        );
+        let pending_loaded = state.pending_drain.expect("pending state rides the blob");
+        assert!(
+            pending_loaded.entries[0].vector_summary["emb"].cells[0]
+                .clusters
+                .vectors_resident(),
+            "pending entries keep fp32 inline for drain resume"
+        );
+    }
+
+    /// A republish whose carried-forward entries are STRIPPED (the shape
+    /// hydration produces) composes the new section from the previous
+    /// generation's section — byte-identical to composing from resident
+    /// fp32 — and fails loudly when no source covers a cell.
+    #[tokio::test]
+    async fn compose_section_from_previous_generation() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let resident = vec![
+            entry_with_summary(FIRST_N_DOCS, 1),
+            entry_with_summary(SECOND_N_DOCS, 6),
+        ];
+        let published = write_state(&storage, &resident, None)
+            .await
+            .expect("first publish");
+        let expected_section = compose_centroid_section(&resident, None).expect("resident bytes");
+
+        // Round-trip the entries through the routing wire — the stripped
+        // shape a writer's hydrated manifest carries at republish time.
+        let stripped = load_state(&storage, &published.uri, &published.content_hash)
+            .await
+            .expect("hydrate stripped");
+        assert!(
+            stripped
+                .iter()
+                .all(|e| !e.vector_summary["emb"].cells[0].clusters.vectors_resident()),
+            "fixture must exercise the stripped path"
+        );
+        assert!(
+            compose_centroid_section(&stripped, None).is_err(),
+            "no fp32 source must fail loudly, never publish a hole"
+        );
+
+        let previous = fetch_centroid_section(&storage, &published.centroids, &resident)
+            .await
+            .expect("fetch previous section");
+        let composed =
+            compose_centroid_section(&stripped, Some(&previous)).expect("compose from previous");
+        assert_eq!(
+            composed, expected_section,
+            "carried-forward cells must compose byte-identical fp32"
+        );
+
+        let republished = write_state(&storage, &stripped, Some(&previous))
+            .await
+            .expect("republish from stripped");
+        assert_eq!(
+            republished.centroids.content_hash,
+            ContentHash::of(&expected_section),
+            "republished section must address the same fp32 bytes"
         );
     }
 }

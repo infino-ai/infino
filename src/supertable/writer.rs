@@ -167,6 +167,7 @@ use crate::{
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
+        slow_vector_state::{CentroidSection, fetch_centroid_section},
     },
 };
 
@@ -5496,6 +5497,41 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     stamp_slow_vector_state(inner, None).await
 }
 
+/// The PREVIOUS generation's centroid section for `manifest`, through the
+/// table's single-slot cache (fetch on miss, reuse on URI match). `None`
+/// when no section is stamped (fresh table) or the fetch fails — the
+/// composer then requires every entry's fp32 to be resident and errors
+/// loudly otherwise.
+async fn previous_centroid_section(
+    options: &SupertableOptions,
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<Arc<CentroidSection>> {
+    let reference = manifest.slow_vector_state_centroids_blob()?.clone();
+    let slot = Arc::clone(&options.centroid_section_cache);
+    let mut guard = slot.lock().await;
+    if let Some(section) = guard.as_ref()
+        && section.uri() == reference.uri
+    {
+        return Some(Arc::clone(section));
+    }
+    match fetch_centroid_section(storage, &reference, manifest.get_all_superfiles()).await {
+        Ok(section) => {
+            let section = Arc::new(section);
+            *guard = Some(Arc::clone(&section));
+            Some(section)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "previous centroid section {} unavailable ({error}); republish must compose \
+                 from resident fp32 only",
+                reference.uri
+            );
+            None
+        }
+    }
+}
+
 async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
@@ -5512,33 +5548,40 @@ async fn stamp_slow_vector_state(
             // already absent because `update` never carries it forward.
             return Ok(());
         }
+        // Carried-forward entries are stripped (routing-shaped hydration);
+        // their fp32 composes from the previous generation's section.
+        let previous_section =
+            previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
         let published = match pending_drain.as_ref() {
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
                     entries,
                     pending,
+                    previous_section.as_deref(),
                 )
                 .await
             }
-            None => slow_vector_state::write_state(storage.as_ref(), entries).await,
+            None => {
+                slow_vector_state::write_state(
+                    storage.as_ref(),
+                    entries,
+                    previous_section.as_deref(),
+                )
+                .await
+            }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
-            && old.slow_vector_state_routing_blob() == Some(&published.routing)
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
         {
             // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest = old.with_slow_vector_state(
-            published.uri,
-            published.content_hash,
-            published.routing,
-            published.centroids,
-        );
+        let new_manifest =
+            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -6009,17 +6052,27 @@ pub(crate) async fn try_commit_attempt(
     if super::handle::is_hidden_vector_index_table(&opts) {
         let entries = new_manifest.get_all_superfiles();
         if !entries.is_empty() {
-            let published = slow_vector_state::write_state(storage.as_ref(), entries)
-                .await
-                .map_err(|e| {
-                    SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
-                        ManifestLoadError::SlowStateHydration(e.to_string()),
-                    ))
-                })?;
+            // Carried-forward entries are stripped; the PREVIOUS manifest
+            // still holds the section ref `update` cleared — compose the
+            // new generation's section from it plus this commit's fresh
+            // (fp32-resident) entries.
+            let previous_section =
+                previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref())
+                    .await;
+            let published = slow_vector_state::write_state(
+                storage.as_ref(),
+                entries,
+                previous_section.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
+                    ManifestLoadError::SlowStateHydration(e.to_string()),
+                ))
+            })?;
             new_manifest = new_manifest.with_slow_vector_state_ref(
                 published.uri,
                 published.content_hash,
-                published.routing,
                 published.centroids,
             );
         }
@@ -6038,7 +6091,13 @@ pub(crate) async fn try_commit_attempt(
     //    list entry references.
     let encoded_refs: Vec<&[u8]> = parts_to_write
         .iter()
-        .flat_map(|ep| [ep.encoded.as_slice(), ep.routing_encoded.as_slice()])
+        .flat_map(|ep| {
+            [
+                Some(ep.encoded.as_slice()),
+                ep.routing_encoded.as_deref(),
+            ]
+        })
+        .flatten()
         .collect();
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)

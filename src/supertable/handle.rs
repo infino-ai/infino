@@ -2507,9 +2507,16 @@ mod tests {
         let hidden_reader = hidden.reader();
         let hidden_manifest = hidden_reader.manifest();
         assert!(
-            hidden_manifest.slow_vector_state_routing_blob().is_some(),
-            "drain must publish the routing sibling ref — mode-on consumers \
-             hydrate from it (1-bit slab only, no fp32 download)"
+            hidden_manifest.slow_vector_state_blob().is_some(),
+            "drain must publish the slow-state ref (routing-shaped blob)"
+        );
+        assert!(
+            hidden_manifest.slow_vector_state_routing_blob().is_none(),
+            "two-object model: no routing sibling — the primary blob IS routing-shaped"
+        );
+        assert!(
+            hidden_manifest.slow_vector_state_centroids_blob().is_some(),
+            "drain must publish the centroid-section ref — exact rescores read it"
         );
         let mut saw_stripped_summary = false;
         for entry in hidden_manifest.superfiles.iter() {

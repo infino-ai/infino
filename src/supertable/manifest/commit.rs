@@ -243,13 +243,16 @@ pub async fn probe_pointer(
 
 pub struct EncodedPart {
     pub part: ManifestPart,
-    /// Full wire form (fp32 + admit slab) — the durable commit artifact
-    /// writers read back.
+    /// Primary wire form: FULL (fp32 + admit slab) for user manifests —
+    /// the fp32 store the first rescore hydrates from — ROUTING-only for
+    /// hidden manifests, whose fp32 lives in the slow-CAS centroid
+    /// section instead.
     pub encoded: Vec<u8>,
     /// Routing-only sibling (counts + admit slab, no fp32) — what
-    /// consumer opens with `summary_centroids_from_superfiles` fetch.
-    /// PUT together with `encoded` in the same commit.
-    pub routing_encoded: Vec<u8>,
+    /// consumer opens fetch. `None` for hidden manifests: their primary
+    /// form IS routing-shaped, so a sibling would be a byte-identical
+    /// duplicate. PUT together with `encoded` in the same commit.
+    pub routing_encoded: Option<Vec<u8>>,
 }
 
 /// Outcome of writing a manifest part — returned by
