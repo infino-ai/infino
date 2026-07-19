@@ -24,7 +24,7 @@ use crate::{
     rss::{self, RssStats},
 };
 
-/// A warm-latency cell. All three warm metrics (min / p50 / p90) are
+/// A warm-latency cell. All three warm metrics (p50 / p90 / p99) are
 /// Δ-tracked equally here; which one *gates* the A/B regression decision is
 /// chosen downstream by the summary, not at measurement time.
 fn warm_time_cell(ns: f64) -> Cell {
@@ -102,12 +102,12 @@ impl ColdSamples {
     }
 }
 
-/// Min / p50 / p90 of a timed-sample set.
+/// p50 / p90 / p99 of a timed-sample set.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
-    pub min: Duration,
     pub p50: Duration,
     pub p90: Duration,
+    pub p99: Duration,
 }
 
 /// Batch sub-µs ops up to this span so per-call `Instant::now` overhead
@@ -156,22 +156,25 @@ fn rss_cells(stats: &RssStats) -> Vec<Cell> {
     ]
 }
 
-/// Min / lower-median / nearest-rank p90 of a sample set (sorts in place).
+/// Lower-median / nearest-rank p90 / nearest-rank p99 of a sample set
+/// (sorts in place). At small sample counts nearest-rank p99 degenerates
+/// to the max — the honest tail read for the samples taken.
 pub fn summarize(samples: &mut [Duration]) -> Stats {
     let n = samples.len();
     if n == 0 {
         return Stats {
-            min: Duration::ZERO,
             p50: Duration::ZERO,
             p90: Duration::ZERO,
+            p99: Duration::ZERO,
         };
     }
     samples.sort_unstable();
     let p90_rank = (9 * n).div_ceil(10).clamp(1, n);
+    let p99_rank = (99 * n).div_ceil(100).clamp(1, n);
     Stats {
-        min: samples[0],
         p50: samples[(n - 1) / 2],
         p90: samples[p90_rank - 1],
+        p99: samples[p99_rank - 1],
     }
 }
 
@@ -660,12 +663,12 @@ pub mod fts {
     }
 
     /// Warm timing (+ RSS) for one query: `warm` is the query phase (id +
-    /// score), `fetched_min` the fetch phase (+ top-k text).
+    /// score), `fetched_p50` the fetch phase (+ top-k text).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
         pub warm: Stats,
-        pub fetched_min: Duration,
+        pub fetched_p50: Duration,
         /// Amortized on-CPU seconds of one warm query-phase search — the
         /// query's measured compute (cache hot, 0 GET), the basis for both the
         /// warm and cold query CPU cost.
@@ -701,7 +704,7 @@ pub mod fts {
         FtsQueryStat {
             name: q.name,
             warm: summarize(&mut samples),
-            fetched_min: summarize(&mut fetched_samples).min,
+            fetched_p50: summarize(&mut fetched_samples).p50,
             cpu_s,
             rss,
         }
@@ -763,14 +766,14 @@ pub mod fts {
     fn warm_cells(stat: Option<&FtsQueryStat>) -> Vec<Cell> {
         match stat {
             Some(q) => {
-                let min_ns = q.warm.min.as_secs_f64() * NS_PER_SEC;
                 let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
                 let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
-                let fetched_ns = q.fetched_min.as_secs_f64() * NS_PER_SEC;
+                let p99_ns = q.warm.p99.as_secs_f64() * NS_PER_SEC;
+                let fetched_ns = q.fetched_p50.as_secs_f64() * NS_PER_SEC;
                 let mut cells = vec![
-                    warm_time_cell(min_ns),
                     warm_time_cell(p50_ns),
                     warm_time_cell(p90_ns),
+                    warm_time_cell(p99_ns),
                     context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
                 ];
                 cells.extend(rss_cells(&q.rss));
@@ -835,10 +838,10 @@ pub mod fts {
         if warm_map.is_some() {
             header_cols.extend(
                 [
-                    "warm min",
                     "warm p50",
                     "warm p90",
-                    "+fetch min",
+                    "warm p99",
+                    "+fetch p50",
                     "Peak RSS",
                     "Median RSS",
                     "P90 RSS",
@@ -1436,7 +1439,7 @@ pub mod vector {
     }
 
     /// Warm timing (+ RSS + measured on-CPU) for one config on an
-    /// already-warm reader, gated on `warm.min`. `cpu_s` is the amortized
+    /// already-warm reader, gated on `warm.p50`. `cpu_s` is the amortized
     /// on-CPU seconds of one warm query — the query's true compute, measured
     /// (not a wall proxy). It's the basis for BOTH warm and cold query CPU
     /// cost: a cold query runs the identical scoring, so its compute equals
@@ -1548,7 +1551,7 @@ pub mod vector {
         pub cold: Option<ColdTiming>,
     }
 
-    /// Gate latency cell (warm min, cold search).
+    /// Gate latency cell (warm p50, cold search).
     fn time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             metric(ns, fmt_time(ns), Better::Lower)
@@ -1557,7 +1560,7 @@ pub mod vector {
         }
     }
 
-    /// Context latency cell (p50/p90, cold open).
+    /// Context latency cell (p90/p99, cold open).
     fn ctx_time_cell(ns: f64) -> Cell {
         if ns.is_finite() {
             context(ns, fmt_time(ns), Better::Lower)
@@ -1585,9 +1588,9 @@ pub mod vector {
         if include_warm {
             headers.extend(
                 [
-                    "warm min",
                     "warm p50",
                     "warm p90",
+                    "warm p99",
                     "Peak RSS",
                     "Median RSS",
                     "P90 RSS",
@@ -1607,12 +1610,12 @@ pub mod vector {
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
-                            let min_ns = w.warm.min.as_secs_f64() * NS_PER_SEC;
                             let p50_ns = w.warm.p50.as_secs_f64() * NS_PER_SEC;
                             let p90_ns = w.warm.p90.as_secs_f64() * NS_PER_SEC;
-                            cells.push(warm_time_cell(min_ns));
+                            let p99_ns = w.warm.p99.as_secs_f64() * NS_PER_SEC;
                             cells.push(warm_time_cell(p50_ns));
                             cells.push(warm_time_cell(p90_ns));
+                            cells.push(warm_time_cell(p99_ns));
                             cells.extend(rss_cells(&w.rss));
                         }
                         None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
@@ -2128,14 +2131,14 @@ pub mod sql {
     }
 
     fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
-        let min_ns = stat.warm.min.as_secs_f64() * 1e9;
         let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
         let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
+        let p99_ns = stat.warm.p99.as_secs_f64() * 1e9;
         let mut cells = vec![
             text(stat.name),
-            warm_time_cell(min_ns),
             warm_time_cell(p50_ns),
             warm_time_cell(p90_ns),
+            warm_time_cell(p99_ns),
             text(fmt_count(stat.rows)),
         ];
         cells.extend(rss_cells(&stat.rss));
@@ -2145,9 +2148,9 @@ pub mod sql {
     fn query_headers() -> Vec<String> {
         vec![
             "Query".into(),
-            "warm min".into(),
             "warm p50".into(),
             "warm p90".into(),
+            "warm p99".into(),
             "Rows".into(),
             "Peak RSS".into(),
             "Median RSS".into(),

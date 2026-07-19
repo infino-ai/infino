@@ -811,7 +811,7 @@ pub mod fts {
                     fmt_count(n_docs)
                 ),
                 "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), \
-                 then per-query min / p50 / p90 over repeated bm25_search (Δ gates on `min`). Cold = \
+                 then per-query p50 / p90 / p99 over repeated bm25_search (Δ gates on `p50`). Cold = \
                  fresh disk cache + consumer per iteration, so each read pays the object-store cold \
                  open. Δ is vs the previous run.",
                 warm.as_deref(),
@@ -1204,6 +1204,40 @@ pub mod vector {
     /// pre-routing search path.
     const RUN_CALIBRATION_GRID: bool = false;
 
+    /// Regression gates on the post-drain first cold query's hidden-data
+    /// GET fan (the "hidden code fetch"): with the pinned <20M grid shape
+    /// (512 user / 256 hidden cells) the probe served one cell in 1 GET at
+    /// 1M and 2 GETs at 10M. Ceilings by scale — runs under
+    /// [`HIDDEN_COLD_GET_SMALL_MAX_DOCS`] must not exceed
+    /// [`HIDDEN_COLD_GET_CEILING_SMALL`]; runs under
+    /// [`HIDDEN_COLD_GET_MID_MAX_DOCS`] must not exceed
+    /// [`HIDDEN_COLD_GET_CEILING_MID`]. At and above 20M the grid shape is
+    /// still being calibrated, so no ceiling applies yet. Scoped to the
+    /// post-drain state: post-compact currently reads one extra GET at 10M
+    /// (the merge changes the fine-run layout) and gets its own gate once
+    /// that's tightened.
+    const HIDDEN_COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+    /// Hidden-data GET ceiling for the post-drain first cold query, <5M docs.
+    const HIDDEN_COLD_GET_CEILING_SMALL: u64 = 1;
+    /// Upper doc bound for the mid-scale ceiling (exclusive).
+    const HIDDEN_COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
+    /// Hidden-data GET ceiling for the post-drain first cold query, 5M–20M docs.
+    const HIDDEN_COLD_GET_CEILING_MID: u64 = 2;
+    /// The routing-state label the hidden cold-GET ceiling applies to.
+    const HIDDEN_COLD_GET_GATED_STATE: &str = "post-drain";
+
+    /// Ceiling on the post-drain first cold query's hidden-data GETs for
+    /// `n_docs`, when one applies at this scale.
+    fn hidden_cold_get_ceiling(n_docs: usize) -> Option<u64> {
+        if n_docs < HIDDEN_COLD_GET_SMALL_MAX_DOCS {
+            Some(HIDDEN_COLD_GET_CEILING_SMALL)
+        } else if n_docs < HIDDEN_COLD_GET_MID_MAX_DOCS {
+            Some(HIDDEN_COLD_GET_CEILING_MID)
+        } else {
+            None
+        }
+    }
+
     /// Calibration policy for supertable vector benches: the grid runs only
     /// when [`RUN_CALIBRATION_GRID`] is flipped on, and even then auto-offs
     /// above [`exec_vec::FULL_CALIBRATION_MAX_DOCS`]. Default and filtered
@@ -1347,6 +1381,7 @@ pub mod vector {
         label: &str,
         expected: ExpectedTiers,
         split: &storage_meter::ColdStoreSplit,
+        n_docs: usize,
     ) {
         let user_data = split
             .first_query
@@ -1365,6 +1400,18 @@ pub mod vector {
             valid,
             "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
         );
+        // Lock in the cold-probe gains: the post-drain hidden fetch must
+        // stay within the per-scale GET ceiling (see
+        // `hidden_cold_get_ceiling`).
+        if label == HIDDEN_COLD_GET_GATED_STATE
+            && let Some(ceiling) = hidden_cold_get_ceiling(n_docs)
+        {
+            assert!(
+                hidden_data <= ceiling,
+                "{label}: hidden-data cold fetch regressed — {hidden_data} GETs on the first \
+                 cold query, ceiling {ceiling} at {n_docs} docs (1 GET <5M, 2 GETs 5M-20M)"
+            );
+        }
     }
 
     fn default_recall(rows: &[exec_vec::RecallRow]) -> Option<String> {
@@ -2311,7 +2358,7 @@ pub mod vector {
             .then(|| measure_cold_store(label, built, query, nprobe, rerank, cache_budget_bytes))
             .flatten();
         if let Some(cold) = &cold {
-            assert_expected_cold_reads(label, expected, &cold.split);
+            assert_expected_cold_reads(label, expected, &cold.split, supertable::n_docs());
         }
         eprintln!(
             "[supertable_vector/{label}] expected {}; top-k {user_hits} user + {hidden_hits} hidden; warm {}; cold {}",
@@ -3459,7 +3506,7 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then min / p50 / p90 over repeated `query_sql` calls (Δ gates on `min`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then p50 / p90 / p99 over repeated `query_sql` calls (Δ gates on `p50`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
             Some(sets)
