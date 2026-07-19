@@ -163,9 +163,10 @@ const UNION_FINE_PICKS_MIN: usize = 2;
 /// for unfiltered search, where fine p1 cell coverage measures 1.000; an
 /// allow-set thins each cell's matching postings (~10% selectivity in the
 /// bench), so the nearest *matching* neighbors spread past the top cell
-/// and p=1 caps filtered recall well below the unfiltered number
-/// (measured 0.756 vs 0.997 at 10M). Probe 4 cells instead.
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
+/// and a narrow probe caps filtered recall well below the unfiltered
+/// number (p=1 measured 0.756 vs 0.997 at 10M; p=4 measured 0.866 at
+/// 10M/256c). Probe 8 cells.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 8;
 
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
