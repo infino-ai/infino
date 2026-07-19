@@ -2689,11 +2689,17 @@ pub mod vector {
             // Bracket the consumer open with settled-anon samples: the delta
             // is the engine handle's own pinned memory, free of the harness
             // heap that precedes it (corpus bookkeeping, producer handle).
+            // This shared handle drives the lifecycle mutations (drain,
+            // delta commit, optimize), so the consumer-memory-mode env knob
+            // must not apply to it — stripped summaries cannot be
+            // republished. The knob-on serving profile is measured on the
+            // fresh consumers each routing state / cold split opens.
             let anon_before_consumer = rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
-            let consumer = tiers::open_consumer(tiers::consumer_options(
+            let consumer = tiers::open_consumer(tiers::consumer_options_with_knob(
                 supertable::options_for(Modality::Vector, None),
                 consumer_meter.provider(),
                 cache,
+                false,
             ));
             crate::rss::log_rss_breakdown("supertable_vector after consumer open");
             if let (Some(before), Some((_, after, _, _))) =

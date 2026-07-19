@@ -714,18 +714,38 @@ pub fn consumer_options(
     storage: Arc<dyn StorageProvider>,
     cache: Arc<DiskCacheStore>,
 ) -> SupertableOptions {
+    consumer_options_with_knob(base, storage, cache, true)
+}
+
+/// [`consumer_options`] with the consumer-memory-mode env knob gateable.
+/// Handles that drive lifecycle mutations (drain / optimize / delta
+/// commits) must pass `allow_summary_knob = false`: the mode is a
+/// read-only-consumer contract — a writer republishing manifests from
+/// stripped summaries panics on the engine's encode guard.
+pub fn consumer_options_with_knob(
+    base: SupertableOptions,
+    storage: Arc<dyn StorageProvider>,
+    cache: Arc<DiskCacheStore>,
+    allow_summary_knob: bool,
+) -> SupertableOptions {
     // Search benches query a static, already-ingested supertable with no
     // concurrent writers. Snapshot consistency keeps the read path free of
     // pointer-GET refreshes so the measured latency is pure query cost; the
     // one-time cold-open manifest read is timed separately.
-    let summary_centroids_from_superfiles = std::env::var(SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV)
+    let knob_env = std::env::var(SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV)
         .ok()
         .as_deref()
         == Some("1");
+    if knob_env && !allow_summary_knob {
+        eprintln!(
+            "[tiers] {SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV} suppressed on this handle: \
+             it drives lifecycle mutations (writer contract needs resident fp32)"
+        );
+    }
     base.with_storage(storage)
         .with_disk_cache(cache)
         .with_read_consistency(infino::supertable::options::Consistency::Snapshot)
-        .with_summary_centroids_from_superfiles(summary_centroids_from_superfiles)
+        .with_summary_centroids_from_superfiles(knob_env && allow_summary_knob)
 }
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
