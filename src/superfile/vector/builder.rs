@@ -81,6 +81,28 @@ const RESERVOIR_SEED_XOR_MASK: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 /// typical embedding distributions.
 const KMEANS_ITERS: usize = 5;
 
+/// Upper bound on one trained fine run's sample share, as a multiple of the
+/// requested per-run target (`sample rows / requested n_cent`). The run-count
+/// formula (`n_cent = ceil(rows / rows_per_run)`) only fixes the *mean* run
+/// at the fine-run byte target; the actual sizes fall out of the k-means
+/// assignment, and Lloyd over a consolidated drain cell (dozens of centroids
+/// over a few dense blobs) can park starved seeds and leave one run holding
+/// a huge share of the cell — measured 48× the mean at 100M-doc drain cells.
+/// An oversized run's summary centroid sits at the blob's center of mass,
+/// far from its boundary rows, so cell routing misranks and recall caps out.
+/// Runs whose sample count exceeds this bound are re-split until every run
+/// fits, making the byte target an invariant rather than an expectation.
+const FINE_RUN_SPLIT_BOUND_FACTOR: usize = 2;
+
+/// Maximum split rounds before accepting residual imbalance. Each round
+/// re-trains only rows inside still-oversized runs, so work decays
+/// geometrically; the cap bounds the pathological worst case.
+const FINE_RUN_SPLIT_MAX_ROUNDS: usize = 4;
+
+/// Seed offset for the split re-k-means, keeping its PRNG stream distinct
+/// from the base k-means stream (which offsets `rot_seed` internally).
+const FINE_RUN_SPLIT_SEED_OFFSET: u64 = 101;
+
 /// Target memory budget (~128 MiB) for one pass-2 rotated chunk
 /// (`chunk_rows × dim × 4` bytes); the chunk row count is derived
 /// from this so resident memory stays bounded independent of `dim`.
@@ -100,9 +122,13 @@ const MATERIALIZED_BUCKET_CHUNK_BYTES: usize = 16 << 20;
 const MATERIALIZED_ASSIGN_BYTES_PER_DIM: usize = 2 + size_of::<f32>();
 
 /// Superfile-local document thresholds for capping the physical IVF centroid
-/// count. Caller-supplied `n_cent` remains a tuning knob, but the builder will
-/// not train more centroids than this row-count policy permits for the physical
-/// superfile being written.
+/// count on the **streaming global build only** (the user-table superfile
+/// path, where `cfg.n_cent` is a corpus-scale config knob — e.g. 1024/4096 —
+/// hitting one commit-sized superfile; the cap turns that into a sane
+/// per-file count). Cell packs never consult it: their `n_cent` is already
+/// row-derived from the fine-run byte target in `drain_cell_vector_config`,
+/// and capping it again would fatten runs past the target (and step
+/// discontinuously at the 100K-row boundary, mid drain-cell range at 100M).
 const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
 /// Maximum IVF centroids for large physical vector indexes.
 const N_CENT_LARGE: usize = 4096;
@@ -1092,14 +1118,71 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
         let n_cent = global.len() / dim.max(1);
         return (n_cent, global.to_vec());
     }
-    let n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_cent_row_count_cap(n_docs))
-        .min(n_docs.max(1));
-    let mut centroids = kmeans(sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+    // Cell packs trust the caller's row-derived `n_cent` (the fine-run byte
+    // target) — no row-count cap here; the split below bounds run sizes.
+    let requested = cfg.n_cent.max(1).min(n_docs.max(1));
+    let mut centroids = kmeans(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
+    let n_cent = split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed);
     order_centroids_geometrically(&mut centroids, dim, n_cent);
     (n_cent, centroids)
+}
+
+/// Enforce the fine-run size bound on trained centroids: while any run's
+/// sample population exceeds [`FINE_RUN_SPLIT_BOUND_FACTOR`] × the requested
+/// per-run target, re-run k-means locally on that run's sample rows and
+/// replace its one centroid with enough sub-centroids to land each subrun
+/// back on the target. Returns the final centroid count (`centroids` grows
+/// in place). Single-run packs (the commit-time cell delta shape,
+/// `requested == 1`) can never exceed the bound and pass through untouched.
+///
+/// Deterministic: assignment and sub-k-means are seeded from `seed` plus a
+/// fixed offset mixed with the round and run index.
+fn split_oversized_fine_runs(
+    centroids: &mut Vec<f32>,
+    sample: &[f32],
+    dim: usize,
+    requested: usize,
+    seed: u64,
+) -> usize {
+    let mut n_cent = centroids.len() / dim.max(1);
+    let sample_n = sample.len() / dim.max(1);
+    if n_cent <= 1 || sample_n == 0 {
+        return n_cent;
+    }
+    let target = sample_n.div_ceil(requested.max(1)).max(1);
+    let bound = target.saturating_mul(FINE_RUN_SPLIT_BOUND_FACTOR);
+    let mut assignments = vec![0u32; sample_n];
+    for round in 0..FINE_RUN_SPLIT_MAX_ROUNDS {
+        assign_to_centroids(sample, centroids, dim, n_cent, &mut assignments);
+        let mut counts = vec![0usize; n_cent];
+        for &a in &assignments {
+            counts[a as usize] += 1;
+        }
+        let oversized: Vec<usize> = (0..n_cent).filter(|&c| counts[c] > bound).collect();
+        if oversized.is_empty() {
+            break;
+        }
+        for &c in &oversized {
+            let members: Vec<usize> = (0..sample_n)
+                .filter(|&r| assignments[r] as usize == c)
+                .collect();
+            // An oversized run has > bound ≥ 2 members, so k lands in
+            // [2, members.len()] and the sub-k-means input is never empty.
+            let k = members.len().div_ceil(target).max(2).min(members.len());
+            let mut rows = Vec::with_capacity(members.len() * dim);
+            for &r in &members {
+                rows.extend_from_slice(&sample[r * dim..(r + 1) * dim]);
+            }
+            let sub_seed = seed
+                .wrapping_add(FINE_RUN_SPLIT_SEED_OFFSET)
+                .wrapping_add(((round as u64) << u32::BITS) | c as u64);
+            let sub = kmeans(&rows, dim, k, KMEANS_ITERS, sub_seed);
+            centroids[c * dim..(c + 1) * dim].copy_from_slice(&sub[..dim]);
+            centroids.extend_from_slice(&sub[dim..]);
+        }
+        n_cent = centroids.len() / dim;
+    }
+    n_cent
 }
 
 /// Reorder trained fine centroids into a deterministic greedy
@@ -1804,11 +1887,9 @@ pub(crate) fn build_cell_subsection_from_source(
             }
         }
     }
-    let requested_n_cent = cfg
-        .n_cent
-        .max(1)
-        .min(n_cent_row_count_cap(n_docs))
-        .min(n_docs);
+    // Mirrors `materialized_centroids`: cell packs take the row-derived
+    // `n_cent` uncapped, so the sample is sized for the runs actually trained.
+    let requested_n_cent = cfg.n_cent.max(1).min(n_docs);
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
@@ -3313,6 +3394,112 @@ mod tests {
             .map(|c| centroids_b[c * DIM])
             .collect();
         assert_eq!(ordered_b, ordered, "chain order is input-order invariant");
+    }
+
+    // ---- fine-run size bound (split_oversized_fine_runs) ---------------
+
+    /// Sample dim for the split tests — small but above trivial.
+    const SPLIT_DIM: usize = 8;
+    /// Requested run count for the split tests: 600 sample rows / 10 runs
+    /// gives target 60, bound 120.
+    const SPLIT_REQUESTED: usize = 10;
+
+    /// 600 rows in two tight blobs (500 near the origin, 100 near 10.0),
+    /// jittered deterministically by an LCG so k-means has structure to
+    /// subdivide.
+    fn two_blob_sample() -> Vec<f32> {
+        let mut rows = Vec::with_capacity(600 * SPLIT_DIM);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut jitter = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) % 1000) as f32 / 1000.0 - 0.5
+        };
+        for r in 0..600 {
+            let base = if r < 500 { 0.0f32 } else { 10.0 };
+            for _ in 0..SPLIT_DIM {
+                rows.push(base + jitter());
+            }
+        }
+        rows
+    }
+
+    /// Counts per centroid after a fresh nearest-centroid assignment.
+    fn run_counts(sample: &[f32], centroids: &[f32], n_cent: usize) -> Vec<usize> {
+        let mut assignments = vec![0u32; sample.len() / SPLIT_DIM];
+        assign_to_centroids(sample, centroids, SPLIT_DIM, n_cent, &mut assignments);
+        let mut counts = vec![0usize; n_cent];
+        for &a in &assignments {
+            counts[a as usize] += 1;
+        }
+        counts
+    }
+
+    /// A centroid set that dumps every row into one run (one centroid on
+    /// the data, the rest far away) must come back with every run at or
+    /// under the bound, growing `n_cent` as needed.
+    #[test]
+    fn split_oversized_fine_runs_bounds_every_run() {
+        let sample = two_blob_sample();
+        let sample_n = sample.len() / SPLIT_DIM;
+        let target = sample_n.div_ceil(SPLIT_REQUESTED);
+        let bound = target * FINE_RUN_SPLIT_BOUND_FACTOR;
+
+        // Centroid 0 sits on the data; 1..5 are parked far away (the
+        // starved-seed shape Lloyd produces on blob-heavy cells).
+        let mut centroids = vec![0.0f32; 5 * SPLIT_DIM];
+        for c in 1..5 {
+            for d in 0..SPLIT_DIM {
+                centroids[c * SPLIT_DIM + d] = 1_000.0 + c as f32;
+            }
+        }
+        let before = run_counts(&sample, &centroids, 5);
+        assert!(
+            before.iter().any(|&n| n > bound),
+            "fixture must start oversized (max run {} ≤ bound {bound})",
+            before.iter().max().expect("nonempty")
+        );
+
+        let n_cent =
+            split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+        assert_eq!(centroids.len(), n_cent * SPLIT_DIM);
+        assert!(n_cent > 5, "split must add sub-centroids");
+        let after = run_counts(&sample, &centroids, n_cent);
+        assert!(
+            after.iter().all(|&n| n <= bound),
+            "every run must fit the bound {bound}: {after:?}"
+        );
+    }
+
+    /// Single-run packs (the commit-time cell delta shape) pass through
+    /// untouched — the commit path stays byte-identical.
+    #[test]
+    fn split_oversized_fine_runs_leaves_single_run_untouched() {
+        let sample = two_blob_sample();
+        let mut centroids = vec![0.5f32; SPLIT_DIM];
+        let original = centroids.clone();
+        let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7);
+        assert_eq!(n_cent, 1);
+        assert_eq!(centroids, original);
+    }
+
+    /// Same inputs and seed produce identical output centroids.
+    #[test]
+    fn split_oversized_fine_runs_is_deterministic() {
+        let sample = two_blob_sample();
+        let make = || {
+            let mut centroids = vec![0.0f32; 5 * SPLIT_DIM];
+            for c in 1..5 {
+                for d in 0..SPLIT_DIM {
+                    centroids[c * SPLIT_DIM + d] = 1_000.0 + c as f32;
+                }
+            }
+            let n =
+                split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+            (n, centroids)
+        };
+        assert_eq!(make(), make());
     }
 
     #[test]
