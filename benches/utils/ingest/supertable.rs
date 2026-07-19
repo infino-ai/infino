@@ -100,9 +100,26 @@ const SMALL_SCALE_USER_CELLS: usize = 512;
 /// with 1-GET cold probes at 1M and 10M.
 const SMALL_SCALE_HIDDEN_CELLS: usize = 256;
 
+/// Explicit grid override for cell-shape experiments: `"user,hidden"`
+/// (e.g. `INFINO_BENCH_CELLS=256,256`). Takes precedence over the pinned
+/// small-scale shape at any doc count; unset runs the normal policy.
+const CELLS_ENV: &str = "INFINO_BENCH_CELLS";
+
 /// Per-table grid cell counts for this run's scale, or `None` to let the
-/// YAML config decide (≥ [`SMALL_SCALE_MAX_DOCS`] docs).
+/// YAML config decide (≥ [`SMALL_SCALE_MAX_DOCS`] docs without an
+/// explicit [`CELLS_ENV`] override).
 fn bench_cell_counts() -> Option<(usize, usize)> {
+    if let Ok(spec) = env::var(CELLS_ENV) {
+        let (user, hidden) = spec
+            .split_once(',')
+            .unwrap_or_else(|| panic!("{CELLS_ENV} must be \"user,hidden\", got {spec:?}"));
+        let parse = |s: &str, which: &str| -> usize {
+            s.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{CELLS_ENV} {which} cell count invalid in {spec:?}"))
+        };
+        return Some((parse(user, "user"), parse(hidden, "hidden")));
+    }
     (n_docs() < SMALL_SCALE_MAX_DOCS).then_some((SMALL_SCALE_USER_CELLS, SMALL_SCALE_HIDDEN_CELLS))
 }
 /// Producer memory budget in GiB — steers the attached disk cache's
