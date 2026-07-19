@@ -362,6 +362,22 @@ fn admit_shortlist_window(ranked_cells: usize) -> usize {
     scaled.max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
 }
 
+/// Cell-probe budget for a filtered (allow-set) fan: the unfiltered
+/// `base` width scaled by 1/selectivity. The filtered top-k are ≈ the
+/// unfiltered top-(k/selectivity) neighbors, whose cells spread
+/// proportionally wider than the unfiltered probe's. Degenerate inputs
+/// (empty allow, no rows, all rows matching) keep the base width; the
+/// result never narrows below it. Callers clamp to the ranked cell
+/// population downstream.
+fn filtered_cell_probe(base: usize, allowed_rows: u64, total_rows: u64) -> usize {
+    if allowed_rows == 0 || total_rows == 0 || allowed_rows >= total_rows {
+        return base;
+    }
+    let selectivity = allowed_rows as f64 / total_rows as f64;
+    ((base as f64 / selectivity).ceil() as usize).max(base)
+}
+
+
 /// One admit fine-centroid candidate:
 /// `(superfile index, flat cluster id, score, cell id, indexed doc count)`.
 type FineCandidate = (usize, u32, f32, Option<u32>, u64);
@@ -1219,14 +1235,30 @@ impl SupertableReader {
         // SIMD cache and force a per-query scalar transpose rebuild).
         let hidden_routing = manifest.vector_cell_routing();
         // The user-table path owns its coarse default (16 cells), and a
-        // filtered fan never probes narrower than that: an allow-set thins
-        // each cell's matching mass, so the filtered default is the floor,
-        // not a cap. Explicit caller overrides keep the resolved value;
-        // hidden routing ignores `nprobe` entirely (persisted
-        // CellRoutingParams). The single-superfile tier is untouched — this
-        // widening lives only in the supertable fan-out.
+        // filtered fan scales its cell budget by the allow-set's
+        // selectivity: the filtered top-k are ≈ the unfiltered
+        // top-(k/selectivity), and those neighbors spread across ~1/s more
+        // cells than the unfiltered probe covers. Probing the same 16
+        // cells under a 10% filter measured recall 0.722; the width sweep
+        // recovered 0.907 at 64 cells and 0.988 at 128 (1M, 256-cell
+        // grid). Explicit caller overrides keep the resolved value; hidden
+        // routing ignores `nprobe` entirely (persisted CellRoutingParams).
+        // The single-superfile tier is untouched — this widening lives
+        // only in the supertable fan-out.
         let nprobe = if !hidden_vector_index && options.nprobe.is_none() {
-            resolved_nprobe.max(USER_COARSE_CELLS)
+            match allow.as_ref() {
+                Some(allow_map) => {
+                    let allowed_rows: u64 = allow_map.values().map(|bm| bm.len()).sum();
+                    let total_rows: u64 = superfiles
+                        .iter()
+                        .filter(|entry| allow_map.contains_key(&entry.uri))
+                        .map(|entry| entry.n_docs)
+                        .sum();
+                    filtered_cell_probe(resolved_nprobe, allowed_rows, total_rows)
+                        .max(USER_COARSE_CELLS)
+                }
+                None => resolved_nprobe.max(USER_COARSE_CELLS),
+            }
         } else {
             resolved_nprobe
         };
@@ -2591,9 +2623,9 @@ mod tests {
 
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
-        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, projection_is_id_score_only,
-        union_cell_selection, vector_read_query_error,
+        admit_shortlist_window, cells_ranked_by_fine_score, filtered_cell_probe,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
+        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2656,6 +2688,20 @@ mod tests {
         // Ceil, not floor: a fractional slice rounds up.
         assert_eq!(admit_shortlist_window(241), 49);
     }
+
+    #[test]
+    fn filtered_cell_probe_scales_by_selectivity() {
+        // 10% selectivity → 10× the unfiltered width.
+        assert_eq!(filtered_cell_probe(8, 100_000, 1_000_000), 80);
+        // 50% selectivity → 2×.
+        assert_eq!(filtered_cell_probe(8, 500_000, 1_000_000), 16);
+        // Degenerate inputs keep the base width.
+        assert_eq!(filtered_cell_probe(8, 0, 1_000_000), 8);
+        assert_eq!(filtered_cell_probe(8, 100, 0), 8);
+        // A filter matching everything is the unfiltered width.
+        assert_eq!(filtered_cell_probe(8, 1_000_000, 1_000_000), 8);
+    }
+
 
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {

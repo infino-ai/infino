@@ -1176,6 +1176,16 @@ pub mod vector {
     const QUERY_SIGMA: f32 = 0.05;
     /// Filtered vector bench allow-set density: keep every Nth row.
     const FILTER_KEEP_EVERY: usize = 10;
+    /// Regression floor for filtered recall@10 at the bench's ~10%
+    /// selectivity — a tripwire below the measured value, the same way
+    /// the 0.80 default-config floor sits below its measured 0.995.
+    /// The selectivity-blind postings target measured 0.722 (1M and
+    /// 10M); the consolidated-cell routing it replaced measured 0.900.
+    const FILTERED_RECALL_FLOOR: f32 = 0.85;
+    /// Explicit cell-probe widths for the filtered width-sweep diagnostic
+    /// (the engine default probes 16). Recall climbing with width ⇒ cell
+    /// coverage gap; flat ⇒ in-cell shortlist/rerank loss.
+    const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[32, 64, 128];
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
     /// Explicitly discard only the derived hidden vector-index sibling before
@@ -3171,6 +3181,44 @@ pub mod vector {
                         q_correct.len(),
                     );
                 }
+                // Probe-width discriminator for filtered recall loss: if
+                // recall climbs with an explicit wider cell probe, the gap
+                // is cell coverage (selection misses the matching
+                // neighbors' cells); if it stays flat, the loss sits
+                // inside the probed cells (kernel shortlist/rerank under
+                // the allow-set). Diagnostic print only — the gate above
+                // stays on the engine default.
+                for width in FILTERED_DIAG_PROBE_WIDTHS {
+                    let mut wide_recalls = Vec::with_capacity(q_correct.len());
+                    let mut wide_lat = Vec::with_capacity(q_correct.len());
+                    for (q, gt) in q_correct.iter().zip(filtered_gt) {
+                        let t0 = Instant::now();
+                        let hits = tiers::block_on(
+                            consumer_reader.vector_hits_prepared_global_allow_async(
+                                supertable::VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                exec_vec::search_opts(*width, exec_vec::ENGINE_DEFAULT),
+                                &prepared_allow,
+                            ),
+                        )
+                        .expect("filtered width-sweep query");
+                        wide_lat.push(t0.elapsed());
+                        let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
+                        wide_recalls.push(corpus::recall_at_k(&dense_hits, gt));
+                    }
+                    if !wide_recalls.is_empty() {
+                        let mean: f32 =
+                            wide_recalls.iter().sum::<f32>() / wide_recalls.len() as f32;
+                        wide_lat.sort_unstable();
+                        let p50_ms =
+                            wide_lat[wide_lat.len() / 2].as_secs_f64() * 1e3;
+                        eprintln!(
+                            "[supertable_vector] filtered width-sweep: nprobe={width} \
+                             recall@{TOP_K}={mean:.3} p50={p50_ms:.2}ms"
+                        );
+                    }
+                }
                 if recalls.is_empty() || latencies.is_empty() {
                     eprintln!(
                         "[supertable_vector] filtered recall skipped: no correctness queries"
@@ -3185,6 +3233,13 @@ pub mod vector {
                         "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
                         q_correct.len(),
                         p50_ns / 1e6,
+                    );
+                    assert!(
+                        mean_recall >= FILTERED_RECALL_FLOOR,
+                        "filtered vector recall@{TOP_K} {mean_recall:.3} < floor \
+                         {FILTERED_RECALL_FLOOR:.2} — the allow-set fan regressed (this class \
+                         previously shipped unasserted: the selectivity-blind postings target \
+                         measured 0.722 for weeks as a print-only line)"
                     );
 
                     report.emit(&Section {
