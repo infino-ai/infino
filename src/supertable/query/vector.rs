@@ -136,12 +136,13 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`]). A cell's rank is its best fine
 /// centroid's 1-bit estimate, and every fine inside a kept cell is
 /// rescored exactly — so the window only has to land the exact-best cell
-/// (plus near-tie companions) *somewhere* inside it. 3/16 is the ratio
-/// recall-validated at 1M/10M (48 of 256 cells: post-drain recall matched
-/// the exact-everything scan at 0.995); a fixed 48 under-covers larger
-/// grids (under 5% of 1024 cells), so the window scales with the ranked
-/// population instead.
-const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 3.0 / 16.0;
+/// (plus near-tie companions) *somewhere* inside it. 20% keeps the same
+/// coverage class as the recall-validated 48-of-256 window (post-drain
+/// recall matched the exact-everything scan at 0.995) while scaling with
+/// the ranked population — a fixed 48 under-covers larger grids (under
+/// 5% of 1024 cells). Applies identically to hidden cells and user
+/// commit fragments (one code path).
+const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 0.20;
 
 /// Window floor: below this many ranked cells the prefilter degenerates
 /// to scoring everything — identical to the exact path. Also the
@@ -2689,19 +2690,20 @@ mod tests {
         ));
     }
 
-    /// The admit window scales with the ranked cell population (3/16
-    /// slice) and never narrows below the validated floor: the 256-cell
-    /// shape keeps its measured 48, larger grids widen proportionally,
-    /// and small tables degenerate to exact-everything.
+    /// The admit window scales with the ranked cell population (20%
+    /// slice) and never narrows below the validated floor: small tables
+    /// degenerate to exact-everything, the 256-cell shape widens just
+    /// past its measured 48, and larger grids grow proportionally.
     #[test]
     fn admit_shortlist_window_scales_with_cell_population() {
         assert_eq!(admit_shortlist_window(0), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
-        assert_eq!(admit_shortlist_window(16), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
-        assert_eq!(admit_shortlist_window(256), 48);
-        assert_eq!(admit_shortlist_window(512), 96);
-        assert_eq!(admit_shortlist_window(1024), 192);
+        assert_eq!(admit_shortlist_window(64), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(240), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(256), 52);
+        assert_eq!(admit_shortlist_window(512), 103);
+        assert_eq!(admit_shortlist_window(1024), 205);
         // Ceil, not floor: a fractional slice rounds up.
-        assert_eq!(admit_shortlist_window(257), 49);
+        assert_eq!(admit_shortlist_window(241), 49);
     }
 
     #[test]
