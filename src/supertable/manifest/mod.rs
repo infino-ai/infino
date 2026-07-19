@@ -67,7 +67,8 @@ use crate::{
         vector::{
             distance::{
                 COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
-                distance, dot, nearest_k_centroids_transposed, transpose_centroids_cluster_major,
+                distance, dot, insert_ranked, nearest_k_centroids_transposed,
+                transpose_centroids_cluster_major,
             },
             layout::VectorLayout,
             quant::BitQuantizer,
@@ -2603,49 +2604,94 @@ pub struct CellVectorSummary {
 /// Bits per `u64` word in a packed centroid sign code.
 pub(crate) const ADMIT_CODE_WORD_BITS: usize = 64;
 
-/// Per-query state for the 1-bit admit prefilter: the column's rotation and
-/// sign quantizer, the query's packed sign code, and a cosine lookup table
-/// indexed by Hamming distance (`cos(π·h/dim)` — the standard sign-sketch
-/// angle estimator). Built **once per query** and shared across every
-/// [`ClusterCentroids`] instance — building rotation state per instance
-/// re-rotates the query thousands of times per search (measured ~51 ms of
-/// admit at 1M pre-drain vs ~1 ms with the shared state).
+/// Fraction of ranked cells the 1-bit admit prefilter keeps for exact
+/// fp32 rescoring — shared by the query-side cell window and the
+/// write-side assignment shortlist. 20% keeps the same coverage class as
+/// the recall-validated 48-of-256 query window while scaling with the
+/// population.
+pub(crate) const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 0.20;
+
+/// Minimum meaningful prefilter window, from the recall-validated
+/// 48-of-256 measurement: when the 20% slice comes out narrower than
+/// this, the population is small enough that the exact scan is cheap and
+/// the 1-bit estimate has nothing to buy — the query window floors here
+/// (scoring everything below ~240 cells) and the write-side assignment
+/// shortlist disengages entirely (exact scan).
+pub(crate) const RABITQ_ADMIT_CELL_SHORTLIST_MIN: usize = 48;
+
+/// Shared per-column state for the 1-bit admit prefilter: the column's
+/// rotation, sign quantizer, and the Hamming→cosine lookup table
+/// (`cos(π·h/dim)` — the standard sign-sketch angle estimator). Built
+/// **once per query or per assignment batch** and shared across every
+/// encoded vector — building rotation state per vector re-derives the
+/// rotation thousands of times (measured ~51 ms of admit at 1M pre-drain
+/// vs ~1 ms with shared state; the same waste per row on the write side).
+#[derive(Debug, Clone)]
+pub(crate) struct RabitqAdmitContext {
+    rot_seed: u64,
+    dim: usize,
+    rotation: Arc<RandomRotation>,
+    quant: BitQuantizer,
+    /// `cos(π·h/dim)` for h in `0..=dim`.
+    cos_table: Arc<Vec<f32>>,
+}
+
+impl RabitqAdmitContext {
+    pub(crate) fn new(dim: usize, rot_seed: u64) -> Self {
+        Self {
+            rot_seed,
+            dim,
+            rotation: Arc::new(RandomRotation::new(dim, rot_seed)),
+            quant: BitQuantizer::new(dim),
+            cos_table: Arc::new(
+                (0..=dim)
+                    .map(|h| (PI * h as f32 / dim as f32).cos())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Encode one vector against this context: rotate, sign-pack, and
+    /// carry the norms the metric transforms need. Cheap per call (the
+    /// rotation and cosine table are shared by `Arc`).
+    pub(crate) fn encode(&self, vector: &[f32]) -> RabitqAdmitQuery {
+        debug_assert_eq!(vector.len(), self.dim);
+        let mut rotated = vec![0.0f32; self.dim];
+        self.rotation.apply(vector, &mut rotated);
+        let mut code = vec![0u8; self.quant.code_bytes()];
+        self.quant.encode_rotated_into(&rotated, &mut code);
+        let q_l2sq = dot(vector, vector);
+        RabitqAdmitQuery {
+            rot_seed: self.rot_seed,
+            rotation: Arc::clone(&self.rotation),
+            quant: self.quant.clone(),
+            q_words: pack_code_bytes_to_words(&code),
+            q_norm: q_l2sq.sqrt(),
+            q_l2sq,
+            cos_table: Arc::clone(&self.cos_table),
+        }
+    }
+}
+
+/// One encoded vector's 1-bit admit state: the packed sign code plus the
+/// shared column context (rotation / quantizer / cosine table by `Arc`).
 #[derive(Debug)]
 pub(crate) struct RabitqAdmitQuery {
     rot_seed: u64,
-    rotation: RandomRotation,
+    rotation: Arc<RandomRotation>,
     quant: BitQuantizer,
-    /// Query sign code packed into u64 words (zero-padded past `dim`).
+    /// Sign code packed into u64 words (zero-padded past `dim`).
     q_words: Vec<u64>,
     /// `‖q‖` and `‖q‖²` for the metric transforms.
     q_norm: f32,
     q_l2sq: f32,
     /// `cos(π·h/dim)` for h in `0..=dim`.
-    cos_table: Vec<f32>,
+    cos_table: Arc<Vec<f32>>,
 }
 
 impl RabitqAdmitQuery {
     pub(crate) fn new(dim: usize, rot_seed: u64, query: &[f32]) -> Self {
-        debug_assert_eq!(query.len(), dim);
-        let rotation = RandomRotation::new(dim, rot_seed);
-        let quant = BitQuantizer::new(dim);
-        let mut rotated = vec![0.0f32; dim];
-        rotation.apply(query, &mut rotated);
-        let mut code = vec![0u8; quant.code_bytes()];
-        quant.encode_rotated_into(&rotated, &mut code);
-        let q_l2sq = dot(query, query);
-        let cos_table = (0..=dim)
-            .map(|h| (PI * h as f32 / dim as f32).cos())
-            .collect();
-        Self {
-            rot_seed,
-            rotation,
-            quant,
-            q_words: pack_code_bytes_to_words(&code),
-            q_norm: q_l2sq.sqrt(),
-            q_l2sq,
-            cos_table,
-        }
+        RabitqAdmitContext::new(dim, rot_seed).encode(query)
     }
 }
 
@@ -3026,9 +3072,9 @@ impl ClusterCentroids {
     /// at hydration ([`prewarm_summary_admit_slabs`]) and by
     /// [`Self::strip_centroids_after_slab`] on stripped summaries.
     fn admit_codes(&self, admit: &RabitqAdmitQuery) -> &RabitqAdmitCodes {
-        let cache = self
-            .admit_codes
-            .get_or_init(|| self.build_admit_codes(&admit.rotation, &admit.quant, admit.rot_seed));
+        let cache = self.admit_codes.get_or_init(|| {
+            self.build_admit_codes(admit.rotation.as_ref(), &admit.quant, admit.rot_seed)
+        });
         debug_assert_eq!(
             cache.rot_seed, admit.rot_seed,
             "admit codes built with a different rot_seed"
@@ -3134,6 +3180,42 @@ impl ClusterCentroids {
             best = Some(best.map_or(score, |b: f32| b.min(score)));
         }
         best
+    }
+
+    /// 1-bit prefilter shortlist over this instance's clusters: rank every
+    /// populated cluster by its estimated admit score (same XOR+popcount
+    /// estimator as [`Self::estimate_min_admit_score`]) and return the top
+    /// `window` cluster ids, ascending by estimate. The write-side
+    /// assignment prefilter: exact fp32 scoring then runs only on the
+    /// returned ids, so the final placement is exact within the window.
+    pub(crate) fn admit_shortlist(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+        window: usize,
+    ) -> Vec<(u32, f32)> {
+        debug_assert_eq!(admit.cos_table.len(), self.dim as usize + 1);
+        let cache = self.admit_codes(admit);
+        let w = cache.words_per_code;
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(window.saturating_add(1));
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            let code = &cache.codes[c * w..(c + 1) * w];
+            let h = hamming_words(&admit.q_words, code) as usize;
+            let est_dot = admit.cos_table[h] * admit.q_norm * cache.norms[c];
+            let score = match metric {
+                Metric::Cosine => COSINE_DISTANCE_BASE - est_dot,
+                Metric::NegDot => -est_dot,
+                Metric::L2Sq => {
+                    let c_norm = cache.norms[c];
+                    admit.q_l2sq + c_norm * c_norm - L2_CROSS_TERM_COEFF * est_dot
+                }
+            };
+            insert_ranked(&mut top, window, c as u32, score);
+        }
+        top
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid

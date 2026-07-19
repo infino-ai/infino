@@ -157,7 +157,7 @@ use crate::{
         error::ManifestError,
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids,
+            ClusterCentroids, RabitqAdmitContext,
             commit::get_current_manifest_etag,
             list::{CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy},
             options_hash,
@@ -3042,12 +3042,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
     let store = user_inner.options.store.clone();
     let storage_opt = user_inner.options.storage.clone();
-    let metric = hidden_inner
+    let (metric, drain_rot_seed) = hidden_inner
         .options
         .vector_columns
         .first()
-        .map(|c| c.metric)
-        .unwrap_or(Metric::L2Sq);
+        .map(|c| (c.metric, c.rot_seed))
+        .unwrap_or((Metric::L2Sq, 0));
     // assign-skip: with global-aligned user superfiles (`vector.user_centroids:
     // global`) cluster c == cell c, so group by the row's own cluster ordinal
     // instead of the O(n·n_cent) per-row nearest-cell scoring.
@@ -3385,6 +3385,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
+                    // Shared admit context + 20% shortlist window: the same
+                    // 1-bit prefilter the commit assign uses, so drain
+                    // assignment compute scales with the window too.
+                    let admit_ctx =
+                        RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
+                    let window = opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
                     let assignments: Vec<opann::BoundaryAssignment> =
                         hidden_inner.options.writer_pool.install(|| {
                             distinct_rows
@@ -3394,6 +3400,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                         clusters_ref,
                                         metric,
                                         &row.encoded,
+                                        &admit_ctx,
+                                        window,
                                     )
                                 })
                                 .collect()
@@ -4374,6 +4382,7 @@ fn assign_cells<'a>(
     rows: &[PackRow<'a>],
     clusters: &ClusterCentroids,
     metric: Metric,
+    rot_seed: u64,
     replica_target_factor: f32,
 ) -> Result<Vec<AssignedCellGroup<'a>>, BuildError> {
     if rows.is_empty() {
@@ -4382,13 +4391,17 @@ fn assign_cells<'a>(
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
     // Per-row nearest-cell scoring is the commit CPU wave: run it on the
     // ambient rayon pool (callers wrap this in `writer_pool.install`).
-    // Centroid ranking rides the `ClusterCentroids` cached transposed
-    // layout — built once on the first row, shared across the pool.
+    // One shared admit context per batch (rotation / quantizer / cosine
+    // table); each row is 1-bit shortlisted over the grid and exact-scored
+    // only inside the 20% window, so assignment compute scales with the
+    // window instead of the full cell count.
+    let admit_ctx = RabitqAdmitContext::new(clusters.dim as usize, rot_seed);
+    let window = opann::assignment_shortlist_window(clusters.n_cent as usize);
     let assignments: Vec<opann::BoundaryAssignment> = rows
         .par_iter()
         .map(|row| match *row {
             PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, metric, vector)
+                opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
             }
         })
         .collect();
@@ -4767,7 +4780,7 @@ fn commit_shards_via_drain(
     let assigned = inner
         .options
         .writer_pool
-        .install(|| assign_cells(&rows, clusters, metric, replica_target))?;
+        .install(|| assign_cells(&rows, clusters, metric, vc.rot_seed, replica_target))?;
     let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
@@ -6227,6 +6240,8 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
     /// Small row count that still exercises multiple global cells.
     const COMMIT_AS_DRAIN_TEST_ROWS: usize = 8;
+    /// Rotation seed for assignment admit contexts in these tests.
+    const COMMIT_AS_DRAIN_TEST_ROT_SEED: u64 = 7;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
@@ -7240,8 +7255,14 @@ mod tests {
             .zip(stable_ids)
             .map(|(vector, stable_id)| PackRow::Fp32 { stable_id, vector })
             .collect();
-        let assigned = assign_cells(&rows, &clusters, Metric::L2Sq, BOUNDARY_STUB_TARGET_FACTOR)
-            .expect("assign");
+        let assigned = assign_cells(
+            &rows,
+            &clusters,
+            Metric::L2Sq,
+            COMMIT_AS_DRAIN_TEST_ROT_SEED,
+            BOUNDARY_STUB_TARGET_FACTOR,
+        )
+        .expect("assign");
 
         let postings: usize = assigned.iter().map(|group| group.members.len()).sum();
         let primaries: usize = assigned

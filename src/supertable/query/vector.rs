@@ -102,7 +102,9 @@ use crate::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::{
-            ManifestSnapshot, RabitqAdmitQuery, SuperfileEntry, SuperfileUri, VectorSummary,
+            ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
+            VectorSummary,
             list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
@@ -131,24 +133,24 @@ test_visible! {
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
 
-/// Fraction of the ranked tagged cells the 1-bit admit prefilter keeps
-/// for exact fp32 rescoring (floored by
-/// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`]). A cell's rank is its best fine
-/// centroid's 1-bit estimate, and every fine inside a kept cell is
-/// rescored exactly — so the window only has to land the exact-best cell
-/// (plus near-tie companions) *somewhere* inside it. 20% keeps the same
-/// coverage class as the recall-validated 48-of-256 window (post-drain
-/// recall matched the exact-everything scan at 0.995) while scaling with
-/// the ranked population — a fixed 48 under-covers larger grids (under
-/// 5% of 1024 cells). Applies identically to hidden cells and user
-/// commit fragments (one code path).
-const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 0.20;
+// The admit window keeps the shared
+// `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
+// ranked tagged cells for exact fp32 rescoring, floored by
+// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`]. A cell's rank is its best fine
+// centroid's 1-bit estimate, and every fine inside a kept cell is
+// rescored exactly — so the window only has to land the exact-best cell
+// (plus near-tie companions) *somewhere* inside it. 20% keeps the same
+// coverage class as the recall-validated 48-of-256 window (post-drain
+// recall matched the exact-everything scan at 0.995) while scaling with
+// the ranked population — a fixed 48 under-covers larger grids (under
+// 5% of 1024 cells). Applies identically to hidden cells and user
+// commit fragments (one code path).
 
-/// Window floor: below this many ranked cells the prefilter degenerates
-/// to scoring everything — identical to the exact path. Also the
-/// validated absolute window at the 256-cell shapes, so small tables
-/// never see a narrower window than the measured one.
-const RABITQ_ADMIT_CELL_SHORTLIST_MIN: usize = 48;
+// The window floor is the shared
+// `manifest::RABITQ_ADMIT_CELL_SHORTLIST_MIN` (48): below it the
+// prefilter degenerates to scoring everything — identical to the exact
+// path — and it is the validated absolute window at the 256-cell shapes,
+// so small tables never see a narrower window than the measured one.
 
 /// Minimum fine-ranked picks in the union cell selection used by the
 /// non-default paths (filtered search, explicit caller nprobe). The fine

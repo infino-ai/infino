@@ -32,7 +32,10 @@ use crate::{
         },
         distance::{Metric, distance, nearest_k_centroids_transposed, relative_score_window},
     },
-    supertable::manifest::ClusterCentroids,
+    supertable::manifest::{
+        ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
+        RabitqAdmitContext,
+    },
 };
 
 /// Overflow threshold for cell split (OPANN step 7). Sourced from
@@ -146,14 +149,29 @@ fn boundary_margin(
     }
 }
 
-/// Drain-side boundary assignment: decode the Sq8+ε row once, then rank
-/// centroids through the shared blocked-SIMD kernel over the
-/// [`ClusterCentroids`] transposed cache. Same assignment semantics as
-/// `nearest-two by score then Voronoi margin`.
+/// Assignment shortlist width for `n_cells` grid cells: the shared 1-bit
+/// admit fraction of the grid with the shared meaningful-window floor,
+/// capped at the grid. Below the floor the window covers every cell and
+/// [`boundary_assignment_fp32`] takes its exact-scan arm — small grids
+/// (and small-dim tests, where a short sign sketch is noise) keep the
+/// exact assignment they always had; the prefilter engages only where it
+/// pays (measured shapes: 103 of 512, 205 of 1024).
+pub(crate) fn assignment_shortlist_window(n_cells: usize) -> usize {
+    let scaled = (n_cells as f64 * RABITQ_ADMIT_CELL_SHORTLIST_FRACTION).ceil() as usize;
+    scaled
+        .max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
+        .min(n_cells.max(1))
+}
+
+/// Drain-side boundary assignment: decode the Sq8+ε row once, then assign
+/// through the shared 1-bit shortlist + exact rescore. Same assignment
+/// semantics as `nearest-two by score then Voronoi margin`.
 pub(crate) fn boundary_assignment_encoded(
     clusters: &ClusterCentroids,
     metric: Metric,
     row: &EncodedCellRow,
+    admit_ctx: &RabitqAdmitContext,
+    window: usize,
 ) -> BoundaryAssignment {
     let dim = clusters.dim as usize;
     let mut row_fp = vec![0f32; dim];
@@ -167,37 +185,58 @@ pub(crate) fn boundary_assignment_encoded(
             .expect("encoded row uses residual-family codec"),
         &mut row_fp,
     );
-    boundary_assignment_decoded(clusters, metric, &row_fp)
+    boundary_assignment_fp32(clusters, metric, &row_fp, admit_ctx, window)
 }
 
-/// Boundary assignment for an already-decoded fp32 row (commit buffer path).
-/// Same nearest-two + margin logic as the encoded drain wrapper.
+/// Boundary assignment for an fp32 row (commit buffer path and the drain's
+/// decoded rows): 1-bit admit shortlist over the grid (XOR+popcount, the
+/// same estimator the query-side prefilter uses), exact fp32 rescore of
+/// the shortlisted cells only, then the nearest-two + Voronoi-margin
+/// closure on the exact scores. Placement is exact within the window;
+/// per-row cost scales with `window` (20% of cells) instead of the grid.
 pub(crate) fn boundary_assignment_fp32(
     clusters: &ClusterCentroids,
     metric: Metric,
     row_fp: &[f32],
-) -> BoundaryAssignment {
-    boundary_assignment_decoded(clusters, metric, row_fp)
-}
-
-fn boundary_assignment_decoded(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    row_fp: &[f32],
+    admit_ctx: &RabitqAdmitContext,
+    window: usize,
 ) -> BoundaryAssignment {
     let n_cent = clusters.n_cent as usize;
     let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
-    // One centroid-scan owner: the blocked SIMD kernel over the struct's
-    // cached transposed layout. No scalar fallback path.
-    let ranked: Vec<(u32, f32)> = nearest_k_centroids_transposed(
-        metric,
-        row_fp,
-        clusters.transposed(),
-        n_cent,
-        clusters.dim as usize,
-        None,
-        top_k,
-    );
+    let ranked: Vec<(u32, f32)> = if window >= n_cent {
+        // Window covers the grid: the exact blocked-SIMD scan is cheaper
+        // than encode + estimate + rescore.
+        nearest_k_centroids_transposed(
+            metric,
+            row_fp,
+            clusters.transposed(),
+            n_cent,
+            clusters.dim as usize,
+            None,
+            top_k,
+        )
+    } else {
+        let admit = admit_ctx.encode(row_fp);
+        let mut exact: Vec<(u32, f32)> = clusters
+            .admit_shortlist(metric, &admit, window)
+            .into_iter()
+            .map(|(cell, _)| (cell, clusters.score_one(metric, cell as usize, row_fp)))
+            .collect();
+        exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        exact.truncate(top_k);
+        exact
+    };
+    boundary_from_ranked(clusters, metric, &ranked)
+}
+
+/// Shared closure tail: primary = best-ranked cell; replicas = ranked
+/// cells within the closure distance ratio, carrying their margin to the
+/// shared Voronoi boundary.
+fn boundary_from_ranked(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    ranked: &[(u32, f32)],
+) -> BoundaryAssignment {
     let mut replicas = [None; REPLICA_CLOSURE_MAX_REPLICAS];
     let Some(&(primary, primary_score)) = ranked.first() else {
         return BoundaryAssignment {
@@ -480,9 +519,14 @@ mod tests {
             .collect()
     }
 
+    /// Rotation seed for the assignment-test admit contexts.
+    const TEST_ROT_SEED: u64 = 7;
+
     /// Closure replication: a row equidistant-ish to several cells collects a
     /// replica candidate for every cell inside the distance-ratio window
     /// (ordered nearest-first), and a row deep inside its cell collects none.
+    /// (4 cells ⇒ the shortlist window covers the grid, so this exercises the
+    /// exact-scan arm.)
     #[test]
     fn boundary_assignment_closure_matches_distance_ratio() {
         let dim = 4usize;
@@ -492,12 +536,14 @@ mod tests {
             fp32.extend(std::iter::repeat_n(base, dim));
         }
         let clusters = ClusterCentroids::from_fp32(4, dim as u32, &fp32, vec![1; 4]);
+        let ctx = RabitqAdmitContext::new(dim, TEST_ROT_SEED);
+        let window = assignment_shortlist_window(4);
 
         // Row at 0.9: distances (L2Sq per dim) to cells 0/1/2 are 0.81, 0.01,
         // 1.21 (per-dim) — cell 1 is primary; cell 0 and 2 are far outside a
         // 1.2 ratio window of 0.01. No replicas.
         let deep = vec![0.9f32; dim];
-        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &deep);
+        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &deep, &ctx, window);
         assert_eq!(assignment.primary, 1);
         assert_eq!(assignment.replicas, [None; REPLICA_CLOSURE_MAX_REPLICAS]);
 
@@ -507,7 +553,7 @@ mod tests {
         // per dim is outside 1.2 × 0.25. Expect primary = 1 (tie broken by
         // lower id) and exactly one replica: cell 2.
         let boundary = vec![1.5f32; dim];
-        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &boundary);
+        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &boundary, &ctx, window);
         assert_eq!(assignment.primary, 1);
         assert_eq!(assignment.replicas[0].map(|(cell, _)| cell), Some(2));
         assert_eq!(assignment.replicas[1], None);
@@ -516,6 +562,74 @@ mod tests {
             margin.is_finite() && margin >= 0.0,
             "boundary margin must be a finite non-negative distance, got {margin}"
         );
+    }
+
+    /// The shortlist window is the shared 20% fraction with the shared 48
+    /// floor, capped at the grid: at or under the floor the window covers
+    /// every cell (exact assignment), past it the 20% slice scales.
+    #[test]
+    fn assignment_shortlist_window_scales_with_grid() {
+        // At or under the floor: the whole grid (exact-scan arm).
+        assert_eq!(assignment_shortlist_window(1), 1);
+        assert_eq!(assignment_shortlist_window(16), 16);
+        assert_eq!(assignment_shortlist_window(48), 48);
+        // Floor binds until 20% overtakes it at 240 cells.
+        assert_eq!(
+            assignment_shortlist_window(64),
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN
+        );
+        assert_eq!(
+            assignment_shortlist_window(240),
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN
+        );
+        // Plain 20% past the floor.
+        assert_eq!(assignment_shortlist_window(256), 52);
+        assert_eq!(assignment_shortlist_window(512), 103);
+        assert_eq!(assignment_shortlist_window(1024), 205);
+    }
+
+    /// The 1-bit shortlisted assignment must agree with the exact scan on
+    /// rows that clearly belong to a cell — the regime every committed row
+    /// is in. Planted well-separated centroids, rows jittered around them;
+    /// primaries must match the exact path cell-for-cell. The grid sits
+    /// past the shared floor so the shortlist arm actually engages.
+    #[test]
+    fn shortlisted_assignment_matches_exact_on_planted_cells() {
+        let dim = 64usize;
+        let n_cells = 300usize;
+        let mut fp32 = vec![0.0f32; n_cells * dim];
+        for (c, chunk) in fp32.chunks_mut(dim).enumerate() {
+            // Distinct direction per cell: two active axes with distinct
+            // magnitudes keep centroids well separated.
+            chunk[c % dim] = 4.0 + (c / dim) as f32;
+            chunk[(c * 7 + 3) % dim] = 2.0;
+        }
+        let clusters =
+            ClusterCentroids::from_fp32(n_cells as u32, dim as u32, &fp32, vec![1; n_cells]);
+        let ctx = RabitqAdmitContext::new(dim, TEST_ROT_SEED);
+        let window = assignment_shortlist_window(n_cells);
+        assert!(window < n_cells, "test must exercise the shortlist arm");
+
+        let mut state = 0x9e37_79b9_97f4_a7c5u64;
+        let mut jitter = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) % 1000) as f32 / 1000.0 * 0.2 - 0.1
+        };
+        for c in 0..n_cells {
+            let mut row = fp32[c * dim..(c + 1) * dim].to_vec();
+            for v in row.iter_mut() {
+                *v += jitter();
+            }
+            let shortlisted = boundary_assignment_fp32(&clusters, Metric::L2Sq, &row, &ctx, window);
+            let exact = boundary_assignment_fp32(&clusters, Metric::L2Sq, &row, &ctx, n_cells);
+            assert_eq!(
+                shortlisted.primary, exact.primary,
+                "cell {c}: shortlisted primary diverged from exact"
+            );
+            assert_eq!(shortlisted.primary, c as u32, "cell {c}: wrong placement");
+        }
     }
 
     #[test]
