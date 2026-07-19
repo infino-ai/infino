@@ -1204,35 +1204,36 @@ pub mod vector {
     /// pre-routing search path.
     const RUN_CALIBRATION_GRID: bool = false;
 
-    /// Regression gates on the post-drain first cold query's hidden-data
-    /// GET fan (the "hidden code fetch"): with the pinned <20M grid shape
-    /// (512 user / 256 hidden cells) the probe served one cell in 1 GET at
-    /// 1M and 2 GETs at 10M. Ceilings by scale — runs under
-    /// [`HIDDEN_COLD_GET_SMALL_MAX_DOCS`] must not exceed
-    /// [`HIDDEN_COLD_GET_CEILING_SMALL`]; runs under
-    /// [`HIDDEN_COLD_GET_MID_MAX_DOCS`] must not exceed
-    /// [`HIDDEN_COLD_GET_CEILING_MID`]. At and above 20M the grid shape is
-    /// still being calibrated, so no ceiling applies yet. Scoped to the
-    /// post-drain state: post-compact currently reads one extra GET at 10M
-    /// (the merge changes the fine-run layout) and gets its own gate once
-    /// that's tightened.
-    const HIDDEN_COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
-    /// Hidden-data GET ceiling for the post-drain first cold query, <5M docs.
-    const HIDDEN_COLD_GET_CEILING_SMALL: u64 = 1;
-    /// Upper doc bound for the mid-scale ceiling (exclusive).
-    const HIDDEN_COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
-    /// Hidden-data GET ceiling for the post-drain first cold query, 5M–20M docs.
-    const HIDDEN_COLD_GET_CEILING_MID: u64 = 2;
-    /// The routing-state label the hidden cold-GET ceiling applies to.
-    const HIDDEN_COLD_GET_GATED_STATE: &str = "post-drain";
+    /// Regression gates on the first cold query's **data** GET fan (user +
+    /// hidden classes together), by routing state and scale tier, with the
+    /// pinned <20M grid shape (512 user / 256 hidden cells). Measured on
+    /// the interleaved layout with geometric fine ordering: post-drain
+    /// 1 GET at 1M / 2 at 10M; post-delta 2 (1 user + 1 hidden) at 1M /
+    /// 3 at 10M; post-compact 1 at 1M / 3 at 10M (the merge currently
+    /// costs one extra GET at 10M vs post-drain). At and above
+    /// [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being calibrated,
+    /// so no ceiling applies yet.
+    const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+    /// Upper doc bound for the mid-scale ceilings (exclusive).
+    const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
+    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on first-cold-query
+    /// data GETs.
+    const COLD_GET_CEILINGS: &[(&str, u64, u64)] = &[
+        ("post-drain", 1, 2),
+        ("post-delta", 2, 3),
+        ("post-compact", 1, 3),
+    ];
 
-    /// Ceiling on the post-drain first cold query's hidden-data GETs for
-    /// `n_docs`, when one applies at this scale.
-    fn hidden_cold_get_ceiling(n_docs: usize) -> Option<u64> {
-        if n_docs < HIDDEN_COLD_GET_SMALL_MAX_DOCS {
-            Some(HIDDEN_COLD_GET_CEILING_SMALL)
-        } else if n_docs < HIDDEN_COLD_GET_MID_MAX_DOCS {
-            Some(HIDDEN_COLD_GET_CEILING_MID)
+    /// Ceiling on `label`'s first cold query data GETs for `n_docs`, when
+    /// one applies to that state at this scale.
+    fn cold_data_get_ceiling(label: &str, n_docs: usize) -> Option<u64> {
+        let (_, small, mid) = COLD_GET_CEILINGS
+            .iter()
+            .find(|(state, _, _)| *state == label)?;
+        if n_docs < COLD_GET_SMALL_MAX_DOCS {
+            Some(*small)
+        } else if n_docs < COLD_GET_MID_MAX_DOCS {
+            Some(*mid)
         } else {
             None
         }
@@ -1400,16 +1401,16 @@ pub mod vector {
             valid,
             "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
         );
-        // Lock in the cold-probe gains: the post-drain hidden fetch must
-        // stay within the per-scale GET ceiling (see
-        // `hidden_cold_get_ceiling`).
-        if label == HIDDEN_COLD_GET_GATED_STATE
-            && let Some(ceiling) = hidden_cold_get_ceiling(n_docs)
-        {
+        // Lock in the cold-probe gains: each gated state's total data fetch
+        // (user + hidden GETs) must stay within its per-scale ceiling (see
+        // `cold_data_get_ceiling`).
+        if let Some(ceiling) = cold_data_get_ceiling(label, n_docs) {
+            let total = user_data + hidden_data;
             assert!(
-                hidden_data <= ceiling,
-                "{label}: hidden-data cold fetch regressed — {hidden_data} GETs on the first \
-                 cold query, ceiling {ceiling} at {n_docs} docs (1 GET <5M, 2 GETs 5M-20M)"
+                total <= ceiling,
+                "{label}: cold data fetch regressed — {total} GETs ({user_data} user + \
+                 {hidden_data} hidden) on the first cold query, ceiling {ceiling} at {n_docs} \
+                 docs (post-drain 1/2, post-delta 2/3, post-compact 1/3 for <5M / 5M-20M)"
             );
         }
     }
