@@ -153,32 +153,34 @@ pub mod vec {
     /// `(global_cell_id, subsection_off, subsection_len)`.
     pub const VERSION_MULTI_CELL: u32 = 2;
 
-    /// subsection layout version stamped at
-    /// bytes [8..12] of each per-column sub-header.
+    /// Subsection layout version stamped at bytes [8..12] of each
+    /// per-column sub-header. Only this version is accepted on read; a
+    /// superfile stamped with any other value is rejected as malformed
+    /// rather than carrying an alternate parse path. (The bump from the
+    /// pre-launch interleaved layout exists so stale blobs fail loudly
+    /// instead of misparsing — there is deliberately no fallback parser.)
     ///
-    /// On-disk shape:
+    /// On-disk shape: every cluster's `[codes][doc_ids]` prefix packed
+    /// consecutively, then every cluster's `full` rerank rows packed
+    /// consecutively in the same cluster order:
     ///
     /// ```text
     /// [sub_header][summary_centroid][centroids][cluster_idx]
-    ///   [codec_meta]                              ← open-time region
-    ///   [per-cluster blocks: each = codes_chunk + doc_ids_chunk]
-    ///   [full]                                    ← rerank column
+    ///   [codec_meta][stable_ids?]                 ← open-time region
+    ///   [prefix region: per cluster, codes + doc_ids]
+    ///   [payload region: per cluster, full rows]  ← rerank column
     ///   [crc]
     /// ```
     ///
-    /// Two wins land together because they ride on the same
-    /// layout (no version skew to manage):
-    ///
-    /// 1. **Open-time region contiguous** at the head of the
-    ///    subsection. One range fetch covers everything search
-    ///    needs before picking a cluster (~1.5 MB at 1M × 384
-    ///    sq8, ~16 MB at 10M × 1024 sq8).
-    /// 2. **Per-cluster `codes + doc_ids` interleave.** One range
-    ///    fetch per probed cluster covers both. Each block is
-    ///    `count[c] * (code_bytes + 4)` bytes; the existing
-    ///    `cluster_index[c] = (doc_off, count)` is enough to
-    ///    address it (block byte offset =
-    ///    `doc_off * (code_bytes + 4)`).
+    /// Why the split: a probe touches a handful of clusters whose file
+    /// positions under an interleaved per-cluster layout depend on
+    /// k-means output order — run-to-run chaotic — so the cold fetch
+    /// fanned into 2–5 range GETs on layout luck (measured at 10M). With
+    /// the prefixes packed dense, the probed clusters' code+id chunks
+    /// sit inside one small contiguous region (`n_docs × (code_bytes +
+    /// 4)` bytes per cell) and coalesce into one range by construction;
+    /// the rerank payload is fetched as a second bounded range. Cold
+    /// probe cost stops depending on cluster order.
     ///
     /// Sub-header byte layout (56 bytes):
     ///
@@ -197,15 +199,15 @@ pub mod vec {
     /// Derived offsets (computed by the reader at open):
     /// - `codec_meta_off = cluster_idx_off + n_cent * 8`
     ///   when `codec_meta_size > 0`, else unused.
-    /// - `full_off = per_cluster_blocks_off + n_docs * (code_bytes + 4)`.
-    /// - per-cluster block at byte offset
+    /// - `payload_off = per_cluster_blocks_off + n_docs * (code_bytes + 4)`.
+    /// - cluster `c` prefix at
     ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
-    ///   block size `count[c] * (code_bytes + 4)`.
-    ///
-    /// Only this version is accepted on read; a superfile stamped
-    /// with any other value at this slot is rejected as malformed
-    /// rather than carrying an alternate parse path.
-    pub const SUBSECTION_VERSION: u32 = 2;
+    ///   length `count[c] * (code_bytes + 4)`.
+    /// - cluster `c` payload at `payload_off + doc_off[c] * per_vec`,
+    ///   length `count[c] * per_vec`.
+    /// - `n_docs` from the trailing region size: prefixes + payloads
+    ///   total `n_docs × (code_bytes + 4 + per_vec)` bytes.
+    pub const SUBSECTION_VERSION: u32 = 3;
 
     /// Width of a little-endian `u32` field in the vector blob.
     pub const U32_BYTES: usize = 4;

@@ -18,8 +18,8 @@ use crate::superfile::{
         CRC_BYTES,
         checksum::crc32c,
         vec::{
-            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
-            U64_BYTES, sub_hdr,
+            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE,
+            SUBSECTION_VERSION, U32_BYTES, U64_BYTES, sub_hdr,
         },
     },
     vector::{
@@ -69,7 +69,6 @@ pub(crate) struct Sq8IvfMergeInput {
     pub per_cluster_blocks_off: usize,
     pub code_bytes: usize,
     pub per_vec_bytes: usize,
-    pub stride: usize,
     pub scale: Vec<f32>,
     pub offset: Vec<f32>,
     /// Inline stable-`_id`s for this input, indexed by its local doc id, when
@@ -77,6 +76,23 @@ pub(crate) struct Sq8IvfMergeInput {
     /// `None` for region-less sources (streaming/incoming). The merge produces a
     /// merged region only when every input has one.
     pub stable_ids: Option<Vec<i128>>,
+}
+
+impl Sq8IvfMergeInput {
+    /// Byte offset of cluster `doc_off`'s `[codes][doc_ids]` prefix in
+    /// this input's subsection (split layout: prefixes pack dense).
+    fn prefix_at(&self, doc_off: usize) -> usize {
+        self.per_cluster_blocks_off + doc_off * (self.code_bytes + DOC_ID_BYTES)
+    }
+
+    /// Byte offset of cluster `doc_off`'s `full[]` rerank rows: the
+    /// payload region starts after every prefix and strides by
+    /// `per_vec_bytes`.
+    fn full_at(&self, doc_off: usize) -> usize {
+        self.per_cluster_blocks_off
+            + (self.n_docs as usize) * (self.code_bytes + DOC_ID_BYTES)
+            + doc_off * self.per_vec_bytes
+    }
 }
 
 /// Output of a byte-splice merge, ready for [`super::builder::VectorBuilder::set_prebuilt_subsection`].
@@ -284,9 +300,9 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                 }
                 let src_scale = &inp.scale[centroid_id * dim..centroid_id * dim + dim];
                 let src_offset = &inp.offset[centroid_id * dim..centroid_id * dim + dim];
-                let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
+                let block = inp.prefix_at(doc_off);
                 let doc_ids_at = block + count * inp.code_bytes;
-                let full_at = block + count * (inp.code_bytes + id_bytes);
+                let full_at = inp.full_at(doc_off);
 
                 for i in 0..count {
                     bytes[blk.codes_base + out_i * code_bytes
@@ -521,9 +537,9 @@ pub(crate) fn splice_fragments_into_cell(
             let scale_c = &dst_scale[centroid_id * dim..centroid_id * dim + dim];
             let offset_c = &dst_offset[centroid_id * dim..centroid_id * dim + dim];
             let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, src_cluster);
-            let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
+            let block = inp.prefix_at(doc_off);
             let doc_ids_at = block + count * inp.code_bytes;
-            let full_at = block + count * (inp.code_bytes + id_bytes);
+            let full_at = inp.full_at(doc_off);
             for i in 0..count {
                 let out_row = blk.first_row + i; // fresh global local doc id
                 bytes[blk.codes_base + i * code_bytes..blk.codes_base + (i + 1) * code_bytes]
@@ -724,6 +740,17 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
             "subsection too short for fragment merge".into(),
         ));
     }
+    let version = u32::from_le_bytes(
+        sub[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
+            .try_into()
+            .expect("4-byte version"),
+    );
+    if version != SUBSECTION_VERSION {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "fragment merge input has subsection layout version {version}; \
+             this build supports only {SUBSECTION_VERSION}"
+        )));
+    }
     let centroids_off = u64::from_le_bytes(
         sub[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
             .try_into()
@@ -774,7 +801,6 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
         per_cluster_blocks_off,
         code_bytes,
         per_vec_bytes,
-        stride: code_bytes + DOC_ID_BYTES + per_vec_bytes,
         scale,
         offset,
         stable_ids,
@@ -989,7 +1015,7 @@ mod tests {
                 (count > 0).then_some((cluster, doc_off, count))
             })
             .expect("fixture has a populated cluster");
-        let block = input.per_cluster_blocks_off + doc_off * input.stride;
+        let block = input.per_cluster_blocks_off + doc_off * (input.code_bytes + DOC_ID_BYTES);
         let first_doc_id = block + count * input.code_bytes;
         input.sub[first_doc_id..first_doc_id + DOC_ID_BYTES]
             .copy_from_slice(&(ROWS as u32).to_le_bytes());
