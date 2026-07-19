@@ -144,7 +144,10 @@ pub mod fts {
             ColdTiming, fts as exec_fts,
             fts::{FTS_BATTERY, FtsRead},
         },
-        harness::{EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, run_fts_with_index},
+        harness::{
+            BuildStat, EngineFtsResult, InfinoFtsEngine, InfinoFtsIndex, PhaseStats,
+            build_positionless, parallel_build_positionless, run_fts_with_index,
+        },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
         report::{Better, Block, Cell, Report, Section, context, metric, text},
         rss::{self, RssStats},
@@ -452,10 +455,13 @@ pub mod fts {
         let mut report = Report::load("superfile_fts");
 
         if phases.build {
+            let (default_builds, default_stored) = measure_default_config_builds(&corpus);
             emit_build(
                 &mut report,
                 n_docs,
                 &corpus,
+                &default_builds,
+                default_stored,
                 &result,
                 index.bytes().len() as u64,
             );
@@ -674,6 +680,45 @@ pub mod fts {
         (corpus, result, index)
     }
 
+    /// Timed build-only runs at the default FTS config
+    /// (`positions: false`) — what a table gets unless it opts in. The
+    /// driver's builds above measure the positional config the query
+    /// battery needs (phrase rows); these rows keep the default build
+    /// path measured and comparable with its own history. Returns the
+    /// per-writer-count stats and the 1-writer artifact's stored size.
+    fn measure_default_config_builds(corpus: &MmapTextCorpus) -> (Vec<BuildStat>, u64) {
+        let docs = corpus.rows();
+        eprintln!("[superfile_fts] default-config (positionless) build probes...");
+        let sampler = rss::PeakSampler::start_default();
+        let t0 = Instant::now();
+        let bytes = build_positionless(FTS_COLUMN, &docs);
+        let wall = t0.elapsed();
+        let rss_stats = sampler.stop_stats();
+        let default_stored = bytes.len() as u64;
+        drop(bytes);
+        let mut builds = vec![BuildStat {
+            writers: 1,
+            phase: PhaseStats {
+                wall,
+                rss: rss_stats,
+            },
+        }];
+        let writers = corpus::parallel_writers();
+        if writers > 1 {
+            let sampler = rss::PeakSampler::start_default();
+            let t0 = Instant::now();
+            parallel_build_positionless(FTS_COLUMN, &docs, writers);
+            builds.push(BuildStat {
+                writers,
+                phase: PhaseStats {
+                    wall: t0.elapsed(),
+                    rss: sampler.stop_stats(),
+                },
+            });
+        }
+        (builds, default_stored)
+    }
+
     fn assert_correct(index: &InfinoFtsIndex, n_docs: usize) {
         eprintln!(
             "[superfile_fts] correctness check: self-consistency + BMW==brute-force on measured artifact..."
@@ -838,14 +883,19 @@ pub mod fts {
         report: &mut Report,
         n_docs: usize,
         corpus: &MmapTextCorpus,
-        result: &EngineFtsResult,
-        stored_bytes: u64,
+        default_builds: &[BuildStat],
+        default_stored: u64,
+        positional: &EngineFtsResult,
+        positional_stored: u64,
     ) {
         // Logical input payload: total corpus text bytes, identical across
         // every writer count (the parallel build shards the same corpus).
         let corpus_bytes = corpus.total_bytes();
-        let rows: Vec<Vec<Cell>> = result
-            .builds
+        // Default-config rows first (the historical `1 writer` /
+        // `N writers` labels keep measuring the positionless build),
+        // then the positional opt-in rows the query battery's
+        // artifact is built with.
+        let mut rows: Vec<Vec<Cell>> = default_builds
             .iter()
             .map(|b| {
                 ingest_row(
@@ -854,10 +904,20 @@ pub mod fts {
                     b.phase.wall,
                     b.phase.rss,
                     corpus_bytes,
-                    stored_bytes,
+                    default_stored,
                 )
             })
             .collect();
+        rows.extend(positional.builds.iter().map(|b| {
+            ingest_row(
+                &format!("{} (positions)", writer_label(b.writers)),
+                n_docs,
+                b.phase.wall,
+                b.phase.rss,
+                corpus_bytes,
+                positional_stored,
+            )
+        }));
         let block = Block {
             subtitle: String::new(),
             headers: super::ingest_headers(),
@@ -871,9 +931,12 @@ pub mod fts {
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
                    commit), through the engine-generic `run_fts` driver the cross-engine comparison also \
-                   uses. Rows are by writer count: `1 writer` is the single-threaded build (and the index \
-                   queries run against); `N writers` is the sharded parallel build. Bandwidth is over the \
-                   logical input text payload. Δ is vs the previous run."
+                   uses. Rows are by writer count and FTS config: `1 writer` / `N writers` measure the \
+                   default config (no token positions); the `(positions)` rows measure the per-column \
+                   positional opt-in, and the 1-writer positional artifact is the index the queries run \
+                   against (the warm battery includes phrase queries, which need positions). `N writers` \
+                   is the sharded parallel build. Bandwidth is over the logical input text payload. Δ is \
+                   vs the previous run."
                 .into(),
             blocks: vec![block],
         });

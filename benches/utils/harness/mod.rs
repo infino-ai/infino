@@ -31,7 +31,9 @@ pub mod vector_driver;
 pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
-pub use infino_engine::{InfinoFtsEngine, InfinoFtsIndex};
+pub use infino_engine::{
+    InfinoFtsEngine, InfinoFtsIndex, build_positionless, parallel_build_positionless,
+};
 pub use infino_sql_engine::{
     InfinoSqlEngine, InfinoSqlIndex, build_supertable_with_options, emb_for, sample_query_csv,
     scatter_key, sql_options, sql_schema,
