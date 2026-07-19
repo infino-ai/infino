@@ -1329,20 +1329,31 @@ fn splitmix64(mut x: u64) -> u64 {
 /// column `rot_seed`.
 const SAMPLE_JITTER_SEED_XOR: u64 = 0xa5a5_5a5a_c3c3_3c3c;
 
-/// Jittered training-sample index: sample `s` of `sample_size` picks a
-/// deterministic pseudo-random row inside its stride bucket
-/// `[s·n/sample, (s+1)·n/sample)` (identity when the sample covers the
-/// whole corpus). Buckets are disjoint, so indices stay strictly
+/// Training-sample index: sample `s` of `sample_size` maps to a row in its
+/// stride bucket `[s·n/sample, (s+1)·n/sample)` (identity when the sample
+/// covers the corpus). Buckets are disjoint, so indices stay strictly
 /// increasing — the streaming spill reader consumes them in one pass.
 ///
-/// The jitter is load-bearing, not cosmetic: a plain stride aliases with
-/// periodic arrival order. Measured at 100M (row-fraction sample = n/4,
-/// an exact stride of 4, over a corpus whose rows cycle planted clusters
-/// round-robin): entire blobs were never sampled, k-means trained no
-/// centroid near them, and each invisible blob collapsed onto its nearest
-/// trained centroid at scatter — 92K-row mega-runs the oversized-run
-/// split cannot see (the sink centroid looks normal-sized in the sample),
-/// a flat 0.13 fine-coverage curve, and post-drain recall 0.136. One
+/// Consolidated cells (past [`CONSOLIDATED_CELL_ROWS_THRESHOLD`], where
+/// the row-fraction sample makes the stride an exact integer) pick a
+/// seeded pseudo-random row inside the bucket instead of its first row.
+/// That jitter is load-bearing: a plain integer stride aliases with
+/// periodic arrival order. Measured at 100M (n/4 sample = exact stride 4,
+/// corpus cycling planted clusters round-robin): entire blobs were never
+/// sampled, k-means trained no centroid near them, and each invisible
+/// blob collapsed onto its nearest trained centroid at scatter — 92K-row
+/// mega-runs the oversized-run split cannot see (the sink centroid looks
+/// normal-sized in the sample), a flat 0.13 fine-coverage curve, and
+/// post-drain recall 0.136.
+///
+/// At or below the threshold the plain stride ships unchanged: those
+/// samples are points-per-centroid sized (non-integer stride, no aliasing
+/// measured) and the 1M/10M cold-probe gates were measured on exactly
+/// that layout — jittering them re-rolled chain adjacency and moved the
+/// 10M post-drain probe from 2 GETs / 7.5 MiB to 4 / 17.5 (gate-caught).
+/// Known sliver: cells between the sample-boost threshold (65,536) and
+/// this one keep the baseline's near-integer stride, tolerated because
+/// the measured-good 10M layout includes its 65,918-row cell. One
 /// definition shared by every cell-pack training sampler, so the spilled
 /// / in-RAM / fp32 feeders train fine centroids on the same rows.
 #[inline]
@@ -1351,6 +1362,9 @@ fn sampled_index(s: usize, sample_size: usize, n_docs: usize, seed: u64) -> usiz
         return s;
     }
     let base = s * n_docs / sample_size;
+    if n_docs <= CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        return base;
+    }
     let next = ((s + 1) * n_docs / sample_size).min(n_docs);
     let width = next.saturating_sub(base).max(1) as u64;
     let jitter = splitmix64(seed ^ SAMPLE_JITTER_SEED_XOR ^ (s as u64)) % width;
@@ -3541,17 +3555,19 @@ mod tests {
         );
     }
 
-    /// The training sampler must not phase-lock to periodic arrival order.
-    /// With a corpus whose rows cycle 4 classes round-robin and a sample of
-    /// exactly n/4 (the 100M row-fraction shape, integer stride 4), a plain
-    /// stride samples one class only and the other three train no centroid
-    /// — measured at 100M as 92K-row mega-runs and post-drain recall 0.136.
-    /// The jittered indices must cover every class, stay strictly
-    /// increasing (the spill reader streams them in one pass), stay in
-    /// bounds, and be deterministic per seed.
+    /// The consolidated-cell training sampler must not phase-lock to
+    /// periodic arrival order. With a corpus whose rows cycle 4 classes
+    /// round-robin and a sample of exactly n/4 (the 100M row-fraction
+    /// shape, integer stride 4), a plain stride samples one class only and
+    /// the other three train no centroid — measured at 100M as 92K-row
+    /// mega-runs and post-drain recall 0.136. The jittered indices must
+    /// cover every class, stay strictly increasing (the spill reader
+    /// streams them in one pass), stay in bounds, and be deterministic per
+    /// seed. At or below the consolidated threshold the plain stride ships
+    /// unchanged — the 1M/10M cold-probe gates were measured on it.
     #[test]
-    fn sampled_index_breaks_periodic_aliasing() {
-        let n_docs = 4096usize;
+    fn sampled_index_breaks_periodic_aliasing_on_consolidated_cells() {
+        let n_docs = CONSOLIDATED_CELL_ROWS_THRESHOLD * 2;
         let sample_size = n_docs / 4;
         let seed = 7u64;
         let indices: Vec<usize> = (0..sample_size)
@@ -3577,7 +3593,17 @@ mod tests {
             .map(|s| sampled_index(s, sample_size, n_docs, seed))
             .collect();
         assert_eq!(indices, again, "same seed must select the same rows");
-        // Full-coverage sample stays the identity.
+
+        // Sub-threshold cells keep the measured plain stride, and a
+        // full-coverage sample stays the identity.
+        let small = CONSOLIDATED_CELL_ROWS_THRESHOLD;
+        for s in [0usize, 7, 1000] {
+            assert_eq!(
+                sampled_index(s, small / 4, small, seed),
+                s * 4,
+                "sub-threshold sampling must stay the plain stride"
+            );
+        }
         assert_eq!(sampled_index(3, 8, 8, seed), 3);
     }
 
