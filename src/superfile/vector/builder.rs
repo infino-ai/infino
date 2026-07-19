@@ -2825,13 +2825,6 @@ struct PlannedClusterBlock {
     block: Option<ClusterBlock>,
 }
 
-/// Split layout (see [`format::vec::SUBSECTION_VERSION`]): every
-/// cluster's `[codes][doc_ids]` prefix packs consecutively from
-/// `per_cluster_blocks_off`, and every cluster's `full` rerank rows pack
-/// consecutively after all prefixes, both in `cluster_order`. Cluster `c`
-/// addresses both regions through its `doc_off` alone — prefix at
-/// `doc_off × (code_bytes + 4)`, payload at `doc_off × per_vec_bytes` —
-/// so the reader needs no extra metadata beyond the cluster index.
 fn plan_ivf_cluster_blocks(
     layout: &IvfSubsectionLayout,
     cluster_order: &[usize],
@@ -2839,23 +2832,21 @@ fn plan_ivf_cluster_blocks(
     code_bytes: usize,
     per_vec_bytes: usize,
 ) -> Vec<PlannedClusterBlock> {
-    let prefix_stride = code_bytes + format::vec::DOC_ID_BYTES;
-    let n_docs: usize = cluster_order
-        .iter()
-        .map(|&c| cluster_counts[c] as usize)
-        .sum();
-    let payload_region_off = layout.per_cluster_blocks_off + n_docs * prefix_stride;
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let mut block_cursor = 0usize;
     let mut doc_offset = 0usize;
     let mut planned = Vec::with_capacity(cluster_order.len());
     for &centroid_id in cluster_order {
         let count = cluster_counts[centroid_id] as usize;
         let cluster_idx_offset = layout.cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
         let block = (count > 0).then(|| {
-            let prefix_base = layout.per_cluster_blocks_off + doc_offset * prefix_stride;
+            let block_base = layout.per_cluster_blocks_off + block_cursor;
+            let codes_len = count * code_bytes;
+            let ids_len = count * format::vec::DOC_ID_BYTES;
             ClusterBlock {
-                codes_base: prefix_base,
-                ids_base: prefix_base + count * code_bytes,
-                rerank_base: payload_region_off + doc_offset * per_vec_bytes,
+                codes_base: block_base,
+                ids_base: block_base + codes_len,
+                rerank_base: block_base + codes_len + ids_len,
                 first_row: doc_offset,
                 count,
             }
@@ -2867,6 +2858,7 @@ fn plan_ivf_cluster_blocks(
             count,
             block,
         });
+        block_cursor += count * cluster_stride;
         doc_offset += count;
     }
     planned

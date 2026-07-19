@@ -132,13 +132,16 @@ pub struct ColumnReader {
     /// per-cluster blocks (inside the open-time region).
     #[allow(dead_code)]
     codec_meta_off: usize,
-    /// Relative offset of the split prefix/payload data region.
-    /// Cluster `c`'s `[codes][doc_ids]` prefix lives at
-    /// `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`; its
-    /// `full` rerank rows live in the payload region at
-    /// `per_cluster_blocks_off + n_docs * (code_bytes + 4) +
-    /// doc_off[c] * per_vec_bytes`. Prefixes pack dense, so a probe's
-    /// clusters coalesce into one range regardless of cluster order.
+    /// Relative offset of the per-cluster blocks region. Each
+    /// cluster `c` lives at
+    /// `per_cluster_blocks_off + doc_off[c] * stride` for
+    /// `count[c] * stride` bytes, where `stride = code_bytes + 4
+    /// + per_vec_bytes`, formatted as `[codes_chunk:
+    /// count*code_bytes][doc_ids_chunk: count*4][full_chunk:
+    /// count*per_vec_bytes]`. The full-precision rerank vectors
+    /// are interleaved into each block (no separate `full[]`
+    /// region) so one range GET per probed cluster covers the
+    /// estimate codes, doc-ids, and rerank vectors together.
     per_cluster_blocks_off: usize,
     /// Relative offset of the inline stable-`_id` region — one i128 per doc,
     /// indexed by `local_doc_id` — present only on materialized (hidden-cell)
@@ -177,24 +180,37 @@ struct ProbeCtx<'a> {
 }
 
 impl ColumnReader {
-    /// Absolute byte offset where cluster `c`'s `[codes][doc_ids]`
-    /// prefix starts: prefixes pack dense at `doc_off × (code_bytes + 4)`.
-    fn cluster_prefix_start(&self, cluster_doc_off: u32) -> usize {
+    /// byte range covering one cluster's
+    /// `[codes_chunk + doc_ids_chunk]` block as a single
+    /// contiguous span. Pulled in **one** range fetch per
+    /// probed cluster; the cold-first-search budget collapses
+    /// to `nprobe + 1` range GETs (nprobe cluster blocks + 1
+    /// rerank run) on a freshly-opened lazy reader, down from
+    /// `2 × nprobe + 1` on the older split-range path.
+    ///
+    /// Block layout: each cluster's block is
+    /// `count * (code_bytes + 4)` bytes formatted as
+    /// `[codes: count*code_bytes][doc_ids: count*4]`. The
+    /// per-cluster `(doc_off, count)` entry recorded in
+    /// `cluster_idx` addresses both halves with no extra
+    /// lookup: byte offset = `per_cluster_blocks_off +
+    /// doc_off * (code_bytes + 4)`.
+    /// Full per-cluster block range `[codes][doc_ids][full]`. The
+    /// production search now fetches only the codes+doc_ids prefix
+    /// (`cluster_codes_doc_ids_range`) plus survivor `full[]` rows
+    /// (`cluster_rerank_row_range`), so this whole-block range is
+    /// retained for the layout-invariant test that pins the on-disk
+    /// shape.
+    pub(super) fn cluster_block_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+    ) -> Range<usize> {
         let sub_start = self.subsection_range.start;
-        let stride = self.quant.code_bytes() + format::vec::DOC_ID_BYTES;
-        sub_start + self.per_cluster_blocks_off + (cluster_doc_off as usize) * stride
-    }
-
-    /// Absolute byte offset where cluster `c`'s `full[]` rerank rows
-    /// start: every cluster's payload packs after all prefixes, at
-    /// `payload_region + doc_off × per_vec`.
-    fn cluster_full_start(&self, cluster_doc_off: u32) -> usize {
-        let per_vec = self.rerank_codec.per_vector_bytes(self.dim);
-        let prefix_stride = self.quant.code_bytes() + format::vec::DOC_ID_BYTES;
-        let payload_region_off = self.subsection_range.start
-            + self.per_cluster_blocks_off
-            + (self.n_docs as usize) * prefix_stride;
-        payload_region_off + (cluster_doc_off as usize) * per_vec
+        let stride = self.per_cluster_doc_stride();
+        let start = sub_start + self.per_cluster_blocks_off + (cluster_doc_off as usize) * stride;
+        let len = (cluster_count as usize) * stride;
+        start..start + len
     }
 
     pub(super) fn cluster_codes_doc_ids_range(
@@ -202,37 +218,35 @@ impl ColumnReader {
         cluster_doc_off: u32,
         cluster_count: u32,
     ) -> Range<usize> {
-        let start = self.cluster_prefix_start(cluster_doc_off);
+        let sub_start = self.subsection_range.start;
+        let start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
         let len = (cluster_count as usize) * (self.quant.code_bytes() + format::vec::DOC_ID_BYTES);
-        start..start + len
-    }
-
-    /// One cluster's whole `full[]` rerank span.
-    pub(super) fn cluster_rerank_rows_range(
-        &self,
-        cluster_doc_off: u32,
-        cluster_count: u32,
-    ) -> Range<usize> {
-        let start = self.cluster_full_start(cluster_doc_off);
-        let len = (cluster_count as usize) * self.rerank_codec.per_vector_bytes(self.dim);
         start..start + len
     }
 
     pub(super) fn cluster_rerank_row_range(
         &self,
         cluster_doc_off: u32,
+        cluster_count: u32,
         local_idx: usize,
     ) -> Range<usize> {
-        let per_vec = self.rerank_codec.per_vector_bytes(self.dim);
-        let start = self.cluster_full_start(cluster_doc_off) + local_idx * per_vec;
-        start..start + per_vec
+        let sub_start = self.subsection_range.start;
+        let block_start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
+        let prefix_len =
+            (cluster_count as usize) * (self.quant.code_bytes() + format::vec::DOC_ID_BYTES);
+        let start =
+            block_start + prefix_len + local_idx * self.rerank_codec.per_vector_bytes(self.dim);
+        start..start + self.rerank_codec.per_vector_bytes(self.dim)
     }
 
-    /// Per-doc byte width summed across the prefix and payload regions:
-    /// `code_bytes + 4 (doc_id) + per_vec_bytes (full rerank)`. The open
-    /// path derives `n_docs` from the trailing region size with this
-    /// total inline; the accessor exists for the layout-invariant tests.
-    #[cfg(test)]
+    /// Per-doc byte stride inside a cluster block:
+    /// `code_bytes + 4 (doc_id) + per_vec_bytes (full rerank)`.
+    /// A cluster's block packs `cnt` docs at this stride as
+    /// `[codes_chunk][doc_ids_chunk][full_chunk]`.
     pub(super) fn per_cluster_doc_stride(&self) -> usize {
         self.quant.code_bytes()
             + format::vec::DOC_ID_BYTES
@@ -2270,6 +2284,7 @@ impl VectorReader {
             per_cluster_blocks_off: col.per_cluster_blocks_off,
             code_bytes: col.quant.code_bytes(),
             per_vec_bytes: col.rerank_codec.per_vector_bytes(dim),
+            stride: col.per_cluster_doc_stride(),
             scale,
             offset,
             stable_ids,
@@ -2520,14 +2535,11 @@ impl VectorReader {
     ) -> Vec<MaterializedIvfRow> {
         let dim = col.dim;
         let code_bytes = col.quant.code_bytes();
+        let stride = col.per_cluster_doc_stride();
         let id_bytes = format::vec::DOC_ID_BYTES;
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
         let n_cent = col.n_cent as usize;
         let store_norm = matches!(col.metric, Metric::L2Sq | Metric::Cosine);
-        // `sub` is the whole subsection, so the shared absolute-range
-        // accessors (subsection-relative + subsection start) apply after
-        // subtracting the subsection start back out.
-        let sub_rel = |abs: usize| abs - col.subsection_range.start;
 
         // Inline stable-`_id` region (relative offset into `sub`), when this is
         // a materialized/hidden-cell subsection. Lets the read-back carry the
@@ -2545,9 +2557,9 @@ impl VectorReader {
             if count == 0 {
                 continue;
             }
-            let block = sub_rel(col.cluster_prefix_start(doc_off as u32));
+            let block = col.per_cluster_blocks_off + doc_off * stride;
             let doc_ids_at = block + count * code_bytes;
-            let full_at = sub_rel(col.cluster_full_start(doc_off as u32));
+            let full_at = block + count * (code_bytes + id_bytes);
             // Shared per-cluster backing: each row clones the Arc (refcount bump),
             // not the dim-length scale/offset buffers.
             let sc: std::sync::Arc<[f32]> = std::sync::Arc::from(&scale[c * dim..c * dim + dim]);
@@ -3149,38 +3161,27 @@ impl VectorReader {
                 };
                 (prefix_blocks, meta_bytes, true)
             } else {
-                // Cold: fetch each probed cluster's `[codes][doc_ids]`
-                // prefix AND its `full[]` rerank rows + Sq8 meta in one
-                // coalesced batch, so the survivor rerank rows arrive
-                // *with* the codes — collapsing the dependent rerank
-                // round-trip (wave 3) into this wave. Cold latency is
-                // RTT/wave-bound and the background cache-fill is already
-                // downloading the whole cell, so the extra rerank bytes
-                // here are bytes we'd pull regardless; we just front-load
-                // them to save a serial S3 round-trip. Prefixes pack dense
-                // in the split layout, so the prefix half coalesces into
-                // one range regardless of which clusters were probed.
-                // `survivor_only_rerank_fetch = false` tells
+                // Cold: fetch the **full** per-cluster blocks
+                // (`[codes][doc_ids][full]`) + Sq8 meta in one coalesced
+                // batch, so the survivor rerank rows arrive *with* the codes
+                // — collapsing the dependent rerank round-trip (wave 3) into
+                // this wave. Cold latency is RTT/wave-bound and the
+                // background cache-fill is already downloading the whole
+                // cell, so the extra rerank bytes here are bytes we'd pull
+                // regardless; we just front-load them to save a serial S3
+                // round-trip. `survivor_only_rerank_fetch = false` tells
                 // `build_shortlist` the rerank rows are in-block (no second
-                // fetch); each cluster's prefix + payload are stitched back
-                // into the interleaved in-memory block shape it expects.
-                let n_probed = cluster_meta.len();
-                let mut wave_ranges: Vec<Range<usize>> = Vec::with_capacity(n_probed * 2);
-                wave_ranges.extend(
-                    cluster_meta
-                        .iter()
-                        .map(|&(_, off, cnt)| col.cluster_codes_doc_ids_range(off, cnt)),
-                );
-                wave_ranges.extend(
-                    cluster_meta
-                        .iter()
-                        .map(|&(_, off, cnt)| col.cluster_rerank_rows_range(off, cnt)),
-                );
+                // fetch).
+                let cluster_full_ranges: Vec<Range<usize>> = cluster_meta
+                    .iter()
+                    .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
+                    .collect();
 
-                _cold_guard = reserve_cold_fetch(&self.source, &wave_ranges, ctx.budget.as_ref())?;
+                _cold_guard =
+                    reserve_cold_fetch(&self.source, &cluster_full_ranges, ctx.budget.as_ref())?;
 
                 // Piggyback the inline stable-`_id` region onto THIS wave:
-                // fetch it concurrently with the cluster GETs (same
+                // fetch it concurrently with the cluster-block GETs (same
                 // round-trip envelope) and stash it on the reader. The remap
                 // step then resolves hidden→user `_id` from the stash (sync,
                 // at the fan-out tag site) instead of issuing a trailing
@@ -3189,7 +3190,7 @@ impl VectorReader {
                 let region_range = col.stable_ids_region_range();
                 let cluster_fut = get_cluster_ranges_coalesced_with_extra_async(
                     &self.source,
-                    &wave_ranges,
+                    &cluster_full_ranges,
                     lazy_sq8_meta_range,
                 );
                 let region_fut = async {
@@ -3198,25 +3199,13 @@ impl VectorReader {
                         None => Ok(None),
                     }
                 };
-                let ((fetched, meta), region_bytes) =
-                    futures::try_join!(cluster_fut, region_fut)
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let ((blocks, meta), region_bytes) = futures::try_join!(cluster_fut, region_fut)
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
                 if let Some(bytes) = region_bytes
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
                 {
                     *slot = Some(bytes);
                 }
-                let (prefixes, fulls) = fetched.split_at(n_probed);
-                let blocks: Vec<Bytes> = prefixes
-                    .iter()
-                    .zip(fulls)
-                    .map(|(prefix, full)| {
-                        let mut block = Vec::with_capacity(prefix.len() + full.len());
-                        block.extend_from_slice(prefix);
-                        block.extend_from_slice(full);
-                        Bytes::from(block)
-                    })
-                    .collect();
                 (blocks, meta, false)
             };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
@@ -3321,11 +3310,8 @@ impl VectorReader {
         let cb = col.quant.code_bytes();
         let per_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
 
-        // Collect each populated cluster's prefix and full-row ranges —
-        // adjacent regions under the interleaved layout, disjoint regions
-        // under the split layout; the accessors hide the difference.
-        let mut prefix_ranges: Vec<Range<usize>> = Vec::new();
-        let mut full_ranges: Vec<Range<usize>> = Vec::new();
+        // Collect all cluster ranges needed for fetching
+        let mut cluster_ranges: Vec<Range<usize>> = Vec::new();
         let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::new();
 
         for c in 0..col.n_cent as usize {
@@ -3333,39 +3319,35 @@ impl VectorReader {
             if cnt == 0 {
                 continue;
             }
-            prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
-            full_ranges.push(col.cluster_rerank_rows_range(off, cnt));
+            cluster_ranges.push(col.cluster_block_range(off, cnt));
             cluster_meta.push((c, off, cnt));
         }
 
-        if prefix_ranges.is_empty() {
+        if cluster_ranges.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Fetch prefixes and full rows in one wave.
-        let n_prefixes = prefix_ranges.len();
-        let mut all_ranges = prefix_ranges;
-        all_ranges.extend(full_ranges);
-        let fetched = self
+        // Fetch all cluster blocks
+        let cluster_blocks = self
             .source
-            .get_ranges_parallel(&all_ranges)
+            .get_ranges_parallel(&cluster_ranges)
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let (prefix_blocks, full_blocks) = fetched.split_at(n_prefixes);
 
         // Allocate output vector with doc_id -> vector mapping
         let mut result: Vec<Option<Vec<f32>>> = vec![None; col.n_docs as usize];
 
-        // Process each cluster
-        for (bi, (prefix, full)) in prefix_blocks.iter().zip(full_blocks).enumerate() {
+        // Process each cluster block
+        for (bi, block) in cluster_blocks.iter().enumerate() {
             let (_, _off, cnt) = cluster_meta[bi];
             let cnt_usize = cnt as usize;
 
-            // Prefix layout: [codes_chunk][doc_ids_chunk].
+            // Layout within the block: [codes_chunk][doc_ids_chunk][full_chunk]
             let codes_len = cnt_usize * cb;
             let doc_ids_len = cnt_usize * 4;
+            let full_start = codes_len + doc_ids_len;
 
-            // Extract doc_ids from the prefix
-            let doc_ids_slice = prefix.slice(codes_len..codes_len + doc_ids_len);
+            // Extract doc_ids from the block
+            let doc_ids_slice = block.slice(codes_len..codes_len + doc_ids_len);
 
             // Extract and reconstruct vectors
             for i in 0..cnt_usize {
@@ -3376,9 +3358,9 @@ impl VectorReader {
                     doc_ids_slice[i * 4 + 3],
                 ]) as usize;
 
-                let vec_start = i * per_vec_bytes;
+                let vec_start = full_start + i * per_vec_bytes;
                 let vec_end = vec_start + per_vec_bytes;
-                let vec_bytes = full.slice(vec_start..vec_end);
+                let vec_bytes = block.slice(vec_start..vec_end);
 
                 // Convert bytes to f32 vector
                 // For Fp32 codec, per_vec_bytes = dim * 4, so we expect dim f32s
@@ -3661,7 +3643,7 @@ async fn build_shortlist(
         let local = (pos - off) as usize;
         let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
             let idx = ranges.len();
-            ranges.push(col.cluster_rerank_row_range(off, local));
+            ranges.push(col.cluster_rerank_row_range(off, cnt, local));
             Some(idx)
         } else {
             None
@@ -8033,23 +8015,24 @@ mod tests {
     }
 
     /// pins the `cluster_block_range` address math
-    /// Pins the split on-disk layout: every cluster's `[codes][doc_ids]`
-    /// prefix packs dense at `per_cluster_blocks_off + doc_off × (cb+4)`,
-    /// the payload region starts after ALL prefixes
-    /// (`n_docs × (cb+4)` in), each cluster's `full[]` rows sit at
-    /// `payload_off + doc_off × per_vec`, and the two regions tile the
-    /// trailing data region exactly to the CRC.
+    /// against the per-cluster block spec
+    /// (`[codes: cnt*cb][doc_ids: cnt*4]`). Walks every non-
+    /// empty cluster and checks the block range size matches
+    /// `cnt × (cb + 4)` exactly, the start aligns with
+    /// `per_cluster_blocks_off + doc_off × (cb + 4)`, and the
+    /// codes/doc_ids halves slice in at the expected boundary
+    /// inside the fetched block.
     #[test]
-    fn cluster_ranges_match_split_layout_invariant() {
+    fn cluster_block_range_matches_v1_layout_invariant() {
         let (blob, json, _) =
             build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];
         let cb = col.quant.code_bytes();
         let pvb = col.rerank_codec.per_vector_bytes(col.dim);
-        let prefix_stride = cb + 4;
-        let region_start = col.subsection_range.start + col.per_cluster_blocks_off;
-        let payload_off = region_start + (col.n_docs as usize) * prefix_stride;
+        // Interleaved layout: each per-cluster block is
+        // `[codes][doc_ids][full]` at stride `cb + 4 + pvb`.
+        let stride = cb + 4 + pvb;
 
         let cluster_idx_bytes = r
             .source
@@ -8068,45 +8051,39 @@ mod tests {
                 continue;
             }
             n_non_empty += 1;
-            let prefix = col.cluster_codes_doc_ids_range(off, cnt);
+            let block = col.cluster_block_range(off, cnt);
+            let expected_start =
+                col.subsection_range.start + col.per_cluster_blocks_off + (off as usize) * stride;
+            let expected_len = (cnt as usize) * stride;
             assert_eq!(
-                prefix.start,
-                region_start + (off as usize) * prefix_stride,
-                "cluster {c} prefix must pack dense at doc_off × (cb + 4)",
+                block.start, expected_start,
+                "cluster {c} block start must equal \
+                 per_cluster_blocks_off + doc_off × stride",
             );
             assert_eq!(
-                prefix.len(),
-                (cnt as usize) * prefix_stride,
-                "cluster {c} prefix must be cnt × (cb + 4) bytes",
+                block.len(),
+                expected_len,
+                "cluster {c} block size must equal cnt × (cb + 4 + per_vec_bytes)",
             );
-            let full = col.cluster_rerank_rows_range(off, cnt);
-            assert_eq!(
-                full.start,
-                payload_off + (off as usize) * pvb,
-                "cluster {c} payload must sit at payload_off + doc_off × per_vec",
+            // Inside the fetched block, `[0..cnt*cb)` is codes,
+            // `[cnt*cb..cnt*(cb+4))` is doc_ids, and the remaining
+            // `cnt*pvb` bytes are the interleaved full[] vectors —
+            // the exact boundaries the search() hot path slices at.
+            let codes_end = (cnt as usize) * cb;
+            let doc_ids_end = codes_end + (cnt as usize) * 4;
+            assert!(
+                doc_ids_end <= block.len(),
+                "codes + doc_ids prefix must fit inside the block"
             );
             assert_eq!(
-                full.len(),
+                block.len() - doc_ids_end,
                 (cnt as usize) * pvb,
-                "cluster {c} payload must be cnt × per_vec bytes",
-            );
-            // Per-row accessor agrees with the whole-cluster span.
-            assert_eq!(col.cluster_rerank_row_range(off, 0).start, full.start);
-            assert_eq!(
-                col.cluster_rerank_row_range(off, (cnt as usize) - 1).end,
-                full.end
+                "full suffix must be cnt × per_vec_bytes bytes",
             );
         }
         assert!(
             n_non_empty > 0,
             "test corpus must populate at least one cluster"
-        );
-        // The regions tile the trailing data region exactly to the CRC.
-        let sub_crc_pos = col.subsection_range.end - format::CRC_BYTES;
-        assert_eq!(
-            payload_off + (col.n_docs as usize) * pvb,
-            sub_crc_pos,
-            "prefix + payload regions must tile to the subsection CRC"
         );
     }
 
@@ -9093,15 +9070,14 @@ mod tests {
     // ColumnReader range accessors
     // -----------------------------------------------------------------
     //
-    // The range helpers all address the split prefix/payload data region
-    // from the same `(doc_off, count)` cluster entry. Prefixes pack
-    // dense at `(cb + 4)` per doc; payloads pack dense after every
-    // prefix at `per_vec` per doc. The helpers must agree on that
-    // arithmetic or rerank reads the wrong bytes. Pin the relationships
-    // structurally off an Fp32 build.
+    // These three range helpers all address the per-cluster blocks
+    // region from the same `(doc_off, count)` cluster entry. The block
+    // is `[codes][doc_ids][full]` at a fixed per-doc stride; the helpers
+    // must agree on the prefix/stride arithmetic or rerank reads the
+    // wrong bytes. Pin the relationships structurally off an Fp32 build.
 
     #[test]
-    fn column_reader_range_accessors_agree_on_split_layout() {
+    fn column_reader_range_accessors_agree_on_block_layout() {
         let dim = 16usize;
         let (blob, json) = build_blob(32, dim, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
@@ -9109,32 +9085,31 @@ mod tests {
 
         let cb = col.quant.code_bytes();
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
-        let prefix_stride = cb + format::vec::DOC_ID_BYTES;
+        let stride = cb + format::vec::DOC_ID_BYTES + per_vec;
+        assert_eq!(col.per_cluster_doc_stride(), stride);
+
+        // Whole-block range covers `count` docs at the full stride.
+        let (off, cnt) = (3u32, 5u32);
+        let block = col.cluster_block_range(off, cnt);
+        assert_eq!(block.len(), (cnt as usize) * stride);
+
+        // The codes+doc_ids prefix shares the block's start and covers
+        // exactly the leading `count · (code_bytes + 4)` bytes.
+        let prefix = col.cluster_codes_doc_ids_range(off, cnt);
+        assert_eq!(prefix.start, block.start);
         assert_eq!(
-            col.per_cluster_doc_stride(),
-            prefix_stride + per_vec,
-            "region-sizing total = prefix stride + payload stride"
+            prefix.len(),
+            (cnt as usize) * (cb + format::vec::DOC_ID_BYTES)
         );
 
-        let (off, cnt) = (3u32, 5u32);
-        let region_start = col.subsection_range.start + col.per_cluster_blocks_off;
-        let payload_off = region_start + (col.n_docs as usize) * prefix_stride;
-
-        // The codes+doc_ids prefix packs dense at doc_off × (cb + 4).
-        let prefix = col.cluster_codes_doc_ids_range(off, cnt);
-        assert_eq!(prefix.start, region_start + (off as usize) * prefix_stride);
-        assert_eq!(prefix.len(), (cnt as usize) * prefix_stride);
-
-        // Rerank rows pack dense in the payload region at
-        // `doc_off × per_vec`; per-row and whole-cluster accessors agree.
-        let rows = col.cluster_rerank_rows_range(off, cnt);
-        assert_eq!(rows.start, payload_off + (off as usize) * per_vec);
-        assert_eq!(rows.len(), (cnt as usize) * per_vec);
-        let row0 = col.cluster_rerank_row_range(off, 0);
-        assert_eq!(row0.start, rows.start);
+        // Each rerank row sits after the prefix at `local_idx · per_vec`
+        // and is exactly one per-vector body wide. The last row's end
+        // must coincide with the whole-block end.
+        let row0 = col.cluster_rerank_row_range(off, cnt, 0);
+        assert_eq!(row0.start, block.start + prefix.len());
         assert_eq!(row0.len(), per_vec);
-        let row_last = col.cluster_rerank_row_range(off, (cnt as usize) - 1);
-        assert_eq!(row_last.end, rows.end);
+        let row_last = col.cluster_rerank_row_range(off, cnt, (cnt as usize) - 1);
+        assert_eq!(row_last.end, block.end);
     }
 
     // -----------------------------------------------------------------
