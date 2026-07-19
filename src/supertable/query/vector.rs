@@ -376,23 +376,13 @@ struct DeferredCellRescore {
     flat_base: u32,
 }
 
-/// How [`score_fine_candidates`] scores a stripped summary cell (fp32
-/// dropped at hydration).
-///
-/// * `Defer` — the hidden path: exact scores come from a windowed rescore
-///   of the superfile centroid regions (one wave, admit-window cells only).
-/// * `Estimate` — the user path: emit the resident 1-bit admit estimates
-///   directly. User fragments are ranked and gated per (file, cell), so a
-///   deferred exact rescore fans one tiny GET per (file, shortlisted cell)
-///   — measured 848 GETs / 427 MiB on a 1M pre-drain first cold query —
-///   while the scores that decide the final top-k are computed inside the
-///   probed blocks regardless. Estimates only steer which runs get probed;
-///   the knob strips summaries uniformly, so scores stay mutually
-///   comparable within a query.
-enum StrippedScorePolicy<'a> {
-    Defer,
-    Estimate(&'a RabitqAdmitQuery),
-}
+// Stripped summary cells (fp32 dropped at hydration) always DEFER to an
+// exact rescore — 1-bit estimates in routing measurably cost recall
+// (filtered measured 0.722 against the 0.95 bar when the user path ranked
+// on estimates). The rescore is cheap in both regimes: hidden manifests
+// read the slow-CAS centroid-section spill; user manifests hydrate fp32
+// once per generation from the FULL manifest parts (the user table's
+// content-addressed fp32 store). See `rescore_deferred_cells`.
 
 /// Validate one superfile's vector summary for `column` (present,
 /// non-empty, dims matching the query) and hand it back. Shared by the
@@ -447,7 +437,6 @@ fn score_fine_candidates(
     metric: Metric,
     admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
-    stripped_policy: StrippedScorePolicy<'_>,
 ) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
     let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
 
@@ -516,40 +505,11 @@ fn score_fine_candidates(
                             candidates.push((si, flat_base + local, score, cell.cell_id, count));
                         });
                 } else {
-                    match stripped_policy {
-                        // Hidden path: exact scores come from the
-                        // superfile's centroid region, fetched in one
-                        // wave after this scan.
-                        StrippedScorePolicy::Defer => deferred.push(DeferredCellRescore {
-                            si,
-                            cell_id: cell.cell_id,
-                            flat_base,
-                        }),
-                        // User path: rank on the resident 1-bit slab —
-                        // see [`StrippedScorePolicy`].
-                        StrippedScorePolicy::Estimate(admit_q) => {
-                            cell.clusters.estimate_admit_scores_into(
-                                metric,
-                                admit_q,
-                                |local, score| {
-                                    let count = cell
-                                        .clusters
-                                        .counts
-                                        .get(local as usize)
-                                        .copied()
-                                        .unwrap_or(0)
-                                        as u64;
-                                    candidates.push((
-                                        si,
-                                        flat_base + local,
-                                        score,
-                                        cell.cell_id,
-                                        count,
-                                    ));
-                                },
-                            );
-                        }
-                    }
+                    deferred.push(DeferredCellRescore {
+                        si,
+                        cell_id: cell.cell_id,
+                        flat_base,
+                    });
                 }
             }
             flat_base = flat_base.saturating_add(cell.clusters.n_cent);
@@ -1021,6 +981,43 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     Ok(out.into_iter().flatten().collect())
 }
 
+/// Score one deferred cell's fp32 centroids into `candidates` — shared by
+/// the centroid-section (hidden) and full-part (user) rescore sources.
+/// Returns false when the entry's summary doesn't validate against the
+/// fp32 slice (caller keeps the cell deferred for the per-superfile
+/// fallback wave).
+fn score_cell_fp32(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    d: &DeferredCellRescore,
+    fp32: &[f32],
+    query: &[f32],
+    metric: Metric,
+    candidates: &mut Vec<FineCandidate>,
+) -> bool {
+    let entry = &superfiles[d.si];
+    let Some(cell) = entry
+        .vector_summary
+        .get(column)
+        .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
+    else {
+        return false;
+    };
+    let dim = cell.clusters.dim as usize;
+    if dim == 0 || fp32.len() != cell.clusters.n_cent as usize * dim {
+        return false;
+    }
+    for (local, centroid) in fp32.chunks_exact(dim).enumerate() {
+        let count = cell.clusters.counts.get(local).copied().unwrap_or(0) as u64;
+        if count == 0 {
+            continue;
+        }
+        let score = distance(metric, query, centroid);
+        candidates.push((d.si, d.flat_base + local as u32, score, d.cell_id, count));
+    }
+    true
+}
+
 impl SupertableReader {
     /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
     /// table: one streamed fetch of a single content-addressed object on
@@ -1087,26 +1084,30 @@ impl SupertableReader {
                     leftovers.push(d);
                     continue;
                 };
-                let Some(cell) = entry
-                    .vector_summary
-                    .get(column)
-                    .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
-                else {
+                if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                    leftovers.push(d);
+                }
+            }
+            leftovers
+        } else {
+            deferred
+        };
+        // User manifests carry no centroid section; their fp32 lives in
+        // the FULL manifest parts (content-addressed), hydrated once per
+        // generation and served from RAM after that.
+        let deferred = if deferred.is_empty() {
+            deferred
+        } else if let Some(cache) = self.manifest().user_centroids_for_rescore().await {
+            let mut leftovers = Vec::new();
+            for d in deferred {
+                let entry = &superfiles[d.si];
+                let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
                     leftovers.push(d);
                     continue;
                 };
-                let dim = cell.clusters.dim as usize;
-                if dim == 0 || fp32.len() != cell.clusters.n_cent as usize * dim {
+                if !score_cell_fp32(superfiles, column, &d, fp32.as_slice(), query, metric, candidates)
+                {
                     leftovers.push(d);
-                    continue;
-                }
-                for (local, centroid) in fp32.chunks_exact(dim).enumerate() {
-                    let count = cell.clusters.counts.get(local).copied().unwrap_or(0) as u64;
-                    if count == 0 {
-                        continue;
-                    }
-                    let score = distance(metric, query, centroid);
-                    candidates.push((d.si, d.flat_base + local as u32, score, d.cell_id, count));
                 }
             }
             leftovers
@@ -1344,19 +1345,13 @@ impl SupertableReader {
             // queries bypass the prefilter's shortlist — an allow-set thins
             // each cell's matching postings, so the nearest *matching*
             // neighbors spread across far more cells than the unfiltered
-            // estimate window is sized for — but stripped user summaries
-            // still score on the 1-bit slab (see [`StrippedScorePolicy`]).
+            // estimate window is sized for.
             let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
             let admit = (!filtered).then_some(());
             let must_include: Vec<u32> = ranked_for_beam[..cutoff]
                 .iter()
                 .map(|(cell, _)| *cell)
                 .collect();
-            let stripped_policy = if hidden_vector_index {
-                StrippedScorePolicy::Defer
-            } else {
-                StrippedScorePolicy::Estimate(&admit_q)
-            };
             let (mut candidates, deferred) = score_fine_candidates(
                 &superfiles,
                 column,
@@ -1364,7 +1359,6 @@ impl SupertableReader {
                 metric,
                 admit.map(|()| (&admit_q, must_include.as_slice())),
                 allow_ref,
-                stripped_policy,
             )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
@@ -1472,7 +1466,6 @@ impl SupertableReader {
                 metric,
                 None,
                 allow_ref,
-                StrippedScorePolicy::Defer,
             )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(

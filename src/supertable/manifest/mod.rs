@@ -858,7 +858,20 @@ impl ManifestSnapshot {
         // skips entries shared with a previous snapshot or a loaded part
         // (already stripped, or referenced by maintenance state that needs
         // fp32). Grid centroids in the list are untouched.
-        if options.summary_centroids_from_superfiles {
+        //
+        // HIDDEN manifests only (VectorCell partitioning): their fine fp32
+        // is the residency pig (~620 MB at 100M) and their exact rescore is
+        // served by the slow-CAS centroid section. User-table summaries
+        // stay resident — they are small (~100 MB at 100M, per-fragment
+        // cells), and stripping them forced pre-drain and filtered routing
+        // onto 1-bit estimates, which measured filtered recall 0.722
+        // against the 0.95 bar (exact fp32 measured 0.995 at 100M).
+        if options.summary_centroids_from_superfiles
+            && matches!(
+                list.partition_strategy,
+                PartitionStrategy::VectorCell { .. }
+            )
+        {
             strip_summary_centroids(&mut all_superfiles, &options.vector_columns);
         }
         // Build the remaining resident summaries' admit slabs now (parallel)
@@ -1405,6 +1418,59 @@ impl ManifestSnapshot {
         Ok(Arc::clone(loaded))
     }
 
+    /// Fp32 fine centroids for this USER manifest's stripped summary
+    /// cells, hydrated once per manifest generation from the FULL
+    /// manifest parts — the user table's content-addressed store for
+    /// summary fp32, mirroring what the slow-CAS centroid section does
+    /// for the hidden table. Consumers under
+    /// `summary_centroids_from_superfiles` open with routing parts
+    /// (1-bit slabs, no fp32); the first rescore pays one full-part wave
+    /// (bytes land in the manifest disk cache), then every query scores
+    /// from RAM. User summaries are per-fragment cells, small enough to
+    /// keep resident. `None` when this is a hidden (cell-partitioned)
+    /// manifest — its rescore reads the spilled centroid section — or
+    /// when no loader/parts exist (entries are inline and unstripped).
+    pub(crate) async fn user_centroids_for_rescore(&self) -> Option<Arc<UserCentroidCache>> {
+        let list = self.list.as_ref()?;
+        if matches!(list.partition_strategy, PartitionStrategy::VectorCell { .. }) {
+            return None;
+        }
+        let loader = self.loader.as_ref()?;
+        if list.parts.is_empty() {
+            return None;
+        }
+        let manifest_id = self.get_manifest_id();
+        let slot = Arc::clone(&self.options.user_centroid_cache);
+        let mut guard = slot.lock().await;
+        if let Some(cache) = guard.as_ref()
+            && cache.manifest_id == manifest_id
+        {
+            return Some(Arc::clone(cache));
+        }
+        // Full-form loads bypass the snapshot's part cells (those hold the
+        // routing-decoded form on knob-on consumers); the loader's disk
+        // cache still dedups bytes across generations by content hash.
+        let waves = list.parts.iter().map(|part| {
+            let loader = Arc::clone(loader);
+            let part_id = part.part_id;
+            async move { loader.load_full(part_id).await }
+        });
+        match future::try_join_all(waves).await {
+            Ok(parts) => {
+                let cache = Arc::new(UserCentroidCache::from_parts(manifest_id, &parts));
+                *guard = Some(Arc::clone(&cache));
+                Some(cache)
+            }
+            Err(error) => {
+                eprintln!(
+                    "[supertable] full-part centroid hydration unavailable ({error}); falling \
+                     back to per-superfile centroid reads"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve one superfile by storage URI. Checks the flat
     /// [`SuperfileList::superfiles`] view first; when the entry is absent
     /// there (lazy list/parts layout), walks manifest parts until a match
@@ -1904,13 +1970,32 @@ impl ManifestPartLoader {
     /// on a miss the freshly-fetched bytes are written back to the
     /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+        self.load_with_form(part_id, self.prefer_routing).await
+    }
+
+    /// [`Self::load`] forced to the FULL wire form (fp32 summaries intact)
+    /// regardless of the loader's routing preference — the user-table
+    /// centroid hydration reads full parts once even on consumers that
+    /// open with routing siblings.
+    pub async fn load_full(
+        &self,
+        part_id: PartId,
+    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+        self.load_with_form(part_id, false).await
+    }
+
+    async fn load_with_form(
+        &self,
+        part_id: PartId,
+        prefer_routing: bool,
+    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let (full_hash, full_uri, routing) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
         // Routing decode lands in the stripped in-memory shape; both forms
         // are content-addressed, so the disk cache can never mix them.
-        let (expected_hash, uri) = match (self.prefer_routing, routing) {
+        let (expected_hash, uri) = match (prefer_routing, routing) {
             (true, Some(routing)) => (&routing.content_hash, &routing.uri),
             _ => (full_hash, full_uri),
         };
@@ -1940,6 +2025,58 @@ impl ManifestPartLoader {
             cache.put(*expected_hash, &bytes).await;
         }
         Ok(Arc::new(parsed))
+    }
+}
+
+/// One consumer's hydrated user-table fp32 fine centroids, built once per
+/// manifest generation from the FULL manifest parts (the user table's
+/// content-addressed store for summary fp32 — the slow-CAS analog). Keyed
+/// by `manifest_id`; a membership change rebuilds it on the next rescore.
+/// Resident by design: user summaries are per-fragment cells (~100 MB at
+/// 100M docs), unlike the hidden table's fine fp32 (spilled section).
+pub(crate) struct UserCentroidCache {
+    pub(crate) manifest_id: u64,
+    /// `(superfile_id, column)` → per-cell `(cell_id, fp32 centroids)`.
+    pub(crate) cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
+}
+
+impl UserCentroidCache {
+    /// One cell's fp32 fine centroids, when the cache carries them.
+    pub(crate) fn cell(
+        &self,
+        superfile_id: Uuid,
+        column: &str,
+        cell_id: Option<u32>,
+    ) -> Option<Arc<Vec<f32>>> {
+        self.cells
+            .get(&(superfile_id, column.to_owned()))?
+            .iter()
+            .find(|(id, _)| *id == cell_id)
+            .map(|(_, fp32)| Arc::clone(fp32))
+    }
+
+    /// Build from fully-loaded parts: every entry's summary cells that
+    /// carry resident fp32.
+    pub(crate) fn from_parts(manifest_id: u64, parts: &[Arc<ManifestPart>]) -> Self {
+        let mut cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
+        for part in parts {
+            for entry in &part.superfiles {
+                for (column, summary) in &entry.vector_summary {
+                    let list = cells
+                        .entry((entry.superfile_id, column.clone()))
+                        .or_default();
+                    for cell in &summary.cells {
+                        if cell.clusters.vectors_resident() && cell.clusters.n_cent > 0 {
+                            list.push((
+                                cell.cell_id,
+                                Arc::new(cell.clusters.centroids.clone()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Self { manifest_id, cells }
     }
 }
 

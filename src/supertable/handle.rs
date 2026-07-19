@@ -2452,15 +2452,29 @@ mod tests {
         assert!(!pre_base_hits.is_empty(), "pre-drain baseline returns hits");
         drop(pre_baseline);
         let pre_stripped = Supertable::open(make_options(true)).expect("pre-drain mode-on");
-        let user_parts_have_routing = pre_stripped
-            .reader()
-            .manifest()
-            .get_all_list_entries()
-            .iter()
-            .all(|entry| entry.routing.is_some());
+        let pre_stripped_reader = pre_stripped.reader();
+        let user_manifest = pre_stripped_reader.manifest();
+        let user_part_entries = user_manifest.get_all_list_entries();
         assert!(
-            user_parts_have_routing,
+            !user_part_entries.is_empty(),
+            "pre-drain user manifest must carry parts (routing hydration under test)"
+        );
+        assert!(
+            user_part_entries.iter().all(|entry| entry.routing.is_some()),
             "commits must stamp a routing sibling on every user part"
+        );
+        // Routing-part decode must have dropped the user fp32 — otherwise
+        // the parity check below never exercises the full-part rescore.
+        let saw_stripped_user_cell = user_manifest.superfiles.iter().any(|entry| {
+            entry.vector_summary.values().any(|vs| {
+                vs.cells
+                    .iter()
+                    .any(|cell| cell.clusters.n_cent > 0 && !cell.clusters.vectors_resident())
+            })
+        });
+        assert!(
+            saw_stripped_user_cell,
+            "mode-on consumer must hydrate stripped user summaries from routing parts"
         );
         let pre_stripped_hits = pre_stripped
             .reader()

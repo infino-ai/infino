@@ -71,7 +71,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
+        manifest::{UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy},
         slow_vector_state::CentroidSection,
     },
 };
@@ -346,6 +346,11 @@ pub struct SupertableOptions {
     /// it). Serves the stripped-summary admit rescore from a local
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the user table's fp32 fine centroids, hydrated
+    /// once per manifest generation from the FULL manifest parts on the
+    /// first stripped-summary rescore (consumers open with routing parts,
+    /// which carry no fp32). Keyed by `manifest_id`.
+    pub(crate) user_centroid_cache: Arc<TokioMutex<Option<Arc<UserCentroidCache>>>>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -631,6 +636,7 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             vector_layout: VectorLayout::Ivf,
