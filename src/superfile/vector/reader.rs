@@ -2806,7 +2806,7 @@ impl VectorReader {
         // sort.
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => Some(
-                get_cluster_ranges_coalesced(&self.source, &ranges)
+                get_survivor_ranges_coalesced(&self.source, &ranges)
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
             ),
             None => None,
@@ -3246,7 +3246,7 @@ impl VectorReader {
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => Some(
-                get_cluster_ranges_coalesced_async(&self.source, &ranges)
+                get_survivor_ranges_coalesced_async(&self.source, &ranges)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
             ),
@@ -4450,6 +4450,17 @@ fn checked_dir_bounds(
 const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
+/// Gap / overfetch windows for the survivor rerank-row wave. Survivor
+/// rows scatter across the selected clusters' `full[]` regions; with the
+/// geometric cluster ordering those regions are file-adjacent, sitting
+/// within roughly one cluster block (~0.7 MiB at the 10M shape) of each
+/// other. A window sized past that stride merges survivors spanning
+/// neighboring runs into one range — one fewer cold round trip per
+/// query for a bounded, cold-only overfetch. The prefix wave keeps the
+/// tight windows above (its ranges are small and already adjacent).
+const SURVIVOR_RANGE_COALESCE_MAX_GAP: usize = 2 * 1024 * 1024;
+const SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH: usize = 2 * 1024 * 1024;
+
 fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
         return None;
@@ -4564,6 +4575,51 @@ fn get_cluster_ranges_coalesced(
         CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
     );
     let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    Ok(plan.restore(&fetched))
+}
+
+/// Survivor-wave fetch: same plan/restore mechanics as
+/// [`get_cluster_ranges_coalesced`] under the wider
+/// [`SURVIVOR_RANGE_COALESCE_MAX_GAP`] windows, so survivor rows spanning
+/// geometrically neighboring clusters merge into one cold range.
+fn get_survivor_ranges_coalesced(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ranges.len() == 1 {
+        return source.get_ranges_parallel(ranges);
+    }
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        SURVIVOR_RANGE_COALESCE_MAX_GAP,
+        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    Ok(plan.restore(&fetched))
+}
+
+/// Async sibling of [`get_survivor_ranges_coalesced`].
+async fn get_survivor_ranges_coalesced_async(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, LazyByteSourceError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ranges.len() == 1 {
+        return source.get_ranges_parallel_async(ranges).await;
+    }
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        SURVIVOR_RANGE_COALESCE_MAX_GAP,
+        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let fetched = source
+        .get_ranges_parallel_async(plan.fetch_ranges())
+        .await?;
     Ok(plan.restore(&fetched))
 }
 

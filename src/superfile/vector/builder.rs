@@ -37,7 +37,7 @@ use crate::{
         },
         vector::{
             cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-            distance::{Metric, dequantize_sq8_residual_into, mean_f32_cluster_major},
+            distance::{Metric, dequantize_sq8_residual_into, distance, mean_f32_cluster_major},
             ivf_merge::MergedIvfSubsection,
             kmeans::{assign_to_centroids, kmeans},
             quant::BitQuantizer,
@@ -1084,6 +1084,10 @@ pub(crate) mod build_phase_timers {
 fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> (usize, Vec<f32>) {
     let dim = cfg.dim;
     if let Some(global) = cfg.provided_centroids.as_ref() {
+        // Global-aligned build: cluster index == cell id is a routing
+        // contract (the drain's assign-skip and the grid summaries key on
+        // it), so provided centroids keep their order verbatim — never
+        // reorder them.
         debug_assert!(dim > 0 && global.len() % dim == 0);
         let n_cent = global.len() / dim.max(1);
         return (n_cent, global.to_vec());
@@ -1093,8 +1097,61 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
         .max(1)
         .min(n_cent_row_count_cap(n_docs))
         .min(n_docs.max(1));
-    let centroids = kmeans(sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+    let mut centroids = kmeans(sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+    order_centroids_geometrically(&mut centroids, dim, n_cent);
     (n_cent, centroids)
+}
+
+/// Reorder trained fine centroids into a deterministic greedy
+/// nearest-neighbor chain: start at the centroid nearest the centroid
+/// mean, then repeatedly append the unvisited centroid nearest the
+/// chain's tail (ties broken by lower index).
+///
+/// Per-cluster blocks are written in centroid order, so geometric
+/// neighbors become **file neighbors**: a query's top fine runs are
+/// mutual neighbors around the query point, so they land adjacent and
+/// the cold fetch coalesces them into one range — independent of k-means
+/// init order, row arrival order, or the upstream grid shape. Without
+/// this the layout is init-order random: measured at 10M, bit-identical
+/// hidden cell topology packed from 256- vs 512-cell user grids flipped
+/// the post-drain first cold query between 2 and 4 GETs on layout luck
+/// alone, and compaction's repack reshuffled it again (2 → 3 GETs on an
+/// unchanged table).
+///
+/// Ordering always chains on L2² over the stored fp32 — well-defined for
+/// every metric (cosine corpora arrive normalized, where L2 order is
+/// angular order) — and permuting whole clusters is semantically
+/// neutral: assignments, summaries, and the cluster index all derive
+/// from the same order downstream.
+fn order_centroids_geometrically(centroids: &mut [f32], dim: usize, n_cent: usize) {
+    if n_cent <= 2 || centroids.len() != n_cent * dim {
+        return;
+    }
+    let mean = mean_f32_cluster_major(centroids, dim, n_cent);
+    let dist = |a: &[f32], c: usize| distance(Metric::L2Sq, a, &centroids[c * dim..(c + 1) * dim]);
+    let mut visited = vec![false; n_cent];
+    let mut order = Vec::with_capacity(n_cent);
+    let mut current = (0..n_cent)
+        .min_by(|&a, &b| dist(&mean, a).total_cmp(&dist(&mean, b)))
+        .unwrap_or(0);
+    visited[current] = true;
+    order.push(current);
+    while order.len() < n_cent {
+        let tail = centroids[current * dim..(current + 1) * dim].to_vec();
+        let next = (0..n_cent)
+            .filter(|&c| !visited[c])
+            .min_by(|&a, &b| dist(&tail, a).total_cmp(&dist(&tail, b)))
+            .expect("unvisited centroid remains");
+        visited[next] = true;
+        order.push(next);
+        current = next;
+    }
+    let mut reordered = vec![0.0f32; centroids.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        reordered[new_idx * dim..(new_idx + 1) * dim]
+            .copy_from_slice(&centroids[old_idx * dim..(old_idx + 1) * dim]);
+    }
+    centroids.copy_from_slice(&reordered);
 }
 
 /// In-RAM encoded rebuild (maintenance / compaction): thin adapter over the
@@ -3217,6 +3274,37 @@ mod tests {
         );
         let reader = VectorReader::open(Bytes::from(blob), &json).expect("open tiny sq8 shard");
         assert_eq!(reader.n_docs(), 1);
+    }
+
+    /// Greedy nearest-neighbor chain: planted 1-D centroids in shuffled
+    /// order come out in walk order, starting nearest the mean —
+    /// deterministic and input-order independent.
+    #[test]
+    fn order_centroids_geometrically_chains_neighbors() {
+        const DIM: usize = 4;
+        // Positions 0, 10, 21, 33 on every axis, supplied shuffled. Mean
+        // is 16 → start at 21 (distance 5 beats 10's 6), then chain
+        // 21 → 10 → 0 → 33.
+        let positions = [33.0f32, 10.0, 0.0, 21.0];
+        let mut centroids = Vec::with_capacity(positions.len() * DIM);
+        for p in positions {
+            centroids.extend(std::iter::repeat_n(p, DIM));
+        }
+        order_centroids_geometrically(&mut centroids, DIM, positions.len());
+        let ordered: Vec<f32> = (0..positions.len()).map(|c| centroids[c * DIM]).collect();
+        assert_eq!(ordered, vec![21.0, 10.0, 0.0, 33.0]);
+
+        // A different input permutation converges to the same chain.
+        let positions_b = [0.0f32, 33.0, 21.0, 10.0];
+        let mut centroids_b = Vec::with_capacity(positions_b.len() * DIM);
+        for p in positions_b {
+            centroids_b.extend(std::iter::repeat_n(p, DIM));
+        }
+        order_centroids_geometrically(&mut centroids_b, DIM, positions_b.len());
+        let ordered_b: Vec<f32> = (0..positions_b.len())
+            .map(|c| centroids_b[c * DIM])
+            .collect();
+        assert_eq!(ordered_b, ordered, "chain order is input-order invariant");
     }
 
     #[test]
