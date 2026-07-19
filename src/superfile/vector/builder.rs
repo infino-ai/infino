@@ -1313,17 +1313,48 @@ fn materialized_chunk_rows_for_dim(dim: usize) -> usize {
     (PASS2_CHUNK_MEM_BUDGET_BYTES / row_bytes).clamp(PASS2_CHUNK_ROWS_MIN, PASS2_CHUNK_ROWS_MAX)
 }
 
-/// Strided training-sample index: sample `s` of `sample_size` maps to corpus
-/// row `s·n_docs/sample_size` (identity when the sample covers the whole
-/// corpus). One definition shared by every cell-pack training sampler, so
-/// the spilled / in-RAM / fp32 feeders train fine centroids on the same rows.
+/// SplitMix64 finalizer — the per-bucket jitter hash for the training
+/// sampler. Deterministic, seedable, and cheap; statistically well-mixed
+/// output for sequential inputs.
 #[inline]
-fn strided_sample_index(s: usize, sample_size: usize, n_docs: usize) -> usize {
-    if sample_size == n_docs {
-        s
-    } else {
-        s * n_docs / sample_size
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Seed decorrelator for the training sampler's jitter stream, keeping it
+/// distinct from the k-means and reservoir streams derived from the same
+/// column `rot_seed`.
+const SAMPLE_JITTER_SEED_XOR: u64 = 0xa5a5_5a5a_c3c3_3c3c;
+
+/// Jittered training-sample index: sample `s` of `sample_size` picks a
+/// deterministic pseudo-random row inside its stride bucket
+/// `[s·n/sample, (s+1)·n/sample)` (identity when the sample covers the
+/// whole corpus). Buckets are disjoint, so indices stay strictly
+/// increasing — the streaming spill reader consumes them in one pass.
+///
+/// The jitter is load-bearing, not cosmetic: a plain stride aliases with
+/// periodic arrival order. Measured at 100M (row-fraction sample = n/4,
+/// an exact stride of 4, over a corpus whose rows cycle planted clusters
+/// round-robin): entire blobs were never sampled, k-means trained no
+/// centroid near them, and each invisible blob collapsed onto its nearest
+/// trained centroid at scatter — 92K-row mega-runs the oversized-run
+/// split cannot see (the sink centroid looks normal-sized in the sample),
+/// a flat 0.13 fine-coverage curve, and post-drain recall 0.136. One
+/// definition shared by every cell-pack training sampler, so the spilled
+/// / in-RAM / fp32 feeders train fine centroids on the same rows.
+#[inline]
+fn sampled_index(s: usize, sample_size: usize, n_docs: usize, seed: u64) -> usize {
+    if sample_size >= n_docs {
+        return s;
     }
+    let base = s * n_docs / sample_size;
+    let next = ((s + 1) * n_docs / sample_size).min(n_docs);
+    let width = next.saturating_sub(base).max(1) as u64;
+    let jitter = splitmix64(seed ^ SAMPLE_JITTER_SEED_XOR ^ (s as u64)) % width;
+    base + jitter as usize
 }
 
 /// Payload half of one bucket record: pinned Sq8+ε bytes copied verbatim
@@ -1383,6 +1414,7 @@ fn sample_spilled_materialized_rows(
     spill: &SpilledCellRows,
     sample_size: usize,
     chunk_rows: usize,
+    seed: u64,
 ) -> Result<Vec<f32>, BuildError> {
     if sample_size == 0 {
         return Ok(Vec::new());
@@ -1390,7 +1422,7 @@ fn sample_spilled_materialized_rows(
     let n_docs = spill.n_rows();
     let dim = spill.dim();
     let targets: Vec<usize> = (0..sample_size)
-        .map(|sample| strided_sample_index(sample, sample_size, n_docs))
+        .map(|sample| sampled_index(sample, sample_size, n_docs, seed))
         .collect();
     let mut sample = vec![0.0f32; sample_size * dim];
     let mut reader = spill.reader()?;
@@ -1815,17 +1847,18 @@ impl CellPackSource<'_> {
     }
 }
 
-/// Strided fp32 training sample decoded from in-RAM encoded rows. Same
-/// stride selection as the spilled sampler.
+/// Jitter-sampled fp32 training rows decoded from in-RAM encoded rows.
+/// Same index selection as the spilled sampler.
 fn sample_ram_materialized_rows(
     rows: &[MaterializedIvfRow],
     sample_size: usize,
     dim: usize,
+    seed: u64,
 ) -> Vec<f32> {
     let n_docs = rows.len();
     let mut sample = vec![0.0f32; sample_size * dim];
     for s in 0..sample_size {
-        let idx = strided_sample_index(s, sample_size, n_docs);
+        let idx = sampled_index(s, sample_size, n_docs, seed);
         let enc = &rows[idx].encoded;
         dequantize_sq8_residual_into(
             &enc.scale,
@@ -1841,12 +1874,12 @@ fn sample_ram_materialized_rows(
     sample
 }
 
-/// Strided fp32 training sample copied straight from an fp32 corpus.
-fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize) -> Vec<f32> {
+/// Jitter-sampled fp32 training rows copied straight from an fp32 corpus.
+fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) -> Vec<f32> {
     let n_docs = vectors.len() / dim.max(1);
     let mut sample = vec![0.0f32; sample_size * dim];
     for s in 0..sample_size {
-        let idx = strided_sample_index(s, sample_size, n_docs);
+        let idx = sampled_index(s, sample_size, n_docs, seed);
         sample[s * dim..(s + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
     sample
@@ -1938,10 +1971,14 @@ pub(crate) fn build_cell_subsection_from_source(
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
     let sample = match &source {
         CellPackSource::Spilled(spill) => {
-            sample_spilled_materialized_rows(spill, sample_size, chunk_rows)?
+            sample_spilled_materialized_rows(spill, sample_size, chunk_rows, cfg.rot_seed)?
         }
-        CellPackSource::Rows(rows) => sample_ram_materialized_rows(rows, sample_size, dim),
-        CellPackSource::Fp32 { vectors, .. } => sample_fp32_rows(vectors, sample_size, dim),
+        CellPackSource::Rows(rows) => {
+            sample_ram_materialized_rows(rows, sample_size, dim, cfg.rot_seed)
+        }
+        CellPackSource::Fp32 { vectors, .. } => {
+            sample_fp32_rows(vectors, sample_size, dim, cfg.rot_seed)
+        }
     };
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
         materialized_centroids(&cfg, n_docs, &sample)
@@ -3502,6 +3539,46 @@ mod tests {
             after.iter().all(|&n| n <= bound),
             "every run must fit the bound {bound}: {after:?}"
         );
+    }
+
+    /// The training sampler must not phase-lock to periodic arrival order.
+    /// With a corpus whose rows cycle 4 classes round-robin and a sample of
+    /// exactly n/4 (the 100M row-fraction shape, integer stride 4), a plain
+    /// stride samples one class only and the other three train no centroid
+    /// — measured at 100M as 92K-row mega-runs and post-drain recall 0.136.
+    /// The jittered indices must cover every class, stay strictly
+    /// increasing (the spill reader streams them in one pass), stay in
+    /// bounds, and be deterministic per seed.
+    #[test]
+    fn sampled_index_breaks_periodic_aliasing() {
+        let n_docs = 4096usize;
+        let sample_size = n_docs / 4;
+        let seed = 7u64;
+        let indices: Vec<usize> = (0..sample_size)
+            .map(|s| sampled_index(s, sample_size, n_docs, seed))
+            .collect();
+        let mut class_seen = [false; 4];
+        for (s, &idx) in indices.iter().enumerate() {
+            assert!(idx < n_docs, "index {idx} out of bounds");
+            if s > 0 {
+                assert!(
+                    idx > indices[s - 1],
+                    "indices must be strictly increasing: {} then {idx}",
+                    indices[s - 1]
+                );
+            }
+            class_seen[idx % 4] = true;
+        }
+        assert_eq!(
+            class_seen, [true; 4],
+            "every periodic class must be sampled (plain stride 4 sees one)"
+        );
+        let again: Vec<usize> = (0..sample_size)
+            .map(|s| sampled_index(s, sample_size, n_docs, seed))
+            .collect();
+        assert_eq!(indices, again, "same seed must select the same rows");
+        // Full-coverage sample stays the identity.
+        assert_eq!(sampled_index(3, 8, 8, seed), 3);
     }
 
     /// Single-run packs (the commit-time cell delta shape) pass through
