@@ -1139,6 +1139,8 @@ pub mod vector {
         sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     };
 
+    use infino::storage::io_counters;
+
     use super::*;
     use crate::{
         corpus,
@@ -3169,6 +3171,9 @@ pub mod vector {
                         .expect("filtered prewarm query");
                 }
                 let filtered_before = consumer_meter.snapshot();
+                // Drop phases accumulated by the prewarm loop so the dump
+                // below covers exactly the measured window.
+                let _ = io_counters::phase_take_summed();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
                     let hits =
@@ -3183,6 +3188,20 @@ pub mod vector {
                     latencies.push(t0.elapsed());
                     let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
                     recalls.push(corpus::recall_at_k(&dense_hits, gt));
+                }
+                let filtered_phases = io_counters::phase_take_summed();
+                if !filtered_phases.is_empty() && !q_correct.is_empty() {
+                    let n = q_correct.len() as f64;
+                    let parts: Vec<String> = filtered_phases
+                        .iter()
+                        .map(|(name, us)| format!("{name}={:.0}µs", *us as f64 / n))
+                        .collect();
+                    eprintln!(
+                        "[vector filtered phases] avg over {} queries (Σ across concurrent \
+                         fan-out units): {}",
+                        q_correct.len(),
+                        parts.join("  ")
+                    );
                 }
                 let filtered_io = consumer_meter.snapshot().since(&filtered_before);
                 if !q_correct.is_empty() {
