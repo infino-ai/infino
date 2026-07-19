@@ -261,6 +261,21 @@ impl QueryStateCost {
             _ => self.ram_bytes.unwrap_or(fallback),
         }
     }
+
+    /// Display form of the serving resident set, split by layer when both
+    /// halves were sampled: pinned heap is supertable state (manifest,
+    /// summaries, routing slabs) and page cache is superfile data (postings,
+    /// centroid regions, rerank payloads). Falls back to the single total.
+    fn serving_ram_label(&self, fallback: u64) -> String {
+        match (self.ram_anon_bytes, self.ram_file_settled_bytes) {
+            (Some(anon), Some(file)) => format!(
+                "{} manifest-pinned + {} superfile cache",
+                fmt_bytes(anon),
+                fmt_bytes(file)
+            ),
+            _ => fmt_bytes(self.serving_resident_bytes(fallback)),
+        }
+    }
 }
 
 /// Metered object-store I/O for the lifecycle phases of one bench cell.
@@ -1201,7 +1216,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     text(format!("Cold — {label}")),
                     text(fmt_time(wall_s * 1e9)),
                     text(fmt_vcpu_seconds(cpu_s)),
-                    text(fmt_bytes(ram_bytes)),
+                    text(state.serving_ram_label(c.resident_anon_bytes)),
                     text(if ram > cpu_s { "RAM" } else { "CPU" }),
                     metric(
                         per_q * PER_MILLION,
@@ -1234,7 +1249,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     text(format!("Warm — {label}")),
                     text(fmt_time(p50_s * 1e9)),
                     text(fmt_vcpu_seconds(cpu_s)),
-                    text(fmt_bytes(ram_bytes)),
+                    text(state.serving_ram_label(c.resident_anon_bytes)),
                     text(if ram > cpu_s { "RAM" } else { "CPU" }),
                     metric(
                         per_q * PER_MILLION,
