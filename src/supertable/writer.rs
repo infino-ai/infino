@@ -397,6 +397,63 @@ struct BufferedBatch {
     vectors: Vec<Arc<Float32Array>>,
 }
 
+/// Zero-copy view of one vector column across the buffered batches:
+/// `row(local)` resolves a commit-wide row ordinal to its `&[f32]` slice
+/// inside the owning batch's Arrow buffer. Replaces the commit-time
+/// flatten, which materialized a full copy of every vector column
+/// (12.8 GiB at a 3.125M-row × dim-1024 commit) just to hand out row
+/// slices — a peak-RSS driver on top of the buffered batches themselves.
+struct VectorColumnView<'a> {
+    dim: usize,
+    /// Per-batch contiguous values, in buffer order.
+    batches: Vec<&'a [f32]>,
+    /// `offsets[i]` = first commit-wide row of batch `i`, plus a trailing
+    /// total-row sentinel.
+    offsets: Vec<usize>,
+}
+
+impl<'a> VectorColumnView<'a> {
+    fn over(buffer: &'a [BufferedBatch], col_idx: usize, dim: usize) -> Self {
+        let mut batches = Vec::with_capacity(buffer.len());
+        let mut offsets = Vec::with_capacity(buffer.len() + 1);
+        let mut total = 0usize;
+        for buffered in buffer {
+            offsets.push(total);
+            let values: &[f32] = buffered.vectors[col_idx].values();
+            total += values.len() / dim.max(1);
+            batches.push(values);
+        }
+        offsets.push(total);
+        Self {
+            dim,
+            batches,
+            offsets,
+        }
+    }
+
+    fn n_rows(&self) -> usize {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
+    /// The commit-wide row `local` as a `&[f32]` of length `dim`.
+    fn row(&self, local: usize) -> Result<&'a [f32], BuildError> {
+        // partition_point returns the first offset > local; its
+        // predecessor is the owning batch.
+        let batch = self
+            .offsets
+            .partition_point(|&first_row| first_row <= local)
+            .saturating_sub(1);
+        let in_batch = local
+            .checked_sub(self.offsets[batch])
+            .ok_or_else(|| BuildError::Store(format!("vector row {local} before batch start")))?;
+        let start = in_batch * self.dim;
+        self.batches
+            .get(batch)
+            .and_then(|values| values.get(start..start + self.dim))
+            .ok_or_else(|| BuildError::Store(format!("vector row {local} out of buffered range")))
+    }
+}
+
 /// Row-balanced split of the writer's buffered batches into
 /// `n_shards` shard inputs, each shaped as a `Vec<BufferedBatch>`
 /// that [`build_one_shard_with_layout`] can consume directly. The split walks
@@ -4716,9 +4773,9 @@ fn commit_shards_via_drain(
         )));
     }
 
-    // Flatten the buffer once (ids + vectors + scalar batches).
+    // Collect ids + scalar batches; vectors stay in their Arrow buffers
+    // behind zero-copy views (no flatten — see `VectorColumnView`).
     let mut stable_ids: Vec<i128> = Vec::new();
-    let mut flat_vectors: Vec<Vec<f32>> = vec![Vec::new(); inner.options.vector_columns.len()];
     let mut scalar_batches: Vec<&RecordBatch> = Vec::with_capacity(buffer.len());
     for buffered in buffer {
         let id_col = buffered
@@ -4735,21 +4792,25 @@ fn commit_shards_via_drain(
         for i in 0..id_col.len() {
             stable_ids.push(id_col.value(i));
         }
-        for (col_idx, fa) in buffered.vectors.iter().enumerate() {
-            flat_vectors[col_idx].extend_from_slice(fa.values());
-        }
         scalar_batches.push(&buffered.scalar);
     }
     if stable_ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let primary_vectors = flat_vectors
+    let vector_views: Vec<VectorColumnView<'_>> = inner
+        .options
+        .vector_columns
+        .iter()
+        .enumerate()
+        .map(|(col_idx, col)| VectorColumnView::over(buffer, col_idx, col.dim))
+        .collect();
+    let primary_view = vector_views
         .first()
         .ok_or_else(|| BuildError::Store("drain-commit missing vector values".into()))?;
-    if primary_vectors.len() != stable_ids.len() * dim {
+    if primary_view.n_rows() != stable_ids.len() {
         return Err(BuildError::Store(format!(
-            "commit vector len {} != rows {} * dim {dim}",
-            primary_vectors.len(),
+            "commit vector rows {} != id rows {}",
+            primary_view.n_rows(),
             stable_ids.len()
         )));
     }
@@ -4769,13 +4830,12 @@ fn commit_shards_via_drain(
         .iter()
         .enumerate()
         .map(|(local, &stable_id)| {
-            let start = local * dim;
-            PackRow::Fp32 {
+            Ok(PackRow::Fp32 {
                 stable_id,
-                vector: &primary_vectors[start..start + dim],
-            }
+                vector: primary_view.row(local)?,
+            })
         })
-        .collect();
+        .collect::<Result<_, BuildError>>()?;
     let replica_target = drain_replica_target_factor();
     let assigned = inner
         .options
@@ -4795,7 +4855,7 @@ fn commit_shards_via_drain(
         build_one_packed_shard_via_drain(
             cells,
             &source_scalar,
-            &flat_vectors,
+            &vector_views,
             &local_by_id,
             options,
             &vc,
@@ -4835,7 +4895,7 @@ fn commit_shards_via_drain(
 fn build_one_packed_shard_via_drain(
     cells: &[(u32, AssignedCellGroup<'_>)],
     source_scalar: &RecordBatch,
-    flat_vectors: &[Vec<f32>],
+    vector_views: &[VectorColumnView<'_>],
     local_by_id: &HashMap<i128, u32>,
     options: &SupertableOptions,
     vc: &VectorConfig,
@@ -4872,7 +4932,7 @@ fn build_one_packed_shard_via_drain(
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
-        || build_shard_parquet_and_fts(source_scalar, flat_vectors, &ordered_locals, options),
+        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, options),
     );
     let packed_groups = packed_groups?;
     let (mut builder, id_min, id_max, n_docs, scalar_stats) = body_and_fts?;
@@ -4900,7 +4960,7 @@ fn build_one_packed_shard_via_drain(
 #[allow(clippy::type_complexity)]
 fn build_shard_parquet_and_fts(
     source_scalar: &RecordBatch,
-    flat_vectors: &[Vec<f32>],
+    vector_views: &[VectorColumnView<'_>],
     ordered_locals: &[u32],
     options: &SupertableOptions,
 ) -> Result<
@@ -4923,18 +4983,14 @@ fn build_shard_parquet_and_fts(
     let scalar = RecordBatch::try_new(source_scalar.schema(), columns)
         .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
-    let mut ordered_vectors: Vec<Vec<f32>> = Vec::with_capacity(flat_vectors.len());
-    for (col_idx, source) in flat_vectors.iter().enumerate() {
-        let dim = options.vector_columns[col_idx].dim;
-        let mut ordered = Vec::with_capacity(ordered_locals.len() * dim);
+    // This shard's rows in IVF order — the one remaining vector copy on
+    // the commit path, shard-sized and transient (the commit-wide flatten
+    // it replaced held every column for the whole commit).
+    let mut ordered_vectors: Vec<Vec<f32>> = Vec::with_capacity(vector_views.len());
+    for view in vector_views {
+        let mut ordered = Vec::with_capacity(ordered_locals.len() * view.dim);
         for &local in ordered_locals {
-            let start = local as usize * dim;
-            let Some(slice) = source.get(start..start + dim) else {
-                return Err(BuildError::Store(format!(
-                    "shard vector local {local} out of bounds for column {col_idx}"
-                )));
-            };
-            ordered.extend_from_slice(slice);
+            ordered.extend_from_slice(view.row(local as usize)?);
         }
         ordered_vectors.push(ordered);
     }
