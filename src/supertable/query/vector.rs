@@ -377,7 +377,6 @@ fn filtered_cell_probe(base: usize, allowed_rows: u64, total_rows: u64) -> usize
     ((base as f64 / selectivity).ceil() as usize).max(base)
 }
 
-
 /// One admit fine-centroid candidate:
 /// `(superfile index, flat cluster id, score, cell id, indexed doc count)`.
 type FineCandidate = (usize, u32, f32, Option<u32>, u64);
@@ -1121,8 +1120,15 @@ impl SupertableReader {
                     leftovers.push(d);
                     continue;
                 };
-                if !score_cell_fp32(superfiles, column, &d, fp32.as_slice(), query, metric, candidates)
-                {
+                if !score_cell_fp32(
+                    superfiles,
+                    column,
+                    &d,
+                    fp32.as_slice(),
+                    query,
+                    metric,
+                    candidates,
+                ) {
                     leftovers.push(d);
                 }
             }
@@ -1491,14 +1497,8 @@ impl SupertableReader {
             // (legacy flat path, no prefilter). Stripped summaries defer to
             // the exact rescore — untagged legacy tables have no per-cell
             // gating to absorb estimate noise.
-            let (mut candidates, deferred) = score_fine_candidates(
-                &superfiles,
-                column,
-                query,
-                metric,
-                None,
-                allow_ref,
-            )?;
+            let (mut candidates, deferred) =
+                score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
                     &superfiles,
@@ -2701,7 +2701,6 @@ mod tests {
         // A filter matching everything is the unfiltered width.
         assert_eq!(filtered_cell_probe(8, 1_000_000, 1_000_000), 8);
     }
-
 
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {

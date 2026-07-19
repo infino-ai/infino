@@ -1430,7 +1430,10 @@ impl ManifestSnapshot {
     /// when no loader/parts exist (entries are inline and unstripped).
     pub(crate) async fn user_centroids_for_rescore(&self) -> Option<Arc<UserCentroidCache>> {
         let list = self.list.as_ref()?;
-        if matches!(list.partition_strategy, PartitionStrategy::VectorCell { .. }) {
+        if matches!(
+            list.partition_strategy,
+            PartitionStrategy::VectorCell { .. }
+        ) {
             return None;
         }
         let loader = self.loader.as_ref()?;
@@ -1996,10 +1999,7 @@ impl ManifestPartLoader {
     /// regardless of the loader's routing preference — the user-table
     /// centroid hydration reads full parts once even on consumers that
     /// open with routing siblings.
-    pub async fn load_full(
-        &self,
-        part_id: PartId,
-    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+    pub async fn load_full(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         self.load_with_form(part_id, false).await
     }
 
@@ -2086,10 +2086,7 @@ impl UserCentroidCache {
                         .or_default();
                     for cell in &summary.cells {
                         if cell.clusters.vectors_resident() && cell.clusters.n_cent > 0 {
-                            list.push((
-                                cell.cell_id,
-                                Arc::new(cell.clusters.centroids.clone()),
-                            ));
+                            list.push((cell.cell_id, Arc::new(cell.clusters.centroids.clone())));
                         }
                     }
                 }

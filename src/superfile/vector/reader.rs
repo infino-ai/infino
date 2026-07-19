@@ -4598,7 +4598,9 @@ async fn get_cluster_ranges_coalesced_with_extras_async(
         ));
     }
     let plan = probe_wave_plan(ranges, extras);
-    let fetched = source.get_ranges_parallel_async(plan.fetch_ranges()).await?;
+    let fetched = source
+        .get_ranges_parallel_async(plan.fetch_ranges())
+        .await?;
     let mut restored = plan.restore(&fetched);
     let extra_bytes = restored.split_off(ranges.len());
     Ok((restored, extra_bytes))

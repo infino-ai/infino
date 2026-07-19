@@ -6057,8 +6057,7 @@ pub(crate) async fn try_commit_attempt(
             // new generation's section from it plus this commit's fresh
             // (fp32-resident) entries.
             let previous_section =
-                previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref())
-                    .await;
+                previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref()).await;
             let published = slow_vector_state::write_state(
                 storage.as_ref(),
                 entries,
@@ -6091,12 +6090,7 @@ pub(crate) async fn try_commit_attempt(
     //    list entry references.
     let encoded_refs: Vec<&[u8]> = parts_to_write
         .iter()
-        .flat_map(|ep| {
-            [
-                Some(ep.encoded.as_slice()),
-                ep.routing_encoded.as_deref(),
-            ]
-        })
+        .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
         .flatten()
         .collect();
     new_manifest

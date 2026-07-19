@@ -2460,7 +2460,9 @@ mod tests {
             "pre-drain user manifest must carry parts (routing hydration under test)"
         );
         assert!(
-            user_part_entries.iter().all(|entry| entry.routing.is_some()),
+            user_part_entries
+                .iter()
+                .all(|entry| entry.routing.is_some()),
             "commits must stamp a routing sibling on every user part"
         );
         // Routing-part decode must have dropped the user fp32 — otherwise

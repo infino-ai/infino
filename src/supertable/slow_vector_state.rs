@@ -273,9 +273,7 @@ pub(crate) fn compose_centroid_section(
                     continue;
                 }
                 let carried = previous
-                    .and_then(|section| {
-                        section.read_cell(entry.superfile_id, column, cell.cell_id)
-                    })
+                    .and_then(|section| section.read_cell(entry.superfile_id, column, cell.cell_id))
                     .filter(|fp32| fp32.len() == expected);
                 match carried {
                     Some(fp32) => {
@@ -691,7 +689,9 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
-        let published = write_state(&storage, &entries, None).await.expect("publish");
+        let published = write_state(&storage, &entries, None)
+            .await
+            .expect("publish");
         assert_eq!(published.centroids.content_hash, ContentHash::of(&section));
 
         let fetched = fetch_centroid_section(&storage, &published.centroids, &entries)
@@ -763,7 +763,9 @@ mod tests {
         let (uri, hash) = (published.uri, published.content_hash);
         // Re-publishing identical content must succeed (PreconditionFailed
         // from the hash-derived URI is benign by construction).
-        let republished = write_state(&storage, &entries, None).await.expect("rewrite");
+        let republished = write_state(&storage, &entries, None)
+            .await
+            .expect("rewrite");
         assert_eq!(uri, republished.uri);
         assert_eq!(hash, republished.content_hash);
         assert_eq!(published.centroids, republished.centroids);

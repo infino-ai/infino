@@ -3262,8 +3262,7 @@ pub mod vector {
                         let mean: f32 =
                             wide_recalls.iter().sum::<f32>() / wide_recalls.len() as f32;
                         wide_lat.sort_unstable();
-                        let p50_ms =
-                            wide_lat[wide_lat.len() / 2].as_secs_f64() * 1e3;
+                        let p50_ms = wide_lat[wide_lat.len() / 2].as_secs_f64() * 1e3;
                         eprintln!(
                             "[supertable_vector] filtered width-sweep: nprobe={width} \
                              recall@{TOP_K}={mean:.3} p50={p50_ms:.2}ms"
@@ -3617,7 +3616,11 @@ pub mod vector {
                                 "steady-state",
                                 &built,
                                 &q_cal[0],
-                                if q_cal.len() > 1 { &q_cal[1..] } else { &q_cal[..] },
+                                if q_cal.len() > 1 {
+                                    &q_cal[1..]
+                                } else {
+                                    &q_cal[..]
+                                },
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
