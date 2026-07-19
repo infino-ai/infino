@@ -42,10 +42,7 @@ use crate::{
             kmeans::{assign_to_centroids, kmeans},
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-            reservoir::{
-                CONSOLIDATED_CELL_ROWS_THRESHOLD, Reservoir, default_kmeans_sample_size,
-                partition_kmeans_sample_size,
-            },
+            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
             rotation::RandomRotation,
             spill::{
                 ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
@@ -106,6 +103,21 @@ const FINE_RUN_SPLIT_MAX_ROUNDS: usize = 4;
 /// from the base k-means stream (which offsets `rot_seed` internally).
 const FINE_RUN_SPLIT_SEED_OFFSET: u64 = 101;
 
+/// Cell row count marking the consolidated-cell regime where the drain's
+/// per-cell k-means degenerates and the cell pack switches build policy:
+/// above it the byte-target `n_cent` goes uncapped and oversized runs are
+/// split; at or below it the legacy build ships byte-identical (row-count
+/// cap applied, no split). The value is bracketed by measurement: 10M's
+/// largest cell (65,918 rows) must keep the legacy layout — the armed
+/// 2-GET cold-probe gate was measured on it, and letting the new policy
+/// leak in moved the probe to 4 GETs — while 100M's median cell (95,801
+/// rows) trains 48×-imbalanced mega-runs under the legacy build (flat
+/// 0.81 fine-coverage curve) and needs both fixes. 80,000 sits strictly
+/// between the two design points. Distinct from the drain-sample boost
+/// threshold (65,536 in `reservoir.rs`), which is part of the measured
+/// 10M baseline and must keep covering its biggest cells.
+const CONSOLIDATED_CELL_ROWS_THRESHOLD: usize = 80_000;
+
 /// Target memory budget (~128 MiB) for one pass-2 rotated chunk
 /// (`chunk_rows × dim × 4` bytes); the chunk row count is derived
 /// from this so resident memory stays bounded independent of `dim`.
@@ -125,13 +137,14 @@ const MATERIALIZED_BUCKET_CHUNK_BYTES: usize = 16 << 20;
 const MATERIALIZED_ASSIGN_BYTES_PER_DIM: usize = 2 + size_of::<f32>();
 
 /// Superfile-local document thresholds for capping the physical IVF centroid
-/// count on the **streaming global build only** (the user-table superfile
-/// path, where `cfg.n_cent` is a corpus-scale config knob — e.g. 1024/4096 —
-/// hitting one commit-sized superfile; the cap turns that into a sane
-/// per-file count). Cell packs never consult it: their `n_cent` is already
-/// row-derived from the fine-run byte target in `drain_cell_vector_config`,
-/// and capping it again would fatten runs past the target (and step
-/// discontinuously at the 100K-row boundary, mid drain-cell range at 100M).
+/// count. On the streaming global build (the user-table superfile path,
+/// where `cfg.n_cent` is a corpus-scale config knob — e.g. 1024/4096 —
+/// hitting one commit-sized superfile) the cap always applies. Cell packs
+/// apply it only below `CONSOLIDATED_CELL_ROWS_THRESHOLD` — there it is
+/// part of the measured 1M/10M layouts — and drop it above, where its
+/// 100K-row step sits mid drain-cell range at 100M and clamping the
+/// byte-target `n_cent` (92 → 64 at a 97K-row cell) fattens runs past
+/// the target.
 const N_CENT_LARGE_DOC_THRESHOLD: usize = 5_000_000;
 /// Maximum IVF centroids for large physical vector indexes.
 const N_CENT_LARGE: usize = 4096;
@@ -1121,16 +1134,23 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
         let n_cent = global.len() / dim.max(1);
         return (n_cent, global.to_vec());
     }
-    // Cell packs trust the caller's row-derived `n_cent` (the fine-run byte
-    // target) — no row-count cap here.
-    let requested = cfg.n_cent.max(1).min(n_docs.max(1));
+    // Build policy switches at the consolidated-cell boundary (see
+    // `CONSOLIDATED_CELL_ROWS_THRESHOLD`): consolidated cells take the
+    // row-derived byte-target `n_cent` uncapped and get oversized runs
+    // split; everything below ships the legacy build byte-identical —
+    // row-count cap applied, no split — because the 1M/10M layouts (and
+    // their armed cold-probe gates) were measured on exactly that build.
+    let consolidated = n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD;
+    let requested = if consolidated {
+        cfg.n_cent.max(1).min(n_docs.max(1))
+    } else {
+        cfg.n_cent
+            .max(1)
+            .min(n_cent_row_count_cap(n_docs))
+            .min(n_docs.max(1))
+    };
     let mut centroids = kmeans(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
-    // The run-size bound engages only in the consolidated-cell regime,
-    // alongside the row-fraction sample boost keyed to the same threshold.
-    // Below it the trained layout ships untouched: 1M/10M cells measured
-    // full fine coverage with their benign imbalance, and splitting them
-    // over-fragmented the runs and scattered the cold probe (2 → 3 GETs).
-    let n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+    let n_cent = if consolidated {
         split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed)
     } else {
         requested
@@ -1899,9 +1919,17 @@ pub(crate) fn build_cell_subsection_from_source(
             }
         }
     }
-    // Mirrors `materialized_centroids`: cell packs take the row-derived
-    // `n_cent` uncapped, so the sample is sized for the runs actually trained.
-    let requested_n_cent = cfg.n_cent.max(1).min(n_docs);
+    // Mirrors the `materialized_centroids` policy switch so the sample is
+    // sized for the runs actually trained: consolidated cells uncapped,
+    // sub-threshold cells under the legacy row-count cap.
+    let requested_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        cfg.n_cent.max(1).min(n_docs)
+    } else {
+        cfg.n_cent
+            .max(1)
+            .min(n_cent_row_count_cap(n_docs))
+            .min(n_docs)
+    };
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
@@ -3486,6 +3514,41 @@ mod tests {
         let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7);
         assert_eq!(n_cent, 1);
         assert_eq!(centroids, original);
+    }
+
+    /// The cell-pack build policy switches at the consolidated-cell
+    /// boundary: at or below it the legacy row-count cap binds `n_cent`
+    /// (the measured 1M/10M layout); above it the byte-target count is
+    /// taken uncapped.
+    #[test]
+    fn materialized_centroids_caps_only_below_consolidated_threshold() {
+        let dim = 8;
+        // Byte-target n_cent above the legacy sub-100K cap of 64.
+        let requested = 92;
+        let sample: Vec<f32> = (0..256 * dim).map(|i| (i % 251) as f32 * 0.01).collect();
+        let mk = |n_docs: usize| {
+            let cfg = VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: requested,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            };
+            materialized_centroids(&cfg, n_docs, &sample).0
+        };
+        assert_eq!(
+            mk(CONSOLIDATED_CELL_ROWS_THRESHOLD),
+            N_CENT_SMALL,
+            "sub-threshold cell keeps the legacy cap"
+        );
+        // Uncapped: at least the byte-target count (the run split may add
+        // sub-centroids on top; with the cap this would read exactly 64).
+        assert!(
+            mk(CONSOLIDATED_CELL_ROWS_THRESHOLD + 1) >= requested,
+            "consolidated cell takes the byte-target count uncapped"
+        );
     }
 
     /// Same inputs and seed produce identical output centroids.

@@ -84,24 +84,23 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
     target.clamp(KMEANS_SAMPLE_SIZE_FLOOR, KMEANS_SAMPLE_SIZE_CAP)
 }
 
-/// Partition row count marking the consolidated-cell regime (100M-scale
-/// drain cells) where per-cell k-means degenerates and needs help. Two
-/// mitigations key off it: the training sample switches from
-/// points-per-centroid to a row fraction (here), and the fine-run size
-/// bound engages (`builder::split_oversized_fine_runs`). At the 10M
-/// design point a hidden cell holds ~39K rows and `64 × n_cent` (~6.7%
-/// of the cell) trains balanced fine runs (measured p50 566 rows vs
-/// ~950 target). At 100M cell sizes (~98K rows) the same flat sample
-/// collapses the run-size distribution (measured p50 69 / max 23,918)
-/// and post-drain recall with it (0.199). Below this threshold both
-/// mitigations stay out of the way — the flat sample measured *better*
-/// at 1M (boosting cost 0.02 recall), and splitting 10M's benign 10×
-/// imbalance over-fragmented cells (14,242 fine runs vs 10,586, p50
-/// 367 vs 572) and scattered the cold probe from 2 to 3 GETs.
-pub(crate) const CONSOLIDATED_CELL_ROWS_THRESHOLD: usize = 65_536;
+/// Partition row count past which the per-cell training sample switches
+/// from points-per-centroid to a row fraction. At the 10M design point a
+/// hidden cell holds ~39K rows and `64 × n_cent` (~6.7% of the cell)
+/// trains balanced fine runs (measured p50 566 rows vs ~950 target). At
+/// 100M cell sizes (~98K rows) the same flat sample collapses the
+/// run-size distribution (measured p50 69 / max 23,918) and post-drain
+/// recall with it (0.199). Below this threshold the flat sample is both
+/// sufficient and *better* — boosting it at 1M-scale cells measured a
+/// 0.02 recall drop (0.995 → 0.975). Deliberately LOWER than the
+/// builder's cap/split boundary (`CONSOLIDATED_CELL_ROWS_THRESHOLD` in
+/// `builder.rs`): the 2-GET 10M baseline was measured with this boost
+/// active on its biggest cells (max 65,918 rows), so the boost is part
+/// of the known-good layout there while the cap/split must stay out.
+const PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS: usize = 65_536;
 
 /// Row fraction of an oversized partition the training sample must cover
-/// once past [`CONSOLIDATED_CELL_ROWS_THRESHOLD`]: a quarter
+/// once past [`PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS`]: a quarter
 /// of the rows, keeping the trained shape scale-invariant as cells grow.
 const PARTITION_SAMPLE_ROW_FRACTION_DIVISOR: usize = 4;
 
@@ -109,7 +108,7 @@ const PARTITION_SAMPLE_ROW_FRACTION_DIVISOR: usize = 4;
 /// per-cell IVF build): *points per centroid* (`mult × n_cent`), floored
 /// at one `mult` for tiny `n_cent` and sharing the upper cap; the caller
 /// bounds it by the row count (`.min(n_docs)`). Partitions past
-/// [`CONSOLIDATED_CELL_ROWS_THRESHOLD`] raise the sample to a
+/// [`PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS`] raise the sample to a
 /// quarter of their rows so the fine-run distribution stays balanced at
 /// 100M-scale cell sizes (see the threshold's doc for both measurements).
 ///
@@ -126,7 +125,7 @@ pub fn partition_kmeans_sample_size(n_cent: usize, n_rows: usize) -> usize {
         KMEANS_SAMPLE_NCENT_MULT
     };
     let per_centroid = mult.saturating_mul(n_cent);
-    let sample = if n_rows > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+    let sample = if n_rows > PARTITION_SAMPLE_ROW_FRACTION_THRESHOLD_ROWS {
         per_centroid.max(n_rows / PARTITION_SAMPLE_ROW_FRACTION_DIVISOR)
     } else {
         per_centroid
