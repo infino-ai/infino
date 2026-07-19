@@ -53,7 +53,7 @@ use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg};
+pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg, SlowStateRoutingRef};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
@@ -427,6 +427,7 @@ impl ManifestSnapshot {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts,
             tombstone_seqs,
         }
@@ -713,6 +714,19 @@ impl ManifestSnapshot {
                 list.slow_vector_state_content_hash,
             ) {
                 (Some(uri), Some(hash)) => {
+                    // Consumer memory mode fetches the routing sibling when
+                    // the publisher stamped one: same visible entries, but
+                    // each summary's cluster blocks are counts + 1-bit admit
+                    // slab (no fp32) — GiBs → MiBs at 100M docs. The decoded
+                    // entries land directly in the stripped shape, so the
+                    // strip pass below is a no-op for them.
+                    let (uri, hash) = match (
+                        options.summary_centroids_from_superfiles,
+                        list.slow_vector_state_routing.as_ref(),
+                    ) {
+                        (true, Some(routing)) => (routing.uri.as_str(), routing.content_hash),
+                        _ => (uri, hash),
+                    };
                     let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
                         .await
                         .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
@@ -1102,6 +1116,14 @@ impl ManifestSnapshot {
         ))
     }
 
+    /// Routing sibling of the slow-CAS blob (counts + 1-bit admit slab,
+    /// no fp32) — what consumer opens fetch under
+    /// `summary_centroids_from_superfiles`. `None` on manifests written
+    /// before the sibling existed.
+    pub(crate) fn slow_vector_state_routing_blob(&self) -> Option<&SlowStateRoutingRef> {
+        self.list.as_ref()?.slow_vector_state_routing.as_ref()
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
     /// without touching superfiles or parts.
@@ -1139,13 +1161,19 @@ impl ManifestSnapshot {
     /// [`ManifestSnapshot::with_deleted_user_ids`]. Standalone restamp path
     /// (e.g. post-drain refresh); membership commits instead compose the
     /// ref via [`Self::with_slow_vector_state_ref`] before the same CAS.
-    pub fn with_slow_vector_state(&self, uri: String, hash: part::ContentHash) -> Self {
+    pub fn with_slow_vector_state(
+        &self,
+        uri: String,
+        hash: part::ContentHash,
+        routing: SlowStateRoutingRef,
+    ) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.manifest_id = next_id;
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
+            list.slow_vector_state_routing = Some(routing);
             list
         });
         Self {
@@ -1172,11 +1200,17 @@ impl ManifestSnapshot {
     /// [`crate::supertable::writer::try_commit_attempt`] so the blob PUT and
     /// list/pointer CAS publish together — closing the window where a crash
     /// leaves membership durable with a cleared slow-state ref.
-    pub(crate) fn with_slow_vector_state_ref(&self, uri: String, hash: part::ContentHash) -> Self {
+    pub(crate) fn with_slow_vector_state_ref(
+        &self,
+        uri: String,
+        hash: part::ContentHash,
+        routing: SlowStateRoutingRef,
+    ) -> Self {
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
+            list.slow_vector_state_routing = Some(routing);
             list
         });
         Self {
@@ -1677,6 +1711,7 @@ impl ManifestSnapshot {
             // CAS, so membership and the slow-state ref publish together.
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: out_list_entries_after_removal,
         };
         let mut new_superfile_list = self
@@ -3006,6 +3041,37 @@ impl ClusterCentroids {
         decoded
     }
 
+    /// Wire-decode constructor for routing-only summary blocks (`CFR0`):
+    /// no fp32 payload on the wire, so the instance lands directly in the
+    /// stripped shape ([`Self::vectors_resident`] = false) with the admit
+    /// slab seeded — the same state [`Self::strip_centroids_after_slab`]
+    /// produces from a full instance.
+    pub(crate) fn from_decoded_routing(
+        n_cent: u32,
+        dim: u32,
+        counts: Vec<u32>,
+        admit: RabitqAdmitCodes,
+    ) -> Self {
+        debug_assert_eq!(
+            counts.len(),
+            n_cent as usize,
+            "routing cluster counts ({}) must match n_cent ({n_cent})",
+            counts.len()
+        );
+        Self {
+            n_cent,
+            dim,
+            centroids: Vec::new(),
+            counts,
+            transposed: OnceLock::new(),
+            admit_codes: {
+                let lock = OnceLock::new();
+                let _ = lock.set(admit);
+                lock
+            },
+        }
+    }
+
     /// 1-bit prefilter: the best (smallest) estimated admit score across
     /// this instance's populated clusters, from XOR+popcount over packed
     /// sign codes. `None` when no cluster is populated. Estimates rank
@@ -3944,6 +4010,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_routing: None,
                 parts: entries,
             }
         }
@@ -4247,6 +4314,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -4421,6 +4489,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_routing: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -4442,10 +4511,23 @@ mod tests {
         assert!(manifest.slow_vector_state_blob().is_none());
 
         let hash = ContentHash([3u8; 32]);
-        let stamped = manifest.with_slow_vector_state("slow-vector-state/state-x.bin".into(), hash);
+        let routing = SlowStateRoutingRef {
+            uri: "slow-vector-state/state-r.bin".into(),
+            content_hash: ContentHash([4u8; 32]),
+        };
+        let stamped = manifest.with_slow_vector_state(
+            "slow-vector-state/state-x.bin".into(),
+            hash,
+            routing.clone(),
+        );
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
         assert_eq!(uri, "slow-vector-state/state-x.bin");
         assert_eq!(got_hash, hash);
+        assert_eq!(
+            stamped.slow_vector_state_routing_blob(),
+            Some(&routing),
+            "routing sibling stamped with the full ref"
+        );
         assert_eq!(stamped.get_manifest_id(), manifest.get_next_manifest_id());
         assert_eq!(
             stamped.get_all_superfiles().len(),
@@ -4460,6 +4542,10 @@ mod tests {
             deleted_stamped.slow_vector_state_blob().is_some(),
             "deleted-ids stamp must preserve the slow-state ref"
         );
+        assert!(
+            deleted_stamped.slow_vector_state_routing_blob().is_some(),
+            "deleted-ids stamp must preserve the routing sibling ref"
+        );
 
         // A membership change (update) must CLEAR the ref: the blob no
         // longer describes the new membership; only maintenance restamps.
@@ -4471,6 +4557,10 @@ mod tests {
         assert!(
             updated.slow_vector_state_blob().is_none(),
             "membership change must clear the slow-state ref"
+        );
+        assert!(
+            updated.slow_vector_state_routing_blob().is_none(),
+            "membership change must clear the routing sibling ref"
         );
     }
 
@@ -4544,6 +4634,16 @@ mod tests {
         storage: &Arc<dyn StorageProvider>,
         slow_ref: Option<(String, ContentHash)>,
     ) -> Vec<Arc<SuperfileEntry>> {
+        persist_two_entry_table_with_routing(storage, slow_ref, None).await
+    }
+
+    /// [`persist_two_entry_table`] with an optional routing sibling ref for
+    /// the consumer-memory-mode hydration tests.
+    async fn persist_two_entry_table_with_routing(
+        storage: &Arc<dyn StorageProvider>,
+        slow_ref: Option<(String, ContentHash)>,
+        routing: Option<SlowStateRoutingRef>,
+    ) -> Vec<Arc<SuperfileEntry>> {
         let entries = vec![
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
@@ -4579,6 +4679,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
+            slow_vector_state_routing: routing,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4619,9 +4720,10 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
             .await
             .expect("write blob");
+        let (blob_uri, blob_hash) = (published.uri, published.content_hash);
         // Rebuild the same membership durably with the ref stamped.
         let (_dir2, storage2) = local_storage();
         let _ = _dir2;
@@ -4648,6 +4750,119 @@ mod tests {
         assert!(loaded.slow_vector_state_blob().is_some());
     }
 
+    /// Dim for the routing-hydration fixture summaries.
+    const ROUTING_TEST_DIM: usize = 16;
+    /// Rot seed for the routing-hydration fixture slabs.
+    const ROUTING_TEST_ROT_SEED: u64 = 5;
+
+    /// Stamped entry carrying a one-cell vector summary whose admit slab is
+    /// built — the shape drain-published entries have at republish time.
+    fn make_summary_entry(docs: u64) -> Arc<SuperfileEntry> {
+        let base = make_superfile_entry(docs, hash_bucket_0_pk());
+        let mut entry = (*base).clone();
+        let mut flat = vec![0.0f32; 2 * ROUTING_TEST_DIM];
+        flat[0] = 1.0;
+        flat[ROUTING_TEST_DIM + 1] = -1.0;
+        let clusters = ClusterCentroids::from_fp32(2, ROUTING_TEST_DIM as u32, &flat, vec![3, 4]);
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(ROUTING_TEST_DIM, ROUTING_TEST_ROT_SEED),
+            &BitQuantizer::new(ROUTING_TEST_DIM),
+            ROUTING_TEST_ROT_SEED,
+        );
+        entry.vector_summary.insert(
+            "emb".into(),
+            VectorSummary {
+                centroid: vec![0.5; ROUTING_TEST_DIM],
+                cells: vec![CellVectorSummary {
+                    cell_id: Some(0),
+                    clusters,
+                }],
+            },
+        );
+        Arc::new(entry)
+    }
+
+    /// Consumer memory mode picks the routing sibling at hydration: the
+    /// decoded summaries arrive stripped (no fp32) with the write-time slab
+    /// seeded. The fixture options carry no vector columns, so the
+    /// hydration-time strip pass is inert — stripped entries can only have
+    /// come from the routing blob, not from a full-blob decode + strip.
+    /// Knob-off consumers and knob-on consumers of pre-sibling manifests
+    /// keep the full blob (resident fp32).
+    #[tokio::test]
+    async fn consumer_mode_hydrates_from_routing_sibling() {
+        let (_dir, storage) = local_storage();
+        let entries = vec![make_summary_entry(100), make_summary_entry(50)];
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
+            .await
+            .expect("write blobs");
+        persist_two_entry_table_with_routing(
+            &storage,
+            Some((published.uri.clone(), published.content_hash)),
+            Some(published.routing.clone()),
+        )
+        .await;
+
+        let consumer_opts = |knob: bool| {
+            Arc::new(
+                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                    .expect("valid options")
+                    .with_summary_centroids_from_superfiles(knob),
+            )
+        };
+        let resident = |m: &ManifestSnapshot| {
+            m.superfiles
+                .iter()
+                .map(|e| {
+                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    assert!(clusters.admit_codes_built().is_some(), "slab always rides");
+                    clusters.vectors_resident()
+                })
+                .collect::<Vec<bool>>()
+        };
+
+        let knob_on = ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(true)))
+            .await
+            .expect("knob-on load");
+        assert_eq!(
+            resident(&knob_on),
+            vec![false, false],
+            "knob-on consumer must hydrate stripped entries from the routing sibling"
+        );
+
+        let knob_off =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(false)))
+                .await
+                .expect("knob-off load");
+        assert_eq!(
+            resident(&knob_off),
+            vec![true, true],
+            "knob-off consumer must keep the full blob's resident fp32"
+        );
+
+        // Pre-sibling manifest (no routing ref): knob-on falls back to the
+        // full blob — old tables stay openable, just without the byte win.
+        let (_dir2, storage2) = local_storage();
+        let republished = slow_vector_state::write_state(storage2.as_ref(), &entries)
+            .await
+            .expect("write blobs");
+        persist_two_entry_table_with_routing(
+            &storage2,
+            Some((republished.uri.clone(), republished.content_hash)),
+            None,
+        )
+        .await;
+        let fallback =
+            ManifestSnapshot::load(None, Arc::clone(&storage2), Some(consumer_opts(true)))
+                .await
+                .expect("fallback load");
+        assert_eq!(
+            resident(&fallback),
+            vec![true, true],
+            "knob-on without a routing ref must fall back to the full blob"
+        );
+    }
+
     /// Residency invariant: a refresh whose slow-state ref is unchanged
     /// (list-only churn — here a deleted-ids stamp) reuses the decoded
     /// entries — same `Arc`s, zero part loads, zero blob refetch.
@@ -4659,9 +4874,10 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries)
             .await
             .expect("write blob");
+        let (blob_uri, blob_hash) = (published.uri, published.content_hash);
         persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
 
         let a = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
@@ -4760,6 +4976,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4907,6 +5124,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 entry_for(&pw_a_old),
                 entry_for(&pw_a_latest),
@@ -5114,6 +5332,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5212,6 +5431,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5337,6 +5557,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
@@ -5452,6 +5673,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -5582,6 +5804,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -5722,6 +5945,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -5876,6 +6100,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -6090,6 +6315,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6185,6 +6411,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6296,6 +6523,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -6429,6 +6657,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -6557,6 +6786,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6643,6 +6873,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6747,6 +6978,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -6872,6 +7104,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts,
         }
     }

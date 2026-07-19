@@ -5402,7 +5402,7 @@ async fn stamp_slow_vector_state(
             // already absent because `update` never carries it forward.
             return Ok(());
         }
-        let (uri, hash) = match pending_drain.as_ref() {
+        let published = match pending_drain.as_ref() {
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
@@ -5415,13 +5415,15 @@ async fn stamp_slow_vector_state(
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
-            && cur_uri == uri
-            && cur_hash == hash
+            && cur_uri == published.uri
+            && cur_hash == published.content_hash
+            && old.slow_vector_state_routing_blob() == Some(&published.routing)
         {
             // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest = old.with_slow_vector_state(uri, hash);
+        let new_manifest =
+            old.with_slow_vector_state(published.uri, published.content_hash, published.routing);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -5892,14 +5894,18 @@ pub(crate) async fn try_commit_attempt(
     if super::handle::is_hidden_vector_index_table(&opts) {
         let entries = new_manifest.get_all_superfiles();
         if !entries.is_empty() {
-            let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
+            let published = slow_vector_state::write_state(storage.as_ref(), entries)
                 .await
                 .map_err(|e| {
                     SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
                         ManifestLoadError::SlowStateHydration(e.to_string()),
                     ))
                 })?;
-            new_manifest = new_manifest.with_slow_vector_state_ref(uri, hash);
+            new_manifest = new_manifest.with_slow_vector_state_ref(
+                published.uri,
+                published.content_hash,
+                published.routing,
+            );
         }
     }
 

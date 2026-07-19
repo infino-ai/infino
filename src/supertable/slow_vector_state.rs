@@ -34,6 +34,8 @@ use crate::{
     storage::{StorageError, StorageProvider},
     supertable::manifest::{
         SuperfileEntry,
+        encoding::SummaryWireMode,
+        list::SlowStateRoutingRef,
         part::{self, ContentHash, ManifestPart, PartId},
     },
 };
@@ -100,12 +102,19 @@ pub(crate) struct SlowVectorState {
 /// is the nil UUID: the blob is not a real part, and a constant id keeps the
 /// encoding deterministic (same entries ⇒ same bytes ⇒ same [`ContentHash`]).
 pub(crate) fn encode_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
+    encode_entries_with_mode(entries, SummaryWireMode::Full)
+}
+
+/// [`encode_entries`] with an explicit summary wire mode — `RoutingOnly`
+/// produces the routing sibling blob (cluster blocks as counts + 1-bit
+/// admit slab, no fp32).
+fn encode_entries_with_mode(entries: &[Arc<SuperfileEntry>], mode: SummaryWireMode) -> Vec<u8> {
     let synthetic = ManifestPart {
         format_version: part::FORMAT_VERSION.into(),
         part_id: PartId(Uuid::nil()),
         superfiles: entries.to_vec(),
     };
-    part::encode(&synthetic)
+    part::encode_with_mode(&synthetic, mode)
 }
 
 /// Decode a blob written by [`encode_entries`].
@@ -198,25 +207,63 @@ async fn write_bytes(
     Ok((uri, content_hash))
 }
 
-/// Content-address and PUT the blob for `entries`. Idempotent: the URI is
-/// hash-derived, so a raced identical PUT surfacing
-/// [`StorageError::PreconditionFailed`] means the bytes are already durable.
-/// Visibility is decided by the manifest-list ref stamp, not by this PUT.
+/// References to one published slow-state generation: the full blob
+/// (writers, GC, and knob-off consumers read it) plus its routing
+/// sibling (what consumer opens with `summary_centroids_from_superfiles`
+/// fetch — same visible entries, cluster blocks as counts + admit slab).
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedState {
+    pub uri: String,
+    pub content_hash: ContentHash,
+    pub routing: SlowStateRoutingRef,
+}
+
+/// Content-address and PUT the blob for `entries` plus its routing
+/// sibling. Idempotent: URIs are hash-derived, so a raced identical PUT
+/// surfacing [`StorageError::PreconditionFailed`] means the bytes are
+/// already durable. Visibility is decided by the manifest-list ref
+/// stamp, not by these PUTs.
 pub(crate) async fn write_state(
     storage: &dyn StorageProvider,
     entries: &[Arc<SuperfileEntry>],
-) -> Result<(String, ContentHash), SlowVectorStateError> {
-    write_bytes(storage, encode_entries(entries)).await
+) -> Result<PublishedState, SlowVectorStateError> {
+    write_full_and_routing(storage, encode_entries(entries), entries).await
 }
 
 /// Publish current visible membership plus an in-progress drain checkpoint in
 /// the same content-addressed slow-CAS state referenced by the hidden manifest.
+/// The routing sibling carries only the visible entries — consumers never read
+/// checkpoint (pending) state.
 pub(crate) async fn write_state_with_pending_drain(
     storage: &dyn StorageProvider,
     entries: &[Arc<SuperfileEntry>],
     pending: &PendingDrainState,
-) -> Result<(String, ContentHash), SlowVectorStateError> {
-    write_bytes(storage, encode_checkpoint_state(entries, pending)).await
+) -> Result<PublishedState, SlowVectorStateError> {
+    write_full_and_routing(storage, encode_checkpoint_state(entries, pending), entries).await
+}
+
+/// PUT the pre-encoded full blob and the routing sibling of `entries`
+/// concurrently.
+async fn write_full_and_routing(
+    storage: &dyn StorageProvider,
+    full_bytes: Vec<u8>,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<PublishedState, SlowVectorStateError> {
+    let routing_bytes = encode_entries_with_mode(entries, SummaryWireMode::RoutingOnly);
+    let (full, routing) = tokio::join!(
+        write_bytes(storage, full_bytes),
+        write_bytes(storage, routing_bytes)
+    );
+    let (uri, content_hash) = full?;
+    let (routing_uri, routing_hash) = routing?;
+    Ok(PublishedState {
+        uri,
+        content_hash,
+        routing: SlowStateRoutingRef {
+            uri: routing_uri,
+            content_hash: routing_hash,
+        },
+    })
 }
 
 /// Fetch the blob at `uri`, verify its bytes hash to `expected`, and decode.
@@ -301,8 +348,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::LocalFsStorageProvider, superfile::vector::layout::VectorLayout,
-        supertable::manifest::SuperfileUri,
+        storage::LocalFsStorageProvider,
+        superfile::vector::{layout::VectorLayout, quant::BitQuantizer, rotation::RandomRotation},
+        supertable::manifest::{CellVectorSummary, ClusterCentroids, SuperfileUri, VectorSummary},
     };
 
     /// Doc count for the first fixture entry; arbitrary but distinct from
@@ -328,6 +376,38 @@ mod tests {
             vector_layout: VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    /// Dim for the routing-sibling fixture's vector summary.
+    const ROUTING_FIXTURE_DIM: usize = 16;
+    /// Rot seed for the routing-sibling fixture's admit slab.
+    const ROUTING_FIXTURE_ROT_SEED: u64 = 9;
+
+    /// [`entry`] plus a one-cell vector summary whose admit slab is built —
+    /// the shape a real write path produces.
+    fn entry_with_summary(n_docs: u64, cell: u32) -> Arc<SuperfileEntry> {
+        let mut e = Arc::try_unwrap(entry(n_docs, cell)).expect("fresh arc");
+        let mut flat = vec![0.0f32; 2 * ROUTING_FIXTURE_DIM];
+        flat[0] = 1.0;
+        flat[ROUTING_FIXTURE_DIM + 3] = -1.0;
+        let clusters =
+            ClusterCentroids::from_fp32(2, ROUTING_FIXTURE_DIM as u32, &flat, vec![3, 4]);
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(ROUTING_FIXTURE_DIM, ROUTING_FIXTURE_ROT_SEED),
+            &BitQuantizer::new(ROUTING_FIXTURE_DIM),
+            ROUTING_FIXTURE_ROT_SEED,
+        );
+        e.vector_summary.insert(
+            "emb".into(),
+            VectorSummary {
+                centroid: vec![0.5; ROUTING_FIXTURE_DIM],
+                cells: vec![CellVectorSummary {
+                    cell_id: Some(cell),
+                    clusters,
+                }],
+            },
+        );
+        Arc::new(e)
     }
 
     fn assert_entries_match(a: &SuperfileEntry, b: &SuperfileEntry) {
@@ -392,7 +472,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("localfs");
         let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 1)];
-        let (uri, _) = write_state(&storage, &entries).await.expect("write");
+        let uri = write_state(&storage, &entries).await.expect("write").uri;
         let whole = storage.get(&uri).await.expect("whole get").0;
         assert!(
             whole.len() as u64 > TINY_STRIPE_CHUNK_BYTES,
@@ -410,12 +490,14 @@ mod tests {
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry(FIRST_N_DOCS, 1)];
 
-        let (uri, hash) = write_state(&storage, &entries).await.expect("write");
+        let published = write_state(&storage, &entries).await.expect("write");
+        let (uri, hash) = (published.uri, published.content_hash);
         // Re-publishing identical content must succeed (PreconditionFailed
         // from the hash-derived URI is benign by construction).
-        let (uri2, hash2) = write_state(&storage, &entries).await.expect("rewrite");
-        assert_eq!(uri, uri2);
-        assert_eq!(hash, hash2);
+        let republished = write_state(&storage, &entries).await.expect("rewrite");
+        assert_eq!(uri, republished.uri);
+        assert_eq!(hash, republished.content_hash);
+        assert_eq!(published.routing, republished.routing);
 
         let loaded = load_state(&storage, &uri, &hash).await.expect("load");
         assert_eq!(loaded.len(), 1);
@@ -433,6 +515,80 @@ mod tests {
         assert!(
             matches!(missing, SlowVectorStateError::Storage(_)),
             "{missing:?}"
+        );
+    }
+
+    /// The routing sibling is a second durable object: smaller than the
+    /// full blob, same entries, summaries decoded straight into the
+    /// stripped shape with the write-time admit slab intact.
+    #[tokio::test]
+    async fn routing_sibling_decodes_stripped_entries_with_slab() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
+        let expected_slab = entries[0].vector_summary["emb"].cells[0]
+            .clusters
+            .admit_codes_built()
+            .expect("write-time slab")
+            .clone();
+
+        let published = write_state(&storage, &entries).await.expect("write");
+        assert_ne!(
+            published.uri, published.routing.uri,
+            "full and routing blobs are distinct objects"
+        );
+        let full_len = storage.get(&published.uri).await.expect("full get").0.len();
+        let routing_len = storage
+            .get(&published.routing.uri)
+            .await
+            .expect("routing get")
+            .0
+            .len();
+        assert!(
+            routing_len < full_len,
+            "routing sibling must shed the fp32 payload ({routing_len} vs {full_len} bytes)"
+        );
+
+        let loaded = load_state(
+            &storage,
+            &published.routing.uri,
+            &published.routing.content_hash,
+        )
+        .await
+        .expect("load routing");
+        assert_eq!(loaded.len(), 1);
+        assert_entries_match(&loaded[0], &entries[0]);
+        let clusters = &loaded[0].vector_summary["emb"].cells[0].clusters;
+        assert!(
+            !clusters.vectors_resident(),
+            "routing entries land in the stripped shape"
+        );
+        assert_eq!(
+            *clusters.admit_codes_built().expect("slab seeded"),
+            expected_slab,
+            "slab survives the routing wire form"
+        );
+
+        // Checkpoint publications carry the sibling too — consumers opening
+        // mid-drain still fetch only the routing layer.
+        let pending = PendingDrainState {
+            metadata: b"epoch".to_vec(),
+            entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
+        };
+        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending)
+            .await
+            .expect("checkpoint write");
+        let visible = load_state(
+            &storage,
+            &checkpoint.routing.uri,
+            &checkpoint.routing.content_hash,
+        )
+        .await
+        .expect("load checkpoint routing");
+        assert_eq!(
+            visible.len(),
+            entries.len(),
+            "checkpoint routing sibling carries only visible entries"
         );
     }
 }

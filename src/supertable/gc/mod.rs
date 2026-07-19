@@ -64,9 +64,13 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     };
     // Slow-CAS entry blob: the URI is read straight off the manifest-list
     // ref — sync, no fetch. Superseded blobs (older drains) are absent from
-    // the current list and get swept once past the safety gap.
+    // the current list and get swept once past the safety gap. The routing
+    // sibling shares the prefix and lifecycle.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
+    }
+    if let Some(routing) = manifest.slow_vector_state_routing_blob() {
+        live.insert(routing.uri.clone());
     }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
@@ -181,7 +185,10 @@ mod tests {
             SupertableOptions,
             manifest::{
                 ManifestSnapshot, SuperfileEntry, SuperfileUri,
-                list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
+                list::{
+                    FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy,
+                    SlowStateRoutingRef,
+                },
                 part::{ContentHash, PartId},
             },
             slow_vector_state,
@@ -265,6 +272,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_routing: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -305,6 +313,8 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
+        let routing_hash = ContentHash::of(b"slow state routing");
+        let routing_uri = slow_vector_state::storage_path(&routing_hash);
         let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
         let manifest = ManifestSnapshot::new(
             TEST_MANIFEST_ID,
@@ -330,12 +340,20 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: Some(uri.clone()),
                 slow_vector_state_content_hash: Some(hash),
+                slow_vector_state_routing: Some(SlowStateRoutingRef {
+                    uri: routing_uri.clone(),
+                    content_hash: routing_hash,
+                }),
                 parts: Vec::new(),
             }),
         );
         let (live, superfiles_complete) = build_live_set(&manifest);
         assert!(superfiles_complete);
         assert!(live.contains(&uri), "referenced blob must be live");
+        assert!(
+            live.contains(&routing_uri),
+            "referenced routing sibling must be live"
+        );
         assert!(
             !live.contains(&orphan),
             "unreferenced blob must be sweepable"

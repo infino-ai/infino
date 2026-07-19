@@ -2424,6 +2424,11 @@ mod tests {
             .clone();
         let hidden_reader = hidden.reader();
         let hidden_manifest = hidden_reader.manifest();
+        assert!(
+            hidden_manifest.slow_vector_state_routing_blob().is_some(),
+            "drain must publish the routing sibling ref — mode-on consumers \
+             hydrate from it (1-bit slab only, no fp32 download)"
+        );
         let mut saw_stripped_summary = false;
         for entry in hidden_manifest.superfiles.iter() {
             for vs in entry.vector_summary.values() {

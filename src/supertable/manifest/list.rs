@@ -143,6 +143,15 @@ pub struct Manifest {
     /// never on table kind.
     pub slow_vector_state_uri: Option<String>,
     pub slow_vector_state_content_hash: Option<ContentHash>,
+    /// Routing sibling of the slow-CAS blob: the same visible entries with
+    /// each summary's cluster blocks encoded as counts + 1-bit admit slab,
+    /// no fp32 payload. Consumer opens running with
+    /// `summary_centroids_from_superfiles` fetch this object instead of the
+    /// full blob (GiBs → MiBs at 100M docs); exact scans then read fp32
+    /// from the superfile centroid regions. Stamped and cleared together
+    /// with the full ref; absent on manifests written before the sibling
+    /// existed (consumers fall back to the full blob).
+    pub slow_vector_state_routing: Option<SlowStateRoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -159,6 +168,14 @@ pub struct Manifest {
     /// readers skip the storage GET entirely. Entries are dropped when
     /// their superfile leaves the manifest (compaction/removal).
     pub tombstone_seqs: BTreeMap<Uuid, u64>,
+}
+
+/// Content-addressed reference to the routing sibling of the slow-CAS
+/// vector-state blob (see [`Manifest::slow_vector_state_routing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowStateRoutingRef {
+    pub uri: String,
+    pub content_hash: ContentHash,
 }
 
 /// Global vector cell-index state owned by the user-table manifest (see
@@ -1023,6 +1040,10 @@ struct ManifestDto {
     slow_vector_state_uri: Option<String>,
     #[serde(default)]
     slow_vector_state_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_routing_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_routing_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1533,6 +1554,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
         slow_vector_state_uri: l.slow_vector_state_uri.clone(),
         slow_vector_state_content_hash: l.slow_vector_state_content_hash.as_ref().map(encode_hash),
+        slow_vector_state_routing_uri: l.slow_vector_state_routing.as_ref().map(|r| r.uri.clone()),
+        slow_vector_state_routing_content_hash: l
+            .slow_vector_state_routing
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1609,6 +1635,19 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             .as_deref()
             .map(decode_hash)
             .transpose()?,
+        // Require both halves: a manifest carrying only one is treated as
+        // having no sibling (consumers fall back to the full blob) rather
+        // than failing the whole list decode.
+        slow_vector_state_routing: match (
+            d.slow_vector_state_routing_uri,
+            d.slow_vector_state_routing_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(SlowStateRoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
         parts,
         tombstone_seqs: d
             .tombstone_seqs
@@ -2204,6 +2243,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
             parts: vec![],
         }
     }
@@ -2465,6 +2505,10 @@ mod tests {
         let mut list = empty_list();
         list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
         list.slow_vector_state_content_hash = Some(ContentHash([7u8; 32]));
+        list.slow_vector_state_routing = Some(SlowStateRoutingRef {
+            uri: "slow-vector-state/state-def.bin".into(),
+            content_hash: ContentHash([8u8; 32]),
+        });
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.slow_vector_state_uri, list.slow_vector_state_uri);
@@ -2472,12 +2516,23 @@ mod tests {
             decoded.slow_vector_state_content_hash,
             list.slow_vector_state_content_hash
         );
+        assert_eq!(
+            decoded.slow_vector_state_routing,
+            list.slow_vector_state_routing
+        );
         // Absent by default (user tables and old manifests without the field).
         let plain = empty_list();
         let bytes = encode(&plain).expect("encode");
+        assert!(
+            !from_utf8(&bytes)
+                .expect("utf8")
+                .contains("slow_vector_state_routing"),
+            "absent routing ref must not serialize null fields"
+        );
         let decoded = decode(&bytes).expect("decode");
         assert!(decoded.slow_vector_state_uri.is_none());
         assert!(decoded.slow_vector_state_content_hash.is_none());
+        assert!(decoded.slow_vector_state_routing.is_none());
     }
 
     /// A slow-state hash that isn't `blake3:<64hex>` is rejected with
