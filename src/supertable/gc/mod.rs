@@ -53,6 +53,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     live.insert(manifest_uri(manifest.manifest_id));
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
+        if let Some(routing) = &entry.routing {
+            live.insert(routing.uri.clone());
+        }
     }
     let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
         for sf in superfiles {
@@ -186,8 +189,7 @@ mod tests {
             manifest::{
                 ManifestSnapshot, SuperfileEntry, SuperfileUri,
                 list::{
-                    FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy,
-                    SlowStateRoutingRef,
+                    FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
                 },
                 part::{ContentHash, PartId},
             },
@@ -280,6 +282,7 @@ mod tests {
                     size_bytes_compressed: 1,
                     size_bytes_uncompressed: 1,
                     content_hash: ContentHash::of(b"part"),
+                    routing: None,
                     id_range: (0, 0),
                     scalar_stats_agg: HashMap::new(),
                     fts_summary_agg: Default::default(),
@@ -340,7 +343,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: Some(uri.clone()),
                 slow_vector_state_content_hash: Some(hash),
-                slow_vector_state_routing: Some(SlowStateRoutingRef {
+                slow_vector_state_routing: Some(RoutingRef {
                     uri: routing_uri.clone(),
                     content_hash: routing_hash,
                 }),

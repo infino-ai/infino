@@ -2401,12 +2401,50 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
         drop(w);
-        st.drain_vectors_to_cells_sync().expect("drain to cells");
-        drop(st);
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
         q[1] = 0.05;
+        let ids = |hits: &[SuperfileHit]| {
+            hits.iter()
+                .map(|h| (h.superfile, h.local_doc_id, h.stable_id))
+                .collect::<Vec<_>>()
+        };
+
+        // Pre-drain: the user wave serves the query, and a mode-on consumer
+        // hydrates the user manifest from routing parts (no fp32 download) —
+        // the deferred rescore reads user superfile centroid regions.
+        let pre_baseline = Supertable::open(make_options(false)).expect("pre-drain mode-off");
+        let pre_base_hits = pre_baseline
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("pre-drain baseline hits");
+        assert!(!pre_base_hits.is_empty(), "pre-drain baseline returns hits");
+        drop(pre_baseline);
+        let pre_stripped = Supertable::open(make_options(true)).expect("pre-drain mode-on");
+        let user_parts_have_routing = pre_stripped
+            .reader()
+            .manifest()
+            .get_all_list_entries()
+            .iter()
+            .all(|entry| entry.routing.is_some());
+        assert!(
+            user_parts_have_routing,
+            "commits must stamp a routing sibling on every user part"
+        );
+        let pre_stripped_hits = pre_stripped
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("pre-drain stripped hits");
+        assert_eq!(
+            ids(&pre_stripped_hits),
+            ids(&pre_base_hits),
+            "pre-drain: routing-part hydration must reproduce resident hits"
+        );
+        drop(pre_stripped);
+
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        drop(st);
 
         let baseline = Supertable::open(make_options(false)).expect("reopen mode-off");
         let base_hits = baseline
@@ -2452,11 +2490,6 @@ mod tests {
             .reader()
             .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
             .expect("stripped-mode hits");
-        let ids = |hits: &[SuperfileHit]| {
-            hits.iter()
-                .map(|h| (h.superfile, h.local_doc_id, h.stable_id))
-                .collect::<Vec<_>>()
-        };
         assert_eq!(
             ids(&stripped_hits),
             ids(&base_hits),

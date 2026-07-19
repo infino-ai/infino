@@ -35,7 +35,7 @@ use crate::{
     supertable::manifest::{
         SuperfileEntry,
         encoding::SummaryWireMode,
-        list::SlowStateRoutingRef,
+        list::RoutingRef,
         part::{self, ContentHash, ManifestPart, PartId},
     },
 };
@@ -215,7 +215,7 @@ async fn write_bytes(
 pub(crate) struct PublishedState {
     pub uri: String,
     pub content_hash: ContentHash,
-    pub routing: SlowStateRoutingRef,
+    pub routing: RoutingRef,
 }
 
 /// Content-address and PUT the blob for `entries` plus its routing
@@ -259,7 +259,7 @@ async fn write_full_and_routing(
     Ok(PublishedState {
         uri,
         content_hash,
-        routing: SlowStateRoutingRef {
+        routing: RoutingRef {
             uri: routing_uri,
             content_hash: routing_hash,
         },

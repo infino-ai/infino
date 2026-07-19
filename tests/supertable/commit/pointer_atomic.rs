@@ -204,6 +204,7 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         size_bytes_compressed: size_bytes,
         size_bytes_uncompressed: size_bytes,
         content_hash: hash,
+        routing: None,
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),

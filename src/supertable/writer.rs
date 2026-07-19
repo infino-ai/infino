@@ -5917,10 +5917,12 @@ pub(crate) async fn try_commit_attempt(
     // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
-    //    content-hashes) are unchanged in the new list.
+    //    content-hashes) are unchanged in the new list. Each touched
+    //    part ships both wire forms: full and the routing sibling the
+    //    list entry references.
     let encoded_refs: Vec<&[u8]> = parts_to_write
         .iter()
-        .map(|ep| ep.encoded.as_slice())
+        .flat_map(|ep| [ep.encoded.as_slice(), ep.routing_encoded.as_slice()])
         .collect();
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)

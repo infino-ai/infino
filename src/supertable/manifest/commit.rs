@@ -243,7 +243,13 @@ pub async fn probe_pointer(
 
 pub struct EncodedPart {
     pub part: ManifestPart,
+    /// Full wire form (fp32 + admit slab) — the durable commit artifact
+    /// writers read back.
     pub encoded: Vec<u8>,
+    /// Routing-only sibling (counts + admit slab, no fp32) — what
+    /// consumer opens with `summary_centroids_from_superfiles` fetch.
+    /// PUT together with `encoded` in the same commit.
+    pub routing_encoded: Vec<u8>,
 }
 
 /// Outcome of writing a manifest part — returned by

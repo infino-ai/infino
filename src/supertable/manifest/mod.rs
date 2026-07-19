@@ -53,7 +53,7 @@ use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg, SlowStateRoutingRef};
+pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
@@ -83,6 +83,7 @@ use crate::{
                 translate_contention, write_manifest, write_part_bytes, write_pointer,
             },
             disk_cache::ManifestDiskCache,
+            encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
@@ -656,11 +657,15 @@ impl ManifestSnapshot {
             });
         }
 
-        // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new_with_cache(
+        // 3. Build the loader, superfiles & parts. Consumer memory mode
+        //    loads each part's routing sibling (counts + 1-bit slab, no
+        //    fp32) when the list stamps one — the user table's centroid
+        //    payload stays in storage, mirroring the slow-blob sibling.
+        let loader = Arc::new(ManifestPartLoader::new_with_cache_and_mode(
             Arc::clone(&storage),
             &list,
             options.manifest_disk_cache.clone(),
+            options.summary_centroids_from_superfiles,
         ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -1120,7 +1125,7 @@ impl ManifestSnapshot {
     /// no fp32) — what consumer opens fetch under
     /// `summary_centroids_from_superfiles`. `None` on manifests written
     /// before the sibling existed.
-    pub(crate) fn slow_vector_state_routing_blob(&self) -> Option<&SlowStateRoutingRef> {
+    pub(crate) fn slow_vector_state_routing_blob(&self) -> Option<&RoutingRef> {
         self.list.as_ref()?.slow_vector_state_routing.as_ref()
     }
 
@@ -1165,7 +1170,7 @@ impl ManifestSnapshot {
         &self,
         uri: String,
         hash: part::ContentHash,
-        routing: SlowStateRoutingRef,
+        routing: RoutingRef,
     ) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
@@ -1204,7 +1209,7 @@ impl ManifestSnapshot {
         &self,
         uri: String,
         hash: part::ContentHash,
-        routing: SlowStateRoutingRef,
+        routing: RoutingRef,
     ) -> Self {
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
@@ -1543,39 +1548,30 @@ impl ManifestSnapshot {
                 // Split: keep the existing part, emit a fresh part for the new
                 // superfiles.
                 out_list_entries.push(entry.clone());
-                let (fresh_entry, fresh_part, fresh_encoded) =
+                let (fresh_entry, fresh_encoded_part) =
                     rebuild_part_and_entry(opts.clone(), vec![], new_for_part, None);
                 out_list_entries.push(fresh_entry);
-                parts_to_write.push(EncodedPart {
-                    part: fresh_part,
-                    encoded: fresh_encoded,
-                });
+                parts_to_write.push(fresh_encoded_part);
             } else {
                 // Rewrite the latest part = its existing superfiles + the new.
                 let existing_part = self.get_part_by_id(entry.part_id).await?;
-                let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = rebuild_part_and_entry(
+                let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
                     opts.clone(),
                     existing_part.superfiles.clone(),
                     new_for_part,
                     Some(entry),
                 );
                 out_list_entries.push(rebuilt_entry);
-                parts_to_write.push(EncodedPart {
-                    part: rebuilt_part,
-                    encoded: rebuilt_encoded,
-                });
+                parts_to_write.push(rebuilt_encoded_part);
             }
         }
 
         // Cold start: no prior parts, so the new entries form the first part.
         if !pending_new.is_empty() {
-            let (fresh_entry, fresh_part, fresh_encoded) =
+            let (fresh_entry, fresh_encoded_part) =
                 rebuild_part_and_entry(opts.clone(), vec![], pending_new, None);
             out_list_entries.push(fresh_entry);
-            parts_to_write.push(EncodedPart {
-                part: fresh_part,
-                encoded: fresh_encoded,
-            });
+            parts_to_write.push(fresh_encoded_part);
         }
 
         // At this point, out_list_entries contains all new ManifestListEntries that will be written.
@@ -1620,19 +1616,13 @@ impl ManifestSnapshot {
                     continue;
                 }
 
-                let (fresh_entry, fresh_part, fresh_encoded) =
+                let (fresh_entry, fresh_encoded_part) =
                     rebuild_part_and_entry(opts.clone(), vec![], final_superfile_entries, None);
 
                 if let Some(existing) = existing_part_to_update {
-                    *existing = EncodedPart {
-                        part: fresh_part,
-                        encoded: fresh_encoded,
-                    };
+                    *existing = fresh_encoded_part;
                 } else {
-                    parts_to_write.push(EncodedPart {
-                        part: fresh_part,
-                        encoded: fresh_encoded,
-                    });
+                    parts_to_write.push(fresh_encoded_part);
                 }
 
                 out_list_entries_after_removal.push(fresh_entry);
@@ -1771,20 +1761,19 @@ impl ManifestSnapshot {
 }
 
 /// build one `ManifestPart` from `superfiles` + the
-/// matching `ManifestPartEntry`. Encodes the part once,
-/// content-hashes it, and computes the list-level aggregate
-/// skip summaries that `list_prune` reads at query time.
+/// matching `ManifestPartEntry`. Encodes the part in both wire forms —
+/// full (fp32 + slab) and routing-only (counts + slab) — content-hashes
+/// each, and computes the list-level aggregate skip summaries that
+/// `list_prune` reads at query time. Both encodings ship in the returned
+/// [`EncodedPart`] so the commit PUTs them together; the entry carries
+/// the sibling ref consumer opens select on.
 /// If base_part is Some, the superfiles MUST only include the new superfiles to be added.
 fn rebuild_part_and_entry(
     opts: Arc<SupertableOptions>,
     old_superfiles: Vec<Arc<SuperfileEntry>>,
     new_superfiles: Vec<Arc<SuperfileEntry>>,
     base_part: Option<&ManifestPartEntry>,
-) -> (
-    ManifestPartEntry,
-    ManifestPart,
-    Vec<u8>, // pre-encoded compressed bytes — reused by write path, no second encode
-) {
+) -> (ManifestPartEntry, EncodedPart) {
     let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
 
     let aggregates = aggregates::compute(&new_superfiles, base_part);
@@ -1801,6 +1790,8 @@ fn rebuild_part_and_entry(
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
+    let routing_encoded = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
+    let routing_hash = ContentHash::of(&routing_encoded);
     let entry = ManifestPartEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),
@@ -1808,11 +1799,22 @@ fn rebuild_part_and_entry(
         size_bytes_compressed: size_compressed,
         size_bytes_uncompressed: size_uncompressed,
         content_hash,
+        routing: Some(RoutingRef {
+            uri: part_uri(&routing_hash),
+            content_hash: routing_hash,
+        }),
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
         fts_summary_agg: aggregates.fts_summary_agg,
     };
-    (entry, part, compressed)
+    (
+        entry,
+        EncodedPart {
+            part,
+            encoded: compressed,
+            routing_encoded,
+        },
+    )
 }
 
 /// Pulls manifest parts through a [`StorageProvider`] and verifies
@@ -1827,13 +1829,19 @@ fn rebuild_part_and_entry(
 /// parts are content-addressed, a cache hit can never be stale.
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
-    /// Maps `PartId → (expected content_hash, uri)`. Built from
-    /// the manifest list at construction; immutable per-`ManifestSnapshot`.
-    parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
+    /// Built from the manifest list at construction; immutable
+    /// per-`ManifestSnapshot`.
+    parts_index: HashMap<PartId, (ContentHash, String, Option<RoutingRef>)>,
     /// On-disk cache for compressed part bytes. `None` disables the
     /// cache (in-process-only supertables, tests, or storage attached
     /// without a `disk_cache_root` configured).
     manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    /// Consumer memory mode (`summary_centroids_from_superfiles`): load
+    /// each part's routing sibling (counts + 1-bit slab, no fp32) when
+    /// the list stamps one. Writer handles keep this off — part rebuilds
+    /// re-encode the full form and need resident fp32.
+    prefer_routing: bool,
 }
 
 impl ManifestPartLoader {
@@ -1847,14 +1855,30 @@ impl ManifestPartLoader {
         list: &Manifest,
         manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
     ) -> Self {
+        Self::new_with_cache_and_mode(storage, list, manifest_disk_cache, false)
+    }
+
+    /// Like [`Self::new_with_cache`] with the consumer routing mode
+    /// explicit — `prefer_routing` selects each part's routing sibling
+    /// when present.
+    pub fn new_with_cache_and_mode(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        prefer_routing: bool,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
-            idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
+            idx.insert(
+                entry.part_id,
+                (entry.content_hash, entry.uri.clone(), entry.routing.clone()),
+            );
         }
         Self {
             storage,
             parts_index: idx,
             manifest_disk_cache,
+            prefer_routing,
         }
     }
 
@@ -1865,10 +1889,16 @@ impl ManifestPartLoader {
     /// on a miss the freshly-fetched bytes are written back to the
     /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
-        let (expected_hash, uri) = self
+        let (full_hash, full_uri, routing) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+        // Routing decode lands in the stripped in-memory shape; both forms
+        // are content-addressed, so the disk cache can never mix them.
+        let (expected_hash, uri) = match (self.prefer_routing, routing) {
+            (true, Some(routing)) => (&routing.content_hash, &routing.uri),
+            _ => (full_hash, full_uri),
+        };
 
         // Disk-cache hit: bytes are verified against `expected_hash`
         // inside `get`, so they're known-good here.
@@ -3982,6 +4012,7 @@ mod tests {
                     size_bytes_compressed: size_compressed,
                     size_bytes_uncompressed: size_compressed,
                     content_hash: hash,
+                    routing: None,
                     id_range: (0, 0),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
@@ -4322,6 +4353,7 @@ mod tests {
                 size_bytes_compressed: 0,
                 size_bytes_uncompressed: 0,
                 content_hash: part::ContentHash([0u8; 32]),
+                routing: None,
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
@@ -4511,7 +4543,7 @@ mod tests {
         assert!(manifest.slow_vector_state_blob().is_none());
 
         let hash = ContentHash([3u8; 32]);
-        let routing = SlowStateRoutingRef {
+        let routing = RoutingRef {
             uri: "slow-vector-state/state-r.bin".into(),
             content_hash: ContentHash([4u8; 32]),
         };
@@ -4642,7 +4674,7 @@ mod tests {
     async fn persist_two_entry_table_with_routing(
         storage: &Arc<dyn StorageProvider>,
         slow_ref: Option<(String, ContentHash)>,
-        routing: Option<SlowStateRoutingRef>,
+        routing: Option<RoutingRef>,
     ) -> Vec<Arc<SuperfileEntry>> {
         let entries = vec![
             make_superfile_entry(100, hash_bucket_0_pk()),
@@ -4684,6 +4716,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -4863,6 +4896,168 @@ mod tests {
         );
     }
 
+    /// Persist a one-part table whose entries carry vector summaries. The
+    /// part ships in both wire forms; `with_routing` controls whether the
+    /// list entry stamps the sibling ref (absent models a pre-sibling
+    /// manifest). No slow-state ref, so hydration goes through the part
+    /// loader — the user-table shape.
+    async fn persist_summary_part_table(storage: &Arc<dyn StorageProvider>, with_routing: bool) {
+        let entries = vec![make_summary_entry(100), make_summary_entry(50)];
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: entries,
+        };
+        let full = part::encode(&part);
+        let full_hash = ContentHash::of(&full);
+        let routing = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
+        let routing_hash = ContentHash::of(&routing);
+        assert!(
+            routing.len() < full.len(),
+            "routing part must shed the fp32 payload ({} vs {} bytes)",
+            routing.len(),
+            full.len()
+        );
+        write_part_bytes(storage.as_ref(), &full)
+            .await
+            .expect("put full part");
+        write_part_bytes(storage.as_ref(), &routing)
+            .await
+            .expect("put routing part");
+        let list = Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            tombstone_seqs: Default::default(),
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_routing: None,
+            parts: vec![ManifestPartEntry {
+                part_id: part.part_id,
+                uri: part_uri(&full_hash),
+                content_hash: full_hash,
+                routing: with_routing.then(|| RoutingRef {
+                    uri: part_uri(&routing_hash),
+                    content_hash: routing_hash,
+                }),
+                size_bytes_compressed: full.len() as u64,
+                size_bytes_uncompressed: full.len() as u64,
+                n_superfiles: 2,
+                id_range: (0, 149),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+            }],
+        };
+        let lw = write_manifest(storage.as_ref(), &list)
+            .await
+            .expect("write list");
+        write_pointer(
+            storage.as_ref(),
+            &PointerFile {
+                manifest_id: 1,
+                manifest_uri: lw.uri,
+                content_hash: lw.content_hash,
+            },
+            None,
+        )
+        .await
+        .expect("write pointer");
+    }
+
+    /// The user-table shape (no slow-state ref, hydration through the part
+    /// loader): consumer memory mode loads each part's routing sibling —
+    /// summaries arrive stripped with the write-time slab, without
+    /// downloading the fp32 payload. Knob-off loads (writers) and knob-on
+    /// loads of pre-sibling manifests keep the full part. The fixture
+    /// options carry no vector columns, so the strip pass is inert and a
+    /// stripped summary can only have come from the routing part.
+    #[tokio::test]
+    async fn consumer_mode_hydrates_parts_from_routing_sibling() {
+        let consumer_opts = |knob: bool| {
+            Arc::new(
+                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                    .expect("valid options")
+                    .with_summary_centroids_from_superfiles(knob),
+            )
+        };
+        let resident = |m: &ManifestSnapshot| {
+            m.superfiles
+                .iter()
+                .map(|e| {
+                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    assert!(clusters.admit_codes_built().is_some(), "slab always rides");
+                    clusters.vectors_resident()
+                })
+                .collect::<Vec<bool>>()
+        };
+
+        let (_dir, storage) = local_storage();
+        persist_summary_part_table(&storage, true).await;
+        let knob_on = ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(true)))
+            .await
+            .expect("knob-on load");
+        assert_eq!(
+            resident(&knob_on),
+            vec![false, false],
+            "knob-on consumer must hydrate stripped entries from the routing part"
+        );
+        let knob_off =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(false)))
+                .await
+                .expect("knob-off load");
+        assert_eq!(
+            resident(&knob_off),
+            vec![true, true],
+            "knob-off load must keep the full part's resident fp32"
+        );
+
+        // Pre-sibling manifest: knob-on falls back to the full part.
+        let (_dir2, storage2) = local_storage();
+        persist_summary_part_table(&storage2, false).await;
+        let fallback =
+            ManifestSnapshot::load(None, Arc::clone(&storage2), Some(consumer_opts(true)))
+                .await
+                .expect("fallback load");
+        assert_eq!(
+            resident(&fallback),
+            vec![true, true],
+            "knob-on without a routing ref must fall back to the full part"
+        );
+    }
+
+    /// [`rebuild_part_and_entry`] stamps the routing sibling: the entry's
+    /// ref addresses exactly the sibling bytes returned for the commit PUT.
+    #[tokio::test]
+    async fn rebuild_part_and_entry_stamps_routing_sibling() {
+        let opts = make_opts();
+        let (entry, encoded_part) =
+            rebuild_part_and_entry(opts, vec![], vec![make_summary_entry(10)], None);
+        let routing = entry.routing.expect("sibling stamped");
+        assert_eq!(
+            routing.content_hash,
+            ContentHash::of(&encoded_part.routing_encoded),
+            "entry ref must address the returned sibling bytes"
+        );
+        assert_eq!(routing.uri, part_uri(&routing.content_hash));
+        assert_eq!(entry.content_hash, ContentHash::of(&encoded_part.encoded));
+        assert!(
+            encoded_part.routing_encoded.len() < encoded_part.encoded.len(),
+            "sibling must shed the fp32 payload"
+        );
+    }
+
     /// Residency invariant: a refresh whose slow-state ref is unchanged
     /// (list-only churn — here a deleted-ids stamp) reuses the decoded
     /// entries — same `Arc`s, zero part loads, zero blob refetch.
@@ -4981,6 +5176,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 1,
@@ -5093,6 +5289,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: SUPERFILES_PER_PART,
@@ -5337,6 +5534,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -5436,6 +5634,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -5562,6 +5761,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -5679,6 +5879,7 @@ mod tests {
                     part_id: pw_old.part_id,
                     uri: pw_old.uri.clone(),
                     content_hash: pw_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5690,6 +5891,7 @@ mod tests {
                     part_id: pw_latest.part_id,
                     uri: pw_latest.uri,
                     content_hash: pw_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5810,6 +6012,7 @@ mod tests {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5821,6 +6024,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5951,6 +6155,7 @@ mod tests {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri.clone(),
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5962,6 +6167,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6106,6 +6312,7 @@ mod tests {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6117,6 +6324,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6128,6 +6336,7 @@ mod tests {
                     part_id: pw_b_old.part_id,
                     uri: pw_b_old.uri.clone(),
                     content_hash: pw_b_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6139,6 +6348,7 @@ mod tests {
                     part_id: pw_b_latest.part_id,
                     uri: pw_b_latest.uri.clone(),
                     content_hash: pw_b_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6320,6 +6530,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6416,6 +6627,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6529,6 +6741,7 @@ mod tests {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -6540,6 +6753,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri.clone(),
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6663,6 +6877,7 @@ mod tests {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6674,6 +6889,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -6791,6 +7007,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6878,6 +7095,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6984,6 +7202,7 @@ mod tests {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri,
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -6995,6 +7214,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri,
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -7080,6 +7300,7 @@ mod tests {
                 size_bytes_compressed: 0,
                 size_bytes_uncompressed: 0,
                 content_hash: part::ContentHash([0u8; 32]),
+                routing: None,
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
