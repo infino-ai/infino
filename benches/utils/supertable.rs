@@ -1257,18 +1257,31 @@ pub mod vector {
     /// Upper doc bound for the mid-scale ceilings (exclusive).
     const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
-    /// query's data GETs (probe + one-time metadata warmup).
+    /// query's DATA GETs (probe + one-time metadata warmup; manifest
+    /// GETs are classed separately). Measured after the probe-wave
+    /// coalescing: 1M = 2 / 3 / 2, 10M = 5 / 6 / 6 — ceilings sit at
+    /// ~2× measured, replacing the loose 64/96 provisional values from
+    /// the v1-open rework. The 10M numbers carry the same steady-probe
+    /// drift the SECOND gate trips on; these stay wide enough not to
+    /// double-report that one root cause.
     const COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
-        ("post-drain", 64, 96),
-        ("post-delta", 96, 128),
-        ("post-compact", 64, 96),
+        ("post-drain", 4, 8),
+        ("post-delta", 6, 12),
+        ("post-compact", 4, 8),
     ];
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
-    /// (steady) cold query's data GETs.
+    /// (steady) cold query's data GETs. These are the ORIGINAL contract
+    /// values from the geometric-ordering era (one coalesced probe GET
+    /// post-drain under 5M; two at 5–20M; post-delta adds one user-delta
+    /// GET) — briefly relaxed to 8/10-class "provisional" ceilings during
+    /// the v1-open rework, which let the 10M steady probe drift to 5
+    /// GETs unnoticed. Measured now: 1M post-drain/post-compact = 1,
+    /// post-delta = 2. The 10M drift is an open regression this gate
+    /// intentionally trips on until run adjacency is restored.
     const COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
-        ("post-drain", 8, 10),
-        ("post-delta", 10, 12),
-        ("post-compact", 8, 10),
+        ("post-drain", 1, 2),
+        ("post-delta", 2, 3),
+        ("post-compact", 1, 2),
     ];
     /// Distinct steady-cold queries sampled per state. A steady cold query
     /// fans concurrent range GETs and its wall is the max of the fan — one
