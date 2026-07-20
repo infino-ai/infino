@@ -1624,9 +1624,16 @@ impl FtsBuilder {
             // headed per term in `dense_doc_poshead`.
             self.doc_pos_chain.clear();
             let doc_pos_chain = &mut self.doc_pos_chain;
-            let mut on_token = |tok: &str| {
-                let position = tokens_in_doc;
-                tokens_in_doc += 1;
+            // `record` interns the token, bumps its tf, and links its
+            // `position` into the per-doc chain. `position` is the
+            // gap-inclusive ordinal — a token the tokenizer drops still
+            // advances it, so a phrase never treats the tokens on either
+            // side of a dropped word as adjacent. The doc length
+            // (`tokens_in_doc`) counts only *emitted* tokens, bumped by
+            // the caller below, so it stays identical to the
+            // positionless build; the two coincide only when nothing is
+            // dropped.
+            let mut record = |tok: &str, position: u64| {
                 let (term_id, is_new) = intern_term_id(term_to_id, id_to_term, term_arena, tok);
                 let idx = term_id as usize;
                 if is_new {
@@ -1654,9 +1661,21 @@ impl FtsBuilder {
                 *head = chain_idx;
             };
             if let Some(ascii) = ascii_tok {
-                ascii.tokenize_each_inline(text, &mut on_token);
+                // Gap-aware: a dropped (non-ASCII) run advances the
+                // position ordinal but emits no token.
+                ascii.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                tokenizer.tokenize_each(text, &mut on_token);
+                // A custom tokenizer can't report dropped tokens through
+                // the current trait, so positions are plain emission
+                // ordinals; a tokenizer that silently drops tokens will
+                // not leave phrase gaps (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each(text, &mut |tok| {
+                    record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
             }
         }
         if pos_overflow {
@@ -1822,9 +1841,14 @@ impl FtsBuilder {
             let doc_pos_head = &mut self.doc_pos_head;
             let doc_pos_chain = &mut self.doc_pos_chain;
             let mut pos_overflow = false;
-            let mut on_token = |tok: &str| {
-                let position = tokens_in_doc;
-                tokens_in_doc += 1;
+            // `record` accumulates tf and links each occurrence's
+            // `position` into the per-doc chain. `position` is the
+            // gap-inclusive ordinal (a dropped token still advances it,
+            // so phrase adjacency isn't faked across a dropped word);
+            // the doc length (`tokens_in_doc`) counts only emitted
+            // tokens, bumped by the caller below — identical to the
+            // positionless build.
+            let mut record = |tok: &str, position: u64| {
                 let hash = compute_hash(tf_per_term.hasher(), tok);
                 let key: &'static str = match tf_per_term
                     .raw_entry_mut()
@@ -1856,9 +1880,20 @@ impl FtsBuilder {
                 doc_pos_chain.push((position as u32, prev));
             };
             if let Some(ascii) = ascii_tok {
-                ascii.tokenize_each_inline(text, &mut on_token);
+                // Gap-aware: a dropped (non-ASCII) run advances the
+                // position ordinal but emits no token.
+                ascii.tokenize_each_inline_positioned(text, |tok, position| {
+                    record(tok, position);
+                    tokens_in_doc += 1;
+                });
             } else {
-                tokenizer.tokenize_each(text, &mut on_token);
+                // A custom tokenizer can't report dropped tokens through
+                // the current trait, so positions are plain emission
+                // ordinals (see the `Tokenizer` trait docs).
+                tokenizer.tokenize_each(text, &mut |tok| {
+                    record(tok, tokens_in_doc);
+                    tokens_in_doc += 1;
+                });
             }
             if pos_overflow {
                 return Err(BuildError::PositionOverflow {

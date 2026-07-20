@@ -71,6 +71,21 @@ const TOKEN_SCRATCH_INITIAL_CAP: usize = 32;
 pub trait Tokenizer: Send + Sync + 'static {
     /// Yield each token as an owned `String` lower-cased per the
     /// implementation's rules.
+    ///
+    /// ## Phrase positions and dropped tokens
+    ///
+    /// The positional index numbers tokens by the order this trait
+    /// yields them, and exact-phrase matching checks those numbers for
+    /// adjacency. A tokenizer that *drops* an input token (a stopword
+    /// filter, a non-ASCII skip, etc.) without otherwise signalling it
+    /// makes the tokens on either side of the dropped one look
+    /// adjacent — so a phrase can match text that isn't actually
+    /// contiguous. The built-in [`AsciiLowerTokenizer`] avoids this on
+    /// its positional build path by leaving a position gap for each
+    /// dropped run; a custom tokenizer that drops tokens and needs
+    /// exact phrase semantics must not rely on this trait to preserve
+    /// gaps (position increments through the trait are a planned
+    /// extension, not yet available).
     fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a>;
 
     /// Call `f(&token)` for each token. The `&str` passed to `f` is
@@ -248,9 +263,35 @@ impl AsciiLowerTokenizer {
     /// keep it.
     #[inline]
     pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
+        // One scan implementation — delegate and discard the position
+        // ordinal so the positionless / query paths and the positional
+        // index build can never disagree on which tokens are emitted.
+        self.tokenize_each_inline_positioned(text, |tok, _position| f(tok));
+    }
+
+    /// Like [`Self::tokenize_each_inline`], but also hands each emitted
+    /// token its **position ordinal**: the count of token runs scanned
+    /// before it, *including runs this tokenizer drops*.
+    ///
+    /// A run that contains a non-ASCII byte is dropped (no token), but
+    /// it still consumes one ordinal — so a phrase never treats the
+    /// tokens on either side of a dropped word as adjacent. Without
+    /// this, `"new café york"` would tokenize to `new`, `york` at
+    /// positions 0, 1 and the phrase `"new york"` would wrongly match
+    /// it; with the gap they sit at 0 and 2. Used by the positional
+    /// index build. (A run consisting *only* of non-ASCII bytes carries
+    /// no ASCII token byte to anchor the scan and is treated as a
+    /// separator, not a gap — the ASCII tokenizer cannot represent such
+    /// text at all.)
+    ///
+    /// The borrowed/copied `&str` is valid only for that one callback
+    /// call, exactly as in [`Self::tokenize_each_inline`].
+    #[inline]
+    pub fn tokenize_each_inline_positioned<F: FnMut(&str, u64)>(&self, text: &str, mut f: F) {
         let bytes = text.as_bytes();
         let mut buf: Vec<u8> = Vec::new();
         let mut pos = 0;
+        let mut position: u64 = 0;
         while pos < bytes.len() {
             pos = simd_skip_non_token(bytes, pos);
             if pos >= bytes.len() {
@@ -259,7 +300,15 @@ impl AsciiLowerTokenizer {
             let start = pos;
             let (end, had_upper, had_non_ascii) = simd_scan_token_run(bytes, pos);
             pos = end;
-            if had_non_ascii || start == pos {
+            if start == pos {
+                continue;
+            }
+            // Every scanned run occupies one ordinal, dropped or not.
+            let this_position = position;
+            position += 1;
+            if had_non_ascii {
+                // Dropped per the v1 ASCII-only rule — the ordinal it
+                // just consumed is the phrase gap it leaves behind.
                 continue;
             }
             if !had_upper {
@@ -271,7 +320,7 @@ impl AsciiLowerTokenizer {
                 // therefore valid UTF-8 and the original `text`
                 // outlives the callback call.
                 let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
-                f(s);
+                f(s, this_position);
             } else {
                 // Slow path: copy + lowercase into the reusable buf.
                 buf.clear();
@@ -283,7 +332,7 @@ impl AsciiLowerTokenizer {
                 // ASCII alphanumeric (or its lowercased form, which
                 // is also ASCII).
                 let s = unsafe { from_utf8_unchecked(&buf) };
-                f(s);
+                f(s, this_position);
             }
         }
     }
@@ -607,6 +656,52 @@ mod tests {
 
     fn tokens(text: &str) -> Vec<String> {
         AsciiLowerTokenizer.tokenize(text).collect()
+    }
+
+    /// Collect `(token, position)` pairs from the positional scan.
+    fn positioned(text: &str) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        AsciiLowerTokenizer
+            .tokenize_each_inline_positioned(text, |tok, pos| out.push((tok.to_owned(), pos)));
+        out
+    }
+
+    #[test]
+    fn positioned_leaves_a_gap_for_dropped_runs() {
+        // No drops: positions are dense emission ordinals, and the
+        // positioned scan emits exactly the same tokens as the plain
+        // one (delegation guarantees this).
+        assert_eq!(
+            positioned("the quick brown fox"),
+            vec![
+                ("the".into(), 0),
+                ("quick".into(), 1),
+                ("brown".into(), 2),
+                ("fox".into(), 3),
+            ],
+        );
+
+        // A dropped (non-ASCII) run consumes an ordinal but emits no
+        // token, so the neighbours are NOT adjacent: `york` is at 2,
+        // not 1 — this is what stops `"new york"` matching this text.
+        assert_eq!(
+            positioned("new café york"),
+            vec![("new".into(), 0), ("york".into(), 2)],
+        );
+        // Gap whether the dropped word leads, trails, or sits between.
+        assert_eq!(
+            positioned("café new york"),
+            vec![("new".into(), 1), ("york".into(), 2)],
+        );
+        assert_eq!(
+            positioned("new york café"),
+            vec![("new".into(), 0), ("york".into(), 1)],
+        );
+
+        // The plain scan still emits the same tokens (positions dropped).
+        let mut plain = Vec::new();
+        AsciiLowerTokenizer.tokenize_each_inline("new café york", |t| plain.push(t.to_owned()));
+        assert_eq!(plain, vec!["new".to_string(), "york".to_string()]);
     }
 
     #[test]

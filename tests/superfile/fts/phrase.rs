@@ -161,6 +161,38 @@ async fn three_token_phrase_and_absent_member() {
 }
 
 #[tokio::test]
+async fn dropped_token_leaves_a_phrase_gap() {
+    // The default tokenizer drops runs containing non-ASCII bytes.
+    // A dropped run must still leave a position gap, or the tokens on
+    // either side of it would look adjacent and a phrase would match
+    // text that isn't contiguous.
+    let corp = vec![
+        (0u64, "new york"),          // genuinely adjacent → must match
+        (1, "new café york"),        // dropped word between → must NOT match
+        (2, "café new york"),        // dropped word before the phrase → matches
+        (3, "new york café"),        // dropped word after the phrase → matches
+        (4, "new naïve fresh york"), // dropped word + real word between → no match
+    ];
+    let r = build_infino_superfile_positional(&corp);
+    let hits = search_hits(&r, r#""new york""#, K_ALL, BoolMode::Or).await;
+    let mut ids: Vec<u64> = hits.iter().map(|(d, _)| *d).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![0, 2, 3],
+        "phrase must span a dropped token as a gap, not treat its neighbours as adjacent"
+    );
+
+    // The single dropped-word doc is not merely absent because `york`
+    // is missing — `york` alone still matches doc 1.
+    let york = search_hits(&r, "york", K_ALL, BoolMode::Or).await;
+    assert!(
+        york.iter().any(|(d, _)| *d == 1),
+        "doc 1 still contains the term `york`"
+    );
+}
+
+#[tokio::test]
 async fn single_and_repeated_words_on_sixty_doc_corpus() {
     // The negation-suite corpus, positional: phrase behavior must
     // agree with the oracle on organic text too.
