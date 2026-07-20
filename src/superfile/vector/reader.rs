@@ -2317,12 +2317,7 @@ impl VectorReader {
             .source
             .try_get_range_sync(col.subsection_range.clone())
             .ok_or(BuildError::VectorReadError)?;
-        Ok(Self::parse_materialized_index_rows(
-            col,
-            sub.as_ref(),
-            &scale,
-            &offset,
-        ))
+        Self::parse_materialized_index_rows(col, sub.as_ref(), &scale, &offset)
     }
 
     /// Async materialize of one cell column slot (v1 single column or one
@@ -2367,12 +2362,7 @@ impl VectorReader {
             .range_async(col.subsection_range.clone())
             .await
             .ok()?;
-        Some(Self::parse_materialized_index_rows(
-            col,
-            sub.as_ref(),
-            &scale_buf,
-            &offset_buf,
-        ))
+        Self::parse_materialized_index_rows(col, sub.as_ref(), &scale_buf, &offset_buf).ok()
     }
 
     /// Materialize packed cells as `(global_cell_id, rows)`.
@@ -2434,12 +2424,18 @@ impl VectorReader {
                 .range_async(range)
                 .await
                 .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            // Exact-size check: a truncated region would silently yield fewer
+            // ids than rows (partial mapping); trailing bytes mean the offsets
+            // are wrong. Both are corruption — fail fast.
+            let expected_len = (col.n_docs as usize) * format::vec::STABLE_ID_BYTES;
+            if region.len() != expected_len {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "inline stable_id region for cell {cell_id}: {} bytes, expected {expected_len}",
+                    region.len()
+                ))));
+            }
             let mut ids = Vec::with_capacity(col.n_docs as usize);
-            for chunk in region
-                .as_ref()
-                .chunks_exact(format::vec::STABLE_ID_BYTES)
-                .take(col.n_docs as usize)
-            {
+            for chunk in region.as_ref().chunks_exact(format::vec::STABLE_ID_BYTES) {
                 let arr: [u8; format::vec::STABLE_ID_BYTES] = chunk.try_into().map_err(|_| {
                     VectorError::Read(ReadError::MalformedVersion(
                         "inline stable_id region slice".into(),
@@ -2510,12 +2506,17 @@ impl VectorReader {
     /// column's per-cluster Sq8 `scale`/`offset`, carrying the inline stable
     /// `_id` when the subsection has the region. Pure/sync — fed pre-fetched
     /// bytes by [`Self::materialized_index_rows_async`].
+    ///
+    /// Fallible: every offset derived from the directory is bounds-checked
+    /// against `sub`, so a truncated or corrupted subsection surfaces
+    /// [`BuildError::VectorReadError`] instead of panicking the maintenance
+    /// path (CRC verification is opt-in there).
     fn parse_materialized_index_rows(
         col: &ColumnReader,
         sub: &[u8],
         scale: &[f32],
         offset: &[f32],
-    ) -> Vec<MaterializedIvfRow> {
+    ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
         let dim = col.dim;
         let code_bytes = col.quant.code_bytes();
         let stride = col.per_cluster_doc_stride();
@@ -2523,6 +2524,17 @@ impl VectorReader {
         let per_vec = col.rerank_codec.per_vector_bytes(dim);
         let n_cent = col.n_cent as usize;
         let store_norm = matches!(col.metric, Metric::L2Sq | Metric::Cosine);
+        let divisor = col
+            .rerank_codec
+            .residual_divisor()
+            .ok_or(BuildError::VectorReadError)?;
+        let u32_at = |p: usize| -> Result<u32, BuildError> {
+            let bytes: [u8; 4] = sub
+                .get(p..p + 4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(BuildError::VectorReadError)?;
+            Ok(u32::from_le_bytes(bytes))
+        };
 
         // Inline stable-`_id` region (relative offset into `sub`), when this is
         // a materialized/hidden-cell subsection. Lets the read-back carry the
@@ -2533,10 +2545,8 @@ impl VectorReader {
         let mut out = Vec::with_capacity(col.n_docs as usize);
         for c in 0..n_cent {
             let e = col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
-            let doc_off = u32::from_le_bytes([sub[e], sub[e + 1], sub[e + 2], sub[e + 3]]) as usize;
-            let cb = e + CLUSTER_IDX_COUNT_OFFSET;
-            let count =
-                u32::from_le_bytes([sub[cb], sub[cb + 1], sub[cb + 2], sub[cb + 3]]) as usize;
+            let doc_off = u32_at(e)? as usize;
+            let count = u32_at(e + CLUSTER_IDX_COUNT_OFFSET)? as usize;
             if count == 0 {
                 continue;
             }
@@ -2545,37 +2555,44 @@ impl VectorReader {
             let full_at = block + count * (code_bytes + id_bytes);
             // Shared per-cluster backing: each row clones the Arc (refcount bump),
             // not the dim-length scale/offset buffers.
-            let sc: std::sync::Arc<[f32]> = std::sync::Arc::from(&scale[c * dim..c * dim + dim]);
-            let of: std::sync::Arc<[f32]> = std::sync::Arc::from(&offset[c * dim..c * dim + dim]);
+            let sc: std::sync::Arc<[f32]> = std::sync::Arc::from(
+                scale
+                    .get(c * dim..c * dim + dim)
+                    .ok_or(BuildError::VectorReadError)?,
+            );
+            let of: std::sync::Arc<[f32]> = std::sync::Arc::from(
+                offset
+                    .get(c * dim..c * dim + dim)
+                    .ok_or(BuildError::VectorReadError)?,
+            );
             for i in 0..count {
-                let idb = doc_ids_at + i * id_bytes;
-                let local_id =
-                    u32::from_le_bytes([sub[idb], sub[idb + 1], sub[idb + 2], sub[idb + 3]]);
-                let rabitq = sub[block + i * code_bytes..block + (i + 1) * code_bytes].to_vec();
+                let local_id = u32_at(doc_ids_at + i * id_bytes)?;
+                let rabitq = sub
+                    .get(block + i * code_bytes..block + (i + 1) * code_bytes)
+                    .ok_or(BuildError::VectorReadError)?
+                    .to_vec();
                 let rowb = full_at + i * per_vec;
-                let codes = sub[rowb..rowb + dim].to_vec();
-                let residuals = sub[rowb + dim..rowb + dim + dim].to_vec();
-                let norm_sq = store_norm.then(|| {
-                    sq8_residual_norm_sq(
-                        &sc,
-                        &of,
-                        &codes,
-                        &residuals,
-                        col.rerank_codec
-                            .residual_divisor()
-                            .expect("materialized row uses residual-family codec"),
-                    )
-                });
-                let stable_id = stable_ids_rel
-                    .map(|so| {
+                let codes = sub
+                    .get(rowb..rowb + dim)
+                    .ok_or(BuildError::VectorReadError)?
+                    .to_vec();
+                let residuals = sub
+                    .get(rowb + dim..rowb + dim + dim)
+                    .ok_or(BuildError::VectorReadError)?
+                    .to_vec();
+                let norm_sq =
+                    store_norm.then(|| sq8_residual_norm_sq(&sc, &of, &codes, &residuals, divisor));
+                let stable_id = match stable_ids_rel {
+                    Some(so) => {
                         let p = so + (local_id as usize) * format::vec::STABLE_ID_BYTES;
-                        i128::from_le_bytes(
-                            sub[p..p + format::vec::STABLE_ID_BYTES]
-                                .try_into()
-                                .expect("16-byte stable_id slice"),
-                        )
-                    })
-                    .unwrap_or(0);
+                        let bytes: [u8; format::vec::STABLE_ID_BYTES] = sub
+                            .get(p..p + format::vec::STABLE_ID_BYTES)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or(BuildError::VectorReadError)?;
+                        i128::from_le_bytes(bytes)
+                    }
+                    None => 0,
+                };
                 out.push(MaterializedIvfRow {
                     local_doc_id: local_id,
                     stable_id,
@@ -2593,7 +2610,7 @@ impl VectorReader {
                 });
             }
         }
-        out
+        Ok(out)
     }
 
     /// Single-column kNN search. Returns `(local_doc_id,

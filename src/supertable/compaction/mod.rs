@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn drain_watermark_partition_never_mixes_drained_and_undrained() {
         // Watermark: versions 0..=10 drained.
-        let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]);
+        let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]).expect("valid intervals");
         let mut a = seg(1, 1, 1000, 0);
         a.birth_version = 5; // drained
         let mut b = seg(2, 1, 1000, 0);

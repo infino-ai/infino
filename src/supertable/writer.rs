@@ -78,7 +78,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
-use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
@@ -608,7 +608,7 @@ fn split_buffer_by_vector_cell(
     cells: &ClusterCentroids,
     metric: Metric,
     vec_col_idx: usize,
-) -> Vec<(u32, Vec<BufferedBatch>)> {
+) -> Result<Vec<(u32, Vec<BufferedBatch>)>, BuildError> {
     let k = cells.n_cent as usize;
     let mut cell_batches: Vec<Vec<BufferedBatch>> = (0..k).map(|_| Vec::new()).collect();
     for batch in buffer {
@@ -628,14 +628,23 @@ fn split_buffer_by_vector_cell(
                 continue;
             }
             let indices = UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+            // Propagate instead of panicking: a take/rebuild failure mid-commit
+            // must roll the append back cleanly, not abort the process.
             let scalar_cols: Vec<ArrayRef> = (0..batch.scalar.num_columns())
                 .map(|col_idx| {
-                    arrow::compute::take(batch.scalar.column(col_idx), &indices, None)
-                        .expect("take column")
+                    take(batch.scalar.column(col_idx), &indices, None).map_err(|e| {
+                        BuildError::Store(format!(
+                            "vector-cell split: take column {col_idx} for cell {cell_id}: {e}"
+                        ))
+                    })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let scalar_batch =
-                RecordBatch::try_new(batch.scalar.schema(), scalar_cols).expect("rebuild batch");
+                RecordBatch::try_new(batch.scalar.schema(), scalar_cols).map_err(|e| {
+                    BuildError::Store(format!(
+                        "vector-cell split: rebuild batch for cell {cell_id}: {e}"
+                    ))
+                })?;
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
                 .iter()
@@ -654,12 +663,12 @@ fn split_buffer_by_vector_cell(
             });
         }
     }
-    cell_batches
+    Ok(cell_batches
         .into_iter()
         .enumerate()
         .filter(|(_, batches)| !batches.is_empty())
         .map(|(cell_id, batches)| (cell_id as u32, batches))
-        .collect()
+        .collect())
 }
 
 /// The public folded `update` / `delete` buffer exactly one mutation
@@ -1645,7 +1654,7 @@ impl SupertableWriter {
                     .unwrap_or(Metric::L2Sq);
                 if clusters.n_cent > 0 && clusters.dim > 0 {
                     let cell_shards = writer_pool
-                        .install(|| split_buffer_by_vector_cell(owned, clusters, metric, 0));
+                        .install(|| split_buffer_by_vector_cell(owned, clusters, metric, 0))?;
                     let hints: Vec<Option<u32>> = cell_shards
                         .iter()
                         .map(|(cell_id, _)| Some(*cell_id))
@@ -2588,14 +2597,19 @@ async fn persist_superfile_publish_batch_async(
 /// routing can't starve foreground ingest CPU.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
-fn maint_pool() -> &'static rayon::ThreadPool {
-    MAINT_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .thread_name(|_| "hidden-maint-cpu".into())
-            .build()
-            .expect("hidden maintenance rayon pool")
-    })
+fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
+    if let Some(pool) = MAINT_POOL.get() {
+        return Ok(pool);
+    }
+    // Build outside `get_or_init` so a spawn failure propagates instead of
+    // panicking the maintenance path (`OnceLock::get_or_try_init` is not
+    // stable). A racing initializer wins harmlessly; ours is dropped.
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(|_| "hidden-maint-cpu".into())
+        .build()
+        .map_err(|e| BuildError::Store(format!("hidden maintenance rayon pool: {e}")))?;
+    Ok(MAINT_POOL.get_or_init(|| pool))
 }
 
 /// No-staging drain: read committed user superfiles, assign their encoded rows
@@ -5217,7 +5231,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
     // resident bytes at split time (a RAM cliff at 100M/1B).
     let split_refs: Vec<&EncodedCellRow> = all_materialized.iter().map(|r| &r.encoded).collect();
     let (sub0, sub1, assign) =
-        maint_pool().install(|| opann::plan_sq8_split(&split_refs, &clusters, split_cell, metric));
+        maint_pool()?.install(|| opann::plan_sq8_split(&split_refs, &clusters, split_cell, metric));
     let mut sub_centroids = sub0;
     sub_centroids.extend_from_slice(&sub1);
     let (updated_clusters, new_cell_id) =
@@ -6478,7 +6492,8 @@ mod tests {
             vectors: vec![Arc::new(vectors)],
         };
 
-        let out = split_buffer_by_vector_cell(vec![batch], &cells, Metric::Cosine, 0);
+        let out = split_buffer_by_vector_cell(vec![batch], &cells, Metric::Cosine, 0)
+            .expect("split buffer by vector cell");
         let mut rows_by_cell: HashMap<u32, usize> = HashMap::new();
         for (cell, batches) in &out {
             rows_by_cell.insert(*cell, batches.iter().map(|b| b.scalar.num_rows()).sum());

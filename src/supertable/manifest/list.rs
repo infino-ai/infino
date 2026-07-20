@@ -242,12 +242,23 @@ pub struct DrainedVersionRanges {
 
 impl DrainedVersionRanges {
     /// Rebuild from persisted intervals (normalizes defensively).
-    pub fn from_intervals(intervals: Vec<(u64, u64)>) -> Self {
+    ///
+    /// Rejects inverted intervals (`lo > hi`) instead of admitting them:
+    /// this decodes remote manifest state, and a malformed interval would
+    /// make `contains`/`covers` lie in release builds — versions could be
+    /// skipped or re-drained. Corruption fails the manifest load loudly.
+    pub fn from_intervals(intervals: Vec<(u64, u64)>) -> Result<Self, ListParseError> {
         let mut s = Self { ranges: Vec::new() };
         for (lo, hi) in intervals {
+            if lo > hi {
+                return Err(ListParseError::BadFieldValue(
+                    "drained_ranges",
+                    format!("inverted interval [{lo}, {hi}]"),
+                ));
+            }
             s.insert_range(lo, hi);
         }
-        s
+        Ok(s)
     }
 
     /// The normalized intervals, for serialization.
@@ -1655,13 +1666,24 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
                 })
             })
             .transpose()?,
-        drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges),
+        drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges)?,
         deleted_user_ids_inline: d
             .deleted_user_ids_inline_b64
             .as_deref()
             .map(|b64| decode_b64(b64, "deleted_user_ids_inline"))
             .transpose()?,
-        slow_vector_state_uri: d.slow_vector_state_uri,
+        // Atomic pair: unlike the centroids section below (whose contract is
+        // fall-back-to-None), the slow-state ref is required where present —
+        // a half-written ref is corruption, not an absent section.
+        slow_vector_state_uri: match (&d.slow_vector_state_uri, &d.slow_vector_state_content_hash) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ListParseError::BadFieldValue(
+                    "slow_vector_state",
+                    "uri and content_hash must be present together".into(),
+                ));
+            }
+            _ => d.slow_vector_state_uri,
+        },
         slow_vector_state_content_hash: d
             .slow_vector_state_content_hash
             .as_deref()
@@ -2657,7 +2679,8 @@ mod tests {
         d.insert(9);
         assert_eq!(d.intervals(), &[(1, 5), (8, 12)]);
         // from_intervals normalizes unsorted/overlapping input.
-        let d2 = DrainedVersionRanges::from_intervals(vec![(5, 7), (1, 3), (4, 4)]);
+        let d2 = DrainedVersionRanges::from_intervals(vec![(5, 7), (1, 3), (4, 4)])
+            .expect("valid intervals");
         assert_eq!(d2.intervals(), &[(1, 7)]);
     }
 
@@ -2681,7 +2704,9 @@ mod tests {
         assert_eq!(p.prefix_end(), Some(7));
         // A set not anchored at genesis (e.g. a parallel high-slice) has no prefix.
         assert_eq!(
-            DrainedVersionRanges::from_intervals(vec![(5, 7)]).prefix_end(),
+            DrainedVersionRanges::from_intervals(vec![(5, 7)])
+                .expect("valid intervals")
+                .prefix_end(),
             None
         );
     }
@@ -2689,7 +2714,8 @@ mod tests {
     #[test]
     fn drained_ranges_roundtrip() {
         let mut list = empty_list();
-        list.drained_ranges = DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]);
+        list.drained_ranges =
+            DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]).expect("valid intervals");
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.drained_ranges, list.drained_ranges);
@@ -2698,7 +2724,8 @@ mod tests {
 
     #[test]
     fn drained_ranges_cover_only_complete_intervals() {
-        let ranges = DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]);
+        let ranges =
+            DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]).expect("valid intervals");
         assert!(ranges.covers(2, 4));
         assert!(!ranges.covers(3, 7));
         assert!(!ranges.covers(5, 6));
