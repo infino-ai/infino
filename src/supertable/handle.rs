@@ -18,7 +18,6 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    io,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -48,8 +47,10 @@ use crate::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
-        query::sql::{SqlSchemas, build_sql_schemas},
-        query::scalar_cache::DecodedScalarCache,
+        query::{
+            scalar_cache::DecodedScalarCache,
+            sql::{SqlSchemas, build_sql_schemas},
+        },
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
@@ -251,103 +252,6 @@ impl Supertable {
     /// open-time sweep bridge entirely because no WAL/GC I/O can
     /// exist without attached storage.
     fn create(options: SupertableOptions) -> Result<Self, OpenError> {
-        // Pointer-probe pass. When storage is attached AND a
-        // pointer file already exists, we want open's load path
-        // — never silently shadow committed state with an empty
-        // manifest.
-        if let Some(storage) = options.storage.as_ref() {
-            let probe = Arc::clone(storage);
-            let probe_result =
-                bridge_sync_to_async(async move { read_pointer(&*probe).await });
-            match probe_result {
-                Ok(Some(_pointer)) => {
-                    return Self::open(options);
-                }
-                Ok(None) => {
-                    // No pointer → fall through to fresh-create.
-                }
-                Err(e) => {
-                    return Err(OpenError::Storage(StorageError::Permanent {
-                        uri: "_supertable/current".into(),
-                        source: Box::new(io::Error::other(format!("{e}"))),
-                    }));
-                }
-            }
-        }
-
-        let options = Arc::new(options);
-        // Build the initial in-memory manifest. A durable table also *persists*
-        // it here — its list plus the pointer at `manifest_id 0` — so the
-        // freshly created table is openable right away: before any append,
-        // after a reopen, and from another process. `open` requires a pointer,
-        // and this doesn't shift the id sequence (the first append still
-        // commits `manifest_id 1`). An in-memory table keeps the lighter
-        // in-process-only empty snapshot, with nothing to persist.
-        let initial: Arc<ManifestSnapshot> = if let Some(storage) = options.storage.clone() {
-            let materialized = Arc::new(ManifestSnapshot::materialized_empty(options.clone()));
-            let write_result = {
-                let manifest = Arc::clone(&materialized);
-                let storage = Arc::clone(&storage);
-                // `expected_prev_etag = None` is the initial-commit shape: no
-                // prior pointer to fence on.
-                bridge_sync_to_async(
-                    async move { manifest.write(storage.as_ref(), None, &[]).await },
-                )
-            };
-            match write_result {
-                Ok(()) => materialized,
-                // Lost the initial-pointer race to a concurrent creator on the
-                // same storage: adopt their committed manifest rather than
-                // failing. This matches `create`'s create-or-open contract — a
-                // pointer that appeared between our probe and our write is the
-                // same as "pointer already present" (which the probe above
-                // routes to `open`).
-                Err(CommitError::WriteContentionExhausted) => {
-                    let storage = Arc::clone(&storage);
-                    let options = options.clone();
-                    bridge_sync_to_async(async move {
-                        ManifestSnapshot::load(None, storage, Some(options)).await
-                    })?
-                }
-                Err(e) => return Err(e.into()),
-            }
-        } else {
-            Arc::new(ManifestSnapshot::empty(options.clone()))
-        };
-        let tombstone_cache = build_tombstone_cache(&options, &initial);
-        let id_generator = IdGenerator::new();
-        let handle_id = SupertableHandleId(id_generator.next_id());
-        let inner = Arc::new(SupertableInner {
-            options,
-            manifest: ArcSwap::new(initial),
-            writer_outstanding: AtomicBool::new(false),
-            compaction_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(id_generator),
-            sql_session_cache: Mutex::new(None),
-            tombstone_cache,
-            handle_id,
-            last_pointer_check: Mutex::new(None),
-            last_pointer_etag: Mutex::new(None),
-            sql_schemas: OnceLock::new(),
-        });
-        install_disk_cache_pinning(&inner);
-        let st = Self { inner };
-        // Open-time recovery + GC sweeps need storage. For in-memory
-        // supertables they are guaranteed no-ops, so skip the async
-        // bridge; this keeps `Supertable::create` usable inside
-        // current-thread `#[tokio::test]` contexts for pure in-memory
-        // unit tests.
-        if st.inner.options.storage.is_some() {
-            // Best-effort: a sweep failure here doesn't fail handle
-            // construction; the next sweep gets another shot.
-            if let Err(e) = st.run_recovery_sweep_once_blocking() {
-                warn!(error = %e, "open-time recovery sweep failed (best-effort)");
-            }
-            if let Err(e) = bridge_sync_to_async(async { st.run_gc_sweep_once().await }) {
-                warn!(error = %e, "open-time gc sweep failed (best-effort)");
-            }
-        }
-        Ok(st)
         bridge_sync_to_async(Self::create_async(options))
     }
     }
@@ -408,29 +312,6 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
         let manifest = ManifestSnapshot::load(None, storage, Some(options_arc.clone())).await?;
-        let tombstone_cache = build_tombstone_cache(&options_arc, &manifest);
-        // Fresh generator per open. The 64-bit ms timestamp
-        // prefix advances naturally across process restarts, so
-        // re-opened supertables never re-mint values that already
-        // live in storage — no resume-from-id_max-on-open logic
-        // needed. The worker_id is also fresh, further insulating
-        // restarts from collisions.
-        let id_generator = IdGenerator::new();
-        let handle_id = SupertableHandleId(id_generator.next_id());
-        let inner = Arc::new(SupertableInner {
-            options: options_arc,
-            manifest: ArcSwap::new(manifest),
-            writer_outstanding: AtomicBool::new(false),
-            compaction_outstanding: AtomicBool::new(false),
-            id_generator: Mutex::new(id_generator),
-            sql_session_cache: Mutex::new(None),
-            tombstone_cache,
-            handle_id,
-            last_pointer_check: Mutex::new(None),
-            last_pointer_etag: Mutex::new(None),
-            sql_schemas: OnceLock::new(),
-        });
-        install_disk_cache_pinning(&inner);
         // Resolve the hidden vector index into one of three states:
         //  * Present  — configured, materialized, opened → `Some(handle)`.
         //  * Absent   — not configured, or configured but no pointer yet
@@ -1459,6 +1340,7 @@ async fn build_handle(
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
         hidden_deleted_cache: Mutex::new(None),
+        sql_schemas: OnceLock::new(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

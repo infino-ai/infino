@@ -19,7 +19,7 @@
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Use the reader's already-pinned `Arc<ManifestSnapshot>`.
+//!   1. Use the reader's already-pinned `Arc<Manifest>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.
@@ -46,18 +46,16 @@
 //! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::SchemaRef;
-use std::{sync::Arc, time::Instant};
 use datafusion::{
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::context::SessionContext,
     logical_expr::{Expr, LogicalPlan},
-    prelude::Expr,
 };
 
 use crate::{
@@ -114,6 +112,7 @@ pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
         .collect();
     let scan = view_string_schema(&scalar, &fts);
     SqlSchemas { scalar, scan }
+}
 
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
@@ -227,11 +226,6 @@ impl SupertableReader {
 
         let sql = sql.to_owned();
         let drive = async move {
-            let df = ctx
-                .sql(&sql)
-                .await
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
-
             // The scan runs strings as `Utf8View`; `expand_views_at_output`
             // (set in `budgeted_session_context`) coerces them back to
             // `LargeUtf8` at the plan output, so the result carries no view.
@@ -549,6 +543,8 @@ mod tests {
         w.append(&build_cat_batch(0, cats, titles)).expect("append");
         w.commit().expect("commit");
         st
+    }
+
     fn rating_table(ratings: &[i64]) -> Supertable {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "rating",
