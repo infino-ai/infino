@@ -336,6 +336,13 @@ impl Supertable {
                         }
                     }
                 }
+                // A consumer-memory-mode handle must not bootstrap-create the
+                // sibling: its user summaries hydrate stripped, so the grid
+                // can't be trained here and the create would durably stamp a
+                // default (non-VectorCell) partition strategy. Absent is
+                // correct — queries fall back to the user fan until a writer
+                // handle materializes the index.
+                Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
                 Ok(None) => match create_table_async(hidden_opts, None, None).await {
                     Ok(table) => (Some(Arc::new(table)), None),
                     Err(e) => {
@@ -1258,10 +1265,13 @@ fn build_vector_index_options(
         .with_writer_pool(Arc::clone(&user_opts.writer_pool))
         .with_read_consistency(user_opts.read_consistency);
     hidden_opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
-    // The hidden manifest's slow-state blob is where the bulk of the fine
-    // fp32 centroids live; a read-only consumer's memory mode must ride
-    // along to its hydration.
-    hidden_opts.summary_centroids_from_superfiles = user_opts.summary_centroids_from_superfiles;
+    // Hidden-manifest summaries hydrate stripped unconditionally (the fp32
+    // wire home is the slow-CAS centroid section), so the consumer memory
+    // mode has nothing left to gate there. Keep it off on the derived
+    // options: the flag marks a handle read-only, and hidden maintenance
+    // (drain, split, compaction) must stay writable regardless of how the
+    // user handle was opened.
+    hidden_opts.summary_centroids_from_superfiles = false;
     // Per-table cell-count overrides ride along too: the hidden handle's
     // paths resolve counts through its own options.
     hidden_opts.user_cell_count = user_opts.user_cell_count;
@@ -2511,10 +2521,6 @@ mod tests {
         assert!(
             hidden_manifest.slow_vector_state_blob().is_some(),
             "drain must publish the slow-state ref (routing-shaped blob)"
-        );
-        assert!(
-            hidden_manifest.slow_vector_state_routing_blob().is_none(),
-            "two-object model: no routing sibling — the primary blob IS routing-shaped"
         );
         assert!(
             hidden_manifest.slow_vector_state_centroids_blob().is_some(),

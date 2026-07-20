@@ -273,7 +273,12 @@ pub(crate) fn compose_centroid_section(
                     continue;
                 }
                 let carried = previous
-                    .and_then(|section| section.read_cell(entry.superfile_id, column, cell.cell_id))
+                    .map(|section| section.read_cell(entry.superfile_id, column, cell.cell_id))
+                    .transpose()
+                    .map_err(|e| {
+                        SlowVectorStateError::Storage(format!("previous section read: {e}"))
+                    })?
+                    .flatten()
                     .filter(|fp32| fp32.len() == expected);
                 match carried {
                     Some(fp32) => {
@@ -347,27 +352,29 @@ impl CentroidSection {
     }
 
     /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
-    /// `None` when the `(superfile, column, cell)` triple is not in the
-    /// section — the caller falls back to the per-superfile read.
+    /// `Ok(None)` when the `(superfile, column, cell)` triple is not in the
+    /// section; a spill-read fault is an error, never "absent" — mapping it
+    /// to `None` would silently reroute the caller to a fallback source.
     pub(crate) fn read_cell(
         &self,
         superfile_id: Uuid,
         column: &str,
         cell_id: Option<u32>,
-    ) -> Option<Vec<f32>> {
-        let cells = self.cells.get(&(superfile_id, column.to_owned()))?;
-        let cell = cells.iter().find(|c| c.cell_id == cell_id)?;
+    ) -> io::Result<Option<Vec<f32>>> {
+        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
+            return Ok(None);
+        };
+        let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
+            return Ok(None);
+        };
         let len = cell.n_cent as usize * cell.dim as usize * 4;
         let mut buf = vec![0u8; len];
-        self.spill
-            .as_file()
-            .read_exact_at(&mut buf, cell.offset)
-            .ok()?;
-        Some(
+        self.spill.as_file().read_exact_at(&mut buf, cell.offset)?;
+        Ok(Some(
             buf.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -393,19 +400,26 @@ pub(crate) async fn fetch_centroid_section(
     }
     let spill = NamedTempFile::new().map_err(io_err)?;
     let mut hasher = blake3::Hasher::new();
-    let mut offset = 0u64;
-    while offset < meta.size {
-        let end = (offset + STRIPED_FETCH_CHUNK_BYTES).min(meta.size);
-        let bytes = storage
-            .get_range(&reference.uri, offset..end)
-            .await
-            .map_err(store_err)?;
+    // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,
+    // bounded in flight. `buffered` yields chunks in range order, so each
+    // is hashed and written at its offset as it lands, then dropped —
+    // peak memory stays at in-flight × chunk, never the whole section.
+    let ranges = striped_ranges(meta.size, STRIPED_FETCH_CHUNK_BYTES);
+    let mut chunks = stream::iter(ranges.into_iter().map(|range| {
+        let uri = &reference.uri;
+        async move {
+            let offset = range.start;
+            storage.get_range(uri, range).await.map(|b| (offset, b))
+        }
+    }))
+    .buffered(STRIPED_FETCH_MAX_IN_FLIGHT);
+    while let Some(chunk) = chunks.next().await {
+        let (offset, bytes) = chunk.map_err(store_err)?;
         hasher.update(&bytes);
         spill
             .as_file()
             .write_all_at(&bytes, offset)
             .map_err(io_err)?;
-        offset = end;
     }
     if ContentHash(*hasher.finalize().as_bytes()) != reference.content_hash {
         return Err(SlowVectorStateError::HashMismatch);
@@ -544,10 +558,7 @@ async fn fetch_blob_striped(
         let (bytes, _) = storage.get(uri).await.map_err(store_err)?;
         return Ok(bytes);
     }
-    let ranges: Vec<Range<u64>> = (0..meta.size)
-        .step_by(chunk_bytes.max(1) as usize)
-        .map(|start| start..(start + chunk_bytes).min(meta.size))
-        .collect();
+    let ranges = striped_ranges(meta.size, chunk_bytes);
     // `buffered` preserves range order, so the concatenation below
     // reassembles the object byte-exactly; the content hash check in
     // the caller is the end-to-end integrity gate.
@@ -565,6 +576,15 @@ async fn fetch_blob_striped(
         out.extend_from_slice(chunk);
     }
     Ok(Bytes::from(out))
+}
+
+/// Consecutive `chunk_bytes`-sized ranges covering `0..size` — the shared
+/// stripe plan for [`fetch_blob_striped`] and [`fetch_centroid_section`].
+fn striped_ranges(size: u64, chunk_bytes: u64) -> Vec<Range<u64>> {
+    (0..size)
+        .step_by(chunk_bytes.max(1) as usize)
+        .map(|start| start..(start + chunk_bytes).min(size))
+        .collect()
 }
 
 #[cfg(test)]
@@ -701,6 +721,7 @@ mod tests {
             let cell = &entry.vector_summary["emb"].cells[0];
             let got = fetched
                 .read_cell(entry.superfile_id, "emb", cell.cell_id)
+                .expect("spill read")
                 .expect("cell served");
             assert_eq!(got, cell.clusters.centroids, "fp32 must round-trip");
         }
@@ -708,6 +729,7 @@ mod tests {
         assert!(
             fetched
                 .read_cell(entries[0].superfile_id, "emb", Some(999))
+                .expect("spill read")
                 .is_none()
         );
     }

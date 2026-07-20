@@ -143,15 +143,6 @@ pub struct Manifest {
     /// never on table kind.
     pub slow_vector_state_uri: Option<String>,
     pub slow_vector_state_content_hash: Option<ContentHash>,
-    /// Routing sibling of the slow-CAS blob: the same visible entries with
-    /// each summary's cluster blocks encoded as counts + 1-bit admit slab,
-    /// no fp32 payload. Consumer opens running with
-    /// `summary_centroids_from_superfiles` fetch this object instead of the
-    /// full blob (GiBs → MiBs at 100M docs); exact scans then read fp32
-    /// from the superfile centroid regions. Stamped and cleared together
-    /// with the full ref; absent on manifests written before the sibling
-    /// existed (consumers fall back to the full blob).
-    pub slow_vector_state_routing: Option<RoutingRef>,
     /// Centroid-section sibling: every visible entry's fp32 fine centroids
     /// concatenated contiguously in `(entry, column, cell)` order. The
     /// stripped-summary admit rescore hydrates it in one fetch on the
@@ -179,13 +170,11 @@ pub struct Manifest {
     pub tombstone_seqs: BTreeMap<Uuid, u64>,
 }
 
-/// Content-addressed reference to the routing-only sibling of a manifest
-/// artifact — the slow-CAS blob ([`Manifest::slow_vector_state_routing`])
-/// or a manifest part ([`ManifestPartEntry::routing`]). The sibling
-/// carries the same entries with each vector summary's cluster blocks
-/// encoded as counts + 1-bit admit slab (no fp32 payload); consumer opens
-/// running with `summary_centroids_from_superfiles` fetch it instead of
-/// the full form.
+/// Content-addressed reference to a sibling object of a manifest
+/// artifact: a manifest part's routing form ([`ManifestPartEntry::routing`],
+/// same entries with each vector summary's cluster blocks encoded as
+/// counts + 1-bit admit slab, no fp32 payload) or the slow-CAS centroid
+/// section ([`Manifest::slow_vector_state_centroids`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingRef {
     pub uri: String,
@@ -1062,10 +1051,6 @@ struct ManifestDto {
     #[serde(default)]
     slow_vector_state_content_hash: Option<String>, // "blake3:<64hex>"
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    slow_vector_state_routing_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    slow_vector_state_routing_content_hash: Option<String>, // "blake3:<64hex>"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroids_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
@@ -1594,11 +1579,6 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
         slow_vector_state_uri: l.slow_vector_state_uri.clone(),
         slow_vector_state_content_hash: l.slow_vector_state_content_hash.as_ref().map(encode_hash),
-        slow_vector_state_routing_uri: l.slow_vector_state_routing.as_ref().map(|r| r.uri.clone()),
-        slow_vector_state_routing_content_hash: l
-            .slow_vector_state_routing
-            .as_ref()
-            .map(|r| encode_hash(&r.content_hash)),
         slow_vector_state_centroids_uri: l
             .slow_vector_state_centroids
             .as_ref()
@@ -1684,18 +1664,8 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             .map(decode_hash)
             .transpose()?,
         // Require both halves: a manifest carrying only one is treated as
-        // having no sibling (consumers fall back to the full blob) rather
-        // than failing the whole list decode.
-        slow_vector_state_routing: match (
-            d.slow_vector_state_routing_uri,
-            d.slow_vector_state_routing_content_hash.as_deref(),
-        ) {
-            (Some(uri), Some(hash)) => Some(RoutingRef {
-                uri,
-                content_hash: decode_hash(hash)?,
-            }),
-            _ => None,
-        },
+        // having no section (consumers fall back to per-superfile reads)
+        // rather than failing the whole list decode.
         slow_vector_state_centroids: match (
             d.slow_vector_state_centroids_uri,
             d.slow_vector_state_centroids_content_hash.as_deref(),
@@ -2301,7 +2271,6 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
-            slow_vector_state_routing: None,
             slow_vector_state_centroids: None,
             parts: vec![],
         }
@@ -2571,8 +2540,8 @@ mod tests {
         let mut list = empty_list();
         list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
         list.slow_vector_state_content_hash = Some(ContentHash([7u8; 32]));
-        list.slow_vector_state_routing = Some(RoutingRef {
-            uri: "slow-vector-state/state-def.bin".into(),
+        list.slow_vector_state_centroids = Some(RoutingRef {
+            uri: "slow-vector-state/state-def.centroids.bin".into(),
             content_hash: ContentHash([8u8; 32]),
         });
         let bytes = encode(&list).expect("encode");
@@ -2583,8 +2552,8 @@ mod tests {
             list.slow_vector_state_content_hash
         );
         assert_eq!(
-            decoded.slow_vector_state_routing,
-            list.slow_vector_state_routing
+            decoded.slow_vector_state_centroids,
+            list.slow_vector_state_centroids
         );
         // Absent by default (user tables and old manifests without the field).
         let plain = empty_list();
@@ -2592,13 +2561,13 @@ mod tests {
         assert!(
             !from_utf8(&bytes)
                 .expect("utf8")
-                .contains("slow_vector_state_routing"),
-            "absent routing ref must not serialize null fields"
+                .contains("slow_vector_state_centroids"),
+            "absent section ref must not serialize null fields"
         );
         let decoded = decode(&bytes).expect("decode");
         assert!(decoded.slow_vector_state_uri.is_none());
         assert!(decoded.slow_vector_state_content_hash.is_none());
-        assert!(decoded.slow_vector_state_routing.is_none());
+        assert!(decoded.slow_vector_state_centroids.is_none());
     }
 
     /// A slow-state hash that isn't `blake3:<64hex>` is rejected with

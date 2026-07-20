@@ -1069,6 +1069,10 @@ impl SupertableReader {
         let reference = manifest.slow_vector_state_centroids_blob()?.clone();
         let storage = manifest.options.storage.as_ref()?;
         let slot = Arc::clone(&manifest.options.centroid_section_cache);
+        // The lock is deliberately held ACROSS the fetch: it makes the
+        // one-time hydration single-flight, so concurrent cold queries
+        // wait for one section download instead of each pulling the whole
+        // object. Steady state holds it only long enough to clone the Arc.
         let mut guard = slot.lock().await;
         if let Some(section) = guard.as_ref()
             && section.uri() == reference.uri
@@ -1084,8 +1088,8 @@ impl SupertableReader {
             }
             Err(error) => {
                 eprintln!(
-                    "[supertable] centroid section {} unavailable ({error}); falling back to \
-                     per-superfile centroid reads",
+                    "[supertable] centroid section {} unavailable ({error}); deferred rescores \
+                     will fail unless the parts cache covers their cells",
                     reference.uri
                 );
                 None
@@ -1118,7 +1122,12 @@ impl SupertableReader {
             let mut leftovers = Vec::new();
             for d in deferred {
                 let entry = &superfiles[d.si];
-                let Some(fp32) = section.read_cell(entry.superfile_id, column, d.cell_id) else {
+                let read = section
+                    .read_cell(entry.superfile_id, column, d.cell_id)
+                    .map_err(|e| {
+                        QueryError::Execute(format!("centroid section spill read: {e}"))
+                    })?;
+                let Some(fp32) = read else {
                     leftovers.push(d);
                     continue;
                 };
@@ -1404,7 +1413,7 @@ impl SupertableReader {
                 // Default path: fine-first p=1, the same selection the user
                 // (pre-drain) branch ships. Filtered search and explicit
                 // caller nprobe keep the wider grid/fine union.
-                let default_p1 = options.nprobe.is_none() && cutoff == 1;
+                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
                 let selected_cells_ordered: Vec<u32> = if default_p1 {
                     fine_first_cell_selection(
                         &fine_ranked,
@@ -1437,7 +1446,7 @@ impl SupertableReader {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
                 // filtered search keep the grid/fine union.
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                let default_p1 = options.nprobe.is_none() && cutoff == 1;
+                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
                 let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
                     fine_first_cell_selection(&fine_ranked, ranked.first().copied())
                 } else {

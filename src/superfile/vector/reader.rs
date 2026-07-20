@@ -4431,7 +4431,6 @@ fn checked_dir_bounds(
     Ok((dir_size, dir_end))
 }
 
-
 /// Gap / overfetch windows for the survivor rerank-row wave. Survivor
 /// rows scatter across the selected clusters' `full[]` regions; with the
 /// geometric cluster ordering those regions are file-adjacent, sitting

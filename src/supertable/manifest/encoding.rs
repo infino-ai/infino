@@ -56,12 +56,6 @@ use crate::{
 
 /// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
 const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
-/// Wire tag for fp32 centroids with a persisted 1-bit admit slab
-/// (`b"CFR1"`). Body after the fp32 block: `rot_seed: u64`,
-/// `words_per_code: u32`, `codes[n_cent * words_per_code]: u64 LE`,
-/// `norms[n_cent]: f32 LE`. Summary blobs only — grid centroids and the
-/// options hash stay on the fp32 tag so existing tables keep validating.
-const CLUSTER_CENTROIDS_WIRE_FP32_RABITQ: u32 = 0x3152_4643;
 /// Wire tag for a routing-only summary block (`b"CFR0"`): counts plus
 /// the 1-bit admit slab, **no fp32 payload**. Written only into routing
 /// sibling artifacts that consumer opens fetch instead of the full form;
@@ -71,12 +65,12 @@ const CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY: u32 = 0x3052_4643;
 
 /// Which form of each summary cell's cluster block goes on the wire.
 ///
-/// `Full` is the durable commit form (fp32 + slab; what writers must be
-/// able to read back). `RoutingOnly` is the consumer-open sibling: same
-/// entries, but every cluster block that carries a built admit slab is
-/// written as [`CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY`] — cells without a
-/// slab (degenerate dim mismatch) fall back to the full form so the
-/// sibling is always decodable.
+/// `Full` is the durable commit form (plain fp32, no slab — hydration
+/// prewarm rebuilds slabs from fp32). `RoutingOnly` is the consumer-open
+/// sibling: same entries, but every cluster block that carries a built
+/// admit slab is written as [`CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY`] —
+/// cells without a slab (degenerate dim mismatch) fall back to the full
+/// form so the sibling is always decodable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryWireMode {
     Full,
@@ -630,7 +624,7 @@ pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
 }
 
 /// Append the packed 1-bit admit slab (rot seed, word width, codes,
-/// norms) — the shared tail of the `CFR1` and `CFR0` wire forms.
+/// norms) — the tail of the `CFR0` routing wire form.
 fn append_admit_slab(out: &mut Vec<u8>, admit: &RabitqAdmitCodes) {
     out.extend_from_slice(&admit.rot_seed.to_le_bytes());
     out.extend_from_slice(&(admit.words_per_code as u32).to_le_bytes());
@@ -641,14 +635,6 @@ fn append_admit_slab(out: &mut Vec<u8>, admit: &RabitqAdmitCodes) {
         out.extend_from_slice(&norm.to_le_bytes());
     }
 }
-
-// Byte-for-byte symmetry note: the fp32+slab wire form (`CFR1`,
-// [`CLUSTER_CENTROIDS_WIRE_FP32_RABITQ`]) is DECODE-ONLY legacy. It
-// existed so full-form decoders got prebuilt slabs, but under the
-// one-copy-per-byte model the slab's only wire home is the routing form
-// (`CFR0`) and fp32's only wire home is the plain fp32 form (`CF32`) —
-// full parts carry no slab (hydration prewarm rebuilds writer-side
-// slabs; consumers get them from routing objects).
 
 /// Routing-only encoder (`CFR0`): counts plus the admit slab, no fp32
 /// payload. Reads only the slab and counts, so it works from both full
@@ -682,13 +668,9 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     }
 
     let tag = read_u32(&mut c, "cluster_wire_tag")?;
-    if tag != CLUSTER_CENTROIDS_WIRE_FP32
-        && tag != CLUSTER_CENTROIDS_WIRE_FP32_RABITQ
-        && tag != CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY
-    {
+    if tag != CLUSTER_CENTROIDS_WIRE_FP32 && tag != CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY {
         return Err(DecodeError::InvalidVectorSummary(format!(
-            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x}, \
-             {CLUSTER_CENTROIDS_WIRE_FP32_RABITQ:#010x}, \
+            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x} \
              or {CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY:#010x}"
         )));
     }
@@ -696,15 +678,10 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     let counts_b = view_n(&mut c, n_cent * 4, "cluster_counts")?;
     let counts: Vec<u32> = counts_b
         .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .map(|b| u32::from_le_bytes(b.try_into().expect("chunks_exact(4) yields 4-byte slices")))
         .collect();
 
-    let centroids = if tag == CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY {
-        // Routing-only block: no fp32 payload on the wire. The instance
-        // decodes into the stripped shape; exact scans read the superfile
-        // centroid regions instead.
-        Vec::new()
-    } else {
+    if tag == CLUSTER_CENTROIDS_WIRE_FP32 {
         // n_cent * cdim can't overflow usize on 64-bit (both are u32), but
         // the *4 byte size can — check the whole chain so a crafted header
         // errors rather than wrapping to a short read (silent truncation).
@@ -717,10 +694,7 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
                 ))
             })?;
         let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
-        decode_f32_le_vec(centroids_b)
-    };
-
-    if tag == CLUSTER_CENTROIDS_WIRE_FP32 {
+        let centroids = decode_f32_le_vec(centroids_b);
         return Ok(ClusterCentroids::from_decoded(
             n_cent as u32,
             cdim as u32,
@@ -728,6 +702,10 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
             counts,
         ));
     }
+
+    // Routing-only block (`CFR0`): no fp32 payload on the wire. The
+    // instance decodes into the stripped shape; exact scans read the
+    // slow-CAS centroid section (hidden) or full parts (user) instead.
 
     let rot_seed = read_u64(&mut c, "admit_rot_seed")?;
     let words_per_code = read_u32(&mut c, "admit_words_per_code")? as usize;
@@ -750,7 +728,7 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     let codes_b = view_n(&mut c, codes_bytes, "admit_codes")?;
     let codes: Vec<u64> = codes_b
         .chunks_exact(8)
-        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        .map(|b| u64::from_le_bytes(b.try_into().expect("chunks_exact(8) yields 8-byte slices")))
         .collect();
     let norms_b = view_n(&mut c, n_cent * 4, "admit_norms")?;
     let norms = decode_f32_le_vec(norms_b);
@@ -761,18 +739,9 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
         norms,
     };
 
-    if tag == CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY {
-        return Ok(ClusterCentroids::from_decoded_routing(
-            n_cent as u32,
-            cdim as u32,
-            counts,
-            admit,
-        ));
-    }
-    Ok(ClusterCentroids::from_decoded_with_admit(
+    Ok(ClusterCentroids::from_decoded_routing(
         n_cent as u32,
         cdim as u32,
-        centroids,
         counts,
         admit,
     ))
@@ -905,14 +874,16 @@ pub fn decode_vector_summary_map(
 
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
     let b = view_n(c, 4, what)?;
-    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    Ok(u32::from_le_bytes(
+        b.try_into().expect("view_n(4) yields a 4-byte slice"),
+    ))
 }
 
 fn read_u64(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u64, DecodeError> {
     let b = view_n(c, 8, what)?;
-    Ok(u64::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-    ]))
+    Ok(u64::from_le_bytes(
+        b.try_into().expect("view_n(8) yields an 8-byte slice"),
+    ))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
@@ -1551,8 +1522,7 @@ mod vector_summary_tests {
     /// One wire home per byte: the FULL form carries fp32 only (no slab —
     /// hydration prewarm rebuilds writer-side slabs), the ROUTING form
     /// carries the slab only, and a write-time slab round-trips bit-exact
-    /// through the routing wire. Legacy fp32+slab blocks (`CFR1`) stay
-    /// decodable.
+    /// through the routing wire.
     #[test]
     fn round_trips_admit_slab_alongside_centroids() {
         use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};

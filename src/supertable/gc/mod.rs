@@ -65,15 +65,12 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     } else {
         false
     };
-    // Slow-CAS entry blob: the URI is read straight off the manifest-list
-    // ref — sync, no fetch. Superseded blobs (older drains) are absent from
-    // the current list and get swept once past the safety gap. The routing
-    // sibling shares the prefix and lifecycle.
+    // Slow-CAS objects (routing-shaped state blob + fp32 centroid
+    // section): the URIs are read straight off the manifest-list refs —
+    // sync, no fetch. Superseded generations (older drains) are absent
+    // from the current list and get swept once past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
-    }
-    if let Some(routing) = manifest.slow_vector_state_routing_blob() {
-        live.insert(routing.uri.clone());
     }
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
@@ -277,7 +274,6 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
-                slow_vector_state_routing: None,
                 slow_vector_state_centroids: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
@@ -320,8 +316,8 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
-        let routing_hash = ContentHash::of(b"slow state routing");
-        let routing_uri = slow_vector_state::storage_path(&routing_hash);
+        let section_hash = ContentHash::of(b"slow state centroid section");
+        let section_uri = slow_vector_state::storage_path(&section_hash);
         let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
         let manifest = ManifestSnapshot::new(
             TEST_MANIFEST_ID,
@@ -347,11 +343,10 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: Some(uri.clone()),
                 slow_vector_state_content_hash: Some(hash),
-                slow_vector_state_routing: Some(RoutingRef {
-                    uri: routing_uri.clone(),
-                    content_hash: routing_hash,
+                slow_vector_state_centroids: Some(RoutingRef {
+                    uri: section_uri.clone(),
+                    content_hash: section_hash,
                 }),
-                slow_vector_state_centroids: None,
                 parts: Vec::new(),
             }),
         );
@@ -359,8 +354,8 @@ mod tests {
         assert!(superfiles_complete);
         assert!(live.contains(&uri), "referenced blob must be live");
         assert!(
-            live.contains(&routing_uri),
-            "referenced routing sibling must be live"
+            live.contains(&section_uri),
+            "referenced centroid section must be live"
         );
         assert!(
             !live.contains(&orphan),

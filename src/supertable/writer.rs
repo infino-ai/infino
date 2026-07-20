@@ -794,7 +794,22 @@ impl Supertable {
     /// active writer slot at a time, enforced atomically; when
     /// the writer is dropped, the slot is released and a
     /// subsequent `writer()` call succeeds.
+    ///
+    /// Consumer-memory-mode handles
+    /// (`summary_centroids_from_superfiles`) are read-only by
+    /// construction: they hydrate routing-form manifest parts (no
+    /// summary fp32), and a commit from that state would re-encode
+    /// stripped summaries into the durable full wire form. Refused
+    /// here — at acquisition, not deep inside a commit.
     fn writer(&self) -> Result<SupertableWriter, BuildError> {
+        if self.inner().options.summary_centroids_from_superfiles {
+            return Err(BuildError::Store(
+                "this handle opened in consumer memory mode \
+                 (summary_centroids_from_superfiles): summaries hydrate without fp32, so it \
+                 cannot write — open a writer handle with the mode off"
+                    .into(),
+            ));
+        }
         match self.inner().writer_outstanding.compare_exchange(
             false,
             true,
@@ -7204,6 +7219,23 @@ mod tests {
         }
         // Slot now free.
         let _w2 = st.writer().expect("second writer after drop");
+    }
+
+    /// A consumer-memory-mode handle (`summary_centroids_from_superfiles`)
+    /// hydrates summaries without fp32, so committing from it would hit
+    /// the wire encoder's stripped-summary panic deep inside the commit.
+    /// The writer slot refuses up front instead.
+    #[test]
+    fn consumer_memory_mode_handle_refuses_writer() {
+        let opts = options_id_title_serial().with_summary_centroids_from_superfiles(true);
+        let st = Supertable::create(opts).expect("create");
+        let err = st
+            .writer()
+            .expect_err("consumer-mode handle must not write");
+        assert!(
+            err.to_string().contains("consumer memory mode"),
+            "unexpected refusal: {err}"
+        );
     }
 
     // ---- single-writer end-to-end (serial pool) ----------------------
