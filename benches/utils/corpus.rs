@@ -219,10 +219,15 @@ fn docs_from_env(var: &str, default: usize) -> usize {
 /// Parallel-writer count for the "N writers" build row — how many
 /// writers build the corpus concurrently. Applied identically to every
 /// engine (infino shards across this many builders; Tantivy uses this
-/// many indexing threads). Always the machine's logical core count so
-/// runs on the same box are comparable.
+/// many indexing threads). Defaults to the machine's logical core count
+/// so runs on the same box are comparable; `INFINO_BENCH_WRITERS`
+/// overrides for shard-shape experiments.
 pub fn parallel_writers() -> usize {
-    num_cpus::get()
+    std::env::var("INFINO_BENCH_WRITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(num_cpus::get)
 }
 
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a

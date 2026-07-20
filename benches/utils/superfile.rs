@@ -893,9 +893,11 @@ pub mod vector {
     //! Infino-only vector bench for the superfile layer:
     //!
     //!   ingest timing (1M × 384 Gaussian planted clusters, cosine)
-    //! + calibrated kNN search at recall targets {0.90, 0.95, 0.99}
-    //! + nprobe/rerank sweeps
-    //! + correctness gate (`recall@10 ≥ 0.80` at high-recall config)
+    //! + default-config warm/cold search (p50/p90/p99), recall-gated
+    //! + filtered (~10%) recall gate + latency table
+    //! + optional nprobe/rerank sweep (`INFINO_BENCH_VECTOR_SWEEP`)
+    //! + optional recall-target calibration grid (`RUN_CALIBRATION_GRID`,
+    //!   off by default — same model as the supertable tier)
     //!
     //! Every phase uses the production path: [`SuperfileBuilder`] →
     //! [`SuperfileReader`] → [`SuperfileReader::vector_search`]. Warm
@@ -903,7 +905,7 @@ pub mod vector {
     //! to object storage and reads through [`DiskCacheStore::reader`].
     //!
     //! Pinned to 1M × 384. Supertable scale (10M × 384, sharded into N
-    //! superfiles) lives in `benches/vector/supertable.rs`.
+    //! superfiles) lives in `benches/utils/supertable.rs`.
     //!
     //! ## Invocation
     //!
@@ -919,7 +921,10 @@ pub mod vector {
     };
 
     use bytes::Bytes;
-    use infino::{roaring::RoaringBitmap, superfile::reader::VectorSearchOptions};
+    use infino::{
+        roaring::RoaringBitmap,
+        superfile::{reader::VectorSearchOptions, vector::reader::effective_filtered_params},
+    };
 
     use crate::{
         corpus::{self, DIM},
@@ -950,6 +955,12 @@ pub mod vector {
     /// Filtered kNN defaults (nominal config before selectivity boost).
     const FILTERED_DEFAULT_NPROBE: usize = 8;
     const FILTERED_DEFAULT_RERANK_MULT: usize = 256;
+    /// Regression floor for filtered recall@10 at ~10% selectivity.
+    /// Same tripwire role as [`exec_vec::DEFAULT_CONFIG_RECALL_FLOOR`];
+    /// the supertable tier pins a higher 0.85 because its filtered path
+    /// is OPANN-shaped (hidden cells + undrained tail) with a measured
+    /// ~0.90 on that corpus — not applicable to single-superfile IVF.
+    const FILTERED_RECALL_FLOOR: f32 = 0.80;
 
     /// The filtered-search row keeps every Nth row in its allow-set — a
     /// ~10% selective predicate. Latency depends on the allow-set's density,
@@ -1078,23 +1089,44 @@ pub mod vector {
         std::env::var_os("INFINO_BENCH_VECTOR_SWEEP").is_some()
     }
 
+    /// Recall-target calibration grid — off by default, matching the
+    /// supertable tier ([`RUN_CALIBRATION_GRID`] there). The engine
+    /// default config measures 1.000 recall on this tier, so the grid
+    /// burned three frontier walks per run to produce rows with no knob
+    /// decision behind them; the default-config row (recall gated at
+    /// [`exec_vec::DEFAULT_CONFIG_RECALL_FLOOR`]) plus the explicit
+    /// sweep mode (`INFINO_BENCH_VECTOR_SWEEP`) carry the signal. Flip
+    /// to `true` for tuning investigations.
+    const RUN_CALIBRATION_GRID: bool = false;
+
     const SWEEP_START_PROBE: usize = 5;
     const SWEEP_START_RERANK: usize = 256;
 
     fn sweep_start_probe() -> usize {
-        SWEEP_START_PROBE
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SWEEP_START_PROBE)
     }
 
     fn sweep_start_rerank() -> usize {
-        SWEEP_START_RERANK
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_RERANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SWEEP_START_RERANK)
     }
 
     fn sweep_probe_min() -> usize {
-        sweep_start_probe()
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(sweep_start_probe)
     }
 
     fn sweep_probe_max() -> Option<usize> {
-        None
+        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
     }
 
     fn sweep_rerank_ladder(start: usize) -> Vec<usize> {
@@ -1379,6 +1411,13 @@ pub mod vector {
                     o.rerank_mult().unwrap_or(VectorSearchOptions::RERANK_MULT),
                 )
             };
+            // Calibration ground truth is only computed when the grid
+            // actually runs — it is a brute-force pass over the corpus.
+            let gt_cal: &[Vec<u32>] = if RUN_CALIBRATION_GRID {
+                ground_truth_calibration()
+            } else {
+                &[]
+            };
             let recall_rows = exec_vec::run_search(
                 &mut report,
                 index.reader(),
@@ -1391,18 +1430,18 @@ pub mod vector {
                 queries_correctness(),
                 ground_truth_correctness(),
                 queries_calibration(),
-                ground_truth_calibration(),
+                gt_cal,
                 phases.warm,
                 phases.cold,
                 3,
-                false,
+                !RUN_CALIBRATION_GRID,
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(
                     "Superfile vector — search, single-superfile / in-memory ({} docs × dim={DIM})",
                     fmt_count(n_docs)
                 ),
-                "Correctness, warm search, and cold upload reuse the measured 1-writer artifact. Recall rows use the lowest-p50 calibrated point meeting each target; `default` is the user-facing option baseline. Δ is vs the previous run.",
+                "Warm search and cold upload reuse the measured 1-writer artifact. The `default` row is the user-facing option baseline, recall-gated; recall-target rows appear only when the calibration grid is explicitly enabled. Δ is vs the previous run.",
             );
             if phases.warm {
                 let b = build_result
@@ -1470,8 +1509,8 @@ pub mod vector {
                         q_corr.len()
                     );
                     assert!(
-                        mean >= 0.80,
-                        "filtered recall@{TOP_K} floor: {mean:.3} < 0.80"
+                        mean >= FILTERED_RECALL_FLOOR,
+                        "filtered recall@{TOP_K} floor: {mean:.3} < {FILTERED_RECALL_FLOOR:.2}"
                     );
                 }
 
@@ -1481,14 +1520,18 @@ pub mod vector {
                 let filtered_gt: Vec<Vec<u32>> =
                     corpus::filtered_ground_truth(vecs, &allow, q_corr, TOP_K);
 
-                /// Maximum multiplier applied by filtered search's
-                /// selectivity boost in the vector reader.
-                const FILTER_MAX_MULT: usize = 64;
-                let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
-                let filtered_nprobe = FILTERED_DEFAULT_NPROBE
-                    .saturating_mul(filter_mult)
-                    .min(corpus::n_cent(n_docs));
-                let filtered_rerank = FILTERED_DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
+                // Effective parameters come from the ENGINE's own math
+                // (selectivity mult + caps, via the shared test-helpers
+                // fn), never a bench-side copy of its constants — the
+                // reported values cannot drift from what the reader runs.
+                let (filtered_nprobe, filtered_rerank) = effective_filtered_params(
+                    &Some(Arc::clone(&allow)),
+                    n_docs as u32,
+                    corpus::n_cent(n_docs) as u32,
+                    FILTERED_DEFAULT_NPROBE,
+                    FILTERED_DEFAULT_RERANK_MULT,
+                )
+                .expect("non-empty allow-set");
                 let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
                 let mut rows = Vec::new();
                 for (
@@ -1561,7 +1604,7 @@ pub mod vector {
                         "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
                         fmt_count(n_docs)
                     ),
-                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` includes the reader's selectivity boost. Δ is vs the previous run.".into(),
+                    note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` is the reader's own post-selectivity-boost math (shared helper, caps included). Δ is vs the previous run.".into(),
                     blocks: vec![Block {
                         subtitle: String::new(),
                         headers: vec![

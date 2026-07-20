@@ -1679,10 +1679,10 @@ pub mod vector {
         let mut rows: Vec<RecallRow> = Vec::new();
         let default_recall: Option<f32>;
         if skip_calibration {
-            // Skip-calibration mode (the supertable tier's default — see
-            // `RUN_CALIBRATION_GRID`): no high-recall correctness gate, no
-            // recall-target grid — only the fixed
-            // `(default_nprobe, default_rerank)` recall sample.
+            // Skip-calibration mode (both tiers' default — see each
+            // tier's `RUN_CALIBRATION_GRID`): no recall-target grid; the
+            // fixed `(default_nprobe, default_rerank)` recall sample IS
+            // the gate, asserted against the floor below.
             if gt_correct.is_empty() {
                 // No brute-force ground truth was built (skip-calibration / no
                 // corpus). Recall is not measured — render "—", not a bogus 0.000.
@@ -1708,6 +1708,14 @@ pub mod vector {
                 );
                 eprintln!(
                     "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {DEFAULT_CONFIG_RECALL_FLOOR:.2})",
+                );
+                // The printed floor is a real gate, not decoration — this
+                // was previously print-only, so a recall collapse in skip
+                // mode sailed through green.
+                assert!(
+                    default >= DEFAULT_CONFIG_RECALL_FLOOR,
+                    "{log_prefix} default-config vector recall@{k} {default:.3} < floor \
+                     {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
                 );
                 default_recall = Some(default);
             }

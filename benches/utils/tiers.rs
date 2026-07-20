@@ -584,7 +584,18 @@ fn bench_prefetch_concurrency() -> usize {
     DiskCacheConfig::default().prefetch_concurrency
 }
 
-/// Fresh disk cache for ingest producers (8 GiB budget).
+/// GiB value from `name`, falling back to `default_gib` when unset,
+/// unparsable, or zero.
+fn env_gib(name: &str, default_gib: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default_gib)
+}
+
+/// Fresh disk cache for ingest producers (8 GiB budget;
+/// `INFINO_SUPERTABLE_INGEST_CACHE_GIB` overrides).
 ///
 /// Ingest attaches this cache only to keep superfile bytes out of the
 /// unbounded in-memory tier; commit-time cache prepopulation is disabled,
@@ -592,7 +603,10 @@ fn bench_prefetch_concurrency() -> usize {
 pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStore>) {
     fresh_disk_cache_with_mode(
         storage,
-        DEFAULT_INGEST_CACHE_GIB * GIB_BYTES,
+        env_gib(
+            "INFINO_SUPERTABLE_INGEST_CACHE_GIB",
+            DEFAULT_INGEST_CACHE_GIB,
+        ) * GIB_BYTES,
         ColdFetchMode::LazyForegroundWithBackgroundFill,
     )
 }
@@ -600,9 +614,10 @@ pub fn fresh_disk_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<Disk
 /// Fresh disk cache for supertable search consumers.
 ///
 /// Budget selection (first match wins):
-/// 1. `index_size_bytes + 10%` when the caller knows the total index
+/// 1. `INFINO_SUPERTABLE_SEARCH_CACHE_GIB` (explicit experiment pin).
+/// 2. `index_size_bytes + 10%` when the caller knows the total index
 ///    size from the manifest — ensures the warm bench is truly warm.
-/// 2. 8 GiB fallback.
+/// 3. 8 GiB fallback.
 pub fn fresh_supertable_search_cache(
     storage: Arc<dyn StorageProvider>,
     index_size_bytes: Option<u64>,
@@ -610,7 +625,16 @@ pub fn fresh_supertable_search_cache(
     use std::sync::Once;
     static LOG_ONCE: Once = Once::new();
 
-    let budget_bytes = if let Some(idx) = index_size_bytes.filter(|&s| s > 0) {
+    let env_pin = std::env::var("INFINO_SUPERTABLE_SEARCH_CACHE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0);
+    let budget_bytes = if let Some(gib) = env_pin {
+        LOG_ONCE.call_once(|| {
+            eprintln!("[tiers] search cache budget = {gib} GiB (env pin)");
+        });
+        gib * GIB_BYTES
+    } else if let Some(idx) = index_size_bytes.filter(|&s| s > 0) {
         let b = idx + idx / INDEX_CACHE_HEADROOM_DIVISOR;
         LOG_ONCE.call_once(|| {
             eprintln!(
