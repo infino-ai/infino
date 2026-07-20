@@ -205,6 +205,53 @@ async fn phrase_oracle_agreement_multi_block() {
 }
 
 #[tokio::test]
+async fn phrase_block_crossing_rejection() {
+    // The block-crossing offset logic must reject as well as accept.
+    // `epsilon` fires every 20th doc, and 20 is a multiple of both 4
+    // and 5, so `beta` and `gamma` are ALWAYS planted between `alpha`
+    // and `epsilon`. The pair therefore co-occurs at every 60th doc —
+    // 17 docs spanning all three of `alpha`'s posting blocks — yet is
+    // never adjacent, so `"alpha epsilon"` must match nothing. This
+    // drives the per-block run-offset rebuild across block boundaries
+    // on a genuine rejection, not just on docs that match.
+    let owned = build_multi_block_corpus();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&refs);
+
+    let phrase = search_hits(&r, r#""alpha epsilon""#, K_ALL_MULTI_BLOCK, BoolMode::Or).await;
+    assert!(
+        phrase.is_empty(),
+        "alpha and epsilon co-occur but are never adjacent — phrase must not match: {phrase:?}"
+    );
+    // Guard the guard: the members really do co-occur (across blocks),
+    // so the empty phrase result is a rejection, not an empty
+    // intersection. Term-AND matches the 17 multiples of 60.
+    let both = search_hits(&r, "+alpha +epsilon", K_ALL_MULTI_BLOCK, BoolMode::Or).await;
+    assert_eq!(
+        both.len(),
+        17,
+        "alpha ∧ epsilon co-occur at every 60th doc: {}",
+        both.len()
+    );
+
+    // `"alpha gamma"` is the mixed case across blocks: adjacent (and
+    // matching) only where `beta` is absent between them — docs
+    // divisible by 15 but not 4 — and rejected elsewhere. Pinning it
+    // against the oracle checks the offset logic accepts exactly the
+    // true-adjacent occurrences and rejects the rest.
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    assert_matches_oracle(
+        &r,
+        &oracle,
+        r#""alpha gamma""#,
+        BoolMode::Or,
+        K_ALL_MULTI_BLOCK,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn truncated_top_k_pruning_agrees_with_oracle() {
     // Every query shape whose ranked walk can skip phrase
     // verification once the heap fills — a small k keeps the bar live
