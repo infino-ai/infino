@@ -1437,7 +1437,25 @@ impl VectorReader {
         overlay.install(0, header_bytes.clone());
         overlay.install(dir_offset as u64, dir_prefetch.clone());
 
-        let mut open_ranges: Vec<(u64, u64)> = Vec::with_capacity(n_cells);
+        // v1 open discipline: fetch each cell's sub-header + cluster index
+        // only. Centroids, Sq8 meta/norms, and the stable-id region stay on
+        // disk and are read per probed cell through the block cache (the
+        // parse below takes its lazy Sq8-meta arm when the bytes are not
+        // resident). The multi-cell contract is one logical column, whose
+        // dim bounds the cluster index.
+        let cols: Vec<VectorColumnConfig> = serde_json::from_str(columns_json).map_err(|e| {
+            VectorError::Read(ReadError::MalformedVersion(format!(
+                "inf.vec.columns JSON: {e}"
+            )))
+        })?;
+        let dim = match cols.as_slice() {
+            [only] if only.dim > 0 => only.dim,
+            _ => {
+                return Err(VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell blob requires exactly one logical column".into(),
+                )));
+            }
+        };
         for i in 0..n_cells {
             let entry_off = i * CELL_DIR_ENTRY_SIZE;
             let subsection_off = read_u64_le(
@@ -1453,7 +1471,6 @@ impl VectorReader {
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
-            // Fetch sub-header first to learn open-time end.
             let sub_hdr_bytes = source
                 .range(subsection_off, SUB_HEADER_SIZE as u64)
                 .await
@@ -1463,28 +1480,36 @@ impl VectorReader {
                     )))
                 })?;
             overlay.install(subsection_off, sub_hdr_bytes.clone());
-            let per_cluster_blocks_off = read_u64_le(
-                &sub_hdr_bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
-                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+            let centroids_off = read_u64_le(
+                &sub_hdr_bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
             );
-            open_ranges.push((subsection_off, per_cluster_blocks_off));
-        }
-        for (subsection_off, open_len) in open_ranges {
-            if open_len <= SUB_HEADER_SIZE as u64 {
-                continue;
+            let cluster_idx_off = read_u64_le(
+                &sub_hdr_bytes
+                    [sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+            );
+            let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell subsection {i}: cluster_idx_off precedes centroids_off"
+                )))
+            })?;
+            if !centroids_span.is_multiple_of(dim as u64 * 4) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell subsection {i}: centroids region not divisible by dim*4"
+                ))));
             }
-            let rest = source
-                .range(
-                    subsection_off + SUB_HEADER_SIZE as u64,
-                    open_len - SUB_HEADER_SIZE as u64,
-                )
-                .await
-                .map_err(|e| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "lazy multi-cell: open-time region: {e}"
-                    )))
-                })?;
-            overlay.install(subsection_off + SUB_HEADER_SIZE as u64, rest);
+            let n_cent = centroids_span / (dim as u64 * 4);
+            let idx_len = n_cent * CLUSTER_IDX_ENTRY_BYTES as u64;
+            if idx_len > 0 {
+                let idx_bytes = source
+                    .range(subsection_off + cluster_idx_off, idx_len)
+                    .await
+                    .map_err(|e| {
+                        VectorError::Read(ReadError::MalformedVersion(format!(
+                            "lazy multi-cell: cluster index {i}: {e}"
+                        )))
+                    })?;
+                overlay.install(subsection_off + cluster_idx_off, idx_bytes);
+            }
         }
 
         Self::open_multi_cell_with_source(
@@ -2701,12 +2726,14 @@ impl VectorReader {
             // Cold: fetch only the codes+doc_ids prefixes (coalesced)
             // plus the Sq8 meta in one batch. Full vectors are fetched
             // later, for survivors only.
-            get_cluster_ranges_coalesced_with_extra(
+            let extras: Vec<Range<usize>> = lazy_sq8_meta_range.clone().into_iter().collect();
+            let (blocks, mut extra_bytes) = get_cluster_ranges_coalesced_with_extras(
                 &self.source,
                 &cluster_prefix_ranges,
-                lazy_sq8_meta_range,
+                &extras,
             )
-            .map_err(|e| VectorError::LazySource(e.to_string()))?
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            (blocks, extra_bytes.pop())
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
 
@@ -2749,7 +2776,7 @@ impl VectorReader {
         // sort.
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => Some(
-                get_cluster_ranges_coalesced(&self.source, &ranges)
+                get_survivor_ranges_coalesced(&self.source, &ranges)
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
             ),
             None => None,
@@ -2917,18 +2944,21 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        // Same inverse-selectivity boost as [`Self::search_async`]: the
-        // supertable fan-out probes externally chosen clusters (no local
-        // nprobe scoring), so rerank breadth must scale here — not only
-        // on the per-superfile nprobe fallback path.
-        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
-        if filter_mult == 0 {
+        // No inverse-selectivity rerank inflation on the fan path: the
+        // shortlist heap admits MATCHING rows only (the allow test runs
+        // before a candidate can take a slot), so `k × rerank_mult`
+        // already buys the standard rerank contract over matching
+        // candidates — post-filter underflow cannot happen. The old ×10
+        // boost multiplied the exact-rerank volume by selectivity on
+        // every probed fragment (measured 70 ms survivor gather + 52 ms
+        // Sq8 rerank per filtered query at 1M).
+        if allow.as_ref().is_some_and(|bm| bm.is_empty()) {
             return Ok(Vec::new());
         }
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
-            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            rerank_mult,
             allow,
             deny,
             pool,
@@ -3015,14 +3045,17 @@ impl VectorReader {
                 .map_err(|e| VectorError::LazySource(e.to_string()))?;
             let mut q_rot = vec![0f32; col.dim];
             col.rot.apply(query, &mut q_rot);
-            let filter_mult = filter_selectivity_mult(&cell_allow, col.n_docs);
-            if filter_mult == 0 {
+            // No inverse-selectivity rerank inflation — same reasoning as
+            // [`Self::search_clusters_async`]: the shortlist is allow-first
+            // (matching rows only), so the standard `k × rerank_mult`
+            // contract holds unchanged under a filter.
+            if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
                 continue;
             }
             let ctx = ProbeCtx {
                 q_rot: &q_rot,
                 k,
-                rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+                rerank_mult,
                 allow: cell_allow,
                 deny: cell_deny,
                 pool: pool.clone(),
@@ -3123,28 +3156,36 @@ impl VectorReader {
                 _cold_guard =
                     reserve_cold_fetch(&self.source, &cluster_full_ranges, ctx.budget.as_ref())?;
 
-                // Piggyback the inline stable-`_id` region onto THIS wave:
-                // fetch it concurrently with the cluster-block GETs (same
-                // round-trip envelope) and stash it on the reader. The remap
-                // step then resolves hidden→user `_id` from the stash (sync,
-                // at the fan-out tag site) instead of issuing a trailing
-                // region GET — removing a serial cold wave. `None` when the
-                // column has no inline region (e.g. incoming superfiles).
+                // The metadata legs (lazy Sq8 meta + inline stable-`_id`
+                // region) ride the SAME coalesce plan as the cluster
+                // blocks. On multi-cell (pre-drain user) files the probed
+                // cell's subsection is contiguous — subheader, meta, ids,
+                // blocks within ~100 KiB — so all three legs merge into
+                // ONE GET per file instead of three; on packed files the
+                // regions are megabytes apart and the plan naturally
+                // keeps them as separate ranges in the same concurrent
+                // round-trip envelope. The remap step then resolves
+                // hidden→user `_id` from the stash (sync, at the fan-out
+                // tag site) instead of issuing a trailing region GET.
                 let region_range = col.stable_ids_region_range();
-                let cluster_fut = get_cluster_ranges_coalesced_with_extra_async(
+                let mut extras: Vec<Range<usize>> = Vec::new();
+                let meta_slot = lazy_sq8_meta_range.clone().map(|r| {
+                    extras.push(r);
+                    extras.len() - 1
+                });
+                let region_slot = region_range.map(|r| {
+                    extras.push(r);
+                    extras.len() - 1
+                });
+                let (blocks, extra_bytes) = get_cluster_ranges_coalesced_with_extras_async(
                     &self.source,
                     &cluster_full_ranges,
-                    lazy_sq8_meta_range,
-                );
-                let region_fut = async {
-                    match &region_range {
-                        Some(r) => self.source.range_async(r.clone()).await.map(Some),
-                        None => Ok(None),
-                    }
-                };
-                let ((blocks, meta), region_bytes) = futures::try_join!(cluster_fut, region_fut)
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                if let Some(bytes) = region_bytes
+                    &extras,
+                )
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let meta = meta_slot.map(|i| extra_bytes[i].clone());
+                if let Some(bytes) = region_slot.map(|i| extra_bytes[i].clone())
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
                 {
                     *slot = Some(bytes);
@@ -3189,7 +3230,7 @@ impl VectorReader {
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => Some(
-                get_cluster_ranges_coalesced_async(&self.source, &ranges)
+                get_survivor_ranges_coalesced_async(&self.source, &ranges)
                     .await
                     .map_err(|e| VectorError::LazySource(e.to_string()))?,
             ),
@@ -4390,8 +4431,16 @@ fn checked_dir_bounds(
     Ok((dir_size, dir_end))
 }
 
-const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
-const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+/// Gap / overfetch windows for the survivor rerank-row wave. Survivor
+/// rows scatter across the selected clusters' `full[]` regions; with the
+/// geometric cluster ordering those regions are file-adjacent, sitting
+/// within roughly one cluster block (~0.7 MiB at the 10M shape) of each
+/// other. A window sized past that stride merges survivors spanning
+/// neighboring runs into one range — one fewer cold round trip per
+/// query for a bounded, cold-only overfetch. The prefix wave keeps the
+/// tight windows above (its ranges are small and already adjacent).
+const SURVIVOR_RANGE_COALESCE_MAX_GAP: usize = 2 * 1024 * 1024;
+const SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH: usize = 2 * 1024 * 1024;
 
 fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
@@ -4445,53 +4494,68 @@ fn reserve_cold_fetch(
         .map_err(|e| VectorError::OverBudget(format!("vector search, {e}")))
 }
 
-fn get_cluster_ranges_coalesced_with_extra(
-    source: &Source,
-    ranges: &[Range<usize>],
-    extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
-    let Some(extra) = extra else {
-        return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
-    };
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let mut fetch = plan.fetch_ranges().to_vec();
-    fetch.push(extra);
-    let mut fetched = source.get_ranges_parallel(&fetch)?;
-    let extra_bytes = fetched.pop();
-    Ok((plan.restore(&fetched), extra_bytes))
+/// Gap / overfetch windows for a COLD probe wave (blocks + metadata
+/// legs). A cold read is round-trip-bound, not byte-bound: the probed
+/// cell's Sq8 meta, stable-id region, and block runs can sit megabytes
+/// apart inside a large packed cell (~60 MiB at 10M docs), and the tight
+/// warm windows below shattered one cell's read into 5 GETs there
+/// (measured; 1 GET at 1M where the whole cell spans ~6 MiB). Merge
+/// anything with sub-8 MiB gaps, capped at 8 MiB of overfetch per merged
+/// range — never more than one extra round-trip's worth of bytes to save
+/// a round trip.
+const COLD_PROBE_COALESCE_MAX_GAP: usize = 8 * 1024 * 1024;
+/// Overfetch cap per merged cold-probe range (see
+/// [`COLD_PROBE_COALESCE_MAX_GAP`]).
+const COLD_PROBE_COALESCE_MAX_OVERFETCH: usize = 8 * 1024 * 1024;
+
+/// Build the one-plan input for a cold probe wave: the cluster block
+/// ranges PLUS the per-column metadata legs (`extras`: lazy Sq8 meta,
+/// inline stable-id region), under the wide cold windows above. Returns
+/// `(blocks, extras)` in input order.
+fn probe_wave_plan(ranges: &[Range<usize>], extras: &[Range<usize>]) -> RangeCoalescePlan {
+    let mut all: Vec<Range<usize>> = Vec::with_capacity(ranges.len() + extras.len());
+    all.extend(ranges.iter().cloned());
+    all.extend(extras.iter().cloned());
+    RangeCoalescePlan::new(
+        &all,
+        COLD_PROBE_COALESCE_MAX_GAP,
+        COLD_PROBE_COALESCE_MAX_OVERFETCH,
+    )
 }
 
-/// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
+fn get_cluster_ranges_coalesced_with_extras(
+    source: &Source,
+    ranges: &[Range<usize>],
+    extras: &[Range<usize>],
+) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
+    let plan = probe_wave_plan(ranges, extras);
+    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    let mut restored = plan.restore(&fetched);
+    let extra_bytes = restored.split_off(ranges.len());
+    Ok((restored, extra_bytes))
+}
+
+/// Async sibling of [`get_cluster_ranges_coalesced_with_extras`]. Same
 /// coalescing plan, dispatched as one `try_join_all` batch on the
 /// caller's runtime so connections pool and the fan-out is concurrent.
-async fn get_cluster_ranges_coalesced_with_extra_async(
+async fn get_cluster_ranges_coalesced_with_extras_async(
     source: &Source,
     ranges: &[Range<usize>],
-    extra: Option<Range<usize>>,
-) -> Result<(Vec<Bytes>, Option<Bytes>), LazyByteSourceError> {
-    let Some(extra) = extra else {
-        return Ok((
-            get_cluster_ranges_coalesced_async(source, ranges).await?,
-            None,
-        ));
-    };
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let mut fetch = plan.fetch_ranges().to_vec();
-    fetch.push(extra);
-    let mut fetched = source.get_ranges_parallel_async(&fetch).await?;
-    let extra_bytes = fetched.pop();
-    Ok((plan.restore(&fetched), extra_bytes))
+    extras: &[Range<usize>],
+) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
+    let plan = probe_wave_plan(ranges, extras);
+    let fetched = source
+        .get_ranges_parallel_async(plan.fetch_ranges())
+        .await?;
+    let mut restored = plan.restore(&fetched);
+    let extra_bytes = restored.split_off(ranges.len());
+    Ok((restored, extra_bytes))
 }
 
-fn get_cluster_ranges_coalesced(
+/// Survivor-wave fetch: plan/restore over the
+/// [`SURVIVOR_RANGE_COALESCE_MAX_GAP`] windows, so survivor rows spanning
+/// geometrically neighboring clusters merge into one cold range.
+fn get_survivor_ranges_coalesced(
     source: &Source,
     ranges: &[Range<usize>],
 ) -> Result<Vec<Bytes>, LazyByteSourceError> {
@@ -4503,15 +4567,15 @@ fn get_cluster_ranges_coalesced(
     }
     let plan = RangeCoalescePlan::new(
         ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+        SURVIVOR_RANGE_COALESCE_MAX_GAP,
+        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
     );
     let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
     Ok(plan.restore(&fetched))
 }
 
-/// Async sibling of [`get_cluster_ranges_coalesced`].
-async fn get_cluster_ranges_coalesced_async(
+/// Async sibling of [`get_survivor_ranges_coalesced`].
+async fn get_survivor_ranges_coalesced_async(
     source: &Source,
     ranges: &[Range<usize>],
 ) -> Result<Vec<Bytes>, LazyByteSourceError> {
@@ -4523,8 +4587,8 @@ async fn get_cluster_ranges_coalesced_async(
     }
     let plan = RangeCoalescePlan::new(
         ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+        SURVIVOR_RANGE_COALESCE_MAX_GAP,
+        SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
     );
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
@@ -7786,30 +7850,32 @@ mod tests {
         );
     }
 
-    /// cold first search must dispatch its
-    /// per-cluster block fetches **concurrently**, not
-    /// serially. The total range-GET count was already
-    /// pinned by the range-budget test above; this test pins
-    /// the round-trip count.
+    /// A cold probe wave with multiple surviving ranges must dispatch
+    /// them **concurrently**, not serially. The end-to-end search GET
+    /// budget is pinned by the range-budget test above; the probe wave
+    /// itself now merges all legs (blocks + Sq8 meta + stable-ids) into
+    /// one coalesce plan, so on small fixtures the wave collapses to a
+    /// single range and a search-side probe can no longer exhibit the
+    /// property. Pin it at the layer that owns it instead:
+    /// `get_ranges_parallel_async` over disjoint uncoalescible ranges.
     ///
-    /// Each `range()` call holds an in-flight slot (RAII
-    /// guard); peak in-flight ≥ 2 proves the cluster fetches
-    /// overlapped. We pad `range()` with a small artificial
-    /// latency so a serial implementation completes each
-    /// future before the next is awaited — without the
-    /// latency, the trivial `bytes.slice(...)` body
-    /// resolves instantly and even a serial caller looks
-    /// concurrent (in-flight peaks at 1 indistinguishably).
+    /// Each `range()` call holds an in-flight slot (RAII guard); peak
+    /// in-flight ≥ 2 proves the fetches overlapped. `range()` is padded
+    /// with a small artificial latency so a serial implementation
+    /// completes each future before the next is awaited — without the
+    /// latency, the trivial `bytes.slice(...)` body resolves instantly
+    /// and even a serial caller looks concurrent (in-flight peaks at 1
+    /// indistinguishably).
     ///
-    /// Runs on the multi-thread runtime for the same
-    /// `block_in_place` reason as the range-budget test above.
+    /// Runs on the multi-thread runtime for the same `block_in_place`
+    /// reason as the range-budget test above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cold_first_search_dispatches_cluster_gets_concurrently() {
-        let (blob, json, all) =
+    async fn cold_range_wave_dispatches_gets_concurrently() {
+        let (blob, json, _all) =
             build_small_superfile(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let blob_len = blob.len();
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
-        let async_counter = counting.async_counter();
         let max_in_flight = counting.max_in_flight_counter();
         counting.disable_sync();
         counting.set_async_latency(Duration::from_millis(5));
@@ -7822,39 +7888,32 @@ mod tests {
         .await
         .expect("open_lazy");
 
-        // Reset max_in_flight after open (we only want to
-        // pin the search-side dispatch shape; open is its
-        // own budget exercise).
+        // Reset max_in_flight after open (we only want to pin the wave
+        // dispatch shape; open is its own budget exercise).
         max_in_flight.store(0, AtomicOrdering::Release);
-        let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
 
-        let nprobe = 8usize;
-        let q = all[0].clone();
-        let hits = r_lazy
-            .search("v", &q, 5, nprobe, 5)
+        // Three disjoint slices spread across the blob — the wave shape a
+        // cold probe produces when coalescing leaves multiple ranges.
+        let slice = (blob_len / 8).max(1);
+        let ranges = vec![
+            0..slice,
+            (blob_len / 2)..(blob_len / 2 + slice),
+            (blob_len - slice)..blob_len,
+        ];
+        let fetched = r_lazy
+            .source
+            .get_ranges_parallel_async(&ranges)
             .await
-            .expect("cold first search");
-        assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
+            .expect("parallel range wave");
+        assert_eq!(fetched.len(), ranges.len(), "one slice per input range");
 
         let peak = max_in_flight.load(AtomicOrdering::Acquire);
-        let search_calls = async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
-        if search_calls >= 3 {
-            // When coalescing still leaves multiple search-side
-            // ranges, they must overlap. A serial dispatch
-            // peaks at exactly 1.
-            assert!(
-                peak >= 2,
-                "cold first search per-cluster fetches must overlap when multiple \
-                 search-side ranges remain (peak in-flight ≥ 2); observed {peak} \
-                 across {search_calls} calls",
-            );
-        } else {
-            assert!(
-                peak >= 1,
-                "coalesced cold first search should still issue at least one \
-                 search-side async range; observed peak={peak}, calls={search_calls}",
-            );
-        }
+        assert!(
+            peak >= 2,
+            "a multi-range cold wave must overlap its fetches (peak in-flight ≥ 2); \
+             observed {peak} across {} ranges",
+            ranges.len(),
+        );
     }
 
     /// round-trip parity for the unified
@@ -9222,11 +9281,11 @@ mod tests {
     /// back out byte-for-byte and preserves input order.
     #[test]
     fn plan_cluster_coalesce_keeps_distant_ranges_separate() {
-        let ranges = vec![0..4, 1_000_000..1_000_008];
+        let ranges = vec![0..4, 100_000_000..100_000_008];
         let plan = RangeCoalescePlan::new(
             &ranges,
-            CLUSTER_RANGE_COALESCE_MAX_GAP,
-            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+            COLD_PROBE_COALESCE_MAX_GAP,
+            COLD_PROBE_COALESCE_MAX_OVERFETCH,
         );
         assert_eq!(
             plan.fetch_ranges().len(),
@@ -9236,7 +9295,7 @@ mod tests {
 
         // Build a synthetic blob and confirm restore recovers the
         // exact requested bytes in input order.
-        let mut blob = vec![0u8; 1_000_016];
+        let mut blob = vec![0u8; 100_000_016];
         for (i, byte) in blob.iter_mut().enumerate() {
             *byte = (i % 251) as u8;
         }
@@ -9262,8 +9321,8 @@ mod tests {
         let ranges = vec![100..120, 80..100, 130..150];
         let plan = RangeCoalescePlan::new(
             &ranges,
-            CLUSTER_RANGE_COALESCE_MAX_GAP,
-            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+            COLD_PROBE_COALESCE_MAX_GAP,
+            COLD_PROBE_COALESCE_MAX_OVERFETCH,
         );
         assert_eq!(
             plan.fetch_ranges().len(),

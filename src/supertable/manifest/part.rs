@@ -30,8 +30,9 @@ use crate::{
     supertable::manifest::{
         SubsectionOffsets, SuperfileEntry, SuperfileUri,
         encoding::{
-            DecodeError, decode_fts_summary_map, decode_scalar_stats, decode_vector_summary_map,
-            encode_fts_summary_map, encode_scalar_stats, encode_vector_summary_map,
+            DecodeError, SummaryWireMode, decode_fts_summary_map, decode_scalar_stats,
+            decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
+            encode_vector_summary_map,
         },
     },
 };
@@ -267,6 +268,15 @@ fn schema() -> &'static AvroSchema {
 /// bit-identical logical content produces the same URI (the
 /// load-bearing property for cross-version part sharing).
 pub fn encode(part: &ManifestPart) -> Vec<u8> {
+    encode_with_mode(part, SummaryWireMode::Full)
+}
+
+/// [`encode`] with an explicit summary wire mode. `RoutingOnly` writes
+/// each vector summary's cluster blocks as counts + 1-bit admit slab
+/// (no fp32) — the sibling encoding consumer opens fetch. Everything
+/// else (ids, stats, FTS blooms, offsets) is byte-identical to the full
+/// form.
+pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Vec<u8> {
     // Use schemaless Avro datum encoding (no OCF container).
     // The OCF wrapper carries a random 16-byte sync marker, which
     // would break content-addressing: encoding the same logical
@@ -279,7 +289,7 @@ pub fn encode(part: &ManifestPart) -> Vec<u8> {
         .map(|seg| {
             let scalar_bytes = encode_scalar_stats(&seg.scalar_stats);
             let fts_bytes = encode_fts_summary_map(&seg.fts_summary);
-            let vector_bytes = encode_vector_summary_map(&seg.vector_summary);
+            let vector_bytes = encode_vector_summary_map(&seg.vector_summary, mode);
 
             AvroValue::Record(vec![
                 (
@@ -1770,7 +1780,8 @@ mod tests {
         let entries: Vec<Arc<SuperfileEntry>> = (0..TIMING_ENTRIES_PER_PART)
             .map(|_| timing_superfile())
             .collect();
-        let summary_bytes_one = encode_vector_summary_map(&entries[0].vector_summary);
+        let summary_bytes_one =
+            encode_vector_summary_map(&entries[0].vector_summary, SummaryWireMode::Full);
         let part = fresh_part(entries);
 
         let t = Instant::now();

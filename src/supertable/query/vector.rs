@@ -94,7 +94,7 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, relative_score_window},
+            distance::{Metric, distance, relative_score_window},
             layout::VectorLayout,
         },
     },
@@ -102,10 +102,13 @@ use crate::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::{
-            ManifestSnapshot, SuperfileEntry, SuperfileUri,
+            ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
+            VectorSummary,
             list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
+        slow_vector_state::{CentroidSection, fetch_centroid_section},
         tombstones::SidecarCache,
     },
 };
@@ -130,6 +133,72 @@ test_visible! {
 /// per-fragment read volume the way probing every run would.
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
+
+/// Filtered-default cell probe width: the same user-table search with the
+/// allow-set pushed down, probing a fixed 4 grid cells instead of the
+/// fine-first single cell. The nearest MATCHING rows sit deeper in the
+/// unfiltered ranking (~rank k/selectivity) and spread across more cells,
+/// so p=1 under-reaches (measured 0.489 @ 3.3 ms at 1M/256 with ~10%
+/// selectivity) while wide sweeps pay latency far past parity (32 cells:
+/// 0.827 @ 18 ms). Fine-run coverage inside a probed cell is already
+/// complete at 4 runs (drain-diag: p4=1.000) and the default keeps 8.
+/// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
+/// trade measured.
+const FILTERED_USER_CELL_NPROBE: usize = 4;
+
+// The admit window keeps the shared
+// `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
+// ranked tagged cells for exact fp32 rescoring, floored by
+// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`]. A cell's rank is its best fine
+// centroid's 1-bit estimate, and every fine inside a kept cell is
+// rescored exactly — so the window only has to land the exact-best cell
+// (plus near-tie companions) *somewhere* inside it. 20% keeps the same
+// coverage class as the recall-validated 48-of-256 window (post-drain
+// recall matched the exact-everything scan at 0.995) while scaling with
+// the ranked population — a fixed 48 under-covers larger grids (under
+// 5% of 1024 cells). Applies identically to hidden cells and user
+// commit fragments (one code path).
+
+// The window floor is the shared
+// `manifest::RABITQ_ADMIT_CELL_SHORTLIST_MIN` (48): below it the
+// prefilter degenerates to scoring everything — identical to the exact
+// path — and it is the validated absolute window at the 256-cell shapes,
+// so small tables never see a narrower window than the measured one.
+
+/// Minimum fine-ranked picks in the union cell selection used by the
+/// non-default paths (filtered search, explicit caller nprobe). The fine
+/// ranking's second pick closes the last coverage gap when the grid is
+/// very coarse — measured at 10M/64c: fine p1 coverage 0.919 (union recall
+/// landed exactly on it at 0.921) vs fine p2 coverage 0.997. An explicit
+/// caller probe width larger than this takes precedence.
+const UNION_FINE_PICKS_MIN: usize = 2;
+
+/// Cell-probe floor for filtered (allow-set) queries over the hidden cell
+/// index. The manifest's default routing (fine-first p=1) is calibrated
+/// for unfiltered search, where fine p1 cell coverage measures 1.000; an
+/// allow-set thins each cell's matching postings (~10% selectivity in the
+/// bench), so the nearest *matching* neighbors spread past the top cell
+/// and a narrow probe caps filtered recall well below the unfiltered
+/// number. Consolidated cells make width nearly free under a filter
+/// (allow-first shortlist + bounded rerank): width is nearly free
+/// because the probe cost is carried by matching rows, not cells. The
+/// 1M/256 sweep at 16-fine depth measured 6 cells → 0.873 @ 1.36 ms,
+/// 128 → 0.940 @ 1.48 ms; the 10M/256 sweep measured 160 → 0.902 @
+/// 4.16 ms, 224 → 0.933 @ 4.91 ms, 256 → 0.933 @ 5.16 ms. The full
+/// grid buys the recall plateau for ~1 ms over the 128 default at 10M,
+/// so filtered sweeps every cell — the residual loss is in-cell depth
+/// ([`FILTERED_HIDDEN_FINE_NPROBE`]), not width. NOTE: absolute width
+/// (= the whole pinned 256-cell grid); if the grid grows past it the
+/// dial becomes a fraction.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
+
+/// Fine-run probe depth inside each hidden cell for filtered queries.
+/// The unfiltered default (8) is calibrated for top-10 neighbors, whose
+/// fine-run coverage saturates at 4 (drain-diag p4 = 1.000); a filter's
+/// nearest MATCHING rows sit at unfiltered rank ~k/selectivity and live
+/// in deeper runs — the width sweep's 0.856 plateau across 6..16 cells
+/// is in-cell loss, recovered by probing deeper, not wider.
+const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
@@ -320,32 +389,146 @@ fn postings_by_cell_from_summaries(
     (postings, any_tagged)
 }
 
-/// Score every fine IVF centroid in the eligible superfile summaries.
+/// 1-bit admit window for `ranked_cells` distinct tagged cells: the
+/// [`RABITQ_ADMIT_CELL_SHORTLIST_FRACTION`] slice of the ranked
+/// population, floored by [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`].
+fn admit_shortlist_window(ranked_cells: usize) -> usize {
+    let scaled = (ranked_cells as f64 * RABITQ_ADMIT_CELL_SHORTLIST_FRACTION).ceil() as usize;
+    scaled.max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
+}
+
+/// One admit fine-centroid candidate:
+/// `(superfile index, flat cluster id, score, cell id, indexed doc count)`.
+type FineCandidate = (usize, u32, f32, Option<u32>, u64);
+
+/// A summary cell selected for exact scoring whose fp32 centroids were
+/// dropped at hydration (`summary_centroids_from_superfiles`): its exact
+/// scores are read from the superfile's on-disk centroid region through
+/// the reader cache instead.
+struct DeferredCellRescore {
+    si: usize,
+    cell_id: Option<u32>,
+    flat_base: u32,
+}
+
+// Stripped summary cells (fp32 dropped at hydration) always DEFER to an
+// exact rescore — 1-bit estimates in routing measurably cost recall
+// (filtered measured 0.722 against the 0.95 bar when the user path ranked
+// on estimates). The rescore is cheap in both regimes: hidden manifests
+// read the slow-CAS centroid-section spill; user manifests hydrate fp32
+// once per generation from the FULL manifest parts (the user table's
+// content-addressed fp32 store). See `rescore_deferred_cells`.
+
+/// Validate one superfile's vector summary for `column` (present,
+/// non-empty, dims matching the query) and hand it back. Shared by the
+/// prefilter and exact passes of [`score_fine_candidates`].
+fn eligible_summary<'e>(
+    entry: &'e SuperfileEntry,
+    column: &str,
+    query_dim: usize,
+) -> Result<&'e VectorSummary, QueryError> {
+    match entry.vector_summary.get(column) {
+        Some(vs) if !vs.cells.is_empty() => {
+            for cell in &vs.cells {
+                if cell.clusters.dim as usize != query_dim {
+                    return Err(QueryError::Execute(format!(
+                        "vector summary dimension {} for column `{column}` on superfile {} \
+                         does not match query dimension {query_dim}",
+                        cell.clusters.dim, entry.superfile_id,
+                    )));
+                }
+            }
+            Ok(vs)
+        }
+        Some(_) => Err(QueryError::Execute(format!(
+            "superfile {} has no cluster centroids in its vector summary for \
+             column `{column}` — malformed build; refusing to degrade to a \
+             blind per-superfile probe",
+            entry.superfile_id
+        ))),
+        None => Err(QueryError::Execute(format!(
+            "superfile {} has no vector summary for column `{column}` — \
+             malformed build; refusing to degrade to a blind per-superfile \
+             probe",
+            entry.superfile_id
+        ))),
+    }
+}
+
+/// Score fine IVF centroids in the eligible superfile summaries.
+///
+/// With `admit` set (`(prefilter query, must-include cells)`), a 1-bit
+/// XOR+popcount pass first ranks tagged cells by their best estimated
+/// fine-centroid score and keeps the [`admit_shortlist_window`] top
+/// slice plus the caller's grid picks; the exact fp32 scan below then
+/// skips instances outside that set. Every *emitted* score is exact
+/// fp32, so routing and near-tie logic never see 1-bit noise — the
+/// estimates only bound which cells get exact-scored. Untagged
+/// (`cell_id: None`) summaries are always exact-scored.
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
     query: &[f32],
     metric: Metric,
+    admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
-) -> Result<Vec<(usize, u32, f32, Option<u32>, u64)>, QueryError> {
-    let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
+) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
+    let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
+
+    let shortlist: Option<HashSet<u32>> = if let Some((admit_q, must_include)) = admit {
+        let mut cell_best: HashMap<u32, f32> = HashMap::new();
+        for entry in superfiles.iter().filter(|e| eligible(e)) {
+            let vs = eligible_summary(entry, column, query.len())?;
+            for cell in &vs.cells {
+                let Some(cell_id) = cell.cell_id else {
+                    continue;
+                };
+                let Some(est) = cell.clusters.estimate_min_admit_score(metric, admit_q) else {
+                    continue;
+                };
+                cell_best
+                    .entry(cell_id)
+                    .and_modify(|best| {
+                        if est < *best {
+                            *best = est;
+                        }
+                    })
+                    .or_insert(est);
+            }
+        }
+        let mut ranked: Vec<(u32, f32)> = cell_best.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut keep: HashSet<u32> = ranked
+            .iter()
+            .take(admit_shortlist_window(ranked.len()))
+            .map(|(cell, _)| *cell)
+            .collect();
+        keep.extend(must_include.iter().copied());
+        Some(keep)
+    } else {
+        None
+    };
+
+    let mut candidates: Vec<FineCandidate> = Vec::new();
+    let mut deferred: Vec<DeferredCellRescore> = Vec::new();
     for (si, entry) in superfiles.iter().enumerate() {
-        if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
+        if !eligible(entry) {
             continue;
         }
-        match entry.vector_summary.get(column) {
-            Some(vs) if !vs.cells.is_empty() => {
-                let mut flat_base = 0u32;
-                for cell in &vs.cells {
-                    if cell.clusters.dim as usize != query.len() {
-                        return Err(QueryError::Execute(format!(
-                            "vector summary dimension {} for column `{column}` on superfile {} \
-                             does not match query dimension {}",
-                            cell.clusters.dim,
-                            entry.superfile_id,
-                            query.len()
-                        )));
-                    }
+        let vs = eligible_summary(entry, column, query.len())?;
+        let mut flat_base = 0u32;
+        for cell in &vs.cells {
+            // Flat cluster ids must stay identical whether or not a cell is
+            // skipped, so flat_base always advances.
+            let skipped = shortlist
+                .as_ref()
+                .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
+            if !skipped {
+                if cell.clusters.vectors_resident() {
                     cell.clusters
                         .score_clusters_into(metric, query, |local, score| {
                             let count = cell
@@ -356,37 +539,48 @@ fn score_fine_candidates(
                                 .unwrap_or(0) as u64;
                             candidates.push((si, flat_base + local, score, cell.cell_id, count));
                         });
-                    flat_base = flat_base.saturating_add(cell.clusters.n_cent);
+                } else {
+                    deferred.push(DeferredCellRescore {
+                        si,
+                        cell_id: cell.cell_id,
+                        flat_base,
+                    });
                 }
             }
-            Some(vs) if vs.cells.is_empty() => {
-                return Err(QueryError::Execute(format!(
-                    "superfile {} has no cluster centroids in its vector summary for \
-                     column `{column}` — malformed build; refusing to degrade to a \
-                     blind per-superfile probe",
-                    entry.superfile_id
-                )));
-            }
-            Some(_) => unreachable!("non-empty cell summaries handled above"),
-            None => {
-                return Err(QueryError::Execute(format!(
-                    "superfile {} has no vector summary for column `{column}` — \
-                     malformed build; refusing to degrade to a blind per-superfile \
-                     probe",
-                    entry.superfile_id
-                )));
-            }
+            flat_base = flat_base.saturating_add(cell.clusters.n_cent);
         }
     }
-    Ok(candidates)
+    Ok((candidates, deferred))
 }
 
-/// Minimum fine-ranked picks in the union cell selection, shared by the
-/// hidden and user branches. The fine ranking's second pick is what closes
-/// the last coverage gap at scale — measured at 10M/64c: fine p1 coverage
-/// 0.919 (union recall landed exactly on it at 0.921) vs fine p2 coverage
-/// 0.997. An explicit caller probe width larger than this takes precedence.
-const UNION_FINE_PICKS_MIN: usize = 2;
+/// Default-path cell selection, shared by the hidden (post-drain) and user
+/// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
+/// top cell only when its own fine score is a genuine near-tie of the fine
+/// winner (same relative window replica closure uses at drain time, so
+/// probing and replication agree on what counts as a boundary). At the
+/// shipped grid shapes (256/1024 cells) fine p1 coverage measures 1.000
+/// (drain-diag, 1M–100M), so a second unconditional pick only multiplies
+/// the probed-cell fan without recall to show for it.
+fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) -> Vec<u32> {
+    let Some(&(fine_top, fine_top_score)) = fine_ranked.first() else {
+        return grid_top.into_iter().collect();
+    };
+    let mut cells = vec![fine_top];
+    if let Some(grid_top) = grid_top
+        && grid_top != fine_top
+    {
+        let tie_threshold =
+            relative_score_window(fine_top_score, REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
+        let grid_top_fine_score = fine_ranked
+            .iter()
+            .find(|(cell, _)| *cell == grid_top)
+            .map(|(_, score)| *score);
+        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
+            cells.push(grid_top);
+        }
+    }
+    cells
+}
 
 /// Union of the grid-ranked and fine-ranked cell selections, in probe
 /// priority order: grid picks first, then fine picks not already selected.
@@ -826,7 +1020,168 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     Ok(out.into_iter().flatten().collect())
 }
 
+/// Score one deferred cell's fp32 centroids into `candidates` — shared by
+/// the centroid-section (hidden) and full-part (user) rescore sources.
+/// Returns false when the entry's summary doesn't validate against the
+/// fp32 slice (caller keeps the cell deferred for the per-superfile
+/// fallback wave).
+fn score_cell_fp32(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    d: &DeferredCellRescore,
+    fp32: &[f32],
+    query: &[f32],
+    metric: Metric,
+    candidates: &mut Vec<FineCandidate>,
+) -> bool {
+    let entry = &superfiles[d.si];
+    let Some(cell) = entry
+        .vector_summary
+        .get(column)
+        .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
+    else {
+        return false;
+    };
+    let dim = cell.clusters.dim as usize;
+    if dim == 0 || fp32.len() != cell.clusters.n_cent as usize * dim {
+        return false;
+    }
+    for (local, centroid) in fp32.chunks_exact(dim).enumerate() {
+        let count = cell.clusters.counts.get(local).copied().unwrap_or(0) as u64;
+        if count == 0 {
+            continue;
+        }
+        let score = distance(metric, query, centroid);
+        candidates.push((d.si, d.flat_base + local as u32, score, d.cell_id, count));
+    }
+    true
+}
+
 impl SupertableReader {
+    /// Hydrate (or reuse) the slow-CAS centroid-section spill for this
+    /// table: one streamed fetch of a single content-addressed object on
+    /// the first cold rescore, then local `pread`s forever — instead of
+    /// one block GET per shortlisted cell per query. `None` when the
+    /// manifest carries no section ref (legacy) or the fetch failed
+    /// (callers fall back to per-superfile centroid reads).
+    async fn centroid_section(&self) -> Option<Arc<CentroidSection>> {
+        let manifest = self.manifest();
+        let reference = manifest.slow_vector_state_centroids_blob()?.clone();
+        let storage = manifest.options.storage.as_ref()?;
+        let slot = Arc::clone(&manifest.options.centroid_section_cache);
+        // The lock is deliberately held ACROSS the fetch: it makes the
+        // one-time hydration single-flight, so concurrent cold queries
+        // wait for one section download instead of each pulling the whole
+        // object. Steady state holds it only long enough to clone the Arc.
+        let mut guard = slot.lock().await;
+        if let Some(section) = guard.as_ref()
+            && section.uri() == reference.uri
+        {
+            return Some(Arc::clone(section));
+        }
+        let entries = manifest.get_all_superfiles();
+        match fetch_centroid_section(storage.as_ref(), &reference, entries).await {
+            Ok(section) => {
+                let section = Arc::new(section);
+                *guard = Some(Arc::clone(&section));
+                Some(section)
+            }
+            Err(error) => {
+                eprintln!(
+                    "[supertable] centroid section {} unavailable ({error}); deferred rescores \
+                     will fail unless the parts cache covers their cells",
+                    reference.uri
+                );
+                None
+            }
+        }
+    }
+
+    /// Exact admit scores for summary cells whose fp32 was dropped at
+    /// hydration. Two sources, both manifest-published state, and they
+    /// are exhaustive: hidden (VectorCell) manifests read the slow-CAS
+    /// centroid-section spill (one object per generation — see
+    /// [`Self::centroid_section`]); user manifests read the fp32
+    /// hydrated once per generation from the FULL manifest parts. A cell
+    /// neither can serve is corrupted routing state — the publish paths
+    /// guarantee every stripped cell is covered (the section composer
+    /// fails a republish rather than leave a hole) — so the query fails
+    /// loudly instead of degrading onto some slower read path.
+    async fn rescore_deferred_cells(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        column: &str,
+        query: &[f32],
+        metric: Metric,
+        candidates: &mut Vec<FineCandidate>,
+        deferred: Vec<DeferredCellRescore>,
+    ) -> Result<(), QueryError> {
+        let deferred = if deferred.is_empty() {
+            deferred
+        } else if let Some(section) = self.centroid_section().await {
+            let mut leftovers = Vec::new();
+            for d in deferred {
+                let entry = &superfiles[d.si];
+                let read = section
+                    .read_cell(entry.superfile_id, column, d.cell_id)
+                    .map_err(|e| {
+                        QueryError::Execute(format!("centroid section spill read: {e}"))
+                    })?;
+                let Some(fp32) = read else {
+                    leftovers.push(d);
+                    continue;
+                };
+                if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                    leftovers.push(d);
+                }
+            }
+            leftovers
+        } else {
+            deferred
+        };
+        // User manifests carry no centroid section; their fp32 lives in
+        // the FULL manifest parts (content-addressed), hydrated once per
+        // generation and served from RAM after that.
+        let deferred = if deferred.is_empty() {
+            deferred
+        } else if let Some(cache) = self.manifest().user_centroids_for_rescore().await {
+            let mut leftovers = Vec::new();
+            for d in deferred {
+                let entry = &superfiles[d.si];
+                let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
+                    leftovers.push(d);
+                    continue;
+                };
+                if !score_cell_fp32(
+                    superfiles,
+                    column,
+                    &d,
+                    fp32.as_slice(),
+                    query,
+                    metric,
+                    candidates,
+                ) {
+                    leftovers.push(d);
+                }
+            }
+            leftovers
+        } else {
+            deferred
+        };
+        if let Some(d) = deferred.first() {
+            let entry = &superfiles[d.si];
+            return Err(QueryError::Execute(format!(
+                "deferred admit rescore: no manifest-published fp32 covers superfile {} column \
+                 {column} cell {:?} ({} cell(s) uncovered) — the centroid section / full parts \
+                 must cover every stripped summary cell",
+                entry.superfile_id,
+                d.cell_id,
+                deferred.len(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Global cross-superfile cluster selection + waved fan-out. Shared
     /// by the user-table path and the hidden vector-index path.
     async fn fanout_vector_clusters(
@@ -861,11 +1216,14 @@ impl SupertableReader {
         // read Copy `CellRoutingParams` (that clone used to drop the transposed
         // SIMD cache and force a per-query scalar transpose rebuild).
         let hidden_routing = manifest.vector_cell_routing();
-        // The user-table path owns its coarse default (16 cells). Explicit
-        // caller overrides and the filtered path keep the resolved value;
-        // hidden routing ignores `nprobe` entirely (persisted
-        // CellRoutingParams). The single-superfile tier is untouched — this
-        // widening lives only in the supertable fan-out.
+        // The user-table path owns its coarse default (16 cells) for the
+        // untagged fallback sweep. The filtered UNDRAINED-tail fan keeps
+        // the default user-table search shape (fine-first p=1 + near-tie
+        // slack) with the allow-set pushed down — latency parity with
+        // unfiltered by design; drained rows route through the hidden
+        // cell index (see `route_filtered_vector_hits_async`). Explicit
+        // caller overrides keep the resolved value; hidden routing merges
+        // its persisted CellRoutingParams with the filtered floor below.
         let nprobe = if !hidden_vector_index && !filtered && options.nprobe.is_none() {
             USER_COARSE_CELLS
         } else {
@@ -880,12 +1238,14 @@ impl SupertableReader {
         // probe only the globally-closest clusters.
         // Undeclared column = caller error, rejected here — not a silent
         // L2Sq default that fails later with a per-superfile decode error.
-        let metric = manifest
+        // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
+        // column's row codes).
+        let (metric, rot_seed) = manifest
             .options
             .vector_columns
             .iter()
             .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
+            .map(|vc| (vc.metric, vc.rot_seed))
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
         // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
@@ -951,11 +1311,48 @@ impl SupertableReader {
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
-                hidden_routing.expect("hidden manifest carries routing")
-            } else if filtered || options.nprobe.is_some() {
+                let base = hidden_routing.expect("hidden manifest carries routing");
+                if filtered && options.nprobe.is_some() {
+                    // Explicit caller `nprobe` on a FILTERED query pins the
+                    // hidden cell sweep — the width dial calibration and
+                    // the bench sweep turn (depth stays at the filtered
+                    // default so the sweep isolates width). Unfiltered
+                    // hidden routing keeps ignoring caller nprobe
+                    // (persisted params own it).
+                    CellRoutingParams {
+                        nprobe_min: nprobe.max(1),
+                        nprobe_max: nprobe.max(1),
+                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        ..base
+                    }
+                } else if filtered {
+                    // Allow-set queries widen to the filtered floor and
+                    // probe DEEPER fine runs per cell — the matching
+                    // neighbors sit past the unfiltered top runs; the
+                    // manifest's persisted routing still wins if broader.
+                    CellRoutingParams {
+                        nprobe_min: base.nprobe_min.max(FILTERED_HIDDEN_CELL_NPROBE),
+                        nprobe_max: base.nprobe_max.max(FILTERED_HIDDEN_CELL_NPROBE),
+                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        ..base
+                    }
+                } else {
+                    base
+                }
+            } else if options.nprobe.is_some() {
                 CellRoutingParams {
                     nprobe_min: nprobe.max(1),
                     nprobe_max: nprobe.max(1),
+                    ..CellRoutingParams::default()
+                }
+            } else if filtered {
+                // Filtered UNDRAINED-tail fan: the default user-table
+                // search with a small fixed floor
+                // ([`FILTERED_USER_CELL_NPROBE`]) — the nearest MATCHING
+                // rows sit deeper than the fine-first single cell reaches.
+                CellRoutingParams {
+                    nprobe_min: FILTERED_USER_CELL_NPROBE,
+                    nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
             } else {
@@ -974,7 +1371,36 @@ impl SupertableReader {
                 ));
             }
             let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
-            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            // 1-bit prefilter for the exact fine scan: the grid's cutoff
+            // picks are must-include so every cell the beam can select has
+            // exact candidate scores (near-tie checks included). Filtered
+            // queries use the same prefilter — same code, same budgets;
+            // the allow-set only decides which rows may take shortlist
+            // slots inside the probed runs.
+            let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
+            let must_include: Vec<u32> = ranked_for_beam[..cutoff]
+                .iter()
+                .map(|(cell, _)| *cell)
+                .collect();
+            let (mut candidates, deferred) = score_fine_candidates(
+                &superfiles,
+                column,
+                query,
+                metric,
+                Some((&admit_q, must_include.as_slice())),
+                allow_ref,
+            )?;
+            if !deferred.is_empty() {
+                self.rescore_deferred_cells(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    &mut candidates,
+                    deferred,
+                )
+                .await?;
+            }
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -983,17 +1409,28 @@ impl SupertableReader {
                 .as_ref()
                 .expect("ranked cell ids exist with scored ranking");
             if hidden_vector_index {
-                let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
-                    .iter()
-                    .map(|(cell, _)| *cell)
-                    .collect();
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                let fine_cells: Vec<u32> = fine_ranked
-                    .iter()
-                    .take(cutoff.max(UNION_FINE_PICKS_MIN))
-                    .map(|(cell, _)| *cell)
-                    .collect();
-                let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
+                // Default path: fine-first p=1, the same selection the user
+                // (pre-drain) branch ships. Filtered search and explicit
+                // caller nprobe keep the wider grid/fine union.
+                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                let selected_cells_ordered: Vec<u32> = if default_p1 {
+                    fine_first_cell_selection(
+                        &fine_ranked,
+                        ranked_for_beam.first().map(|(cell, _)| *cell),
+                    )
+                } else {
+                    let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    let fine_cells: Vec<u32> = fine_ranked
+                        .iter()
+                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    union_cell_selection(&grid_cells, &fine_cells)
+                };
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 gated = gate_fine_candidates_by_fragment(
                     candidates,
@@ -1011,23 +1448,7 @@ impl SupertableReader {
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
                 let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
                 let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
-                    let (fine_top, fine_top_score) = fine_ranked[0];
-                    let mut cells = vec![fine_top];
-                    let grid_top = ranked[0];
-                    if grid_top != fine_top {
-                        let tie_threshold = relative_score_window(
-                            fine_top_score,
-                            REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
-                        );
-                        let grid_top_fine_score = fine_ranked
-                            .iter()
-                            .find(|(cell, _)| *cell == grid_top)
-                            .map(|(_, score)| *score);
-                        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
-                            cells.push(grid_top);
-                        }
-                    }
-                    cells
+                    fine_first_cell_selection(&fine_ranked, ranked.first().copied())
                 } else {
                     let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
                     let fine_cells: Vec<u32> = fine_ranked
@@ -1065,8 +1486,22 @@ impl SupertableReader {
             }
         } else {
             // No grid, or untagged summaries: score every fine centroid
-            // (legacy flat path).
-            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            // (legacy flat path, no prefilter). Stripped summaries defer to
+            // the exact rescore — untagged legacy tables have no per-cell
+            // gating to absorb estimate noise.
+            let (mut candidates, deferred) =
+                score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
+            if !deferred.is_empty() {
+                self.rescore_deferred_cells(
+                    &superfiles,
+                    column,
+                    query,
+                    metric,
+                    &mut candidates,
+                    deferred,
+                )
+                .await?;
+            }
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -2364,9 +2799,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        SCORE_COLUMN, VectorFilter, VectorSearchOptions, cells_ranked_by_fine_score,
-        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
+        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
+        hidden_hits_user_ids, is_hidden_vector_manifest, projection_is_id_score_only,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2412,6 +2848,22 @@ mod tests {
             Some(&["other", SCORE_COLUMN]),
             id
         ));
+    }
+
+    /// The admit window scales with the ranked cell population (20%
+    /// slice) and never narrows below the validated floor: small tables
+    /// degenerate to exact-everything, the 256-cell shape widens just
+    /// past its measured 48, and larger grids grow proportionally.
+    #[test]
+    fn admit_shortlist_window_scales_with_cell_population() {
+        assert_eq!(admit_shortlist_window(0), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(64), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(240), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
+        assert_eq!(admit_shortlist_window(256), 52);
+        assert_eq!(admit_shortlist_window(512), 103);
+        assert_eq!(admit_shortlist_window(1024), 205);
+        // Ceil, not floor: a fractional slice rounds up.
+        assert_eq!(admit_shortlist_window(241), 49);
     }
 
     #[test]

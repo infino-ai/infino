@@ -244,6 +244,30 @@ impl PeakSampler {
     }
 }
 
+/// Settled `(rss, anonymous, file_backed, shmem)` resident bytes from
+/// `/proc/self/smaps_rollup`, after an allocator purge. "Settled" means
+/// freed heap has been returned to the OS before sampling, so the values
+/// reflect what the process retains — not a transient peak.
+pub fn settled_rss_breakdown() -> Option<(u64, u64, u64, u64)> {
+    purge_allocator();
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let kb = |key: &str| -> u64 {
+        rollup
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let rss = kb("Rss:") * KIB_TO_BYTES;
+    let anon = kb("Anonymous:") * KIB_TO_BYTES;
+    let shmem = kb("Shmem:") * KIB_TO_BYTES;
+    // Everything resident that is neither anonymous heap nor shmem is
+    // file-backed: mmap'd disk-cache segments, corpus files, binaries.
+    let file_backed = rss.saturating_sub(anon).saturating_sub(shmem);
+    Some((rss, anon, file_backed, shmem))
+}
+
 /// Format a byte count as a right-justified human string —
 /// `"12.34 GiB"` / `"456.78 MiB"` / `"123.4 KiB"` — for the
 /// bench markdown tables.
@@ -255,30 +279,15 @@ impl PeakSampler {
 /// allocator first so retained-but-free heap doesn't masquerade as a
 /// live working set.
 pub fn log_rss_breakdown(label: &str) {
-    purge_allocator();
-    let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+    let Some((rss, anon, file_backed, shmem)) = settled_rss_breakdown() else {
         return;
     };
-    let kb = |key: &str| -> u64 {
-        rollup
-            .lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    };
-    let rss = kb("Rss:");
-    let anon = kb("Anonymous:");
-    let shmem = kb("Shmem:");
-    // Everything resident that is neither anonymous heap nor shmem is
-    // file-backed: mmap'd disk-cache segments, corpus files, binaries.
-    let file_backed = rss.saturating_sub(anon).saturating_sub(shmem);
     eprintln!(
         "[rss-breakdown] {label}: rss={} anonymous={} file_backed={} shmem={}",
-        fmt_bytes(rss * KIB_TO_BYTES),
-        fmt_bytes(anon * KIB_TO_BYTES),
-        fmt_bytes(file_backed * KIB_TO_BYTES),
-        fmt_bytes(shmem * KIB_TO_BYTES),
+        fmt_bytes(rss),
+        fmt_bytes(anon),
+        fmt_bytes(file_backed),
+        fmt_bytes(shmem),
     );
 }
 
@@ -353,6 +362,13 @@ mod tests {
     /// actually paying RSS).
     #[test]
     fn sampler_observes_allocation_growth() {
+        // Take the baseline in the same purged-allocator state the
+        // sampler seeds from (`start()` purges before its first read).
+        // Without this, memory freed by concurrently-running tests sits
+        // allocator-retained in the baseline reading and is released by
+        // the sampler's purge — measured 150 MiB of drop, dwarfing the
+        // 32 MiB growth this test asserts on.
+        purge_allocator();
         let baseline = match current_rss_bytes() {
             Some(b) => b,
             None => return,

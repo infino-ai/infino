@@ -471,6 +471,13 @@ impl Supertable {
                         }
                     }
                 }
+                // A consumer-memory-mode handle must not bootstrap-create the
+                // sibling: its user summaries hydrate stripped, so the grid
+                // can't be trained here and the create would durably stamp a
+                // default (non-VectorCell) partition strategy. Absent is
+                // correct — queries fall back to the user fan until a writer
+                // handle materializes the index.
+                Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
                 Ok(None) => match create_table_async(hidden_opts, None, None).await {
                     Ok(table) => (Some(Arc::new(table)), None),
                     Err(e) => {
@@ -1198,18 +1205,25 @@ impl Supertable {
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
 /// Cell count for the **user** table's grid, trained at the first commit —
-/// used to cell-pack user superfiles and route the pre-drain query. From
-/// `vector.user_cell_count` (YAML-only; no env override).
-pub(crate) fn user_vector_cell_count() -> usize {
-    config::global().vector.user_cell_count.max(1)
+/// used to cell-pack user superfiles and route the pre-drain query. The
+/// per-table option wins when set; otherwise `vector.user_cell_count`
+/// from the YAML config (no env override).
+pub(crate) fn user_vector_cell_count(options: &SupertableOptions) -> usize {
+    options
+        .user_cell_count
+        .unwrap_or_else(|| config::global().vector.user_cell_count)
+        .max(1)
 }
 
 /// Cell count for the **hidden** vector index: `global_vector_index.grid` is
 /// trained at this count and the drain reads it verbatim; post-drain routing
-/// runs at this granularity. From `vector.hidden_cell_count` (YAML-only; no
-/// env override).
-pub(crate) fn hidden_vector_cell_count() -> usize {
-    config::global().vector.hidden_cell_count.max(1)
+/// runs at this granularity. The per-table option wins when set; otherwise
+/// `vector.hidden_cell_count` from the YAML config (no env override).
+pub(crate) fn hidden_vector_cell_count(options: &SupertableOptions) -> usize {
+    options
+        .hidden_cell_count
+        .unwrap_or_else(|| config::global().vector.hidden_cell_count)
+        .max(1)
 }
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
@@ -1276,7 +1290,9 @@ pub(crate) fn train_global_centroids(
         };
         for cell in &vs.cells {
             let clusters = &cell.clusters;
-            if clusters.is_empty() {
+            // Stripped summaries (read-only consumer memory mode) carry no
+            // fp32 to train from; grid bootstrap is a writer-side concern.
+            if clusters.is_empty() || !clusters.vectors_resident() {
                 continue;
             }
             dim = clusters.dim as usize;
@@ -1389,12 +1405,23 @@ fn build_vector_index_options(
         .with_writer_pool(Arc::clone(&user_opts.writer_pool))
         .with_read_consistency(user_opts.read_consistency);
     hidden_opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
+    // Hidden-manifest summaries hydrate stripped unconditionally (the fp32
+    // wire home is the slow-CAS centroid section), so the consumer memory
+    // mode has nothing left to gate there. Keep it off on the derived
+    // options: the flag marks a handle read-only, and hidden maintenance
+    // (drain, split, compaction) must stay writable regardless of how the
+    // user handle was opened.
+    hidden_opts.summary_centroids_from_superfiles = false;
+    // Per-table cell-count overrides ride along too: the hidden handle's
+    // paths resolve counts through its own options.
+    hidden_opts.user_cell_count = user_opts.user_cell_count;
+    hidden_opts.hidden_cell_count = user_opts.hidden_cell_count;
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, hidden_vector_cell_count())
+            train_global_centroids(user_opts, manifest, hidden_vector_cell_count(user_opts))
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -2320,7 +2347,7 @@ mod tests {
             });
         assert_eq!(
             user_grid_trained,
-            user_vector_cell_count() != hidden_vector_cell_count(),
+            user_vector_cell_count(st.options()) != hidden_vector_cell_count(st.options()),
             "user-side grid must be trained exactly when the cell counts differ"
         );
         assert_eq!(
@@ -2442,6 +2469,244 @@ mod tests {
             after_compaction, before_compaction,
             "fixed residual payloads must survive compaction"
         );
+    }
+
+    /// The per-table cell-count overrides win over the YAML config; the
+    /// `.max(1)` floor still applies. No assertion on the config-backed
+    /// default value itself — the test environment's YAML may override it.
+    #[test]
+    fn vector_cell_count_options_override_config() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "text",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let base = SupertableOptions::new(schema, vec![], vec![], None).expect("options");
+        let overridden = base.with_vector_cell_counts(7, 9);
+        assert_eq!(user_vector_cell_count(&overridden), 7);
+        assert_eq!(hidden_vector_cell_count(&overridden), 9);
+        let floored = overridden.with_vector_cell_counts(0, 0);
+        assert_eq!(user_vector_cell_count(&floored), 1);
+        assert_eq!(hidden_vector_cell_count(&floored), 1);
+    }
+
+    /// Read-only consumer memory mode (`summary_centroids_from_superfiles`):
+    /// after a drain, a consumer reopened with the mode on must (a) hold
+    /// the hidden summaries without resident fp32 centroids and (b) return
+    /// exactly the hits of a mode-off consumer — the deferred admit rescore
+    /// reads centroid regions from the superfiles through the reader cache.
+    #[test]
+    fn stripped_summary_consumer_matches_resident_hits() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::query::SuperfileHit,
+        };
+
+        // Rows across the planted one-hot directions (three per direction
+        // at dim=16), so each cosine cluster has a few members.
+        const N_DOCS: usize = 48;
+        // Top-k compared across the two consumer modes.
+        const TOP_K: usize = 5;
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let make_options = |from_superfiles: bool| {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+            .with_summary_centroids_from_superfiles(from_superfiles)
+        };
+
+        // One-hot planted directions (i % dim) — separable cosine clusters.
+        let st = Supertable::create(make_options(false)).expect("create");
+        let titles =
+            LargeStringArray::from((0..N_DOCS).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let mut flat = Vec::with_capacity(N_DOCS * dim);
+        for i in 0..N_DOCS {
+            for d in 0..dim {
+                flat.push(if d == i % dim { 1.0f32 } else { 0.0 });
+            }
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        q[1] = 0.05;
+        let ids = |hits: &[SuperfileHit]| {
+            hits.iter()
+                .map(|h| (h.superfile, h.local_doc_id, h.stable_id))
+                .collect::<Vec<_>>()
+        };
+
+        // Pre-drain: the user wave serves the query, and a mode-on consumer
+        // hydrates the user manifest from routing parts (no fp32 download) —
+        // the deferred rescore reads user superfile centroid regions.
+        let pre_baseline = Supertable::open(make_options(false)).expect("pre-drain mode-off");
+        let pre_base_hits = pre_baseline
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("pre-drain baseline hits");
+        assert!(!pre_base_hits.is_empty(), "pre-drain baseline returns hits");
+        drop(pre_baseline);
+        let pre_stripped = Supertable::open(make_options(true)).expect("pre-drain mode-on");
+        let pre_stripped_reader = pre_stripped.reader();
+        let user_manifest = pre_stripped_reader.manifest();
+        let user_part_entries = user_manifest.get_all_list_entries();
+        assert!(
+            !user_part_entries.is_empty(),
+            "pre-drain user manifest must carry parts (routing hydration under test)"
+        );
+        assert!(
+            user_part_entries
+                .iter()
+                .all(|entry| entry.routing.is_some()),
+            "commits must stamp a routing sibling on every user part"
+        );
+        // Routing-part decode must have dropped the user fp32 — otherwise
+        // the parity check below never exercises the full-part rescore.
+        let saw_stripped_user_cell = user_manifest.superfiles.iter().any(|entry| {
+            entry.vector_summary.values().any(|vs| {
+                vs.cells
+                    .iter()
+                    .any(|cell| cell.clusters.n_cent > 0 && !cell.clusters.vectors_resident())
+            })
+        });
+        assert!(
+            saw_stripped_user_cell,
+            "mode-on consumer must hydrate stripped user summaries from routing parts"
+        );
+        let pre_stripped_hits = pre_stripped
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("pre-drain stripped hits");
+        assert_eq!(
+            ids(&pre_stripped_hits),
+            ids(&pre_base_hits),
+            "pre-drain: routing-part hydration must reproduce resident hits"
+        );
+        drop(pre_stripped);
+
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+        drop(st);
+
+        let baseline = Supertable::open(make_options(false)).expect("reopen mode-off");
+        let base_hits = baseline
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("baseline hits");
+        assert!(!base_hits.is_empty(), "baseline must return hits");
+        drop(baseline);
+
+        let stripped = Supertable::open(make_options(true)).expect("reopen mode-on");
+        let hidden = stripped
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let hidden_reader = hidden.reader();
+        let hidden_manifest = hidden_reader.manifest();
+        assert!(
+            hidden_manifest.slow_vector_state_blob().is_some(),
+            "drain must publish the slow-state ref (routing-shaped blob)"
+        );
+        assert!(
+            hidden_manifest.slow_vector_state_centroids_blob().is_some(),
+            "drain must publish the centroid-section ref — exact rescores read it"
+        );
+        let mut saw_stripped_summary = false;
+        for entry in hidden_manifest.superfiles.iter() {
+            for vs in entry.vector_summary.values() {
+                for cell in &vs.cells {
+                    if cell.clusters.n_cent > 0 {
+                        assert!(
+                            !cell.clusters.vectors_resident(),
+                            "hidden summary fp32 must be dropped in mode-on consumers"
+                        );
+                        saw_stripped_summary = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_stripped_summary,
+            "drained hidden manifest must carry cell summaries"
+        );
+
+        let stripped_hits = stripped
+            .reader()
+            .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
+            .expect("stripped-mode hits");
+        assert_eq!(
+            ids(&stripped_hits),
+            ids(&base_hits),
+            "deferred rescore must reproduce the resident-mode hit set"
+        );
+        for (a, b) in stripped_hits.iter().zip(&base_hits) {
+            assert!(
+                (a.score - b.score).abs() <= 1e-5 * (1.0 + b.score.abs()),
+                "scores must agree: {} vs {}",
+                a.score,
+                b.score
+            );
+        }
     }
 
     /// Plan contract: splice-mode drain is a separate identity path. Routing

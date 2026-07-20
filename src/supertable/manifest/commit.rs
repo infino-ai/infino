@@ -243,7 +243,16 @@ pub async fn probe_pointer(
 
 pub struct EncodedPart {
     pub part: ManifestPart,
+    /// Primary wire form: FULL (fp32 + admit slab) for user manifests —
+    /// the fp32 store the first rescore hydrates from — ROUTING-only for
+    /// hidden manifests, whose fp32 lives in the slow-CAS centroid
+    /// section instead.
     pub encoded: Vec<u8>,
+    /// Routing-only sibling (counts + admit slab, no fp32) — what
+    /// consumer opens fetch. `None` for hidden manifests: their primary
+    /// form IS routing-shaped, so a sibling would be a byte-identical
+    /// duplicate. PUT together with `encoded` in the same commit.
+    pub routing_encoded: Option<Vec<u8>>,
 }
 
 /// Outcome of writing a manifest part — returned by
@@ -780,6 +789,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: Vec::new(),
         };
         let res = write_manifest(storage.as_ref(), &list)

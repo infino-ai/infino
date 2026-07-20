@@ -145,8 +145,10 @@ use crate::{
             },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
-            reader::VectorReader,
+            quant::BitQuantizer,
+            reader::{VectorColumnConfig, VectorReader},
             rerank_codec::RerankCodec,
+            rotation::RandomRotation,
             spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},
         },
     },
@@ -155,7 +157,7 @@ use crate::{
         error::ManifestError,
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids,
+            ClusterCentroids, RabitqAdmitContext,
             commit::get_current_manifest_etag,
             list::{CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy},
             options_hash,
@@ -164,6 +166,7 @@ use crate::{
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state,
+        slow_vector_state::{CentroidSection, fetch_centroid_section},
     },
 };
 
@@ -393,6 +396,63 @@ impl fmt::Debug for SupertableWriter {
 struct BufferedBatch {
     scalar: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
+}
+
+/// Zero-copy view of one vector column across the buffered batches:
+/// `row(local)` resolves a commit-wide row ordinal to its `&[f32]` slice
+/// inside the owning batch's Arrow buffer. Replaces the commit-time
+/// flatten, which materialized a full copy of every vector column
+/// (12.8 GiB at a 3.125M-row × dim-1024 commit) just to hand out row
+/// slices — a peak-RSS driver on top of the buffered batches themselves.
+struct VectorColumnView<'a> {
+    dim: usize,
+    /// Per-batch contiguous values, in buffer order.
+    batches: Vec<&'a [f32]>,
+    /// `offsets[i]` = first commit-wide row of batch `i`, plus a trailing
+    /// total-row sentinel.
+    offsets: Vec<usize>,
+}
+
+impl<'a> VectorColumnView<'a> {
+    fn over(buffer: &'a [BufferedBatch], col_idx: usize, dim: usize) -> Self {
+        let mut batches = Vec::with_capacity(buffer.len());
+        let mut offsets = Vec::with_capacity(buffer.len() + 1);
+        let mut total = 0usize;
+        for buffered in buffer {
+            offsets.push(total);
+            let values: &[f32] = buffered.vectors[col_idx].values();
+            total += values.len() / dim.max(1);
+            batches.push(values);
+        }
+        offsets.push(total);
+        Self {
+            dim,
+            batches,
+            offsets,
+        }
+    }
+
+    fn n_rows(&self) -> usize {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
+    /// The commit-wide row `local` as a `&[f32]` of length `dim`.
+    fn row(&self, local: usize) -> Result<&'a [f32], BuildError> {
+        // partition_point returns the first offset > local; its
+        // predecessor is the owning batch.
+        let batch = self
+            .offsets
+            .partition_point(|&first_row| first_row <= local)
+            .saturating_sub(1);
+        let in_batch = local
+            .checked_sub(self.offsets[batch])
+            .ok_or_else(|| BuildError::Store(format!("vector row {local} before batch start")))?;
+        let start = in_batch * self.dim;
+        self.batches
+            .get(batch)
+            .and_then(|values| values.get(start..start + self.dim))
+            .ok_or_else(|| BuildError::Store(format!("vector row {local} out of buffered range")))
+    }
 }
 
 /// Row-balanced split of the writer's buffered batches into
@@ -733,7 +793,22 @@ impl Supertable {
     /// active writer slot at a time, enforced atomically; when
     /// the writer is dropped, the slot is released and a
     /// subsequent `writer()` call succeeds.
+    ///
+    /// Consumer-memory-mode handles
+    /// (`summary_centroids_from_superfiles`) are read-only by
+    /// construction: they hydrate routing-form manifest parts (no
+    /// summary fp32), and a commit from that state would re-encode
+    /// stripped summaries into the durable full wire form. Refused
+    /// here — at acquisition, not deep inside a commit.
     fn writer(&self) -> Result<SupertableWriter, BuildError> {
+        if self.inner().options.summary_centroids_from_superfiles {
+            return Err(BuildError::Store(
+                "this handle opened in consumer memory mode \
+                 (summary_centroids_from_superfiles): summaries hydrate without fp32, so it \
+                 cannot write — open a writer handle with the mode off"
+                    .into(),
+            ));
+        }
         match self.inner().writer_outstanding.compare_exchange(
             false,
             true,
@@ -1456,10 +1531,10 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 buffer,
                 vc.dim,
-                super::handle::hidden_vector_cell_count(),
+                super::handle::hidden_vector_cell_count(&self.inner.options),
             ) {
-            let hidden_cells = super::handle::hidden_vector_cell_count();
-            let user_cells = super::handle::user_vector_cell_count();
+            let hidden_cells = super::handle::hidden_vector_cell_count(&self.inner.options);
+            let user_cells = super::handle::user_vector_cell_count(&self.inner.options);
             let user_grid = (user_cells != hidden_cells)
                 .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
                 .flatten();
@@ -1839,8 +1914,18 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
             open_blob: Vec::new(),
         });
     }
+    // Multi-cell open ranges need the column dim to bound the cluster index
+    // (the cell directory carries no n_cent); a single logical column is the
+    // multi-cell contract.
+    let vec_dim = kvs
+        .get(kv::VEC_COLUMNS)
+        .and_then(|json| serde_json::from_str::<Vec<VectorColumnConfig>>(json).ok())
+        .and_then(|cols| match cols.as_slice() {
+            [only] => Some(only.dim),
+            _ => None,
+        });
     let vec_open_ranges = vec
-        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len, vec_dim))
         .unwrap_or_default();
     let fts_open_ranges = fts
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
@@ -1907,7 +1992,12 @@ fn build_open_blob(
     blob
 }
 
-fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+fn vector_open_ranges(
+    bytes: &Bytes,
+    off: u64,
+    len: u64,
+    dim: Option<usize>,
+) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
@@ -1917,7 +2007,7 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
     let version =
         read_u32_le(blob.get(outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES)?);
     if version == crate::superfile::format::vec::VERSION_MULTI_CELL {
-        return vector_open_ranges_multi_cell(blob, off);
+        return vector_open_ranges_multi_cell(blob, off, dim?);
     }
     // Reject any version we don't recognize instead of falling through to the
     // v1 layout (a future/corrupt version would otherwise be mis-parsed).
@@ -2001,10 +2091,21 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
 }
 
 /// Open-time ranges for a v2 multi-cell vector blob: outer header, cell
-/// directory, and each cell's open-time region (sub-header through
-/// `per_cluster_blocks_off`).
-fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)>> {
+/// directory, and each cell's sub-header + cluster index — the same v1
+/// discipline as the single-cell path above. The fp32 centroids, Sq8
+/// scale/offset meta, per-row norms, and the inline stable-id region all
+/// stay on disk: they are read per probed cell through the block cache
+/// (deferred rescore, the lazy Sq8-meta arm, and the probe wave's
+/// stable-id piggyback). Staging them here made the open footprint —
+/// manifest-inline open blobs *and* the cold-open hint fetch — grow with
+/// per-row data: measured 318 MiB of hidden-data open fetch at 10M and
+/// 3.62 GiB / 12.3 s at 100M, with user manifest parts at 3.28 GiB from
+/// the embedded copies.
+fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Vec<(u64, u64)>> {
     use crate::superfile::format::vec::U64_BYTES;
+    if dim == 0 {
+        return None;
+    }
     let n_cells =
         read_u32_le(blob.get(outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES)?) as usize;
     let dir_offset =
@@ -2036,13 +2137,27 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)
             return None;
         }
         let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
-        let per_cluster_blocks_off = read_u64_le(sub.get(
-            sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES,
-        )?) as usize;
-        if per_cluster_blocks_off < SUB_HEADER_SIZE || per_cluster_blocks_off > subsection_len {
+        let centroids_off = read_u64_le(
+            sub.get(sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let cluster_idx_off = read_u64_le(
+            sub.get(sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES)?,
+        ) as usize;
+        let centroids_span = cluster_idx_off.checked_sub(centroids_off)?;
+        if centroids_off < SUB_HEADER_SIZE || !centroids_span.is_multiple_of(dim * 4) {
             return None;
         }
-        ranges.push((off + subsection_off as u64, per_cluster_blocks_off as u64));
+        let n_cent = centroids_span / (dim * 4);
+        let cluster_idx_end =
+            cluster_idx_off.checked_add(n_cent.checked_mul(CLUSTER_IDX_ENTRY_BYTES)?)?;
+        if cluster_idx_end > subsection_len {
+            return None;
+        }
+        ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+        ranges.push((
+            off + (subsection_off + cluster_idx_off) as u64,
+            (cluster_idx_end - cluster_idx_off) as u64,
+        ));
     }
     Some(merge_ranges(ranges))
 }
@@ -2130,6 +2245,38 @@ impl PreparedSuperfile {
     }
 }
 
+/// One vector column's per-cell manifest summary from a freshly written
+/// superfile: the per-cluster fp32 centroids (so a query ranks this
+/// superfile's clusters globally without opening it) plus the 1-bit
+/// admit slab computed alongside them — the summary wire blob persists
+/// both, and consumers decode the slab at hydration instead of
+/// re-deriving one rotation per centroid. Shared by the commit staging
+/// path and the WAL update pipeline.
+pub(crate) fn build_column_vector_summary(
+    vec_reader: &VectorReader,
+    vc: &VectorConfig,
+) -> Option<VectorSummary> {
+    let centroid = vec_reader.summary(&vc.column)?;
+    let cells: Vec<CellVectorSummary> = vec_reader
+        .cluster_centroids_by_cell(&vc.column)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
+            cell_id,
+            clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
+        })
+        .collect();
+    let rotation = RandomRotation::new(vc.dim, vc.rot_seed);
+    let quant = BitQuantizer::new(vc.dim);
+    for cell in &cells {
+        if cell.clusters.dim as usize == vc.dim {
+            cell.clusters
+                .prewarm_admit_codes(&rotation, &quant, vc.rot_seed);
+        }
+    }
+    Some(VectorSummary { centroid, cells })
+}
+
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
@@ -2203,20 +2350,8 @@ pub(super) fn prepare_superfile_with_uri(
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some(centroid) = vec_reader.summary(&vc.column) {
-                // Stage the per-cluster centroids (Sq8) into the
-                // manifest so a query can rank this superfile's clusters
-                // globally without opening the superfile.
-                let cells = vec_reader
-                    .cluster_centroids_by_cell(&vc.column)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
-                        cell_id,
-                        clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
-                    })
-                    .collect();
-                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, cells });
+            if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
+                vector_summary.insert(vc.column.clone(), summary);
             }
         }
     }
@@ -3020,12 +3155,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
     let store = user_inner.options.store.clone();
     let storage_opt = user_inner.options.storage.clone();
-    let metric = hidden_inner
+    let (metric, drain_rot_seed) = hidden_inner
         .options
         .vector_columns
         .first()
-        .map(|c| c.metric)
-        .unwrap_or(Metric::L2Sq);
+        .map(|c| (c.metric, c.rot_seed))
+        .unwrap_or((Metric::L2Sq, 0));
     // assign-skip: with global-aligned user superfiles (`vector.user_centroids:
     // global`) cluster c == cell c, so group by the row's own cluster ordinal
     // instead of the O(n·n_cent) per-row nearest-cell scoring.
@@ -3363,6 +3498,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
+                    // Shared admit context + 20% shortlist window: the same
+                    // 1-bit prefilter the commit assign uses, so drain
+                    // assignment compute scales with the window too.
+                    let admit_ctx =
+                        RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
+                    let window = opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
                     let assignments: Vec<opann::BoundaryAssignment> =
                         hidden_inner.options.writer_pool.install(|| {
                             distinct_rows
@@ -3372,6 +3513,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                         clusters_ref,
                                         metric,
                                         &row.encoded,
+                                        &admit_ctx,
+                                        window,
                                     )
                                 })
                                 .collect()
@@ -4352,6 +4495,7 @@ fn assign_cells<'a>(
     rows: &[PackRow<'a>],
     clusters: &ClusterCentroids,
     metric: Metric,
+    rot_seed: u64,
     replica_target_factor: f32,
 ) -> Result<Vec<AssignedCellGroup<'a>>, BuildError> {
     if rows.is_empty() {
@@ -4360,13 +4504,17 @@ fn assign_cells<'a>(
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
     // Per-row nearest-cell scoring is the commit CPU wave: run it on the
     // ambient rayon pool (callers wrap this in `writer_pool.install`).
-    // Centroid ranking rides the `ClusterCentroids` cached transposed
-    // layout — built once on the first row, shared across the pool.
+    // One shared admit context per batch (rotation / quantizer / cosine
+    // table); each row is 1-bit shortlisted over the grid and exact-scored
+    // only inside the 20% window, so assignment compute scales with the
+    // window instead of the full cell count.
+    let admit_ctx = RabitqAdmitContext::new(clusters.dim as usize, rot_seed);
+    let window = opann::assignment_shortlist_window(clusters.n_cent as usize);
     let assignments: Vec<opann::BoundaryAssignment> = rows
         .par_iter()
         .map(|row| match *row {
             PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, metric, vector)
+                opann::boundary_assignment_fp32(clusters, metric, vector, &admit_ctx, window)
             }
         })
         .collect();
@@ -4681,9 +4829,9 @@ fn commit_shards_via_drain(
         )));
     }
 
-    // Flatten the buffer once (ids + vectors + scalar batches).
+    // Collect ids + scalar batches; vectors stay in their Arrow buffers
+    // behind zero-copy views (no flatten — see `VectorColumnView`).
     let mut stable_ids: Vec<i128> = Vec::new();
-    let mut flat_vectors: Vec<Vec<f32>> = vec![Vec::new(); inner.options.vector_columns.len()];
     let mut scalar_batches: Vec<&RecordBatch> = Vec::with_capacity(buffer.len());
     for buffered in buffer {
         let id_col = buffered
@@ -4700,21 +4848,25 @@ fn commit_shards_via_drain(
         for i in 0..id_col.len() {
             stable_ids.push(id_col.value(i));
         }
-        for (col_idx, fa) in buffered.vectors.iter().enumerate() {
-            flat_vectors[col_idx].extend_from_slice(fa.values());
-        }
         scalar_batches.push(&buffered.scalar);
     }
     if stable_ids.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let primary_vectors = flat_vectors
+    let vector_views: Vec<VectorColumnView<'_>> = inner
+        .options
+        .vector_columns
+        .iter()
+        .enumerate()
+        .map(|(col_idx, col)| VectorColumnView::over(buffer, col_idx, col.dim))
+        .collect();
+    let primary_view = vector_views
         .first()
         .ok_or_else(|| BuildError::Store("drain-commit missing vector values".into()))?;
-    if primary_vectors.len() != stable_ids.len() * dim {
+    if primary_view.n_rows() != stable_ids.len() {
         return Err(BuildError::Store(format!(
-            "commit vector len {} != rows {} * dim {dim}",
-            primary_vectors.len(),
+            "commit vector rows {} != id rows {}",
+            primary_view.n_rows(),
             stable_ids.len()
         )));
     }
@@ -4734,18 +4886,17 @@ fn commit_shards_via_drain(
         .iter()
         .enumerate()
         .map(|(local, &stable_id)| {
-            let start = local * dim;
-            PackRow::Fp32 {
+            Ok(PackRow::Fp32 {
                 stable_id,
-                vector: &primary_vectors[start..start + dim],
-            }
+                vector: primary_view.row(local)?,
+            })
         })
-        .collect();
+        .collect::<Result<_, BuildError>>()?;
     let replica_target = drain_replica_target_factor();
     let assigned = inner
         .options
         .writer_pool
-        .install(|| assign_cells(&rows, clusters, metric, replica_target))?;
+        .install(|| assign_cells(&rows, clusters, metric, vc.rot_seed, replica_target))?;
     let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
@@ -4760,7 +4911,7 @@ fn commit_shards_via_drain(
         build_one_packed_shard_via_drain(
             cells,
             &source_scalar,
-            &flat_vectors,
+            &vector_views,
             &local_by_id,
             options,
             &vc,
@@ -4800,7 +4951,7 @@ fn commit_shards_via_drain(
 fn build_one_packed_shard_via_drain(
     cells: &[(u32, AssignedCellGroup<'_>)],
     source_scalar: &RecordBatch,
-    flat_vectors: &[Vec<f32>],
+    vector_views: &[VectorColumnView<'_>],
     local_by_id: &HashMap<i128, u32>,
     options: &SupertableOptions,
     vc: &VectorConfig,
@@ -4837,7 +4988,7 @@ fn build_one_packed_shard_via_drain(
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         },
-        || build_shard_parquet_and_fts(source_scalar, flat_vectors, &ordered_locals, options),
+        || build_shard_parquet_and_fts(source_scalar, vector_views, &ordered_locals, options),
     );
     let packed_groups = packed_groups?;
     let (mut builder, id_min, id_max, n_docs, scalar_stats) = body_and_fts?;
@@ -4865,7 +5016,7 @@ fn build_one_packed_shard_via_drain(
 #[allow(clippy::type_complexity)]
 fn build_shard_parquet_and_fts(
     source_scalar: &RecordBatch,
-    flat_vectors: &[Vec<f32>],
+    vector_views: &[VectorColumnView<'_>],
     ordered_locals: &[u32],
     options: &SupertableOptions,
 ) -> Result<
@@ -4888,18 +5039,14 @@ fn build_shard_parquet_and_fts(
     let scalar = RecordBatch::try_new(source_scalar.schema(), columns)
         .map_err(|_| BuildError::BatchSchemaMismatch)?;
 
-    let mut ordered_vectors: Vec<Vec<f32>> = Vec::with_capacity(flat_vectors.len());
-    for (col_idx, source) in flat_vectors.iter().enumerate() {
-        let dim = options.vector_columns[col_idx].dim;
-        let mut ordered = Vec::with_capacity(ordered_locals.len() * dim);
+    // This shard's rows in IVF order — the one remaining vector copy on
+    // the commit path, shard-sized and transient (the commit-wide flatten
+    // it replaced held every column for the whole commit).
+    let mut ordered_vectors: Vec<Vec<f32>> = Vec::with_capacity(vector_views.len());
+    for view in vector_views {
+        let mut ordered = Vec::with_capacity(ordered_locals.len() * view.dim);
         for &local in ordered_locals {
-            let start = local as usize * dim;
-            let Some(slice) = source.get(start..start + dim) else {
-                return Err(BuildError::Store(format!(
-                    "shard vector local {local} out of bounds for column {col_idx}"
-                )));
-            };
-            ordered.extend_from_slice(slice);
+            ordered.extend_from_slice(view.row(local as usize)?);
         }
         ordered_vectors.push(ordered);
     }
@@ -5364,6 +5511,41 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     stamp_slow_vector_state(inner, None).await
 }
 
+/// The PREVIOUS generation's centroid section for `manifest`, through the
+/// table's single-slot cache (fetch on miss, reuse on URI match). `None`
+/// when no section is stamped (fresh table) or the fetch fails — the
+/// composer then requires every entry's fp32 to be resident and errors
+/// loudly otherwise.
+async fn previous_centroid_section(
+    options: &SupertableOptions,
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<Arc<CentroidSection>> {
+    let reference = manifest.slow_vector_state_centroids_blob()?.clone();
+    let slot = Arc::clone(&options.centroid_section_cache);
+    let mut guard = slot.lock().await;
+    if let Some(section) = guard.as_ref()
+        && section.uri() == reference.uri
+    {
+        return Some(Arc::clone(section));
+    }
+    match fetch_centroid_section(storage, &reference, manifest.get_all_superfiles()).await {
+        Ok(section) => {
+            let section = Arc::new(section);
+            *guard = Some(Arc::clone(&section));
+            Some(section)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "previous centroid section {} unavailable ({error}); republish must compose \
+                 from resident fp32 only",
+                reference.uri
+            );
+            None
+        }
+    }
+}
+
 async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
@@ -5380,26 +5562,40 @@ async fn stamp_slow_vector_state(
             // already absent because `update` never carries it forward.
             return Ok(());
         }
-        let (uri, hash) = match pending_drain.as_ref() {
+        // Carried-forward entries are stripped (routing-shaped hydration);
+        // their fp32 composes from the previous generation's section.
+        let previous_section =
+            previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
+        let published = match pending_drain.as_ref() {
             Some(pending) => {
                 slow_vector_state::write_state_with_pending_drain(
                     storage.as_ref(),
                     entries,
                     pending,
+                    previous_section.as_deref(),
                 )
                 .await
             }
-            None => slow_vector_state::write_state(storage.as_ref(), entries).await,
+            None => {
+                slow_vector_state::write_state(
+                    storage.as_ref(),
+                    entries,
+                    previous_section.as_deref(),
+                )
+                .await
+            }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
-            && cur_uri == uri
-            && cur_hash == hash
+            && cur_uri == published.uri
+            && cur_hash == published.content_hash
+            && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
         {
             // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest = old.with_slow_vector_state(uri, hash);
+        let new_manifest =
+            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -5870,14 +6066,28 @@ pub(crate) async fn try_commit_attempt(
     if super::handle::is_hidden_vector_index_table(&opts) {
         let entries = new_manifest.get_all_superfiles();
         if !entries.is_empty() {
-            let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
-                .await
-                .map_err(|e| {
-                    SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
-                        ManifestLoadError::SlowStateHydration(e.to_string()),
-                    ))
-                })?;
-            new_manifest = new_manifest.with_slow_vector_state_ref(uri, hash);
+            // Carried-forward entries are stripped; the PREVIOUS manifest
+            // still holds the section ref `update` cleared — compose the
+            // new generation's section from it plus this commit's fresh
+            // (fp32-resident) entries.
+            let previous_section =
+                previous_centroid_section(&opts, storage.as_ref(), current_manifest.as_ref()).await;
+            let published = slow_vector_state::write_state(
+                storage.as_ref(),
+                entries,
+                previous_section.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
+                    ManifestLoadError::SlowStateHydration(e.to_string()),
+                ))
+            })?;
+            new_manifest = new_manifest.with_slow_vector_state_ref(
+                published.uri,
+                published.content_hash,
+                published.centroids,
+            );
         }
     }
 
@@ -5889,10 +6099,13 @@ pub(crate) async fn try_commit_attempt(
     // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
     //    Untouched parts are NOT re-PUT — their URIs (and
-    //    content-hashes) are unchanged in the new list.
+    //    content-hashes) are unchanged in the new list. Each touched
+    //    part ships both wire forms: full and the routing sibling the
+    //    list entry references.
     let encoded_refs: Vec<&[u8]> = parts_to_write
         .iter()
-        .map(|ep| ep.encoded.as_slice())
+        .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
+        .flatten()
         .collect();
     new_manifest
         .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
@@ -6197,6 +6410,8 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_DIM: usize = 16;
     /// Small row count that still exercises multiple global cells.
     const COMMIT_AS_DRAIN_TEST_ROWS: usize = 8;
+    /// Rotation seed for assignment admit contexts in these tests.
+    const COMMIT_AS_DRAIN_TEST_ROT_SEED: u64 = 7;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
@@ -6626,6 +6841,77 @@ mod tests {
         );
     }
 
+    /// Row count for the open-footprint regression fixture: large enough
+    /// that row-proportional staging (stable ids at 16 B/row + norms at
+    /// 4 B/row ≈ 100 KB here) is unmistakable against the v1-discipline
+    /// footprint (headers + cluster index, a few KB).
+    const OPEN_RANGES_FIXTURE_ROWS: usize = 5_000;
+    /// Ceiling on the staged vector open bytes for the fixture — generous
+    /// against headers + cluster index, far below any per-row region.
+    const OPEN_RANGES_FIXTURE_CEILING_BYTES: u64 = 16 * 1024;
+
+    /// Multi-cell superfiles stage only sub-headers + cluster indexes in
+    /// their open ranges (the v1 discipline): the open footprint must not
+    /// scale with row count. Staging the full open-time region embedded
+    /// per-row stable ids / norms / Sq8 meta into manifest open blobs and
+    /// the cold-open hint fetch — measured 3.62 GiB of hidden-data open
+    /// fetch and 3.28 GiB of manifest parts at 100M.
+    #[test]
+    fn multi_cell_open_ranges_exclude_row_proportional_regions() {
+        let dim = COMMIT_AS_DRAIN_TEST_DIM;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            options_title_emb_serial(dim, COMMIT_AS_DRAIN_TEST_ROWS).with_storage(storage),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_axis_vector_batch(OPEN_RANGES_FIXTURE_ROWS, dim))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let mut checked = 0usize;
+        for entry in walkdir(dir.path()) {
+            let bytes = Bytes::from(fs::read(&entry).expect("read superfile"));
+            let Some(offsets) = build_subsection_offsets(&bytes) else {
+                continue;
+            };
+            if offsets.vec_open_ranges.is_empty() {
+                continue;
+            }
+            let staged: u64 = offsets.vec_open_ranges.iter().map(|&(_, len)| len).sum();
+            assert!(
+                staged <= OPEN_RANGES_FIXTURE_CEILING_BYTES,
+                "{entry:?}: staged vector open bytes {staged} scale with rows \
+                 (ceiling {OPEN_RANGES_FIXTURE_CEILING_BYTES})"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "fixture must produce vector superfiles");
+    }
+
+    /// Recursively collect the `.sf.parquet` superfiles under a temp root.
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.to_string_lossy().ends_with(".sf.parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     fn options_title_emb_serial(dim: usize, n_cent: usize) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_title_emb(dim),
@@ -6934,6 +7220,23 @@ mod tests {
         let _w2 = st.writer().expect("second writer after drop");
     }
 
+    /// A consumer-memory-mode handle (`summary_centroids_from_superfiles`)
+    /// hydrates summaries without fp32, so committing from it would hit
+    /// the wire encoder's stripped-summary panic deep inside the commit.
+    /// The writer slot refuses up front instead.
+    #[test]
+    fn consumer_memory_mode_handle_refuses_writer() {
+        let opts = options_id_title_serial().with_summary_centroids_from_superfiles(true);
+        let st = Supertable::create(opts).expect("create");
+        let err = st
+            .writer()
+            .expect_err("consumer-mode handle must not write");
+        assert!(
+            err.to_string().contains("consumer memory mode"),
+            "unexpected refusal: {err}"
+        );
+    }
+
     // ---- single-writer end-to-end (serial pool) ----------------------
 
     #[test]
@@ -7210,8 +7513,14 @@ mod tests {
             .zip(stable_ids)
             .map(|(vector, stable_id)| PackRow::Fp32 { stable_id, vector })
             .collect();
-        let assigned = assign_cells(&rows, &clusters, Metric::L2Sq, BOUNDARY_STUB_TARGET_FACTOR)
-            .expect("assign");
+        let assigned = assign_cells(
+            &rows,
+            &clusters,
+            Metric::L2Sq,
+            COMMIT_AS_DRAIN_TEST_ROT_SEED,
+            BOUNDARY_STUB_TARGET_FACTOR,
+        )
+        .expect("assign");
 
         let postings: usize = assigned.iter().map(|group| group.members.len()).sum();
         let primaries: usize = assigned

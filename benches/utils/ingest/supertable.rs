@@ -86,6 +86,51 @@ const GIB_BYTES: u64 = 1u64 << 30;
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
+/// Table-doc-count boundary for the bench's pinned CELL-GRID shape:
+/// runs strictly under this many docs pin the grid cell counts below; at
+/// and above it the YAML config (`vector.user_cell_count` /
+/// `vector.hidden_cell_count`) stays in charge while the large-scale
+/// shape is still being calibrated. Bench-harness knob only — distinct
+/// from the engine's per-cell ROW cap (`opann.rs` split threshold),
+/// which bounds rows inside one cell, not the grid size. The pinned
+/// shape is the measured candidate for the engine default at these
+/// scales; once promoted into the shipped config the pin goes away and
+/// the bench runs what customers get.
+const CELL_GRID_PIN_MAX_TABLE_DOCS: usize = 20_000_000;
+/// User-grid cell count pinned under
+/// [`CELL_GRID_PIN_MAX_TABLE_DOCS`]. Finer user packing measured
+/// pre-drain warm 13.4 ms at 10M/512c vs 23.1 ms at 10M/256c with recall
+/// parity (0.997).
+const CELL_GRID_PIN_USER_CELLS: usize = 512;
+/// Hidden-grid cell count pinned under
+/// [`CELL_GRID_PIN_MAX_TABLE_DOCS`]. The 256-cell hidden shape measured
+/// best post-drain: 0.995–0.997 recall with 1-GET cold probes at 1M and
+/// 10M.
+const CELL_GRID_PIN_HIDDEN_CELLS: usize = 256;
+
+/// Explicit grid override for cell-shape experiments: `"user,hidden"`
+/// (e.g. `INFINO_BENCH_CELLS=256,256`). Takes precedence over the pinned
+/// small-scale shape at any doc count; unset runs the normal policy.
+const CELLS_ENV: &str = "INFINO_BENCH_CELLS";
+
+/// Per-table grid cell counts for this run's scale, or `None` to let the
+/// YAML config decide (≥ [`CELL_GRID_PIN_MAX_TABLE_DOCS`] docs without
+/// an explicit [`CELLS_ENV`] override).
+fn bench_cell_counts() -> Option<(usize, usize)> {
+    if let Ok(spec) = env::var(CELLS_ENV) {
+        let (user, hidden) = spec
+            .split_once(',')
+            .unwrap_or_else(|| panic!("{CELLS_ENV} must be \"user,hidden\", got {spec:?}"));
+        let parse = |s: &str, which: &str| -> usize {
+            s.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{CELLS_ENV} {which} cell count invalid in {spec:?}"))
+        };
+        return Some((parse(user, "user"), parse(hidden, "hidden")));
+    }
+    (n_docs() < CELL_GRID_PIN_MAX_TABLE_DOCS)
+        .then_some((CELL_GRID_PIN_USER_CELLS, CELL_GRID_PIN_HIDDEN_CELLS))
+}
 /// Producer memory budget in GiB — steers the attached disk cache's
 /// post-commit madvise sweep only; it does not cap ingest/build RSS.
 const WRITER_MEMORY_BUDGET_GIB: u64 = 8;
@@ -200,6 +245,9 @@ pub fn options_for(
             .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
             .with_reader_pool(Arc::clone(&pool))
             .with_writer_pool(pool);
+        if let Some((user, hidden)) = bench_cell_counts() {
+            opts = opts.with_vector_cell_counts(user, hidden);
+        }
         if let Some(s) = storage {
             opts = opts.with_storage(s);
         }
@@ -239,6 +287,9 @@ pub fn options_for(
         .with_reader_pool(pool.clone())
         .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
         .with_writer_pool(pool);
+    if let Some((user, hidden)) = bench_cell_counts() {
+        opts = opts.with_vector_cell_counts(user, hidden);
+    }
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -317,17 +368,25 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     });
     let vectors = modality.has_vector().then(|| {
         if let Some(path) = explicit_vector_path.as_deref() {
+            // A persisted corpus is either base-only (`n_docs` rows) or —
+            // for the vector modality — carries the undrained delta tail
+            // (`vector_docs` rows, the shape `generate` writes). Accept
+            // both; `vector_delta_batch` regenerates the tail when only
+            // the base rows are present.
             eprintln!(
                 "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
                 fmt_count(n_docs),
                 path.display()
             );
-            MmapVectorCorpus::open(path, n_docs).unwrap_or_else(|error| {
-                panic!(
-                    "failed to open {VECTOR_CORPUS_PATH_ENV}={}: {error}",
-                    path.display()
-                )
-            })
+            MmapVectorCorpus::open(path, vector_docs)
+                .or_else(|_| MmapVectorCorpus::open(path, n_docs))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to open {VECTOR_CORPUS_PATH_ENV}={} with either \
+                         {vector_docs} (base + delta) or {n_docs} (base-only) rows: {error}",
+                        path.display()
+                    )
+                })
         } else {
             eprintln!(
                 "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",

@@ -53,8 +53,6 @@ const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 const BYTES_PER_GB: f64 = 1.0e9;
 /// Seconds per hour.
 const SECS_PER_HOUR: f64 = 3600.0;
-/// Hours per month for standing-cost lines (365.25 days / 12 months).
-const HOURS_PER_MONTH: f64 = 730.5;
 /// Queries per "per-million" pricing unit.
 const PER_MILLION: f64 = 1.0e6;
 /// Queries per month assumed by the monthly read line. The write line uses
@@ -70,6 +68,14 @@ const SUMMARY_COMMITS_PER_DRAIN: f64 = 16.0;
 /// Maintenance cadence assumed by the monthly summary: one compaction
 /// (optimize) pass per this many drains.
 const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
+/// Padding on the per-query RAM-hold window: a query holds the resident set
+/// a little longer than its own p50 (dispatch, response write, scheduler
+/// slack between overlapped queries), so the hold is billed at fudge × p50.
+/// Residency is otherwise billed strictly per query served — never as a
+/// standing calendar-hours line. Bench cost model only: real customer
+/// metering must record the exact measured hold time and put any padding
+/// in the PRICE, never in the reported quantity.
+const QUERY_RAM_HOLD_FUDGE: f64 = 2.0;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -166,25 +172,33 @@ impl Instance {
     }
 
     /// RAM-hold leg for one query, in aggregate vCPU-seconds: the resident
-    /// heap's share of the box held for the query's COMPUTE window (`window ×
-    /// RSS-share × vcpu`). For a warm query the window is its own p50; for a
-    /// cold query it is the same-config warm p50 — once bytes are local the
-    /// scoring path holds the heap for about the warm window, while the rest
-    /// of the cold p50 is off-CPU I/O wait that holds no extra heap.
-    fn query_ram_leg(&self, window_s: f64, resident_anon_bytes: u64) -> f64 {
-        window_s * self.ram_share(resident_anon_bytes) * f64::from(self.vcpu.max(1))
+    /// set's share of the box (pinned heap + page-cache working set — the
+    /// bytes that must be resident for the query to run warm) held for the
+    /// query's COMPUTE window (`window × RSS-share × vcpu`), padded by
+    /// [`QUERY_RAM_HOLD_FUDGE`]. For a warm query the window is its own p50;
+    /// for a cold query it is the same-config warm p50 — once bytes are local
+    /// the scoring path holds the set for about the warm window, while the
+    /// rest of the cold p50 is off-CPU I/O wait that holds no extra RAM.
+    /// This leg is the ONLY place residency is billed: memory cost scales
+    /// with queries actually served, never with calendar hours (idle
+    /// processes are reaped; keep-warm policy is the operator's line item).
+    fn query_ram_leg(&self, window_s: f64, resident_bytes: u64) -> f64 {
+        window_s
+            * QUERY_RAM_HOLD_FUDGE
+            * self.ram_share(resident_bytes)
+            * f64::from(self.vcpu.max(1))
     }
 
     /// Aggregate vCPU·s a query bills: `max(measured on-CPU, RAM-hold leg)` —
     /// the binding resource over its compute window.
-    fn per_query_vcpu_seconds(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
-        cpu_s.max(self.query_ram_leg(window_s, resident_anon_bytes))
+    fn per_query_vcpu_seconds(&self, cpu_s: f64, window_s: f64, resident_bytes: u64) -> f64 {
+        cpu_s.max(self.query_ram_leg(window_s, resident_bytes))
     }
 
     /// Per-query dollars from the binding leg (see `per_query_vcpu_seconds`),
     /// priced per-vCPU.
-    fn per_query_usd(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
-        self.compute_usd(self.per_query_vcpu_seconds(cpu_s, window_s, resident_anon_bytes))
+    fn per_query_usd(&self, cpu_s: f64, window_s: f64, resident_bytes: u64) -> f64 {
+        self.compute_usd(self.per_query_vcpu_seconds(cpu_s, window_s, resident_bytes))
     }
 }
 
@@ -210,6 +224,10 @@ pub struct QueryStateIo {
     pub label: Option<&'static str>,
     pub cold_open: Option<ObjectStoreMeter>,
     pub cold_query: Option<ObjectStoreMeter>,
+    /// A second, distinct query on the same cold consumer: the steady cold
+    /// per-query fetch once the first query's one-time metadata warmup
+    /// (admit-window centroids, Sq8 meta, stable-id blocks) is resident.
+    pub cold_second: Option<ObjectStoreMeter>,
     pub cold_repeat: Option<ObjectStoreMeter>,
     pub warm: Option<ObjectStoreMeter>,
     pub warm_iters: u64,
@@ -222,10 +240,54 @@ pub struct QueryStateCost {
     pub warm_p50_s: Option<f64>,
     pub warm_cpu_s: Option<f64>,
     pub ram_bytes: Option<u64>,
+    /// Engine-only settled anon after the state's warm battery: what a
+    /// serving process actually pins (consumer handle + state the engine
+    /// retains across queries), with freed query scratch purged and bench
+    /// harness heap subtracted out.
+    pub ram_anon_bytes: Option<u64>,
+    /// Settled file-backed resident bytes at the same sample: the mmap
+    /// page-cache working set — reclaimable, NVMe-backed, held only while
+    /// actively serving warm.
+    pub ram_file_settled_bytes: Option<u64>,
     pub cold_open_s: Option<f64>,
     pub cold_open_cpu_s: Option<f64>,
     pub cold_query_s: Option<f64>,
     pub cold_query_cpu_s: Option<f64>,
+    /// Wall/CPU of the steady cold query — the per-query cost once the
+    /// first query's metadata warmup is resident. Median across the
+    /// distinct steady-cold samples (a single draw is the max of a
+    /// concurrent GET fan and one object-store straggler can triple it).
+    pub cold_second_s: Option<f64>,
+    pub cold_second_cpu_s: Option<f64>,
+}
+
+impl QueryStateCost {
+    /// Resident bytes a query in this state holds to be served: engine-only
+    /// pinned heap + settled page-cache working set when both were sampled
+    /// (harness overhead excluded), else the state's total RSS, else the
+    /// caller's fallback. This is the byte basis of the per-query RAM-hold
+    /// leg — "whatever must occupy RAM for the duration of the query".
+    fn serving_resident_bytes(&self, fallback: u64) -> u64 {
+        match (self.ram_anon_bytes, self.ram_file_settled_bytes) {
+            (Some(anon), Some(file)) => anon + file,
+            _ => self.ram_bytes.unwrap_or(fallback),
+        }
+    }
+
+    /// Display form of the serving resident set, split by layer when both
+    /// halves were sampled: pinned heap is supertable state (manifest,
+    /// summaries, routing slabs) and page cache is superfile data (postings,
+    /// centroid regions, rerank payloads). Falls back to the single total.
+    fn serving_ram_label(&self, fallback: u64) -> String {
+        match (self.ram_anon_bytes, self.ram_file_settled_bytes) {
+            (Some(anon), Some(file)) => format!(
+                "{} manifest-pinned + {} superfile cache",
+                fmt_bytes(anon),
+                fmt_bytes(file)
+            ),
+            _ => fmt_bytes(self.serving_resident_bytes(fallback)),
+        }
+    }
 }
 
 /// Metered object-store I/O for the lifecycle phases of one bench cell.
@@ -267,9 +329,15 @@ pub struct StorePhases {
     /// One cold table open on a fresh cache (manifest + pointer + open
     /// blobs) — one-time, amortized across queries on a supertable.
     pub cold_open: Option<ObjectStoreMeter>,
-    /// The first query on the cold cache — the per-query cold fetch.
-    /// This is the "GETs per query" number.
+    /// The first query on the cold cache. Under the v1 open discipline
+    /// this includes the one-time metadata warmup (admit-window centroid
+    /// regions, Sq8 meta, stable-id blocks) alongside the probe — a
+    /// once-per-consumer cost, not the steady cold rate.
     pub cold_query: Option<ObjectStoreMeter>,
+    /// A second, distinct query on the same cold consumer — the steady
+    /// cold per-query fetch once the first query's metadata warmup is
+    /// resident. This is the "GETs per query" number for cold traffic.
+    pub cold_second_query: Option<ObjectStoreMeter>,
     /// Pre-drain counterparts of `cold_open` / `cold_query`: the transient
     /// shape a fresh table serves (hidden IVF still in INCOMING) until
     /// maintenance drains it. Priced so the cost of querying *before*
@@ -885,8 +953,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         one_time_row(&mut io_rows, "Cold table open", c.store.cold_open, "1/open");
         per_query_row(
             &mut io_rows,
-            "Cold query (first on cold cache)",
+            "Cold query (first on cold cache, +metadata warmup)",
             c.store.cold_query,
+        );
+        per_query_row(
+            &mut io_rows,
+            "Cold query (second, steady cold)",
+            c.store.cold_second_query,
         );
         let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
             (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
@@ -917,8 +990,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             );
             per_query_row(
                 &mut io_rows,
-                &format!("Cold — {label}"),
+                &format!("Cold 1st (+metadata warmup) — {label}"),
                 state.io.cold_query,
+            );
+            per_query_row(
+                &mut io_rows,
+                &format!("Cold 2nd (steady cold) — {label}"),
+                state.io.cold_second,
             );
             // Background lazy→mmap fill concurrent with the cold/repeat
             // windows — counted separately so query GETs stay foreground-only.
@@ -1158,15 +1236,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         compute_rows.push(match (state.cold_query_s, state.cold_query_cpu_s) {
             (Some(wall_s), Some(cpu_s)) => {
                 let warm_window = state.warm_p50_s.unwrap_or(0.0);
-                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
                 let ram = inst.query_ram_leg(warm_window, ram_bytes);
                 let vcpu = inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes);
                 let per_q = inst.compute_usd(vcpu);
                 vec![
-                    text(format!("Cold — {label}")),
+                    text(format!("Cold 1st (warmup) — {label}")),
                     text(fmt_time(wall_s * 1e9)),
                     text(fmt_vcpu_seconds(cpu_s)),
-                    text(fmt_bytes(ram_bytes)),
+                    text(state.serving_ram_label(c.resident_anon_bytes)),
                     text(if ram > cpu_s { "RAM" } else { "CPU" }),
                     metric(
                         per_q * PER_MILLION,
@@ -1176,7 +1254,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 ]
             }
             _ => vec![
-                text(format!("Cold — {label}")),
+                text(format!("Cold 1st (warmup) — {label}")),
                 text(
                     state
                         .cold_query_s
@@ -1189,9 +1267,28 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 text("N/A"),
             ],
         });
+        if let (Some(wall_s), Some(cpu_s)) = (state.cold_second_s, state.cold_second_cpu_s) {
+            let warm_window = state.warm_p50_s.unwrap_or(0.0);
+            let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
+            let ram = inst.query_ram_leg(warm_window, ram_bytes);
+            let vcpu = inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes);
+            let per_q = inst.compute_usd(vcpu);
+            compute_rows.push(vec![
+                text(format!("Cold 2nd (steady) — {label}")),
+                text(fmt_time(wall_s * 1e9)),
+                text(fmt_vcpu_seconds(cpu_s)),
+                text(state.serving_ram_label(c.resident_anon_bytes)),
+                text(if ram > cpu_s { "RAM" } else { "CPU" }),
+                metric(
+                    per_q * PER_MILLION,
+                    usd_per_query_both_scales(per_q),
+                    Better::Lower,
+                ),
+            ]);
+        }
         compute_rows.push(match (state.warm_p50_s, state.warm_cpu_s) {
             (Some(p50_s), Some(cpu_s)) => {
-                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
                 let ram = inst.query_ram_leg(p50_s, ram_bytes);
                 let vcpu = inst.per_query_vcpu_seconds(cpu_s, p50_s, ram_bytes);
                 let per_q = inst.compute_usd(vcpu);
@@ -1199,7 +1296,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     text(format!("Warm — {label}")),
                     text(fmt_time(p50_s * 1e9)),
                     text(fmt_vcpu_seconds(cpu_s)),
-                    text(fmt_bytes(ram_bytes)),
+                    text(state.serving_ram_label(c.resident_anon_bytes)),
                     text(if ram > cpu_s { "RAM" } else { "CPU" }),
                     metric(
                         per_q * PER_MILLION,
@@ -1288,7 +1385,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         for state in &query_states {
             let label = state.io.label.expect("filtered query state has a label");
             if let (Some(p50_s), Some(cpu_s)) = (state.warm_p50_s, state.warm_cpu_s) {
-                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
                 let per_q = inst.per_query_usd(cpu_s, p50_s, ram_bytes);
                 let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
                 serving_rows.push(vec![
@@ -1304,17 +1401,22 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 ]);
                 steady_warm = Some((format!("warm — {label}"), per_q));
             }
+            // First cold query: one-time metadata warmup — a rate reference,
+            // never the blended cold leg.
             if let (Some(wall_s), Some(cpu_s), Some(io)) = (
                 state.cold_query_s,
                 state.cold_query_cpu_s,
                 state.io.cold_query,
             ) {
                 let warm_window = state.warm_p50_s.unwrap_or(0.0);
-                let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
                 let per_q = inst.per_query_usd(cpu_s, warm_window, ram_bytes) + request_usd(&io);
                 let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
                 serving_rows.push(vec![
-                    text(format!("cold — {label} ({} GET)", io.get_count)),
+                    text(format!(
+                        "cold 1st, one-time warmup — {label} ({} GET)",
+                        io.get_count
+                    )),
                     text(fmt_time(wall_s * 1e9)),
                     metric(
                         queries_per_usd,
@@ -1324,7 +1426,37 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     latency_per_usd_cell(per_q, wall_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
-                steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+                // Fallback steady leg when no second-query window was metered.
+                if state.io.cold_second.is_none() {
+                    steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+                }
+            }
+            // Second (steady) cold query: the per-query price cold traffic
+            // actually pays — this is the blended cold leg.
+            if let (Some(wall_s), Some(cpu_s), Some(io)) = (
+                state.cold_second_s,
+                state.cold_second_cpu_s,
+                state.io.cold_second,
+            ) {
+                let warm_window = state.warm_p50_s.unwrap_or(0.0);
+                let ram_bytes = state.serving_resident_bytes(c.resident_anon_bytes);
+                let per_q = inst.per_query_usd(cpu_s, warm_window, ram_bytes) + request_usd(&io);
+                let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+                serving_rows.push(vec![
+                    text(format!("cold steady — {label} ({} GET)", io.get_count)),
+                    text(fmt_time(wall_s * 1e9)),
+                    metric(
+                        queries_per_usd,
+                        format!("{queries_per_usd:.0}"),
+                        Better::Higher,
+                    ),
+                    latency_per_usd_cell(per_q, wall_s),
+                    text(usd(per_q * PER_MILLION)),
+                ]);
+                steady_cold = Some((
+                    format!("cold steady — {label} ({} GET)", io.get_count),
+                    per_q,
+                ));
             }
         }
     }
@@ -1343,17 +1475,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     };
 
     // ---- Block 5: monthly cost summary ----
-    // The standing bill for one table at an assumed steady load: capacity,
-    // reads, writes, and the RAM residency an open table pins. Reads/writes
-    // price the measured steady-state per-unit costs at 1M units/month;
-    // residency prices the resident set's share of the instance for a full
-    // month. All inputs are measured — a line without a measurement is
-    // omitted, never guessed.
-    let steady_ram_bytes = query_states
-        .last()
-        .and_then(|state| state.ram_bytes)
-        .unwrap_or(c.resident_anon_bytes);
-    let residency_month = inst.ram_share(steady_ram_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    // The standing bill for one table at the assumed steady load. Residency
+    // is NOT a standing line: the resident set a query needs in order to be
+    // served — pinned heap (manifest, routing state) plus the page-cache
+    // working set — is billed inside each query's price through the RAM-hold
+    // leg (`query_ram_leg`: resident share × fudged query window), and its
+    // per-layer bytes are shown on the compute ledger's query rows. Memory
+    // cost therefore scales with queries actually served, never with
+    // calendar hours; idle processes are reaped, and any keep-warm-while-
+    // idle policy is the operator's line item. All inputs are measured — a
+    // line without a measurement is omitted, never guessed.
     let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
         text("Storage"),
         text(format!(
@@ -1365,7 +1496,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     ]];
     // Warm and cold read lines are rate references (empty $/month); the
     // blended line — most queries warm, a small tail paying the cold fetch —
-    // is the billed monthly read cost.
+    // is the billed monthly read cost. Each per-query price already carries
+    // its RAM-hold leg for the full resident set.
     let blended_read_q = match (&steady_warm, &steady_cold) {
         (Some((_, warm_q)), Some((_, cold_q))) => {
             Some(warm_q * SUMMARY_READ_WARM_FRACTION + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION))
@@ -1498,25 +1630,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
         month
     });
-    summary_rows.push(vec![
-        text("Open table — RAM residency"),
-        text(format!(
-            "{} resident ({:.0}% of {})",
-            fmt_bytes(steady_ram_bytes),
-            inst.ram_share(steady_ram_bytes) * 100.0,
-            inst.name,
-        )),
-        metric(residency_month, usd(residency_month), Better::Lower),
-    ]);
     let monthly_total = storage_month
         + blended_read_q
             .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
             .unwrap_or(0.0)
         + writes_month
-        + maintenance_month.unwrap_or(0.0)
-        + residency_month;
+        + maintenance_month.unwrap_or(0.0);
     summary_rows.push(vec![
-        text("Total (storage + blended reads + writes + maintenance + residency)"),
+        text("Total (storage + blended reads + writes + maintenance)"),
         text("—"),
         metric(monthly_total, usd(monthly_total), Better::Lower),
     ]);
