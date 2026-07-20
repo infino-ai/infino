@@ -110,8 +110,21 @@ fn budgeted_runtime(budget: &Arc<ConnectionMemoryBudget>) -> DfResult<Arc<Runtim
 pub(crate) fn budgeted_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
 ) -> DfResult<SessionContext> {
+    let mut config = SessionConfig::new();
+    // We scan string columns as `Utf8View` for fast comparisons, but a SQL
+    // result should be `LargeUtf8`. This flag makes DataFusion convert every
+    // `Utf8View` back to `LargeUtf8` at the query output, so the view stays
+    // internal to the scan and never reaches the caller.
+    //
+    // It also dodges a DataFusion 54 bug: an ungrouped MIN/MAX over a `Utf8View`
+    // column crashes the planner (`ProjectionPushdown`, `Utf8View`-vs-`LargeUtf8`
+    // mismatch). Converting the output to `LargeUtf8` keeps the types consistent.
+    //
+    // One consequence: a column the user themselves declared `Utf8View` is also
+    // converted, so SQL string results are always `LargeUtf8`, never a view.
+    config.options_mut().optimizer.expand_views_at_output = true;
     Ok(SessionContext::new_with_config_rt(
-        SessionConfig::new(),
+        config,
         budgeted_runtime(budget)?,
     ))
 }

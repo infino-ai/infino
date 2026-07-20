@@ -45,11 +45,19 @@
 //! (callers reach them through `vector_search`). The parquet body
 //! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
+//!
+//! **String result type.** String columns are always returned as
+//! `LargeUtf8`, regardless of how they are stored or scanned. The scan may
+//! run a non-FTS string column internally as `Utf8View` (a comparison
+//! optimization), but that view is coerced back to `LargeUtf8` at the plan
+//! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
+//! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
+use arrow_schema::SchemaRef;
 use datafusion::{
     datasource::DefaultTableSource,
     error::DataFusionError,
@@ -62,17 +70,56 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
+        options::SupertableOptions,
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
                 fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
                 match_exec::register_match, vector_exec::register_vector_search,
             },
-            provider::{SupertableProvider, TABLE_NAME},
+            provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
         reader_cache::disk::ForegroundQueryGuard,
     },
 };
+
+/// Per-table SQL schemas, built once (`build_sql_schemas`) and cached on the
+/// handle instead of recomputed per query. Cheap to clone (fields are `Arc`s).
+///
+/// - `scalar`: id + scalar + FTS columns, no vectors. What the search TVFs bind to.
+/// - `scan`: `scalar` with non-FTS strings viewed as `Utf8View`
+///   (`view_string_schema`). What the provider plans against.
+#[derive(Clone)]
+pub(crate) struct SqlSchemas {
+    scalar: SchemaRef,
+    scan: SchemaRef,
+}
+
+impl SqlSchemas {
+    /// Plain scalar schema (id + scalar + FTS, no vectors) the TVFs bind to.
+    pub(crate) fn scalar(&self) -> &SchemaRef {
+        &self.scalar
+    }
+
+    /// String-viewed schema the provider plans against.
+    pub(crate) fn scan(&self) -> &SchemaRef {
+        &self.scan
+    }
+}
+
+/// Build the [`SqlSchemas`] for `options`. Called once per table; the result is
+/// cached on the handle. This is the one place that walks the full column set,
+/// so a wide (thousands of columns) table pays it once, not per query.
+pub(crate) fn build_sql_schemas(options: &SupertableOptions) -> SqlSchemas {
+    let scalar = options.scalar_schema();
+    let fts: HashSet<&str> = options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    let scan = view_string_schema(&scalar, &fts);
+    SqlSchemas { scalar, scan }
+}
 
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
@@ -186,6 +233,9 @@ impl SupertableReader {
 
         let sql = sql.to_owned();
         let drive = async move {
+            // The scan runs strings as `Utf8View`; `expand_views_at_output`
+            // (set in `budgeted_session_context`) coerces them back to
+            // `LargeUtf8` at the plan output, so the result carries no view.
             // Exact manifest statistics can eliminate an unfiltered aggregate
             // before `TableProvider::scan` runs, but only after every
             // superfile's delete view is known. The ordinary scan performs the
@@ -256,9 +306,11 @@ impl SupertableReader {
 
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
+        // Cached per-table schemas: the provider scans the string-viewed `scan`
+        // schema; the TVFs bind to the plain `scalar` schema.
+        let schemas = self.sql_schemas();
         let provider = SupertableProvider::new(
-            Arc::clone(&scalar_schema),
+            schemas.scan().clone(),
             Arc::clone(&manifest),
             store,
             disk_cache,
@@ -281,11 +333,11 @@ impl SupertableReader {
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
         // the pinned snapshot. They lower to custom `ExecutionPlan`
         // nodes that call the async kernels inside `execute()`.
-        register_vector_search(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
-        register_bm25(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
+        register_vector_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        register_bm25(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         // Unranked token / exact match TVFs (siblings of bm25_search).
-        register_match(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
-        register_hybrid_search(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
+        register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
+        register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
         *guard = Some((Arc::clone(&manifest), ctx.clone()));
 
@@ -354,9 +406,9 @@ impl Supertable {
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
-        let scalar_schema = self.options().scalar_schema();
+        // Provider scans the cached string-viewed schema.
         let provider = SupertableProvider::new(
-            scalar_schema,
+            self.sql_schemas().scan().clone(),
             manifest,
             store,
             disk_cache,
@@ -414,7 +466,9 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions, error::QueryError},
+        supertable::{
+            Supertable, SupertableOptions, error::QueryError, query::sql::build_sql_schemas,
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -485,6 +539,17 @@ mod tests {
             vec![Arc::new(cat_arr), Arc::new(title_arr)],
         )
         .expect("build batch")
+    }
+
+    /// A single-superfile table seeded with one committed batch of
+    /// `cats`/`titles`. Collapses the create + append + commit boilerplate the
+    /// string-view tests share.
+    fn seeded(cats: &[&str], titles: &[&str]) -> Supertable {
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_cat_batch(0, cats, titles)).expect("append");
+        w.commit().expect("commit");
+        st
     }
 
     fn rating_table(ratings: &[i64]) -> Supertable {
@@ -803,6 +868,391 @@ mod tests {
                 ("rust".to_string(), 3),
             ]
         );
+    }
+
+    // ---- Utf8View scan ----------------------------------------------------
+
+    /// The scan runs strings as `Utf8View`, but `expand_views_at_output` coerces
+    /// them to `LargeUtf8` at the plan output, so no view leaks to a caller: a
+    /// GROUP BY key on a `LargeUtf8` column comes back `LargeUtf8`, not a view.
+    #[test]
+    fn query_sql_string_group_by_key_is_large_utf8_not_view() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable GROUP BY category")
+            .expect("group-by");
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::LargeUtf8,
+            "public result must be LargeUtf8, not Utf8View"
+        );
+        assert!(
+            col.as_any().downcast_ref::<LargeStringArray>().is_some(),
+            "category should downcast to LargeStringArray"
+        );
+        assert!(
+            col.as_any().downcast_ref::<StringViewArray>().is_none(),
+            "Utf8View must not leak to the caller"
+        );
+    }
+
+    /// A projected + `ORDER BY` string column returns `LargeUtf8` and the
+    /// values are correctly sorted (the view compare ran during the sort).
+    #[test]
+    fn query_sql_ordered_string_projection_is_large_utf8_and_sorted() {
+        let st = seeded(&["rust", "go", "python"], &["a", "b", "c"]);
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable ORDER BY category")
+            .expect("order-by");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "python", "rust"]);
+    }
+
+    /// Grouped `MIN(string)` aggregates on the view and returns `LargeUtf8`,
+    /// with correct per-group minima.
+    #[test]
+    fn query_sql_grouped_min_string_is_large_utf8() {
+        let st = seeded(&["rust", "rust", "go", "go"], &["b", "a", "d", "c"]);
+        let batches = st
+            .reader()
+            .query_sql(
+                "SELECT category, MIN(title) AS m FROM supertable \
+                 GROUP BY category ORDER BY category",
+            )
+            .expect("grouped min");
+        let cat = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        let m = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("MIN(title) is LargeUtf8");
+        let got: Vec<(&str, &str)> = (0..cat.len()).map(|i| (cat.value(i), m.value(i))).collect();
+        assert_eq!(got, vec![("go", "c"), ("rust", "a")]);
+    }
+
+    /// Ungrouped `MIN(string)` over a viewed column. On its own this trips a
+    /// DataFusion `ProjectionPushdown` schema mismatch (`Utf8View` vs
+    /// `LargeUtf8`); `expand_views_at_output` (set in `budgeted_session_context`)
+    /// coerces the view at the plan output and sidesteps it. Returns `LargeUtf8`.
+    #[test]
+    fn query_sql_ungrouped_min_string() {
+        let st = seeded(&["rust", "go", "python"], &["a", "b", "c"]);
+        let batches = st
+            .reader()
+            .query_sql("SELECT MIN(category) AS m FROM supertable")
+            .expect("ungrouped min");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("MIN(string) is LargeUtf8");
+        assert_eq!(col.value(0), "go");
+    }
+
+    /// Unit: `build_sql_schemas` views the scan schema (non-FTS strings ->
+    /// `Utf8View`, FTS kept) and keeps the plain `scalar`. The walk done once
+    /// per table.
+    #[test]
+    fn build_sql_schemas_views_scan_and_keeps_scalar() {
+        let s = build_sql_schemas(&options_id_cat_title());
+        // scan: `category` (non-FTS string) viewed; `title` (FTS) kept.
+        assert_eq!(
+            s.scan()
+                .field_with_name("category")
+                .expect("category")
+                .data_type(),
+            &DataType::Utf8View,
+        );
+        assert_eq!(
+            s.scan()
+                .field_with_name("title")
+                .expect("title")
+                .data_type(),
+            &DataType::LargeUtf8,
+            "FTS column stays LargeUtf8 in the scan schema",
+        );
+        // scalar: no viewing.
+        assert_eq!(
+            s.scalar()
+                .field_with_name("category")
+                .expect("category")
+                .data_type(),
+            &DataType::LargeUtf8,
+        );
+    }
+
+    /// The per-table schemas are built once and memoized on the handle, not
+    /// rebuilt per query (the whole point of the cache for wide tables).
+    #[test]
+    fn sql_schemas_is_memoized_across_calls() {
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let a = st.sql_schemas();
+        let b = st.sql_schemas();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "sql_schemas must be cached (same Arc), not recomputed per call",
+        );
+    }
+
+    /// A NULL string value survives the view scan + output coercion.
+    #[test]
+    fn query_sql_null_string_survives() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::LargeUtf8, true), // nullable, so we can plant a NULL
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool"),
+        );
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![Some("rust"), None, Some("go")])),
+                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable")
+            .expect("select");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        assert_eq!(col.null_count(), 1, "the NULL survives the view + coercion");
+    }
+
+    /// A column the user declared `Utf8View` comes back `LargeUtf8`: the view
+    /// is an internal scan type, and `expand_views_at_output` coerces every
+    /// view to `LargeUtf8` at the plan output, so SQL results never expose one.
+    #[test]
+    fn query_sql_declared_utf8view_column_returns_large_utf8() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8View, false), // user declares a view
+            Field::new("title", DataType::LargeUtf8, false),   // FTS column must be LargeUtf8
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool"),
+        );
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(vec!["rust", "go", "rust"])),
+                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable GROUP BY category")
+            .expect("group-by");
+        assert_eq!(
+            batches[0].column(0).data_type(),
+            &DataType::LargeUtf8,
+            "views are internal; SQL results expose LargeUtf8, not Utf8View"
+        );
+    }
+
+    /// Alias on a viewed string column: the aliased output name has no declared
+    /// type, so it defaults to `LargeUtf8`; values stay correct.
+    #[test]
+    fn query_sql_aliased_string_column_is_large_utf8() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT category AS c FROM supertable GROUP BY c ORDER BY c")
+            .expect("alias");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("aliased column is LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
+    }
+
+    /// String column projected through a CTE: the name survives, so it is
+    /// returned as `LargeUtf8`.
+    #[test]
+    fn query_sql_cte_string_column_is_declared_type() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql(
+                "WITH t AS (SELECT category FROM supertable) \
+                 SELECT category FROM t GROUP BY category ORDER BY category",
+            )
+            .expect("cte");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("CTE column is LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
+    }
+
+    /// String column projected through a FROM-subquery.
+    #[test]
+    fn query_sql_subquery_string_column_is_declared_type() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql(
+                "SELECT category FROM (SELECT category FROM supertable) sub \
+                 GROUP BY category ORDER BY category",
+            )
+            .expect("subquery");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("subquery column is LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
+    }
+
+    /// No data loss through the view + coercion for values that stress
+    /// `Utf8View`'s layout: strings past the 12-byte inline limit (stored
+    /// out-of-line), values sharing a 4-byte prefix (the view compares the
+    /// prefix first, so it must fall through to the full bytes and keep them
+    /// distinct), an empty string, and multi-byte unicode. GROUP BY exercises
+    /// both the comparison (distinct groups) and the coercion (exact values).
+    #[test]
+    fn query_sql_string_values_survive_view_and_coercion() {
+        let vals = [
+            "",                        // empty
+            "short",                   // inline (<= 12 bytes)
+            "sixteen_byte_val",        // 16 bytes, out-of-line
+            "prefabricated_alpha",     // shares "pref" 4-byte prefix ...
+            "prefabricated_omega",     // ... differs later, must stay distinct
+            "café_ünïcode_日本語_str", // multi-byte unicode, out-of-line
+            "sixteen_byte_val",        // duplicate: must fold to one group
+        ];
+        let titles: Vec<&str> = (0..vals.len()).map(|_| "t").collect();
+        let st = seeded(&vals, &titles);
+        let batches = st
+            .reader()
+            .query_sql("SELECT category FROM supertable GROUP BY category ORDER BY category")
+            .expect("group-by over layout-stressing values");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("category is LargeUtf8");
+        let mut got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        got.sort_unstable();
+
+        // Every distinct value survives byte-for-byte; the duplicate folds to
+        // one; the prefix-sharing pair stays as two.
+        let mut want: Vec<&str> = vec![
+            "",
+            "café_ünïcode_日本語_str",
+            "prefabricated_alpha",
+            "prefabricated_omega",
+            "short",
+            "sixteen_byte_val",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    /// `SELECT DISTINCT` on a viewed string column: dedup compares on the view,
+    /// result comes back `LargeUtf8`.
+    #[test]
+    fn query_sql_distinct_string_is_declared_type() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql("SELECT DISTINCT category FROM supertable ORDER BY category")
+            .expect("distinct");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("distinct column is LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
+    }
+
+    /// Self-join whose join key is a viewed string column: the equality runs on
+    /// `Utf8View`, and the projected key comes back `LargeUtf8`.
+    #[test]
+    fn query_sql_self_join_on_string_key() {
+        let st = seeded(&["rust", "go", "rust"], &["a", "b", "c"]);
+
+        let batches = st
+            .reader()
+            .query_sql(
+                "SELECT a.category AS cat FROM supertable a \
+                 JOIN supertable b ON a.category = b.category \
+                 GROUP BY a.category ORDER BY a.category",
+            )
+            .expect("self-join on string key");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("join key projects as LargeUtf8");
+        let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
     }
 
     #[test]
