@@ -180,17 +180,17 @@ const UNION_FINE_PICKS_MIN: usize = 2;
 /// bench), so the nearest *matching* neighbors spread past the top cell
 /// and a narrow probe caps filtered recall well below the unfiltered
 /// number. Consolidated cells make width nearly free under a filter
-/// (allow-first shortlist + bounded rerank): the 1M/256 sweep at 16-fine
-/// depth measured 6 cells → 0.873 @ 1.36 ms, 32 → 0.901 @ 1.41 ms,
-/// 128 → 0.940 @ 1.48 ms — the probe cost is carried by matching rows,
-/// not cells, so half the grid costs ~0.1 ms over the floor at this
-/// scale. The matching neighbors scatter thinly across mid-ranked cells
-/// on the bench corpus, so bulk width is the efficient dial (see also
-/// [`FILTERED_HIDDEN_FINE_NPROBE`]). NOTE: absolute width; at scales
-/// where matching-row mass makes width expensive (10M+), the dial
-/// likely becomes a selectivity-aware fraction — the bench sweep
-/// brackets the ceiling (256 = the full grid = exact over matching).
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 128;
+/// (allow-first shortlist + bounded rerank): width is nearly free
+/// because the probe cost is carried by matching rows, not cells. The
+/// 1M/256 sweep at 16-fine depth measured 6 cells → 0.873 @ 1.36 ms,
+/// 128 → 0.940 @ 1.48 ms; the 10M/256 sweep measured 160 → 0.902 @
+/// 4.16 ms, 224 → 0.933 @ 4.91 ms, 256 → 0.933 @ 5.16 ms. The full
+/// grid buys the recall plateau for ~1 ms over the 128 default at 10M,
+/// so filtered sweeps every cell — the residual loss is in-cell depth
+/// ([`FILTERED_HIDDEN_FINE_NPROBE`]), not width. NOTE: absolute width
+/// (= the whole pinned 256-cell grid); if the grid grows past it the
+/// dial becomes a fraction.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
 
 /// Fine-run probe depth inside each hidden cell for filtered queries.
 /// The unfiltered default (8) is calibrated for top-10 neighbors, whose
