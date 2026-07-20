@@ -1201,21 +1201,25 @@ pub mod vector {
     /// selectivity — a tripwire below the measured value, the same way
     /// the 0.80 default-config floor sits below its measured 0.995.
     ///
-    /// Context for the absolute level: filtered search IS the default
-    /// user-table search plus the allow-set pushdown (latency parity by
-    /// design). On THIS corpus the filtered ground truth sits at
-    /// unfiltered rank ~k/selectivity, and the synthetic cluster
-    /// geometry scatters those neighbors across most of the grid (width
-    /// sweep: 0.832@32 cells → 0.988@128), so default-width routing
-    /// measures far below what real embedding data (whose neighbor
-    /// structure persists past rank 100) would. The width-sweep rows
-    /// printed beside this number keep the coverage trade visible.
-    const FILTERED_RECALL_FLOOR: f32 = 0.50;
+    /// Context for the absolute level: filtered routes like unfiltered
+    /// (hidden cells + undrained user tail) with the allow-set pushed
+    /// down; the filtered defaults probe 32 hidden cells × 16 fine runs
+    /// — measured 0.901 @ 1.37 ms at 1M/256 (~10% selectivity), with
+    /// width nearly free on consolidated cells (128 cells → 0.940 @
+    /// 1.48 ms). The floor sits under the measured default the same way
+    /// the 0.80 default-config floor sits under its 0.995. On THIS
+    /// corpus the filtered ground truth sits at unfiltered rank
+    /// ~k/selectivity and scatters across most of the grid; real
+    /// embedding data (neighbor structure past rank 100) measures
+    /// higher at every width. The sweep rows keep the trade visible.
+    const FILTERED_RECALL_FLOOR: f32 = 0.85;
     /// Explicit cell-probe widths for the filtered width-sweep diagnostic
-    /// (the engine default probes 4). Recall climbing with width ⇒ cell
-    /// coverage gap; flat ⇒ in-cell shortlist/rerank loss. The 8-cell row
-    /// is the standing "p=8 for larger corpora?" probe.
-    const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[8, 32, 64, 128];
+    /// (the engine default probes 128 hidden cells post-drain — width is
+    /// nearly free on consolidated cells at 1M). Recall climbing with
+    /// width ⇒ cell coverage gap; flat ⇒ in-cell shortlist/rerank loss
+    /// (a depth problem). The 256 row is the full 1M/256 grid: exact
+    /// search over matching rows, the recall ceiling of the approach.
+    const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[160, 192, 224, 256];
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
     /// Explicitly discard only the derived hidden vector-index sibling before

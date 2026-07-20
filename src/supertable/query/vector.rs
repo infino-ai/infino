@@ -179,12 +179,26 @@ const UNION_FINE_PICKS_MIN: usize = 2;
 /// allow-set thins each cell's matching postings (~10% selectivity in the
 /// bench), so the nearest *matching* neighbors spread past the top cell
 /// and a narrow probe caps filtered recall well below the unfiltered
-/// number (p=1 measured 0.756 vs 0.997 at 10M). Probe 4 cells: filtered
-/// recall tracks the row mass probed, not the probe count — p=8 on a
-/// 512-cell grid measured *lower* (0.850 / 10.35 ms at 10M) than p=4 on
-/// the 256-cell grid (0.866 / 9.79 ms), because halving the cells halves
-/// each probe's mass.
-const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
+/// number. Consolidated cells make width nearly free under a filter
+/// (allow-first shortlist + bounded rerank): the 1M/256 sweep at 16-fine
+/// depth measured 6 cells → 0.873 @ 1.36 ms, 32 → 0.901 @ 1.41 ms,
+/// 128 → 0.940 @ 1.48 ms — the probe cost is carried by matching rows,
+/// not cells, so half the grid costs ~0.1 ms over the floor at this
+/// scale. The matching neighbors scatter thinly across mid-ranked cells
+/// on the bench corpus, so bulk width is the efficient dial (see also
+/// [`FILTERED_HIDDEN_FINE_NPROBE`]). NOTE: absolute width; at scales
+/// where matching-row mass makes width expensive (10M+), the dial
+/// likely becomes a selectivity-aware fraction — the bench sweep
+/// brackets the ceiling (256 = the full grid = exact over matching).
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 128;
+
+/// Fine-run probe depth inside each hidden cell for filtered queries.
+/// The unfiltered default (8) is calibrated for top-10 neighbors, whose
+/// fine-run coverage saturates at 4 (drain-diag p4 = 1.000); a filter's
+/// nearest MATCHING rows sit at unfiltered rank ~k/selectivity and live
+/// in deeper runs — the width sweep's 0.856 plateau across 6..16 cells
+/// is in-cell loss, recovered by probing deeper, not wider.
+const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 
 /// Build the fine-cluster probe set, then refill globally (best score first)
 /// toward `gated_target` postings. Candidates without a cell go to `scored`
@@ -1346,12 +1360,28 @@ impl SupertableReader {
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if filtered {
-                    // Allow-set queries widen to the filtered floor; the
+                if filtered && options.nprobe.is_some() {
+                    // Explicit caller `nprobe` on a FILTERED query pins the
+                    // hidden cell sweep — the width dial calibration and
+                    // the bench sweep turn (depth stays at the filtered
+                    // default so the sweep isolates width). Unfiltered
+                    // hidden routing keeps ignoring caller nprobe
+                    // (persisted params own it).
+                    CellRoutingParams {
+                        nprobe_min: nprobe.max(1),
+                        nprobe_max: nprobe.max(1),
+                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        ..base
+                    }
+                } else if filtered {
+                    // Allow-set queries widen to the filtered floor and
+                    // probe DEEPER fine runs per cell — the matching
+                    // neighbors sit past the unfiltered top runs; the
                     // manifest's persisted routing still wins if broader.
                     CellRoutingParams {
                         nprobe_min: base.nprobe_min.max(FILTERED_HIDDEN_CELL_NPROBE),
                         nprobe_max: base.nprobe_max.max(FILTERED_HIDDEN_CELL_NPROBE),
+                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
                         ..base
                     }
                 } else {
