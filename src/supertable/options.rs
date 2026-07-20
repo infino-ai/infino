@@ -47,6 +47,7 @@ use std::{
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     error::BuildError,
@@ -55,8 +56,6 @@ use super::{
         SuperfileReaderCache,
     },
 };
-use tokio::sync::Mutex as TokioMutex;
-
 use crate::{
     config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,

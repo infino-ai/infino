@@ -132,7 +132,6 @@ use crate::{
             },
         },
         reader::vector_layout_from_kv,
-        vector::reader::VectorColumnConfig,
         vector::{
             builder::{
                 MultiCellSubsectionSource, build_merged_subsection_from_fp32,
@@ -147,7 +146,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             quant::BitQuantizer,
-            reader::VectorReader,
+            reader::{VectorColumnConfig, VectorReader},
             rerank_codec::RerankCodec,
             rotation::RandomRotation,
             spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},

@@ -39,11 +39,11 @@
 
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 use std::{
     env,
     process::{Command, Stdio},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use infino::{
