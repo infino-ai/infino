@@ -2914,7 +2914,6 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
-
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![

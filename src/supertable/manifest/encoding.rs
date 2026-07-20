@@ -1593,8 +1593,9 @@ mod vector_summary_tests {
             "the FULL wire form must not carry a slab — its only wire home is the routing form"
         );
 
-        let routing = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::RoutingOnly))
-            .expect("decode routing");
+        let routing =
+            decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::RoutingOnly))
+                .expect("decode routing");
         let routing_decoded = &routing.cells[0].clusters;
         assert!(
             !routing_decoded.vectors_resident(),

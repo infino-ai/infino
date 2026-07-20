@@ -478,13 +478,16 @@ fn live_stored_bytes(consumer: &Supertable) -> Option<u64> {
         }
         None => 0,
     };
-    Some(bucket_total.saturating_sub(user_dead).saturating_sub(hidden_dead))
+    Some(
+        bucket_total
+            .saturating_sub(user_dead)
+            .saturating_sub(hidden_dead),
+    )
 }
 
 /// Sum of object sizes under `prefix`, listed from the table's provider.
 fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
-    listed_objects_under(table, prefix)
-        .map(|objects| objects.iter().map(|(_, size)| *size).sum())
+    listed_objects_under(table, prefix).map(|objects| objects.iter().map(|(_, size)| *size).sum())
 }
 
 /// `(key, size)` for every object under `prefix`, listed from the
