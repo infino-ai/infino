@@ -53,7 +53,7 @@ use std::{
 };
 
 use arrow_array::ArrayRef;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
@@ -206,9 +206,35 @@ impl fmt::Debug for SupertableProvider {
     }
 }
 
+/// Rewrite non-FTS `Utf8`/`LargeUtf8` columns to `Utf8View` for the scan.
+///
+/// - Why: a view compares a 4-byte prefix before full bytes, so string
+///   GROUP BY / ORDER BY / equality skip most `memcmp`.
+/// - Stored bytes are unchanged, and `expand_views_at_output` (set in
+///   `budgeted_session_context`) coerces the views back to `LargeUtf8` at the
+///   plan output, so the view stays internal and SQL results expose no view.
+/// - FTS columns keep their stored type: pruning resolves them by it, so
+///   viewing one would silently disable its pruning.
+pub(crate) fn view_string_schema(schema: &Schema, fts_columns: &HashSet<&str>) -> SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 if !fts_columns.contains(f.name().as_str()) => {
+                // clone + retype: keeps nullability and metadata (`Field::new` drops it).
+                Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View))
+            }
+            _ => Arc::clone(f),
+        })
+        .collect::<Vec<_>>();
+
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 impl SupertableProvider {
-    /// Build a provider over a pinned snapshot. The arguments
-    /// mirror what `Supertable::query_sql` already pins.
+    /// Build a provider over a pinned snapshot. `schema` is the scan schema
+    /// DataFusion plans against, already string-viewed and cached on the table
+    /// (`view_string_schema`); the provider stores it verbatim.
     pub(crate) fn new(
         schema: SchemaRef,
         manifest: Arc<ManifestSnapshot>,
@@ -219,6 +245,7 @@ impl SupertableProvider {
         let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
         let store_url = ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
             .expect("invariant: a counter-derived store URL is always valid");
+
         Self {
             schema,
             manifest,
@@ -1423,6 +1450,63 @@ mod tests {
         },
         test_helpers::default_tokenizer,
     };
+
+    /// `view_string_schema` views scalar `Utf8`/`LargeUtf8` columns as
+    /// `Utf8View`, but leaves FTS columns as-is (their bloom / term-range
+    /// pruning resolves by the stored type) and passes non-string columns
+    /// through. Nullability and metadata are preserved.
+    #[test]
+    fn view_string_schema_views_scalars_excludes_fts_and_nonstrings() {
+        let mut schema_md = HashMap::new();
+        schema_md.insert("k".to_string(), "v".to_string());
+        // `category` carries per-field metadata: it must survive the retype
+        // (the reason we clone the field instead of `Field::new`).
+        let mut field_md = HashMap::new();
+        field_md.insert("ext".to_string(), "tag".to_string());
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("category", DataType::LargeUtf8, false).with_metadata(field_md), // -> view
+                Field::new("body", DataType::LargeUtf8, false), // FTS -> unchanged
+                Field::new("small", DataType::Utf8, true),      // scalar Utf8 -> view
+                Field::new("n", DataType::Int64, false),        // non-string -> unchanged
+            ],
+            schema_md,
+        );
+        let fts: HashSet<&str> = ["body"].into_iter().collect();
+
+        let out = view_string_schema(&schema, &fts);
+        assert_eq!(
+            out.field(0).data_type(),
+            &DataType::Utf8View,
+            "scalar LargeUtf8 becomes a view"
+        );
+        assert_eq!(
+            out.field(0).metadata().get("ext").map(String::as_str),
+            Some("tag"),
+            "per-field metadata must survive the retype"
+        );
+        assert_eq!(
+            out.field(1).data_type(),
+            &DataType::LargeUtf8,
+            "FTS column must stay LargeUtf8 or pruning silently breaks"
+        );
+        assert_eq!(
+            out.field(2).data_type(),
+            &DataType::Utf8View,
+            "scalar Utf8 becomes a view"
+        );
+        assert!(out.field(2).is_nullable(), "nullability preserved");
+        assert_eq!(
+            out.field(3).data_type(),
+            &DataType::Int64,
+            "non-string column untouched"
+        );
+        assert_eq!(
+            out.metadata().get("k").map(String::as_str),
+            Some("v"),
+            "schema-level metadata preserved"
+        );
+    }
 
     /// Build an in-memory Parquet file of `Int64` values `0..total`
     /// split into row groups of `rg_size` rows each.

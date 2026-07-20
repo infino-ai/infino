@@ -19,7 +19,7 @@ use std::{
     fmt,
     future::Future,
     io,
-    sync::{Arc, Mutex, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -42,6 +42,7 @@ use crate::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
+        query::sql::{SqlSchemas, build_sql_schemas},
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
         tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
@@ -146,6 +147,10 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Cached SQL schemas, built once from the immutable `options` (lock-free
+    /// lazy init). A pure function of the schema, so no snapshot invalidation
+    /// (unlike `sql_session_cache`). See [`SqlSchemas`].
+    pub(super) sql_schemas: OnceLock<Arc<SqlSchemas>>,
 }
 
 impl SupertableInner {
@@ -154,6 +159,15 @@ impl SupertableInner {
     /// [`shared_query_runtime`].
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         shared_io_runtime()
+    }
+
+    /// The table's cached SQL schemas, built once from the immutable options.
+    /// Cheap `Arc` clone on every call after the first.
+    pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
+        Arc::clone(
+            self.sql_schemas
+                .get_or_init(|| Arc::new(build_sql_schemas(&self.options))),
+        )
     }
 
     /// Push the current manifest's tombstone-seq view into the
@@ -281,6 +295,7 @@ impl Supertable {
             handle_id,
             last_pointer_check: Mutex::new(None),
             last_pointer_etag: Mutex::new(None),
+            sql_schemas: OnceLock::new(),
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
@@ -380,6 +395,7 @@ impl Supertable {
             handle_id,
             last_pointer_check: Mutex::new(None),
             last_pointer_etag: Mutex::new(None),
+            sql_schemas: OnceLock::new(),
         });
         install_disk_cache_pinning(&inner);
         debug!(
@@ -584,6 +600,11 @@ impl Supertable {
     /// ```
     pub fn schema(&self) -> SchemaRef {
         self.inner.options.user_schema()
+    }
+
+    /// Cached per-table SQL schemas (scan view + scalar schema).
+    pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
+        self.inner.sql_schemas()
     }
 
     /// Sync→async bridge for the public query surface. Mirrors the
@@ -999,6 +1020,11 @@ impl SupertableReader {
     /// Per-supertable configuration for this reader's snapshot.
     pub(crate) fn options(&self) -> &Arc<SupertableOptions> {
         &self.inner.options
+    }
+
+    /// Cached per-table SQL schemas (scan view + scalar schema).
+    pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
+        self.inner.sql_schemas()
     }
 
     /// Cached `SessionContext` keyed on the manifest `Arc`, reused by

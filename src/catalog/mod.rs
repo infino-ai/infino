@@ -630,9 +630,11 @@ impl Connection {
 
             // A RecordBatch carries the schema; an empty Vec does not. Capture
             // the output schema before collect() consumes the DataFrame so a
-            // zero-row result returns one empty batch with the projected
-            // schema, rather than a schema-less Vec — which the Python binding's
-            // Table.from_batches([]) can't build from.
+            // zero-row result returns one empty batch with the projected schema,
+            // rather than a schema-less Vec, which the Python binding's
+            // Table.from_batches([]) can't build from. The scan's `Utf8View`
+            // columns are already coerced back to `LargeUtf8` here by
+            // `expand_views_at_output`, so the schema needs no further fixup.
             let output_schema: SchemaRef = df.schema().inner().clone();
             let batches = df
                 .collect()
@@ -842,7 +844,7 @@ fn now_unix() -> u64 {
 mod tests {
     use std::{fs, path::Path, sync::Arc, thread};
 
-    use arrow_array::Int64Array;
+    use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -1719,6 +1721,98 @@ mod tests {
             expected_schema,
             "zero-group schema must match the with-groups schema"
         );
+    }
+
+    /// Public path: a non-FTS `LargeUtf8` column is scanned as `Utf8View`, but
+    /// `Connection::query_sql` returns it as `LargeUtf8` (the scan view is
+    /// coerced at the plan output), so no `Utf8View` leaks to a caller.
+    #[test]
+    fn query_sql_public_string_result_is_large_utf8_not_view() {
+        let conn = connect("memory://").expect("connect");
+        // No FTS on `title`, so it is a plain scalar string and gets viewed
+        // (the case the view targets).
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["alpha", "beta", "alpha"]))
+            .expect("append");
+
+        let batches = conn
+            .query_sql("SELECT title FROM docs GROUP BY title ORDER BY title")
+            .expect("group-by");
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::LargeUtf8,
+            "public result must be LargeUtf8, not Utf8View"
+        );
+        let titles = col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title downcasts to LargeStringArray");
+        let got: Vec<&str> = (0..titles.len()).map(|i| titles.value(i)).collect();
+        assert_eq!(got, vec!["alpha", "beta"], "distinct titles, ordered");
+        assert!(
+            col.as_any().downcast_ref::<StringViewArray>().is_none(),
+            "Utf8View must not leak to the caller"
+        );
+    }
+
+    /// Ungrouped `MIN`/`MAX` over a viewed string column through the public
+    /// path (the shape that regressed before `expand_views_at_output`): must
+    /// not error and returns `LargeUtf8`.
+    #[test]
+    fn query_sql_public_ungrouped_min_max_string() {
+        let conn = connect("memory://").expect("connect");
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new())
+            .expect("create docs");
+        docs.append(&build_title_batch(&["beta", "alpha", "gamma"]))
+            .expect("append");
+
+        let batches = conn
+            .query_sql("SELECT MIN(title) lo, MAX(title) hi, COUNT(*) n FROM docs")
+            .expect("ungrouped min/max over a viewed column");
+        let lo = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("MIN(title) is LargeUtf8");
+        assert_eq!(lo.value(0), "alpha");
+    }
+
+    /// Cross-table join whose key is a viewed string column: the join key comes
+    /// back `LargeUtf8`, not a view.
+    #[test]
+    fn query_sql_join_across_tables_on_string_column() {
+        let conn = connect("memory://").expect("connect");
+        // No FTS, so `title` is a plain scalar string (viewed) in both tables.
+        let a = conn
+            .create_table("a", schema_id_title(), IndexSpec::new())
+            .expect("create a");
+        let b = conn
+            .create_table("b", schema_id_title(), IndexSpec::new())
+            .expect("create b");
+        a.append(&build_title_batch(&["rust", "go"]))
+            .expect("append a");
+        b.append(&build_title_batch(&["rust", "go"]))
+            .expect("append b");
+
+        let batches = conn
+            .query_sql("SELECT a.title FROM a JOIN b ON a.title = b.title ORDER BY a.title")
+            .expect("cross-table join on a string key");
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::LargeUtf8,
+            "joined string key must be LargeUtf8, not a view"
+        );
+        let t = col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title is LargeUtf8");
+        let got: Vec<&str> = (0..t.len()).map(|i| t.value(i)).collect();
+        assert_eq!(got, vec!["go", "rust"]);
     }
 
     #[test]
