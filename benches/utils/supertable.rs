@@ -38,6 +38,7 @@
 //! ```
 
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use std::{
     env,
@@ -435,31 +436,75 @@ fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
     listed_bytes_under(table, SLOW_VECTOR_STATE_PREFIX)
 }
 
-/// EVERY durable byte under the table's storage root, LISTed from the
-/// object store: superfiles, manifest lists/parts/routing siblings,
-/// pointers, slow-CAS state, the nested hidden vector-index subtree, and
-/// any superseded objects GC has not yet reclaimed (deliberately counted
-/// — they are billed bytes until reclaim). This is what the cost model
-/// prices; the manifest-metadata superfile sums remain as the printed
-/// breakdown. `None` when the table has no storage attached; empty
-/// listings (providers without metadata listing) fall back to the
-/// manifest sums at the call site.
-fn bucket_stored_bytes(table: &Supertable) -> Option<u64> {
-    listed_bytes_under(table, "")
+/// The LIVE stored bytes for the table, LISTed from the object store and
+/// filtered to what the CURRENT manifests reference: live superfiles
+/// (user + hidden), manifest lists/parts/siblings, pointers, and slow-CAS
+/// state. Superfile data objects not referenced by the current manifests
+/// (superseded generations awaiting GC, orphaned tmp files) are excluded
+/// from the count — the steady-state capacity is what the cost model
+/// prices. `None` when the table has no storage attached.
+fn live_stored_bytes(consumer: &Supertable) -> Option<u64> {
+    /// Relative prefix of superfile data objects under a table root.
+    const DATA_PREFIX: &str = "data/";
+    let user_reader = consumer.reader();
+    let user_manifest = user_reader.manifest();
+    let listing = listed_objects_under(consumer, "")?;
+    let bucket_total: u64 = listing.iter().map(|(_, size)| *size).sum();
+    let user_live: HashSet<String> = user_manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|entry| entry.uri.storage_path())
+        .collect();
+    let user_dead: u64 = listing
+        .iter()
+        .filter(|(key, _)| key.starts_with(DATA_PREFIX) && !user_live.contains(key))
+        .map(|(_, size)| *size)
+        .sum();
+    let hidden_dead: u64 = match consumer.vector_index_table() {
+        Some(hidden) => {
+            let hidden_reader = hidden.pinned_reader();
+            let hidden_live: HashSet<String> = hidden_reader
+                .manifest()
+                .get_all_superfiles()
+                .iter()
+                .map(|entry| entry.uri.storage_path())
+                .collect();
+            listed_objects_under(hidden, DATA_PREFIX)
+                .unwrap_or_default()
+                .iter()
+                .filter(|(key, _)| !hidden_live.contains(key))
+                .map(|(_, size)| *size)
+                .sum()
+        }
+        None => 0,
+    };
+    Some(bucket_total.saturating_sub(user_dead).saturating_sub(hidden_dead))
 }
 
 /// Sum of object sizes under `prefix`, listed from the table's provider.
 fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
+    listed_objects_under(table, prefix)
+        .map(|objects| objects.iter().map(|(_, size)| *size).sum())
+}
+
+/// `(key, size)` for every object under `prefix`, listed from the
+/// table's provider. Keys are provider-root-relative — the same
+/// convention as `SuperfileUri::storage_path`.
+fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String, u64)>> {
     let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
     let prefix = prefix.to_owned();
-    let total = tiers::block_on(async move {
+    let objects = tiers::block_on(async move {
         storage
             .list_with_prefix_metadata(&prefix)
             .await
-            .map(|objs| objs.iter().map(|(_, meta)| meta.size).sum::<u64>())
-            .unwrap_or(0)
+            .map(|objs| {
+                objs.into_iter()
+                    .map(|(key, meta)| (key, meta.size))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     });
-    Some(total)
+    Some(objects)
 }
 
 /// Cap on printed first-cold-query trace lines; the tail is summarized so a
@@ -3575,20 +3620,21 @@ pub mod vector {
                     .and_then(|h| slow_state_stored_bytes(h))
                     .unwrap_or(0);
                 // The PRICED capacity is a real object-store LIST over the
-                // table root (superfiles + manifest lists/parts/siblings +
-                // pointers + slow-CAS state + not-yet-GC'd objects — every
-                // byte the store bills). The manifest-metadata sums above
-                // remain the printed breakdown; superfile sums alone
-                // under-counted the bucket by ~25% at 1M (the slow-CAS trio
-                // and manifest parts were printed but never priced).
-                let bucket_stored = bucket_stored_bytes(&consumer)
+                // table root, filtered to LIVE state: current superfiles
+                // (user + hidden), manifests/parts/siblings, pointers, and
+                // slow-CAS objects. Data objects the current manifests no
+                // longer reference (the superseded generation compaction
+                // just replaced, sitting out GC's safety window) are
+                // excluded — steady-state capacity, not a
+                // moment-after-compaction snapshot.
+                let bucket_stored = live_stored_bytes(&consumer)
                     .filter(|&bytes| bytes > 0)
                     .unwrap_or(post_drain_stored + slow_state_stored);
                 let manifest_overhead = bucket_stored
                     .saturating_sub(post_drain_stored)
                     .saturating_sub(slow_state_stored);
                 eprintln!(
-                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} superfiles (ingest-time user-only was {}); slow vector-state {}; manifests + not-yet-GC'd {}; PRICED bucket total (listed) {}",
+                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} superfiles (ingest-time user-only was {}); slow vector-state {}; manifests {}; PRICED live total (listed) {}",
                     rss::fmt_bytes(user_stored),
                     rss::fmt_bytes(hidden_stored),
                     rss::fmt_bytes(post_drain_stored),
