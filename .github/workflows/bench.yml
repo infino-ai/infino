@@ -67,5 +67,8 @@ jobs:
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}
       # Fork PR ⇒ gate on maintainer approval before secrets are exposed.
-      is_fork_pr: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+      # Guard on the event: a push has no pull_request context, so the bare
+      # inequality would treat every push as a fork and route it to the
+      # approval-gated environment, leaving baseline runs stuck awaiting review.
+      is_fork_pr: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository }}
     secrets: inherit
