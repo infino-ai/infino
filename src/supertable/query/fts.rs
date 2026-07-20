@@ -89,6 +89,7 @@ use crate::{
     InfinoError,
     superfile::{
         SuperfileReader,
+        error::{FtsError, ReadError},
         fts::{
             reader::ClauseLists,
             tokenize::{AsciiLowerTokenizer, Tokenizer},
@@ -418,7 +419,7 @@ impl SupertableReader {
                             floor,
                         )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .map_err(fts_read_error)?
                     }
                     None => {
                         let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
@@ -439,7 +440,7 @@ impl SupertableReader {
                             floor,
                         )
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .map_err(fts_read_error)?
                     }
                 };
                 // Raise the global floor with this unit's surviving
@@ -533,11 +534,11 @@ impl SupertableReader {
                     Some((start, end)) => r
                         .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(fts_read_error),
                     None => r
                         .bm25_search_prefix(&column_arc, &prefix_arc, k)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string())),
+                        .map_err(fts_read_error),
                 }
             }
         };
@@ -693,11 +694,11 @@ impl SupertableReader {
                     true => r
                         .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                        .map_err(fts_read_error)?,
                     false => r
                         .token_match(&column_arc, &refs, match_mode)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                        .map_err(fts_read_error)?,
                 };
                 // Drop any positive match that also carries a negated
                 // atom (union of the negatives). The df / count fast
@@ -709,11 +710,11 @@ impl SupertableReader {
                         true => r
                             .token_match(&column_arc, &neg_refs, BoolMode::Or)
                             .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                            .map_err(fts_read_error)?,
                         false => r
                             .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
                             .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                            .map_err(fts_read_error)?,
                     }
                     .into_iter()
                     .collect();
@@ -805,11 +806,11 @@ impl SupertableReader {
                             true => r
                                 .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                                 .await
-                                .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                                .map_err(fts_read_error)?,
                             false => r
                                 .token_match(&column_arc, &refs, match_mode)
                                 .await
-                                .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                                .map_err(fts_read_error)?,
                         };
                         let excluded: RoaringBitmap = if has_negatives {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
@@ -817,7 +818,7 @@ impl SupertableReader {
                                 true => r
                                     .token_match(&column_arc, &neg_refs, BoolMode::Or)
                                     .await
-                                    .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                                    .map_err(fts_read_error)?,
                                 false => r
                                     .atoms_match_ids(
                                         &column_arc,
@@ -826,7 +827,7 @@ impl SupertableReader {
                                         BoolMode::Or,
                                     )
                                     .await
-                                    .map_err(|e| QueryError::Parquet(e.to_string()))?,
+                                    .map_err(fts_read_error)?,
                             }
                             .into_iter()
                             .collect()
@@ -849,15 +850,15 @@ impl SupertableReader {
                     let n = if single_term {
                         r.term_df(&column_arc, &term_arc[0])
                             .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                            .map_err(fts_read_error)?
                     } else if phrase_involved {
                         r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode)
                             .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                            .map_err(fts_read_error)?
                     } else {
                         r.token_match_count(&column_arc, &refs, match_mode)
                             .await
-                            .map_err(|e| QueryError::Parquet(e.to_string()))?
+                            .map_err(fts_read_error)?
                     };
                     Ok(n)
                 }
@@ -907,7 +908,7 @@ impl SupertableReader {
                 let docs = r
                     .exact_match(&column_arc, &value_arc)
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    .map_err(fts_read_error)?;
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
@@ -1038,6 +1039,26 @@ struct WorkUnit {
 /// the scales we benchmark (1.25M docs/superfile after 10M × cpus/2
 /// row-shard) are well above this floor.
 const SUBRANGE_MIN_DOCS: u32 = 50_000;
+
+/// Map a per-superfile FTS read error to the query-layer error. A
+/// phrase query against a column indexed without positions, or a query
+/// with no positive clause to rank, is a malformed *request* — surface
+/// it as [`QueryError::InvalidQuery`] so the caller sees a bad-input
+/// error, not a storage/scan failure. Everything else is a genuine
+/// read error and stays [`QueryError::Parquet`].
+fn fts_read_error(e: ReadError) -> QueryError {
+    match &e {
+        ReadError::Fts(fts)
+            if matches!(
+                fts.as_ref(),
+                FtsError::PositionsUnavailable { .. } | FtsError::NegationOnly
+            ) =>
+        {
+            QueryError::InvalidQuery(e.to_string())
+        }
+        _ => QueryError::Parquet(e.to_string()),
+    }
+}
 
 /// Minimum query term count that makes OR sub-range fan-out eligible.
 /// The range-aware Block-Max MaxScore path is only wired up for
@@ -1996,14 +2017,24 @@ mod tests {
         let err = r
             .bm25_hits("title", r#""climate change""#, 10, BoolMode::Or)
             .expect_err("typed error expected");
-        let msg = err.to_string();
+        // A phrase on a positionless column is a bad *request*, not a
+        // read failure — it surfaces as InvalidQuery, and the message
+        // explains the missing positions.
         assert!(
-            msg.contains("positions"),
-            "error should say positions are missing: {msg}"
+            matches!(err, QueryError::InvalidQuery(_)),
+            "phrase on positionless column should be InvalidQuery, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("positions"),
+            "error should say positions are missing: {err}"
         );
         let err = r
             .count("title", r#""climate change""#, BoolMode::Or)
             .expect_err("count errors too");
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "count phrase on positionless column should be InvalidQuery, got {err:?}"
+        );
         assert!(err.to_string().contains("positions"));
     }
 
