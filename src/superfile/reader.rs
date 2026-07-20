@@ -561,8 +561,15 @@ impl SuperfileReader {
     /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
     /// against the source.
     ///
+    /// On a promoted hybrid reader ([`install_resident_parquet`]) the
+    /// returned bytes leave the embedded **vector blob sparse**; every
+    /// parquet-referenced byte and the FTS subsection are real. External
+    /// parquet readers never dereference the vector region, but consumers
+    /// that need the complete superfile must gate on `is_fully_resident`.
+    ///
     /// [`open`]: SuperfileReader::open
     /// [`open_lazy`]: SuperfileReader::open_lazy
+    /// [`install_resident_parquet`]: SuperfileReader::install_resident_parquet
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
     }
@@ -572,6 +579,46 @@ impl SuperfileReader {
     /// those readers must stay on the async object-store row path.
     pub(crate) fn can_take_by_local_doc_ids(&self) -> bool {
         self.bytes.is_some() && self.arrow_meta.is_some()
+    }
+
+    /// Whether every byte of the superfile is resident and real — the eager
+    /// [`open`] shape. `false` for lazy readers and for promoted hybrid
+    /// readers whose resident bytes leave the vector blob sparse
+    /// ([`install_resident_parquet`]); consumers that read vector bytes
+    /// synchronously (compaction's Sq8 merge) must gate on this, not on
+    /// [`parquet_bytes`] presence.
+    ///
+    /// [`open`]: SuperfileReader::open
+    /// [`parquet_bytes`]: SuperfileReader::parquet_bytes
+    /// [`install_resident_parquet`]: SuperfileReader::install_resident_parquet
+    pub(crate) fn is_fully_resident(&self) -> bool {
+        self.bytes.is_some() && self.source.is_none()
+    }
+
+    /// Install resident whole-file bytes on a lazily-opened reader so the
+    /// synchronous parquet paths (`take_by_local_doc_ids`,
+    /// `get_record_batch`, `id_lookup`) run main-style sync decodes instead
+    /// of the async stream machinery. Used by the disk cache's hybrid mmap
+    /// promotion, where `bytes` is the fill-file mmap with the **vector blob
+    /// left sparse** — valid for every parquet-referenced byte (data pages,
+    /// footer) and for the FTS subsection, but NOT for the vector region.
+    /// The FTS/vector sub-readers keep the sources they were opened over;
+    /// [`byte_source`] keeps preferring the reader's lazy source, so no
+    /// consumer can reach the sparse region through this reader.
+    ///
+    /// [`byte_source`]: SuperfileReader::byte_source
+    pub(crate) fn install_resident_parquet(&mut self, bytes: Bytes) -> Result<(), ReadError> {
+        let arrow_meta = ArrowReaderMetadata::load(
+            &bytes,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+        )
+        .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        // Seed the page-index cell too (best effort — a concurrent lazy
+        // upgrade may have won; either value serves the same reads).
+        let _ = self.page_index_meta.set(Arc::clone(arrow_meta.metadata()));
+        self.arrow_meta = Some(arrow_meta);
+        self.bytes = Some(bytes);
+        Ok(())
     }
     /// Returns a record batch containing all documents with all columns
     pub fn get_record_batch(
@@ -637,8 +684,13 @@ impl SuperfileReader {
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub fn byte_source(&self) -> Arc<dyn LazyByteSource> {
         match (&self.bytes, &self.source) {
-            (Some(bytes), _) => Arc::new(BytesLazyByteSource::new(bytes.clone())),
-            (None, Some(src)) => Arc::clone(src),
+            // Source-first: a promoted hybrid reader has BOTH — its bytes
+            // leave the vector blob sparse (`install_resident_parquet`), so
+            // whole-file byte access must go through the source, whose
+            // vector-hole fallback serves real bytes. Eager readers have no
+            // source and keep the zero-copy bytes wrap.
+            (_, Some(src)) => Arc::clone(src),
+            (Some(bytes), None) => Arc::new(BytesLazyByteSource::new(bytes.clone())),
             (None, None) => {
                 unreachable!("a SuperfileReader has either resident bytes or a lazy source")
             }

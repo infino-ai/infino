@@ -165,8 +165,11 @@ pub(crate) async fn open_compaction_input(
                 .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
                 .await
                 .map_err(|e| QueryError::Store(e.to_string()));
+            // Fully-resident only: a promoted hybrid reader exposes parquet
+            // bytes but leaves the vector blob sparse, and the Sq8 merge
+            // below reads real vector bytes synchronously.
             if let Ok(reader) = reader
-                && reader.parquet_bytes().is_some()
+                && reader.is_fully_resident()
             {
                 return Ok(reader);
             }

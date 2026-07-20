@@ -42,6 +42,7 @@ use object_store::{
 };
 
 use crate::superfile::LazyByteSource;
+use crate::superfile::lazy_source::Source;
 
 /// Fixed `last_modified` reported for every registered superfile.
 /// Superfiles are immutable once committed, so a wall-clock timestamp
@@ -158,8 +159,11 @@ impl ObjectStore for SuperfileObjectStore {
         let bytes = if len == 0 {
             Bytes::new()
         } else {
-            source
-                .range(range.start, len)
+            // Route through `range_async` so a warm, mmap/block-resident scan
+            // serves its bytes synchronously (zero-copy, no I/O) instead of
+            // awaiting a range fetch; a cold miss still `await`s the GET.
+            Source::Lazy(source)
+                .range_async(range.start as usize..range.end as usize)
                 .await
                 .map_err(|e| OsError::Generic {
                     store: "SuperfileObjectStore",

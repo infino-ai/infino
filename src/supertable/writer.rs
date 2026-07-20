@@ -3314,8 +3314,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let storage_opt = storage_opt.clone();
                 let manifest = Arc::clone(&user_manifest);
                 async move {
+                    // Fully-resident only: the splice reads real vector bytes
+                    // synchronously, which a promoted hybrid reader (sparse
+                    // vector region) cannot serve.
                     let reader = match store.reader(&entry.uri) {
-                        Ok(r) if r.parquet_bytes().is_some() => r,
+                        Ok(r) if r.is_fully_resident() => r,
                         _ => {
                             let storage = storage_opt.as_ref().ok_or_else(|| {
                                 BuildError::Store(

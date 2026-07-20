@@ -45,7 +45,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     superfile::{
-        LazyByteSource, SuperfileReader,
+        SuperfileReader,
+        lazy_source::Source,
         reader::{rank_back_indices, row_selection_for_ids},
     },
     supertable::{
@@ -528,20 +529,21 @@ async fn resolve_columns(
 /// For disk-cache readers this preserves the block-cache layer instead of
 /// bypassing it with a new object-store handle on every scalar projection.
 struct ByteSourceAsyncReader {
-    source: Arc<dyn LazyByteSource>,
+    source: Source,
     metadata: Arc<ParquetMetaData>,
 }
 
 impl AsyncFileReader for ByteSourceAsyncReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        let source = Arc::clone(&self.source);
+        // `range_async` resolves mmap/block-resident ranges synchronously
+        // (zero-copy, no I/O) via `try_get_range_sync`, and only `await`s a
+        // real fetch on a cold miss — the same fast path the FTS reader's
+        // posting fetches ride.
+        let source = self.source.clone();
+        let range = range.start as usize..range.end as usize;
         async move {
-            let len = range
-                .end
-                .checked_sub(range.start)
-                .ok_or_else(|| ParquetError::General(format!("invalid byte range {range:?}")))?;
             source
-                .range(range.start, len)
+                .range_async(range)
                 .await
                 .map_err(|error| ParquetError::General(error.to_string()))
         }
@@ -552,21 +554,19 @@ impl AsyncFileReader for ByteSourceAsyncReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        let source = Arc::clone(&self.source);
+        // `get_ranges_parallel_async` serves each resident range synchronously
+        // and batches only the cold misses into one `try_join_all`, returning
+        // bytes in input order.
+        let source = self.source.clone();
+        let ranges: Vec<Range<usize>> = ranges
+            .into_iter()
+            .map(|range| range.start as usize..range.end as usize)
+            .collect();
         async move {
-            try_join_all(ranges.into_iter().map(|range| {
-                let source = Arc::clone(&source);
-                async move {
-                    let len = range.end.checked_sub(range.start).ok_or_else(|| {
-                        ParquetError::General(format!("invalid byte range {range:?}"))
-                    })?;
-                    source
-                        .range(range.start, len)
-                        .await
-                        .map_err(|error| ParquetError::General(error.to_string()))
-                }
-            }))
-            .await
+            source
+                .get_ranges_parallel_async(&ranges)
+                .await
+                .map_err(|error| ParquetError::General(error.to_string()))
         }
         .boxed()
     }
@@ -591,7 +591,7 @@ pub(crate) async fn take_rows_byte_source(
         .await
         .map_err(|error| DataFusionError::Execution(error.to_string()))?;
     let input = ByteSourceAsyncReader {
-        source: reader.byte_source(),
+        source: Source::Lazy(reader.byte_source()),
         metadata,
     };
     take_rows_async(

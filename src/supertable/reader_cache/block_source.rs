@@ -78,6 +78,15 @@ pub(crate) struct BlockCachedSource {
     entry_token: Arc<()>,
     /// Whether this source reserves and releases touched-block bytes itself.
     owns_accounting: bool,
+    /// Virtual hole: `(offset, len)` of a subsection whose reads bypass the
+    /// block cache and fetch exact ranges from the inner source. Set to the
+    /// FTS subsection: posting reads are ~KiB-sized and scattered, so
+    /// rounding each to a 512 KiB block over-fetches ~200× per read on a
+    /// wide OR (the block size is tuned for vector's 0.25–2 MiB scans).
+    /// Their warm locality comes from the background-fill mmap promotion,
+    /// not from this cache. Reads only partially overlapping the hole keep
+    /// block semantics.
+    passthrough: Option<(u64, u64)>,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -95,18 +104,20 @@ impl BlockCachedSource {
         uri: SuperfileUri,
         path: PathBuf,
     ) -> Arc<Self> {
-        Self::new_with_accounting(inner, store, uri, path, true)
+        Self::new_with_accounting(inner, store, uri, path, true, None)
     }
 
     /// Construct a sparse source whose owning entry has already reserved the
-    /// complete object size.
+    /// complete object size. `passthrough` is the optional exact-read hole
+    /// (see the field docs) — the FTS subsection on the cold-open path.
     pub(crate) fn new_pre_reserved(
         inner: Arc<dyn LazyByteSource>,
         store: Weak<DiskCacheStore>,
         uri: SuperfileUri,
         path: PathBuf,
+        passthrough: Option<(u64, u64)>,
     ) -> Arc<Self> {
-        Self::new_with_accounting(inner, store, uri, path, false)
+        Self::new_with_accounting(inner, store, uri, path, false, passthrough)
     }
 
     fn new_with_accounting(
@@ -115,6 +126,7 @@ impl BlockCachedSource {
         uri: SuperfileUri,
         path: PathBuf,
         owns_accounting: bool,
+        passthrough: Option<(u64, u64)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner,
@@ -123,10 +135,19 @@ impl BlockCachedSource {
             path,
             entry_token: Arc::new(()),
             owns_accounting,
+            passthrough,
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Whether `[start, start + len)` lies fully inside the passthrough hole.
+    fn in_passthrough(&self, start: u64, len: u64) -> bool {
+        match self.passthrough {
+            Some((off, hole_len)) => start >= off && start + len <= off + hole_len,
+            None => false,
+        }
     }
 
     /// Identity token installed on the cache entry that owns this source.
@@ -306,6 +327,9 @@ impl LazyByteSource for BlockCachedSource {
         if len == 0 {
             return Ok(Bytes::new());
         }
+        if self.in_passthrough(start, len) {
+            return self.inner.range(start, len).await;
+        }
         let Some(bf) = self.block_file() else {
             return self.inner.range(start, len).await;
         };
@@ -326,6 +350,9 @@ impl LazyByteSource for BlockCachedSource {
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());
+        }
+        if self.in_passthrough(start, len) {
+            return self.inner.try_get_range_sync(start, len);
         }
         let bf = self.block_file()?;
         if start.saturating_add(len) > bf.size {

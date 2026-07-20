@@ -717,6 +717,35 @@ impl DiskCacheStore {
         )))
     }
 
+    /// Block until no cache entry has a background fill still in flight
+    /// (fill spawned, not yet mmap-promoted), or fail after `timeout`.
+    ///
+    /// Scoped to work the caller's own opens actually caused: entries that
+    /// never spawned a fill (vector opens) and superfiles never opened at
+    /// all are not waited on. Registering as a promotion waiter releases
+    /// fills that are politely waiting on a held foreground reader.
+    pub async fn wait_until_fills_settled(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<(), DiskCacheError> {
+        let _guard = PromotionWaitGuard::new(&self.n_promotion_waiters);
+        let start = Instant::now();
+        loop {
+            let pending = self.cached.iter().any(|entry| {
+                entry.value().fill_spawned.load(Ordering::Acquire) && entry.value().mmap.is_none()
+            });
+            if !pending {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(DiskCacheError::SuperfileOpen(format!(
+                    "background fills not settled within {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(MMAP_PROMOTION_POLL_INTERVAL).await;
+        }
+    }
+
     /// Snapshot of the cache's load. Cheap; reads atomics +
     /// a `DashMap::len` (which itself is `O(shards)`).
     pub fn stats(&self) -> CacheStats {
@@ -1446,6 +1475,9 @@ impl DiskCacheStore {
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                // FTS subsection reads bypass block rounding (exact ranges);
+                // see the `passthrough` field docs.
+                offsets.fts,
             );
             block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
@@ -1526,6 +1558,8 @@ impl DiskCacheStore {
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                // No manifest hints here, so the FTS subsection is unknown.
+                None,
             );
             block_source_arc = Arc::clone(&block_source);
             let source: Arc<dyn LazyByteSource> = block_source;
@@ -2305,16 +2339,20 @@ async fn lazy_background_fill(
         let (promoted_reader, block_token, block_source) = match (skip_vec, prior_block) {
             (Some((vec_off, vec_len)), Some(block_source)) => {
                 let block_token = block_source.entry_token();
-                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let local: Arc<dyn LazyByteSource> =
+                    Arc::new(BytesLazyByteSource::new(bytes.clone()));
                 let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
                     local,
                     hole_start: vec_off,
                     hole_len: vec_len,
                     fallback: Arc::clone(&block_source),
                 });
-                let reader =
+                let mut reader =
                     SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
                         .await?;
+                // Sync parquet decodes (take / id scans) run off the mmap;
+                // the sparse vector region stays behind the hole source.
+                reader.install_resident_parquet(bytes)?;
                 (reader, Some(block_token), Some(block_source))
             }
             (Some((vec_off, vec_len)), None) => {
@@ -2330,18 +2368,25 @@ async fn lazy_background_fill(
                     Arc::downgrade(&store),
                     uri,
                     store.blocks_path(&uri),
+                    // Serves only the promoted reader's vector hole; FTS
+                    // bytes come from the mmap.
+                    None,
                 );
                 let block_token = block_source.entry_token();
-                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let local: Arc<dyn LazyByteSource> =
+                    Arc::new(BytesLazyByteSource::new(bytes.clone()));
                 let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
                     local,
                     hole_start: vec_off,
                     hole_len: vec_len,
                     fallback: Arc::clone(&block_source),
                 });
-                let reader =
+                let mut reader =
                     SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
                         .await?;
+                // Sync parquet decodes (take / id scans) run off the mmap;
+                // the sparse vector region stays behind the hole source.
+                reader.install_resident_parquet(bytes)?;
                 (reader, Some(block_token), Some(block_source))
             }
             (None, _) => {
@@ -3329,6 +3374,7 @@ mod tests {
             Arc::downgrade(&store),
             uri,
             store.blocks_path(&uri),
+            None,
         );
         let hfs = HoleFallbackSource {
             local,

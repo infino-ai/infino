@@ -740,12 +740,14 @@ impl Supertable {
     }
     }
 
-    /// Block until every resident superfile in the current manifest is
-    /// mmap-backed, or `timeout` elapses for one of them.
+    /// Block until the disk cache has settled every background fill the
+    /// caller's own queries kicked off, or `timeout` elapses.
     ///
-    /// The caller must first open the readers it wants warmed. Registering
-    /// this waiter lets their background fills proceed even if another handle
-    /// still holds a lazy reader.
+    /// Scoped to in-flight work only: superfiles never opened, and opens
+    /// that don't spawn fills (vector), are not waited on — so a query on
+    /// a small working set settles fast regardless of table size.
+    /// Registering this waiter lets pending fills proceed even if another
+    /// handle still holds a lazy reader.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn wait_until_warm(&self, timeout: Duration) -> Result<(), DiskCacheError> {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
@@ -755,13 +757,7 @@ impl Supertable {
             return Ok(());
         }
         let cache = Arc::clone(cache);
-        let manifest = self.inner.manifest.load_full();
-        self.block_on_query(async move {
-            for entry in manifest.superfiles.iter() {
-                cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
-            }
-            Ok(())
-        })
+        self.block_on_query(async move { cache.wait_until_fills_settled(timeout).await })
     }
 
     /// This handle's lease-owner id. Stamped on every WAL the
