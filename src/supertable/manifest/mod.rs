@@ -728,13 +728,12 @@ impl ManifestSnapshot {
                     let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
                         .await
                         .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
-                    if expected_n_superfiles
-                        .is_some_and(|expected| entries.len() as u64 != expected)
+                    if let Some(expected) = expected_n_superfiles
+                        && entries.len() as u64 != expected
                     {
                         return Err(ManifestLoadError::SlowStateHydration(format!(
-                            "blob entry count {} != list total {}",
+                            "blob entry count {} != list total {expected}",
                             entries.len(),
-                            expected_n_superfiles.expect("checked Some above")
                         )));
                     }
                     Some(entries)
@@ -1781,7 +1780,18 @@ impl ManifestSnapshot {
                 })
                 .collect(),
             partition_strategy: strategy,
-            vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
+            // Never stamp a sibling prefix onto a hidden VectorCell manifest:
+            // the prefix is only ever resolved off the USER manifest to locate
+            // the hidden index, and a hidden table claiming its own hidden
+            // subtree would misroute maintenance/GC.
+            vector_index_storage_prefix: if matches!(
+                self.get_partition_strategy(),
+                list::PartitionStrategy::VectorCell { .. }
+            ) {
+                None
+            } else {
+                self.stamp_vector_index_storage_prefix(&vector_columns)
+            },
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self
                 .list

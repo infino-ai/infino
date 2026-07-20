@@ -1546,7 +1546,13 @@ impl VectorReader {
                 rerank_codec.name()
             ))));
         }
-        let sub_end = subsection_off + subsection_len;
+        // Checked: both values come from on-disk metadata, so the sum can
+        // overflow before the bounds check and wrap to a bogus in-range end.
+        let sub_end = subsection_off.checked_add(subsection_len).ok_or_else(|| {
+            VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection offset + length overflows".into(),
+            ))
+        })?;
         if sub_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "cell subsection runs past blob".into(),
@@ -1748,7 +1754,12 @@ impl VectorReader {
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
         if self.flat_cluster_base.is_empty() {
-            return Some((0, flat));
+            // v1 single IVF: bound against the only column's cluster count so
+            // a stale/corrupt routing id can't leak an out-of-range cluster
+            // into downstream indexing. (The multi-cell path below is bounded
+            // by the prefix sums, which are built from the same n_cents.)
+            let col = self.columns.first()?;
+            return (flat < col.n_cent).then_some((0, flat));
         }
         // flat_cluster_base is prefix sums of length n_cells+1.
         let bases = &self.flat_cluster_base;

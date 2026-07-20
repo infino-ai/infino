@@ -2586,8 +2586,20 @@ async fn persist_superfile_publish_batch_async(
     } else {
         list_metadata.apply(&old).with_appended(batch.new_entries)
     };
+    // Insert the bytes BEFORE publishing the manifest, and fail on error:
+    // with no storage attached the in-memory store is the ONLY copy, so
+    // publishing first would expose entries whose bytes a reader can't
+    // fetch, and a failed insert would leave a "successful" commit with
+    // lost data. (The storage-backed path above keeps insert-after-store
+    // non-fatal — its bytes are already durable and refetchable.)
+    for (uri, bytes) in batch.pending_store_inserts {
+        inner
+            .options
+            .store
+            .insert(uri, bytes)
+            .map_err(|e| BuildError::Store(format!("store insert for {uri:?}: {e}")))?;
+    }
     inner.manifest.store(Arc::new(new));
-    apply_pending_store_inserts(inner, batch.pending_store_inserts);
     Ok(())
 }
 
