@@ -3372,11 +3372,16 @@ impl PartialOrd for TopKEntry {
 }
 impl Ord for TopKEntry {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Score is inverted (lower score = greater) so the max-heap's
+        // peek is the worst kept entry; the doc-id leg must NOT be
+        // inverted, so that among score-tied entries the LARGER doc id
+        // is greater — i.e. peek — and is the one evicted when a
+        // better doc arrives, keeping the smaller id.
         other
             .0
             .partial_cmp(&self.0)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| other.1.cmp(&self.1))
+            .then_with(|| self.1.cmp(&other.1))
     }
 }
 

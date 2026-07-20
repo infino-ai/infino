@@ -203,3 +203,94 @@ async fn phrase_oracle_agreement_multi_block() {
     // Truncated top-k exercises the atom walk's pruning bar.
     assert_matches_oracle(&r, &oracle, r#""alpha beta" gamma"#, BoolMode::Or, 10).await;
 }
+
+#[tokio::test]
+async fn truncated_top_k_pruning_agrees_with_oracle() {
+    // Every query shape whose ranked walk can skip phrase
+    // verification once the heap fills — a small k keeps the bar live
+    // for most of the walk, so a pruning bug (skipping a doc that
+    // belongs in the top k, or scoring a skipped doc) diverges from
+    // the oracle. Shapes cover the three prune sites: the union
+    // advance (bare phrase, alone and beside other atoms), the
+    // must-driven leapfrog (phrase musts), and the should drag
+    // (phrase should landing on must-matched docs).
+    let owned = build_multi_block_corpus();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+    for query in [
+        r#""alpha beta""#,
+        r#"+"alpha beta""#,
+        r#"+"alpha beta" +delta"#,
+        r#"+delta "alpha beta""#,
+        r#""alpha beta" "gamma delta""#,
+        r#""alpha beta" epsilon -"gamma delta""#,
+    ] {
+        for k in [3, 10] {
+            assert_matches_oracle(&r, &oracle, query, BoolMode::Or, k).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unranked_ids_and_count_agree_with_oracle() {
+    // The unranked walk (`token_match` / `count`) is a separate spine
+    // from ranked search and must never prune: every verified match
+    // counts. Pin its ids and count against the oracle's full match
+    // set for both combination modes.
+    let owned = build_multi_block_corpus();
+    let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile_positional(&refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&refs, tok.as_ref());
+
+    let alpha_beta = || vec![vec!["alpha".to_string(), "beta".to_string()]];
+    let shapes: Vec<(Vec<&str>, Vec<Vec<String>>)> = vec![
+        (vec![], alpha_beta()),
+        (vec!["gamma"], alpha_beta()),
+        (
+            vec![],
+            vec![
+                vec!["alpha".to_string(), "beta".to_string()],
+                vec!["gamma".to_string(), "delta".to_string()],
+            ],
+        ),
+    ];
+    for (terms, phrases) in shapes {
+        for mode in [BoolMode::And, BoolMode::Or] {
+            let owned_terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+            // Under And the atoms are all musts; under Or all shoulds.
+            let (musts, must_ph, shoulds, should_ph) = match mode {
+                BoolMode::And => (owned_terms.clone(), phrases.clone(), vec![], vec![]),
+                BoolMode::Or => (vec![], vec![], owned_terms.clone(), phrases.clone()),
+            };
+            let want: HashSet<u64> = oracle
+                .top_k_atoms(&musts, &must_ph, &shoulds, &should_ph, &[], &[], refs.len())
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+
+            let ids = r
+                .atoms_match_ids("title", &terms, &phrases, mode)
+                .await
+                .expect("atoms_match_ids");
+            let got: HashSet<u64> = ids.into_iter().map(u64::from).collect();
+            assert_eq!(
+                got, want,
+                "unranked ids disagree ({terms:?} + {phrases:?}, {mode:?})"
+            );
+
+            let count = r
+                .atoms_match_count("title", &terms, &phrases, mode)
+                .await
+                .expect("atoms_match_count");
+            assert_eq!(
+                count as usize,
+                want.len(),
+                "unranked count disagrees ({terms:?} + {phrases:?}, {mode:?})"
+            );
+        }
+    }
+}
+
