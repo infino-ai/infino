@@ -47,6 +47,7 @@ use std::{
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     error::BuildError,
@@ -68,7 +69,10 @@ use crate::{
         fts::tokenize::Tokenizer,
         vector::layout::VectorLayout,
     },
-    supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
+    supertable::{
+        manifest::{UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy},
+        slow_vector_state::CentroidSection,
+    },
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -335,6 +339,17 @@ pub struct SupertableOptions {
     /// that bounds the mmap resident set, this bounds anonymous heap. See
     /// [`crate::memory`].
     pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// Single-slot cache for the slow-CAS centroid-section spill, shared by
+    /// every manifest snapshot of this table handle and keyed by the
+    /// section's content-addressed URI (a new drain generation replaces
+    /// it). Serves the stripped-summary admit rescore from a local
+    /// temp-file spill instead of per-cell object-store reads.
+    pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the user table's fp32 fine centroids, hydrated
+    /// once per manifest generation from the FULL manifest parts on the
+    /// first stripped-summary rescore (consumers open with routing parts,
+    /// which carry no fp32). Keyed by `manifest_id`.
+    pub(crate) user_centroid_cache: Arc<TokioMutex<Option<Arc<UserCentroidCache>>>>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -464,6 +479,28 @@ pub struct SupertableOptions {
     /// the application never refreshes by hand. Default:
     /// [`Consistency::BoundedStaleness`] with a 1s window.
     pub read_consistency: Consistency,
+    /// Read-only-consumer memory mode for per-superfile vector summaries:
+    /// when `true`, manifest hydration derives the 1-bit admit slab +
+    /// norms from each summary's fp32 fine centroids and then drops the
+    /// fp32 vectors from memory. The exact admit rescore reads centroid
+    /// regions from the superfiles through the attached disk cache
+    /// instead (mmap-served warm, range-GET on first touch).
+    ///
+    /// **Read-only handles only.** Writer paths re-encode resident
+    /// summaries back to storage (slow-state blob republish on hidden
+    /// commits / drain checkpoints, latest-part rewrites) — a handle
+    /// that commits with this set would persist empty centroids; the
+    /// encode path asserts against that. Grid (routing) centroids and
+    /// summary `counts` stay resident regardless. Default `false`.
+    pub summary_centroids_from_superfiles: bool,
+    /// Per-table override for the **user** grid's cell count (trained at
+    /// the first commit and stamped into the manifest; changing it later
+    /// affects new tables only). `None` → `vector.user_cell_count` from
+    /// the YAML config.
+    pub user_cell_count: Option<usize>,
+    /// Per-table override for the **hidden** vector-index grid's cell
+    /// count. `None` → `vector.hidden_cell_count` from the YAML config.
+    pub hidden_cell_count: Option<usize>,
 }
 
 impl SupertableOptions {
@@ -597,6 +634,8 @@ impl SupertableOptions {
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
+            centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             vector_layout: VectorLayout::Ivf,
@@ -610,6 +649,9 @@ impl SupertableOptions {
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
+            summary_centroids_from_superfiles: false,
+            user_cell_count: None,
+            hidden_cell_count: None,
         })
     }
 
@@ -849,6 +891,26 @@ impl SupertableOptions {
     /// `true`. See [`Self::verify_crc_on_open`].
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
         self.verify_crc_on_open = v;
+        self
+    }
+
+    /// Read-only-consumer memory mode: derive the 1-bit admit slab at
+    /// hydration and drop summary fp32 fine centroids from memory; the
+    /// exact admit rescore reads superfile centroid regions through the
+    /// disk cache instead. See
+    /// [`Self::summary_centroids_from_superfiles`].
+    pub fn with_summary_centroids_from_superfiles(mut self, v: bool) -> Self {
+        self.summary_centroids_from_superfiles = v;
+        self
+    }
+
+    /// Per-table cell counts for the user and hidden vector grids,
+    /// overriding the YAML config's `vector.user_cell_count` /
+    /// `vector.hidden_cell_count`. Grids are trained at the first commit
+    /// and stamped into the manifest, so this only affects table create.
+    pub fn with_vector_cell_counts(mut self, user: usize, hidden: usize) -> Self {
+        self.user_cell_count = Some(user);
+        self.hidden_cell_count = Some(hidden);
         self
     }
 

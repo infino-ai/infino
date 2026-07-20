@@ -53,6 +53,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     live.insert(manifest_uri(manifest.manifest_id));
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
+        if let Some(routing) = &entry.routing {
+            live.insert(routing.uri.clone());
+        }
     }
     let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
         for sf in superfiles {
@@ -62,11 +65,15 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     } else {
         false
     };
-    // Slow-CAS entry blob: the URI is read straight off the manifest-list
-    // ref — sync, no fetch. Superseded blobs (older drains) are absent from
-    // the current list and get swept once past the safety gap.
+    // Slow-CAS objects (routing-shaped state blob + fp32 centroid
+    // section): the URIs are read straight off the manifest-list refs —
+    // sync, no fetch. Superseded generations (older drains) are absent
+    // from the current list and get swept once past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
+    }
+    if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
+        live.insert(centroids.uri.clone());
     }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
@@ -181,7 +188,9 @@ mod tests {
             SupertableOptions,
             manifest::{
                 ManifestSnapshot, SuperfileEntry, SuperfileUri,
-                list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
+                list::{
+                    FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
+                },
                 part::{ContentHash, PartId},
             },
             slow_vector_state,
@@ -265,6 +274,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_centroids: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -272,6 +282,7 @@ mod tests {
                     size_bytes_compressed: 1,
                     size_bytes_uncompressed: 1,
                     content_hash: ContentHash::of(b"part"),
+                    routing: None,
                     id_range: (0, 0),
                     scalar_stats_agg: HashMap::new(),
                     fts_summary_agg: Default::default(),
@@ -305,6 +316,8 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
+        let section_hash = ContentHash::of(b"slow state centroid section");
+        let section_uri = slow_vector_state::storage_path(&section_hash);
         let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
         let manifest = ManifestSnapshot::new(
             TEST_MANIFEST_ID,
@@ -330,12 +343,20 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: Some(uri.clone()),
                 slow_vector_state_content_hash: Some(hash),
+                slow_vector_state_centroids: Some(RoutingRef {
+                    uri: section_uri.clone(),
+                    content_hash: section_hash,
+                }),
                 parts: Vec::new(),
             }),
         );
         let (live, superfiles_complete) = build_live_set(&manifest);
         assert!(superfiles_complete);
         assert!(live.contains(&uri), "referenced blob must be live");
+        assert!(
+            live.contains(&section_uri),
+            "referenced centroid section must be live"
+        );
         assert!(
             !live.contains(&orphan),
             "unreferenced blob must be sweepable"

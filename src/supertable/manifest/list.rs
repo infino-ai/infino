@@ -143,6 +143,15 @@ pub struct Manifest {
     /// never on table kind.
     pub slow_vector_state_uri: Option<String>,
     pub slow_vector_state_content_hash: Option<ContentHash>,
+    /// Centroid-section sibling: every visible entry's fp32 fine centroids
+    /// concatenated contiguously in `(entry, column, cell)` order. The
+    /// stripped-summary admit rescore hydrates it in one fetch on the
+    /// first cold query (NVMe-spilled, page-cache-evictable) instead of
+    /// fanning one block GET per shortlisted cell per query — measured 53
+    /// then 43 GETs on the first two post-drain cold queries at 1M/256.
+    /// Stamped and cleared together with the full ref; absent on older
+    /// manifests (consumers fall back to per-superfile centroid reads).
+    pub slow_vector_state_centroids: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -159,6 +168,17 @@ pub struct Manifest {
     /// readers skip the storage GET entirely. Entries are dropped when
     /// their superfile leaves the manifest (compaction/removal).
     pub tombstone_seqs: BTreeMap<Uuid, u64>,
+}
+
+/// Content-addressed reference to a sibling object of a manifest
+/// artifact: a manifest part's routing form ([`ManifestPartEntry::routing`],
+/// same entries with each vector summary's cluster blocks encoded as
+/// counts + 1-bit admit slab, no fp32 payload) or the slow-CAS centroid
+/// section ([`Manifest::slow_vector_state_centroids`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRef {
+    pub uri: String,
+    pub content_hash: ContentHash,
 }
 
 /// Global vector cell-index state owned by the user-table manifest (see
@@ -375,6 +395,13 @@ pub struct ManifestPartEntry {
     pub size_bytes_compressed: u64,
     pub size_bytes_uncompressed: u64,
     pub content_hash: ContentHash,
+    /// Routing-only sibling of this part (same entries, vector summaries
+    /// as counts + 1-bit admit slab, no fp32). Consumer opens with
+    /// `summary_centroids_from_superfiles` load it instead of `uri` —
+    /// the user table's fp32 fine centroids stay in storage. Absent on
+    /// parts written before the sibling existed (loads fall back to the
+    /// full part).
+    pub routing: Option<RoutingRef>,
     /// Aggregate id range across this part's superfiles. `i128`
     /// matches the supertable-injected `_id` column type
     /// (`Decimal128(38, 0)`); signed-int comparison gives
@@ -1023,6 +1050,10 @@ struct ManifestDto {
     slow_vector_state_uri: Option<String>,
     #[serde(default)]
     slow_vector_state_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1149,6 +1180,10 @@ struct ManifestPartEntryDto {
     size_bytes_compressed: u64,
     size_bytes_uncompressed: u64,
     content_hash: String, // "blake3:<hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_content_hash: Option<String>, // "blake3:<hex>"
     // i128 stringified as decimal — JSON numbers are bounded
     // to f64 precision (~53 bits) so we can't round-trip a
     // 128-bit value as a JSON number without loss. Decimal
@@ -1275,6 +1310,8 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
         size_bytes_compressed: e.size_bytes_compressed,
         size_bytes_uncompressed: e.size_bytes_uncompressed,
         content_hash: encode_hash(&e.content_hash),
+        routing_uri: e.routing.as_ref().map(|r| r.uri.clone()),
+        routing_content_hash: e.routing.as_ref().map(|r| encode_hash(&r.content_hash)),
         id_range: (e.id_range.0.to_string(), e.id_range.1.to_string()),
         scalar_stats_agg,
         fts_summary_agg: e
@@ -1394,6 +1431,15 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
         size_bytes_compressed: d.size_bytes_compressed,
         size_bytes_uncompressed: d.size_bytes_uncompressed,
         content_hash,
+        // Require both halves, mirroring the slow-state routing ref: a
+        // part carrying only one is treated as having no sibling.
+        routing: match (d.routing_uri, d.routing_content_hash.as_deref()) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
         id_range: {
             let lo =
                 d.id_range.0.parse::<i128>().map_err(|_| {
@@ -1533,6 +1579,14 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
         slow_vector_state_uri: l.slow_vector_state_uri.clone(),
         slow_vector_state_content_hash: l.slow_vector_state_content_hash.as_ref().map(encode_hash),
+        slow_vector_state_centroids_uri: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| r.uri.clone()),
+        slow_vector_state_centroids_content_hash: l
+            .slow_vector_state_centroids
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1609,6 +1663,19 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             .as_deref()
             .map(decode_hash)
             .transpose()?,
+        // Require both halves: a manifest carrying only one is treated as
+        // having no section (consumers fall back to per-superfile reads)
+        // rather than failing the whole list decode.
+        slow_vector_state_centroids: match (
+            d.slow_vector_state_centroids_uri,
+            d.slow_vector_state_centroids_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
         parts,
         tombstone_seqs: d
             .tombstone_seqs
@@ -2204,6 +2271,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![],
         }
     }
@@ -2259,6 +2327,12 @@ mod tests {
             size_bytes_compressed: 10_485_760,
             size_bytes_uncompressed: 26_214_400,
             content_hash: ContentHash([seed; 32]),
+            // Alternate present/absent so the round-trip covers both the
+            // stamped sibling and the pre-sibling (legacy) shape.
+            routing: (seed % 2 == 1).then(|| RoutingRef {
+                uri: format!("manifests/part-{seed:02x}-routing.avro.zst"),
+                content_hash: ContentHash([seed ^ 0xff; 32]),
+            }),
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
@@ -2306,6 +2380,7 @@ mod tests {
             "size_bytes_uncompressed"
         );
         assert_eq!(a.content_hash, b.content_hash, "content_hash");
+        assert_eq!(a.routing, b.routing, "routing");
         assert_eq!(a.id_range, b.id_range, "id_range");
         assert_eq!(a.scalar_stats_agg, b.scalar_stats_agg, "scalar_stats_agg");
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");
@@ -2465,6 +2540,10 @@ mod tests {
         let mut list = empty_list();
         list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
         list.slow_vector_state_content_hash = Some(ContentHash([7u8; 32]));
+        list.slow_vector_state_centroids = Some(RoutingRef {
+            uri: "slow-vector-state/state-def.centroids.bin".into(),
+            content_hash: ContentHash([8u8; 32]),
+        });
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.slow_vector_state_uri, list.slow_vector_state_uri);
@@ -2472,12 +2551,23 @@ mod tests {
             decoded.slow_vector_state_content_hash,
             list.slow_vector_state_content_hash
         );
+        assert_eq!(
+            decoded.slow_vector_state_centroids,
+            list.slow_vector_state_centroids
+        );
         // Absent by default (user tables and old manifests without the field).
         let plain = empty_list();
         let bytes = encode(&plain).expect("encode");
+        assert!(
+            !from_utf8(&bytes)
+                .expect("utf8")
+                .contains("slow_vector_state_centroids"),
+            "absent section ref must not serialize null fields"
+        );
         let decoded = decode(&bytes).expect("decode");
         assert!(decoded.slow_vector_state_uri.is_none());
         assert!(decoded.slow_vector_state_content_hash.is_none());
+        assert!(decoded.slow_vector_state_centroids.is_none());
     }
 
     /// A slow-state hash that isn't `blake3:<64hex>` is rejected with

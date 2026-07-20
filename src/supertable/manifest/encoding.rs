@@ -47,7 +47,8 @@ use thiserror::Error;
 use crate::{
     superfile::vector::distance::decode_f32_le_vec,
     supertable::manifest::{
-        CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary,
+        ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
+        VectorSummary,
         bloom::Bloom,
         list::{ScalarStatsAgg, ScalarValueCounts},
     },
@@ -55,6 +56,26 @@ use crate::{
 
 /// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
 const CLUSTER_CENTROIDS_WIRE_FP32: u32 = 0x3233_4643;
+/// Wire tag for a routing-only summary block (`b"CFR0"`): counts plus
+/// the 1-bit admit slab, **no fp32 payload**. Written only into routing
+/// sibling artifacts that consumer opens fetch instead of the full form;
+/// decodes into the stripped in-memory shape (`vectors_resident()` =
+/// false), so exact scans read the superfile centroid regions.
+const CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY: u32 = 0x3052_4643;
+
+/// Which form of each summary cell's cluster block goes on the wire.
+///
+/// `Full` is the durable commit form (plain fp32, no slab — hydration
+/// prewarm rebuilds slabs from fp32). `RoutingOnly` is the consumer-open
+/// sibling: same entries, but every cluster block that carries a built
+/// admit slab is written as [`CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY`] —
+/// cells without a slab (degenerate dim mismatch) fall back to the full
+/// form so the sibling is always decodable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryWireMode {
+    Full,
+    RoutingOnly,
+}
 
 /// Errors from the per-summary binary decoders.
 ///
@@ -575,6 +596,19 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
+    // A summary whose fp32 was dropped (`summary_centroids_from_superfiles`,
+    // read-only consumer memory mode) must never reach the wire: the
+    // slow-state blob and manifest parts are re-encoded from these resident
+    // structs, so persisting empty centroids would corrupt routing state
+    // for every future open. Fail loudly instead — only writer handles
+    // (which must keep the mode off) encode summaries.
+    assert!(
+        cl.centroids.len() == nc * cd,
+        "encode_cluster_centroids on a stripped summary ({} of {} fp32 values); \
+         writer handles must not enable summary_centroids_from_superfiles",
+        cl.centroids.len(),
+        nc * cd,
+    );
     let body = nc * cd;
     let mut out = Vec::with_capacity(12 + nc * 4 + body * 4);
     out.extend_from_slice(&cl.n_cent.to_le_bytes());
@@ -589,6 +623,41 @@ pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     out
 }
 
+/// Append the packed 1-bit admit slab (rot seed, word width, codes,
+/// norms) — the tail of the `CFR0` routing wire form.
+fn append_admit_slab(out: &mut Vec<u8>, admit: &RabitqAdmitCodes) {
+    out.extend_from_slice(&admit.rot_seed.to_le_bytes());
+    out.extend_from_slice(&(admit.words_per_code as u32).to_le_bytes());
+    for &word in &admit.codes {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for &norm in &admit.norms {
+        out.extend_from_slice(&norm.to_le_bytes());
+    }
+}
+
+/// Routing-only encoder (`CFR0`): counts plus the admit slab, no fp32
+/// payload. Reads only the slab and counts, so it works from both full
+/// and stripped instances. A cell without a built slab (degenerate dim
+/// mismatch — the prewarm skips those) falls back to the plain fp32
+/// form so the artifact stays decodable everywhere.
+pub(crate) fn encode_cluster_centroids_routing(cl: &ClusterCentroids) -> Vec<u8> {
+    let Some(admit) = cl.admit_codes_built() else {
+        return encode_cluster_centroids(cl);
+    };
+    let nc = cl.n_cent as usize;
+    let mut out =
+        Vec::with_capacity(12 + nc * 4 + 12 + admit.codes.len() * 8 + admit.norms.len() * 4);
+    out.extend_from_slice(&cl.n_cent.to_le_bytes());
+    out.extend_from_slice(&cl.dim.to_le_bytes());
+    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY.to_le_bytes());
+    for &c in &cl.counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    append_admit_slab(&mut out, admit);
+    out
+}
+
 pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, DecodeError> {
     let mut c = Cursor::new(bytes);
     let n_cent = read_u32(&mut c, "cluster_n_cent")? as usize;
@@ -599,41 +668,86 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     }
 
     let tag = read_u32(&mut c, "cluster_wire_tag")?;
-    if tag != CLUSTER_CENTROIDS_WIRE_FP32 {
+    if tag != CLUSTER_CENTROIDS_WIRE_FP32 && tag != CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY {
         return Err(DecodeError::InvalidVectorSummary(format!(
-            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x}"
+            "cluster centroids wire tag {tag:#010x}, want {CLUSTER_CENTROIDS_WIRE_FP32:#010x} \
+             or {CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY:#010x}"
         )));
     }
 
     let counts_b = view_n(&mut c, n_cent * 4, "cluster_counts")?;
     let counts: Vec<u32> = counts_b
         .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .map(|b| u32::from_le_bytes(b.try_into().expect("chunks_exact(4) yields 4-byte slices")))
         .collect();
 
-    // n_cent * cdim can't overflow usize on 64-bit (both are u32), but the
-    // *4 byte size can — check the whole chain so a crafted header errors
-    // rather than wrapping to a short read (silent truncation).
-    let body_bytes = n_cent
-        .checked_mul(cdim)
-        .and_then(|body| body.checked_mul(4))
+    if tag == CLUSTER_CENTROIDS_WIRE_FP32 {
+        // n_cent * cdim can't overflow usize on 64-bit (both are u32), but
+        // the *4 byte size can — check the whole chain so a crafted header
+        // errors rather than wrapping to a short read (silent truncation).
+        let body_bytes = n_cent
+            .checked_mul(cdim)
+            .and_then(|body| body.checked_mul(4))
+            .ok_or_else(|| {
+                DecodeError::InvalidVectorSummary(format!(
+                    "cluster centroids byte size overflow: n_cent={n_cent} dim={cdim}"
+                ))
+            })?;
+        let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
+        let centroids = decode_f32_le_vec(centroids_b);
+        return Ok(ClusterCentroids::from_decoded(
+            n_cent as u32,
+            cdim as u32,
+            centroids,
+            counts,
+        ));
+    }
+
+    // Routing-only block (`CFR0`): no fp32 payload on the wire. The
+    // instance decodes into the stripped shape; exact scans read the
+    // slow-CAS centroid section (hidden) or full parts (user) instead.
+
+    let rot_seed = read_u64(&mut c, "admit_rot_seed")?;
+    let words_per_code = read_u32(&mut c, "admit_words_per_code")? as usize;
+    // Reject a header whose word width disagrees with the declared dim —
+    // scoring would slice the code slab at the wrong stride.
+    let expected_words = cdim.div_ceil(ADMIT_CODE_WORD_BITS);
+    if words_per_code != expected_words {
+        return Err(DecodeError::InvalidVectorSummary(format!(
+            "admit slab words_per_code {words_per_code}, want {expected_words} for dim {cdim}"
+        )));
+    }
+    let codes_bytes = n_cent
+        .checked_mul(words_per_code)
+        .and_then(|words| words.checked_mul(8))
         .ok_or_else(|| {
             DecodeError::InvalidVectorSummary(format!(
-                "cluster centroids byte size overflow: n_cent={n_cent} dim={cdim}"
+                "admit slab byte size overflow: n_cent={n_cent} words_per_code={words_per_code}"
             ))
         })?;
-    let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
-    let centroids = decode_f32_le_vec(centroids_b);
+    let codes_b = view_n(&mut c, codes_bytes, "admit_codes")?;
+    let codes: Vec<u64> = codes_b
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().expect("chunks_exact(8) yields 8-byte slices")))
+        .collect();
+    let norms_b = view_n(&mut c, n_cent * 4, "admit_norms")?;
+    let norms = decode_f32_le_vec(norms_b);
+    let admit = RabitqAdmitCodes {
+        rot_seed,
+        words_per_code,
+        codes,
+        norms,
+    };
 
-    Ok(ClusterCentroids::from_decoded(
+    Ok(ClusterCentroids::from_decoded_routing(
         n_cent as u32,
         cdim as u32,
-        centroids,
         counts,
+        admit,
     ))
 }
 
-pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
+pub fn encode_vector_summary(s: &VectorSummary, mode: SummaryWireMode) -> Vec<u8> {
     let dim = s.centroid.len();
     let mut out = Vec::new();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
@@ -643,7 +757,10 @@ pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     out.extend_from_slice(&(s.cells.len() as u32).to_le_bytes());
     for cell in &s.cells {
         out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
-        let encoded = encode_cluster_centroids(&cell.clusters);
+        let encoded = match mode {
+            SummaryWireMode::Full => encode_cluster_centroids(&cell.clusters),
+            SummaryWireMode::RoutingOnly => encode_cluster_centroids_routing(&cell.clusters),
+        };
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         out.extend_from_slice(&encoded);
     }
@@ -714,14 +831,17 @@ pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary
     Ok(out)
 }
 
-pub fn encode_vector_summary_map(map: &HashMap<String, VectorSummary>) -> Vec<u8> {
+pub fn encode_vector_summary_map(
+    map: &HashMap<String, VectorSummary>,
+    mode: SummaryWireMode,
+) -> Vec<u8> {
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     let mut out = Vec::new();
     out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     for k in keys {
         let key_bytes = k.as_bytes();
-        let value_bytes = encode_vector_summary(&map[k]);
+        let value_bytes = encode_vector_summary(&map[k], mode);
         out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(key_bytes);
         out.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
@@ -754,7 +874,16 @@ pub fn decode_vector_summary_map(
 
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
     let b = view_n(c, 4, what)?;
-    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    Ok(u32::from_le_bytes(
+        b.try_into().expect("view_n(4) yields a 4-byte slice"),
+    ))
+}
+
+fn read_u64(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u64, DecodeError> {
+    let b = view_n(c, 8, what)?;
+    Ok(u64::from_le_bytes(
+        b.try_into().expect("view_n(8) yields an 8-byte slice"),
+    ))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
@@ -1288,7 +1417,7 @@ mod decode_error_tests {
 
 #[cfg(test)]
 mod vector_summary_tests {
-    use super::{decode_vector_summary, encode_vector_summary};
+    use super::{SummaryWireMode, decode_vector_summary, encode_vector_summary};
     use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
 
     #[test]
@@ -1312,7 +1441,8 @@ mod vector_summary_tests {
             }],
         };
 
-        let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
         assert_eq!(got.centroid, s.centroid);
         assert_eq!(got.cells[0].cell_id, Some(7));
         assert_eq!(got.cells[0].clusters.n_cent, n_cent);
@@ -1334,8 +1464,198 @@ mod vector_summary_tests {
             centroid: vec![0.5, -0.5],
             cells: Vec::new(),
         };
-        let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
         assert_eq!(got.centroid, s.centroid);
         assert!(got.cells.is_empty());
+    }
+
+    /// A stripped summary (read-only consumer memory mode) must never be
+    /// re-serialized — silently persisting empty centroids would corrupt
+    /// the slow-state blob / manifest part for every future open.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_stripped_summary_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let _ = super::encode_cluster_centroids(&clusters);
+    }
+
+    /// Same guard on the summary-wire path (the encoder a real part /
+    /// slow-blob write goes through): a stripped instance carries a slab
+    /// but no fp32, and must fail loudly rather than serialize short.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_vector_summary_on_stripped_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let s = VectorSummary {
+            centroid: vec![0.0; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(1),
+                clusters,
+            }],
+        };
+        let _ = encode_vector_summary(&s, SummaryWireMode::Full);
+    }
+
+    /// One wire home per byte: the FULL form carries fp32 only (no slab —
+    /// hydration prewarm rebuilds writer-side slabs), the ROUTING form
+    /// carries the slab only, and a write-time slab round-trips bit-exact
+    /// through the routing wire.
+    #[test]
+    fn round_trips_admit_slab_alongside_centroids() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 32;
+        const ROT_SEED: u64 = 7;
+        let n_cent = 3u32;
+        let mut centroids = vec![0.0f32; 3 * DIM];
+        centroids[0] = 1.0;
+        centroids[DIM + 4] = 1.0;
+        centroids[2 * DIM + 9] = -1.0;
+        let counts = vec![5u32, 0, 7];
+        let clusters = ClusterCentroids::from_fp32(n_cent, DIM as u32, &centroids, counts.clone());
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let expected_slab = clusters
+            .admit_codes_built()
+            .expect("slab built at write time")
+            .clone();
+        let s = VectorSummary {
+            centroid: vec![0.25; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(3),
+                clusters,
+            }],
+        };
+
+        let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
+            .expect("decode");
+        let decoded = &got.cells[0].clusters;
+        assert_eq!(decoded.centroids, centroids, "fp32 must survive");
+        assert_eq!(decoded.counts, counts);
+        assert!(
+            decoded.admit_codes_built().is_none(),
+            "the FULL wire form must not carry a slab — its only wire home is the routing form"
+        );
+
+        let routing =
+            decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::RoutingOnly))
+                .expect("decode routing");
+        let routing_decoded = &routing.cells[0].clusters;
+        assert!(
+            !routing_decoded.vectors_resident(),
+            "routing form sheds fp32"
+        );
+        assert_eq!(
+            *routing_decoded
+                .admit_codes_built()
+                .expect("routing decode must seed the admit slab"),
+            expected_slab,
+            "persisted slab must round-trip bit-exact through the routing wire"
+        );
+    }
+
+    /// Routing-only wire form: no fp32 on the wire; decode lands in the
+    /// stripped shape with counts and the slab intact — the same state a
+    /// hydration-time strip produces, so the query path needs no cases.
+    #[test]
+    fn routing_only_round_trips_stripped_with_slab() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 32;
+        const ROT_SEED: u64 = 7;
+        let n_cent = 3u32;
+        let mut centroids = vec![0.0f32; 3 * DIM];
+        centroids[1] = 1.0;
+        centroids[DIM + 5] = -1.0;
+        centroids[2 * DIM + 8] = 1.0;
+        let counts = vec![4u32, 9, 0];
+        let clusters = ClusterCentroids::from_fp32(n_cent, DIM as u32, &centroids, counts.clone());
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let expected_slab = clusters.admit_codes_built().expect("slab").clone();
+        let s = VectorSummary {
+            centroid: vec![0.5; DIM],
+            cells: vec![CellVectorSummary {
+                cell_id: Some(11),
+                clusters,
+            }],
+        };
+
+        let full = encode_vector_summary(&s, SummaryWireMode::Full);
+        let routing = encode_vector_summary(&s, SummaryWireMode::RoutingOnly);
+        assert!(
+            routing.len() < full.len() - n_cent as usize * DIM * 4 / 2,
+            "routing form must shed the fp32 payload ({} vs {} bytes)",
+            routing.len(),
+            full.len()
+        );
+
+        let got = decode_vector_summary(&routing).expect("decode routing");
+        let decoded = &got.cells[0].clusters;
+        assert_eq!(got.centroid, s.centroid, "summary centroid survives");
+        assert_eq!(decoded.n_cent, n_cent);
+        assert_eq!(decoded.dim, DIM as u32);
+        assert_eq!(decoded.counts, counts);
+        assert!(
+            !decoded.vectors_resident(),
+            "routing decode must land in the stripped shape"
+        );
+        assert_eq!(
+            *decoded.admit_codes_built().expect("slab seeded"),
+            expected_slab,
+            "slab must round-trip bit-exact through the routing form"
+        );
+    }
+
+    /// A cell without a built slab can't be written routing-only; the
+    /// encoder falls back to the full form so the artifact stays decodable.
+    #[test]
+    fn routing_only_falls_back_to_full_without_slab() {
+        let (n_cent, dim) = (2u32, 4u32);
+        let centroids = vec![0.25f32; 8];
+        let counts = vec![3u32, 1];
+        let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
+        let s = VectorSummary {
+            centroid: vec![0.0; 4],
+            cells: vec![CellVectorSummary {
+                cell_id: None,
+                clusters,
+            }],
+        };
+        let routing = encode_vector_summary(&s, SummaryWireMode::RoutingOnly);
+        let got = decode_vector_summary(&routing).expect("decode fallback");
+        assert_eq!(
+            got.cells[0].clusters.centroids, centroids,
+            "fallback must carry the fp32 payload"
+        );
     }
 }

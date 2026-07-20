@@ -184,6 +184,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         deleted_user_ids_inline: None,
         slow_vector_state_uri: None,
         slow_vector_state_content_hash: None,
+        slow_vector_state_centroids: None,
         parts,
     }
 }
@@ -203,6 +204,7 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         size_bytes_compressed: size_bytes,
         size_bytes_uncompressed: size_bytes,
         content_hash: hash,
+        routing: None,
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),

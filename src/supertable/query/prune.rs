@@ -319,6 +319,7 @@ mod tests {
             size_bytes_compressed: 1,
             size_bytes_uncompressed: 1,
             content_hash: ContentHash([seed; 32]),
+            routing: None,
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
@@ -345,6 +346,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts,
         }
     }

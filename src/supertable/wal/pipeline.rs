@@ -72,8 +72,8 @@ use crate::{
         ManifestSnapshot, SupertableOptions,
         handle::{Supertable, SupertableInner},
         manifest::{
-            CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry,
-            SuperfileUri, VectorSummary, bloom::BloomBuilder,
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+            bloom::BloomBuilder,
         },
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
@@ -87,8 +87,8 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_subsection_offsets, persist_commit,
-            read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            CommitListMetadata, build_column_vector_summary, build_subsection_offsets,
+            persist_commit, read_vector_layout_from_bytes, stamp_tombstone_seqs,
         },
     },
 };
@@ -595,9 +595,9 @@ fn build_fts_summary(
     out
 }
 
-/// Per-vector-column centroid summary. `None` from the
-/// reader → column absent from this superfile's vector blob → no
-/// entry in the summary map.
+/// Per-vector-column centroid summary (fp32 + 1-bit admit slab; see
+/// [`build_column_vector_summary`]). `None` from the reader → column
+/// absent from this superfile's vector blob → no entry in the map.
 fn build_vector_summary(
     reader: &SuperfileReader,
     options: &SupertableOptions,
@@ -607,17 +607,8 @@ fn build_vector_summary(
         return out;
     };
     for vc in &options.vector_columns {
-        if let Some(centroid) = vec_reader.summary(&vc.column) {
-            let cells = vec_reader
-                .cluster_centroids_by_cell(&vc.column)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
-                    cell_id,
-                    clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
-                })
-                .collect();
-            out.insert(vc.column.clone(), VectorSummary { centroid, cells });
+        if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
+            out.insert(vc.column.clone(), summary);
         }
     }
     out

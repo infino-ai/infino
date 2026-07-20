@@ -38,6 +38,7 @@ pub mod term_range;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
+    f32::consts::PI,
     fmt,
     ops::Deref,
     sync::{Arc, OnceLock},
@@ -52,8 +53,8 @@ use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg};
-use rayon::prelude::*;
+pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
+use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -61,12 +62,18 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::vector::{
-        distance::{
-            Metric, all_centroid_scores_transposed, distance, nearest_k_centroids_transposed,
-            transpose_centroids_cluster_major,
+    superfile::{
+        builder::VectorConfig,
+        vector::{
+            distance::{
+                COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
+                distance, dot, insert_ranked, nearest_k_centroids_transposed,
+                transpose_centroids_cluster_major,
+            },
+            layout::VectorLayout,
+            quant::BitQuantizer,
+            rotation::RandomRotation,
         },
-        layout::VectorLayout,
     },
     supertable::{
         CommitError,
@@ -77,6 +84,7 @@ use crate::{
                 translate_contention, write_manifest, write_part_bytes, write_pointer,
             },
             disk_cache::ManifestDiskCache,
+            encoding::SummaryWireMode,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
@@ -421,6 +429,7 @@ impl ManifestSnapshot {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts,
             tombstone_seqs,
         }
@@ -649,11 +658,15 @@ impl ManifestSnapshot {
             });
         }
 
-        // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new_with_cache(
+        // 3. Build the loader, superfiles & parts. Consumer memory mode
+        //    loads each part's routing sibling (counts + 1-bit slab, no
+        //    fp32) when the list stamps one — the user table's centroid
+        //    payload stays in storage, mirroring the slow-blob sibling.
+        let loader = Arc::new(ManifestPartLoader::new_with_cache_and_mode(
             Arc::clone(&storage),
             &list,
             options.manifest_disk_cache.clone(),
+            options.summary_centroids_from_superfiles,
         ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -700,6 +713,7 @@ impl ManifestSnapshot {
         // or agree with the list, that is corruption and the load fails
         // loudly. The part fan below serves only manifests without a ref
         // (the user table always; the hidden table mid-maintenance).
+        let entries_reused = reused.is_some();
         let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match reused {
             Some(entries) => Some(entries),
             None => match (
@@ -707,6 +721,10 @@ impl ManifestSnapshot {
                 list.slow_vector_state_content_hash,
             ) {
                 (Some(uri), Some(hash)) => {
+                    // Two-object model: the primary blob is routing-shaped
+                    // (counts + 1-bit admit slab, no fp32 — GiBs → MiBs at
+                    // 100M docs) and EVERYONE hydrates from it; exact
+                    // centroid scores come from the section.
                     let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
                         .await
                         .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
@@ -822,6 +840,51 @@ impl ManifestSnapshot {
                     parts.insert(entry.part_id, Arc::new(OnceCell::new()));
                 }
             }
+        }
+
+        // HIDDEN manifests (VectorCell partitioning) never hold summary
+        // fp32 in RAM — the two-object slow-CAS model stores it once, in
+        // the centroid section, and every exact rescore (consumer or
+        // maintenance) reads from there. New-era blobs decode straight
+        // into the stripped shape (routing wire); this pass covers legacy
+        // full-form blobs and inherited entries so the resident shape is
+        // uniform regardless of what was fetched. Unconditional — not
+        // knob-gated: hidden fine fp32 is the residency pig (~620 MB at
+        // 100M). User-table summaries stay resident — they are small
+        // (~100 MB at 100M, per-fragment cells), and stripping them
+        // forced pre-drain and filtered routing onto 1-bit estimates,
+        // which measured filtered recall 0.722 against the 0.95 bar.
+        // Grid centroids in the list are untouched.
+        // Skip when the entry list was reused from the current manifest:
+        // those `Arc`s were stripped and prewarmed by the load that first
+        // produced them, and this path also runs on the strong-consistency
+        // refresh (query hot path), where a re-walk buys nothing. For fresh
+        // entries the strip + slab encode is a CPU wave (rotation +
+        // sign-pack per fine centroid, ~1.4 s single-threaded at 100M), so
+        // it runs on the blocking pool — not inline on a runtime worker.
+        if !entries_reused {
+            let strip = matches!(
+                list.partition_strategy,
+                PartitionStrategy::VectorCell { .. }
+            );
+            let vector_columns = options.vector_columns.clone();
+            let pool = Arc::clone(&options.reader_pool);
+            let mut entries = all_superfiles;
+            let prewarm = move || {
+                if strip {
+                    strip_summary_centroids(&mut entries, &vector_columns);
+                }
+                prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
+                entries
+            };
+            all_superfiles = match spawn_blocking(prewarm).await {
+                Ok(entries) => entries,
+                Err(join_error) => {
+                    return Err(ManifestLoadError::SlowStateHydration(format!(
+                        "admit slab prewarm task failed: {join_error}"
+                    )));
+                }
+            };
         }
 
         let mut new_superfile_list = SuperfileList::empty(options.clone());
@@ -1078,6 +1141,14 @@ impl ManifestSnapshot {
         ))
     }
 
+    /// Centroid-section sibling of the slow-CAS blob (contiguous fp32 fine
+    /// centroids in `(entry, column, cell)` order) — the stripped-summary
+    /// admit rescore hydrates it once instead of fanning per-cell superfile
+    /// reads. `None` on manifests written before the sibling existed.
+    pub(crate) fn slow_vector_state_centroids_blob(&self) -> Option<&RoutingRef> {
+        self.list.as_ref()?.slow_vector_state_centroids.as_ref()
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
     /// without touching superfiles or parts.
@@ -1115,13 +1186,19 @@ impl ManifestSnapshot {
     /// [`ManifestSnapshot::with_deleted_user_ids`]. Standalone restamp path
     /// (e.g. post-drain refresh); membership commits instead compose the
     /// ref via [`Self::with_slow_vector_state_ref`] before the same CAS.
-    pub fn with_slow_vector_state(&self, uri: String, hash: part::ContentHash) -> Self {
+    pub fn with_slow_vector_state(
+        &self,
+        uri: String,
+        hash: part::ContentHash,
+        centroids: RoutingRef,
+    ) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.manifest_id = next_id;
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
+            list.slow_vector_state_centroids = Some(centroids);
             list
         });
         Self {
@@ -1148,11 +1225,17 @@ impl ManifestSnapshot {
     /// [`crate::supertable::writer::try_commit_attempt`] so the blob PUT and
     /// list/pointer CAS publish together — closing the window where a crash
     /// leaves membership durable with a cleared slow-state ref.
-    pub(crate) fn with_slow_vector_state_ref(&self, uri: String, hash: part::ContentHash) -> Self {
+    pub(crate) fn with_slow_vector_state_ref(
+        &self,
+        uri: String,
+        hash: part::ContentHash,
+        centroids: RoutingRef,
+    ) -> Self {
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
+            list.slow_vector_state_centroids = Some(centroids);
             list
         });
         Self {
@@ -1328,6 +1411,62 @@ impl ManifestSnapshot {
         Ok(Arc::clone(loaded))
     }
 
+    /// Fp32 fine centroids for this USER manifest's stripped summary
+    /// cells, hydrated once per manifest generation from the FULL
+    /// manifest parts — the user table's content-addressed store for
+    /// summary fp32, mirroring what the slow-CAS centroid section does
+    /// for the hidden table. Consumers under
+    /// `summary_centroids_from_superfiles` open with routing parts
+    /// (1-bit slabs, no fp32); the first rescore pays one full-part wave
+    /// (bytes land in the manifest disk cache), then every query scores
+    /// from RAM. User summaries are per-fragment cells, small enough to
+    /// keep resident. `None` when this is a hidden (cell-partitioned)
+    /// manifest — its rescore reads the spilled centroid section — or
+    /// when no loader/parts exist (entries are inline and unstripped).
+    pub(crate) async fn user_centroids_for_rescore(&self) -> Option<Arc<UserCentroidCache>> {
+        let list = self.list.as_ref()?;
+        if matches!(
+            list.partition_strategy,
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            return None;
+        }
+        let loader = self.loader.as_ref()?;
+        if list.parts.is_empty() {
+            return None;
+        }
+        let manifest_id = self.get_manifest_id();
+        let slot = Arc::clone(&self.options.user_centroid_cache);
+        let mut guard = slot.lock().await;
+        if let Some(cache) = guard.as_ref()
+            && cache.manifest_id == manifest_id
+        {
+            return Some(Arc::clone(cache));
+        }
+        // Full-form loads bypass the snapshot's part cells (those hold the
+        // routing-decoded form on knob-on consumers); the loader's disk
+        // cache still dedups bytes across generations by content hash.
+        let waves = list.parts.iter().map(|part| {
+            let loader = Arc::clone(loader);
+            let part_id = part.part_id;
+            async move { loader.load_full(part_id).await }
+        });
+        match future::try_join_all(waves).await {
+            Ok(parts) => {
+                let cache = Arc::new(UserCentroidCache::from_parts(manifest_id, &parts));
+                *guard = Some(Arc::clone(&cache));
+                Some(cache)
+            }
+            Err(error) => {
+                eprintln!(
+                    "[supertable] full-part centroid hydration unavailable ({error}); falling \
+                     back to per-superfile centroid reads"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve one superfile by storage URI. Checks the flat
     /// [`SuperfileList::superfiles`] view first; when the entry is absent
     /// there (lazy list/parts layout), walks manifest parts until a match
@@ -1387,6 +1526,11 @@ impl ManifestSnapshot {
         //    if present, else use the options default.
         let opts = self.get_opts();
         let strategy = self.get_partition_strategy();
+        // Part wire form follows the LOCKED strategy, not raw options: a
+        // handle opened with a mismatched partition option must never flip
+        // a user part to routing-only wire (that would drop its fp32
+        // summaries durably, with no sibling to recover from).
+        let hidden_table = matches!(&strategy, PartitionStrategy::VectorCell { .. });
 
         // 2. Stamp each new entry with its partition key — this also validates
         //    against the strategy (surfaces SuperfileSpansPartition /
@@ -1485,39 +1629,30 @@ impl ManifestSnapshot {
                 // Split: keep the existing part, emit a fresh part for the new
                 // superfiles.
                 out_list_entries.push(entry.clone());
-                let (fresh_entry, fresh_part, fresh_encoded) =
-                    rebuild_part_and_entry(opts.clone(), vec![], new_for_part, None);
+                let (fresh_entry, fresh_encoded_part) =
+                    rebuild_part_and_entry(vec![], new_for_part, None, hidden_table);
                 out_list_entries.push(fresh_entry);
-                parts_to_write.push(EncodedPart {
-                    part: fresh_part,
-                    encoded: fresh_encoded,
-                });
+                parts_to_write.push(fresh_encoded_part);
             } else {
                 // Rewrite the latest part = its existing superfiles + the new.
                 let existing_part = self.get_part_by_id(entry.part_id).await?;
-                let (rebuilt_entry, rebuilt_part, rebuilt_encoded) = rebuild_part_and_entry(
-                    opts.clone(),
+                let (rebuilt_entry, rebuilt_encoded_part) = rebuild_part_and_entry(
                     existing_part.superfiles.clone(),
                     new_for_part,
                     Some(entry),
+                    hidden_table,
                 );
                 out_list_entries.push(rebuilt_entry);
-                parts_to_write.push(EncodedPart {
-                    part: rebuilt_part,
-                    encoded: rebuilt_encoded,
-                });
+                parts_to_write.push(rebuilt_encoded_part);
             }
         }
 
         // Cold start: no prior parts, so the new entries form the first part.
         if !pending_new.is_empty() {
-            let (fresh_entry, fresh_part, fresh_encoded) =
-                rebuild_part_and_entry(opts.clone(), vec![], pending_new, None);
+            let (fresh_entry, fresh_encoded_part) =
+                rebuild_part_and_entry(vec![], pending_new, None, hidden_table);
             out_list_entries.push(fresh_entry);
-            parts_to_write.push(EncodedPart {
-                part: fresh_part,
-                encoded: fresh_encoded,
-            });
+            parts_to_write.push(fresh_encoded_part);
         }
 
         // At this point, out_list_entries contains all new ManifestListEntries that will be written.
@@ -1562,19 +1697,13 @@ impl ManifestSnapshot {
                     continue;
                 }
 
-                let (fresh_entry, fresh_part, fresh_encoded) =
-                    rebuild_part_and_entry(opts.clone(), vec![], final_superfile_entries, None);
+                let (fresh_entry, fresh_encoded_part) =
+                    rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table);
 
                 if let Some(existing) = existing_part_to_update {
-                    *existing = EncodedPart {
-                        part: fresh_part,
-                        encoded: fresh_encoded,
-                    };
+                    *existing = fresh_encoded_part;
                 } else {
-                    parts_to_write.push(EncodedPart {
-                        part: fresh_part,
-                        encoded: fresh_encoded,
-                    });
+                    parts_to_write.push(fresh_encoded_part);
                 }
 
                 out_list_entries_after_removal.push(fresh_entry);
@@ -1653,6 +1782,7 @@ impl ManifestSnapshot {
             // CAS, so membership and the slow-state ref publish together.
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: out_list_entries_after_removal,
         };
         let mut new_superfile_list = self
@@ -1712,22 +1842,30 @@ impl ManifestSnapshot {
 }
 
 /// build one `ManifestPart` from `superfiles` + the
-/// matching `ManifestPartEntry`. Encodes the part once,
-/// content-hashes it, and computes the list-level aggregate
-/// skip summaries that `list_prune` reads at query time.
+/// matching `ManifestPartEntry`. Encodes the part in both wire forms —
+/// full (fp32 + slab) and routing-only (counts + slab) — content-hashes
+/// each, and computes the list-level aggregate skip summaries that
+/// `list_prune` reads at query time. Both encodings ship in the returned
+/// [`EncodedPart`] so the commit PUTs them together; the entry carries
+/// the sibling ref consumer opens select on.
 /// If base_part is Some, the superfiles MUST only include the new superfiles to be added.
 fn rebuild_part_and_entry(
-    opts: Arc<SupertableOptions>,
     old_superfiles: Vec<Arc<SuperfileEntry>>,
     new_superfiles: Vec<Arc<SuperfileEntry>>,
     base_part: Option<&ManifestPartEntry>,
-) -> (
-    ManifestPartEntry,
-    ManifestPart,
-    Vec<u8>, // pre-encoded compressed bytes — reused by write path, no second encode
-) {
-    let _ = opts; // reserved for future per-options encoding tweaks (zstd level, etc.)
-
+    hidden: bool,
+) -> (ManifestPartEntry, EncodedPart) {
+    // Hidden (VectorCell) manifests write parts in ROUTING wire form and
+    // skip the sibling: their fp32 is stored once per generation in the
+    // slow-CAS centroid section, and their entries hydrate stripped for
+    // everyone — a full-form part would be a fourth fp32 copy nothing
+    // reads. User manifests keep both forms: the full part is the fp32
+    // store the first rescore hydrates from (3 GETs vs the measured
+    // 848-GET per-superfile fan), the routing sibling is what serving
+    // opens fetch. `hidden` comes from the caller's PERSISTED strategy
+    // (`get_partition_strategy`), never re-derived from raw options: a
+    // handle opened with mismatched options must not flip a user part to
+    // routing-only wire (fp32 would be dropped durably, with no sibling).
     let aggregates = aggregates::compute(&new_superfiles, base_part);
     let superfiles = old_superfiles
         .into_iter()
@@ -1738,10 +1876,22 @@ fn rebuild_part_and_entry(
         part_id: PartId::new_v4(),
         superfiles,
     };
-    let compressed = part::encode(&part);
+    let primary_mode = if hidden {
+        SummaryWireMode::RoutingOnly
+    } else {
+        SummaryWireMode::Full
+    };
+    let compressed = part::encode_with_mode(&part, primary_mode);
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
+    let routing = if hidden {
+        None
+    } else {
+        let routing_encoded = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
+        let routing_hash = ContentHash::of(&routing_encoded);
+        Some((routing_encoded, routing_hash))
+    };
     let entry = ManifestPartEntry {
         part_id: part.part_id,
         uri: part_uri(&content_hash),
@@ -1749,11 +1899,22 @@ fn rebuild_part_and_entry(
         size_bytes_compressed: size_compressed,
         size_bytes_uncompressed: size_uncompressed,
         content_hash,
+        routing: routing.as_ref().map(|(_, hash)| RoutingRef {
+            uri: part_uri(hash),
+            content_hash: *hash,
+        }),
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
         fts_summary_agg: aggregates.fts_summary_agg,
     };
-    (entry, part, compressed)
+    (
+        entry,
+        EncodedPart {
+            part,
+            encoded: compressed,
+            routing_encoded: routing.map(|(bytes, _)| bytes),
+        },
+    )
 }
 
 /// Pulls manifest parts through a [`StorageProvider`] and verifies
@@ -1768,13 +1929,19 @@ fn rebuild_part_and_entry(
 /// parts are content-addressed, a cache hit can never be stale.
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
-    /// Maps `PartId → (expected content_hash, uri)`. Built from
-    /// the manifest list at construction; immutable per-`ManifestSnapshot`.
-    parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// Maps `PartId → (expected content_hash, uri, routing sibling)`.
+    /// Built from the manifest list at construction; immutable
+    /// per-`ManifestSnapshot`.
+    parts_index: HashMap<PartId, (ContentHash, String, Option<RoutingRef>)>,
     /// On-disk cache for compressed part bytes. `None` disables the
     /// cache (in-process-only supertables, tests, or storage attached
     /// without a `disk_cache_root` configured).
     manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    /// Consumer memory mode (`summary_centroids_from_superfiles`): load
+    /// each part's routing sibling (counts + 1-bit slab, no fp32) when
+    /// the list stamps one. Writer handles keep this off — part rebuilds
+    /// re-encode the full form and need resident fp32.
+    prefer_routing: bool,
 }
 
 impl ManifestPartLoader {
@@ -1788,14 +1955,30 @@ impl ManifestPartLoader {
         list: &Manifest,
         manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
     ) -> Self {
+        Self::new_with_cache_and_mode(storage, list, manifest_disk_cache, false)
+    }
+
+    /// Like [`Self::new_with_cache`] with the consumer routing mode
+    /// explicit — `prefer_routing` selects each part's routing sibling
+    /// when present.
+    pub fn new_with_cache_and_mode(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+        prefer_routing: bool,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
-            idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
+            idx.insert(
+                entry.part_id,
+                (entry.content_hash, entry.uri.clone(), entry.routing.clone()),
+            );
         }
         Self {
             storage,
             parts_index: idx,
             manifest_disk_cache,
+            prefer_routing,
         }
     }
 
@@ -1806,10 +1989,32 @@ impl ManifestPartLoader {
     /// on a miss the freshly-fetched bytes are written back to the
     /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
-        let (expected_hash, uri) = self
+        self.load_with_form(part_id, self.prefer_routing).await
+    }
+
+    /// [`Self::load`] forced to the FULL wire form (fp32 summaries intact)
+    /// regardless of the loader's routing preference — the user-table
+    /// centroid hydration reads full parts once even on consumers that
+    /// open with routing siblings.
+    pub async fn load_full(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+        self.load_with_form(part_id, false).await
+    }
+
+    async fn load_with_form(
+        &self,
+        part_id: PartId,
+        prefer_routing: bool,
+    ) -> Result<Arc<ManifestPart>, ManifestLoadError> {
+        let (full_hash, full_uri, routing) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+        // Routing decode lands in the stripped in-memory shape; both forms
+        // are content-addressed, so the disk cache can never mix them.
+        let (expected_hash, uri) = match (prefer_routing, routing) {
+            (true, Some(routing)) => (&routing.content_hash, &routing.uri),
+            _ => (full_hash, full_uri),
+        };
 
         // Disk-cache hit: bytes are verified against `expected_hash`
         // inside `get`, so they're known-good here.
@@ -1825,20 +2030,66 @@ impl ManifestPartLoader {
             .get(uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
-        let actual_hash = ContentHash::of(&bytes);
-        if actual_hash != *expected_hash {
-            return Err(ManifestLoadError::ContentHashMismatch {
-                expected: expected_hash.to_hex(),
-                actual: actual_hash.to_hex(),
-            });
-        }
-        // Populate the cache for next time (best-effort; the hash is
-        // already verified, satisfying `put`'s contract).
+        // Hash verify runs inside the same blocking task as the decode:
+        // blake3 over a multi-hundred-MiB part is CPU the polling task
+        // must not absorb (it serializes the nominally-concurrent part
+        // fan exactly like the inline decode used to).
+        let parsed = verify_and_decode_part_off_thread(bytes.clone(), *expected_hash).await?;
+        // Populate the cache for next time (best-effort; the hash was
+        // verified above, satisfying `put`'s contract).
         if let Some(cache) = &self.manifest_disk_cache {
-            cache.put(actual_hash, &bytes).await;
+            cache.put(*expected_hash, &bytes).await;
         }
-        let parsed = decode_part_off_thread(bytes).await?;
         Ok(Arc::new(parsed))
+    }
+}
+
+/// One consumer's hydrated user-table fp32 fine centroids, built once per
+/// manifest generation from the FULL manifest parts (the user table's
+/// content-addressed store for summary fp32 — the slow-CAS analog). Keyed
+/// by `manifest_id`; a membership change rebuilds it on the next rescore.
+/// Resident by design: user summaries are per-fragment cells (~100 MB at
+/// 100M docs), unlike the hidden table's fine fp32 (spilled section).
+pub(crate) struct UserCentroidCache {
+    pub(crate) manifest_id: u64,
+    /// `(superfile_id, column)` → per-cell `(cell_id, fp32 centroids)`.
+    pub(crate) cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>>,
+}
+
+impl UserCentroidCache {
+    /// One cell's fp32 fine centroids, when the cache carries them.
+    pub(crate) fn cell(
+        &self,
+        superfile_id: Uuid,
+        column: &str,
+        cell_id: Option<u32>,
+    ) -> Option<Arc<Vec<f32>>> {
+        self.cells
+            .get(&(superfile_id, column.to_owned()))?
+            .iter()
+            .find(|(id, _)| *id == cell_id)
+            .map(|(_, fp32)| Arc::clone(fp32))
+    }
+
+    /// Build from fully-loaded parts: every entry's summary cells that
+    /// carry resident fp32.
+    pub(crate) fn from_parts(manifest_id: u64, parts: &[Arc<ManifestPart>]) -> Self {
+        let mut cells: HashMap<(Uuid, String), Vec<(Option<u32>, Arc<Vec<f32>>)>> = HashMap::new();
+        for part in parts {
+            for entry in &part.superfiles {
+                for (column, summary) in &entry.vector_summary {
+                    let list = cells
+                        .entry((entry.superfile_id, column.clone()))
+                        .or_default();
+                    for cell in &summary.cells {
+                        if cell.clusters.vectors_resident() && cell.clusters.n_cent > 0 {
+                            list.push((cell.cell_id, Arc::new(cell.clusters.centroids.clone())));
+                        }
+                    }
+                }
+            }
+        }
+        Self { manifest_id, cells }
     }
 }
 
@@ -1853,6 +2104,31 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
+        ))),
+    }
+}
+
+/// [`decode_part_off_thread`] preceded by a blake3 content-hash check on
+/// the same blocking task, for the storage-GET path where the bytes are
+/// not yet verified.
+async fn verify_and_decode_part_off_thread(
+    bytes: Bytes,
+    expected_hash: ContentHash,
+) -> Result<ManifestPart, ManifestLoadError> {
+    let verify_then_decode = move || {
+        let actual_hash = ContentHash::of(&bytes);
+        if actual_hash != expected_hash {
+            return Err(ManifestLoadError::ContentHashMismatch {
+                expected: expected_hash.to_hex(),
+                actual: actual_hash.to_hex(),
+            });
+        }
+        part::decode(&bytes).map_err(ManifestLoadError::from)
+    };
+    match spawn_blocking(verify_then_decode).await {
+        Ok(result) => result,
+        Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
+            format!("part verify/decode task failed: {join_error}"),
         ))),
     }
 }
@@ -2489,6 +2765,227 @@ pub struct CellVectorSummary {
     pub clusters: ClusterCentroids,
 }
 
+/// Bits per `u64` word in a packed centroid sign code.
+pub(crate) const ADMIT_CODE_WORD_BITS: usize = 64;
+
+/// Fraction of ranked cells the 1-bit admit prefilter keeps for exact
+/// fp32 rescoring — shared by the query-side cell window and the
+/// write-side assignment shortlist. 20% keeps the same coverage class as
+/// the recall-validated 48-of-256 query window while scaling with the
+/// population.
+pub(crate) const RABITQ_ADMIT_CELL_SHORTLIST_FRACTION: f64 = 0.20;
+
+/// Minimum meaningful prefilter window, from the recall-validated
+/// 48-of-256 measurement: when the 20% slice comes out narrower than
+/// this, the population is small enough that the exact scan is cheap and
+/// the 1-bit estimate has nothing to buy — the query window floors here
+/// (scoring everything below ~240 cells) and the write-side assignment
+/// shortlist disengages entirely (exact scan).
+pub(crate) const RABITQ_ADMIT_CELL_SHORTLIST_MIN: usize = 48;
+
+/// Shared per-column state for the 1-bit admit prefilter: the column's
+/// rotation, sign quantizer, and the Hamming→cosine lookup table
+/// (`cos(π·h/dim)` — the standard sign-sketch angle estimator). Built
+/// **once per query or per assignment batch** and shared across every
+/// encoded vector — building rotation state per vector re-derives the
+/// rotation thousands of times (measured ~51 ms of admit at 1M pre-drain
+/// vs ~1 ms with shared state; the same waste per row on the write side).
+#[derive(Debug, Clone)]
+pub(crate) struct RabitqAdmitContext {
+    rot_seed: u64,
+    dim: usize,
+    rotation: Arc<RandomRotation>,
+    quant: BitQuantizer,
+    /// `cos(π·h/dim)` for h in `0..=dim`.
+    cos_table: Arc<Vec<f32>>,
+}
+
+impl RabitqAdmitContext {
+    pub(crate) fn new(dim: usize, rot_seed: u64) -> Self {
+        Self {
+            rot_seed,
+            dim,
+            rotation: Arc::new(RandomRotation::new(dim, rot_seed)),
+            quant: BitQuantizer::new(dim),
+            cos_table: Arc::new(
+                (0..=dim)
+                    .map(|h| (PI * h as f32 / dim as f32).cos())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Encode one vector against this context: rotate, sign-pack, and
+    /// carry the norms the metric transforms need. Cheap per call (the
+    /// rotation and cosine table are shared by `Arc`).
+    pub(crate) fn encode(&self, vector: &[f32]) -> RabitqAdmitQuery {
+        debug_assert_eq!(vector.len(), self.dim);
+        let mut rotated = vec![0.0f32; self.dim];
+        self.rotation.apply(vector, &mut rotated);
+        let mut code = vec![0u8; self.quant.code_bytes()];
+        self.quant.encode_rotated_into(&rotated, &mut code);
+        let q_l2sq = dot(vector, vector);
+        RabitqAdmitQuery {
+            rot_seed: self.rot_seed,
+            rotation: Arc::clone(&self.rotation),
+            quant: self.quant.clone(),
+            q_words: pack_code_bytes_to_words(&code),
+            q_norm: q_l2sq.sqrt(),
+            q_l2sq,
+            cos_table: Arc::clone(&self.cos_table),
+        }
+    }
+}
+
+/// One encoded vector's 1-bit admit state: the packed sign code plus the
+/// shared column context (rotation / quantizer / cosine table by `Arc`).
+#[derive(Debug)]
+pub(crate) struct RabitqAdmitQuery {
+    rot_seed: u64,
+    rotation: Arc<RandomRotation>,
+    quant: BitQuantizer,
+    /// Sign code packed into u64 words (zero-padded past `dim`).
+    q_words: Vec<u64>,
+    /// `‖q‖` and `‖q‖²` for the metric transforms.
+    q_norm: f32,
+    q_l2sq: f32,
+    /// `cos(π·h/dim)` for h in `0..=dim`.
+    cos_table: Arc<Vec<f32>>,
+}
+
+impl RabitqAdmitQuery {
+    pub(crate) fn new(dim: usize, rot_seed: u64, query: &[f32]) -> Self {
+        RabitqAdmitContext::new(dim, rot_seed).encode(query)
+    }
+}
+
+/// One shared rotation + sign quantizer per vector column, for
+/// hydration-time slab work over every summary instance.
+fn admit_encoders(
+    vector_columns: &[VectorConfig],
+) -> HashMap<&str, (RandomRotation, BitQuantizer, u64)> {
+    vector_columns
+        .iter()
+        .map(|vc| {
+            (
+                vc.column.as_str(),
+                (
+                    RandomRotation::new(vc.dim, vc.rot_seed),
+                    BitQuantizer::new(vc.dim),
+                    vc.rot_seed,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Read-only-consumer memory mode: for every uniquely-owned entry, build
+/// each summary cell's 1-bit admit slab from its resident fp32 centroids
+/// and then drop the fp32 vectors. One rotation + quantizer pair per
+/// column, shared across all entries. Entries whose `Arc` is shared (a
+/// previous snapshot or a loaded manifest part also references them) are
+/// skipped — they were either stripped by the earlier load or belong to
+/// maintenance state that needs fp32.
+fn strip_summary_centroids(
+    superfiles: &mut [Arc<SuperfileEntry>],
+    vector_columns: &[VectorConfig],
+) {
+    let encoders = admit_encoders(vector_columns);
+    if encoders.is_empty() {
+        return;
+    }
+    for entry in superfiles.iter_mut() {
+        let Some(entry) = Arc::get_mut(entry) else {
+            continue;
+        };
+        for (column, summary) in entry.vector_summary.iter_mut() {
+            let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                continue;
+            };
+            for cell in &mut summary.cells {
+                if cell.clusters.dim as usize != quant.dim {
+                    continue;
+                }
+                cell.clusters
+                    .strip_centroids_after_slab(rotation, quant, *rot_seed);
+            }
+        }
+    }
+}
+
+/// Pre-build every summary cell's 1-bit admit slab at hydration, in
+/// parallel on the table's reader pool. The slab is otherwise built
+/// lazily on first scan, which lands the whole encode on the first
+/// (cold) query — measured +1.4 s on a 100M-doc cold search (~105K fine
+/// centroids, one rotation+sign-pack each, single-threaded). Open
+/// absorbs the same work in a rayon pass instead. Idempotent: stripped
+/// or already-warm instances are `OnceLock` no-ops.
+fn prewarm_summary_admit_slabs(
+    superfiles: &[Arc<SuperfileEntry>],
+    vector_columns: &[VectorConfig],
+    pool: &ThreadPool,
+) {
+    let encoders = admit_encoders(vector_columns);
+    if encoders.is_empty() {
+        return;
+    }
+    pool.install(|| {
+        superfiles.par_iter().for_each(|entry| {
+            for (column, summary) in &entry.vector_summary {
+                let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                    continue;
+                };
+                for cell in &summary.cells {
+                    if cell.clusters.dim as usize != quant.dim || !cell.clusters.vectors_resident()
+                    {
+                        continue;
+                    }
+                    cell.clusters
+                        .prewarm_admit_codes(rotation, quant, *rot_seed);
+                }
+            }
+        });
+    });
+}
+
+/// Pack a byte sign code into little-endian u64 words, zero-padding the
+/// tail. Zero pad bits match on both sides of an XOR, so they never
+/// contribute to the Hamming distance.
+fn pack_code_bytes_to_words(code: &[u8]) -> Vec<u64> {
+    let bytes_per_word = ADMIT_CODE_WORD_BITS / 8;
+    code.chunks(bytes_per_word)
+        .map(|chunk| {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u64::from_le_bytes(word)
+        })
+        .collect()
+}
+
+/// XOR + popcount Hamming distance over packed sign codes. Safe Rust —
+/// `count_ones` lowers to the POPCNT instruction on x86-64.
+#[inline]
+fn hamming_words(a: &[u64], b: &[u64]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+/// Packed 1-bit sign codes for every centroid in a [`ClusterCentroids`],
+/// plus per-centroid norms for the metric transforms. Computed wherever
+/// the centroids are computed (commit staging, drain packs) and persisted
+/// beside the fp32 in the summary wire blob, so hydration decodes the
+/// slab instead of re-deriving one rotation per fine centroid; legacy
+/// fp32-only blobs still derive it at hydration.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RabitqAdmitCodes {
+    pub(crate) rot_seed: u64,
+    pub(crate) words_per_code: usize,
+    /// `n_cent * words_per_code`, cluster-major.
+    pub(crate) codes: Vec<u64>,
+    /// `‖centroid[c]‖` per cluster.
+    pub(crate) norms: Vec<f32>,
+}
+
 /// Per-cluster IVF centroids for one vector column, stored canonically as fp32
 /// cluster-major (`n_cent * dim`) plus a derived block-transposed cache for hot
 /// routing. Carried in the manifest so a query can rank every superfile's
@@ -2504,6 +3001,11 @@ pub struct CellVectorSummary {
 /// SIMD kernels in `superfile::vector::distance` over [`Self::transposed`],
 /// the lazily-built block-transposed cache. [`Self::score_one`] stays a
 /// zero-copy single-centroid [`distance`] probe.
+///
+/// The 1-bit admit prefilter ([`Self::estimate_min_admit_score`]) ranks
+/// whole instances cheaply from packed sign codes; exact fp32 scoring then
+/// runs only on the shortlisted cells, so final routing scores are always
+/// exact.
 #[derive(Debug, Default)]
 pub struct ClusterCentroids {
     pub n_cent: u32,
@@ -2518,19 +3020,25 @@ pub struct ClusterCentroids {
     /// instance on first scan; reset by `Clone` (a clone may mutate
     /// `centroids`, so it re-derives its own cache on first use).
     transposed: OnceLock<Vec<f32>>,
+    /// Lazily-built packed sign codes for the 1-bit admit prefilter.
+    admit_codes: OnceLock<RabitqAdmitCodes>,
 }
 
 impl Clone for ClusterCentroids {
     fn clone(&self) -> Self {
-        // Preserve a warm transposed cache when present. Dropping it on every
-        // clone forced the query path (which historically cloned the global
-        // grid / VectorCell strategy each search) to rebuild the scalar
-        // block-transpose — milliseconds at dim=1024 — before the SIMD scan
-        // could run. Callers that mutate `centroids` after cloning must
-        // [`Self::invalidate_transposed`].
+        // Preserve warm scan caches when present. Dropping the transposed
+        // cache on every clone forced the query path (which historically
+        // cloned the global grid / VectorCell strategy each search) to
+        // rebuild the scalar block-transpose — milliseconds at dim=1024 —
+        // before the SIMD scan could run. Callers that mutate `centroids`
+        // after cloning must [`Self::invalidate_transposed`].
         let transposed = OnceLock::new();
         if let Some(cache) = self.transposed.get() {
             let _ = transposed.set(cache.clone());
+        }
+        let admit_codes = OnceLock::new();
+        if let Some(cache) = self.admit_codes.get() {
+            let _ = admit_codes.set(cache.clone());
         }
         Self {
             n_cent: self.n_cent,
@@ -2538,6 +3046,7 @@ impl Clone for ClusterCentroids {
             centroids: self.centroids.clone(),
             counts: self.counts.clone(),
             transposed,
+            admit_codes,
         }
     }
 }
@@ -2566,6 +3075,13 @@ impl ClusterCentroids {
 
     /// Zero-copy fp32 slice of cluster `c`'s centroid (length `dim`).
     pub fn centroid(&self, c: usize) -> &[f32] {
+        // Same residency guard as `transposed()` / `build_admit_codes()`:
+        // on a stripped summary this would otherwise fail as an
+        // out-of-bounds slice, hiding the actual invariant breach.
+        assert!(
+            self.vectors_resident(),
+            "centroid() on a stripped summary — fp32 centroids are not resident"
+        );
         let d = self.dim as usize;
         let base = c * d;
         &self.centroids[base..base + d]
@@ -2621,6 +3137,7 @@ impl ClusterCentroids {
             centroids,
             counts,
             transposed: OnceLock::new(),
+            admit_codes: OnceLock::new(),
         }
     }
 
@@ -2630,6 +3147,11 @@ impl ClusterCentroids {
     /// sanctioned way to scan these centroids; do not hand-roll
     /// `(0..n_cent).map(distance)` loops against [`Self::centroid`].
     pub(crate) fn transposed(&self) -> &[f32] {
+        assert!(
+            self.vectors_resident(),
+            "fp32 centroids were dropped (summary_centroids_from_superfiles); \
+             exact scans must read the superfile centroid regions"
+        );
         self.transposed.get_or_init(|| {
             transpose_centroids_cluster_major(
                 &self.centroids,
@@ -2639,15 +3161,220 @@ impl ClusterCentroids {
         })
     }
 
-    /// Drop the transposed SIMD cache after mutating [`Self::centroids`]
-    /// (or `counts` / `n_cent` / `dim`) on a value that may already have
-    /// been scanned. The next [`Self::transposed`] call rebuilds it.
+    /// Drop the transposed / admit-code scan caches after mutating
+    /// [`Self::centroids`] (or `counts` / `n_cent` / `dim`) on a value that
+    /// may already have been scanned. The next scan rebuilds them.
     ///
     /// Not called on the read path today (centroids are immutable after
     /// decode); kept for write/maintenance sites that mutate in place.
     #[allow(dead_code)]
     pub(crate) fn invalidate_transposed(&mut self) {
         self.transposed = OnceLock::new();
+        self.admit_codes = OnceLock::new();
+    }
+
+    /// Whether the fp32 centroid vectors are resident. `false` only after
+    /// [`Self::strip_centroids_after_slab`] (read-only consumer memory
+    /// mode) — exact scans must then read the superfile centroid regions
+    /// instead of this struct.
+    pub(crate) fn vectors_resident(&self) -> bool {
+        self.n_cent == 0 || !self.centroids.is_empty()
+    }
+
+    /// Build the packed 1-bit admit codes + norms from the resident fp32
+    /// centroids. Shared by the lazy per-query cache fill and the eager
+    /// hydration-time build that precedes a centroid strip.
+    fn build_admit_codes(
+        &self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) -> RabitqAdmitCodes {
+        assert!(
+            self.vectors_resident(),
+            "admit codes need resident fp32 centroids; this summary was stripped"
+        );
+        let dim = self.dim as usize;
+        let n_cent = self.n_cent as usize;
+        let words_per_code = dim.div_ceil(ADMIT_CODE_WORD_BITS);
+        let mut codes = vec![0u64; n_cent.saturating_mul(words_per_code)];
+        let mut norms = vec![0.0f32; n_cent];
+        let mut rotated = vec![0.0f32; dim];
+        let mut byte_code = vec![0u8; quant.code_bytes()];
+        for c in 0..n_cent {
+            let centroid = self.centroid(c);
+            norms[c] = dot(centroid, centroid).sqrt();
+            rotation.apply(centroid, &mut rotated);
+            quant.encode_rotated_into(&rotated, &mut byte_code);
+            codes[c * words_per_code..(c + 1) * words_per_code]
+                .copy_from_slice(&pack_code_bytes_to_words(&byte_code));
+        }
+        RabitqAdmitCodes {
+            rot_seed,
+            words_per_code,
+            codes,
+            norms,
+        }
+    }
+
+    /// Read-only-consumer memory mode: eagerly build the 1-bit admit slab,
+    /// then drop the fp32 centroid vectors (and the transposed cache) from
+    /// memory. `counts`, `n_cent`, and `dim` stay resident — the flat
+    /// cluster id math and posting budgets depend on them. Idempotent.
+    pub(crate) fn strip_centroids_after_slab(
+        &mut self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) {
+        if self.n_cent == 0 || self.centroids.is_empty() {
+            return;
+        }
+        let codes = self.build_admit_codes(rotation, quant, rot_seed);
+        self.admit_codes = OnceLock::new();
+        let _ = self.admit_codes.set(codes);
+        self.centroids = Vec::new();
+        self.transposed = OnceLock::new();
+    }
+
+    /// Packed sign codes for the 1-bit admit prefilter — built once per
+    /// instance from the resident fp32 centroids with the query's shared
+    /// rotation/quantizer (no per-instance rotation state). Pre-populated
+    /// at hydration ([`prewarm_summary_admit_slabs`]) and by
+    /// [`Self::strip_centroids_after_slab`] on stripped summaries.
+    fn admit_codes(&self, admit: &RabitqAdmitQuery) -> &RabitqAdmitCodes {
+        let cache = self.admit_codes.get_or_init(|| {
+            self.build_admit_codes(admit.rotation.as_ref(), &admit.quant, admit.rot_seed)
+        });
+        // Release assert, mirroring the superfile reader's hard error on a
+        // rot_seed mismatch: scoring a slab built under a different
+        // rotation silently corrupts admit ranking (a recall bug with no
+        // crash), which is strictly worse than failing loudly here.
+        assert_eq!(
+            cache.rot_seed, admit.rot_seed,
+            "admit codes built with a different rot_seed"
+        );
+        cache
+    }
+
+    /// Hydration-time slab fill: build the packed admit codes now so the
+    /// first query does not pay the encode. `OnceLock` no-op when already
+    /// built (a reload reusing warm entries, or a stripped summary).
+    pub(crate) fn prewarm_admit_codes(
+        &self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) {
+        let _ = self
+            .admit_codes
+            .get_or_init(|| self.build_admit_codes(rotation, quant, rot_seed));
+    }
+
+    /// The built admit slab, if any — the summary wire encoder persists it
+    /// beside the fp32 centroids when present.
+    pub(crate) fn admit_codes_built(&self) -> Option<&RabitqAdmitCodes> {
+        self.admit_codes.get()
+    }
+
+    /// Wire-decode constructor for routing-only summary blocks (`CFR0`):
+    /// no fp32 payload on the wire, so the instance lands directly in the
+    /// stripped shape ([`Self::vectors_resident`] = false) with the admit
+    /// slab seeded — the same state [`Self::strip_centroids_after_slab`]
+    /// produces from a full instance.
+    pub(crate) fn from_decoded_routing(
+        n_cent: u32,
+        dim: u32,
+        counts: Vec<u32>,
+        admit: RabitqAdmitCodes,
+    ) -> Self {
+        debug_assert_eq!(
+            counts.len(),
+            n_cent as usize,
+            "routing cluster counts ({}) must match n_cent ({n_cent})",
+            counts.len()
+        );
+        Self {
+            n_cent,
+            dim,
+            centroids: Vec::new(),
+            counts,
+            transposed: OnceLock::new(),
+            admit_codes: {
+                let lock = OnceLock::new();
+                let _ = lock.set(admit);
+                lock
+            },
+        }
+    }
+
+    /// 1-bit prefilter: the best (smallest) estimated admit score across
+    /// this instance's populated clusters, from XOR+popcount over packed
+    /// sign codes. `None` when no cluster is populated. Estimates rank
+    /// cells for the exact-rescore shortlist only — they never feed
+    /// routing or near-tie logic directly.
+    pub(crate) fn estimate_min_admit_score(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+    ) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        self.estimate_admit_scores_into(metric, admit, |_, score| {
+            best = Some(best.map_or(score, |b: f32| b.min(score)));
+        });
+        best
+    }
+
+    /// 1-bit prefilter shortlist over this instance's clusters: rank every
+    /// populated cluster by its estimated admit score (same XOR+popcount
+    /// estimator as [`Self::estimate_min_admit_score`]) and return the top
+    /// `window` cluster ids, ascending by estimate. The write-side
+    /// assignment prefilter: exact fp32 scoring then runs only on the
+    /// returned ids, so the final placement is exact within the window.
+    pub(crate) fn admit_shortlist(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+        window: usize,
+    ) -> Vec<(u32, f32)> {
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(window.saturating_add(1));
+        self.estimate_admit_scores_into(metric, admit, |c, score| {
+            insert_ranked(&mut top, window, c, score);
+        });
+        top
+    }
+
+    /// Emit every populated cluster's estimated admit score — the shared
+    /// XOR+popcount estimator behind [`Self::estimate_min_admit_score`],
+    /// [`Self::admit_shortlist`], and the user-path stripped-summary fine
+    /// scoring (which ranks fragments on the resident 1-bit slab instead
+    /// of fetching fp32 per (file, cell)).
+    pub(crate) fn estimate_admit_scores_into(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+        mut emit: impl FnMut(u32, f32),
+    ) {
+        debug_assert_eq!(admit.cos_table.len(), self.dim as usize + 1);
+        let cache = self.admit_codes(admit);
+        let w = cache.words_per_code;
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            let code = &cache.codes[c * w..(c + 1) * w];
+            let h = hamming_words(&admit.q_words, code) as usize;
+            let est_dot = admit.cos_table[h] * admit.q_norm * cache.norms[c];
+            let score = match metric {
+                Metric::Cosine => COSINE_DISTANCE_BASE - est_dot,
+                Metric::NegDot => -est_dot,
+                Metric::L2Sq => {
+                    let c_norm = cache.norms[c];
+                    admit.q_l2sq + c_norm * c_norm - L2_CROSS_TERM_COEFF * est_dot
+                }
+            };
+            emit(c as u32, score);
+        }
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
@@ -3041,6 +3768,102 @@ mod tests {
         assert!(mutated.transposed.get().is_some());
     }
 
+    /// The 1-bit admit estimate must prefer the instance holding the
+    /// query's true nearest centroid on separated fixtures, for every
+    /// metric — the property the exact-rescore cell shortlist rides on.
+    #[test]
+    fn admit_estimate_prefers_matching_centroid_instance() {
+        const DIM: usize = 128;
+        const ROT_SEED: u64 = 7;
+        // Two single-centroid instances on different axes.
+        let mut near = vec![0.0f32; DIM];
+        near[0] = 1.0;
+        let mut far = vec![0.0f32; DIM];
+        far[5] = 1.0;
+        let a = ClusterCentroids::from_fp32(1, DIM as u32, &near, vec![1]);
+        let b = ClusterCentroids::from_fp32(1, DIM as u32, &far, vec![1]);
+        // Query beside `near`, small off-axis noise.
+        let mut query = near.clone();
+        query[1] = 0.05;
+        let admit = RabitqAdmitQuery::new(DIM, ROT_SEED, &query);
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let ea = a
+                .estimate_min_admit_score(metric, &admit)
+                .expect("a populated");
+            let eb = b
+                .estimate_min_admit_score(metric, &admit)
+                .expect("b populated");
+            assert!(
+                ea < eb,
+                "{metric:?}: matching instance must rank first ({ea} vs {eb})"
+            );
+        }
+        // Count-0 clusters are skipped: an unpopulated instance has no
+        // estimate to contribute.
+        let unpopulated = ClusterCentroids::from_fp32(1, DIM as u32, &near, vec![0]);
+        assert!(
+            unpopulated
+                .estimate_min_admit_score(Metric::Cosine, &admit)
+                .is_none()
+        );
+        // Clone carries the warm admit-code slab.
+        let cloned = a.clone();
+        assert!(cloned.admit_codes.get().is_some());
+    }
+
+    /// Stripping keeps `counts`/`n_cent`/`dim` and the pre-built admit
+    /// slab, drops the fp32 vectors, and stays idempotent; estimates keep
+    /// serving from the slab afterward.
+    #[test]
+    fn strip_centroids_keeps_slab_and_counts() {
+        const DIM: usize = 64;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; 2 * DIM];
+        flat[0] = 1.0;
+        flat[DIM + 5] = 1.0;
+        let mut cc = ClusterCentroids::from_fp32(2, DIM as u32, &flat, vec![3, 4]);
+        let rotation = RandomRotation::new(DIM, ROT_SEED);
+        let quant = BitQuantizer::new(DIM);
+        cc.strip_centroids_after_slab(&rotation, &quant, ROT_SEED);
+        assert!(!cc.vectors_resident());
+        assert_eq!(cc.n_cent, 2);
+        assert_eq!(cc.counts, vec![3, 4]);
+        assert!(cc.centroids.is_empty());
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        let admit = RabitqAdmitQuery::new(DIM, ROT_SEED, &query);
+        assert!(
+            cc.estimate_min_admit_score(Metric::Cosine, &admit)
+                .is_some(),
+            "estimates must keep serving from the pre-built slab"
+        );
+        // Idempotent (a reload may strip already-stripped clones).
+        cc.strip_centroids_after_slab(&rotation, &quant, ROT_SEED);
+        assert!(!cc.vectors_resident());
+        // Clone carries the stripped state + slab.
+        let cloned = cc.clone();
+        assert!(!cloned.vectors_resident());
+        assert!(cloned.admit_codes.get().is_some());
+    }
+
+    /// Exact scans on a stripped summary must fail loudly — the caller is
+    /// required to route through the superfile centroid regions instead.
+    #[test]
+    #[should_panic(expected = "fp32 centroids were dropped")]
+    fn transposed_on_stripped_summary_panics() {
+        const DIM: usize = 64;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut cc = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        cc.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let _ = cc.transposed();
+    }
+
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.
     #[test]
     fn score_clusters_into_matches_centroid_distance() {
@@ -3430,6 +4253,7 @@ mod tests {
                     size_bytes_compressed: size_compressed,
                     size_bytes_uncompressed: size_compressed,
                     content_hash: hash,
+                    routing: None,
                     id_range: (0, 0),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
@@ -3458,6 +4282,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_centroids: None,
                 parts: entries,
             }
         }
@@ -3761,6 +4586,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -3768,6 +4594,7 @@ mod tests {
                 size_bytes_compressed: 0,
                 size_bytes_uncompressed: 0,
                 content_hash: part::ContentHash([0u8; 32]),
+                routing: None,
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
@@ -3935,6 +4762,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
+                slow_vector_state_centroids: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -3956,10 +4784,23 @@ mod tests {
         assert!(manifest.slow_vector_state_blob().is_none());
 
         let hash = ContentHash([3u8; 32]);
-        let stamped = manifest.with_slow_vector_state("slow-vector-state/state-x.bin".into(), hash);
+        let centroids = RoutingRef {
+            uri: "slow-vector-state/state-c.bin".into(),
+            content_hash: ContentHash([5u8; 32]),
+        };
+        let stamped = manifest.with_slow_vector_state(
+            "slow-vector-state/state-x.bin".into(),
+            hash,
+            centroids.clone(),
+        );
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
         assert_eq!(uri, "slow-vector-state/state-x.bin");
         assert_eq!(got_hash, hash);
+        assert_eq!(
+            stamped.slow_vector_state_centroids_blob(),
+            Some(&centroids),
+            "centroid-section sibling stamped with the state ref"
+        );
         assert_eq!(stamped.get_manifest_id(), manifest.get_next_manifest_id());
         assert_eq!(
             stamped.get_all_superfiles().len(),
@@ -3974,6 +4815,10 @@ mod tests {
             deleted_stamped.slow_vector_state_blob().is_some(),
             "deleted-ids stamp must preserve the slow-state ref"
         );
+        assert!(
+            deleted_stamped.slow_vector_state_centroids_blob().is_some(),
+            "deleted-ids stamp must preserve the centroid-section ref"
+        );
 
         // A membership change (update) must CLEAR the ref: the blob no
         // longer describes the new membership; only maintenance restamps.
@@ -3985,6 +4830,10 @@ mod tests {
         assert!(
             updated.slow_vector_state_blob().is_none(),
             "membership change must clear the slow-state ref"
+        );
+        assert!(
+            updated.slow_vector_state_centroids_blob().is_none(),
+            "membership change must clear the centroid-section ref"
         );
     }
 
@@ -4093,10 +4942,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -4133,9 +4984,10 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
             .await
             .expect("write blob");
+        let (blob_uri, blob_hash) = (published.uri, published.content_hash);
         // Rebuild the same membership durably with the ref stamped.
         let (_dir2, storage2) = local_storage();
         let _ = _dir2;
@@ -4162,6 +5014,287 @@ mod tests {
         assert!(loaded.slow_vector_state_blob().is_some());
     }
 
+    /// Dim for the routing-hydration fixture summaries.
+    const ROUTING_TEST_DIM: usize = 16;
+    /// Rot seed for the routing-hydration fixture slabs.
+    const ROUTING_TEST_ROT_SEED: u64 = 5;
+
+    /// Stamped entry carrying a one-cell vector summary whose admit slab is
+    /// built — the shape drain-published entries have at republish time.
+    fn make_summary_entry(docs: u64) -> Arc<SuperfileEntry> {
+        let base = make_superfile_entry(docs, hash_bucket_0_pk());
+        let mut entry = (*base).clone();
+        let mut flat = vec![0.0f32; 2 * ROUTING_TEST_DIM];
+        flat[0] = 1.0;
+        flat[ROUTING_TEST_DIM + 1] = -1.0;
+        let clusters = ClusterCentroids::from_fp32(2, ROUTING_TEST_DIM as u32, &flat, vec![3, 4]);
+        clusters.prewarm_admit_codes(
+            &RandomRotation::new(ROUTING_TEST_DIM, ROUTING_TEST_ROT_SEED),
+            &BitQuantizer::new(ROUTING_TEST_DIM),
+            ROUTING_TEST_ROT_SEED,
+        );
+        entry.vector_summary.insert(
+            "emb".into(),
+            VectorSummary {
+                centroid: vec![0.5; ROUTING_TEST_DIM],
+                cells: vec![CellVectorSummary {
+                    cell_id: Some(0),
+                    clusters,
+                }],
+            },
+        );
+        Arc::new(entry)
+    }
+
+    /// Two-object slow-CAS model: the state blob is routing-shaped, so
+    /// EVERY consumer — knob on or off — hydrates stripped entries (no
+    /// fp32) with the write-time slab seeded; exact centroid scores come
+    /// from the published section. The fixture options carry no vector
+    /// columns, so the hydration-time strip pass is inert — stripped
+    /// entries can only have come from the blob's wire form itself.
+    #[tokio::test]
+    async fn state_blob_hydrates_stripped_for_all_consumers() {
+        let (_dir, storage) = local_storage();
+        let entries = vec![make_summary_entry(100), make_summary_entry(50)];
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+            .await
+            .expect("write blobs");
+        persist_two_entry_table(
+            &storage,
+            Some((published.uri.clone(), published.content_hash)),
+        )
+        .await;
+
+        let consumer_opts = |knob: bool| {
+            Arc::new(
+                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                    .expect("valid options")
+                    .with_summary_centroids_from_superfiles(knob),
+            )
+        };
+        let resident = |m: &ManifestSnapshot| {
+            m.superfiles
+                .iter()
+                .map(|e| {
+                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    assert!(clusters.admit_codes_built().is_some(), "slab always rides");
+                    clusters.vectors_resident()
+                })
+                .collect::<Vec<bool>>()
+        };
+
+        let knob_on = ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(true)))
+            .await
+            .expect("knob-on load");
+        assert_eq!(
+            resident(&knob_on),
+            vec![false, false],
+            "the routing-shaped state blob hydrates stripped entries"
+        );
+
+        let knob_off =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(false)))
+                .await
+                .expect("knob-off load");
+        assert_eq!(
+            resident(&knob_off),
+            vec![false, false],
+            "knob-off hydrates the same routing-shaped blob — fp32 lives in the section"
+        );
+    }
+
+    /// Persist a one-part table whose entries carry vector summaries. The
+    /// part ships in both wire forms; `with_routing` controls whether the
+    /// list entry stamps the sibling ref (absent models a pre-sibling
+    /// manifest). No slow-state ref, so hydration goes through the part
+    /// loader — the user-table shape.
+    async fn persist_summary_part_table(storage: &Arc<dyn StorageProvider>, with_routing: bool) {
+        let entries = vec![make_summary_entry(100), make_summary_entry(50)];
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: entries,
+        };
+        let full = part::encode(&part);
+        let full_hash = ContentHash::of(&full);
+        let routing = part::encode_with_mode(&part, SummaryWireMode::RoutingOnly);
+        let routing_hash = ContentHash::of(&routing);
+        assert!(
+            routing.len() < full.len(),
+            "routing part must shed the fp32 payload ({} vs {} bytes)",
+            routing.len(),
+            full.len()
+        );
+        write_part_bytes(storage.as_ref(), &full)
+            .await
+            .expect("put full part");
+        write_part_bytes(storage.as_ref(), &routing)
+            .await
+            .expect("put routing part");
+        let list = Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            tombstone_seqs: Default::default(),
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
+            parts: vec![ManifestPartEntry {
+                part_id: part.part_id,
+                uri: part_uri(&full_hash),
+                content_hash: full_hash,
+                routing: with_routing.then(|| RoutingRef {
+                    uri: part_uri(&routing_hash),
+                    content_hash: routing_hash,
+                }),
+                size_bytes_compressed: full.len() as u64,
+                size_bytes_uncompressed: full.len() as u64,
+                n_superfiles: 2,
+                id_range: (0, 149),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+            }],
+        };
+        let lw = write_manifest(storage.as_ref(), &list)
+            .await
+            .expect("write list");
+        write_pointer(
+            storage.as_ref(),
+            &PointerFile {
+                manifest_id: 1,
+                manifest_uri: lw.uri,
+                content_hash: lw.content_hash,
+            },
+            None,
+        )
+        .await
+        .expect("write pointer");
+    }
+
+    /// The user-table shape (no slow-state ref, hydration through the part
+    /// loader): consumer memory mode loads each part's routing sibling —
+    /// summaries arrive stripped with the write-time slab, without
+    /// downloading the fp32 payload. Knob-off loads (writers) and knob-on
+    /// loads of pre-sibling manifests keep the full part. The fixture
+    /// options carry no vector columns, so the strip pass is inert and a
+    /// stripped summary can only have come from the routing part.
+    #[tokio::test]
+    async fn consumer_mode_hydrates_parts_from_routing_sibling() {
+        let consumer_opts = |knob: bool| {
+            Arc::new(
+                SupertableOptions::new(simple_schema(), vec![], vec![], None)
+                    .expect("valid options")
+                    .with_summary_centroids_from_superfiles(knob),
+            )
+        };
+        // (fp32 resident, slab present) per entry. The routing wire is the
+        // slab's ONLY home now: full-part decodes carry fp32 and no slab
+        // (real tables rebuild writer-side slabs in the hydration prewarm;
+        // this fixture declares no vector columns, so the prewarm is inert).
+        let shape = |m: &ManifestSnapshot| {
+            m.superfiles
+                .iter()
+                .map(|e| {
+                    let clusters = &e.vector_summary["emb"].cells[0].clusters;
+                    (
+                        clusters.vectors_resident(),
+                        clusters.admit_codes_built().is_some(),
+                    )
+                })
+                .collect::<Vec<(bool, bool)>>()
+        };
+
+        let (_dir, storage) = local_storage();
+        persist_summary_part_table(&storage, true).await;
+        let knob_on = ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(true)))
+            .await
+            .expect("knob-on load");
+        assert_eq!(
+            shape(&knob_on),
+            vec![(false, true), (false, true)],
+            "knob-on consumer must hydrate stripped entries (slab riding) from the routing part"
+        );
+        let knob_off =
+            ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(false)))
+                .await
+                .expect("knob-off load");
+        assert_eq!(
+            shape(&knob_off),
+            vec![(true, false), (true, false)],
+            "knob-off load must keep the full part's resident fp32 (slab rebuilt by prewarm \
+             on real tables)"
+        );
+
+        // Pre-sibling manifest: knob-on falls back to the full part.
+        let (_dir2, storage2) = local_storage();
+        persist_summary_part_table(&storage2, false).await;
+        let fallback =
+            ManifestSnapshot::load(None, Arc::clone(&storage2), Some(consumer_opts(true)))
+                .await
+                .expect("fallback load");
+        assert_eq!(
+            shape(&fallback),
+            vec![(true, false), (true, false)],
+            "knob-on without a routing ref must fall back to the full part"
+        );
+    }
+
+    /// [`rebuild_part_and_entry`] stamps the routing sibling on USER
+    /// manifests: the entry's ref addresses exactly the sibling bytes
+    /// returned for the commit PUT. Hidden (VectorCell) manifests write
+    /// the part routing-shaped and skip the sibling entirely — the
+    /// primary IS the slim form and fp32 lives in the slow-CAS section.
+    #[tokio::test]
+    async fn rebuild_part_and_entry_stamps_routing_sibling() {
+        let (entry, encoded_part) =
+            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, false);
+        let routing = entry.routing.expect("sibling stamped");
+        let routing_encoded = encoded_part
+            .routing_encoded
+            .as_ref()
+            .expect("user part carries sibling bytes");
+        assert_eq!(
+            routing.content_hash,
+            ContentHash::of(routing_encoded),
+            "entry ref must address the returned sibling bytes"
+        );
+        assert_eq!(routing.uri, part_uri(&routing.content_hash));
+        assert_eq!(entry.content_hash, ContentHash::of(&encoded_part.encoded));
+        assert!(
+            routing_encoded.len() < encoded_part.encoded.len(),
+            "sibling must shed the fp32 payload"
+        );
+
+        let (hidden_entry, hidden_encoded) =
+            rebuild_part_and_entry(vec![], vec![make_summary_entry(10)], None, true);
+        assert!(
+            hidden_entry.routing.is_none(),
+            "hidden part must not stamp a sibling — its primary is routing-shaped"
+        );
+        assert!(
+            hidden_encoded.routing_encoded.is_none(),
+            "hidden part must not carry sibling bytes"
+        );
+        assert!(
+            hidden_encoded.encoded.len() < encoded_part.encoded.len(),
+            "hidden primary must shed the fp32 payload ({} vs {} bytes)",
+            hidden_encoded.encoded.len(),
+            encoded_part.encoded.len()
+        );
+    }
+
     /// Residency invariant: a refresh whose slow-state ref is unchanged
     /// (list-only churn — here a deleted-ids stamp) reuses the decoded
     /// entries — same `Arc`s, zero part loads, zero blob refetch.
@@ -4173,9 +5306,10 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
             .await
             .expect("write blob");
+        let (blob_uri, blob_hash) = (published.uri, published.content_hash);
         persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
 
         let a = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
@@ -4274,10 +5408,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 1,
@@ -4390,6 +5526,7 @@ mod tests {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: SUPERFILES_PER_PART,
@@ -4421,6 +5558,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 entry_for(&pw_a_old),
                 entry_for(&pw_a_latest),
@@ -4628,10 +5766,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -4726,10 +5866,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -4851,10 +5993,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -4966,11 +6110,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
                     uri: pw_old.uri.clone(),
                     content_hash: pw_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -4982,6 +6128,7 @@ mod tests {
                     part_id: pw_latest.part_id,
                     uri: pw_latest.uri,
                     content_hash: pw_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5096,11 +6243,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5112,6 +6261,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5236,11 +6386,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri.clone(),
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5252,6 +6404,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri,
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5390,11 +6543,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5406,6 +6561,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5417,6 +6573,7 @@ mod tests {
                     part_id: pw_b_old.part_id,
                     uri: pw_b_old.uri.clone(),
                     content_hash: pw_b_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5428,6 +6585,7 @@ mod tests {
                     part_id: pw_b_latest.part_id,
                     uri: pw_b_latest.uri.clone(),
                     content_hash: pw_b_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5604,10 +6762,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -5699,10 +6859,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -5810,11 +6972,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
                     uri: pw_a.uri,
                     content_hash: pw_a.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -5826,6 +6990,7 @@ mod tests {
                     part_id: pw_b.part_id,
                     uri: pw_b.uri.clone(),
                     content_hash: pw_b.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_b.size_bytes_compressed,
                     size_bytes_uncompressed: pw_b.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5943,11 +7108,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri.clone(),
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -5959,6 +7126,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri.clone(),
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -6071,10 +7239,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6157,10 +7327,12 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
                 content_hash: pw.content_hash,
+                routing: None,
                 size_bytes_compressed: pw.size_bytes_compressed,
                 size_bytes_uncompressed: pw.size_bytes_uncompressed,
                 n_superfiles: 2,
@@ -6261,11 +7433,13 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
                     uri: pw_a_old.uri,
                     content_hash: pw_a_old.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_old.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_old.size_bytes_uncompressed,
                     n_superfiles: 2,
@@ -6277,6 +7451,7 @@ mod tests {
                     part_id: pw_a_latest.part_id,
                     uri: pw_a_latest.uri,
                     content_hash: pw_a_latest.content_hash,
+                    routing: None,
                     size_bytes_compressed: pw_a_latest.size_bytes_compressed,
                     size_bytes_uncompressed: pw_a_latest.size_bytes_uncompressed,
                     n_superfiles: 1,
@@ -6362,6 +7537,7 @@ mod tests {
                 size_bytes_compressed: 0,
                 size_bytes_uncompressed: 0,
                 content_hash: part::ContentHash([0u8; 32]),
+                routing: None,
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
@@ -6386,6 +7562,7 @@ mod tests {
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
+            slow_vector_state_centroids: None,
             parts,
         }
     }
