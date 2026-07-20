@@ -259,6 +259,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // --- retrieve every question through all three modes ---------------------
     let mut scored: Vec<Scored> = Vec::new();
     for case in &fx.cases {
+        // Questions are raw conversational text, and a few contain
+        // double-quote characters — which the query parser reads as
+        // exact-phrase atoms, a query form this table doesn't index
+        // for (and not the intent here). Strip them so every word of
+        // the question contributes as a plain term.
+        let question = case.question.replace('"', " ");
         let csv = case
             .query_vector
             .iter()
@@ -276,14 +282,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?)?;
         let keyword = ids_in_order(&table.bm25_search(
             "text",
-            &case.question,
+            &question,
             k,
             BoolMode::Or,
             Some(&["id", "score"]),
         )?)?;
         let hybrid = ids_in_order(&db.query_sql(&format!(
             "SELECT id, score FROM hybrid_search('mem', 'text', '{}', 'vector', '{}', {k}) ORDER BY score DESC",
-            sql_lit(&case.question),
+            sql_lit(&question),
             csv,
         ))?)?;
 
