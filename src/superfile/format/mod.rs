@@ -22,12 +22,26 @@ pub const CRC_BYTES: usize = 4;
 
 /// FTS section magic bytes and constants.
 pub mod fts {
-    /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` + version `01`.
+    /// 8-byte magic at the start of the FTS blob: `INF` + `FTS` +
+    /// `01`. The trailing `01` is a fixed part of the section
+    /// identity, **not** a version — it never changes across blob
+    /// versions (v2 blobs carry this same magic). The blob's version
+    /// is the `u32` at [`hdr::VERSION_OFF`], and only that field.
     pub const MAGIC: &[u8; 8] = b"INFFTS01";
-    /// Numeric version emitted in the blob header (redundant with magic
-    /// suffix; future-proofing for a per-section version separate from
-    /// section identity).
-    pub const VERSION: u32 = 1;
+    /// Legacy blob version: the positionless layout with the 48-byte
+    /// header. **Read-only** — files written before the positions
+    /// region existed carry it and stay readable until support is
+    /// explicitly dropped; new code always writes
+    /// [`VERSION_V2`].
+    pub const VERSION_V1_LEGACY: u32 = 1;
+
+    /// The version new code writes: the header grows to
+    /// [`HEADER_SIZE_V2`] with the positions-region offset at
+    /// [`hdr::POSITIONS_OFFSET_OFF`], and a positions region —
+    /// empty unless a column records positions — sits between the
+    /// postings region and the doc-lengths directory. Readers accept
+    /// both versions.
+    pub const VERSION_V2: u32 = 2;
 
     /// Fixed-point scale for the per-column average document length.
     /// The builder stores `round(avgdl × 1000)` in the doc-lengths
@@ -43,9 +57,15 @@ pub mod fts {
     /// write and read must agree on the scale.
     pub const BLOCK_MAX_BM25_FIXED_POINT_SCALE: f32 = 1000.0;
 
-    /// Total FTS blob header size in bytes. The FST directory begins
-    /// immediately after this fixed-size header.
-    pub const HEADER_SIZE: usize = 48;
+    /// Total FTS blob header size in bytes for [`VERSION_V1_LEGACY`] (no
+    /// positions). The FST directory begins immediately after this
+    /// fixed-size header.
+    pub const HEADER_SIZE_V1_LEGACY: usize = 48;
+
+    /// Header size for [`VERSION_V2`]: the v1 fields plus the
+    /// trailing positions-region offset (`u64` at
+    /// [`hdr::POSITIONS_OFFSET_OFF`]).
+    pub const HEADER_SIZE_V2: usize = 56;
 
     /// Width of the 8-byte FTS magic field.
     pub const MAGIC_BYTES: usize = 8;
@@ -81,6 +101,13 @@ pub mod fts {
         pub const POSTINGS_OFFSET_OFF: usize = 32;
         /// `[40..48]` doc-lengths directory offset (`u64` LE).
         pub const DOC_LENGTHS_DIR_OFF: usize = 40;
+        /// `[48..56]` positions region offset (`u64` LE).
+        /// [`VERSION_V2`](super::VERSION_V2) headers
+        /// only — a v1 header ends at
+        /// [`HEADER_SIZE_V1_LEGACY`](super::HEADER_SIZE_V1_LEGACY). The region sits
+        /// between the postings region and the doc-lengths directory
+        /// so the lazy-open doc-lengths tail fetch stays small.
+        pub const POSITIONS_OFFSET_OFF: usize = 48;
     }
 
     /// Per-term metadata header field offsets (relative to a term's
@@ -92,6 +119,17 @@ pub mod fts {
     /// [12..16] postings_length (u32 LE)
     /// [16..20] num_blocks (u32 LE)
     /// ```
+    ///
+    /// Terms of a **positional column** carry an extended 32-byte
+    /// header — the 20-byte layout above plus:
+    ///
+    /// ```text
+    /// [20..28] positions_offset (u64 LE, absolute in the positions region)
+    /// [28..32] positions_length (u32 LE)
+    /// ```
+    ///
+    /// The column's positions flag (from `inf.fts.columns`) selects
+    /// the stride; the two layouts never mix within one column.
     pub mod term_meta {
         /// `[0..4]` document frequency (`u32` LE).
         pub const DF_OFF: usize = 0;
@@ -99,6 +137,12 @@ pub mod fts {
         pub const POSTINGS_LENGTH_OFF: usize = 12;
         /// `[16..20]` number of PFOR blocks / skip-table entries (`u32` LE).
         pub const NUM_BLOCKS_OFF: usize = 16;
+        /// `[20..28]` absolute offset of this term's position bytes in
+        /// the positions region (`u64` LE). Positional columns only.
+        pub const POSITIONS_OFFSET_OFF: usize = 20;
+        /// `[28..32]` byte length of this term's position bytes
+        /// (`u32` LE). Positional columns only.
+        pub const POSITIONS_LENGTH_OFF: usize = 28;
     }
 
     /// Skip-table entry field offsets (relative to the entry start;
@@ -108,8 +152,16 @@ pub mod fts {
     /// [ 0.. 4] last_doc_id (u32 LE)
     /// [ 4.. 8] block_offset (u32 LE, relative to term metadata start)
     /// [ 8..12] max_bm25_x1000 (u32 LE)
-    /// [12..16] reserved (u32)
+    /// [12..16] positions_block_offset (u32 LE; positional columns)
     /// ```
+    ///
+    /// The final field was reserved (always written zero) before
+    /// positions existed; for a positional column it now records the
+    /// byte offset of this block's position runs, relative to the
+    /// term's `positions_offset` — per-block random access into the
+    /// term's position bytes, aligned with the PFOR doc blocks.
+    /// Positionless columns keep writing zero, byte-identical to the
+    /// reserved era.
     pub mod skip_entry {
         /// `[0..4]` largest doc-id in the block (`u32` LE).
         pub const LAST_DOC_ID_OFF: usize = 0;
@@ -117,6 +169,10 @@ pub mod fts {
         pub const BLOCK_OFFSET_OFF: usize = 4;
         /// `[8..12]` fixed-point block-max BM25 bound (`u32` LE).
         pub const MAX_BM25_OFF: usize = 8;
+        /// `[12..16]` block's position-runs offset, relative to the
+        /// term's `positions_offset` (`u32` LE). Zero on positionless
+        /// columns (formerly the reserved field).
+        pub const POSITIONS_BLOCK_OFFSET_OFF: usize = 12;
     }
 }
 

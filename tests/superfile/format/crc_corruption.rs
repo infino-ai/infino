@@ -47,6 +47,42 @@ const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
 /// XOR mask used to flip a byte when corrupting a CRC-protected region.
 const CORRUPTION_FLIP_MASK: u8 = 0xFF;
 
+/// Positional variant of the corruptable superfile: same corpus, the
+/// FTS column records token positions, so the blob is v2 and carries a
+/// CRC-protected positions region.
+fn build_corruptable_positional_superfile() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: true,
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let n = CRC_TEST_N_DOCS;
+    let ids = decimal128_ids(0..n as u64);
+    let titles = LargeStringArray::from(
+        (0..n)
+            .map(|i| format!("doc {i} rust async runtime systems"))
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+        .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    b.finish().expect("finish builder")
+}
+
 fn build_corruptable_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -61,6 +97,7 @@ fn build_corruptable_superfile() -> Vec<u8> {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", CRC_TEST_ROT_SEED)],
         Some(default_tokenizer()),
@@ -267,4 +304,53 @@ fn corruption_at_random_interior_positions_rejected() {
         rejected * 4 >= n_samples * 3,
         "expected ≥75% of random interior corruptions to be rejected; got {rejected}/{n_samples}"
     );
+}
+
+#[test]
+fn corrupt_fts_positions_region_rejected() {
+    // v2 blob: the positions-region offset lives at header bytes
+    // [48..56] (relative to the blob). Flip a byte inside the region
+    // body — the multi-doc terms guarantee it is non-empty.
+    let bytes = build_corruptable_positional_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    let version = u32::from_le_bytes(
+        bytes[fts_off + 8..fts_off + 12]
+            .try_into()
+            .expect("version bytes"),
+    );
+    assert_eq!(version, 2, "positional superfile must embed a v2 FTS blob");
+    let positions_off_rel = u64::from_le_bytes(
+        bytes[fts_off + 48..fts_off + 56]
+            .try_into()
+            .expect("positions offset bytes"),
+    ) as usize;
+    let doc_lengths_off_rel = u64::from_le_bytes(
+        bytes[fts_off + 40..fts_off + 48]
+            .try_into()
+            .expect("doc-lengths offset bytes"),
+    ) as usize;
+    assert!(
+        doc_lengths_off_rel - positions_off_rel > 4,
+        "positions region has a non-empty body"
+    );
+    let target = fts_off + positions_off_rel + 1;
+    assert_corruption_rejected(bytes, target, "fts/positions region");
+}
+
+#[test]
+fn uncorrupted_positional_superfile_opens() {
+    // Sanity twin of the corruption test: the same v2 bytes open
+    // cleanly when untouched.
+    let bytes = build_corruptable_positional_superfile();
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean v2 superfile opens");
+}
+
+/// FTS blob range only (the positional fixture has no vector blob, so
+/// `locate_blobs` — which insists on both — doesn't apply).
+fn locate_fts_blob_only(bytes: &[u8]) -> (usize, usize) {
+    use infino::superfile::format::footer::read_kv_metadata;
+    let kv = read_kv_metadata(bytes).expect("read kv metadata");
+    let fts_off: usize = kv["inf.fts.offset"].parse().expect("parse");
+    let fts_len: usize = kv["inf.fts.length"].parse().expect("parse");
+    (fts_off, fts_len)
 }

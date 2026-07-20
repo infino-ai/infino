@@ -153,6 +153,7 @@ fn build_supertable(corpus: &[(u64, String)], n_superfiles: usize) -> Supertable
         schema_id_title(),
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(tk),

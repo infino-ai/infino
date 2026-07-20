@@ -80,6 +80,7 @@ fn build_test_bytes() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -126,6 +127,80 @@ async fn open_lazy_via_bytes_source_matches_open() {
         .iter_column_terms("title")
         .expect("eager terms");
     assert_eq!(lazy_terms, eager_terms);
+}
+
+/// v2 (positional) variant of the fixture: same corpus, positions on.
+fn build_positional_test_bytes() -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+            positions: true,
+        }],
+        vec![],
+        Some(default_tokenizer()),
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("builder");
+    let ids = decimal128_ids(vec![1u64, 2, 3, 4]);
+    let titles = LargeStringArray::from(vec![
+        "alpha bravo special",
+        "charlie delta",
+        "echo special foxtrot",
+        "gamma hotel",
+    ]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    Bytes::from(b.finish().expect("finish"))
+}
+
+#[tokio::test]
+async fn open_lazy_reads_positional_v2_blob_like_eager() {
+    // The v2 header extension and the shifted FST prefetch range are
+    // lazy-open-specific code paths; this pins them against the eager
+    // open on the same bytes, including a term resolution (postings
+    // fetch through the lazy source with the positional term-meta
+    // stride).
+    let bytes = build_positional_test_bytes();
+    let eager = SuperfileReader::open(bytes.clone()).expect("eager open");
+
+    let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+    let lazy = SuperfileReader::open_lazy(source).await.expect("lazy open");
+
+    assert_eq!(lazy.n_docs(), eager.n_docs());
+    assert_eq!(lazy.fts_columns(), eager.fts_columns());
+    let lazy_terms = lazy
+        .fts()
+        .expect("fts")
+        .iter_column_terms("title")
+        .expect("lazy terms");
+    let eager_terms = eager
+        .fts()
+        .expect("fts")
+        .iter_column_terms("title")
+        .expect("eager terms");
+    assert_eq!(lazy_terms, eager_terms);
+
+    // A multi-doc term ("special", df=2) resolves through the lazy
+    // postings fetch with the 32-byte positional term meta.
+    let lazy_hits = lazy
+        .token_match("title", &["special"], BoolMode::And)
+        .await
+        .expect("lazy match");
+    let eager_hits = eager
+        .token_match("title", &["special"], BoolMode::And)
+        .await
+        .expect("eager match");
+    assert_eq!(lazy_hits, eager_hits);
+    assert_eq!(lazy_hits, vec![0, 2]);
 }
 
 // ============================================================
@@ -324,6 +399,7 @@ fn build_vec_plus_fts_bytes() -> Bytes {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", LAZY_VEC_ROT_SEED)],
         Some(default_tokenizer()),

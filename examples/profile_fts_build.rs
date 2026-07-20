@@ -42,7 +42,7 @@ fn main() {
 
     let mut builder = FtsBuilder::new(default_tokenizer());
     builder
-        .register_column("title".to_string())
+        .register_column("title".to_string(), false)
         .expect("register column");
 
     let t_add = Instant::now();

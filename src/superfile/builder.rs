@@ -127,6 +127,12 @@ use crate::superfile::{
 #[derive(Clone)]
 pub struct FtsConfig {
     pub column: String,
+    /// Record token positions for this column, enabling exact phrase
+    /// queries against it. Off by default: positions roughly double
+    /// the column's FTS index footprint, so the cost is a per-column
+    /// opt-in. Columns without positions answer phrase queries with a
+    /// typed error, never a silent bag-of-words fallback.
+    pub positions: bool,
 }
 
 // `VectorConfig` (the per-column vector config used by
@@ -293,6 +299,7 @@ impl BuilderOptions {
             fts.fts_columns_config()
                 .map(|c| FtsConfig {
                     column: c.name.clone(),
+                    positions: c.positions,
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -537,7 +544,7 @@ impl SuperfileBuilder {
                 .clone();
             let mut fb = FtsBuilder::new(tk);
             for fc in &opts.fts_columns {
-                fb.register_column(fc.column.clone())?;
+                fb.register_column(fc.column.clone(), fc.positions)?;
             }
             Some(fb)
         };
@@ -1377,7 +1384,14 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         }
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","tokenizer":"ascii_lower"}"#);
+        s.push_str(r#"","tokenizer":"ascii_lower""#);
+        // Emitted only when set: a positionless column's JSON stays
+        // byte-identical to files written before positions existed
+        // (the reader defaults a missing field to false).
+        if c.positions {
+            s.push_str(r#","positions":true"#);
+        }
+        s.push('}');
     }
     s.push(']');
     s
@@ -1484,6 +1498,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -1545,6 +1560,7 @@ mod tests {
                 "doc_id",
                 vec![FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 }],
                 vec![],
                 Some(default_tokenizer()),
@@ -1565,6 +1581,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "nope".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -1584,6 +1601,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -1599,6 +1617,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("title", 1)],
             Some(default_tokenizer()),
@@ -1640,6 +1659,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             None,
@@ -1793,9 +1813,11 @@ mod tests {
         let cols = vec![
             FtsConfig {
                 column: "title".into(),
+                positions: false,
             },
             FtsConfig {
                 column: "body".into(),
+                positions: false,
             },
         ];
         let s = fts_columns_json(&cols);
@@ -1803,6 +1825,36 @@ mod tests {
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
         assert!(s.contains(r#""tokenizer":"ascii_lower""#));
+        // Positionless columns emit no positions field at all — the
+        // JSON stays byte-identical to files written before the flag
+        // existed.
+        assert!(!s.contains("positions"));
+    }
+
+    /// The positions field appears only on the columns that opt in,
+    /// and a mixed declaration keeps the positionless column's entry
+    /// in the legacy shape.
+    #[test]
+    fn fts_columns_json_positions_emitted_only_when_true() {
+        let cols = vec![
+            FtsConfig {
+                column: "title".into(),
+                positions: true,
+            },
+            FtsConfig {
+                column: "body".into(),
+                positions: false,
+            },
+        ];
+        let s = fts_columns_json(&cols);
+        assert!(
+            s.contains(r#"{"name":"title","tokenizer":"ascii_lower","positions":true}"#),
+            "positional column carries the flag: {s}"
+        );
+        assert!(
+            s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
+            "positionless column stays in the legacy shape: {s}"
+        );
     }
 
     #[test]
@@ -1840,6 +1892,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("emb", 7)],
             Some(default_tokenizer()),
@@ -1962,6 +2015,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2068,6 +2122,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2119,6 +2174,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("emb", 7)],
             Some(default_tokenizer()),
@@ -2297,6 +2353,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("emb", 7)],
             Some(default_tokenizer()),
@@ -2384,6 +2441,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2429,6 +2487,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2487,6 +2546,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![default_vector_config("emb", 7)],
             Some(default_tokenizer()),
@@ -2534,6 +2594,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2583,6 +2644,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2723,6 +2785,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2794,6 +2857,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2874,6 +2938,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -2970,6 +3035,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),

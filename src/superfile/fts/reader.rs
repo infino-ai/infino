@@ -32,15 +32,18 @@ use crate::superfile::{
         self, FST_SEPARATOR,
         checksum::crc32c,
         fts::{
-            HEADER_SIZE as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr, skip_entry,
-            term_meta,
+            HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
+            skip_entry, term_meta,
         },
     },
     fts::{
         bm25,
-        builder::{DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_SIZE},
+        builder::{
+            DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
+        },
         dict::{DictReader, make_key},
         fst_value::FstValue,
+        positions::{decode_run, skip_run},
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
     },
@@ -66,6 +69,42 @@ pub enum BoolMode {
     /// the musts alone define the match set and bare terms become
     /// scoring-only.
     Or,
+}
+
+/// A query's parsed clause lists, borrowed for one search call —
+/// terms and phrases per polarity, with the default operator already
+/// resolved (see `ParsedQuery::into_clauses`). Grouped so the search
+/// entry points don't take nine parallel parameters.
+#[derive(Default)]
+pub(crate) struct ClauseLists<'a> {
+    pub musts: &'a [&'a str],
+    pub shoulds: &'a [&'a str],
+    pub negatives: &'a [&'a str],
+    pub must_phrases: &'a [Vec<String>],
+    pub should_phrases: &'a [Vec<String>],
+    pub negative_phrases: &'a [Vec<String>],
+}
+
+impl ClauseLists<'_> {
+    /// Any phrase atom anywhere routes the query to the atom walks.
+    fn has_phrases(&self) -> bool {
+        !self.must_phrases.is_empty()
+            || !self.should_phrases.is_empty()
+            || !self.negative_phrases.is_empty()
+    }
+
+    /// Nothing to rank or match on the positive side.
+    fn no_positive_atoms(&self) -> bool {
+        self.musts.is_empty()
+            && self.shoulds.is_empty()
+            && self.must_phrases.is_empty()
+            && self.should_phrases.is_empty()
+    }
+
+    /// Nothing negated either.
+    fn no_negative_atoms(&self) -> bool {
+        self.negatives.is_empty() && self.negative_phrases.is_empty()
+    }
 }
 
 impl From<&str> for BoolMode {
@@ -203,6 +242,9 @@ pub struct ColumnMeta {
     /// add + mul vs recomputing on the fly. Computed once per
     /// reader at `open` time.
     pub dl_norm_k1: Vec<f32>,
+    /// Whether this column's index carries token positions (from
+    /// `inf.fts.columns`); phrase queries require it.
+    pub positions: bool,
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV
@@ -217,6 +259,12 @@ pub struct FtsColumnConfig {
     /// been emitted with it implicitly.
     #[serde(default = "default_tokenizer")]
     pub tokenizer: String,
+    /// Whether this column's index records token positions (phrase
+    /// support). Files written before positions existed lack the
+    /// field, which can only mean no positions — so a missing field
+    /// deserializes to `false`.
+    #[serde(default)]
+    pub positions: bool,
 }
 
 fn default_tokenizer() -> String {
@@ -259,6 +307,10 @@ pub struct FtsReader {
     n_terms_total: u32,
     fst_range: Range<usize>,
     postings_range: Range<usize>,
+    /// Byte range of the positions region (CRC stripped) — `Some`
+    /// iff the blob is v2. Phrase queries fetch per-term run ranges
+    /// out of it via [`Self::fetch_term_positions`].
+    positions_range: Option<Range<usize>>,
     columns: Vec<ColumnMeta>,
     column_id_by_name: HashMap<String, u32>,
 }
@@ -293,7 +345,16 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        let header = fetch_lazy_range(source.as_ref(), 0..FTS_HEADER_SIZE, "fts header").await?;
+        // One GET covers either header size: any real FTS blob is
+        // larger than the 56-byte v2 header (header + FST CRC +
+        // postings CRC + a non-empty doc-lengths directory), so
+        // fetching the v2 span up front costs no extra round-trip on
+        // v1 blobs and saves one on v2.
+        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
+        let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
+        if header.len() < FTS_HEADER_SIZE {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
+        }
         if &header[0..MAGIC_BYTES] != format::fts::MAGIC {
             return Err(FtsError::Read(ReadError::BadMagic {
                 section: "fts",
@@ -302,10 +363,21 @@ impl FtsReader {
             }));
         }
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION {
+        if version != format::fts::VERSION_V1_LEGACY && version != format::fts::VERSION_V2 {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
+        }
+        // The FST directory starts right after whichever header
+        // applies; a v2 header's extension bytes are already in the
+        // fetched span (and in the overlay below), so
+        // `open_with_source` re-reads them without another GET.
+        let header_size = match version {
+            v if v == format::fts::VERSION_V2 => format::fts::HEADER_SIZE_V2,
+            _ => FTS_HEADER_SIZE,
+        };
+        if header.len() < header_size {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
 
         let postings_offset =
@@ -336,11 +408,7 @@ impl FtsReader {
         // keeping the open-time GET count minimal and avoiding
         // per-column range calls during metadata decode.
         let (fst_region, doc_lengths_tail) = futures::try_join!(
-            fetch_lazy_range(
-                source.as_ref(),
-                FTS_HEADER_SIZE..postings_offset,
-                "fts/dict"
-            ),
+            fetch_lazy_range(source.as_ref(), header_size..postings_offset, "fts/dict"),
             fetch_lazy_range(
                 source.as_ref(),
                 doc_lengths_table_offset..fts_blob_len,
@@ -350,7 +418,7 @@ impl FtsReader {
 
         let mut overlay = PrefetchedSource::new(source);
         overlay.install(0, header);
-        overlay.install(FTS_HEADER_SIZE as u64, fst_region);
+        overlay.install(header_size as u64, fst_region);
         overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
 
         Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
@@ -379,12 +447,25 @@ impl FtsReader {
             }));
         }
 
-        // Version check.
+        // Version check. v1 = no positions (48-byte header); v2 adds
+        // the positions-region offset at [48..56] and a positions
+        // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::fts::VERSION {
-            return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
-                "fts section version {version}"
-            ))));
+        let positional_blob = match version {
+            v if v == format::fts::VERSION_V1_LEGACY => false,
+            v if v == format::fts::VERSION_V2 => true,
+            _ => {
+                return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
+                    "fts section version {version}"
+                ))));
+            }
+        };
+        let header_size = match positional_blob {
+            true => format::fts::HEADER_SIZE_V2,
+            false => FTS_HEADER_SIZE,
+        };
+        if source_len < header_size {
+            return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
 
         let n_columns =
@@ -399,6 +480,19 @@ impl FtsReader {
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
+        // The v2 extension lives past the 48 bytes fetched above; on
+        // the lazy path it resolves from the prefetch overlay.
+        let positions_offset: Option<usize> = match positional_blob {
+            true => {
+                let ext = fetch_source_range(
+                    &source,
+                    FTS_HEADER_SIZE..format::fts::HEADER_SIZE_V2,
+                    "fts header ext",
+                )?;
+                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
+            }
+            false => None,
+        };
 
         // Bounds-check every offset against the blob length before
         // any slice indexing. A single byte flip in the header can
@@ -411,24 +505,31 @@ impl FtsReader {
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
-        if fst_offset < FTS_HEADER_SIZE
+        let postings_end = positions_offset.unwrap_or(doc_lengths_table_offset);
+        if fst_offset < header_size
             || postings_offset < fst_offset + 4
-            || doc_lengths_table_offset < postings_offset + 4
+            || postings_end < postings_offset + 4
+            || doc_lengths_table_offset < postings_end
             || doc_lengths_table_offset > source_len
+            || positions_offset.is_some_and(|po| doc_lengths_table_offset < po + 4)
         {
             return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
-                 doc_lengths={doc_lengths_table_offset}, blob_len={}",
+                 positions={positions_offset:?}, doc_lengths={doc_lengths_table_offset}, \
+                 blob_len={}",
                 source_len
             ))));
         }
 
-        // Postings region length: we don't store it explicitly (CRC32C of
-        // the body is at postings_offset + len - 4). Compute from the
-        // surrounding offsets — postings ends where the doc-lengths
+        // Region lengths aren't stored explicitly (each region ends
+        // with its CRC32C). Compute from the surrounding offsets —
+        // postings end where the positions region begins (or the
+        // doc-lengths directory on a v1 blob), positions end where the
         // directory begins.
         let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
-        let postings_range = postings_offset..doc_lengths_table_offset.saturating_sub(4); // strip CRC
+        let postings_range = postings_offset..postings_end.saturating_sub(4); // strip CRC
+        let positions_range: Option<Range<usize>> =
+            positions_offset.map(|po| po..doc_lengths_table_offset.saturating_sub(4));
 
         // Verify FST CRC32C (4 bytes after fst body).
         if opts.verify_crc {
@@ -450,12 +551,9 @@ impl FtsReader {
 
         // Verify postings region CRC32C.
         if opts.verify_crc {
-            let postings_crc_pos = doc_lengths_table_offset.saturating_sub(4);
-            let postings_crc_bytes = fetch_source_range(
-                &source,
-                postings_crc_pos..doc_lengths_table_offset,
-                "fts/postings crc",
-            )?;
+            let postings_crc_pos = postings_end.saturating_sub(4);
+            let postings_crc_bytes =
+                fetch_source_range(&source, postings_crc_pos..postings_end, "fts/postings crc")?;
             let postings_crc_expected = read_u32_le(&postings_crc_bytes);
             let postings_bytes =
                 fetch_source_range(&source, postings_range.clone(), "fts/postings")?;
@@ -463,6 +561,27 @@ impl FtsReader {
             if postings_crc_expected != postings_crc_actual {
                 return Err(FtsError::Read(ReadError::ChecksumMismatch {
                     section: "fts/postings",
+                    column: String::new(),
+                }));
+            }
+        }
+
+        // Verify positions region CRC32C (v2 blobs only).
+        if opts.verify_crc
+            && let Some(pos_range) = &positions_range
+        {
+            let crc_pos = doc_lengths_table_offset.saturating_sub(4);
+            let crc_bytes = fetch_source_range(
+                &source,
+                crc_pos..doc_lengths_table_offset,
+                "fts/positions crc",
+            )?;
+            let crc_expected = read_u32_le(&crc_bytes);
+            let pos_bytes = fetch_source_range(&source, pos_range.clone(), "fts/positions")?;
+            let crc_actual = crc32c(&pos_bytes);
+            if crc_expected != crc_actual {
+                return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                    section: "fts/positions",
                     column: String::new(),
                 }));
             }
@@ -584,6 +703,7 @@ impl FtsReader {
                 doc_lengths_range: doc_lengths_offset..array_end,
                 avgdl,
                 dl_norm_k1,
+                positions: col_cfg.positions,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
@@ -594,6 +714,7 @@ impl FtsReader {
             n_terms_total,
             fst_range,
             postings_range,
+            positions_range,
             columns,
             column_id_by_name,
         })
@@ -685,6 +806,406 @@ impl FtsReader {
                 )))
             })?;
         Ok(plan.restore(&fetched))
+    }
+
+    /// Fetch each requested term's position-run bytes from the
+    /// positions region — the phrase sibling of
+    /// [`fetch_term_postings`](Self::fetch_term_postings): one range
+    /// per term, fanned out in parallel, never the whole region.
+    /// `terms` pairs are `(positions_offset, positions_length)` from
+    /// the terms' metadata; zero-length entries (inline terms) yield
+    /// empty buffers without touching the source.
+    async fn fetch_term_positions(&self, terms: &[(u64, u32)]) -> Result<Vec<Bytes>, FtsError> {
+        if terms.iter().all(|&(_, len)| len == 0) {
+            return Ok(vec![Bytes::new(); terms.len()]);
+        }
+        let region = self.positions_range.as_ref().ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "positional term in a blob with no positions region".into(),
+            ))
+        })?;
+        let base = region.start;
+        let region_len = region.len();
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(terms.len());
+        for &(off, len) in terms {
+            let off = off as usize;
+            let len = len as usize;
+            if off + len > region_len {
+                return Err(FtsError::Read(ReadError::MalformedVersion(
+                    "term positions range runs past positions region".into(),
+                )));
+            }
+            ranges.push(base + off..base + off + len);
+        }
+        self.source
+            .get_ranges_parallel_async(&ranges)
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/positions term range fetch failed: {e}"
+                )))
+            })
+    }
+
+    /// Build one [`AnyCursor`] per requested atom, preserving input
+    /// order: first the `terms`, then the `phrases`. An atom whose
+    /// term (or any phrase member) is absent from the column yields
+    /// `None` — the caller applies polarity semantics (a missing must
+    /// empties the result; a missing should or negative is dropped).
+    ///
+    /// Multi-token phrases require the column to be positional;
+    /// otherwise [`FtsError::PositionsUnavailable`].
+    async fn build_atom_cursors(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+    ) -> Result<Vec<Option<AnyCursor>>, FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        if !phrases.is_empty() && !col_meta.positions {
+            return Err(FtsError::PositionsUnavailable {
+                column: col_meta.name.clone(),
+            });
+        }
+        let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
+        for term in terms {
+            let mut cursors = self.build_term_cursors(column_id, &[term]).await?;
+            out.push(cursors.pop().map(AnyCursor::Term));
+        }
+        for phrase in phrases {
+            let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
+            let cursors = self.build_term_cursors(column_id, &member_refs).await?;
+            if cursors.len() != member_refs.len() {
+                // A member is absent — the phrase can never match.
+                out.push(None);
+                continue;
+            }
+            // Positional extras per member, kept off the term cursors
+            // (whose footprint the term-only kernels depend on): PFOR
+            // members re-parse their metadata header from their own
+            // bytes; an inline (df=1) member recovers its single
+            // position from the FST slot the tf-reinterpretation
+            // dropped during cursor build.
+            let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
+                Vec::with_capacity(cursors.len());
+            for (cursor, term) in cursors.iter().zip(&member_refs) {
+                match cursor.bytes.is_empty() {
+                    false => {
+                        let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
+                        positional.push((Some(term_meta), None));
+                    }
+                    true => {
+                        let fst_bytes = self.dict_bytes_async().await?;
+                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+                            FtsError::Read(ReadError::MalformedVersion(format!(
+                                "FST parse failed: {e}"
+                            )))
+                        })?;
+                        let key = make_key(&col_meta.name, term);
+                        let packed = dict
+                            .lookup(&key)
+                            .expect("inline member cursor was built from this dict");
+                        let position = match FstValue::unpack(packed) {
+                            FstValue::Inline { tf: slot, .. } => slot,
+                            FstValue::Pfor { .. } => {
+                                unreachable!("inline cursor from a PFOR FST value")
+                            }
+                        };
+                        positional.push((None, Some(position)));
+                    }
+                }
+            }
+            let pos_ranges: Vec<(u64, u32)> = positional
+                .iter()
+                .map(|(term_meta, _)| {
+                    term_meta
+                        .map(|tm| (tm.positions_offset, tm.positions_length))
+                        .unwrap_or((0, 0))
+                })
+                .collect();
+            let positions = self.fetch_term_positions(&pos_ranges).await?;
+            out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
+                cursors, positions, positional,
+            )?)));
+        }
+        Ok(out)
+    }
+
+    /// Ranked search over heterogeneous atoms — the walk every
+    /// phrase-bearing query takes. With musts, the match set is their
+    /// intersection and shoulds are scoring-only (the clause model);
+    /// with none, the shoulds' union matches. Docs excluded by
+    /// `filter` never reach the heap; docs scoring strictly below
+    /// `floor_eff` are dropped at admission.
+    fn run_atoms_search(
+        &self,
+        column_id: u32,
+        mut musts: Vec<AnyCursor>,
+        mut shoulds: Vec<AnyCursor>,
+        k: usize,
+        mut filter: Option<AtomExcludeFilter>,
+        floor_eff: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1.as_slice();
+        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+
+        // Per-atom pruning slack: an atom only needs to contribute
+        // more than the walk's bar minus what every *other* atom could
+        // possibly add. Phrase atoms use it to skip position work on
+        // docs that provably can't matter (`skip_to_pruned`).
+        let atom_slack = |atoms: &[AnyCursor], extra_ub: f32| -> Vec<f32> {
+            let total: f32 = atoms.iter().map(AnyCursor::term_max_bm25).sum();
+            atoms
+                .iter()
+                .map(|a| total - a.term_max_bm25() + extra_ub)
+                .collect()
+        };
+
+        if musts.is_empty() {
+            // Union of shoulds, doc-at-a-time: score every atom
+            // sitting on the frontier doc, then advance them past it.
+            let others_ub = atom_slack(&shoulds, 0.0);
+            while let Some(doc) = shoulds
+                .iter()
+                .filter(|a| !a.is_exhausted())
+                .map(AnyCursor::current_doc_id)
+                .min()
+            {
+                let admitted = match filter.as_mut() {
+                    Some(f) => f.admits(doc)?,
+                    None => true,
+                };
+                if admitted {
+                    let norm = dl_norm_k1[doc as usize];
+                    let score: f32 = shoulds
+                        .iter()
+                        .filter(|a| !a.is_exhausted() && a.current_doc_id() == doc)
+                        .map(|a| a.score_current(norm))
+                        .sum();
+                    if score > floor_eff {
+                        and_heap_push(&mut heap, k, None, score, doc);
+                    }
+                }
+                let Some(next) = doc.checked_add(1) else {
+                    break;
+                };
+                let bar = match heap.len() >= k {
+                    true => heap.peek().expect("heap len == k").0.max(floor_eff),
+                    false => floor_eff,
+                };
+                for (a, &others) in shoulds.iter_mut().zip(&others_ub) {
+                    if !a.is_exhausted() && a.current_doc_id() == doc {
+                        a.skip_to_pruned(next, bar - others, dl_norm_k1)?;
+                    }
+                }
+            }
+            return Ok(drain_top_k_desc(heap));
+        }
+
+        // Must-driven walk: leapfrog the musts to each common doc,
+        // score musts + landing shoulds there.
+        let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
+        let must_others_ub = atom_slack(&musts, should_ub);
+        let should_others_ub: Vec<f32> = {
+            let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
+            atom_slack(&shoulds, must_ub_total)
+        };
+        let mut target = 0u32;
+        'docs: loop {
+            let bar = match heap.len() >= k {
+                true => heap.peek().expect("heap len == k").0.max(floor_eff),
+                false => floor_eff,
+            };
+            let mut aligned = target;
+            let mut i = 0usize;
+            while i < musts.len() {
+                let a = &mut musts[i];
+                a.skip_to_pruned(aligned, bar - must_others_ub[i], dl_norm_k1)?;
+                if a.is_exhausted() {
+                    break 'docs;
+                }
+                let here = a.current_doc_id();
+                if here > aligned {
+                    aligned = here;
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+            // Bar skip: the kth-best (or the seeded floor) minus the
+            // most the shoulds could add bounds what the musts must
+            // reach; a candidate whose must-side block bounds can't
+            // get there is dead without scoring (and, for phrase
+            // shoulds, without any position work). `>=`, not `>`: a
+            // doc exactly at the bar can still displace the incumbent
+            // kth-best on the ascending-doc-id tie-break.
+            let scoring_needed = match bar > f32::NEG_INFINITY {
+                true => {
+                    let must_ub: f32 = musts
+                        .iter_mut()
+                        .map(|a| a.block_max_in_range(aligned, aligned))
+                        .sum();
+                    must_ub + should_ub >= bar
+                }
+                false => true,
+            };
+            let admitted = scoring_needed
+                && match filter.as_mut() {
+                    Some(f) => f.admits(aligned)?,
+                    None => true,
+                };
+            if admitted {
+                let norm = dl_norm_k1[aligned as usize];
+                let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
+                for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
+                    sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
+                    if !sh.is_exhausted() && sh.current_doc_id() == aligned {
+                        score += sh.score_current(norm);
+                    }
+                }
+                if score > floor_eff {
+                    and_heap_push(&mut heap, k, None, score, aligned);
+                }
+            }
+            let Some(next) = aligned.checked_add(1) else {
+                break;
+            };
+            target = next;
+        }
+        Ok(drain_top_k_desc(heap))
+    }
+
+    /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
+    /// `on_doc` for every matching doc in ascending order. `And` walks
+    /// the atoms' intersection (a phrase atom's own verification is
+    /// part of its cursor); `Or` walks their union. The shared spine
+    /// of the phrase-aware `token_match` / `count` entries.
+    fn walk_atoms_match(
+        &self,
+        mut atoms: Vec<AnyCursor>,
+        mode: BoolMode,
+        mut filter: Option<AtomExcludeFilter>,
+        mut on_doc: impl FnMut(u32),
+    ) -> Result<(), FtsError> {
+        match mode {
+            BoolMode::Or => {
+                while let Some(doc) = atoms
+                    .iter()
+                    .filter(|a| !a.is_exhausted())
+                    .map(AnyCursor::current_doc_id)
+                    .min()
+                {
+                    let admitted = match filter.as_mut() {
+                        Some(f) => f.admits(doc)?,
+                        None => true,
+                    };
+                    if admitted {
+                        on_doc(doc);
+                    }
+                    let Some(next) = doc.checked_add(1) else {
+                        break;
+                    };
+                    for a in atoms.iter_mut() {
+                        if !a.is_exhausted() && a.current_doc_id() == doc {
+                            a.skip_to(next)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BoolMode::And => {
+                let mut target = 0u32;
+                'docs: loop {
+                    let mut aligned = target;
+                    let mut i = 0usize;
+                    while i < atoms.len() {
+                        let a = &mut atoms[i];
+                        a.skip_to(aligned)?;
+                        if a.is_exhausted() {
+                            break 'docs;
+                        }
+                        let here = a.current_doc_id();
+                        if here > aligned {
+                            aligned = here;
+                            i = 0;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    let admitted = match filter.as_mut() {
+                        Some(f) => f.admits(aligned)?,
+                        None => true,
+                    };
+                    if admitted {
+                        on_doc(aligned);
+                    }
+                    let Some(next) = aligned.checked_add(1) else {
+                        break;
+                    };
+                    target = next;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Phrase-aware unranked match: the `local_doc_id`s matching the
+    /// terms + phrases under `mode`, ascending — the atoms sibling of
+    /// [`Self::token_match`], used whenever the match set contains a
+    /// phrase. Under `And`, a missing atom empties the set.
+    pub(crate) async fn atoms_match_ids(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let atoms: Vec<AnyCursor> = match mode {
+            BoolMode::And => {
+                if built.iter().any(Option::is_none) {
+                    return Ok(Vec::new());
+                }
+                built.into_iter().flatten().collect()
+            }
+            BoolMode::Or => built.into_iter().flatten().collect(),
+        };
+        if atoms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        self.walk_atoms_match(atoms, mode, None, |d| out.push(d))?;
+        Ok(out)
+    }
+
+    /// Phrase-aware unranked match **count** — the atoms sibling of
+    /// [`Self::token_match_count`].
+    pub(crate) async fn atoms_match_count(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<u64, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let atoms: Vec<AnyCursor> = match mode {
+            BoolMode::And => {
+                if built.iter().any(Option::is_none) {
+                    return Ok(0);
+                }
+                built.into_iter().flatten().collect()
+            }
+            BoolMode::Or => built.into_iter().flatten().collect(),
+        };
+        if atoms.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u64;
+        self.walk_atoms_match(atoms, mode, None, |_| n += 1)?;
+        Ok(n)
     }
 
     /// Resolve a column name to its dense column_id, or
@@ -821,9 +1342,7 @@ impl FtsReader {
     pub(crate) async fn search_excluding(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
-        negatives: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
@@ -831,23 +1350,65 @@ impl FtsReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        if musts.is_empty() && shoulds.is_empty() {
-            if negatives.is_empty() {
+        if lists.no_positive_atoms() {
+            if lists.no_negative_atoms() {
                 return Ok(Vec::new());
             }
             return Err(FtsError::NegationOnly);
         }
+        let floor_eff = floor.next_down();
 
-        let mut filter = match negatives {
+        if lists.has_phrases() {
+            // Phrase-bearing query: the heterogeneous atom walks.
+            let must_atoms = self
+                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .await?;
+            if must_atoms.iter().any(Option::is_none) {
+                // A must atom can never match in this superfile.
+                return Ok(Vec::new());
+            }
+            let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
+            let should_atoms: Vec<AnyCursor> = self
+                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let negative_atoms: Vec<AnyCursor> = self
+                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let filter = match negative_atoms.is_empty() {
+                true => None,
+                false => Some(AtomExcludeFilter::new(negative_atoms)),
+            };
+            return self.run_atoms_search(
+                column_id,
+                must_atoms,
+                should_atoms,
+                k,
+                filter,
+                floor_eff,
+            );
+        }
+
+        let mut filter = match lists.negatives {
             [] => None,
             _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, negatives).await?,
+                self.build_term_cursors(column_id, lists.negatives).await?,
             )),
         };
-
-        let floor_eff = floor.next_down();
-        self.search_clauses(column_id, musts, shoulds, k, filter.as_mut(), floor_eff)
-            .await
+        self.search_clauses(
+            column_id,
+            lists.musts,
+            lists.shoulds,
+            k,
+            filter.as_mut(),
+            floor_eff,
+        )
+        .await
     }
 
     /// Shared dispatch for [`Self::search_with_floor`] and
@@ -1146,6 +1707,14 @@ impl FtsReader {
                 // skip-table, no PFOR decode. The single doc's score
                 // is the entire result for any k ≥ 1 (unless it sits
                 // strictly below the caller's floor).
+                //
+                // On a positional column the slot carries the term's
+                // single position, tf implied 1 (the builder only
+                // inlines tf == 1 there) — score with the implied tf.
+                let tf = match col_meta.positions {
+                    true => 1,
+                    false => tf,
+                };
                 let idf_t = bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
@@ -1179,7 +1748,7 @@ impl FtsReader {
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        let term_meta = TermMeta::parse(postings, metadata_offset)?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
@@ -1303,6 +1872,16 @@ impl FtsReader {
         for r in resolved {
             match r {
                 Resolved::Inline { doc_id, tf } => {
+                    // On a positional column the inline slot carries
+                    // the term's single position, tf implied 1 — the
+                    // builder only inlines tf == 1 postings there.
+                    // Scoring must use the implied tf, never the slot.
+                    // (Phrase members recover the position itself with
+                    // their own FST lookup — see `build_atom_cursors`.)
+                    let tf = match col_meta.positions {
+                        true => 1,
+                        false => tf,
+                    };
                     let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
                     cursors.push(TermCursor::new_inline(
                         doc_id,
@@ -1313,7 +1892,11 @@ impl FtsReader {
                 }
                 Resolved::Pfor => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    cursors.push(TermCursor::new(term_bytes, self.n_docs as u64)?);
+                    cursors.push(TermCursor::new(
+                        term_bytes,
+                        self.n_docs as u64,
+                        col_meta.positions,
+                    )?);
                 }
             }
         }
@@ -2802,11 +3385,16 @@ impl PartialOrd for TopKEntry {
 }
 impl Ord for TopKEntry {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Score is inverted (lower score = greater) so the max-heap's
+        // peek is the worst kept entry; the doc-id leg must NOT be
+        // inverted, so that among score-tied entries the LARGER doc id
+        // is greater — i.e. peek — and is the one evicted when a
+        // better doc arrives, keeping the smaller id.
         other
             .0
             .partial_cmp(&self.0)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| other.1.cmp(&self.1))
+            .then_with(|| self.1.cmp(&other.1))
     }
 }
 
@@ -2824,6 +3412,435 @@ fn drain_top_k_desc(heap: BinaryHeap<TopKEntry>) -> Vec<(u32, f32)> {
             .then(a.0.cmp(&b.0))
     });
     out
+}
+
+/// One member term of a [`PhraseCursor`]: its posting cursor, its
+/// fetched position runs, and a lazily-built per-block cache of each
+/// pair's run offset.
+struct PhraseMember {
+    cursor: TermCursor,
+    /// The term's complete position runs (empty for an inline df=1
+    /// member, whose single position is `inline_position`).
+    positions: Bytes,
+    /// The term's parsed metadata header, re-parsed from the cursor's
+    /// own bytes at member build — the source of the per-block
+    /// position-run offsets. `None` for an inline member (no postings
+    /// bytes). Kept here, not on [`TermCursor`] or [`BlockMeta`]:
+    /// plain term queries never touch positions, and their hot
+    /// structures must not grow for the phrase path's benefit.
+    term_meta: Option<TermMeta>,
+    /// The single position of an inline (df=1, tf=1) member — the
+    /// inline FST value's slot carries it instead of a tf. `None` for
+    /// PFOR members.
+    inline_position: Option<u32>,
+    /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
+    idf: f32,
+    /// Byte offset of each decoded-block pair's run within
+    /// `positions`, valid for `run_offsets_block`. Rebuilt on block
+    /// crossings by one `skip_run` walk over the block's runs.
+    run_offsets: Vec<u32>,
+    /// Which block index `run_offsets` covers (`usize::MAX` = none).
+    run_offsets_block: usize,
+    /// Scratch for the member's decoded positions at the aligned doc.
+    pos_scratch: Vec<u32>,
+}
+
+/// Sentinel for [`PhraseMember::run_offsets_block`]: no block cached.
+const NO_BLOCK_CACHED: usize = usize::MAX;
+
+impl PhraseMember {
+    /// The member's positions at its cursor's current doc, decoded
+    /// into `pos_scratch`. The cursor must be positioned on a doc
+    /// (not exhausted).
+    fn decode_current_positions(&mut self) -> Result<(), FtsError> {
+        self.pos_scratch.clear();
+        if let Some(p) = self.inline_position {
+            self.pos_scratch.push(p);
+            return Ok(());
+        }
+        let block = self.cursor.current_block;
+        if self.run_offsets_block != block {
+            // One forward walk locates every pair's run in this
+            // block: start at the block's recorded first-run offset
+            // (the skip entry's fourth field), then skip each pair's
+            // `tf` varints.
+            self.run_offsets.clear();
+            let term_meta = self.term_meta.as_ref().expect("PFOR member has term meta");
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            for i in 0..self.cursor.block_n {
+                self.run_offsets.push(at as u32);
+                skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "position runs truncated within block".into(),
+                    ))
+                })?;
+            }
+            self.run_offsets_block = block;
+        }
+        let pair = self.cursor.pos;
+        let mut at = self.run_offsets[pair] as usize;
+        decode_run(
+            &self.positions,
+            &mut at,
+            self.cursor.block_tfs[pair],
+            &mut self.pos_scratch,
+        )
+        .ok_or_else(|| {
+            FtsError::Read(ReadError::MalformedVersion(
+                "position run truncated or overflowing".into(),
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// Doc-at-a-time cursor over an exact phrase: the members'
+/// intersection drives doc alignment, and a doc matches only when the
+/// members' positions verify adjacency (member `i` at `p + i` for
+/// some anchor `p`). Scores as one BM25 atom with `tf` = the number
+/// of verified anchors and `idf` = Σ member idf. Exposes the same
+/// notion of term- and block-level upper bounds as [`TermCursor`], so
+/// the atom walks can prune with it:
+/// `bound = phrase_idf × min_i(member_bound_i / idf_i)` — sound
+/// because the phrase tf in any doc is ≤ every member's tf there and
+/// the BM25 tf-factor is monotone in tf.
+struct PhraseCursor {
+    members: Vec<PhraseMember>,
+    /// Σ member idf × (K1 + 1) — the phrase's scoring constant.
+    idf_x_k1p1: f32,
+    /// Phrase-scaled term-level upper bound (see type docs).
+    term_max_bm25: f32,
+    /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
+    current_doc: u32,
+    /// Number of verified anchors at `current_doc`.
+    current_tf: u32,
+}
+
+impl PhraseCursor {
+    /// Build from member cursors (query order), their fetched
+    /// position runs, and their positional metadata — `(term_meta,
+    /// inline_position)` per member, exactly one of the two present —
+    /// then seek to the first matching doc.
+    fn new(
+        cursors: Vec<TermCursor>,
+        positions: Vec<Bytes>,
+        positional: Vec<(Option<TermMeta>, Option<u32>)>,
+    ) -> Result<Self, FtsError> {
+        debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
+        debug_assert_eq!(cursors.len(), positions.len());
+        debug_assert_eq!(cursors.len(), positional.len());
+        let mut idf_sum = 0.0f32;
+        let mut min_scaled_bound = f32::INFINITY;
+        let members: Vec<PhraseMember> = cursors
+            .into_iter()
+            .zip(positions)
+            .zip(positional)
+            .map(|((cursor, positions), (term_meta, inline_position))| {
+                let idf = cursor.idf_x_k1p1 / (bm25::K1 + 1.0);
+                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
+                idf_sum += idf;
+                PhraseMember {
+                    cursor,
+                    positions,
+                    term_meta,
+                    inline_position,
+                    idf,
+                    run_offsets: Vec::new(),
+                    run_offsets_block: NO_BLOCK_CACHED,
+                    pos_scratch: Vec::new(),
+                }
+            })
+            .collect();
+        let mut cursor = Self {
+            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
+            term_max_bm25: idf_sum * min_scaled_bound,
+            members,
+            current_doc: 0,
+            current_tf: 0,
+        };
+        cursor.seek_match(0, f32::NEG_INFINITY, &[])?;
+        Ok(cursor)
+    }
+
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        self.current_doc == u32::MAX
+    }
+
+    #[inline]
+    fn current_doc_id(&self) -> u32 {
+        self.current_doc
+    }
+
+    /// Advance to the first verified phrase match at doc ≥ `target`.
+    fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
+        if self.is_exhausted() || self.current_doc >= target {
+            return Ok(());
+        }
+        self.seek_match(target, f32::NEG_INFINITY, &[])
+    }
+
+    /// [`Self::skip_to`] for ranked walks: additionally skips docs
+    /// whose phrase contribution provably can't matter. `bar` is the
+    /// most this atom may need to contribute (the walk's pruning bar
+    /// minus every other atom's upper bound); a doc whose phrase
+    /// score bound falls strictly below it is passed over without any
+    /// position work — sound for top-k because the doc's total score
+    /// then can't reach the bar, but NOT for match/count walks, which
+    /// must keep using [`Self::skip_to`].
+    fn skip_to_pruned(
+        &mut self,
+        target: u32,
+        bar: f32,
+        dl_norm_k1: &[f32],
+    ) -> Result<(), FtsError> {
+        if self.is_exhausted() || self.current_doc >= target {
+            return Ok(());
+        }
+        self.seek_match(target, bar, dl_norm_k1)
+    }
+
+    /// Leapfrog the members to their next common doc ≥ `from`, verify
+    /// adjacency there, and repeat until a match or exhaustion. When
+    /// `bar` is finite, aligned docs are pre-screened without touching
+    /// positions: the phrase tf can't exceed any member's tf, so the
+    /// BM25 score at the members' minimum tf bounds the phrase's
+    /// contribution, and a doc strictly below `bar` is skipped before
+    /// the run decode. (`<`, not `<=`: a doc exactly at the bar can
+    /// still displace the incumbent kth-best on the ascending-doc-id
+    /// tie-break, so it must be verified.)
+    fn seek_match(&mut self, mut from: u32, bar: f32, dl_norm_k1: &[f32]) -> Result<(), FtsError> {
+        'docs: loop {
+            // Align every member to the same doc ≥ `from`.
+            let mut aligned = from;
+            let mut i = 0usize;
+            while i < self.members.len() {
+                let c = &mut self.members[i].cursor;
+                c.skip_to(aligned);
+                if c.is_exhausted() {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+                let here = c.current_doc_id();
+                if here > aligned {
+                    // Restart alignment at the higher doc.
+                    aligned = here;
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+
+            if bar > f32::NEG_INFINITY {
+                let min_tf = self
+                    .members
+                    .iter()
+                    .map(|m| m.cursor.current_tf())
+                    .min()
+                    .expect("members >= 2");
+                let ub = bm25::score_with_dl_norm_k1(
+                    self.idf_x_k1p1,
+                    min_tf,
+                    dl_norm_k1[aligned as usize],
+                );
+                if ub < bar {
+                    from = match aligned.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            self.current_doc = u32::MAX;
+                            self.current_tf = 0;
+                            return Ok(());
+                        }
+                    };
+                    continue 'docs;
+                }
+            }
+
+            // Verify adjacency at the aligned doc.
+            let tf = self.verify_at_aligned()?;
+            if tf > 0 {
+                self.current_doc = aligned;
+                self.current_tf = tf;
+                return Ok(());
+            }
+            from = match aligned.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    self.current_doc = u32::MAX;
+                    self.current_tf = 0;
+                    return Ok(());
+                }
+            };
+            continue 'docs;
+        }
+    }
+
+    /// Count the phrase's anchors at the members' aligned doc: the
+    /// first member's positions `p` where member `i` also has `p + i`
+    /// for every `i`. Member position lists are ascending, so each
+    /// probe is a binary search over a per-doc-tf-sized slice.
+    fn verify_at_aligned(&mut self) -> Result<u32, FtsError> {
+        for m in self.members.iter_mut() {
+            m.decode_current_positions()?;
+        }
+        let (anchor, rest) = self.members.split_first_mut().expect("members >= 2");
+        let mut tf = 0u32;
+        'anchors: for &p in &anchor.pos_scratch {
+            for (i, m) in rest.iter().enumerate() {
+                let want = match p.checked_add(i as u32 + 1) {
+                    Some(w) => w,
+                    None => continue 'anchors,
+                };
+                if m.pos_scratch.binary_search(&want).is_err() {
+                    continue 'anchors;
+                }
+            }
+            tf += 1;
+        }
+        Ok(tf)
+    }
+
+    /// Score the phrase at its current doc with the caller-supplied
+    /// per-doc BM25 normalization.
+    #[inline]
+    fn score_current(&self, dl_norm_k1: f32) -> f32 {
+        bm25::score_with_dl_norm_k1(self.idf_x_k1p1, self.current_tf, dl_norm_k1)
+    }
+
+    /// Phrase-scaled block-level upper bound over `[range_start,
+    /// range_end]` — the block analog of `term_max_bm25`.
+    fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        let mut min_scaled = f32::INFINITY;
+        for m in self.members.iter_mut() {
+            let b = m.cursor.block_max_in_range(range_start, range_end);
+            min_scaled = min_scaled.min(b / m.idf);
+        }
+        let idf_sum = self.idf_x_k1p1 / (bm25::K1 + 1.0);
+        idf_sum * min_scaled
+    }
+}
+
+/// A query atom's cursor: a plain term or an exact phrase. The atom
+/// walks below are heterogeneous doc-at-a-time loops over this enum —
+/// deliberately separate from the field-level optimized kernels
+/// (flat-merge AND, MaxScore/BMM, windowed union), which keep serving
+/// term-only queries unchanged. A query containing any phrase routes
+/// here: correctness-first walks whose per-doc cost is dominated by
+/// the phrase verification itself.
+enum AnyCursor {
+    Term(TermCursor),
+    Phrase(PhraseCursor),
+}
+
+impl AnyCursor {
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        match self {
+            AnyCursor::Term(c) => c.is_exhausted(),
+            AnyCursor::Phrase(c) => c.is_exhausted(),
+        }
+    }
+
+    #[inline]
+    fn current_doc_id(&self) -> u32 {
+        match self {
+            AnyCursor::Term(c) => c.current_doc_id(),
+            AnyCursor::Phrase(c) => c.current_doc_id(),
+        }
+    }
+
+    /// Advance to the first (phrase: first *verified*) doc ≥ `target`.
+    fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
+        match self {
+            AnyCursor::Term(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
+            AnyCursor::Phrase(c) => c.skip_to(target),
+        }
+    }
+
+    /// [`Self::skip_to`] with the ranked walks' pruning bar: a phrase
+    /// atom skips docs it provably can't lift over the bar without
+    /// doing any position work (see [`PhraseCursor::skip_to_pruned`]).
+    /// Term atoms ignore the bar — their per-doc score costs nothing
+    /// beyond the postings walk itself.
+    fn skip_to_pruned(
+        &mut self,
+        target: u32,
+        bar: f32,
+        dl_norm_k1: &[f32],
+    ) -> Result<(), FtsError> {
+        match self {
+            AnyCursor::Term(c) => {
+                c.skip_to(target);
+                Ok(())
+            }
+            AnyCursor::Phrase(c) => c.skip_to_pruned(target, bar, dl_norm_k1),
+        }
+    }
+
+    /// BM25 contribution at the cursor's current doc.
+    #[inline]
+    fn score_current(&self, dl_norm_k1: f32) -> f32 {
+        match self {
+            AnyCursor::Term(c) => {
+                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
+            }
+            AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
+        }
+    }
+
+    /// Atom-level score upper bound (any doc).
+    #[inline]
+    fn term_max_bm25(&self) -> f32 {
+        match self {
+            AnyCursor::Term(c) => c.term_max_bm25,
+            AnyCursor::Phrase(c) => c.term_max_bm25,
+        }
+    }
+
+    /// Score upper bound over the doc range (see the cursors' docs).
+    #[inline]
+    fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        match self {
+            AnyCursor::Term(c) => c.block_max_in_range(range_start, range_end),
+            AnyCursor::Phrase(c) => c.block_max_in_range(range_start, range_end),
+        }
+    }
+}
+
+/// Atom-walk exclusion gate: the heterogeneous sibling of
+/// [`ExcludeFilter`], additionally able to exclude docs containing a
+/// negated *phrase*. Same monotonic-doc contract.
+struct AtomExcludeFilter {
+    atoms: Vec<AnyCursor>,
+    last_doc: u32,
+}
+
+impl AtomExcludeFilter {
+    fn new(atoms: Vec<AnyCursor>) -> Self {
+        Self { atoms, last_doc: 0 }
+    }
+
+    /// `false` iff `doc` matches any negated atom.
+    fn admits(&mut self, doc: u32) -> Result<bool, FtsError> {
+        debug_assert!(
+            doc >= self.last_doc,
+            "AtomExcludeFilter fed non-monotonic doc: {doc} < {}",
+            self.last_doc
+        );
+        self.last_doc = doc;
+        for a in &mut self.atoms {
+            a.skip_to(doc)?;
+            if !a.is_exhausted() && a.current_doc_id() == doc {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// Exclusion gate for negated (`-term`) clauses: holds one
@@ -3244,6 +4261,12 @@ struct TermMeta {
     /// Absolute offset (within the postings region) of the first
     /// skip-table entry: `metadata_offset + TERM_META_SIZE`.
     skip_start: usize,
+    /// This term's byte offset in the positions region (positional
+    /// columns; zero otherwise).
+    positions_offset: u64,
+    /// Byte length of this term's position runs (positional columns;
+    /// zero otherwise).
+    positions_length: u32,
 }
 
 impl TermMeta {
@@ -3251,8 +4274,17 @@ impl TermMeta {
     /// Returns `Err` (never panics) on a corrupt or malicious
     /// `metadata_offset` — the crate-wide "untrusted input yields
     /// `Err`, not a slice-index panic" rule.
-    fn parse(postings: &[u8], metadata_offset: usize) -> Result<Self, FtsError> {
-        if metadata_offset + TERM_META_SIZE > postings.len() {
+    fn parse(postings: &[u8], metadata_offset: usize, positional: bool) -> Result<Self, FtsError> {
+        // Positional columns carry the extended 32-byte header (the
+        // term's positions offset + length after `num_blocks`); the
+        // skip table starts after whichever stride applies. The
+        // positions fields themselves are consumed by the phrase read
+        // path, not here.
+        let term_meta_size = match positional {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+        if metadata_offset + term_meta_size > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
                 "term metadata offset out of postings region".into(),
             )));
@@ -3271,7 +4303,21 @@ impl TermMeta {
                 ..metadata_offset + term_meta::NUM_BLOCKS_OFF + U32_BYTES],
         ) as usize;
 
-        let skip_start = metadata_offset + TERM_META_SIZE;
+        let (positions_offset, positions_length) = match positional {
+            true => (
+                read_u64_le(
+                    &postings[metadata_offset + term_meta::POSITIONS_OFFSET_OFF
+                        ..metadata_offset + term_meta::POSITIONS_OFFSET_OFF + U64_BYTES],
+                ),
+                read_u32_le(
+                    &postings[metadata_offset + term_meta::POSITIONS_LENGTH_OFF
+                        ..metadata_offset + term_meta::POSITIONS_LENGTH_OFF + U32_BYTES],
+                ),
+            ),
+            false => (0, 0),
+        };
+
+        let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
         if skip_end > postings.len() {
             return Err(FtsError::Read(ReadError::MalformedVersion(
@@ -3283,6 +4329,8 @@ impl TermMeta {
             postings_length,
             num_blocks,
             skip_start,
+            positions_offset,
+            positions_length,
         })
     }
 
@@ -3316,6 +4364,19 @@ impl TermMeta {
             last_doc_id,
             block_offset,
             max_bm25_x1000 as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+        )
+    }
+
+    /// This block's position-run byte offset within the term's
+    /// positions bytes — the skip entry's fourth field (zero on
+    /// positionless columns, where it is the reserved slot).
+    #[inline]
+    fn positions_block_offset(&self, postings: &[u8], i: usize) -> u32 {
+        debug_assert!(i < self.num_blocks, "skip entry {i} >= {}", self.num_blocks);
+        let entry_off = self.skip_start + i * SKIP_ENTRY_SIZE;
+        read_u32_le(
+            &postings[entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF
+                ..entry_off + skip_entry::POSITIONS_BLOCK_OFFSET_OFF + U32_BYTES],
         )
     }
 
@@ -3409,6 +4470,13 @@ struct TermCursor {
     /// Mirrors the vector reader's per-probed-cluster buffers: the
     /// search hot loops index only the bytes this term touches, never
     /// the whole postings region.
+    ///
+    /// Deliberately carries NO positional state: term cursors are the
+    /// hot per-query unit the multi-cursor kernels iterate over, and
+    /// the positional extras matter only to phrase members —
+    /// [`PhraseMember`] re-derives them from these bytes instead, so
+    /// plain term queries never pay for them in cursor or block-meta
+    /// footprint.
     bytes: Bytes,
 }
 
@@ -3418,11 +4486,11 @@ impl TermCursor {
     /// the term's 20-byte metadata header (offset 0) and runs to the
     /// end of its last block — the contiguous range
     /// [`FtsReader::fetch_term_postings`] fetched for this term.
-    fn new(term_bytes: Bytes, n_docs: u64) -> Result<Self, FtsError> {
+    fn new(term_bytes: Bytes, n_docs: u64, positional: bool) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
-        let term_meta = TermMeta::parse(postings, metadata_offset)?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional)?;
         let idf = bm25::idf(n_docs, term_meta.df);
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
@@ -3761,7 +4829,8 @@ mod tests {
         // 3 docs, 1 column.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         b.add_doc(0, 0, "rust async runtime").expect("add doc");
         b.add_doc(0, 1, "tokio is a rust runtime").expect("add doc");
         b.add_doc(0, 2, "java spring boot").expect("add doc");
@@ -3915,7 +4984,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
             if i % 2 == 0 {
@@ -3993,7 +5062,8 @@ mod tests {
         // score, ascending doc_id tiebreak).
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         // 20 docs sprinkled with mixed term combinations.
         let docs = [
             "alpha",
@@ -4145,7 +5215,8 @@ mod tests {
     fn build_mixed_df_blob() -> (Bytes, String) {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register column");
+        b.register_column("body".into(), false)
+            .expect("register column");
         // `common`     → df = 3 (PFOR form)
         // `rust`       → df = 2 (PFOR form)
         // `uniqzero`  → df = 1 (inline form)
@@ -4271,7 +5342,7 @@ mod tests {
 
         let mut b_inline = FtsBuilder::new(tok.clone());
         b_inline
-            .register_column("body".into())
+            .register_column("body".into(), false)
             .expect("register column");
         for i in 0..20 {
             b_inline
@@ -4282,7 +5353,7 @@ mod tests {
 
         let mut b_pfor = FtsBuilder::new(tok);
         b_pfor
-            .register_column("body".into())
+            .register_column("body".into(), false)
             .expect("register column");
         // Same 20 terms but all appearing in every doc → df = 20 → PFOR.
         for i in 0..20 {
@@ -4300,24 +5371,26 @@ mod tests {
                 .try_into()
                 .expect("postings_off_i slice is 8 bytes"),
         ) as usize;
-        let dir_off_i = u64::from_le_bytes(
-            blob_inline[40..48]
+        // v2 layout: the postings region ends where the positions
+        // region begins (header bytes [48..56]).
+        let positions_off_i = u64::from_le_bytes(
+            blob_inline[48..56]
                 .try_into()
-                .expect("dir_off_i slice is 8 bytes"),
+                .expect("positions_off_i slice is 8 bytes"),
         ) as usize;
-        let postings_size_inline = dir_off_i - postings_off_i;
+        let postings_size_inline = positions_off_i - postings_off_i;
 
         let postings_off_p = u64::from_le_bytes(
             blob_pfor[32..40]
                 .try_into()
                 .expect("postings_off_p slice is 8 bytes"),
         ) as usize;
-        let dir_off_p = u64::from_le_bytes(
-            blob_pfor[40..48]
+        let positions_off_p = u64::from_le_bytes(
+            blob_pfor[48..56]
                 .try_into()
-                .expect("dir_off_p slice is 8 bytes"),
+                .expect("positions_off_p slice is 8 bytes"),
         ) as usize;
-        let postings_size_pfor = dir_off_p - postings_off_p;
+        let postings_size_pfor = positions_off_p - postings_off_p;
 
         // Inline-only blob's postings region holds just the trailing
         // CRC32 (4 B). PFOR blob holds 20 terms × (20 B metadata +
@@ -4521,13 +5594,168 @@ mod tests {
         assert!(matches!(err, FtsError::UnknownColumn(_)));
     }
 
+    // ---- phrase atoms ----
+
+    /// Corpus with controlled adjacency for "new york": docs 0, 2
+    /// match (doc 4 twice); docs 1, 3 contain both words but never
+    /// adjacent in order.
+    fn build_phrase_blob() -> (Bytes, &'static str) {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        b.register_column("title".into(), true).expect("register");
+        let docs = [
+            "new york city",
+            "york new haven",
+            "the new york times",
+            "new haven york",
+            "new york new york",
+        ];
+        for (i, d) in docs.iter().enumerate() {
+            b.add_doc(0, i as u32, d).expect("add doc");
+        }
+        (
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"title","tokenizer":"ascii_lower","positions":true}]"#,
+        )
+    }
+
+    fn phrase(terms: &[&str]) -> Vec<Vec<String>> {
+        vec![terms.iter().map(|t| t.to_string()).collect()]
+    }
+
+    #[tokio::test]
+    async fn phrase_matches_adjacent_in_order_only() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 2, 4], "adjacency in order only");
+        // Doc 4 has the phrase twice — highest tf, and with uniform
+        // doc lengths in play its score must strictly exceed doc 0's
+        // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
+        assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    #[tokio::test]
+    async fn phrase_composes_with_clauses() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ny = phrase(&["new", "york"]);
+
+        // Must-phrase + must-term: "the" only in doc 2.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    musts: &["the"],
+                    must_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("must phrase + term");
+        assert_eq!(
+            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            vec![2],
+            "+\"new york\" +the"
+        );
+
+        // Negated phrase: haven-docs minus the phrase docs.
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    shoulds: &["haven"],
+                    negative_phrases: &ny,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("negated phrase");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "haven docs don't contain the phrase");
+    }
+
+    #[tokio::test]
+    async fn phrase_with_absent_member_matches_nothing() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open");
+        let ghost = phrase(&["new", "zealand"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    must_phrases: &ghost,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("ghost phrase");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn phrase_on_positionless_column_is_typed_error() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        b.register_column("title".into(), false).expect("register");
+        b.add_doc(0, 0, "new york").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let r =
+            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+        let phrases = phrase(&["new", "york"]);
+        let err = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect_err("must be a typed error");
+        assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+
     #[tokio::test]
     async fn search_excluding_drops_negated_docs() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         // "runtime" hits docs 0 and 1; negate "async" (only in doc 0).
         let hits = r
-            .search_excluding("body", &[], &["runtime"], &["async"], 10, f32::NEG_INFINITY)
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["runtime"],
+                    negatives: &["async"],
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
             .await
             .expect("search excluding");
         let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -4539,7 +5767,15 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let err = r
-            .search_excluding("body", &[], &[], &["rust"], 10, f32::NEG_INFINITY)
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    negatives: &["rust"],
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
             .await
             .expect_err("negation-only");
         assert!(matches!(err, FtsError::NegationOnly));
@@ -4550,7 +5786,7 @@ mod tests {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         let hits = r
-            .search_excluding("body", &[], &[], &[], 10, f32::NEG_INFINITY)
+            .search_excluding("body", ClauseLists::default(), 10, f32::NEG_INFINITY)
             .await
             .expect("empty");
         assert!(hits.is_empty());
@@ -4572,8 +5808,8 @@ mod tests {
     async fn search_multi_weights_and_combines_columns() {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("title".into()).expect("register");
-        b.register_column("body".into()).expect("register");
+        b.register_column("title".into(), false).expect("register");
+        b.register_column("body".into(), false).expect("register");
         // doc 0: title "rust"; doc 1: body "rust"; doc 2: neither.
         b.add_doc(0, 0, "rust").expect("add");
         b.add_doc(1, 0, "systems").expect("add");
@@ -4600,7 +5836,7 @@ mod tests {
         // ranged path actually clips some out.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
@@ -4649,7 +5885,7 @@ mod tests {
     async fn search_or_range_with_floor_prunes() {
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
@@ -4669,7 +5905,7 @@ mod tests {
         // BMM path on the planted corpus.
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         let docs = [
             "alpha beta",
             "alpha",
@@ -4721,7 +5957,7 @@ mod tests {
 
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
             // `alpha` in ~every doc, `beta` in ~half, `gamma` every
@@ -4776,7 +6012,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha zeta eta theta "); // ~every doc
             if i % 2 == 0 {
@@ -4847,7 +6083,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha ");
             if i % 2 == 0 {
@@ -4892,7 +6128,7 @@ mod tests {
         const N_DOCS: u32 = 4000;
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common "); // every doc
             if i % 2 == 0 {
@@ -4939,7 +6175,7 @@ mod tests {
         const N_DOCS: u32 = OR_WINDOW + 1000; // spans more than one window
         let tok = Arc::new(AsciiLowerTokenizer);
         let mut b = FtsBuilder::new(tok);
-        b.register_column("body".into()).expect("register");
+        b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha ");
             if i % 2 == 0 {

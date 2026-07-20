@@ -70,6 +70,7 @@ fn options_title_emb() -> SupertableOptions {
         schema,
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
         Some(default_tokenizer()),

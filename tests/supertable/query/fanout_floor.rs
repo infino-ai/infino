@@ -117,6 +117,7 @@ fn options_title_only() -> SupertableOptions {
         schema,
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -228,6 +229,7 @@ fn build_one_superfile() -> SuperfileReader {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![],
         Some(default_tokenizer()),

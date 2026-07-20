@@ -20,7 +20,7 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -52,7 +52,7 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, FtsReader},
+            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
@@ -928,8 +928,29 @@ impl SuperfileReader {
         let musts: Vec<&str> = clauses.musts.iter().map(|t| &**t).collect();
         let shoulds: Vec<&str> = clauses.shoulds.iter().map(|t| &**t).collect();
         let negatives: Vec<&str> = clauses.negatives.iter().map(|t| &**t).collect();
-        self.bm25_search_clauses(column, &musts, &shoulds, &negatives, k, f32::NEG_INFINITY)
-            .await
+        let own = |phrases: Vec<Vec<Cow<'_, str>>>| -> Vec<Vec<String>> {
+            phrases
+                .into_iter()
+                .map(|p| p.into_iter().map(Cow::into_owned).collect())
+                .collect()
+        };
+        let must_phrases = own(clauses.must_phrases);
+        let should_phrases = own(clauses.should_phrases);
+        let negative_phrases = own(clauses.negative_phrases);
+        self.bm25_search_clauses(
+            column,
+            ClauseLists {
+                musts: &musts,
+                shoulds: &shoulds,
+                negatives: &negatives,
+                must_phrases: &must_phrases,
+                should_phrases: &should_phrases,
+                negative_phrases: &negative_phrases,
+            },
+            k,
+            f32::NEG_INFINITY,
+        )
+        .await
     }
 
     /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
@@ -1010,6 +1031,39 @@ impl SuperfileReader {
         Ok(fts.token_match_count(column, tokens, mode).await?)
     }
 
+    /// Phrase-aware unranked match: `local_doc_id`s whose `column`
+    /// matches the `terms` and exact `phrases` under `mode`,
+    /// ascending. Used by the table layer whenever the match set
+    /// contains a phrase; plain-token queries keep
+    /// [`token_match`](Self::token_match).
+    pub async fn atoms_match_ids(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<Vec<u32>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.atoms_match_ids(column, terms, phrases, mode).await?)
+    }
+
+    /// Phrase-aware unranked match **count** — the phrase sibling of
+    /// [`token_match_count`](Self::token_match_count).
+    pub async fn atoms_match_count(
+        &self,
+        column: &str,
+        terms: &[&str],
+        phrases: &[Vec<String>],
+        mode: BoolMode,
+    ) -> Result<u64, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.atoms_match_count(column, terms, phrases, mode).await?)
+    }
+
     /// Document frequency of `token` in `column` (0 if absent) — a cheap
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to
@@ -1085,18 +1139,14 @@ impl SuperfileReader {
     pub(crate) async fn bm25_search_clauses(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
-        negatives: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts
-            .search_excluding(column, musts, shoulds, negatives, k, floor)
-            .await?)
+        Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
     /// Prefix-expanded BM25 search.
@@ -1546,6 +1596,7 @@ mod tests {
             "doc_id",
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(default_tokenizer()),
@@ -1913,9 +1964,11 @@ mod tests {
             vec![
                 FtsConfig {
                     column: "title".into(),
+                    positions: false,
                 },
                 FtsConfig {
                     column: "body".into(),
+                    positions: false,
                 },
             ],
             vec![],

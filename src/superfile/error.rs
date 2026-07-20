@@ -39,6 +39,12 @@ pub enum BuildError {
     #[error("user column name {0:?} contains reserved \\x1F separator")]
     ReservedSeparatorInColumnName(String),
 
+    #[error(
+        "FTS column {column:?}: document exceeds the u32::MAX token-position \
+         limit of the positional index"
+    )]
+    PositionOverflow { column: String },
+
     #[error("schema mismatch: self={mine:?} other={other:?}")]
     SchemaMismatch { mine: String, other: String },
 
@@ -185,6 +191,16 @@ pub enum FtsError {
     /// Reject this case.
     #[error("query has only negated terms; at least one positive term is required")]
     NegationOnly,
+
+    /// A phrase query needs token positions but the column was built
+    /// without them (`FtsConfig::positions` was false). A typed error
+    /// — never a silent bag-of-words fallback, which would return
+    /// wrong matches.
+    #[error(
+        "phrase query on column {column:?}, which was indexed without token \
+         positions; rebuild with positions enabled to use phrase queries"
+    )]
+    PositionsUnavailable { column: String },
 
     #[error("read error: {0}")]
     Read(#[from] ReadError),

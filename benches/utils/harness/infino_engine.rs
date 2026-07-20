@@ -36,8 +36,12 @@ const WRITE_CHUNK: usize = 65_536;
 
 /// Build one superfile (`.parquet` + embedded FTS blob) from `docs` with
 /// a single builder, returning the finished bytes. Shared by the
-/// queryable `write` and the build-throughput probe.
-fn build_superfile(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
+/// queryable `write` and the build-throughput probes. `positions`
+/// selects the FTS config: the queryable artifact is positional (the
+/// warm battery includes phrase queries), while the default-config
+/// build rows measure `positions: false` — what a table gets unless it
+/// opts in.
+fn build_superfile(column: &str, docs: &[(u64, &str)], positions: bool) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(ID_COLUMN, DataType::Decimal128(38, 0), false),
         Field::new(column, DataType::LargeUtf8, false),
@@ -47,6 +51,7 @@ fn build_superfile(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
         ID_COLUMN,
         vec![FtsConfig {
             column: column.to_string(),
+            positions,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -65,6 +70,36 @@ fn build_superfile(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
         builder.add_batch(&batch, &[]).expect("add_batch");
     }
     builder.finish().expect("SuperfileBuilder::finish")
+}
+
+/// Build-only run at `writers` parallelism: shard the corpus across
+/// `writers` builders, each emitting its own superfile (the same
+/// sharded-ingest shape a partitioned commit produces); bytes
+/// discarded. `writers <= 1` is a plain single-builder run.
+fn parallel_build(column: &str, docs: &[(u64, &str)], writers: usize, positions: bool) {
+    if writers <= 1 {
+        std::hint::black_box(build_superfile(column, docs, positions));
+        return;
+    }
+    let shard_len = docs.len().div_ceil(writers);
+    let shards: Vec<Vec<u8>> = docs
+        .par_chunks(shard_len)
+        .map(|shard| build_superfile(column, shard, positions))
+        .collect();
+    std::hint::black_box(shards);
+}
+
+/// Single-writer build at the default FTS config (`positions: false`),
+/// returning the finished bytes so the caller can report the
+/// default-config stored size alongside the timing.
+pub fn build_positionless(column: &str, docs: &[(u64, &str)]) -> Vec<u8> {
+    build_superfile(column, docs, false)
+}
+
+/// Build-only throughput probe at the default FTS config
+/// (`positions: false`) and `writers` parallelism.
+pub fn parallel_build_positionless(column: &str, docs: &[(u64, &str)], writers: usize) {
+    parallel_build(column, docs, writers, false);
 }
 
 /// infino as a comparison engine.
@@ -117,26 +152,14 @@ impl FtsEngine for InfinoFtsEngine {
     }
 
     fn write(index: &mut Self::Index, docs: &[(u64, &str)]) {
-        let bytes = build_superfile(&index.column, docs);
+        let bytes = build_superfile(&index.column, docs, true);
         index.reader =
             Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
         index.bytes = Some(bytes);
     }
 
     fn parallel_write(column: &str, docs: &[(u64, &str)], writers: usize) {
-        if writers <= 1 {
-            std::hint::black_box(build_superfile(column, docs));
-            return;
-        }
-        // Parallel build: shard the corpus across `writers` builders,
-        // each emitting its own superfile (the same sharded-ingest shape
-        // a partitioned commit produces). Build-only — bytes discarded.
-        let shard_len = docs.len().div_ceil(writers);
-        let shards: Vec<Vec<u8>> = docs
-            .par_chunks(shard_len)
-            .map(|shard| build_superfile(column, shard))
-            .collect();
-        std::hint::black_box(shards);
+        parallel_build(column, docs, writers, true);
     }
 
     fn read(index: &Self::Index, terms: &[&str], k: usize, mode: BoolMode) -> Vec<Hit> {

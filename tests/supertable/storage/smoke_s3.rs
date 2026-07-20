@@ -203,6 +203,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
         schema,
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![VectorConfig {
             column: "emb".into(),

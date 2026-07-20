@@ -111,6 +111,15 @@ pub fn corpus() -> Vec<(u64, &'static str)> {
 
 /// Build an infino superfile from the corpus.
 pub fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
+    build_infino_superfile_with(corpus, false)
+}
+
+/// Positional variant for the phrase oracle tests.
+pub fn build_infino_superfile_positional(corpus: &[(u64, &str)]) -> SuperfileReader {
+    build_infino_superfile_with(corpus, true)
+}
+
+fn build_infino_superfile_with(corpus: &[(u64, &str)], positions: bool) -> SuperfileReader {
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
@@ -120,6 +129,7 @@ pub fn build_infino_superfile(corpus: &[(u64, &str)]) -> SuperfileReader {
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions,
         }],
         vec![],
         Some(default_tokenizer()),

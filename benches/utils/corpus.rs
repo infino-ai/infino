@@ -1483,7 +1483,7 @@ pub fn calibrate_superfile(
 /// both bench harnesses construct the index identically.
 pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
     let mut b = FtsBuilder::new(default_tokenizer());
-    b.register_column("title".to_string())
+    b.register_column("title".to_string(), true)
         .expect("register column");
     for (i, text) in docs.iter().enumerate() {
         b.add_doc(0, i as u32, text).expect("add doc");
@@ -1559,6 +1559,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![SfVectorConfig {
             provided_centroids: None,
@@ -1606,6 +1607,7 @@ pub fn build_superfile_with_metric(
         "doc_id",
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![SfVectorConfig {
             provided_centroids: None,

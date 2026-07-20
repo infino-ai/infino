@@ -498,6 +498,7 @@ mod tests {
             schema_id_cat_title(),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),
@@ -1024,6 +1025,7 @@ mod tests {
             Arc::clone(&schema),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),
@@ -1075,6 +1077,7 @@ mod tests {
             Arc::clone(&schema),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![],
             Some(tok()),
@@ -1670,6 +1673,7 @@ mod tests {
             schema_with_vector(dim),
             vec![FtsConfig {
                 column: "title".into(),
+                positions: false,
             }],
             vec![VectorConfig {
                 column: "emb".into(),
