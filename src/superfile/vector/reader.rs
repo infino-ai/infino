@@ -3001,18 +3001,21 @@ impl VectorReader {
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
         let chosen: Vec<usize> = clusters.iter().map(|&c| c as usize).collect();
-        // Same inverse-selectivity boost as [`Self::search_async`]: the
-        // supertable fan-out probes externally chosen clusters (no local
-        // nprobe scoring), so rerank breadth must scale here — not only
-        // on the per-superfile nprobe fallback path.
-        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
-        if filter_mult == 0 {
+        // No inverse-selectivity rerank inflation on the fan path: the
+        // shortlist heap admits MATCHING rows only (the allow test runs
+        // before a candidate can take a slot), so `k × rerank_mult`
+        // already buys the standard rerank contract over matching
+        // candidates — post-filter underflow cannot happen. The old ×10
+        // boost multiplied the exact-rerank volume by selectivity on
+        // every probed fragment (measured 70 ms survivor gather + 52 ms
+        // Sq8 rerank per filtered query at 1M).
+        if allow.as_ref().is_some_and(|bm| bm.is_empty()) {
             return Ok(Vec::new());
         }
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
-            rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+            rerank_mult,
             allow,
             deny,
             pool,
@@ -3099,14 +3102,17 @@ impl VectorReader {
                 .map_err(|e| VectorError::LazySource(e.to_string()))?;
             let mut q_rot = vec![0f32; col.dim];
             col.rot.apply(query, &mut q_rot);
-            let filter_mult = filter_selectivity_mult(&cell_allow, col.n_docs);
-            if filter_mult == 0 {
+            // No inverse-selectivity rerank inflation — same reasoning as
+            // [`Self::search_clusters_async`]: the shortlist is allow-first
+            // (matching rows only), so the standard `k × rerank_mult`
+            // contract holds unchanged under a filter.
+            if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
                 continue;
             }
             let ctx = ProbeCtx {
                 q_rot: &q_rot,
                 k,
-                rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+                rerank_mult,
                 allow: cell_allow,
                 deny: cell_deny,
                 pool: pool.clone(),

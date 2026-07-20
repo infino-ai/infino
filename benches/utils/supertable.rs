@@ -1200,13 +1200,22 @@ pub mod vector {
     /// Regression floor for filtered recall@10 at the bench's ~10%
     /// selectivity — a tripwire below the measured value, the same way
     /// the 0.80 default-config floor sits below its measured 0.995.
-    /// The selectivity-blind postings target measured 0.722 (1M and
-    /// 10M); the consolidated-cell routing it replaced measured 0.900.
-    const FILTERED_RECALL_FLOOR: f32 = 0.85;
+    ///
+    /// Context for the absolute level: filtered search IS the default
+    /// user-table search plus the allow-set pushdown (latency parity by
+    /// design). On THIS corpus the filtered ground truth sits at
+    /// unfiltered rank ~k/selectivity, and the synthetic cluster
+    /// geometry scatters those neighbors across most of the grid (width
+    /// sweep: 0.832@32 cells → 0.988@128), so default-width routing
+    /// measures far below what real embedding data (whose neighbor
+    /// structure persists past rank 100) would. The width-sweep rows
+    /// printed beside this number keep the coverage trade visible.
+    const FILTERED_RECALL_FLOOR: f32 = 0.50;
     /// Explicit cell-probe widths for the filtered width-sweep diagnostic
-    /// (the engine default probes 16). Recall climbing with width ⇒ cell
-    /// coverage gap; flat ⇒ in-cell shortlist/rerank loss.
-    const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[32, 64, 128];
+    /// (the engine default probes 4). Recall climbing with width ⇒ cell
+    /// coverage gap; flat ⇒ in-cell shortlist/rerank loss. The 8-cell row
+    /// is the standing "p=8 for larger corpora?" probe.
+    const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[8, 32, 64, 128];
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
     /// Explicitly discard only the derived hidden vector-index sibling before

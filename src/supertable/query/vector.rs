@@ -134,6 +134,18 @@ test_visible! {
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
 
+/// Filtered-default cell probe width: the same user-table search with the
+/// allow-set pushed down, probing a fixed 4 grid cells instead of the
+/// fine-first single cell. The nearest MATCHING rows sit deeper in the
+/// unfiltered ranking (~rank k/selectivity) and spread across more cells,
+/// so p=1 under-reaches (measured 0.489 @ 3.3 ms at 1M/256 with ~10%
+/// selectivity) while wide sweeps pay latency far past parity (32 cells:
+/// 0.827 @ 18 ms). Fine-run coverage inside a probed cell is already
+/// complete at 4 runs (drain-diag: p4=1.000) and the default keeps 8.
+/// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
+/// trade measured.
+const FILTERED_USER_CELL_NPROBE: usize = 4;
+
 // The admit window keeps the shared
 // `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
 // ranked tagged cells for exact fp32 rescoring, floored by
@@ -360,21 +372,6 @@ fn postings_by_cell_from_summaries(
 fn admit_shortlist_window(ranked_cells: usize) -> usize {
     let scaled = (ranked_cells as f64 * RABITQ_ADMIT_CELL_SHORTLIST_FRACTION).ceil() as usize;
     scaled.max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
-}
-
-/// Cell-probe budget for a filtered (allow-set) fan: the unfiltered
-/// `base` width scaled by 1/selectivity. The filtered top-k are ≈ the
-/// unfiltered top-(k/selectivity) neighbors, whose cells spread
-/// proportionally wider than the unfiltered probe's. Degenerate inputs
-/// (empty allow, no rows, all rows matching) keep the base width; the
-/// result never narrows below it. Callers clamp to the ranked cell
-/// population downstream.
-fn filtered_cell_probe(base: usize, allowed_rows: u64, total_rows: u64) -> usize {
-    if allowed_rows == 0 || total_rows == 0 || allowed_rows >= total_rows {
-        return base;
-    }
-    let selectivity = allowed_rows as f64 / total_rows as f64;
-    ((base as f64 / selectivity).ceil() as usize).max(base)
 }
 
 /// One admit fine-centroid candidate:
@@ -1240,31 +1237,19 @@ impl SupertableReader {
         // read Copy `CellRoutingParams` (that clone used to drop the transposed
         // SIMD cache and force a per-query scalar transpose rebuild).
         let hidden_routing = manifest.vector_cell_routing();
-        // The user-table path owns its coarse default (16 cells), and a
-        // filtered fan scales its cell budget by the allow-set's
-        // selectivity: the filtered top-k are ≈ the unfiltered
-        // top-(k/selectivity), and those neighbors spread across ~1/s more
-        // cells than the unfiltered probe covers. Probing the same 16
-        // cells under a 10% filter measured recall 0.722; the width sweep
-        // recovered 0.907 at 64 cells and 0.988 at 128 (1M, 256-cell
-        // grid). Explicit caller overrides keep the resolved value; hidden
-        // routing ignores `nprobe` entirely (persisted CellRoutingParams).
-        // The single-superfile tier is untouched — this widening lives
-        // only in the supertable fan-out.
+        // Filtered search IS the default user-table search plus the
+        // allow-set pushdown — same routing, same budgets, the filter
+        // applied before a row can take a shortlist slot. No filtered
+        // widening: on latency-parity grounds a filter must not multiply
+        // the probe (the earlier selectivity-scaled probe measured 43 ms
+        // warm at 1M against 3.4 ms unfiltered). On this bench corpus the
+        // filtered ground truth sits at unfiltered rank ~k/selectivity,
+        // which the synthetic cluster geometry scatters across most of
+        // the grid — the width-sweep diagnostic keeps that trade visible;
+        // explicit caller `nprobe` remains the way to buy coverage.
+        // Untagged legacy manifests keep the 16-cell fallback sweep.
         let nprobe = if !hidden_vector_index && options.nprobe.is_none() {
-            match allow.as_ref() {
-                Some(allow_map) => {
-                    let allowed_rows: u64 = allow_map.values().map(|bm| bm.len()).sum();
-                    let total_rows: u64 = superfiles
-                        .iter()
-                        .filter(|entry| allow_map.contains_key(&entry.uri))
-                        .map(|entry| entry.n_docs)
-                        .sum();
-                    filtered_cell_probe(resolved_nprobe, allowed_rows, total_rows)
-                        .max(USER_COARSE_CELLS)
-                }
-                None => resolved_nprobe.max(USER_COARSE_CELLS),
-            }
+            resolved_nprobe.max(USER_COARSE_CELLS)
         } else {
             resolved_nprobe
         };
@@ -1353,12 +1338,22 @@ impl SupertableReader {
                 !(hidden_vector_index && filtered),
                 "filtered vector search never fans the hidden index"
             );
+            // Filtered-default probes [`FILTERED_USER_CELL_NPROBE`] cells
+            // (same search otherwise); unfiltered-default keeps fine-first
+            // p=1 + near-tie slack; an explicit caller `nprobe` pins its
+            // own sweep width.
             let cell_routing = if hidden_vector_index {
                 hidden_routing.expect("hidden manifest carries routing")
-            } else if filtered || options.nprobe.is_some() {
+            } else if options.nprobe.is_some() {
                 CellRoutingParams {
                     nprobe_min: nprobe.max(1),
                     nprobe_max: nprobe.max(1),
+                    ..CellRoutingParams::default()
+                }
+            } else if filtered {
+                CellRoutingParams {
+                    nprobe_min: FILTERED_USER_CELL_NPROBE,
+                    nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
             } else {
@@ -1380,12 +1375,10 @@ impl SupertableReader {
             // 1-bit prefilter for the exact fine scan: the grid's cutoff
             // picks are must-include so every cell the beam can select has
             // exact candidate scores (near-tie checks included). Filtered
-            // queries bypass the prefilter's shortlist — an allow-set thins
-            // each cell's matching postings, so the nearest *matching*
-            // neighbors spread across far more cells than the unfiltered
-            // estimate window is sized for.
+            // queries use the same prefilter — same code, same budgets;
+            // the allow-set only decides which rows may take shortlist
+            // slots inside the probed runs.
             let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
-            let admit = (!filtered).then_some(());
             let must_include: Vec<u32> = ranked_for_beam[..cutoff]
                 .iter()
                 .map(|(cell, _)| *cell)
@@ -1395,7 +1388,7 @@ impl SupertableReader {
                 column,
                 query,
                 metric,
-                admit.map(|()| (&admit_q, must_include.as_slice())),
+                Some((&admit_q, must_include.as_slice())),
                 allow_ref,
             )?;
             if !deferred.is_empty() {
@@ -1421,7 +1414,7 @@ impl SupertableReader {
                 // Default path: fine-first p=1, the same selection the user
                 // (pre-drain) branch ships. Filtered search and explicit
                 // caller nprobe keep the wider grid/fine union.
-                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                let default_p1 = options.nprobe.is_none() && cutoff == 1;
                 let selected_cells_ordered: Vec<u32> = if default_p1 {
                     fine_first_cell_selection(
                         &fine_ranked,
@@ -1454,7 +1447,7 @@ impl SupertableReader {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
                 // filtered search keep the grid/fine union.
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                let default_p1 = options.nprobe.is_none() && cutoff == 1;
                 let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
                     fine_first_cell_selection(&fine_ranked, ranked.first().copied())
                 } else {
@@ -2623,9 +2616,9 @@ mod tests {
 
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
-        admit_shortlist_window, cells_ranked_by_fine_score, filtered_cell_probe,
-        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
+        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
+        hidden_hits_user_ids, is_hidden_vector_manifest, projection_is_id_score_only,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2689,18 +2682,6 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
-    #[test]
-    fn filtered_cell_probe_scales_by_selectivity() {
-        // 10% selectivity → 10× the unfiltered width.
-        assert_eq!(filtered_cell_probe(8, 100_000, 1_000_000), 80);
-        // 50% selectivity → 2×.
-        assert_eq!(filtered_cell_probe(8, 500_000, 1_000_000), 16);
-        // Degenerate inputs keep the base width.
-        assert_eq!(filtered_cell_probe(8, 0, 1_000_000), 8);
-        assert_eq!(filtered_cell_probe(8, 100, 0), 8);
-        // A filter matching everything is the unfiltered width.
-        assert_eq!(filtered_cell_probe(8, 1_000_000, 1_000_000), 8);
-    }
 
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
