@@ -1313,7 +1313,15 @@ impl VectorReader {
                 subsection_len,
                 opts.verify_crc,
             )?;
-            flat_total = flat_total.saturating_add(col.n_cent);
+            // Checked, not saturating: a malformed directory whose summed
+            // cluster count overflows u32 would otherwise saturate and alias
+            // every later cell onto the same flat base in
+            // `resolve_flat_cluster`.
+            flat_total = flat_total.checked_add(col.n_cent).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell directory total cluster count exceeds u32".into(),
+                ))
+            })?;
             flat_cluster_base.push(flat_total);
             columns.push(col);
             cell_ids.push(cell_id);
@@ -2227,18 +2235,25 @@ impl VectorReader {
             .source
             .try_get_range_sync(col.subsection_range.clone())
             .ok_or(BuildError::VectorReadError)?;
-        let stable_ids = col.stable_ids_off.map(|so| {
-            (0..col.n_docs as usize)
-                .map(|local| {
-                    let p = so + local * format::vec::STABLE_ID_BYTES;
-                    i128::from_le_bytes(
-                        sub[p..p + format::vec::STABLE_ID_BYTES]
-                            .try_into()
-                            .expect("16-byte stable_id slice"),
-                    )
-                })
-                .collect()
-        });
+        // Checked reads: this path serves maintenance (compaction / drain
+        // merge) over bytes whose CRC verification is opt-in, so a
+        // truncated stable-id region must surface as a read error, not an
+        // out-of-bounds panic.
+        let stable_ids = col
+            .stable_ids_off
+            .map(|so| {
+                (0..col.n_docs as usize)
+                    .map(|local| {
+                        let p = so + local * format::vec::STABLE_ID_BYTES;
+                        sub.as_ref()
+                            .get(p..p + format::vec::STABLE_ID_BYTES)
+                            .and_then(|b| b.try_into().ok())
+                            .map(i128::from_le_bytes)
+                            .ok_or(BuildError::VectorReadError)
+                    })
+                    .collect::<Result<Vec<_>, BuildError>>()
+            })
+            .transpose()?;
         Ok(Sq8IvfMergeInput {
             sub: sub.as_ref().to_vec(),
             dim,
@@ -2856,14 +2871,11 @@ impl VectorReader {
         // enough eligible rows. Capped at [`MAX_FILTER_SELECTIVITY_MULT`]
         // on the selectivity side and [`MAX_EFFECTIVE_FILTERED_RERANK_MULT`]
         // on the effective rerank width.
-        let filter_mult = filter_selectivity_mult(&allow, col.n_docs);
-        if filter_mult == 0 {
+        let Some((nprobe_eff, rerank_mult_eff)) =
+            effective_filtered_params(&allow, col.n_docs, col.n_cent, nprobe, rerank_mult)
+        else {
             return Ok(Vec::new());
-        }
-        let nprobe_eff = nprobe
-            .saturating_mul(filter_mult)
-            .min(col.n_cent as usize)
-            .max(1);
+        };
         // 2. Score centroids → top `nprobe` clusters.
         let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
@@ -2876,7 +2888,6 @@ impl VectorReader {
         //    `search_clusters_async` path).
         let _ = sub_start;
         let chosen: Vec<usize> = centroid_scores.iter().map(|&(c, _)| c).collect();
-        let rerank_mult_eff = effective_filtered_rerank_mult(rerank_mult, filter_mult);
         let ctx = ProbeCtx {
             q_rot: &q_rot,
             k,
@@ -3692,6 +3703,37 @@ fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usi
     rerank_mult
         .saturating_mul(filter_mult)
         .min(MAX_EFFECTIVE_FILTERED_RERANK_MULT)
+}
+
+test_visible! {
+/// Effective `(nprobe, rerank_mult)` after filtered-search selectivity
+/// scaling — exactly the values [`ColumnReader`]'s self-routed search
+/// computes before probing. `None` for a present-but-empty allow-set
+/// (no row can match; the search returns empty without probing).
+///
+/// One math, two consumers: the search path above and the bench's
+/// filtered-search table, which reports the effective parameters and
+/// must never drift from what the engine actually runs.
+fn effective_filtered_params(
+    allow: &Option<Arc<RoaringBitmap>>,
+    n_docs: u32,
+    n_cent: u32,
+    nprobe: usize,
+    rerank_mult: usize,
+) -> Option<(usize, usize)> {
+    let filter_mult = filter_selectivity_mult(allow, n_docs);
+    if filter_mult == EMPTY_FILTER_SELECTIVITY_MULT {
+        return None;
+    }
+    let nprobe_eff = nprobe
+        .saturating_mul(filter_mult)
+        .min(n_cent as usize)
+        .max(1);
+    Some((
+        nprobe_eff,
+        effective_filtered_rerank_mult(rerank_mult, filter_mult),
+    ))
+}
 }
 
 /// Score `query` against every centroid in `centroids_bytes` and

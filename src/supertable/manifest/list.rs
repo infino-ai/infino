@@ -1135,8 +1135,12 @@ struct CellRoutingParamsDto {
     nprobe_min: usize,
     #[serde(default)]
     nprobe_max: usize,
+    /// `Option` rather than a zero sentinel: `slack = 0.0` is a meaningful
+    /// persisted value (no near-tie widening — τ = d* exactly), so absence
+    /// must be distinguishable from explicit zero. The `usize` knobs keep
+    /// the zero sentinel — zero probes/fine-runs is not a valid config.
     #[serde(default)]
-    slack: f32,
+    slack: Option<f32>,
     #[serde(default)]
     fine_nprobe: usize,
 }
@@ -1146,7 +1150,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
         Self {
             nprobe_min: r.nprobe_min,
             nprobe_max: r.nprobe_max,
-            slack: r.slack,
+            slack: Some(r.slack),
             fine_nprobe: r.fine_nprobe,
         }
     }
@@ -1161,8 +1165,8 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         if d.nprobe_max > 0 {
             r.nprobe_max = d.nprobe_max;
         }
-        if d.slack > 0.0 {
-            r.slack = d.slack;
+        if let Some(slack) = d.slack {
+            r.slack = slack;
         }
         if d.fine_nprobe > 0 {
             r.fine_nprobe = d.fine_nprobe;
@@ -1748,6 +1752,7 @@ mod tests {
 
     use super::{
         super::{
+            ClusterCentroids,
             bloom::BloomBuilder,
             part::{ContentHash, PartId},
         },
@@ -2450,6 +2455,46 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.partition_strategy, list.partition_strategy);
+    }
+
+    /// An explicitly-persisted `slack = 0.0` must survive the round-trip:
+    /// the DTO once used zero as its "field absent" sentinel, so reopening
+    /// a manifest silently widened the probe threshold back to the default
+    /// slack — a routing behavior change on tables that intentionally
+    /// persist no near-tie widening. Absent stays default.
+    #[test]
+    fn cell_routing_params_zero_slack_roundtrip() {
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(1, 4, &[0.5, 0.5, 0.5, 0.5], vec![1]),
+            routing: CellRoutingParams {
+                slack: 0.0,
+                ..CellRoutingParams::default()
+            },
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
+            panic!("VectorCell strategy must survive the round-trip");
+        };
+        assert_eq!(
+            routing.slack, 0.0,
+            "explicit zero slack must not decode back to the default"
+        );
+        // A JSON body without the field still lands on the default.
+        let s = from_utf8(&bytes).expect("utf8");
+        let stripped = s.replace("\"slack\": 0.0,", "");
+        assert_ne!(stripped, s, "fixture must actually strip the field");
+        let legacy = decode(stripped.as_bytes()).expect("decode without slack");
+        let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
+            panic!("VectorCell strategy must survive the stripped decode");
+        };
+        assert_eq!(
+            routing.slack,
+            CellRoutingParams::default().slack,
+            "absent slack keeps the default"
+        );
     }
 
     #[test]

@@ -159,3 +159,49 @@ fn build_current_thread_runtime() -> runtime::Runtime {
              catastrophic OS resource exhaustion",
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this pins: `bridge_on_runtime` once preferred the
+    /// AMBIENT runtime when one was present, driving the future on a
+    /// runtime other than the one its async resources are bound to.
+    /// Awaiting those resources cross-runtime can lose the wakeup — the
+    /// cold disk-cache fetch during a sync search deadlocked exactly
+    /// this way. The contract: always drive on the PASSED runtime; an
+    /// ambient runtime only decides whether `block_in_place` is needed
+    /// to make the nested `block_on` legal.
+    #[test]
+    fn bridge_on_runtime_drives_on_the_passed_runtime() {
+        let owned = build_query_runtime("bridge-test");
+        let owned_id = format!("{:?}", owned.handle().id());
+
+        // No ambient runtime: drives on the passed runtime.
+        let seen = bridge_on_runtime(async { format!("{:?}", Handle::current().id()) }, &owned);
+        assert_eq!(
+            seen, owned_id,
+            "no-ambient drive must use the passed runtime"
+        );
+
+        // Ambient multi-thread runtime present: the drive must STILL land on
+        // the passed runtime — under the old ambient-preferring behavior this
+        // assertion fails with the ambient's id.
+        let ambient = build_query_runtime("bridge-test-ambient");
+        let owned_for_task = Arc::clone(&owned);
+        let seen = ambient.block_on(async move {
+            tokio::spawn(async move {
+                bridge_on_runtime(
+                    async { format!("{:?}", Handle::current().id()) },
+                    &owned_for_task,
+                )
+            })
+            .await
+            .expect("bridge task")
+        });
+        assert_eq!(
+            seen, owned_id,
+            "an ambient runtime must not capture the drive"
+        );
+    }
+}

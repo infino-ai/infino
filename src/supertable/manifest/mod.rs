@@ -1070,6 +1070,20 @@ impl ManifestSnapshot {
                 .cloned()
                 .collect());
         };
+        // A list carrying a slow-state ref hydrated its membership from the
+        // blob (hidden manifests write no parts at all), so the resident
+        // flat view is authoritative and the parts sum below would be wrong
+        // — zero parts would fan out to zero entries and silently drop
+        // every undrained superfile.
+        if list.slow_vector_state_uri.is_some() {
+            return Ok(self
+                .superfile_list
+                .superfiles
+                .iter()
+                .filter(|entry| !drained.contains(entry.birth_version))
+                .cloned()
+                .collect());
+        }
         let expected: u64 = list.parts.iter().map(|entry| entry.n_superfiles).sum();
         if self.superfile_list.superfiles.len() as u64 == expected {
             return Ok(self
@@ -4834,6 +4848,57 @@ mod tests {
         assert!(
             updated.slow_vector_state_centroids_blob().is_none(),
             "membership change must clear the centroid-section ref"
+        );
+    }
+
+    /// A manifest whose list carries a slow-state ref hydrated its
+    /// membership from the blob — hidden manifests write NO parts. The
+    /// undrained load must trust the resident flat view there: summing
+    /// `parts[].n_superfiles` gives zero, and the part fan it used to
+    /// trigger flattened zero parts into zero entries, silently dropping
+    /// every undrained superfile.
+    #[tokio::test]
+    async fn undrained_load_trusts_resident_view_with_slow_state_ref() {
+        let opts = make_opts();
+        let entries = vec![
+            make_superfile_entry(100, hash_bucket_0_pk()),
+            make_superfile_entry(50, hash_bucket_0_pk()),
+        ];
+        let list = Manifest {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            tombstone_seqs: Default::default(),
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
+            slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
+            slow_vector_state_centroids: None,
+            parts: Vec::new(),
+        };
+        // Storage must be attached: `new` only keeps the list (and builds
+        // the part loader this test's fan path needs) when it is.
+        let (_dir, storage) = local_storage();
+        let manifest = ManifestSnapshot::new(1, opts, entries.clone(), Some(storage), Some(list));
+        let drained = list::DrainedVersionRanges::default();
+        let got = manifest
+            .get_undrained_superfiles_loaded(&drained)
+            .await
+            .expect("undrained load");
+        assert_eq!(
+            got.len(),
+            entries.len(),
+            "resident blob-hydrated membership must be returned, not the empty part fan"
         );
     }
 

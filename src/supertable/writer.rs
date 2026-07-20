@@ -2491,6 +2491,15 @@ fn prepare_user_superfile_batch_in_scope(
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
+    // `zip` silently truncates to the shorter side; a length mismatch here
+    // would drop shard outputs or hints and publish an incomplete commit.
+    if outputs.len() != hints.len() {
+        return Err(BuildError::Store(format!(
+            "superfile publish inputs out of sync: {} shard outputs for {} partition hints",
+            outputs.len(),
+            hints.len()
+        )));
+    }
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
