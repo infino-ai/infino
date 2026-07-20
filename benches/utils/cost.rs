@@ -72,7 +72,9 @@ const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
 /// a little longer than its own p50 (dispatch, response write, scheduler
 /// slack between overlapped queries), so the hold is billed at fudge × p50.
 /// Residency is otherwise billed strictly per query served — never as a
-/// standing calendar-hours line.
+/// standing calendar-hours line. Bench cost model only: real customer
+/// metering must record the exact measured hold time and put any padding
+/// in the PRICE, never in the reported quantity.
 const QUERY_RAM_HOLD_FUDGE: f64 = 2.0;
 
 /// The instance the model prices against. Default is a portable cloud SKU

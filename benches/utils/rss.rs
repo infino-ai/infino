@@ -362,6 +362,13 @@ mod tests {
     /// actually paying RSS).
     #[test]
     fn sampler_observes_allocation_growth() {
+        // Take the baseline in the same purged-allocator state the
+        // sampler seeds from (`start()` purges before its first read).
+        // Without this, memory freed by concurrently-running tests sits
+        // allocator-retained in the baseline reading and is released by
+        // the sampler's purge — measured 150 MiB of drop, dwarfing the
+        // 32 MiB growth this test asserts on.
+        purge_allocator();
         let baseline = match current_rss_bytes() {
             Some(b) => b,
             None => return,

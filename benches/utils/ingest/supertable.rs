@@ -86,19 +86,27 @@ const GIB_BYTES: u64 = 1u64 << 30;
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
-/// Scale boundary for the bench's fixed cell-count shape: runs strictly
-/// under this doc count pin the grids below; at and above it the YAML
-/// config (`vector.user_cell_count` / `vector.hidden_cell_count`) stays
-/// in charge while the large-scale shape is still being calibrated.
-const SMALL_SCALE_MAX_DOCS: usize = 20_000_000;
-/// User-grid cells pinned for sub-[`SMALL_SCALE_MAX_DOCS`] runs. Finer
-/// user packing measured pre-drain warm 13.4 ms at 10M/512c vs 23.1 ms
-/// at 10M/256c with recall parity (0.997).
-const SMALL_SCALE_USER_CELLS: usize = 512;
-/// Hidden-grid cells pinned for sub-[`SMALL_SCALE_MAX_DOCS`] runs. The
-/// 256-cell hidden shape measured best post-drain: 0.995–0.997 recall
-/// with 1-GET cold probes at 1M and 10M.
-const SMALL_SCALE_HIDDEN_CELLS: usize = 256;
+/// Table-doc-count boundary for the bench's pinned CELL-GRID shape:
+/// runs strictly under this many docs pin the grid cell counts below; at
+/// and above it the YAML config (`vector.user_cell_count` /
+/// `vector.hidden_cell_count`) stays in charge while the large-scale
+/// shape is still being calibrated. Bench-harness knob only — distinct
+/// from the engine's per-cell ROW cap (`opann.rs` split threshold),
+/// which bounds rows inside one cell, not the grid size. The pinned
+/// shape is the measured candidate for the engine default at these
+/// scales; once promoted into the shipped config the pin goes away and
+/// the bench runs what customers get.
+const CELL_GRID_PIN_MAX_TABLE_DOCS: usize = 20_000_000;
+/// User-grid cell count pinned under
+/// [`CELL_GRID_PIN_MAX_TABLE_DOCS`]. Finer user packing measured
+/// pre-drain warm 13.4 ms at 10M/512c vs 23.1 ms at 10M/256c with recall
+/// parity (0.997).
+const CELL_GRID_PIN_USER_CELLS: usize = 512;
+/// Hidden-grid cell count pinned under
+/// [`CELL_GRID_PIN_MAX_TABLE_DOCS`]. The 256-cell hidden shape measured
+/// best post-drain: 0.995–0.997 recall with 1-GET cold probes at 1M and
+/// 10M.
+const CELL_GRID_PIN_HIDDEN_CELLS: usize = 256;
 
 /// Explicit grid override for cell-shape experiments: `"user,hidden"`
 /// (e.g. `INFINO_BENCH_CELLS=256,256`). Takes precedence over the pinned
@@ -106,8 +114,8 @@ const SMALL_SCALE_HIDDEN_CELLS: usize = 256;
 const CELLS_ENV: &str = "INFINO_BENCH_CELLS";
 
 /// Per-table grid cell counts for this run's scale, or `None` to let the
-/// YAML config decide (≥ [`SMALL_SCALE_MAX_DOCS`] docs without an
-/// explicit [`CELLS_ENV`] override).
+/// YAML config decide (≥ [`CELL_GRID_PIN_MAX_TABLE_DOCS`] docs without
+/// an explicit [`CELLS_ENV`] override).
 fn bench_cell_counts() -> Option<(usize, usize)> {
     if let Ok(spec) = env::var(CELLS_ENV) {
         let (user, hidden) = spec
@@ -120,7 +128,8 @@ fn bench_cell_counts() -> Option<(usize, usize)> {
         };
         return Some((parse(user, "user"), parse(hidden, "hidden")));
     }
-    (n_docs() < SMALL_SCALE_MAX_DOCS).then_some((SMALL_SCALE_USER_CELLS, SMALL_SCALE_HIDDEN_CELLS))
+    (n_docs() < CELL_GRID_PIN_MAX_TABLE_DOCS)
+        .then_some((CELL_GRID_PIN_USER_CELLS, CELL_GRID_PIN_HIDDEN_CELLS))
 }
 /// Producer memory budget in GiB — steers the attached disk cache's
 /// post-commit madvise sweep only; it does not cap ingest/build RSS.

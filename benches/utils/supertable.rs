@@ -1286,11 +1286,11 @@ pub mod vector {
     /// Skip the normal undrained-delta commit while retaining pre-drain,
     /// drain, post-drain, and optimize/compact measurements.
     const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
-    /// Skip the post-drain assignment audit entirely. The audit is
-    /// diagnostic-only; at 100M+ its full-corpus pass reads ~0.4 TB of
-    /// mmap even in streaming order, so runs that only need the lifecycle
-    /// recall numbers can opt out.
-    const SKIP_DRAIN_DIAG_ENV: &str = "INFINO_BENCH_SKIP_DRAIN_DIAG";
+    /// Opt IN to the post-drain assignment audit. The audit is
+    /// diagnostic-only (it gates nothing) and its full-corpus pass reads
+    /// ~0.4 TB of mmap at 100M even in streaming order, so the default is
+    /// off; investigation runs set `INFINO_BENCH_DRAIN_DIAG=1`.
+    const DRAIN_DIAG_ENV: &str = "INFINO_BENCH_DRAIN_DIAG";
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1759,8 +1759,8 @@ pub mod vector {
     ) {
         use rayon::prelude::*;
 
-        if env::var(SKIP_DRAIN_DIAG_ENV).ok().as_deref() == Some("1") {
-            eprintln!("[drain-diag] skipped ({SKIP_DRAIN_DIAG_ENV}=1)");
+        if env::var(DRAIN_DIAG_ENV).ok().as_deref() != Some("1") {
+            eprintln!("[drain-diag] skipped — diagnostic-only; opt in with {DRAIN_DIAG_ENV}=1");
             return;
         }
 
