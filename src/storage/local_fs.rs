@@ -34,6 +34,10 @@ use super::{ObjectMeta, StorageError, StorageProvider};
 pub struct LocalFsStorageProvider {
     root: PathBuf,
     store: Arc<LocalFileSystem>,
+    // Serializes conditional-PUT contenders within this process so
+    // they `.await` each other instead of piling up on `flock`,
+    // which would starve the tokio worker pool.
+    commit_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalFsStorageProvider {
@@ -57,6 +61,7 @@ impl LocalFsStorageProvider {
         Ok(Self {
             root,
             store: Arc::new(store),
+            commit_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -210,6 +215,14 @@ impl StorageProvider for LocalFsStorageProvider {
             // `S3StorageProvider::put_if_match`.
             Some(expected) => {
                 use fs4::tokio::AsyncFileExt;
+                // In-process contenders wait here instead of piling up
+                // on `flock` below, which is a blocking syscall and
+                // would starve the tokio worker pool. An async mutex
+                // yields while waiting, so concurrent writers to
+                // DIFFERENT pointers (the user/hidden dual-write
+                // `join!`) serialize briefly instead of deadlocking.
+                let _guard = self.commit_lock.lock().await;
+
                 // Scope the advisory lock to the *pointer's own directory*, not
                 // a single root-level `_supertable/.lock`. A `PrefixedStorageProvider`
                 // (e.g. the hidden vector index) delegates here with a prefixed
@@ -244,18 +257,20 @@ impl StorageProvider for LocalFsStorageProvider {
                         uri: uri.into(),
                         source: Box::new(e),
                     })?;
-                lock_file
-                    .lock_exclusive()
-                    .map_err(|e| StorageError::Permanent {
-                        uri: uri.into(),
-                        source: Box::new(e),
-                    })?;
-                // Lock held below until `lock_file` drops at
-                // end of branch (or early-return). Holding it
-                // across `.await` points blocks the
-                // tokio worker; head + put on LocalFS are
-                // microseconds, so the worst-case stall is
-                // bounded.
+                // `flock` is a blocking syscall; run it on the
+                // blocking pool so it can't stall a tokio worker.
+                let lock_file = tokio::task::spawn_blocking(move || {
+                    lock_file.lock_exclusive().map(|_| lock_file)
+                })
+                .await
+                .map_err(|e| StorageError::Permanent {
+                    uri: uri.into(),
+                    source: Box::new(e),
+                })?
+                .map_err(|e| StorageError::Permanent {
+                    uri: uri.into(),
+                    source: Box::new(e),
+                })?;
 
                 let result: Result<Option<String>, StorageError> = async {
                     let current = self
