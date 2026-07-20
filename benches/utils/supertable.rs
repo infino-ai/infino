@@ -1339,31 +1339,31 @@ pub mod vector {
     /// Upper doc bound for the mid-scale ceilings (exclusive).
     const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
-    /// query's DATA GETs (probe + one-time metadata warmup; manifest
-    /// GETs are classed separately). Measured after the probe-wave
-    /// coalescing: 1M = 2 / 3 / 2, 10M = 5 / 6 / 6 — ceilings sit at
-    /// ~2× measured, replacing the loose 64/96 provisional values from
-    /// the v1-open rework. The 10M numbers carry the same steady-probe
-    /// drift the SECOND gate trips on; these stay wide enough not to
-    /// double-report that one root cause.
+    /// query's DATA GETs (probe blocks; manifest GETs — parts, slow-CAS
+    /// blob, centroid section — are classed separately). A cold probe
+    /// reads the geometric-chain islands its selected runs span under the
+    /// 8 MiB cold coalesce windows: whole-cell at <5M (cells ~6 MiB), 2–4
+    /// islands at 10M (cells ~60 MiB; bridging 10–18 MiB inter-island
+    /// gaps would cost more wall time on one stream than parallel GETs).
     const COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
         ("post-drain", 4, 8),
-        ("post-delta", 6, 12),
+        ("post-delta", 6, 10),
         ("post-compact", 4, 8),
     ];
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
-    /// (steady) cold query's data GETs. These are the ORIGINAL contract
-    /// values from the geometric-ordering era (one coalesced probe GET
-    /// post-drain under 5M; two at 5–20M; post-delta adds one user-delta
-    /// GET) — briefly relaxed to 8/10-class "provisional" ceilings during
-    /// the v1-open rework, which let the 10M steady probe drift to 5
-    /// GETs unnoticed. Measured now: 1M post-drain/post-compact = 1,
-    /// post-delta = 2. The 10M drift is an open regression this gate
-    /// intentionally trips on until run adjacency is restored.
+    /// (steady) cold query's data GETs. <5M: a probed cell spans ~6 MiB,
+    /// the whole probe coalesces to ONE GET (measured 1 / 2 / 1 at 1M —
+    /// post-delta's extra GET is the undrained user tail). 5–20M: a
+    /// probed cell spans ~60 MiB and the selected runs occupy 2–4
+    /// geometric-chain islands with 10–18 MiB gaps that are cheaper to
+    /// fetch in parallel than to bridge (median 3 measured at 10M under
+    /// the 8 MiB cold windows). The old 2-GET value at this tier was
+    /// calibrated against the fat-open era (727 MiB opens staging all
+    /// cell metadata) and is not reachable on the v1-open architecture.
     const COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
-        ("post-drain", 1, 2),
-        ("post-delta", 2, 3),
-        ("post-compact", 1, 2),
+        ("post-drain", 1, 4),
+        ("post-delta", 2, 5),
+        ("post-compact", 1, 4),
     ];
     /// Distinct steady-cold queries sampled per state. A steady cold query
     /// fans concurrent range GETs and its wall is the max of the fan — one

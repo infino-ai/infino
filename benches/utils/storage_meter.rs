@@ -37,10 +37,17 @@ use crate::rss::fmt_bytes;
 /// table.
 const HIDDEN_INDEX_PATH_TOKEN: &str = "_vector_index";
 /// Path tokens of the manifest namespace on either table: the pointer
-/// (`_supertable/current`), the list dir, and the parts dir. Three separate
-/// top-level dirs — matching `POINTER_PATH`, `MANIFEST_DIR`, and
-/// `MANIFEST_PARTS_DIR` in `supertable::manifest::commit`.
-const MANIFEST_PATH_TOKENS: [&str; 3] = ["_supertable/", "manifest/", "manifest-parts/"];
+/// (`_supertable/current`), the list dir, the parts dir, and the slow-CAS
+/// state prefix (routing blob + centroid section — manifest-published
+/// routing state, fetched once per generation, never per-query data).
+/// Matches `POINTER_PATH`, `MANIFEST_DIR`, `MANIFEST_PARTS_DIR`, and
+/// `slow_vector_state::STORAGE_PREFIX` in `supertable`.
+const MANIFEST_PATH_TOKENS: [&str; 4] = [
+    "_supertable/",
+    "manifest/",
+    "manifest-parts/",
+    "slow-vector-state/",
+];
 
 /// Which table + namespace a request URI belongs to. GETs are attributed
 /// per class so a query's fan can be split into user vs hidden traffic.
