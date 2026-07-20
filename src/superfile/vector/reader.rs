@@ -1736,63 +1736,6 @@ impl VectorReader {
         !self.cell_ids.is_empty()
     }
 
-    /// Exact fp32 centroid scores for one cell, read from the on-disk
-    /// centroid region (`centroids_off .. cluster_idx_off` inside the
-    /// cell's subsection) — resident/mmap zero-copy when warm, one range
-    /// fetch when cold. Returns every centroid's `(local_cluster, score)`
-    /// sorted ascending. Serves the admit rescore for manifest summaries
-    /// whose resident fp32 was dropped
-    /// (`summary_centroids_from_superfiles`); count-0 clusters are the
-    /// caller's job to skip (the summary keeps `counts`).
-    ///
-    /// `cell_id: Some(_)` addresses one packed cell of a multi-cell blob;
-    /// `None` addresses the single subsection of a v1 blob.
-    pub(crate) async fn score_cell_centroids_async(
-        &self,
-        column: &str,
-        cell_id: Option<u32>,
-        query: &[f32],
-    ) -> Result<Vec<(u32, f32)>, VectorError> {
-        let cid = *self
-            .column_id_by_name
-            .get(column)
-            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
-        let col_index = match cell_id {
-            Some(cell) if self.is_multi_cell() => self
-                .cell_ids
-                .iter()
-                .position(|&c| c == cell)
-                .ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "cell {cell} not present in multi-cell blob"
-                    )))
-                })?,
-            _ => cid as usize,
-        };
-        let col = &self.columns[col_index];
-        if query.len() != col.dim {
-            return Err(VectorError::DimensionMismatch {
-                expected: col.dim,
-                got: query.len(),
-            });
-        }
-        let start = col.subsection_range.start + col.centroids_off;
-        let end = col.subsection_range.start + col.cluster_idx_off;
-        let centroids_bytes = self
-            .source
-            .range_async(start..end)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        Ok(nearest_k_centroids_bytes(
-            col.metric,
-            query,
-            &centroids_bytes,
-            col.n_cent as usize,
-            col.dim,
-            col.n_cent as usize,
-        ))
-    }
-
     /// Map a flat cluster id (manifest / query fan-out) to
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
@@ -4488,8 +4431,6 @@ fn checked_dir_bounds(
     Ok((dir_size, dir_end))
 }
 
-const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
-const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
 /// Gap / overfetch windows for the survivor rerank-row wave. Survivor
 /// rows scatter across the selected clusters' `full[]` regions; with the
@@ -4554,23 +4495,32 @@ fn reserve_cold_fetch(
         .map_err(|e| VectorError::OverBudget(format!("vector search, {e}")))
 }
 
+/// Gap / overfetch windows for a COLD probe wave (blocks + metadata
+/// legs). A cold read is round-trip-bound, not byte-bound: the probed
+/// cell's Sq8 meta, stable-id region, and block runs can sit megabytes
+/// apart inside a large packed cell (~60 MiB at 10M docs), and the tight
+/// warm windows below shattered one cell's read into 5 GETs there
+/// (measured; 1 GET at 1M where the whole cell spans ~6 MiB). Merge
+/// anything with sub-8 MiB gaps, capped at 8 MiB of overfetch per merged
+/// range — never more than one extra round-trip's worth of bytes to save
+/// a round trip.
+const COLD_PROBE_COALESCE_MAX_GAP: usize = 8 * 1024 * 1024;
+/// Overfetch cap per merged cold-probe range (see
+/// [`COLD_PROBE_COALESCE_MAX_GAP`]).
+const COLD_PROBE_COALESCE_MAX_OVERFETCH: usize = 8 * 1024 * 1024;
+
 /// Build the one-plan input for a cold probe wave: the cluster block
 /// ranges PLUS the per-column metadata legs (`extras`: lazy Sq8 meta,
-/// inline stable-id region). Metadata rides the SAME coalesce plan as the
-/// blocks, so on multi-cell (pre-drain user) files — where a cell's whole
-/// subsection spans ~100 KiB — all legs merge into one GET, while on
-/// packed single-cell files the meta/ids regions sit megabytes before the
-/// blocks and the plan keeps them as separate ranges (same fetches as
-/// issuing them apart, never worse). Returns `(blocks, extras)` in input
-/// order.
+/// inline stable-id region), under the wide cold windows above. Returns
+/// `(blocks, extras)` in input order.
 fn probe_wave_plan(ranges: &[Range<usize>], extras: &[Range<usize>]) -> RangeCoalescePlan {
     let mut all: Vec<Range<usize>> = Vec::with_capacity(ranges.len() + extras.len());
     all.extend(ranges.iter().cloned());
     all.extend(extras.iter().cloned());
     RangeCoalescePlan::new(
         &all,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+        COLD_PROBE_COALESCE_MAX_GAP,
+        COLD_PROBE_COALESCE_MAX_OVERFETCH,
     )
 }
 
@@ -4579,9 +4529,6 @@ fn get_cluster_ranges_coalesced_with_extras(
     ranges: &[Range<usize>],
     extras: &[Range<usize>],
 ) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
-    if extras.is_empty() {
-        return Ok((get_cluster_ranges_coalesced(source, ranges)?, Vec::new()));
-    }
     let plan = probe_wave_plan(ranges, extras);
     let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
     let mut restored = plan.restore(&fetched);
@@ -4597,12 +4544,6 @@ async fn get_cluster_ranges_coalesced_with_extras_async(
     ranges: &[Range<usize>],
     extras: &[Range<usize>],
 ) -> Result<(Vec<Bytes>, Vec<Bytes>), LazyByteSourceError> {
-    if extras.is_empty() {
-        return Ok((
-            get_cluster_ranges_coalesced_async(source, ranges).await?,
-            Vec::new(),
-        ));
-    }
     let plan = probe_wave_plan(ranges, extras);
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
@@ -4612,27 +4553,7 @@ async fn get_cluster_ranges_coalesced_with_extras_async(
     Ok((restored, extra_bytes))
 }
 
-fn get_cluster_ranges_coalesced(
-    source: &Source,
-    ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, LazyByteSourceError> {
-    if ranges.is_empty() {
-        return Ok(Vec::new());
-    }
-    if ranges.len() == 1 {
-        return source.get_ranges_parallel(ranges);
-    }
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
-    Ok(plan.restore(&fetched))
-}
-
-/// Survivor-wave fetch: same plan/restore mechanics as
-/// [`get_cluster_ranges_coalesced`] under the wider
+/// Survivor-wave fetch: plan/restore over the
 /// [`SURVIVOR_RANGE_COALESCE_MAX_GAP`] windows, so survivor rows spanning
 /// geometrically neighboring clusters merge into one cold range.
 fn get_survivor_ranges_coalesced(
@@ -4669,28 +4590,6 @@ async fn get_survivor_ranges_coalesced_async(
         ranges,
         SURVIVOR_RANGE_COALESCE_MAX_GAP,
         SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH,
-    );
-    let fetched = source
-        .get_ranges_parallel_async(plan.fetch_ranges())
-        .await?;
-    Ok(plan.restore(&fetched))
-}
-
-/// Async sibling of [`get_cluster_ranges_coalesced`].
-async fn get_cluster_ranges_coalesced_async(
-    source: &Source,
-    ranges: &[Range<usize>],
-) -> Result<Vec<Bytes>, LazyByteSourceError> {
-    if ranges.is_empty() {
-        return Ok(Vec::new());
-    }
-    if ranges.len() == 1 {
-        return source.get_ranges_parallel_async(ranges).await;
-    }
-    let plan = RangeCoalescePlan::new(
-        ranges,
-        CLUSTER_RANGE_COALESCE_MAX_GAP,
-        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
     );
     let fetched = source
         .get_ranges_parallel_async(plan.fetch_ranges())
@@ -9383,11 +9282,11 @@ mod tests {
     /// back out byte-for-byte and preserves input order.
     #[test]
     fn plan_cluster_coalesce_keeps_distant_ranges_separate() {
-        let ranges = vec![0..4, 1_000_000..1_000_008];
+        let ranges = vec![0..4, 100_000_000..100_000_008];
         let plan = RangeCoalescePlan::new(
             &ranges,
-            CLUSTER_RANGE_COALESCE_MAX_GAP,
-            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+            COLD_PROBE_COALESCE_MAX_GAP,
+            COLD_PROBE_COALESCE_MAX_OVERFETCH,
         );
         assert_eq!(
             plan.fetch_ranges().len(),
@@ -9397,7 +9296,7 @@ mod tests {
 
         // Build a synthetic blob and confirm restore recovers the
         // exact requested bytes in input order.
-        let mut blob = vec![0u8; 1_000_016];
+        let mut blob = vec![0u8; 100_000_016];
         for (i, byte) in blob.iter_mut().enumerate() {
             *byte = (i % 251) as u8;
         }
@@ -9423,8 +9322,8 @@ mod tests {
         let ranges = vec![100..120, 80..100, 130..150];
         let plan = RangeCoalescePlan::new(
             &ranges,
-            CLUSTER_RANGE_COALESCE_MAX_GAP,
-            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+            COLD_PROBE_COALESCE_MAX_GAP,
+            COLD_PROBE_COALESCE_MAX_OVERFETCH,
         );
         assert_eq!(
             plan.fetch_ranges().len(),

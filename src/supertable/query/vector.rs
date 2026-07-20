@@ -1094,16 +1094,15 @@ impl SupertableReader {
     }
 
     /// Exact admit scores for summary cells whose fp32 was dropped at
-    /// hydration (`summary_centroids_from_superfiles`). Preferred source:
-    /// the slow-CAS centroid-section spill (one object, hydrated once —
-    /// see [`Self::centroid_section`]). Cells the section cannot serve
-    /// (legacy manifests, membership drift) fall back to opening each
-    /// involved superfile through the tiered reader cache and scoring its
-    /// on-disk centroid region. One concurrent wave across superfiles,
-    /// cells within a superfile fetched concurrently too. Background
-    /// fills stay off — an admit touch of a cell's centroid bytes must
-    /// not trigger whole-file pulls for files the fan-out may never
-    /// probe.
+    /// hydration. Two sources, both manifest-published state, and they
+    /// are exhaustive: hidden (VectorCell) manifests read the slow-CAS
+    /// centroid-section spill (one object per generation — see
+    /// [`Self::centroid_section`]); user manifests read the fp32
+    /// hydrated once per generation from the FULL manifest parts. A cell
+    /// neither can serve is corrupted routing state — the publish paths
+    /// guarantee every stripped cell is covered (the section composer
+    /// fails a republish rather than leave a hole) — so the query fails
+    /// loudly instead of degrading onto some slower read path.
     async fn rescore_deferred_cells(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -1160,72 +1159,16 @@ impl SupertableReader {
         } else {
             deferred
         };
-        if deferred.is_empty() {
-            return Ok(());
-        }
-        let manifest = self.manifest();
-        let store = Arc::clone(&manifest.options.store);
-        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let storage = manifest.options.storage.as_ref().map(Arc::clone);
-        let mut by_si: HashMap<usize, Vec<DeferredCellRescore>> = HashMap::new();
-        for d in deferred {
-            by_si.entry(d.si).or_default().push(d);
-        }
-        let waves = by_si.into_iter().map(|(si, cells)| {
-            let entry = Arc::clone(&superfiles[si]);
-            let store = Arc::clone(&store);
-            let disk_cache = disk_cache.clone();
-            let storage = storage.clone();
-            async move {
-                let reader = dispatch::open_reader(
-                    &store,
-                    disk_cache.as_ref(),
-                    storage.as_ref(),
-                    &entry,
-                    false,
-                )
-                .await?;
-                let vec_reader = reader.vec().ok_or_else(|| {
-                    QueryError::Execute(format!(
-                        "superfile {} has no vector section for the deferred admit rescore",
-                        entry.superfile_id
-                    ))
-                })?;
-                let cell_scores = try_join_all(cells.iter().map(|d| async {
-                    vec_reader
-                        .score_cell_centroids_async(column, d.cell_id, query)
-                        .await
-                        .map_err(|e| QueryError::Execute(format!("deferred admit rescore: {e}")))
-                }))
-                .await?;
-                Ok::<_, QueryError>((si, cells, cell_scores))
-            }
-        });
-        for (si, cells, cell_scores) in try_join_all(waves).await? {
-            let entry = &superfiles[si];
-            let vs = entry
-                .vector_summary
-                .get(column)
-                .expect("summary presence validated by score_fine_candidates");
-            for (d, scores) in cells.iter().zip(cell_scores) {
-                // Counts stay resident on the stripped summary — only the
-                // fp32 vectors were dropped.
-                let Some(counts) = vs
-                    .cells
-                    .iter()
-                    .find(|cell| cell.cell_id == d.cell_id)
-                    .map(|cell| &cell.clusters.counts)
-                else {
-                    continue;
-                };
-                for (local, score) in scores {
-                    let count = counts.get(local as usize).copied().unwrap_or(0) as u64;
-                    if count == 0 {
-                        continue;
-                    }
-                    candidates.push((si, d.flat_base + local, score, d.cell_id, count));
-                }
-            }
+        if let Some(d) = deferred.first() {
+            let entry = &superfiles[d.si];
+            return Err(QueryError::Execute(format!(
+                "deferred admit rescore: no manifest-published fp32 covers superfile {} column \
+                 {column} cell {:?} ({} cell(s) uncovered) — the centroid section / full parts \
+                 must cover every stripped summary cell",
+                entry.superfile_id,
+                d.cell_id,
+                deferred.len(),
+            )));
         }
         Ok(())
     }
