@@ -642,51 +642,22 @@ fn append_admit_slab(out: &mut Vec<u8>, admit: &RabitqAdmitCodes) {
     }
 }
 
-/// Summary-wire encoder: fp32 plus, when the instance carries a built
-/// 1-bit admit slab, the slab itself — so hydration decodes it instead of
-/// re-deriving one rotation per fine centroid. Grid centroids and the
-/// options hash keep [`encode_cluster_centroids`]; changing their bytes
-/// would fail every existing table's options-hash check at open.
-pub fn encode_cluster_centroids_summary(cl: &ClusterCentroids) -> Vec<u8> {
-    let Some(admit) = cl.admit_codes_built() else {
-        return encode_cluster_centroids(cl);
-    };
-    let nc = cl.n_cent as usize;
-    let cd = cl.dim as usize;
-    // Same stripped-summary guard as the fp32 encoder: a summary whose
-    // fp32 was dropped must never reach the wire in the full (durable)
-    // form (see `encode_cluster_centroids`).
-    assert!(
-        cl.centroids.len() == nc * cd,
-        "encode_cluster_centroids_summary on a stripped summary ({} of {} fp32 values); \
-         writer handles must not enable summary_centroids_from_superfiles",
-        cl.centroids.len(),
-        nc * cd,
-    );
-    let mut out = Vec::with_capacity(
-        12 + nc * 4 + nc * cd * 4 + 12 + admit.codes.len() * 8 + admit.norms.len() * 4,
-    );
-    out.extend_from_slice(&cl.n_cent.to_le_bytes());
-    out.extend_from_slice(&cl.dim.to_le_bytes());
-    out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_FP32_RABITQ.to_le_bytes());
-    for &c in &cl.counts {
-        out.extend_from_slice(&c.to_le_bytes());
-    }
-    for &v in &cl.centroids {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    append_admit_slab(&mut out, admit);
-    out
-}
+// Byte-for-byte symmetry note: the fp32+slab wire form (`CFR1`,
+// [`CLUSTER_CENTROIDS_WIRE_FP32_RABITQ`]) is DECODE-ONLY legacy. It
+// existed so full-form decoders got prebuilt slabs, but under the
+// one-copy-per-byte model the slab's only wire home is the routing form
+// (`CFR0`) and fp32's only wire home is the plain fp32 form (`CF32`) —
+// full parts carry no slab (hydration prewarm rebuilds writer-side
+// slabs; consumers get them from routing objects).
 
 /// Routing-only encoder (`CFR0`): counts plus the admit slab, no fp32
 /// payload. Reads only the slab and counts, so it works from both full
 /// and stripped instances. A cell without a built slab (degenerate dim
-/// mismatch — the prewarm skips those) falls back to the full summary
+/// mismatch — the prewarm skips those) falls back to the plain fp32
 /// form so the artifact stays decodable everywhere.
 pub(crate) fn encode_cluster_centroids_routing(cl: &ClusterCentroids) -> Vec<u8> {
     let Some(admit) = cl.admit_codes_built() else {
-        return encode_cluster_centroids_summary(cl);
+        return encode_cluster_centroids(cl);
     };
     let nc = cl.n_cent as usize;
     let mut out =
@@ -818,7 +789,7 @@ pub fn encode_vector_summary(s: &VectorSummary, mode: SummaryWireMode) -> Vec<u8
     for cell in &s.cells {
         out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
         let encoded = match mode {
-            SummaryWireMode::Full => encode_cluster_centroids_summary(&cell.clusters),
+            SummaryWireMode::Full => encode_cluster_centroids(&cell.clusters),
             SummaryWireMode::RoutingOnly => encode_cluster_centroids_routing(&cell.clusters),
         };
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -1577,9 +1548,11 @@ mod vector_summary_tests {
         let _ = encode_vector_summary(&s, SummaryWireMode::Full);
     }
 
-    /// A summary whose admit slab was computed at write time round-trips
-    /// the slab through the wire: decode seeds it directly, so neither
-    /// hydration nor the first query re-derives codes.
+    /// One wire home per byte: the FULL form carries fp32 only (no slab —
+    /// hydration prewarm rebuilds writer-side slabs), the ROUTING form
+    /// carries the slab only, and a write-time slab round-trips bit-exact
+    /// through the routing wire. Legacy fp32+slab blocks (`CFR1`) stay
+    /// decodable.
     #[test]
     fn round_trips_admit_slab_alongside_centroids() {
         use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
@@ -1613,14 +1586,26 @@ mod vector_summary_tests {
         let got = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::Full))
             .expect("decode");
         let decoded = &got.cells[0].clusters;
-        assert_eq!(decoded.centroids, centroids, "fp32 must survive the slab");
+        assert_eq!(decoded.centroids, centroids, "fp32 must survive");
         assert_eq!(decoded.counts, counts);
+        assert!(
+            decoded.admit_codes_built().is_none(),
+            "the FULL wire form must not carry a slab — its only wire home is the routing form"
+        );
+
+        let routing = decode_vector_summary(&encode_vector_summary(&s, SummaryWireMode::RoutingOnly))
+            .expect("decode routing");
+        let routing_decoded = &routing.cells[0].clusters;
+        assert!(
+            !routing_decoded.vectors_resident(),
+            "routing form sheds fp32"
+        );
         assert_eq!(
-            *decoded
+            *routing_decoded
                 .admit_codes_built()
-                .expect("decode must seed the admit slab"),
+                .expect("routing decode must seed the admit slab"),
             expected_slab,
-            "persisted slab must round-trip bit-exact"
+            "persisted slab must round-trip bit-exact through the routing wire"
         );
     }
 

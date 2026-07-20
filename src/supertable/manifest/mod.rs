@@ -5255,15 +5255,21 @@ mod tests {
                     .with_summary_centroids_from_superfiles(knob),
             )
         };
-        let resident = |m: &ManifestSnapshot| {
+        // (fp32 resident, slab present) per entry. The routing wire is the
+        // slab's ONLY home now: full-part decodes carry fp32 and no slab
+        // (real tables rebuild writer-side slabs in the hydration prewarm;
+        // this fixture declares no vector columns, so the prewarm is inert).
+        let shape = |m: &ManifestSnapshot| {
             m.superfiles
                 .iter()
                 .map(|e| {
                     let clusters = &e.vector_summary["emb"].cells[0].clusters;
-                    assert!(clusters.admit_codes_built().is_some(), "slab always rides");
-                    clusters.vectors_resident()
+                    (
+                        clusters.vectors_resident(),
+                        clusters.admit_codes_built().is_some(),
+                    )
                 })
-                .collect::<Vec<bool>>()
+                .collect::<Vec<(bool, bool)>>()
         };
 
         let (_dir, storage) = local_storage();
@@ -5272,18 +5278,19 @@ mod tests {
             .await
             .expect("knob-on load");
         assert_eq!(
-            resident(&knob_on),
-            vec![false, false],
-            "knob-on consumer must hydrate stripped entries from the routing part"
+            shape(&knob_on),
+            vec![(false, true), (false, true)],
+            "knob-on consumer must hydrate stripped entries (slab riding) from the routing part"
         );
         let knob_off =
             ManifestSnapshot::load(None, Arc::clone(&storage), Some(consumer_opts(false)))
                 .await
                 .expect("knob-off load");
         assert_eq!(
-            resident(&knob_off),
-            vec![true, true],
-            "knob-off load must keep the full part's resident fp32"
+            shape(&knob_off),
+            vec![(true, false), (true, false)],
+            "knob-off load must keep the full part's resident fp32 (slab rebuilt by prewarm \
+             on real tables)"
         );
 
         // Pre-sibling manifest: knob-on falls back to the full part.
@@ -5294,8 +5301,8 @@ mod tests {
                 .await
                 .expect("fallback load");
         assert_eq!(
-            resident(&fallback),
-            vec![true, true],
+            shape(&fallback),
+            vec![(true, false), (true, false)],
             "knob-on without a routing ref must fall back to the full part"
         );
     }
