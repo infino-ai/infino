@@ -1915,6 +1915,10 @@ pub mod sql {
         /// Run a one-row `SELECT COUNT(*)`-shaped aggregate and return the
         /// scalar `Int64` value — used by the correctness gate.
         fn query_count(&self, sql: &str) -> i64;
+        /// Settle any background work the preceding (warmup) queries kicked
+        /// off, so timed iterations measure the steady state instead of
+        /// racing it. No-op for tiers with no background machinery.
+        fn settle_warm(&self) {}
     }
 
     impl SqlRead for InfinoSqlIndex {
@@ -1944,7 +1948,16 @@ pub mod sql {
         fn query_count(&self, sql: &str) -> i64 {
             scalar_i64(&self.reader().query_sql(sql).expect("query_sql count"))
         }
+        fn settle_warm(&self) {
+            self.wait_until_warm(WARM_SETTLE_TIMEOUT)
+                .expect("settle background fills");
+        }
     }
+
+    /// Generous ceiling for settling a single query's background fills;
+    /// scoped to the query's own working set, so the typical wait is the
+    /// few files that query opened — not the table.
+    const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// Extract the single `Int64` aggregate value from a one-row result.
     fn scalar_i64(batches: &[arrow_array::RecordBatch]) -> i64 {
@@ -2005,6 +2018,9 @@ pub mod sql {
         for _ in 0..WARMUP_ITERS {
             warm_rows = reader.query_rows(sql);
         }
+        // Warmup opened this query's working set; settle its background
+        // fills so the timed iterations measure steady state.
+        reader.settle_warm();
         let sampler = PeakSampler::start_default();
         let (mut samples, cpu_s) = sample_batched_cpu(iters, || reader.query_rows(sql));
         let rss = sampler.stop_stats();

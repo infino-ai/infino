@@ -1001,7 +1001,9 @@ pub mod fts {
         Vec<exec_fts::CountStat>,
         Vec<(&'static str, Duration)>,
     ) {
-        eprintln!("[supertable_fts] warm: opening shared consumer...");
+        eprintln!(
+            "[supertable_fts] warm: opening shared consumer, prewarm + wait_until_warm once..."
+        );
         // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
         // the discriminator for "where do the warm-phase GiBs live" —
         // ingest leftovers show up as anonymous bloat already present
@@ -1010,8 +1012,28 @@ pub mod fts {
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
+        // Prewarm + wait: one query opens every pruned-in superfile so the
+        // background fills spawn, then wait_until_warm blocks until each is
+        // mmap-promoted. Warm numbers time a hot cache, not the fill race —
+        // same methodology as the cold split, which meters the fill
+        // explicitly.
+        let first = &FTS_BATTERY[0];
+        let first_query = first.terms.join(" ");
+        let _ = reader
+            .bm25_search(
+                supertable::TEXT_COLUMN,
+                &first_query,
+                TOP_K,
+                exec_fts::to_infino_mode(first.mode),
+                None,
+            )
+            .expect("warm prewarm bm25_search");
+        consumer
+            .wait_until_warm(Duration::from_secs(600))
+            .expect("supertable warm promotion");
+        crate::rss::log_rss_breakdown("supertable_fts after wait_until_warm");
         eprintln!(
-            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
+            "[supertable_fts] warm: cache hot — timing {} queries × {WARM_ITERS} iters via bm25_search...",
             FTS_BATTERY.len(),
         );
         let out = exec_fts::measure_warm(
