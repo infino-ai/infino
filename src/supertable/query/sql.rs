@@ -19,7 +19,7 @@
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Use the reader's already-pinned `Arc<Manifest>`.
+//!   1. Use the reader's already-pinned `Arc<ManifestSnapshot>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.
@@ -45,6 +45,13 @@
 //! (callers reach them through `vector_search`). The parquet body
 //! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
+//!
+//! **String result type.** String columns are always returned as
+//! `LargeUtf8`, regardless of how they are stored or scanned. The scan may
+//! run a non-FTS string column internally as `Utf8View` (a comparison
+//! optimization), but that view is coerced back to `LargeUtf8` at the plan
+//! output and never reaches a caller — a `SELECT`, `GROUP BY` key, or
+//! `MIN`/`MAX` over a string column always comes back `LargeUtf8`.
 
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -910,8 +917,8 @@ mod tests {
         assert_eq!(got, vec!["go", "python", "rust"]);
     }
 
-    /// Grouped `MIN(string)` aggregates on the view and returns `LargeUtf8`
-    ///, with correct per-group minima.
+    /// Grouped `MIN(string)` aggregates on the view and returns `LargeUtf8`,
+    /// with correct per-group minima.
     #[test]
     fn query_sql_grouped_min_string_is_large_utf8() {
         let st = seeded(&["rust", "rust", "go", "go"], &["b", "a", "d", "c"]);
