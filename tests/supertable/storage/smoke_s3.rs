@@ -186,15 +186,8 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
     eprintln!("[real-s3] bucket={bucket} prefix={prefix}");
 
     let storage_opts = s3_storage_options_from_env();
-    let has_access_key = storage_opts.contains_key("aws_access_key_id");
-    let has_secret_key = storage_opts.contains_key("aws_secret_access_key");
-    if !has_access_key || !has_secret_key {
-        eprintln!(
-            "supertable_real_s3_lazy_vector_and_fts_round_trip: skipped \
-             (missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY in environment)"
-        );
-        return;
-    }
+    // Do not require explicit AWS_* env vars: the provider can also resolve the
+    // default credential chain (instance role, shared config, etc.).
     eprintln!(
         "[real-s3] storage_options keys: {:?}",
         storage_opts.keys().collect::<Vec<_>>()

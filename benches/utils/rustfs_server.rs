@@ -240,14 +240,22 @@ pub fn prefetch_rustfs_binary() {
 
 fn wait_for_binary_prefetch() -> Result<PathBuf, String> {
     loop {
-        let state = BINARY_PREFETCH.lock().expect("rustfs binary prefetch lock");
-        match &*state {
+        let mut state = BINARY_PREFETCH.lock().expect("rustfs binary prefetch lock");
+        match std::mem::replace(&mut *state, BinaryPrefetchState::Idle) {
             BinaryPrefetchState::Idle => return download_rustfs_binary_sync(),
             BinaryPrefetchState::Running => {
+                *state = BinaryPrefetchState::Running;
                 drop(state);
                 std::thread::sleep(Duration::from_millis(BINARY_PREFETCH_POLL_MS));
             }
-            BinaryPrefetchState::Ready(result) => return result.clone(),
+            BinaryPrefetchState::Ready(Ok(path)) => {
+                *state = BinaryPrefetchState::Ready(Ok(path.clone()));
+                return Ok(path);
+            }
+            BinaryPrefetchState::Ready(Err(err)) => {
+                // Leave Idle so a later call can retry a transient download failure.
+                return Err(err);
+            }
         }
     }
 }
@@ -305,7 +313,7 @@ fn spawn_rustfs_daemon() -> Result<RustFsHandle, String> {
             continue;
         }
 
-        match wait_for_health(&endpoint, &ca_pem) {
+        match wait_for_health(&mut child, &endpoint, &ca_pem) {
             Ok(()) => {
                 eprintln!("[rustfs] endpoint={endpoint} storage_label=rustfs");
                 return Ok(RustFsHandle {
@@ -1238,7 +1246,7 @@ fn generate_tls_material() -> Result<(TempDir, Vec<u8>), String> {
     Ok((tls_dir, ca_pem))
 }
 
-fn wait_for_health(endpoint: &str, ca_pem: &[u8]) -> Result<(), String> {
+fn wait_for_health(child: &mut Child, endpoint: &str, ca_pem: &[u8]) -> Result<(), String> {
     let url = format!("{endpoint}/health");
     let cert = reqwest::Certificate::from_pem(ca_pem).map_err(|e| e.to_string())?;
     let client = reqwest::blocking::Client::builder()
@@ -1247,6 +1255,11 @@ fn wait_for_health(endpoint: &str, ca_pem: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECS);
     while Instant::now() < deadline {
+        if child_exited(child) {
+            return Err(format!(
+                "rustfs exited before health check succeeded at {url}"
+            ));
+        }
         if let Ok(response) = client.get(&url).send()
             && response.status().is_success()
         {
