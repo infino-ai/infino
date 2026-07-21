@@ -1974,21 +1974,6 @@ impl VectorReader {
         Some(out)
     }
 
-    /// Map a file-local doc id (parquet / multi-cell search hit space) to
-    /// `(cell_column_index, cell_local_doc_id)`. Cells are laid out in
-    /// directory order with contiguous `[base, base + n_docs)` spans.
-    fn file_local_to_cell(&self, file_local: u32) -> Option<(usize, u32)> {
-        let mut running = 0u32;
-        for (i, col) in self.columns.iter().enumerate() {
-            let next = running.saturating_add(col.n_docs);
-            if file_local < next {
-                return Some((i, file_local - running));
-            }
-            running = next;
-        }
-        None
-    }
-
     /// Remap a file-local allow/deny bitmap onto one packed cell's local
     /// id space (`0..n_docs`). IVF cluster blocks store cell-local ids;
     /// callers pass file-local bitmaps (parquet / packed-shard space).

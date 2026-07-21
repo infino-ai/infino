@@ -523,13 +523,8 @@ impl DiskCacheStore {
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                self.reader_lazy_with_bg_fill_hinted(
-                    uri,
-                    offsets.cloned(),
-                    storage,
-                    allow_background_fill,
-                )
-                .await
+                self.reader_lazy_with_bg_fill_hinted(uri, offsets, storage, allow_background_fill)
+                    .await
             }
         }
     }
@@ -1317,7 +1312,7 @@ impl DiskCacheStore {
     async fn reader_lazy_with_bg_fill_hinted(
         self: &Arc<Self>,
         uri: &SuperfileUri,
-        offsets: Option<SubsectionOffsets>,
+        offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
         allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
@@ -1336,8 +1331,7 @@ impl DiskCacheStore {
         let result = cell
             .get_or_init(|| async {
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_lazy(uri, offsets.as_ref(), fetch_storage)
-                    .await
+                self.cold_fetch_lazy(uri, offsets, fetch_storage).await
             })
             .await;
         let fetch_storage = self.resolve_storage(storage);
@@ -1350,10 +1344,7 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                match self
-                    .cold_fetch_lazy(uri, offsets.as_ref(), fetch_storage)
-                    .await
-                {
+                match self.cold_fetch_lazy(uri, offsets, fetch_storage).await {
                     Ok(entry) => {
                         if allow_background_fill {
                             self.maybe_spawn_background_fill(uri, &entry, storage);

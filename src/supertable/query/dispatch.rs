@@ -32,12 +32,7 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
@@ -56,7 +51,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::SupertableReader,
-        manifest::{SuperfileEntry, SuperfileUri},
+        manifest::SuperfileEntry,
         query::{
             exec::common::{take_rows_byte_source, take_rows_object_store},
             superfile_reader::superfile_reader,
