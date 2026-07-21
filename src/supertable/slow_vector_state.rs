@@ -208,14 +208,27 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowVectorState, SlowVectorSt
     })
 }
 
+/// Above this size the slow-state blob is written via multipart (staged blocks)
+/// instead of a single PUT. Azure/S3 cap a single `Put Blob`/`PutObject` at
+/// ~5 GiB; the fp32-centroid slow state exceeds that at ~100M+ docs. 100 MiB
+/// matches the superfile multipart cutoff.
+const SLOW_STATE_MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+
 async fn write_bytes(
     storage: &dyn StorageProvider,
     bytes: Vec<u8>,
 ) -> Result<(String, ContentHash), SlowVectorStateError> {
     let content_hash = ContentHash::of(&bytes);
     let uri = storage_path(&content_hash);
-    match storage.put_atomic(&uri, Bytes::from(bytes)).await {
-        Ok(_) | Err(StorageError::PreconditionFailed { .. }) => {}
+    match crate::supertable::writer::put_bytes_multipart_or_atomic(
+        storage,
+        &uri,
+        Bytes::from(bytes),
+        SLOW_STATE_MULTIPART_THRESHOLD_BYTES,
+    )
+    .await
+    {
+        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {}
         Err(error) => return Err(SlowVectorStateError::Storage(error.to_string())),
     }
     Ok((uri, content_hash))
