@@ -30,9 +30,7 @@ use infino::{
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{StorageError, StorageProvider},
     },
-    test_helpers::{
-        build_title_batch, default_supertable_options, lazy_foreground_disk_cache,
-    },
+    test_helpers::{build_title_batch, default_supertable_options, lazy_foreground_disk_cache},
 };
 use infino_bench_utils::rustfs_server;
 use tempfile::TempDir;
@@ -822,7 +820,8 @@ async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
             let mut w = producer.writer().expect("shared-budget producer writer");
             w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
                 .expect("append large vector+FTS batch");
-            w.commit().expect("shared-budget producer commit via RustFS");
+            w.commit()
+                .expect("shared-budget producer commit via RustFS");
             assert_eq!(producer.manifest_id(), commit + 1);
         }
     }
@@ -880,7 +879,3 @@ async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
         "the shared budget must record the crossing"
     );
 }
-
-
-
-
