@@ -25,9 +25,17 @@ use crate::storage::{StorageError, StorageProvider};
 /// honor a stale conditional update (its 412 path is covered by the real-S3
 /// integration smoke instead), so its caller passes `false`.
 pub async fn cas_conformance(p: &dyn StorageProvider, key: &str, expect_stale_rejected: bool) {
+    // Distinct payload lengths: LocalFS etags often incorporate size + mtime, so
+    // equal-length bodies written in the same mtime tick can share an etag and
+    // make a "stale" conditional update spuriously succeed.
+    const V1: &[u8] = b"v1";
+    const V2: &[u8] = b"v2-xx";
+    const V3: &[u8] = b"v3-xxxx";
+    const V4: &[u8] = b"v4-xxxxxx";
+
     // 1. Create establishes the object and yields a token.
     let tok_create = p
-        .put_atomic(key, Bytes::from_static(b"v1"))
+        .put_atomic(key, Bytes::from_static(V1))
         .await
         .expect("put_atomic create");
 
@@ -35,7 +43,7 @@ pub async fn cas_conformance(p: &dyn StorageProvider, key: &str, expect_stale_re
     let (_, meta) = p.get(key).await.expect("get after create");
     let read_tok = meta.etag.clone();
     let tok_after_v2 = p
-        .put_if_match(key, Bytes::from_static(b"v2"), read_tok.as_deref())
+        .put_if_match(key, Bytes::from_static(V2), read_tok.as_deref())
         .await
         .expect("conditional update with the read token");
 
@@ -44,7 +52,7 @@ pub async fn cas_conformance(p: &dyn StorageProvider, key: &str, expect_stale_re
     //    chained path WAL persistence relies on (no re-read between steps).
     //    A backend that returns the wrong token kind fails right here.
     if tok_after_v2.is_some() {
-        p.put_if_match(key, Bytes::from_static(b"v3"), tok_after_v2.as_deref())
+        p.put_if_match(key, Bytes::from_static(V3), tok_after_v2.as_deref())
             .await
             .expect("chained update with the token RETURNED by put_if_match");
     }
@@ -55,7 +63,7 @@ pub async fn cas_conformance(p: &dyn StorageProvider, key: &str, expect_stale_re
     //    it (real S3/Azure/GCS do).
     if expect_stale_rejected && tok_create.is_some() && tok_create != tok_after_v2 {
         let stale = p
-            .put_if_match(key, Bytes::from_static(b"v4"), tok_create.as_deref())
+            .put_if_match(key, Bytes::from_static(V4), tok_create.as_deref())
             .await;
         assert!(
             matches!(stale, Err(StorageError::PreconditionFailed { .. })),
