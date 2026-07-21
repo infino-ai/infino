@@ -21,6 +21,7 @@ use std::{
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    OptimizeOptions,
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
@@ -120,6 +121,12 @@ pub fn build_supertable(cfg: &DiagConfig) -> (Supertable, Vec<RecordBatch>) {
             writer.commit().expect("commit");
         }
     }
+    // Optimize with defaults — the maintenance step a real deployment runs.
+    // (At small totals this leaves the per-commit superfiles as-is, since
+    // optimize only merges once the total exceeds the target size.)
+    table
+        .optimize(&OptimizeOptions::default())
+        .expect("optimize diag supertable");
     (table, batches)
 }
 

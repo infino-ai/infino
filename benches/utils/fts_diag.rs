@@ -84,11 +84,12 @@ pub fn run() {
     eprintln!("[fts-diag] building supertable...");
     let build_t0 = Instant::now();
     let (table, _batches) = diag_common::build_supertable(&cfg);
-    eprintln!(
-        "[fts-diag] built in {:.1}s",
-        build_t0.elapsed().as_secs_f64()
-    );
     let reader = table.reader();
+    eprintln!(
+        "[fts-diag] built in {:.1}s ({} superfile(s) after optimize)",
+        build_t0.elapsed().as_secs_f64(),
+        reader.manifest().superfiles.len(),
+    );
 
     // Warm both paths for every shape (cache-hot before timing).
     for s in SHAPES {
