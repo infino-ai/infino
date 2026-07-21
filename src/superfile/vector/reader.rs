@@ -2232,6 +2232,15 @@ impl VectorReader {
         column: &str,
         doc_id_offset: u32,
     ) -> Result<Sq8IvfMergeInput, BuildError> {
+        // Fail closed on multi-cell blobs: `column_id_by_name` pins slot 0
+        // there, so the name-based path would silently merge one packed cell
+        // and drop the rest. Maintenance must address cells explicitly via
+        // [`Self::sq8_ivf_merge_input_at`].
+        if self.is_multi_cell() {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "multi-cell blob for column {column}: use sq8_ivf_merge_input_at per packed cell"
+            )));
+        }
         let cid = *self
             .column_id_by_name
             .get(column)

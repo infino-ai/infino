@@ -621,7 +621,16 @@ fn split_buffer_by_vector_cell(
         cells.assign_rows(metric, vecs, &mut assignments);
         let mut per_cell_rows: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
         for (row, &cell) in assignments.iter().enumerate() {
-            per_cell_rows[cell as usize].push(row);
+            // Checked: an out-of-range assignment must roll the commit back,
+            // not abort the writer.
+            per_cell_rows
+                .get_mut(cell as usize)
+                .ok_or_else(|| {
+                    BuildError::Store(format!(
+                        "vector-cell split: row {row} assigned to out-of-range cell {cell} (k={k})"
+                    ))
+                })?
+                .push(row);
         }
         for (cell_id, rows) in per_cell_rows.into_iter().enumerate() {
             if rows.is_empty() {
@@ -846,14 +855,18 @@ fn bootstrap_centroids_from_batch(
 ) -> Option<ClusterCentroids> {
     let mut vectors = Vec::new();
     for batch in batches {
-        if batch.vectors.is_empty() {
+        let Some(first) = batch.vectors.first() else {
             continue;
-        }
-        let vecs = batch.vectors[0].values();
+        };
+        let vecs = first.values();
         let n_rows = batch.scalar.num_rows();
-        for row in 0..n_rows {
-            vectors.extend_from_slice(&vecs[row * vec_dim..(row + 1) * vec_dim]);
+        // Checked: a malformed buffered batch (vector column shorter than
+        // rows × dim) must fail the bootstrap, not panic the commit.
+        let expected = n_rows.checked_mul(vec_dim)?;
+        if vecs.len() < expected {
+            return None;
         }
+        vectors.extend_from_slice(&vecs[..expected]);
     }
     let n_docs = vectors.len() / vec_dim;
     if n_docs == 0 {
