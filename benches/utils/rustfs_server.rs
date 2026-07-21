@@ -10,7 +10,8 @@
 //! ## Session model (tests and benches)
 //!
 //! [`session`] starts one RustFS daemon per process on **first use** (`OnceLock`);
-//! the child is intentionally leaked so it outlives individual fixtures. Tests
+//! the child handle is owned by the session so it outlives individual fixtures.
+//! Tests
 //! should open storage via [`open_test_fixture`] — no explicit session create or
 //! teardown. Buckets are isolated per fixture; they are not deleted on drop (the
 //! process exit tears down the daemon). For explicit bucket cleanup tests, use
@@ -26,7 +27,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -91,6 +95,13 @@ struct S3SignParams<'a> {
 /// Length of generated access/secret keys when env overrides are absent.
 const GENERATED_KEY_LEN: usize = 20;
 const GENERATED_SECRET_LEN: usize = 40;
+/// Allowed characters for generated RustFS credentials.
+const GENERATED_KEY_CHARSET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// Monotonic suffix for unique RustFS bucket names within one process.
+const RUSTFS_BUCKET_COUNTER_START: u64 = 0;
+
+static RUSTFS_BUCKET_COUNTER: AtomicU64 = AtomicU64::new(RUSTFS_BUCKET_COUNTER_START);
 
 /// Running RustFS child plus tempdirs that must outlive the process.
 pub struct RustFsHandle {
@@ -348,6 +359,7 @@ pub struct RustFsSession {
     access_key: String,
     secret_key: String,
     ca_pem: Vec<u8>,
+    _handle: RustFsHandle,
 }
 
 impl RustFsSession {
@@ -372,22 +384,24 @@ impl RustFsSession {
     }
 }
 
-static RUSTFS_SESSION: OnceLock<Arc<RustFsSession>> = OnceLock::new();
+static RUSTFS_SESSION: OnceLock<Result<Arc<RustFsSession>, String>> = OnceLock::new();
 
 /// One RustFS daemon per process; lazy-loaded on first call. The child outlives
 /// all fixtures (see [`open_test_fixture`]).
-pub fn session() -> Arc<RustFsSession> {
-    Arc::clone(RUSTFS_SESSION.get_or_init(|| {
-        let handle = spawn_rustfs_daemon().expect("rustfs session daemon");
-        let session = Arc::new(RustFsSession {
+pub fn session() -> Result<Arc<RustFsSession>, String> {
+    match RUSTFS_SESSION.get_or_init(|| {
+        let handle = spawn_rustfs_daemon()?;
+        Ok(Arc::new(RustFsSession {
             endpoint: handle.endpoint.clone(),
             access_key: handle.access_key.clone(),
             secret_key: handle.secret_key.clone(),
             ca_pem: handle.ca_pem.clone(),
-        });
-        Box::leak(Box::new(handle));
-        session
-    }))
+            _handle: handle,
+        }))
+    }) {
+        Ok(session) => Ok(Arc::clone(session)),
+        Err(err) => Err(err.clone()),
+    }
 }
 
 /// Scoped bucket on the shared session. Empties and deletes the bucket on drop
@@ -503,7 +517,7 @@ pub fn begin_rustfs_test(test_name: &str) -> bool {
 /// Open an isolated bucket on the lazy shared session (blocking).
 pub fn open_test_fixture(prefix: &str) -> Result<RustFsTestFixture, String> {
     prefetch_rustfs_binary();
-    let lease = session().open_test_bucket(prefix)?;
+    let lease = session()?.open_test_bucket(prefix)?;
     let bucket = lease.bucket.clone();
     let storage = Arc::clone(&lease.storage);
     drop(lease);
@@ -529,7 +543,7 @@ pub async fn release_lease(lease: RustFsBucketLease) {
 /// the concrete type (same bucket path as [`open_test_fixture`]).
 pub fn open_wire_test_provider() -> Result<S3StorageProvider, String> {
     let fixture = open_test_fixture("")?;
-    let session = session();
+    let session = session()?;
     S3StorageProvider::new_with_endpoint_and_prefix(
         session.endpoint(),
         &fixture.bucket,
@@ -547,11 +561,12 @@ fn keep_rustfs_bucket() -> bool {
 }
 
 fn unique_rustfs_bucket_name() -> String {
-    let nanos = std::time::SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
-        .as_nanos();
-    format!("infino-{}-{nanos}", std::process::id())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = RUSTFS_BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("infino-{}-{nanos}-{seq}", std::process::id())
 }
 
 fn provision_bucket(
@@ -653,6 +668,12 @@ fn rustfs_blocking_client(ca_pem: &[u8]) -> Result<reqwest::blocking::Client, St
         .map_err(|e| e.to_string())
 }
 
+fn canonical_uri_from_request_target(request_target: &str) -> &str {
+    request_target
+        .split_once('?')
+        .map_or(request_target, |(path, _)| path)
+}
+
 fn signed_s3_get(
     session: &RustFsSession,
     bucket: &str,
@@ -664,7 +685,7 @@ fn signed_s3_get(
     let url = format!("{}{request_target}", session.endpoint);
     let amz_date = amz_timestamp();
     let payload_hash = sha256_hex(b"");
-    let canonical_uri = format!("/{bucket}");
+    let canonical_uri = canonical_uri_from_request_target(request_target);
     let authorization = sign_s3_request(&S3SignParams {
         method: "GET",
         canonical_uri: &canonical_uri,
@@ -880,13 +901,13 @@ fn rustfs_credentials() -> (String, String) {
 }
 
 fn generate_key(len: usize) -> String {
-    use rand::RngExt;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
-    (0..len)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
+    let mut bytes = vec![0_u8; len];
+    rand::fill(&mut bytes);
+    bytes
+        .into_iter()
+        .map(|b| {
+            let idx = (b as usize) % GENERATED_KEY_CHARSET.len();
+            GENERATED_KEY_CHARSET[idx] as char
         })
         .collect()
 }
@@ -1447,6 +1468,13 @@ def456  other.zip
     #[test]
     fn parse_sha256_sums_missing_asset_errors() {
         assert!(parse_sha256_sums_entry("abc123  other.zip\n", "missing.zip").is_err());
+    }
+
+    #[test]
+    fn unique_rustfs_bucket_names_are_distinct_within_process() {
+        let a = unique_rustfs_bucket_name();
+        let b = unique_rustfs_bucket_name();
+        assert_ne!(a, b, "bucket names must be unique within a process");
     }
 
     #[test]

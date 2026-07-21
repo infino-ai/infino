@@ -113,11 +113,11 @@ async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
     let bucket_name = {
         let lease = tokio::task::spawn_blocking(|| {
             rustfs_server::session()
-                .open_unique_bucket("")
-                .expect("open_unique_bucket on shared session")
+                .and_then(|session| session.open_unique_bucket(""))
         })
         .await
-        .expect("spawn_blocking join");
+        .expect("spawn_blocking join")
+        .expect("open_unique_bucket on shared session");
 
         eprintln!("[rustfs-session-smoke] leased bucket={}", lease.bucket);
 
@@ -144,11 +144,11 @@ async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
     let second_bucket = {
         let lease = tokio::task::spawn_blocking(|| {
             rustfs_server::session()
-                .open_unique_bucket("")
-                .expect("second open_unique_bucket after first lease dropped")
+                .and_then(|session| session.open_unique_bucket(""))
         })
         .await
-        .expect("spawn_blocking join");
+        .expect("spawn_blocking join")
+        .expect("second open_unique_bucket after first lease dropped");
         assert_ne!(
             lease.bucket, bucket_name,
             "each open_unique_bucket call must allocate a fresh bucket name"
@@ -165,12 +165,11 @@ async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
     let _ = second_bucket;
 
     let recreated = tokio::task::spawn_blocking(move || {
-        rustfs_server::session()
-            .open_bucket(&bucket_name, "", true)
-            .expect("recreate bucket after lease cleanup")
+        rustfs_server::session().and_then(|session| session.open_bucket(&bucket_name, "", true))
     })
     .await
-    .expect("spawn_blocking join");
+    .expect("spawn_blocking join")
+    .expect("recreate bucket after lease cleanup");
     let err = recreated
         .storage
         .get(PROBE_KEY)
@@ -333,8 +332,9 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
 
     let pre = cache.stats();
 
-    let mut q = vec![0.0f32; dim];
-    q[0] = 1.0;
+    let q: Vec<f32> = (0..dim)
+        .map(|i| if i == 0 { 1.0f32 } else { 0.0f32 })
+        .collect();
     let q_csv = q
         .iter()
         .map(|v| v.to_string())

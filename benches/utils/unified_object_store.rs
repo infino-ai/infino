@@ -402,11 +402,11 @@ async fn setup_rustfs_fixture(
 ) -> (Arc<dyn StorageProvider>, SuperfileUri, RustFsBucketLease) {
     let lease = tokio::task::spawn_blocking(|| {
         rustfs_server::session()
-            .open_unique_bucket("")
-            .expect("rustfs object-store bench bucket")
+            .and_then(|session| session.open_unique_bucket(""))
     })
     .await
-    .expect("rustfs spawn_blocking join");
+    .expect("rustfs spawn_blocking join")
+    .expect("rustfs object-store bench bucket");
     let storage = Arc::clone(&lease.storage);
     let uri = SuperfileUri::new_v4();
     let path = uri.storage_path();

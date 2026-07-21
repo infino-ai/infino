@@ -367,10 +367,20 @@ fn unique_bench_prefix(root: &str) -> String {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX_EPOCH")
-            .as_nanos()
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     );
     format!("{}/{}", root.trim_matches('/'), unique)
+}
+
+/// Print a bench setup error and exit with status 2 (misconfiguration).
+fn bench_setup_fatal(err: impl std::fmt::Display) -> ! {
+    eprintln!("{err}");
+    std::process::exit(2);
+}
+
+fn backend_from_env_or_exit() -> Backend {
+    Backend::from_env().unwrap_or_else(|e| bench_setup_fatal(e))
 }
 
 /// Build the fixture for a real backend (S3, Azure, or GCS): a unique prefix, a
@@ -403,7 +413,7 @@ fn remote_fixture(backend: Backend, prefix_default: &str) -> StorageFixture {
 }
 
 async fn backing_store(prefix_default: &str) -> StorageFixture {
-    let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let backend = backend_from_env_or_exit();
     match backend {
         Backend::RustFs => rustfs_fixture(prefix_default, false).await,
         backend => remote_fixture(backend, prefix_default),
@@ -421,11 +431,11 @@ async fn rustfs_fixture(prefix_default: &str, supertable_shaped: bool) -> Storag
     }
     let lease = tokio::task::spawn_blocking(move || {
         rustfs_server::session()
-            .open_unique_bucket(&prefix)
-            .unwrap_or_else(|e| panic!("rustfs bucket lease: {e}"))
+            .and_then(|session| session.open_unique_bucket(&prefix))
     })
     .await
-    .expect("rustfs spawn_blocking join");
+    .unwrap_or_else(|e| bench_setup_fatal(format!("rustfs spawn_blocking join failed: {e}")))
+    .unwrap_or_else(|e| bench_setup_fatal(e));
 
     StorageFixture {
         storage: Arc::clone(&lease.storage),
@@ -451,7 +461,7 @@ INFINO_REAL_GCS_BUCKET + GOOGLE_APPLICATION_CREDENTIALS).";
 /// delete the unique prefix when the run finishes. RustFS uses a fresh bucket
 /// per run that is deleted when the lease drops.
 pub async fn supertable_storage_fixture() -> StorageFixture {
-    match Backend::from_env().unwrap_or_else(|e| panic!("{e}")) {
+    match backend_from_env_or_exit() {
         Backend::RustFs => rustfs_fixture("infino-supertable-bench", true).await,
         backend => remote_fixture(backend, "infino-supertable-bench"),
     }
@@ -471,9 +481,9 @@ endpoint).";
 /// under the base prefix from `INFINO_BENCH_DATASET_PREFIX`. Production object
 /// store only (not the local RustFS bench session).
 pub async fn dataset_storage_fixture(subdir: &str) -> StorageFixture {
-    let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let backend = backend_from_env_or_exit();
     if backend.uses_local_rustfs_bench_session() {
-        panic!("{DATASET_REQUIRES_PRODUCTION_STORE}");
+        bench_setup_fatal(DATASET_REQUIRES_PRODUCTION_STORE);
     }
     let base = crate::dataset::dataset_prefix()
         .expect("dataset_storage_fixture requires INFINO_BENCH_DATASET_PREFIX");
@@ -518,14 +528,14 @@ fn existing_supertable_prefix() -> Option<String> {
 /// store only (not the local RustFS bench session).
 pub(crate) async fn existing_supertable_storage_fixture() -> Option<StorageFixture> {
     let prefix = existing_supertable_prefix()?;
-    let backend = Backend::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let backend = backend_from_env_or_exit();
     if backend.uses_local_rustfs_bench_session() {
-        panic!("{EXISTING_PREFIX_REQUIRES_PRODUCTION_STORE}");
+        bench_setup_fatal(EXISTING_PREFIX_REQUIRES_PRODUCTION_STORE);
     }
     let label = backend.label();
     let storage = backend
         .provider(&prefix)
-        .unwrap_or_else(|| panic!("existing-prefix provider for {label}"));
+        .unwrap_or_else(|| bench_setup_fatal(format!("existing-prefix provider for {label}")));
     eprintln!("[tiers] existing supertable {label} prefix={prefix} (read-only, no cleanup)");
     Some(StorageFixture {
         storage,
