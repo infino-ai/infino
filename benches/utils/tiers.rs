@@ -23,7 +23,10 @@ use infino::{
         SuperfileUri, Supertable, SupertableOptions,
         manifest::SubsectionOffsets,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
-        storage::{AzureStorageProvider, GcsStorageProvider, S3StorageProvider, StorageProvider},
+        storage::{
+            AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+            StorageProvider,
+        },
     },
 };
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
@@ -244,11 +247,20 @@ enum Backend {
     Azure { container: String },
     /// Real Google Cloud Storage.
     Gcs { bucket: String },
+    /// Real local filesystem (e.g. a fast local disk) — isolates index logic
+    /// from object-store write-path limits. Full OCC + multipart are provided
+    /// by `LocalFsStorageProvider`, so the multi-commit path works.
+    Local { root: String },
 }
 
 impl Backend {
     fn from_env() -> Result<Self, String> {
         let store = std::env::var("INFINO_BENCH_STORE").unwrap_or_else(|_| "s3s_fs".into());
+        if store == "local" {
+            let root = std::env::var("INFINO_BENCH_LOCAL_ROOT")
+                .unwrap_or_else(|_| "/data/bench-store".into());
+            return Ok(Self::Local { root });
+        }
         Self::parse(
             &store,
             real_s3_bucket_env(),
@@ -292,6 +304,7 @@ impl Backend {
             Self::S3 { .. } => "s3",
             Self::Azure { .. } => "azure",
             Self::Gcs { .. } => "gcs",
+            Self::Local { .. } => "local",
         }
     }
 
@@ -302,6 +315,7 @@ impl Backend {
             Self::S3 { .. } => real_s3_prefix_root(default),
             Self::Azure { .. } => azure_prefix_root(default),
             Self::Gcs { .. } => gcs_prefix_root(default),
+            Self::Local { .. } => default.to_string(),
         }
     }
 
@@ -330,6 +344,17 @@ impl Backend {
                 )
                 .expect("real GCS provider"),
             )),
+            Self::Local { root } => {
+                let dir = if prefix.is_empty() {
+                    root.clone()
+                } else {
+                    format!("{root}/{prefix}")
+                };
+                std::fs::create_dir_all(&dir).expect("create local store dir");
+                Some(Arc::new(
+                    LocalFsStorageProvider::new(dir).expect("local fs provider"),
+                ))
+            }
         }
     }
 }

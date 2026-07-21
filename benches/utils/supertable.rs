@@ -2977,6 +2977,11 @@ pub mod vector {
                     == Some("1");
             let skip_vector_delta =
                 std::env::var(SKIP_VECTOR_DELTA_ENV).ok().as_deref() == Some("1");
+            // Force compaction (optimize) + post-compact on a reopened, already-drained
+            // table -- otherwise a drained existing prefix reports phase-derived only and
+            // never exercises the split.
+            let force_compact =
+                std::env::var("INFINO_BENCH_FORCE_COMPACT").ok().as_deref() == Some("1");
 
             let search_title = |phase: &str| {
                 format!(
@@ -3048,6 +3053,9 @@ pub mod vector {
             } else {
                 force_pre_post_drain
             };
+            // Run compaction/split + post-compact either in the forced drain
+            // lifecycle or when explicitly forced on a reopened drained table.
+            let run_compact = pre_post_drain || force_compact;
             let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
                 None;
             let mut delta_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
@@ -3549,7 +3557,7 @@ pub mod vector {
                 // Optimize compacts user + hidden physical files; when the
                 // delta phase ran it first drains that tail. The following
                 // state must therefore be hidden-only in either mode.
-                let compaction_stats = pre_post_drain.then(|| {
+                let compaction_stats = run_compact.then(|| {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
@@ -3583,7 +3591,7 @@ pub mod vector {
                     });
                 }
                 let mut cold_split_post = None;
-                if pre_post_drain {
+                if run_compact {
                     let compact_map = delta_id_to_dense.as_ref().unwrap_or(&id_to_dense);
                     let compact_truth = if skip_vector_delta {
                         &gt_correct
