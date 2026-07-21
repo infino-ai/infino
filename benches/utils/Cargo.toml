@@ -26,10 +26,6 @@ datafusion = "54"
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 infino = { path = "../..", features = ["test-helpers"] }
-# Already in the tree via infino's default mimalloc allocator; the
-# direct dep only exposes mi_collect so the RSS sampler can purge
-# allocator-retained pages before each measurement window.
-libmimalloc-sys = { version = "0.1", features = ["extended"] }
 memmap2 = "0.9"
 num_cpus = "1"
 object_store = { version = "0.13", features = ["aws"] }

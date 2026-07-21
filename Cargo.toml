@@ -70,7 +70,7 @@ bench = false
 # (`default-features = false`): a second global allocator dlopened into a
 # live process segfaults. Not part of the public API surface.
 default = ["mimalloc"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Exposes `infino::test_helpers` — convenience builders for
 # Decimal128 id columns, default tokenizers, default vector
 # configs. Enabled explicitly by the Makefile test / bench / coverage
@@ -116,6 +116,9 @@ bytemuck = { version = "1", features = ["min_const_generics"] }
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for
 # per-query scratch, plus the custom MemoryArena in fts/arena.rs.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# Exposes `mi_collect` so RSS sampling can purge retained arenas. Only
+# linked when the mimalloc feature (and thus the global allocator) is on.
+libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"

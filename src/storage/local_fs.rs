@@ -28,7 +28,9 @@ use object_store::{
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider, counting, io_counters};
+use super::{
+    ObjectMeta, StorageError, StorageProvider, counting, usage::UsageMeter,
+};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -38,6 +40,7 @@ pub struct LocalFsStorageProvider {
     // they `.await` each other instead of piling up on `flock`,
     // which would starve the tokio worker pool.
     commit_lock: Arc<tokio::sync::Mutex<()>>,
+    meter: Arc<UsageMeter>,
 }
 
 impl LocalFsStorageProvider {
@@ -48,6 +51,14 @@ impl LocalFsStorageProvider {
     /// (permission denied, parent doesn't exist + we can't
     /// mkdir, etc.).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        Self::new_with_meter(root, UsageMeter::process_default())
+    }
+
+    /// Like [`Self::new`], but records into the given connection meter.
+    pub fn new_with_meter(
+        root: impl Into<PathBuf>,
+        meter: Arc<UsageMeter>,
+    ) -> Result<Self, StorageError> {
         let root: PathBuf = root.into();
         std::fs::create_dir_all(&root).map_err(|e| StorageError::Permanent {
             uri: root.display().to_string(),
@@ -62,6 +73,7 @@ impl LocalFsStorageProvider {
             root,
             store: Arc::new(store),
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            meter,
         })
     }
 
@@ -114,7 +126,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        io_counters::record_head();
+        self.meter.record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -133,7 +145,7 @@ impl StorageProvider for LocalFsStorageProvider {
             last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-        io_counters::record_get(bytes.len() as u64);
+        self.meter.record_get(uri, None, bytes.len() as u64);
         Ok((bytes, meta))
     }
 
@@ -143,13 +155,15 @@ impl StorageProvider for LocalFsStorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = Self::path(uri)?;
+        let requested = (range.start, range.end);
         let out = self
             .store
             .get_range(&path, range)
             .await
             .map_err(|e| translate(uri, e));
         if let Ok(b) = &out {
-            io_counters::record_get(b.len() as u64);
+            self.meter
+                .record_get(uri, Some(requested), b.len() as u64);
         }
         out
     }
@@ -168,7 +182,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
-            io_counters::record_put(n);
+            self.meter.record_put(n);
         }
         out
     }
@@ -195,7 +209,7 @@ impl StorageProvider for LocalFsStorageProvider {
                     .map(|r| r.e_tag)
                     .map_err(|e| translate(uri, e));
                 if out.is_ok() {
-                    io_counters::record_put(n);
+                    self.meter.record_put(n);
                 }
                 out
             }
@@ -294,7 +308,7 @@ impl StorageProvider for LocalFsStorageProvider {
                         .map(|r| r.e_tag)
                         .map_err(|e| translate(uri, e));
                     if out.is_ok() {
-                        io_counters::record_put(put_bytes);
+                        self.meter.record_put(put_bytes);
                     }
                     out
                 }
@@ -312,18 +326,18 @@ impl StorageProvider for LocalFsStorageProvider {
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = Self::path(uri)?;
         // CreateMultipartUpload is a billable request (0 payload bytes).
-        io_counters::record_put(0);
+        self.meter.record_put(0);
         let upload = self
             .store
             .put_multipart(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        Ok(counting::wrap_multipart(upload))
+        Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = Self::path(uri)?;
-        io_counters::record_delete();
+        self.meter.record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -335,7 +349,7 @@ impl StorageProvider for LocalFsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        io_counters::record_list();
+        self.meter.record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -355,12 +369,16 @@ impl StorageProvider for LocalFsStorageProvider {
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         // The prefix (root) is baked into the LocalFileSystem store, so
         // the object key is the bare uri. Wrap so parquet range GETs issued
-        // against this handle are metered in io_counters.
+        // against this handle share this provider's UsageMeter.
         let path = Self::path(uri).ok()?;
         Some((
-            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>),
+            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>, Arc::clone(&self.meter)),
             path,
         ))
+    }
+
+    fn usage_meter(&self) -> Arc<UsageMeter> {
+        Arc::clone(&self.meter)
     }
 }
 
@@ -715,7 +733,7 @@ mod tests {
             .await
             .expect("put");
         let (store, path) = p.object_store_handle("seg/x.bin").expect("handle");
-        let before = io_counters::snapshot();
+        let before = p.usage_meter().snapshot();
         let bytes = store
             .get(&path)
             .await
@@ -724,7 +742,7 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(bytes.as_ref(), b"0123456789");
-        let delta = io_counters::snapshot().since(&before);
+        let delta = p.usage_meter().snapshot().since(&before);
         // Process-global counters — lower bounds under parallel tests.
         assert!(delta.get_count >= 1);
         assert!(delta.get_bytes >= 10);
@@ -733,18 +751,18 @@ mod tests {
     #[tokio::test]
     async fn put_multipart_counts_create_part_and_complete() {
         let (_dir, p) = provider();
-        let before = io_counters::snapshot();
+        let before = p.usage_meter().snapshot();
         let mut upload = p
             .put_multipart("data/multi.bin")
             .await
             .expect("create multipart");
         // Create already counted as a zero-byte PUT.
-        assert!(io_counters::snapshot().since(&before).put_count >= 1);
+        assert!(p.usage_meter().snapshot().since(&before).put_count >= 1);
 
         let part = upload.put_part(PutPayload::from_static(b"abcdef"));
         part.await.expect("part");
         upload.complete().await.expect("complete");
-        let delta = io_counters::snapshot().since(&before);
+        let delta = p.usage_meter().snapshot().since(&before);
         // create + part + complete
         assert!(delta.put_count >= 3);
         assert!(delta.put_bytes >= 6);

@@ -9,6 +9,7 @@
 // - `superfile`, `supertable` — tier-specific bench runners by modality
 // - `tiers`, `markdown`, `rss` — storage backends + reporting
 
+pub mod cold_store;
 pub mod corpus;
 pub mod cost;
 pub mod cpu;

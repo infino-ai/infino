@@ -26,7 +26,7 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry,
+    logical_list_key, options::apply, retry, usage::UsageMeter,
 };
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS
@@ -57,6 +57,7 @@ pub struct GcsStorageProvider {
     bucket: String,
     prefix: String,
     store: Arc<GoogleCloudStorage>,
+    meter: Arc<UsageMeter>,
 }
 
 impl GcsStorageProvider {
@@ -103,6 +104,7 @@ impl GcsStorageProvider {
             bucket,
             prefix: normalize_prefix(prefix),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         })
     }
 
@@ -113,7 +115,14 @@ impl GcsStorageProvider {
             bucket: bucket.into(),
             prefix: String::new(),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         }
+    }
+
+    /// Replace the usage meter (connection-scoped ledger).
+    pub fn with_usage_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = meter;
+        self
     }
 
     /// GCS bucket this provider is scoped to.
@@ -194,7 +203,7 @@ impl StorageProvider for GcsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        io_counters::record_head();
+        self.meter.record_head();
         Ok(ObjectMeta {
             size: meta.size,
             etag: version_token(&meta),
@@ -217,7 +226,7 @@ impl StorageProvider for GcsStorageProvider {
         })
         .await;
         if let Ok((b, _)) = &out {
-            io_counters::record_get(b.len() as u64);
+            self.meter.record_get(uri, None, b.len() as u64);
             io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
@@ -239,7 +248,7 @@ impl StorageProvider for GcsStorageProvider {
         })
         .await;
         if let Ok(b) = &out {
-            io_counters::record_get(b.len() as u64);
+            self.meter.record_get(uri, None, b.len() as u64);
             io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
         }
         out
@@ -270,7 +279,7 @@ impl StorageProvider for GcsStorageProvider {
         })
         .await;
         if let Ok((b, size)) = &out {
-            io_counters::record_get(b.len() as u64);
+            self.meter.record_get(uri, None, b.len() as u64);
             io_counters::timeline_record(
                 "tail",
                 uri,
@@ -305,7 +314,7 @@ impl StorageProvider for GcsStorageProvider {
         })
         .await;
         if out.is_ok() {
-            io_counters::record_put(n);
+            self.meter.record_put(n);
         }
         out
     }
@@ -343,7 +352,7 @@ impl StorageProvider for GcsStorageProvider {
             .map(|r| r.version)
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
-            io_counters::record_put(n);
+            self.meter.record_put(n);
         }
         out
     }
@@ -351,18 +360,18 @@ impl StorageProvider for GcsStorageProvider {
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
         // CreateMultipartUpload is a billable request (0 payload bytes).
-        io_counters::record_put(0);
+        self.meter.record_put(0);
         let upload = self
             .store
             .put_multipart(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        Ok(counting::wrap_multipart(upload))
+        Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        io_counters::record_delete();
+        self.meter.record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -374,7 +383,7 @@ impl StorageProvider for GcsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        io_counters::record_list();
+        self.meter.record_list();
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -395,9 +404,13 @@ impl StorageProvider for GcsStorageProvider {
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
         Some((
-            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>),
+            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>, Arc::clone(&self.meter)),
             path,
         ))
+    }
+
+    fn usage_meter(&self) -> Arc<UsageMeter> {
+        Arc::clone(&self.meter)
     }
 }
 

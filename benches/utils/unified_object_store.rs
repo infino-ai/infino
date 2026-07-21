@@ -949,6 +949,20 @@ pub(crate) mod diag {
         async fn delete(&self, uri: &str) -> Result<(), StorageError> {
             self.inner.delete(uri).await
         }
+
+        fn object_store_handle(
+            &self,
+            uri: &str,
+        ) -> Option<(
+            Arc<dyn object_store::ObjectStore>,
+            object_store::path::Path,
+        )> {
+            self.inner.object_store_handle(uri)
+        }
+
+        fn usage_meter(&self) -> Arc<infino::storage::UsageMeter> {
+            self.inner.usage_meter()
+        }
     }
 
     fn duration_from_us(us: u128) -> Duration {
