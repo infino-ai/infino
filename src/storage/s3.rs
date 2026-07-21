@@ -139,6 +139,7 @@ impl S3StorageProvider {
             bucket,
             prefix: String::new(),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         })
     }
 
