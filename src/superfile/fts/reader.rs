@@ -5591,6 +5591,49 @@ mod tests {
     }
 
     #[test]
+    fn norm_table_footprint_is_one_byte_per_doc() {
+        // Memory guard: the resident length-norm table must stay at one
+        // byte per doc (plus the fixed 256-entry decode LUT), not the
+        // 4-byte-per-doc `f32` table it replaced. Build enough
+        // varied-length docs that the per-doc term dominates the LUT.
+        const N: u32 = 5_000;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for d in 0..N {
+            // Lengths cycle 1..=40 tokens so norms span many buckets and
+            // the table isn't a degenerate single value.
+            let words = (d % 40) + 1;
+            let text: String = (0..words).map(|w| format!("t{}x{w} ", d % 97)).collect();
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        let nt = &r.columns[0].dl_norm_k1;
+
+        let per_doc = nt.bytes.capacity(); // 1 byte/doc
+        let lut = nt.lut.capacity() * std::mem::size_of::<f32>(); // 256 * 4 = 1 KiB
+        let m2_bytes = per_doc + lut;
+        let f32_baseline = N as usize * std::mem::size_of::<f32>();
+
+        assert_eq!(nt.bytes.len(), N as usize, "one bucket byte per doc");
+        assert_eq!(nt.lut.len(), 256, "fixed 256-entry decode table");
+        // The whole point: strictly smaller than the old f32 table, and
+        // asymptotically 4× smaller (per-doc term is 1 byte vs 4).
+        assert!(
+            m2_bytes < f32_baseline,
+            "norm table {m2_bytes} B not smaller than f32 baseline {f32_baseline} B"
+        );
+        assert_eq!(
+            per_doc * 4,
+            f32_baseline,
+            "per-doc term is exactly 4× smaller"
+        );
+    }
+
+    #[test]
     fn iter_column_terms_lists_every_term_in_lex_order() {
         // build_blob plants the union of tokens across the 3 docs.
         let (blob, json) = build_blob();
