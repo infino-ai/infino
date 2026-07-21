@@ -687,14 +687,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 .unwrap_or(0.0);
             Some(inst.per_query_usd(cpu, window, c.resident_anon_bytes) + request_usd(&io))
         }
-        (Some(io), None) => anchor_cold.map(|q| {
-            let window = warm_window_for(&q.name).unwrap_or(0.0);
-            q.search_cpu_s
-                .map(|cpu| inst.per_query_usd(cpu, window, c.resident_anon_bytes))
-                .unwrap_or(0.0)
-                + request_usd(&io)
-        }),
-        (None, _) => None,
+        // Do not fall back to first-query (metadata-warmup) CPU while
+        // charging steady-second request counts — that mixes windows.
+        (Some(_), None) | (None, _) => None,
     };
 
     // ---- Block 1: rate card ----

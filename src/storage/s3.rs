@@ -495,10 +495,17 @@ impl StorageProvider for S3StorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        self.meter.record_delete();
         match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(ObjError::NotFound { .. }) => Ok(()),
+            Ok(()) => {
+                self.meter.record_delete();
+                Ok(())
+            }
+            // Idempotent delete: NotFound is success for the caller and is
+            // still a completed DeleteObject (or equivalent) round-trip.
+            Err(ObjError::NotFound { .. }) => {
+                self.meter.record_delete();
+                Ok(())
+            }
             Err(e) => Err(translate(uri, e)),
         }
     }
@@ -507,7 +514,6 @@ impl StorageProvider for S3StorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        self.meter.record_list();
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -522,6 +528,7 @@ impl StorageProvider for S3StorageProvider {
                 },
             ));
         }
+        self.meter.record_list();
         Ok(out)
     }
 

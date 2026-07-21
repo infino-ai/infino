@@ -14,8 +14,8 @@ use crate::{
     storage_meter::{ColdStoreSplit, MeteredStorage, ObjectStoreMeter},
 };
 
-/// Distinct steady-cold samples; median wall and median-GET I/O sample
-/// are reported (same constant for every modality).
+/// Distinct steady-cold samples; the wall-median sample's wall / CPU / I/O
+/// are reported together (same constant for every modality).
 pub const STEADY_COLD_SAMPLES: usize = 3;
 
 /// Timed + metered cold-store windows shared across modalities.
@@ -82,14 +82,12 @@ pub fn measure_cold_store<C>(
     run_repeat(&consumer);
     let after_repeat = meter.snapshot();
 
-    let median_wall_s = {
-        let mut walls: Vec<f64> = steady.iter().map(|(wall, _, _)| *wall).collect();
-        walls.sort_unstable_by(f64::total_cmp);
-        walls[walls.len() / 2]
-    };
-    let (_, median_cpu_s, median_io) = {
-        steady.sort_unstable_by_key(|(_, _, io)| io.get_count);
-        steady[steady.len() / 2]
+    // One median sample owns wall, CPU, and I/O together so the cost model
+    // never pairs one run's latency with another's GET count.
+    steady.sort_unstable_by(|(wall_a, _, _), (wall_b, _, _)| f64::total_cmp(wall_a, wall_b));
+    let (median_wall_s, median_cpu_s, median_io) = {
+        let (wall_s, cpu_s, io) = &steady[steady.len() / 2];
+        (*wall_s, *cpu_s, *io)
     };
 
     ColdStoreMeasurement {

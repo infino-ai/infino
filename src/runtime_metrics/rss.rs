@@ -154,7 +154,8 @@ impl PeakSampler {
                     if let Some(rss) = current_rss_bytes() {
                         samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
                     }
-                    thread::sleep(interval);
+                    // Interruptible wait so `stop_stats` can unpark promptly.
+                    thread::park_timeout(interval);
                 }
                 if let Some(rss) = current_rss_bytes() {
                     samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
@@ -174,6 +175,9 @@ impl PeakSampler {
     /// Stop the sampler and return peak / median / p90 plus anon/file peaks.
     pub fn stop_stats(mut self) -> RssStats {
         self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.as_ref() {
+            handle.thread().unpark();
+        }
         let samples = self
             .handle
             .take()

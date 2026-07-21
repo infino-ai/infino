@@ -334,10 +334,16 @@ impl StorageProvider for LocalFsStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = Self::path(uri)?;
-        self.meter.record_delete();
         match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(ObjError::NotFound { .. }) => Ok(()),
+            Ok(()) => {
+                self.meter.record_delete();
+                Ok(())
+            }
+            // Idempotent delete: NotFound is success for the caller.
+            Err(ObjError::NotFound { .. }) => {
+                self.meter.record_delete();
+                Ok(())
+            }
             Err(e) => Err(translate(uri, e)),
         }
     }
@@ -346,7 +352,6 @@ impl StorageProvider for LocalFsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        self.meter.record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -360,6 +365,7 @@ impl StorageProvider for LocalFsStorageProvider {
                 },
             ));
         }
+        self.meter.record_list();
         Ok(out)
     }
 

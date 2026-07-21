@@ -43,15 +43,20 @@ const UTIME_FIELD_IDX: usize = 11;
 const STIME_FIELD_IDX: usize = 12;
 
 fn clock_ticks_per_second() -> Option<u128> {
-    static TICKS: OnceLock<Option<u128>> = OnceLock::new();
-    *TICKS.get_or_init(|| {
-        let output = Command::new(GETCONF).arg(CLK_TCK).output().ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).ok()?.trim().parse().ok())
-            .flatten()
-    })
+    // Cache only a successful tick rate. A transient `getconf` failure must
+    // not permanently disable CPU metering for the process.
+    static TICKS: OnceLock<u128> = OnceLock::new();
+    if let Some(ticks) = TICKS.get() {
+        return Some(*ticks);
+    }
+    let output = Command::new(GETCONF).arg(CLK_TCK).output().ok()?;
+    let ticks = output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok()?.trim().parse().ok())
+        .flatten()?;
+    let _ = TICKS.set(ticks);
+    Some(ticks)
 }
 
 /// Sum of on-CPU nanoseconds across every thread of this process, or `None`

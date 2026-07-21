@@ -124,11 +124,16 @@ impl ObjectStore for CountingObjectStore {
         &self,
         prefix: Option<&ObjPath>,
     ) -> BoxStream<'static, ObjectStoreResult<OsObjectMeta>> {
+        // A LIST request is issued when the stream is created; count it so
+        // callers that go through `object_store_handle` share the ledger.
+        self.meter.record_list();
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
+        let result = self.inner.list_with_delimiter(prefix).await?;
+        self.meter.record_list();
+        Ok(result)
     }
 
     async fn copy_opts(
