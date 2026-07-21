@@ -185,6 +185,7 @@ pub mod fts {
         "two_term_or",
         "ten_term_or",
         "two_term_and",
+        "two_term_and_small",
     ];
     /// Large-union shapes that exist only to stress the multi-term count
     /// path. Excluded from the cold object-store search tier, where their
