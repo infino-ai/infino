@@ -406,6 +406,16 @@ pub mod fts {
             terms: &["term00001", "term00050"],
             mode: BoolMode::And,
         },
+        // Small intersection: two mid-rare terms whose overlap is well
+        // under a top-1000 request, so the top-k heap never fills and
+        // the block-max-AND skip cannot fire — every match is scored.
+        // Isolates the raw score-and-collect cost that the large
+        // `two_term_and` overlap hides behind pruning.
+        FtsQuery {
+            name: "two_term_and_small",
+            terms: &["term00500", "term01000"],
+            mode: BoolMode::And,
+        },
         FtsQuery {
             name: "three_wide_and",
             terms: &["term00001", "term00050", "term00100"],

@@ -27,7 +27,10 @@
 //! tie differently. We assert "set equality" on the head, not
 //! "ordered equality".
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -756,5 +759,139 @@ async fn oracle_and_multi_block_score_matches_brute_force() {
     assert_eq!(
         infino_set, oracle_set,
         "multi-block AND top-10 sets disagree: infino={infino_hits:?} oracle={oracle_hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn oracle_and_multi_block_two_term_score_values_match_brute_force() {
+    // Scores (not just doc-id sets) for a two-term AND whose match set
+    // spans multiple posting blocks — cross-checked against the exact
+    // BM25 oracle so a block-crossing scoring bug (wrong tf index after
+    // a block boundary, stale norm) can't slip through.
+    //
+    // alpha (÷3, spans 3 blocks) ∧ gamma (÷5, spans 2 blocks) →
+    // d ÷ 15 → docs {0, 15, …, 990} = 67 matches, crossing blocks on
+    // both cursors mid-walk.
+    let corp_owned = build_multi_block_corpus();
+    let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let r = build_infino_superfile(&corp_refs);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
+    let mut terms: Vec<String> = Vec::new();
+    tok.tokenize_each("alpha gamma", &mut |t| terms.push(t.to_owned()));
+
+    // Oracle scores for the full intersection, indexed by doc-id and
+    // also as a descending score vector for the top-k comparison.
+    let oracle_full = oracle.top_k_terms_and(&terms, MULTI_BLOCK_N_DOCS as usize);
+    let oracle_by_doc: HashMap<u64, f32> = oracle_full.iter().copied().collect();
+    assert_eq!(
+        oracle_full.len(),
+        67,
+        "corpus assumption changed: alpha∧gamma should be 67 docs"
+    );
+
+    // Regime 1 — no pruning: k >= match count, so the heap never fills,
+    // the block-max bar stays -inf, and every match is batch-scored.
+    // Each returned score must match the oracle for that exact doc.
+    let infino_full = r
+        .bm25_hits_async(
+            "title",
+            "alpha gamma",
+            MULTI_BLOCK_N_DOCS as usize,
+            BoolMode::And,
+        )
+        .await
+        .expect("AND search (full)");
+    assert_eq!(infino_full.len(), 67, "full AND(alpha, gamma) count");
+    for (doc, score) in &infino_full {
+        let expected = oracle_by_doc
+            .get(&(*doc as u64))
+            .expect("returned doc not in oracle intersection");
+        let delta = (score - expected).abs();
+        assert!(
+            delta < BM25_SCORE_ABS_TOLERANCE,
+            "score divergence on doc {doc}: infino={score} oracle={expected} delta={delta}"
+        );
+    }
+
+    // Regime 2 — pruning active: k < match count, so the heap fills and
+    // the block-max-AND skip fires between blocks while the batched
+    // scorer flushes each block's tail before the bar is re-read. The
+    // ten best scores must equal the oracle's ten best (compared by
+    // value, so a score-tie at the boundary can't make this flaky).
+    let mut infino_top: Vec<f32> = r
+        .bm25_hits_async("title", "alpha gamma", 10, BoolMode::And)
+        .await
+        .expect("AND search (top-k)")
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(infino_top.len(), 10, "top-k=10 should fill");
+    infino_top.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+    let mut oracle_top: Vec<f32> = oracle_full.iter().map(|(_, s)| *s).collect();
+    oracle_top.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+    oracle_top.truncate(10);
+    for (got, want) in infino_top.iter().zip(&oracle_top) {
+        let delta = (got - want).abs();
+        assert!(
+            delta < BM25_SCORE_ABS_TOLERANCE,
+            "top-10 score divergence: infino={got} oracle={want} delta={delta}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quantized_norms_preserve_topk_ranking_on_long_docs() {
+    // The length-norm table is byte-quantized, which is lossy for
+    // documents long enough to leave the exact-encoding region. This
+    // guards the ranking-quality claim: on long docs with well-separated
+    // lengths, the quantized top-k must still be the exact BM25 top-k.
+    //
+    // Each candidate doc contains "qterm" once and is padded with
+    // per-doc-unique filler to a length that grows ~1.5× per doc
+    // (20, 30, 45, …). BM25 for "qterm" (tf=1, same idf everywhere)
+    // ranks purely by length-norm — shortest first — and the 1.5× gap
+    // exceeds one quantization bucket, so the exact order is preserved.
+    const N_CANDIDATES: usize = 8;
+    let mut corpus_owned: Vec<(u64, String)> = Vec::new();
+    let mut len = 20usize;
+    for d in 0..N_CANDIDATES {
+        let mut text = String::from("qterm");
+        // Pad with tokens unique to this doc so filler never matches the
+        // query and every doc's length is deliberate.
+        for f in 0..(len - 1) {
+            text.push_str(&format!(" fill{d}x{f}"));
+        }
+        corpus_owned.push((d as u64, text));
+        len = (len * 3) / 2;
+    }
+    // A few long filler-only docs to make avgdl realistic and ensure the
+    // norm table spans multiple quantization buckets.
+    for d in N_CANDIDATES..(N_CANDIDATES + 4) {
+        let mut text = String::new();
+        for f in 0..300 {
+            text.push_str(&format!("noise{d}x{f} "));
+        }
+        corpus_owned.push((d as u64, text));
+    }
+    let corpus: Vec<(u64, &str)> = corpus_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+
+    let infino = build_infino_superfile(&corpus);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corpus, tok.as_ref());
+
+    let infino_hits = infino_top_k(&infino, "qterm", N_CANDIDATES).await;
+    let oracle_hits: Vec<u64> = oracle
+        .top_k("qterm", N_CANDIDATES, tok.as_ref())
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+
+    // Order preserved: shortest doc (id 0) first, longest last. The 1.5×
+    // length spacing keeps every candidate in its own bucket, so the
+    // quantized ranking matches the exact ranking element-for-element.
+    assert_eq!(
+        infino_hits, oracle_hits,
+        "quantized norms reordered the top-k vs exact BM25"
     );
 }
