@@ -2335,10 +2335,15 @@ pub(super) fn prepare_superfile_with_uri(
     // a cache-attached producer keeps superfile bytes out of the unbounded
     // in-memory store regardless of whether we pre-populate the disk cache.
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
-    // Always warm-fill the disk cache when attached: commits are durable in
+    // Warm-fill the disk cache when attached AND the producer opts in
+    // (`prepopulate_cache_on_commit`, default true): commits are durable in
     // object storage first, then mirrored locally so maintenance/compaction
     // can merge from mmap-resident bytes without re-fetching whole objects.
-    let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
+    // Ingest-only producers that drop the writer immediately (e.g. the bench)
+    // set this false — mirroring would be a pure second fsync'd write + CRC
+    // re-scan of every superfile, ~doubling per-commit write I/O for no reader.
+    let bytes_for_cache =
+        (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
 
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached

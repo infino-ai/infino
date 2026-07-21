@@ -979,19 +979,27 @@ impl DiskCacheStore {
             let tmp = self.tmp_path(uri);
             let final_path = self.cache_path(uri);
 
-            // Write the bytes to a tmp file, fsync, then
-            // atomically rename into place. Same shape as
-            // the cold-fetch path's tmp→final promote.
+            // Write the bytes to a tmp file, then atomically rename into place.
+            // No fsync: the disk cache is a reconstructible mirror of bytes that
+            // are already durable in object storage, so a crash losing an
+            // unflushed cache file just cold-fetches on the next open — and
+            // `restore_from_cache_root` CRC-verifies on-disk files at open,
+            // dropping any torn one. Skipping the fsync keeps the committer's
+            // warm-fill off the synchronous disk-flush path.
             {
                 let mut file = tokio::fs::File::create(&tmp).await?;
                 file.write_all(&bytes).await?;
                 file.flush().await?;
-                file.sync_all().await?;
             }
             tokio::fs::rename(&tmp, &final_path).await?;
 
             // mmap the freshly-written file + open it as a superfile reader.
-            self.open_cached_entry(&final_path, size)
+            // Skip CRC: the committer just built these bytes in memory and they
+            // are known-valid (CRC'd at build, already opened as a reader for
+            // summary extraction) — re-scanning here is redundant. Files read
+            // back from a PRIOR run take the verifying path via
+            // `restore_from_cache_root`.
+            self.open_cached_entry(&final_path, size, false)
         }
         .await;
 
@@ -1043,16 +1051,12 @@ impl DiskCacheStore {
         &self,
         path: &Path,
         size: u64,
+        verify_crc: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let mmap = open_readonly_mmap(path).map_err(DiskCacheError::Io)?;
         let mmap_arc = Arc::new(mmap);
         let reader_bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
-        let reader = SuperfileReader::open_with(
-            reader_bytes,
-            OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
-            },
-        )?;
+        let reader = SuperfileReader::open_with(reader_bytes, OpenOptions { verify_crc })?;
         Ok(Arc::new(CachedEntry {
             reader: Arc::new(reader),
             mmap: Some(mmap_arc),
@@ -1095,7 +1099,7 @@ impl DiskCacheStore {
                 Ok(m) if m.len() > 0 => m.len(),
                 _ => continue,
             };
-            match self.open_cached_entry(&path, size) {
+            match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
                 Ok(cached_entry) => {
                     if self.cached.insert(uri, cached_entry).is_none() {
                         self.current_bytes.fetch_add(size, Ordering::Release);
