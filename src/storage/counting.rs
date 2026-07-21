@@ -260,10 +260,7 @@ mod tests {
             .put_part(PutPayload::from_static(b"x"))
             .await
             .expect_err("part must fail");
-        assert!(matches!(
-            err,
-            object_store::Error::NotImplemented { .. }
-        ));
+        assert!(matches!(err, object_store::Error::NotImplemented { .. }));
         assert!(
             meter.snapshot().since(&before).is_zero(),
             "failed put_part must not bump the ledger"

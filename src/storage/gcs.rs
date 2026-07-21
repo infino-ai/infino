@@ -249,8 +249,7 @@ impl StorageProvider for GcsStorageProvider {
         })
         .await;
         if let Ok(b) = &out {
-            self.meter
-                .record_get(uri, Some(requested), b.len() as u64);
+            self.meter.record_get(uri, Some(requested), b.len() as u64);
             io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
         }
         out
