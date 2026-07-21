@@ -1042,7 +1042,10 @@ mod tests {
         // The orchestration loop treats that same error as a superseded
         // (benign) job and keeps going rather than aborting the pass — the
         // regression guard for the optimize-time SuperfileNotFound crash.
-        assert!(is_superseded_job(&err), "vanished input must classify superseded: {err:?}");
+        assert!(
+            is_superseded_job(&err),
+            "vanished input must classify superseded: {err:?}"
+        );
         assert!(
             !is_superseded_job(&CompactionError::NoStorage),
             "a genuine failure must not classify superseded"
