@@ -1310,7 +1310,7 @@ impl SupertableReader {
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
-            let cell_routing = if hidden_vector_index {
+            let mut cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
                 if filtered && options.nprobe.is_some() {
                     // Explicit caller `nprobe` on a FILTERED query pins the
@@ -1358,6 +1358,19 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
+            // Diagnostic sweep knob: override the fine-first gate for
+            // UNFILTERED vector queries only. Off by default (unset ⇒ the
+            // manifest routing value). Filtered queries keep their own fine
+            // floor untouched, so the knob never widens or narrows a
+            // filtered sweep.
+            if !filtered
+                && let Some(fnp) = std::env::var("INFINO_VECTOR_FINE_NPROBE")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&v| v > 0)
+            {
+                cell_routing.fine_nprobe = fnp;
+            }
             let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
                 .iter()
                 .filter(|(cell, _)| postings_by_cell.contains_key(cell))

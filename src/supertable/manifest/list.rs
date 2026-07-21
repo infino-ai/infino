@@ -71,8 +71,10 @@ const DEFAULT_CELL_NPROBE_MAX: usize = 1;
 /// Inert while `nprobe_max == nprobe_min`; acts only when a table
 /// explicitly widens its persisted routing.
 const DEFAULT_CELL_SLACK: f32 = 1.0;
-/// Fine IVF centroids probed inside the selected cell.
-const DEFAULT_CELL_FINE_NPROBE: usize = 8;
+/// Fine IVF centroids probed inside the selected cell. Recall is flat
+/// from four centroids upward, so probing more only inflates the
+/// per-query read without buying accuracy.
+const DEFAULT_CELL_FINE_NPROBE: usize = 4;
 
 // ---------- Public in-memory shapes ----------
 
