@@ -123,6 +123,18 @@ pub(crate) fn budgeted_session_context(
     // One consequence: a column the user themselves declared `Utf8View` is also
     // converted, so SQL string results are always `LargeUtf8`, never a view.
     config.options_mut().optimizer.expand_views_at_output = true;
+
+    // Skip DataFusion's partial (pre-)aggregation sooner. Its default only
+    // bails out of the partial phase when more than 80% of sampled group keys
+    // are unique; 0.5 bails at 50%. On a high-cardinality GROUP BY the partial
+    // phase barely reduces the row count yet still hashes every key, so
+    // skipping it and letting the final aggregate hash once is faster.
+    // Execution strategy only; results are identical.
+    config
+        .options_mut()
+        .execution
+        .skip_partial_aggregation_probe_ratio_threshold = 0.5;
+
     Ok(SessionContext::new_with_config_rt(
         config,
         budgeted_runtime(budget)?,
