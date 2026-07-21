@@ -657,15 +657,23 @@ fn split_buffer_by_vector_cell(
             let vectors: Vec<Arc<Float32Array>> = batch
                 .vectors
                 .iter()
-                .map(|v| {
+                .map(|v| -> Result<Arc<Float32Array>, BuildError> {
+                    // One divisibility check bounds the whole loop: rows come
+                    // from this batch (r < n_rows), so r*vdim + vdim <= len.
+                    if v.len() % n_rows != 0 {
+                        return Err(BuildError::Store(format!(
+                            "vector-cell split: {} values do not divide across {n_rows} rows",
+                            v.len()
+                        )));
+                    }
                     let vdim = v.len() / n_rows;
                     let mut out = Vec::with_capacity(rows.len() * vdim);
                     for &r in &rows {
                         out.extend_from_slice(&v.values()[r * vdim..(r + 1) * vdim]);
                     }
-                    std::sync::Arc::new(Float32Array::from(out))
+                    Ok(Arc::new(Float32Array::from(out)))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             cell_batches[cell_id].push(BufferedBatch {
                 scalar: scalar_batch,
                 vectors,

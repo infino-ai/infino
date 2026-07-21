@@ -1333,6 +1333,14 @@ impl VectorReader {
         // bit-flipped `n_docs` of 0 — must fail the open instead of opening
         // clean and silently returning empty results.
         let summed_docs: u64 = columns.iter().map(|col| u64::from(col.n_docs)).sum();
+        // File-local ids are u32 throughout the read paths; a blob whose
+        // summed cell docs exceed that space would silently wrap routing
+        // and bitmap remaps.
+        if summed_docs > u64::from(u32::MAX) {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "multi-cell blob doc count exceeds u32 local-doc-id space".into(),
+            )));
+        }
         if n_docs != summed_docs {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "multi-cell outer header n_docs={n_docs} != summed cell docs {summed_docs}"
