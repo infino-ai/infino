@@ -609,18 +609,8 @@ fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost
     }
 }
 
-/// Force FTS/SQL optimize + post-compact measurement on an existing prefix
-/// (fresh ingest already runs that lifecycle by default).
-const FORCE_OPTIMIZE_ENV: &str = "INFINO_BENCH_FORCE_OPTIMIZE";
-
 /// `(wall_s, io, peak_rss_bytes, cpu_s)` for one metered `optimize()` pass.
 type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
-
-/// Run optimize/post-compact when this process just ingested, or when
-/// [`FORCE_OPTIMIZE_ENV`] is set (reuse an existing multi-superfile prefix).
-fn should_run_optimize(ingest_metrics: Option<&ShapeMetrics>) -> bool {
-    ingest_metrics.is_some() || env::var(FORCE_OPTIMIZE_ENV).ok().as_deref() == Some("1")
-}
 
 /// Metered [`Supertable::optimize`] — same shape as the vector compaction
 /// window (wall / CPU / RSS / UsageMeter delta), without drain/delta.
@@ -952,10 +942,9 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
-        // Optimize + post-compact when we just ingested (or FORCE_OPTIMIZE),
-        // mirroring vector's lifecycle gate — without drain/delta/OPANN.
-        let run_optimize =
-            should_run_optimize(ingest_metrics.as_ref()) && (phases.warm || phases.cold);
+        // Optimize + post-compact only on a fresh ingest in this process —
+        // without drain/delta/OPANN.
+        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
@@ -3992,10 +3981,9 @@ pub mod sql {
                 .expect("sql ingest sets sample_key"),
         };
 
-        // Optimize + post-compact when we just ingested (or FORCE_OPTIMIZE),
-        // same gate as FTS — without drain/delta/OPANN.
-        let run_optimize =
-            should_run_optimize(ingest_metrics.as_ref()) && (phases.warm || phases.cold);
+        // Optimize + post-compact only on a fresh ingest in this process —
+        // same gate as FTS.
+        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
