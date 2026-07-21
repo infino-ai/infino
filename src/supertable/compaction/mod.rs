@@ -122,6 +122,18 @@ pub struct CompactionJob {
     pub estimated_output_bytes: u64,
 }
 
+/// Whether a `run_compaction_job` error means the job was **superseded** by
+/// concurrent maintenance — its planned inputs were merged/drained away before
+/// it ran — rather than a genuine failure. Jobs are planned from one manifest
+/// snapshot but execute against a fresh one, so between the two a drain, a cell
+/// split, or another compactor may remove the inputs. The orchestration loop
+/// skips these and continues; every other error aborts the pass. `select` only
+/// ever emits real ids drawn from the snapshot, so at the orchestration level a
+/// missing input always means "already handled elsewhere," never a planning bug.
+fn is_superseded_job(err: &CompactionError) -> bool {
+    matches!(err, CompactionError::SuperfileNotFound(_))
+}
+
 /// Plan compaction: pack each partition's small superfiles into
 /// as many target-sized jobs as they fill. Leftovers that can't
 /// reach the floor are left for next time.
@@ -359,7 +371,21 @@ impl Supertable {
         };
         for stats in &stat_groups {
             for job in select(stats, cfg) {
-                table.run_compaction_job(job, stale_seal_timeout).await?;
+                match table.run_compaction_job(job, stale_seal_timeout).await {
+                    Ok(()) => {}
+                    // Inputs vanished between planning (`select`) and execution
+                    // because concurrent maintenance — the drain that runs
+                    // before compaction in `optimize`, a cell split, or another
+                    // compactor — already merged those superfiles away. The
+                    // compaction goal for those files is met, so skip this job
+                    // and continue. Only this exact condition is benign; every
+                    // other error still aborts the pass.
+                    Err(e) if is_superseded_job(&e) => {
+                        warn!(error = %e, "compaction: skipping superseded job (inputs already merged away)");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
                 table
                     .refresh()
                     .await
@@ -1012,6 +1038,14 @@ mod tests {
         assert!(
             matches!(err, CompactionError::SuperfileNotFound(id) if id == bogus),
             "{err:?}"
+        );
+        // The orchestration loop treats that same error as a superseded
+        // (benign) job and keeps going rather than aborting the pass — the
+        // regression guard for the optimize-time SuperfileNotFound crash.
+        assert!(is_superseded_job(&err), "vanished input must classify superseded: {err:?}");
+        assert!(
+            !is_superseded_job(&CompactionError::NoStorage),
+            "a genuine failure must not classify superseded"
         );
     }
 
