@@ -16,7 +16,7 @@
 //! cargo bench -- supertable vector build cold
 //!
 //! # Diagnostics (standalone programs, same binary):
-//! cargo bench -- diagnostic              # all five
+//! cargo bench -- diagnostic              # all seven
 //! cargo bench -- diagnostic scale        # a subset, grouped
 //! cargo bench -- tombstone               # bare names also work
 //!
@@ -34,9 +34,9 @@
 //!   `all`       : explicit "every tier × modality × phase" (the default).
 //!                 Matrix only — diagnostics are NEVER implied by `all` or
 //!                 by a bare `cargo bench`.
-//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `object-store` | `concurrent`,
+//!   diagnostic  : `scale` | `tombstone` | `update` | `sql-diag` | `fts-diag` | `object-store` | `concurrent`,
 //!                 by name, or grouped under the `diagnostic` keyword —
-//!                 `cargo bench -- diagnostic` runs all six,
+//!                 `cargo bench -- diagnostic` runs all seven,
 //!                 `cargo bench -- diagnostic scale tombstone` a subset.
 //!
 //! The matrix tests run = (selected tiers) × (selected modalities).
@@ -67,6 +67,7 @@ enum Diagnostic {
     Tombstone,
     Update,
     SqlDiag,
+    FtsDiag,
     ObjectStore,
     Concurrent,
 }
@@ -78,6 +79,7 @@ impl Diagnostic {
             Diagnostic::Tombstone => "tombstone",
             Diagnostic::Update => "update",
             Diagnostic::SqlDiag => "sql-diag",
+            Diagnostic::FtsDiag => "fts-diag",
             Diagnostic::ObjectStore => "object-store",
             Diagnostic::Concurrent => "concurrent",
         }
@@ -89,6 +91,7 @@ impl Diagnostic {
             Diagnostic::Tombstone => infino_bench_utils::tombstone_overhead::run(),
             Diagnostic::Update => infino_bench_utils::supertable_update::run(),
             Diagnostic::SqlDiag => infino_bench_utils::sql_diag::run(),
+            Diagnostic::FtsDiag => infino_bench_utils::fts_diag::run(),
             Diagnostic::ObjectStore => infino_bench_utils::unified_object_store::run(),
             Diagnostic::Concurrent => infino_bench_utils::concurrent::run(),
         }
@@ -297,7 +300,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | object-store | concurrent,\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent,\n\
          \x20           or `diagnostic` for all six / `diagnostic <names>` for a subset\n\
          \n\
          Examples:\n\
@@ -382,6 +385,7 @@ fn parse_args() -> Selection {
             "tombstone" | "tombstone-overhead" => diagnostics.push(Diagnostic::Tombstone),
             "update" | "supertable-update" => diagnostics.push(Diagnostic::Update),
             "sql-diag" | "sql_diag" => diagnostics.push(Diagnostic::SqlDiag),
+            "fts-diag" | "fts_diag" => diagnostics.push(Diagnostic::FtsDiag),
             "object-store" | "object_store" => diagnostics.push(Diagnostic::ObjectStore),
             "concurrent" => diagnostics.push(Diagnostic::Concurrent),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
@@ -404,6 +408,7 @@ fn parse_args() -> Selection {
             Diagnostic::Tombstone,
             Diagnostic::Update,
             Diagnostic::SqlDiag,
+            Diagnostic::FtsDiag,
             Diagnostic::ObjectStore,
             Diagnostic::Concurrent,
         ];

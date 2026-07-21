@@ -28,6 +28,8 @@ pub mod superfile;
 pub mod supertable;
 
 pub mod concurrent;
+pub mod diag_common;
+pub mod fts_diag;
 pub mod scale;
 pub mod sql_diag;
 pub mod supertable_update;
