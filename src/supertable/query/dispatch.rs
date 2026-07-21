@@ -191,12 +191,18 @@ pub(crate) async fn open_compaction_input(
 /// Tag a kernel's results with their source and stamp stable ids immediately
 /// when the manifest's contiguous span makes that translation arithmetic.
 pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
+    // Hoist the span check: `row_id_from_manifest_entry(entry, local)` is
+    // `id_min + local` behind local-independent validity checks, so one
+    // base lookup per unit stamps every hit with a single add. Stamping at
+    // tag time (rather than post-selection) also spares the resolver a
+    // per-URI manifest-entry lookup — the fan-out already holds the entry.
+    let base = row_id_from_manifest_entry(entry, 0);
     hits.into_iter()
         .map(|(local_doc_id, score)| SuperfileHit {
             superfile: entry.uri,
             local_doc_id,
             score,
-            stable_id: row_id_from_manifest_entry(entry, local_doc_id),
+            stable_id: base.map(|b| b + i128::from(local_doc_id)),
         })
         .collect()
 }
@@ -273,9 +279,18 @@ pub(crate) async fn attach_stable_ids(
         return Ok(());
     }
     let id_column = reader.id_column();
-    let batch = take_rows_byte_source(reader, &locals, &[id_column])
-        .await
-        .map_err(|error| QueryError::Execute(error.to_string()))?;
+    // Sync decode when the reader holds resident parquet bytes (eager or
+    // promoted hybrid) — the async stream take pays per-call setup that
+    // dominates targeted id reads; only genuinely lazy readers await it.
+    let batch = if reader.can_take_by_local_doc_ids() {
+        reader
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|error| QueryError::Execute(error.to_string()))?
+    } else {
+        take_rows_byte_source(reader, &locals, &[id_column])
+            .await
+            .map_err(|error| QueryError::Execute(error.to_string()))?
+    };
     let ids = batch
         .column(0)
         .as_any()
@@ -297,56 +312,45 @@ pub(crate) async fn attach_stable_ids_to_hits(
     table_reader: &SupertableReader,
     hits: &mut [SuperfileHit],
 ) -> Result<(), QueryError> {
-    let mut grouped: HashMap<SuperfileUri, Vec<(usize, SuperfileHit)>> = HashMap::new();
-    for (index, hit) in hits.iter().copied().enumerate() {
-        if hit.stable_id.is_none() {
-            grouped.entry(hit.superfile).or_default().push((index, hit));
-        }
-    }
-    if grouped.is_empty() {
-        return Ok(());
-    }
-
+    // Arithmetic-capable files were stamped at tag time ([`tag_hits`]);
+    // only hits from cell-packed / gapped-span files arrive unresolved. On
+    // such tables that is EVERY hit, so this must not copy hits: process
+    // contiguous same-file runs in place (unranked hits arrive file-grouped
+    // from the fan-out; ranked top-k interleaves, but is top-k-sized). Per
+    // run: one manifest lookup, one reader open, one in-place stamp.
     let manifest = Arc::clone(table_reader.manifest());
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
-    let stamped = try_join_all(grouped.into_iter().map(|(uri, indexed_hits)| {
-        let manifest = Arc::clone(&manifest);
-        let store = Arc::clone(&store);
-        let disk_cache = disk_cache.clone();
-        let storage = storage.clone();
-        async move {
-            let entry = manifest
-                .lookup_superfile_entry(uri)
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .ok_or_else(|| {
-                    QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
-                })?;
-            // FTS post-topk id stamp — allow fill (same modality as the search).
-            let reader =
-                open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true).await?;
-            let mut local_hits: Vec<SuperfileHit> =
-                indexed_hits.iter().map(|(_, hit)| *hit).collect();
-            attach_stable_ids(&reader, &entry, &mut local_hits, true).await?;
-            indexed_hits
-                .into_iter()
-                .zip(local_hits)
-                .map(|((index, _), hit)| {
-                    hit.stable_id.map(|id| (index, id)).ok_or_else(|| {
-                        QueryError::Execute(format!(
-                            "hit {uri:?}/{} missing stable _id after search-wave stamping",
-                            hit.local_doc_id
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
+    let mut start = 0usize;
+    while start < hits.len() {
+        if hits[start].stable_id.is_some() {
+            start += 1;
+            continue;
         }
-    }))
-    .await?;
-    for (index, id) in stamped.into_iter().flatten() {
-        hits[index].stable_id = Some(id);
+        let uri = hits[start].superfile;
+        let mut end = start + 1;
+        while end < hits.len() && hits[end].superfile == uri && hits[end].stable_id.is_none() {
+            end += 1;
+        }
+        let entry = manifest
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .ok_or_else(|| {
+                QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
+            })?;
+        // FTS post-topk id stamp — allow fill (same modality as the search).
+        let reader =
+            open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true).await?;
+        attach_stable_ids(&reader, &entry, &mut hits[start..end], true).await?;
+        if let Some(missing) = hits[start..end].iter().find(|h| h.stable_id.is_none()) {
+            return Err(QueryError::Execute(format!(
+                "hit {uri:?}/{} missing stable _id after search-wave stamping",
+                missing.local_doc_id
+            )));
+        }
+        start = end;
     }
     Ok(())
 }

@@ -46,6 +46,7 @@
 //! knobs.
 
 use infino_bench_utils::supertable::Phases;
+use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -427,6 +428,18 @@ fn parse_args() -> Selection {
 }
 
 fn main() {
+    // Span-timing diagnosis: with a `--features detailed-tracing` build,
+    // `INFINO_TRACE_SPANS=1` (+ `RUST_LOG=infino=info`) prints every
+    // instrumented span's busy time on close — per-stage attribution for
+    // query-path latency without touching engine code.
+    if std::env::var("INFINO_TRACE_SPANS").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_span_events(FmtSpan::CLOSE)
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     // Isolated per-shape supertable ingest child (`INFINO_BENCH_SUPERTABLE_SHAPE`).
     if infino_bench_utils::supertable::handle_shape_child_from_env() {
         return;

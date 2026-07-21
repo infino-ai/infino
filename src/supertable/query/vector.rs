@@ -4420,6 +4420,74 @@ mod tests {
         assert_eq!(total, k, "search must return k distinct rows, got {total}");
     }
 
+    /// The inline stable-id region on cell-packed USER superfiles must answer
+    /// parquet-local lookups with exactly the `_id` column's values — the
+    /// contract `stable_ids_for_tagged_hits` (FTS/SQL post-top-k id stamping)
+    /// relies on. Boundary stubs add neighbor-cell postings; if a shard's
+    /// per-cell doc counts or region layout counted those stubs, the
+    /// `file_local_to_cell` prefix sums would silently pair hits with the
+    /// wrong rows' ids.
+    #[test]
+    fn user_multicell_inline_ids_match_parquet_id_column() {
+        use arrow_array::Decimal128Array;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        let n = 200usize;
+        w.append(&build_vector_batch(0, n, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let manifest = r.manifest();
+        let mut checked_files = 0usize;
+        for entry in manifest.superfiles.iter() {
+            let reader = manifest
+                .options
+                .store
+                .reader(&entry.uri)
+                .expect("writer-published reader");
+            let vec_reader = reader.vec().expect("vector reader");
+            let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+            // Ground truth: the parquet `_id` column at those rows.
+            let batch = reader
+                .take_by_local_doc_ids(&locals, &[reader.id_column()])
+                .expect("take _id column");
+            let truth = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id is Decimal128");
+            let Some(inline) = vec_reader.inline_stable_ids_for_locals(&locals) else {
+                panic!(
+                    "inline stable-id lookup unavailable on user superfile {:?} \
+                     (layout {:?}): stable_ids_for_tagged_hits would silently fall \
+                     back to the _id page read",
+                    entry.uri, entry.vector_layout
+                );
+            };
+            for (i, &local) in locals.iter().enumerate() {
+                assert_eq!(
+                    inline[i],
+                    truth.value(i),
+                    "inline stable-id for parquet-local {local} in {:?} diverges \
+                     from the _id column",
+                    entry.uri
+                );
+            }
+            checked_files += 1;
+        }
+        assert!(checked_files > 0, "commit published no user superfiles");
+    }
+
     #[test]
     fn global_union_includes_undrained_user_delta() {
         let dim = 16usize;

@@ -742,7 +742,13 @@ impl SupertableReader {
             }
         };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
+        // reallocations copy the whole hit vec repeatedly at 1M hits.
+        let total: usize = per_unit.iter().map(Vec::len).sum();
+        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
+        for unit in per_unit {
+            hits.extend(unit);
+        }
         dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
         Ok(hits)
     }

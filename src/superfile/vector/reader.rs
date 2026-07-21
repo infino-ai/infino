@@ -2023,34 +2023,52 @@ impl VectorReader {
     pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
         if self.is_multi_cell() {
             // Per-cell regions; do not use `cold_stable_id_region` (that stash
-            // holds at most one cell from the last probe wave). Group first so
-            // each cell region is resolved once, not once per requested row.
-            let mut grouped: Vec<Vec<(usize, u32)>> = vec![Vec::new(); self.columns.len()];
-            for (output_idx, &file_local) in locals.iter().enumerate() {
-                let (cell_idx, cell_local) = self.file_local_to_cell(file_local)?;
-                grouped[cell_idx].push((output_idx, cell_local));
+            // holds at most one cell from the last probe wave).
+            //
+            // Batched cell mapping: prefix sums once, then a moving cursor —
+            // callers pass locals in ascending runs (token_match order), so
+            // the common case is O(1) per hit; out-of-order locals fall back
+            // to a binary search. A per-hit linear `file_local_to_cell` walk
+            // costs more than the entire posting scan at 1M hits. Regions are
+            // fetched lazily per cell (once each) as the cursor enters them.
+            let mut bases: Vec<u32> = Vec::with_capacity(self.columns.len() + 1);
+            let mut running = 0u32;
+            bases.push(0);
+            for col in &self.columns {
+                running = running.checked_add(col.n_docs)?;
+                bases.push(running);
             }
             let mut out = vec![0i128; locals.len()];
-            for (cell_idx, positions) in grouped.into_iter().enumerate() {
-                if positions.is_empty() {
-                    continue;
-                }
-                let col = &self.columns[cell_idx];
-                if !col.has_inline_stable_ids() {
+            let mut cell_idx = 0usize;
+            let mut region: Option<Bytes> = None;
+            for (output_idx, &file_local) in locals.iter().enumerate() {
+                if file_local >= running {
                     return None;
                 }
-                let region = self
-                    .source
-                    .try_get_range_sync(col.stable_ids_region_range()?)?;
-                for (output_idx, cell_local) in positions {
-                    let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
-                    let end = p + format::vec::STABLE_ID_BYTES;
-                    if end > region.len() {
+                if file_local < bases[cell_idx] || file_local >= bases[cell_idx + 1] {
+                    // partition_point: first base > file_local, minus one.
+                    cell_idx = bases.partition_point(|&b| b <= file_local) - 1;
+                    region = None;
+                }
+                if region.is_none() {
+                    let col = &self.columns[cell_idx];
+                    if !col.has_inline_stable_ids() {
                         return None;
                     }
-                    let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
-                    out[output_idx] = i128::from_le_bytes(arr);
+                    region = Some(
+                        self.source
+                            .try_get_range_sync(col.stable_ids_region_range()?)?,
+                    );
                 }
+                let region = region.as_ref()?;
+                let cell_local = file_local - bases[cell_idx];
+                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
+                let end = p + format::vec::STABLE_ID_BYTES;
+                if end > region.len() {
+                    return None;
+                }
+                let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
+                out[output_idx] = i128::from_le_bytes(arr);
             }
             return Some(out);
         }
@@ -2101,16 +2119,35 @@ impl VectorReader {
             if !self.columns.iter().any(|c| c.has_inline_stable_ids()) {
                 return Ok(None);
             }
+            // Batched cell mapping — prefix sums + moving cursor, same as the
+            // sync variant: a per-hit linear cell walk dominates everything
+            // else at million-hit scale. Locals arrive in ascending runs;
+            // out-of-order falls back to a binary search.
+            let mut bases: Vec<u32> = Vec::with_capacity(self.columns.len() + 1);
+            let mut running = 0u32;
+            bases.push(0);
+            for col in &self.columns {
+                running = running.checked_add(col.n_docs).ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "inline stable_id region: cell doc counts overflow".into(),
+                    ))
+                })?;
+                bases.push(running);
+            }
             let mut grouped: Vec<Vec<(usize, u32)>> = vec![Vec::new(); self.columns.len()];
+            let mut cell_idx = 0usize;
             for (output_idx, &file_local) in locals.iter().enumerate() {
-                let Some((cell_idx, cell_local)) = self.file_local_to_cell(file_local) else {
+                if file_local >= running {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "inline stable_id region: file-local {file_local} out of range \
                          (n_docs={})",
                         self.n_docs
                     ))));
-                };
-                grouped[cell_idx].push((output_idx, cell_local));
+                }
+                if file_local < bases[cell_idx] || file_local >= bases[cell_idx + 1] {
+                    cell_idx = bases.partition_point(|&b| b <= file_local) - 1;
+                }
+                grouped[cell_idx].push((output_idx, file_local - bases[cell_idx]));
             }
             let mut requests = Vec::new();
             for (cell_idx, positions) in grouped.into_iter().enumerate() {
