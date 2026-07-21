@@ -430,8 +430,7 @@ async fn rustfs_fixture(prefix_default: &str, supertable_shaped: bool) -> Storag
         eprintln!("[tiers] rustfs prefix={prefix}");
     }
     let lease = tokio::task::spawn_blocking(move || {
-        rustfs_server::session()
-            .and_then(|session| session.open_unique_bucket(&prefix))
+        rustfs_server::session().and_then(|session| session.open_unique_bucket(&prefix))
     })
     .await
     .unwrap_or_else(|e| bench_setup_fatal(format!("rustfs spawn_blocking join failed: {e}")))

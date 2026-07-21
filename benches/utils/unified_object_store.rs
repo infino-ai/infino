@@ -116,9 +116,10 @@ use infino::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use crate::rustfs_server::{self, RustFsBucketLease};
-
-use crate::corpus;
+use crate::{
+    corpus,
+    rustfs_server::{self, RustFsBucketLease},
+};
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -401,8 +402,7 @@ async fn setup_rustfs_fixture(
     superfile: &Bytes,
 ) -> (Arc<dyn StorageProvider>, SuperfileUri, RustFsBucketLease) {
     let lease = tokio::task::spawn_blocking(|| {
-        rustfs_server::session()
-            .and_then(|session| session.open_unique_bucket(""))
+        rustfs_server::session().and_then(|session| session.open_unique_bucket(""))
     })
     .await
     .expect("rustfs spawn_blocking join")

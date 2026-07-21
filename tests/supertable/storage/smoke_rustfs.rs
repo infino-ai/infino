@@ -112,8 +112,7 @@ async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
 
     let bucket_name = {
         let lease = tokio::task::spawn_blocking(|| {
-            rustfs_server::session()
-                .and_then(|session| session.open_unique_bucket(""))
+            rustfs_server::session().and_then(|session| session.open_unique_bucket(""))
         })
         .await
         .expect("spawn_blocking join")
@@ -143,8 +142,7 @@ async fn rustfs_session_unique_bucket_lease_matches_bench_lifecycle() {
 
     let second_bucket = {
         let lease = tokio::task::spawn_blocking(|| {
-            rustfs_server::session()
-                .and_then(|session| session.open_unique_bucket(""))
+            rustfs_server::session().and_then(|session| session.open_unique_bucket(""))
         })
         .await
         .expect("spawn_blocking join")
