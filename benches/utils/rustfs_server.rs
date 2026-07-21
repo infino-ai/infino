@@ -688,7 +688,7 @@ fn signed_s3_get(
     let canonical_uri = canonical_uri_from_request_target(request_target);
     let authorization = sign_s3_request(&S3SignParams {
         method: "GET",
-        canonical_uri: &canonical_uri,
+        canonical_uri,
         canonical_query,
         host: &host,
         amz_date: &amz_date,
