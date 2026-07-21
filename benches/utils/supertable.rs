@@ -609,6 +609,90 @@ fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost
     }
 }
 
+/// Force FTS/SQL optimize + post-compact measurement on an existing prefix
+/// (fresh ingest already runs that lifecycle by default).
+const FORCE_OPTIMIZE_ENV: &str = "INFINO_BENCH_FORCE_OPTIMIZE";
+
+/// `(wall_s, io, peak_rss_bytes, cpu_s)` for one metered `optimize()` pass.
+type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
+
+/// Run optimize/post-compact when this process just ingested, or when
+/// [`FORCE_OPTIMIZE_ENV`] is set (reuse an existing multi-superfile prefix).
+fn should_run_optimize(ingest_metrics: Option<&ShapeMetrics>) -> bool {
+    ingest_metrics.is_some() || env::var(FORCE_OPTIMIZE_ENV).ok().as_deref() == Some("1")
+}
+
+/// Metered [`Supertable::optimize`] — same shape as the vector compaction
+/// window (wall / CPU / RSS / UsageMeter delta), without drain/delta.
+fn run_metered_optimize(
+    label: &str,
+    consumer: &Supertable,
+    meter: &storage_meter::MeteredStorage,
+) -> CompactionStats {
+    eprintln!(
+        "[{label}] before optimize: {} superfiles",
+        consumer.reader().n_superfiles()
+    );
+    eprintln!("[{label}] compacting (optimize)...");
+    let before = meter.snapshot();
+    let sampler = PeakSampler::start_default();
+    let (result, wall, cpu_s) = cpu::timed(|| consumer.optimize(&OptimizeOptions::default()));
+    result.expect("optimize (compaction)");
+    let wall_s = wall.as_secs_f64();
+    let rss_stats = sampler.stop_stats();
+    let peak_rss = rss_stats.peak_rss_bytes;
+    let io = meter.snapshot().since(&before);
+    eprintln!(
+        "[{label}] compaction object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s \
+         (peak RSS {} / anon {} / file {}); after optimize: {} superfiles",
+        io.put_count,
+        rss::fmt_bytes(io.put_bytes),
+        io.get_count,
+        rss::fmt_bytes(io.get_bytes),
+        rss::fmt_bytes(peak_rss),
+        rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
+        rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
+        consumer.reader().n_superfiles(),
+    );
+    (wall_s, io, peak_rss, cpu_s)
+}
+
+fn store_phases_with_compaction(
+    measured: Option<ColdStoreMeasurement>,
+    compaction: Option<CompactionStats>,
+) -> cost::StorePhases {
+    let mut store = store_phases_from_measurement(measured);
+    if let Some((wall_s, io, peak_rss, cpu_s)) = compaction {
+        store.compaction = Some(io);
+        store.compaction_wall_s = Some(wall_s);
+        store.compaction_cpu_s = cpu_s;
+        store.compaction_peak_rss_bytes = Some(peak_rss);
+    }
+    store
+}
+
+/// Open a metered consumer, run [`run_metered_optimize`], return stats.
+/// The table on `built.storage` is left in the compacted layout.
+fn optimize_built_table(
+    label: &str,
+    modality: Modality,
+    built: &supertable::IngestResult,
+) -> CompactionStats {
+    let meter = storage_meter::wrap(Arc::clone(&built.storage));
+    let (cache_dir, cache) =
+        tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+    let opts = tiers::consumer_options(
+        supertable::options_for(modality, None),
+        meter.provider(),
+        cache,
+    );
+    let consumer = tiers::open_consumer(opts);
+    let stats = run_metered_optimize(label, &consumer, &meter);
+    drop(consumer);
+    drop(cache_dir);
+    stats
+}
+
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
 /// cold `(open, search)` rows measured before hidden-index maintenance.
 type PreDrainLatencies<'a> = (&'a [cost::WarmQueryCost], &'a [cost::ColdQuery]);
@@ -868,6 +952,11 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
+        // Optimize + post-compact when we just ingested (or FORCE_OPTIMIZE),
+        // mirroring vector's lifecycle gate — without drain/delta/OPANN.
+        let run_optimize =
+            should_run_optimize(ingest_metrics.as_ref()) && (phases.warm || phases.cold);
+
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
             let reader = consumer.reader();
@@ -876,25 +965,45 @@ pub mod fts {
             drop(cache_dir);
         }
 
-        let (warm, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
+        // Pre-compact (or sole) search: fragmented post-ingest layout.
+        let (warm_pre, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
             Some((w, c, l)) => (Some(w), Some(c), Some(l)),
             None => (None, None, None),
         };
-        let cold = phases.cold.then(|| measure_cold(&built));
+        let cold_pre = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
+            let (anchor, title, note) = if run_optimize {
+                (
+                    "bench/fts/supertable/search-pre-compact",
+                    format!(
+                        "Supertable FTS — search pre-compact, multi-superfile / object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Pre-compact (post-ingest fanout): warm = shared consumer + disk cache; \
+                     cold open = construct only; cold search = first bm25_search. Δ vs previous run."
+                        .to_string(),
+                )
+            } else {
+                (
+                    "bench/fts/supertable/search",
+                    format!(
+                        "Supertable FTS — search, multi-superfile / object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Warm = shared consumer + disk cache; one prewarm + wait_until_warm, then p50 / p90 / p99 \
+                     over repeated bm25_search (Δ gates on `p50`). Cold open = fresh cache + consumer \
+                     construct only; cold search = first bm25_search (query-driven survivor opens + score) — \
+                     same split as cost-model cold I/O. Δ is vs the previous run."
+                        .to_string(),
+                )
+            };
             exec_fts::emit_search(
                 &mut report,
-                "bench/fts/supertable/search",
-                format!(
-                    "Supertable FTS — search, multi-superfile / object-store ({} docs)",
-                    fmt_count(n_docs)
-                ),
-                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), \
-                 then per-query p50 / p90 / p99 over repeated bm25_search (Δ gates on `p50`). Cold = \
-                 fresh disk cache + consumer per iteration, so each read pays the object-store cold \
-                 open. Δ is vs the previous run.",
-                warm.as_deref(),
-                cold.as_ref(),
+                anchor,
+                title,
+                &note,
+                warm_pre.as_deref(),
+                cold_pre.as_ref(),
                 None,
             );
         }
@@ -942,13 +1051,63 @@ pub mod fts {
             );
         }
 
+        let compaction_stats =
+            run_optimize.then(|| optimize_built_table("supertable_fts", Modality::Fts, &built));
+
+        // Post-compact search + cost-cold (steady serving layout).
+        let (warm_post, cold_post) = if run_optimize {
+            let warm_post = phases.warm.then(|| {
+                let (w, _, _) = measure_warm(&built);
+                w
+            });
+            let cold_post = phases.cold.then(|| measure_cold(&built));
+            if phases.warm || phases.cold {
+                exec_fts::emit_search(
+                    &mut report,
+                    "bench/fts/supertable/search-post-compact",
+                    format!(
+                        "Supertable FTS — search post-compact, multi-superfile / object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "Post-compact (after optimize): fewer superfiles; warm/cold recipe unchanged. \
+                     This is the steady-state layout the cost model prices. Δ vs previous run.",
+                    warm_post.as_deref(),
+                    cold_post.as_ref(),
+                    None,
+                );
+            }
+            (warm_post, cold_post)
+        } else {
+            (None, None)
+        };
+
         if phases.warm || phases.cold {
-            let warm_vec = warm.as_deref().map(cost::warm_from_fts).unwrap_or_default();
-            let cold_vec = cold
-                .as_ref()
+            let (warm_for_cost, cold_for_cost, pre_latencies) = if run_optimize {
+                (
+                    warm_post.as_deref().unwrap_or(&[]),
+                    cold_post.as_ref(),
+                    Some((
+                        warm_pre
+                            .as_deref()
+                            .map(cost::warm_from_fts)
+                            .unwrap_or_default(),
+                        cold_pre
+                            .as_ref()
+                            .map(cost::cold_from_timings)
+                            .unwrap_or_default(),
+                    )),
+                )
+            } else {
+                (warm_pre.as_deref().unwrap_or(&[]), cold_pre.as_ref(), None)
+            };
+            let warm_vec = cost::warm_from_fts(warm_for_cost);
+            let cold_vec = cold_for_cost
                 .map(cost::cold_from_timings)
                 .unwrap_or_default();
             let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
+            let pre_refs = pre_latencies
+                .as_ref()
+                .map(|(w, c)| (w.as_slice(), c.as_slice()));
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
@@ -963,9 +1122,9 @@ pub mod fts {
                     } else {
                         Some(&cold_vec)
                     },
-                    None,
+                    pre_refs,
                     false,
-                    store_phases_from_measurement(cold_measured),
+                    store_phases_with_compaction(cold_measured, compaction_stats),
                     None,
                 );
             }
@@ -1163,10 +1322,10 @@ pub mod fts {
         Some(measured)
     }
 
-    /// Cold-tier guard: a fresh disk cache + consumer per open. The
-    /// constructor performs the full cold open (consumer + manifest +
-    /// every superfile reader), so the timed `bm25_rows` pays only the
-    /// cold search work — open and search are reported separately.
+    /// Cold-tier guard: fresh disk cache + consumer only. Same open
+    /// window as cost-model cold (`measure_cold_store`) and SQL cold —
+    /// no `open_all_superfiles`. Timed search is the first
+    /// `bm25_search`, which opens prune survivors itself.
     struct SupertableColdGuard {
         _cache_dir: TempDir,
         consumer: Supertable,
@@ -1175,7 +1334,6 @@ pub mod fts {
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
@@ -3834,6 +3992,11 @@ pub mod sql {
                 .expect("sql ingest sets sample_key"),
         };
 
+        // Optimize + post-compact when we just ingested (or FORCE_OPTIMIZE),
+        // same gate as FTS — without drain/delta/OPANN.
+        let run_optimize =
+            should_run_optimize(ingest_metrics.as_ref()) && (phases.warm || phases.cold);
+
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
             exec_sql::assert_correct(&consumer, n_docs, "supertable_sql");
@@ -3841,57 +4004,149 @@ pub mod sql {
             drop(cache_dir);
         }
 
-        let warm_sets = if phases.warm {
-            eprintln!("[supertable_sql] warm: opening consumer...");
+        // Pre-compact (or sole) warm/cold on the post-ingest layout.
+        let warm_sets_pre = if phases.warm {
+            eprintln!("[supertable_sql] warm (pre-compact): opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
             let sets =
                 exec_sql::measure_query_sets(&consumer, &inputs, exec_sql::ITERS, "supertable_sql");
             drop(consumer);
             drop(cache_dir);
-            exec_sql::emit_query(
-                &mut report,
-                "bench/sql/supertable/warm",
-                format!(
-                    "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
-                    fmt_count(n_docs)
-                ),
-                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then p50 / p90 / p99 over repeated `query_sql` calls (Δ gates on `p50`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
-                &sets,
-            );
+            let (anchor, title, note) = if run_optimize {
+                (
+                    "bench/sql/supertable/warm-pre-compact",
+                    format!(
+                        "Supertable SQL — warm queries pre-compact, warm cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Pre-compact (post-ingest fanout): each query once untimed (cache fill), then p50 / p90 / p99. Δ vs previous run.",
+                )
+            } else {
+                (
+                    "bench/sql/supertable/warm",
+                    format!(
+                        "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then p50 / p90 / p99 over repeated `query_sql` calls (Δ gates on `p50`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                )
+            };
+            exec_sql::emit_query(&mut report, anchor, title, note, &sets);
             Some(sets)
         } else {
             None
         };
 
-        let cold = if phases.cold {
+        let cold_pre = if phases.cold {
             let cold = exec_sql::measure_cold(
                 || SupertableSqlColdGuard::open(&built),
                 COLD_ITERS,
                 "supertable_sql",
             );
-            exec_sql::emit_cold(
-                &mut report,
-                "bench/sql/supertable/cold",
-                format!(
-                    "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
-                    fmt_count(n_docs)
-                ),
-                "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
-                &cold,
-            );
+            let (anchor, title, note) = if run_optimize {
+                (
+                    "bench/sql/supertable/cold-pre-compact",
+                    format!(
+                        "Supertable SQL — cold queries pre-compact, fresh cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. Δ vs previous run.",
+                )
+            } else {
+                (
+                    "bench/sql/supertable/cold",
+                    format!(
+                        "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
+                )
+            };
+            exec_sql::emit_cold(&mut report, anchor, title, note, &cold);
             Some(cold)
         } else {
             None
         };
 
-        let warm_vec = warm_sets
+        let compaction_stats =
+            run_optimize.then(|| optimize_built_table("supertable_sql", Modality::Sql, &built));
+
+        let (warm_sets_post, cold_post) = if run_optimize {
+            let warm_sets_post = if phases.warm {
+                eprintln!("[supertable_sql] warm (post-compact): opening consumer...");
+                let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
+                let sets = exec_sql::measure_query_sets(
+                    &consumer,
+                    &inputs,
+                    exec_sql::ITERS,
+                    "supertable_sql",
+                );
+                drop(consumer);
+                drop(cache_dir);
+                exec_sql::emit_query(
+                    &mut report,
+                    "bench/sql/supertable/warm-post-compact",
+                    format!(
+                        "Supertable SQL — warm queries post-compact, warm cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Post-compact (after optimize): fewer superfiles; same warm recipe. Steady-state layout for the cost model. Δ vs previous run.",
+                    &sets,
+                );
+                Some(sets)
+            } else {
+                None
+            };
+            let cold_post = if phases.cold {
+                let cold = exec_sql::measure_cold(
+                    || SupertableSqlColdGuard::open(&built),
+                    COLD_ITERS,
+                    "supertable_sql",
+                );
+                exec_sql::emit_cold(
+                    &mut report,
+                    "bench/sql/supertable/cold-post-compact",
+                    format!(
+                        "Supertable SQL — cold queries post-compact, fresh cache / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
+                    &cold,
+                );
+                Some(cold)
+            } else {
+                None
+            };
+            (warm_sets_post, cold_post)
+        } else {
+            (None, None)
+        };
+
+        let warm_pre_vec = warm_sets_pre
             .as_ref()
             .map(cost::warm_from_sql)
             .unwrap_or_default();
-        let cold_vec = cold
+        let cold_pre_vec = cold_pre
             .as_ref()
             .map(cost::cold_from_timings)
             .unwrap_or_default();
+        let warm_post_vec = warm_sets_post
+            .as_ref()
+            .map(cost::warm_from_sql)
+            .unwrap_or_default();
+        let cold_post_vec = cold_post
+            .as_ref()
+            .map(cost::cold_from_timings)
+            .unwrap_or_default();
+        let (warm_vec, cold_vec, pre_latencies) = if run_optimize {
+            (
+                warm_post_vec.as_slice(),
+                cold_post_vec.as_slice(),
+                Some((warm_pre_vec.as_slice(), cold_pre_vec.as_slice())),
+            )
+        } else {
+            (warm_pre_vec.as_slice(), cold_pre_vec.as_slice(), None)
+        };
         let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
         if !warm_vec.is_empty() || !cold_vec.is_empty() {
             emit_cost_warm(
@@ -3901,11 +4156,11 @@ pub mod sql {
                 &built,
                 ingest_metrics.as_ref(),
                 n_docs,
-                &warm_vec,
-                (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
-                None,
+                warm_vec,
+                (!cold_vec.is_empty()).then_some(cold_vec),
+                pre_latencies,
                 false,
-                store_phases_from_measurement(cold_measured),
+                store_phases_with_compaction(cold_measured, compaction_stats),
                 None,
             );
         }
