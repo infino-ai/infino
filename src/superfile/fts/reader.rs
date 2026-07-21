@@ -241,9 +241,12 @@ fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
 pub struct NormTable {
     /// Per-doc quantized length bucket. Empty for a column with no docs.
     bytes: Vec<u8>,
-    /// Bucket → `K1·(1 - B + B·dequantize_len(bucket)/avgdl)`. 256
-    /// entries; empty when the column is empty.
-    lut: Vec<f32>,
+    /// Bucket → `K1·(1 - B + B·dequantize_len(bucket)/avgdl)`. A fixed
+    /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
+    /// scanned by non-scoring paths — column lookup, listing) while the
+    /// `u8` bucket index into a fixed-length array lets the compiler drop
+    /// the bounds check in `get`.
+    lut: Box<[f32; 256]>,
 }
 
 impl NormTable {
@@ -252,18 +255,16 @@ impl NormTable {
     /// never indexed because `search` short-circuits on empty columns.
     fn new(doc_lengths: impl Iterator<Item = u32>, n_docs: usize, avgdl: f32) -> Self {
         if avgdl <= 0.0 {
-            return Self {
-                bytes: Vec::new(),
-                lut: Vec::new(),
-            };
+            return Self::empty();
         }
         let inv_avgdl = 1.0_f32 / avgdl;
-        let lut: Vec<f32> = (0..=u8::MAX)
-            .map(|b| {
-                let dl = bm25::dequantize_len(b) as f32;
-                bm25::K1 * (1.0 - bm25::B + bm25::B * dl * inv_avgdl)
-            })
-            .collect();
+        // Fill the boxed table in place so the 256 f32s land on the heap
+        // directly rather than being built on the stack and moved.
+        let mut lut = Box::new([0.0_f32; 256]);
+        for (b, slot) in lut.iter_mut().enumerate() {
+            let dl = bm25::dequantize_len(b as u8) as f32;
+            *slot = bm25::K1 * (1.0 - bm25::B + bm25::B * dl * inv_avgdl);
+        }
         let mut bytes = Vec::with_capacity(n_docs);
         for dl in doc_lengths {
             bytes.push(bm25::quantize_len(dl));
@@ -285,13 +286,15 @@ impl NormTable {
         self.bytes.len()
     }
 
-    /// An empty table (no allocation). For call sites that need a
-    /// `&NormTable` but provably never index it — an unranked
-    /// (`bar == NEG_INFINITY`) phrase seek, which does no scoring.
+    /// An empty table: `bytes` is empty, so `get` must never be called on
+    /// it. For call sites that need a `&NormTable` but provably never index
+    /// it — an unranked (`bar == NEG_INFINITY`) phrase seek, which does no
+    /// scoring. The `lut` is a zeroed 256-entry table, allocated but never
+    /// read.
     fn empty() -> Self {
         Self {
             bytes: Vec::new(),
-            lut: Vec::new(),
+            lut: Box::new([0.0; 256]),
         }
     }
 }
@@ -5616,7 +5619,7 @@ mod tests {
         let nt = &r.columns[0].dl_norm_k1;
 
         let per_doc = nt.bytes.capacity(); // 1 byte/doc
-        let lut = nt.lut.capacity() * std::mem::size_of::<f32>(); // 256 * 4 = 1 KiB
+        let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB
         let m2_bytes = per_doc + lut;
         let f32_baseline = N as usize * std::mem::size_of::<f32>();
 
