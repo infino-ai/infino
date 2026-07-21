@@ -1364,12 +1364,14 @@ fn scalar_batch_in_stable_id_order(
             "multi-cell merge: concat scalar batches failed: {e}"
         )))
     })?;
-    let id_idx = concat.schema().index_of(id_column).map_err(|_| {
-        BuildError::BatchSchemaMismatch {
-            batch: format!("missing id column {id_column:?} in concatenated scalars"),
-            builder: schema.to_string(),
-        }
-    })?;
+    let id_idx =
+        concat
+            .schema()
+            .index_of(id_column)
+            .map_err(|_| BuildError::BatchSchemaMismatch {
+                batch: format!("missing id column {id_column:?} in concatenated scalars"),
+                builder: schema.to_string(),
+            })?;
     let id_col = concat
         .column(id_idx)
         .as_any()
