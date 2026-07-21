@@ -72,6 +72,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
         schema,
         vec![FtsConfig {
             column: "title".into(),
+            positions: false,
         }],
         vec![VectorConfig {
             column: "emb".into(),
@@ -79,7 +80,8 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+            provided_centroids: None,
         }],
         Some(infino::test_helpers::default_tokenizer()),
     )
@@ -123,6 +125,7 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        ..Config::default()
     }
 }
 
