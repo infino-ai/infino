@@ -351,6 +351,7 @@ impl StorageProvider for S3StorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
+        let requested = (range.start, range.end);
         let off = range.start;
         let tl = io_counters::timeline_start();
         let out = retry::complete_range(uri, range, |r| async {
@@ -361,7 +362,8 @@ impl StorageProvider for S3StorageProvider {
         })
         .await;
         if let Ok(b) = &out {
-            self.meter.record_get(uri, None, b.len() as u64);
+            self.meter
+                .record_get(uri, Some(requested), b.len() as u64);
             io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
         }
         out
@@ -403,14 +405,10 @@ impl StorageProvider for S3StorageProvider {
         })
         .await;
         if let Ok((b, size)) = &out {
-            self.meter.record_get(uri, None, b.len() as u64);
-            io_counters::timeline_record(
-                "tail",
-                uri,
-                size.saturating_sub(b.len() as u64),
-                b.len() as u64,
-                tl,
-            );
+            let start = size.saturating_sub(b.len() as u64);
+            self.meter
+                .record_get(uri, Some((start, *size)), b.len() as u64);
+            io_counters::timeline_record("tail", uri, start, b.len() as u64, tl);
         }
         out
     }
@@ -486,13 +484,13 @@ impl StorageProvider for S3StorageProvider {
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
-        // CreateMultipartUpload is a billable request (0 payload bytes).
-        self.meter.record_put(0);
         let upload = self
             .store
             .put_multipart(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        // CreateMultipartUpload is billable; count only after the session exists.
+        self.meter.record_put(0);
         Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 

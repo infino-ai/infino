@@ -144,6 +144,8 @@ impl PeakSampler {
         );
 
         let stop_t = Arc::clone(&stop);
+        // Sampling is best-effort: if the OS refuses a thread, degrade to
+        // the initial snapshot instead of aborting the process.
         let handle = thread::Builder::new()
             .name("rss-sampler".into())
             .spawn(move || {
@@ -159,12 +161,9 @@ impl PeakSampler {
                 }
                 samples
             })
-            .expect("spawn rss-sampler thread");
+            .ok();
 
-        Self {
-            stop,
-            handle: Some(handle),
-        }
+        Self { stop, handle }
     }
 
     /// Stop the sampler and return peak VmRSS (bytes).

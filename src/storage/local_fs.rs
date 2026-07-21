@@ -322,13 +322,13 @@ impl StorageProvider for LocalFsStorageProvider {
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = Self::path(uri)?;
-        // CreateMultipartUpload is a billable request (0 payload bytes).
-        self.meter.record_put(0);
         let upload = self
             .store
             .put_multipart(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        // CreateMultipartUpload is billable; count only after the session exists.
+        self.meter.record_put(0);
         Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 
@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// Parquet / DataFusion range GETs go through `object_store_handle`
-    /// and must still increment engine `io_counters`.
+    /// and must still increment the connection [`UsageMeter`].
     #[tokio::test]
     async fn object_store_handle_reads_are_metered() {
         use object_store::ObjectStoreExt;
@@ -733,6 +733,7 @@ mod tests {
             .await
             .expect("put");
         let (store, path) = p.object_store_handle("seg/x.bin").expect("handle");
+
         let before = p.usage_meter().snapshot();
         let bytes = store
             .get(&path)
@@ -742,10 +743,32 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(bytes.as_ref(), b"0123456789");
-        let delta = p.usage_meter().snapshot().since(&before);
-        // Process-global counters — lower bounds under parallel tests.
-        assert!(delta.get_count >= 1);
-        assert!(delta.get_bytes >= 10);
+        let after_get = p.usage_meter().snapshot();
+        let full = after_get.since(&before);
+        assert!(full.get_count >= 1);
+        assert!(full.get_bytes >= 10);
+
+        // The Parquet path issues ranged reads — guard those explicitly.
+        let ranged = store.get_range(&path, 2..6).await.expect("get_range");
+        assert_eq!(ranged.as_ref(), b"2345");
+        let after_range = p.usage_meter().snapshot();
+        let range_delta = after_range.since(&after_get);
+        assert!(
+            range_delta.get_count >= 1 && range_delta.get_bytes >= 4,
+            "object_store_handle get_range must meter: {range_delta:?}"
+        );
+
+        let multi = store
+            .get_ranges(&path, &[0..2, 8..10])
+            .await
+            .expect("get_ranges");
+        assert_eq!(multi[0].as_ref(), b"01");
+        assert_eq!(multi[1].as_ref(), b"89");
+        let multi_delta = p.usage_meter().snapshot().since(&after_range);
+        assert!(
+            multi_delta.get_count >= 1 && multi_delta.get_bytes >= 4,
+            "object_store_handle get_ranges must meter: {multi_delta:?}"
+        );
     }
 
     #[tokio::test]

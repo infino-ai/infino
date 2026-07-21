@@ -3931,6 +3931,10 @@ pub mod sql {
     fn measure_cold_store(built: &supertable::IngestResult) -> Option<ColdStoreMeasurement> {
         let sample_title = built.sql_sample_title.as_deref()?;
         let sample_key = built.sql_sample_key.as_deref()?;
+        // Ingest already escapes titles; escape again at the format site so a
+        // non-escaped caller cannot break the SQL string literal.
+        let sample_title = sample_title.replace('\'', "''");
+        let sample_key = sample_key.replace('\'', "''");
         // Same shapes as warm `fts_pushdown` / filter projections: must
         // scan row data, so first/steady cold windows accrue real GETs.
         let first = format!("SELECT key FROM supertable WHERE key = '{sample_key}'");
@@ -3955,16 +3959,27 @@ pub mod sql {
                 let consumer = tiers::open_consumer(opts);
                 (cache_dir, consumer)
             },
+            // `query_rows` already `.expect`s on plan/exec failure; require a
+            // non-empty hit so a wrong predicate cannot look like success.
             |(_cache, consumer)| {
-                let _ = consumer.query_rows(&first);
+                assert!(
+                    consumer.query_rows(&first) > 0,
+                    "metered first cold SQL returned no rows: {first}"
+                );
             },
             |(_cache, consumer), i| {
                 let q = &steady[i % steady.len()];
-                let _ = consumer.query_rows(q);
+                assert!(
+                    consumer.query_rows(q) > 0,
+                    "metered steady cold SQL returned no rows: {q}"
+                );
             },
             steady.len().min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
-                let _ = consumer.query_rows(&first);
+                assert!(
+                    consumer.query_rows(&first) > 0,
+                    "metered repeat cold SQL returned no rows: {first}"
+                );
             },
         );
         log_cold_split("supertable_sql", &measured.split);

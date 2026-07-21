@@ -27,8 +27,9 @@ pub(crate) fn wrap_object_store(
     Arc::new(CountingObjectStore { inner, meter })
 }
 
-/// Wrap a multipart upload so each `put_part` / `complete` records a PUT.
-/// Create is counted by the caller via `meter.record_put(0)`.
+/// Wrap a multipart upload so each successful `put_part` / `complete`
+/// records a PUT. Create is counted by the caller after
+/// `put_multipart` / `put_multipart_opts` succeeds (`meter.record_put(0)`).
 pub(crate) fn wrap_multipart(
     inner: Box<dyn MultipartUpload>,
     meter: Arc<UsageMeter>,
@@ -95,7 +96,10 @@ impl ObjectStore for CountingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        self.inner.put_opts(location, payload, opts).await
+        let len = payload.content_length() as u64;
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        self.meter.record_put(len);
+        Ok(result)
     }
 
     async fn put_multipart_opts(
@@ -103,7 +107,10 @@ impl ObjectStore for CountingObjectStore {
         location: &ObjPath,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
+        let upload = self.inner.put_multipart_opts(location, opts).await?;
+        // CreateMultipartUpload is billable; count only after the session exists.
+        self.meter.record_put(0);
+        Ok(wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 
     fn delete_stream(
@@ -148,13 +155,24 @@ impl fmt::Debug for CountingMultipart {
 #[async_trait]
 impl MultipartUpload for CountingMultipart {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.meter.record_put(data.content_length() as u64);
-        self.inner.put_part(data)
+        let len = data.content_length() as u64;
+        let meter = Arc::clone(&self.meter);
+        let upload = self.inner.put_part(data);
+        Box::pin(async move {
+            let result = upload.await;
+            if result.is_ok() {
+                meter.record_put(len);
+            }
+            result
+        })
     }
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
-        self.meter.record_put(0);
-        self.inner.complete().await
+        let result = self.inner.complete().await;
+        if result.is_ok() {
+            self.meter.record_put(0);
+        }
+        result
     }
 
     async fn abort(&mut self) -> ObjectStoreResult<()> {
@@ -191,5 +209,64 @@ mod tests {
         let delta = meter.snapshot().since(&before);
         assert_eq!(delta.get_count, 1);
         assert_eq!(delta.get_bytes, 10);
+    }
+
+    #[tokio::test]
+    async fn object_store_wrapper_counts_put_after_success() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjPath::from("seg/w.bin");
+        let meter = UsageMeter::new();
+        let counted = wrap_object_store(store, Arc::clone(&meter));
+        let before = meter.snapshot();
+        counted
+            .put(&path, PutPayload::from_static(b"abcd"))
+            .await
+            .expect("put");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.put_count, 1);
+        assert_eq!(delta.put_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn multipart_part_failure_does_not_record_put() {
+        fn not_implemented(operation: &str) -> object_store::Error {
+            object_store::Error::NotImplemented {
+                operation: operation.to_string(),
+                implementer: "FailPartUpload".to_string(),
+            }
+        }
+
+        /// Upload that fails every `put_part`.
+        #[derive(Debug)]
+        struct FailPartUpload;
+
+        #[async_trait]
+        impl MultipartUpload for FailPartUpload {
+            fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+                Box::pin(async { Err(not_implemented("put_part")) })
+            }
+            async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+                Err(not_implemented("complete"))
+            }
+            async fn abort(&mut self) -> ObjectStoreResult<()> {
+                Ok(())
+            }
+        }
+
+        let meter = UsageMeter::new();
+        let mut upload = wrap_multipart(Box::new(FailPartUpload), Arc::clone(&meter));
+        let before = meter.snapshot();
+        let err = upload
+            .put_part(PutPayload::from_static(b"x"))
+            .await
+            .expect_err("part must fail");
+        assert!(matches!(
+            err,
+            object_store::Error::NotImplemented { .. }
+        ));
+        assert!(
+            meter.snapshot().since(&before).is_zero(),
+            "failed put_part must not bump the ledger"
+        );
     }
 }
