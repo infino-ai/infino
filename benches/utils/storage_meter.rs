@@ -116,8 +116,13 @@ mod tests {
     #[tokio::test]
     async fn wrap_reads_engine_meter_including_object_store_handle() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let provider: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        // Fresh meter — do not share the process-default ledger with
+        // unrelated concurrent tests.
+        let ledger = Arc::new(UsageMeter::new());
+        let provider: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&ledger))
+                .expect("localfs"),
+        );
         provider
             .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
             .await

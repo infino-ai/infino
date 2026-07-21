@@ -407,6 +407,9 @@ impl StorageProvider for AzureStorageProvider {
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
+        // LIST is billable once the stream exists (path already validated);
+        // a mid-iteration failure must not undercount the request.
+        self.meter.record_list();
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             let location = meta.location.to_string();
@@ -419,7 +422,6 @@ impl StorageProvider for AzureStorageProvider {
                 },
             ));
         }
-        self.meter.record_list();
         Ok(out)
     }
 

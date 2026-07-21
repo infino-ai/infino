@@ -678,19 +678,18 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // internal fetch volume — not customer egress — and are not priced here.
     let cold_second_io = c.store.cold_second_query;
     let cold_query_req_usd = cold_second_io.map(|io| request_usd(&io));
-    let cold_query_usd = match (cold_second_io, c.store.cold_second_cpu_s) {
-        (Some(io), Some(cpu)) => {
-            let window = c
-                .store
-                .cold_second_wall_s
-                .or_else(|| anchor_cold.map(|q| warm_window_for(&q.name).unwrap_or(0.0)))
-                .unwrap_or(0.0);
+    let cold_query_usd = match (
+        cold_second_io,
+        c.store.cold_second_cpu_s,
+        c.store.cold_second_wall_s,
+    ) {
+        // CPU + wall must both be from the steady sample; never borrow a
+        // warm / first-query window into the steady price.
+        (Some(io), Some(cpu), Some(window)) => {
             Some(inst.per_query_usd(cpu, window, c.resident_anon_bytes) + request_usd(&io))
         }
-        // Request-only when steady CPU is missing — never borrow first-
-        // query (metadata-warmup) CPU into the steady price.
-        (Some(io), None) => Some(request_usd(&io)),
-        (None, _) => None,
+        (Some(io), _, _) => Some(request_usd(&io)),
+        (None, _, _) => None,
     };
 
     // ---- Block 1: rate card ----

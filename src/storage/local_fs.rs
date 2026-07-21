@@ -354,6 +354,9 @@ impl StorageProvider for LocalFsStorageProvider {
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
+        // LIST is billable once the stream exists; a mid-iteration failure
+        // must not undercount the request.
+        self.meter.record_list();
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             out.push((
@@ -365,7 +368,6 @@ impl StorageProvider for LocalFsStorageProvider {
                 },
             ));
         }
-        self.meter.record_list();
         Ok(out)
     }
 
