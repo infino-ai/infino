@@ -187,9 +187,9 @@ impl MultipartUpload for CountingMultipart {
 
 #[cfg(test)]
 mod tests {
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
     use super::*;
-    use object_store::ObjectStoreExt;
-    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn object_store_wrapper_counts_get() {

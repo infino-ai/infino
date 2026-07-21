@@ -9,11 +9,10 @@
 
 use std::sync::Arc;
 
+pub use infino::storage::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass};
 use infino::storage::{StorageProvider, UsageMeter, UsageSnapshot};
 
 use crate::rss;
-
-pub use infino::storage::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass};
 
 /// Alias kept so cost / report call sites need not rename every use.
 pub type ObjectStoreMeter = UsageSnapshot;
@@ -108,10 +107,11 @@ pub fn fmt_get_class_breakdown(snap: &ObjectStoreMeter) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
     use infino::storage::LocalFsStorageProvider;
     use object_store::ObjectStoreExt;
+
+    use super::*;
 
     #[tokio::test]
     async fn wrap_reads_engine_meter_including_object_store_handle() {
