@@ -687,9 +687,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 .unwrap_or(0.0);
             Some(inst.per_query_usd(cpu, window, c.resident_anon_bytes) + request_usd(&io))
         }
-        // Do not fall back to first-query (metadata-warmup) CPU while
-        // charging steady-second request counts — that mixes windows.
-        (Some(_), None) | (None, _) => None,
+        // Request-only when steady CPU is missing — never borrow first-
+        // query (metadata-warmup) CPU into the steady price.
+        (Some(io), None) => Some(request_usd(&io)),
+        (None, _) => None,
     };
 
     // ---- Block 1: rate card ----

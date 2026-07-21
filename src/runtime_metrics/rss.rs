@@ -82,6 +82,8 @@ fn anon_rss_bytes_fast() -> Option<u64> {
 pub struct PeakSampler {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Vec<(u64, u64)>>>,
+    /// Seed sample taken at start; reused if the sampler thread never runs.
+    initial: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,7 +166,11 @@ impl PeakSampler {
             })
             .ok();
 
-        Self { stop, handle }
+        Self {
+            stop,
+            handle,
+            initial,
+        }
     }
 
     /// Stop the sampler and return peak VmRSS (bytes).
@@ -182,12 +188,7 @@ impl PeakSampler {
             .handle
             .take()
             .and_then(|h| h.join().ok())
-            .unwrap_or_else(|| {
-                vec![(
-                    current_rss_bytes().unwrap_or(0),
-                    anon_rss_bytes_fast().unwrap_or(0),
-                )]
-            });
+            .unwrap_or_else(|| vec![self.initial]);
         RssStats::from_samples(samples)
     }
 }

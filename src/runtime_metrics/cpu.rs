@@ -54,7 +54,8 @@ fn clock_ticks_per_second() -> Option<u128> {
         .status
         .success()
         .then(|| String::from_utf8(output.stdout).ok()?.trim().parse().ok())
-        .flatten()?;
+        .flatten()
+        .filter(|ticks| *ticks != 0)?;
     let _ = TICKS.set(ticks);
     Some(ticks)
 }
@@ -70,7 +71,8 @@ pub fn process_cpu_ns() -> Option<u128> {
     let fields: Vec<&str> = raw[close + 1..].split_whitespace().collect();
     let user_ticks = fields.get(UTIME_FIELD_IDX)?.parse::<u128>().ok()?;
     let system_ticks = fields.get(STIME_FIELD_IDX)?.parse::<u128>().ok()?;
-    let ticks_per_second = clock_ticks_per_second()?;
+    // Reject zero so a bogus `getconf` value cannot panic on divide.
+    let ticks_per_second = clock_ticks_per_second().filter(|ticks| *ticks != 0)?;
     Some((user_ticks + system_ticks) * NS_PER_SEC / ticks_per_second)
 }
 

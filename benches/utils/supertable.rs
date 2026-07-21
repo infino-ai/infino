@@ -1130,6 +1130,10 @@ pub mod fts {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
+                // Keep one-time postings/superfile fetches in the open
+                // window so first_query stays comparable to prior FTS
+                // cold-cost measurements.
+                crate::executors::open_all_superfiles(&consumer);
                 (cache_dir, consumer)
             },
             |(_cache, consumer)| {
@@ -3938,10 +3942,12 @@ pub mod sql {
         // Same shapes as warm `fts_pushdown` / filter projections: must
         // scan row data, so first/steady cold windows accrue real GETs.
         let first = format!("SELECT key FROM supertable WHERE key = '{sample_key}'");
+        // Steady predicates must hit the ingest sample row on every corpus;
+        // hard-coded category/rating filters can legitimately return zero.
         let steady = [
             format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
-            "SELECT title FROM supertable WHERE category = 'rust'".to_string(),
-            "SELECT title FROM supertable WHERE rating < 10".to_string(),
+            format!("SELECT key FROM supertable WHERE title = '{sample_title}'"),
+            format!("SELECT title FROM supertable WHERE key = '{sample_key}'"),
         ];
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let measured = cold_store::measure_cold_store(
