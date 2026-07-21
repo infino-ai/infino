@@ -6,6 +6,9 @@
 //! Uses the lazy shared [`rustfs_server::session`] via [`rustfs_server::open_test_fixture`].
 //! The daemon starts on first S3 use; tests do not create or tear down the session.
 //!
+//! Also covers the connection-budget OverBudget e2es: cold vector / SQL / hybrid
+//! refusal and the shared multi-superfile budget, previously run against s3s-fs.
+//!
 //! ## Gating
 //!
 //! Runs by default. Set `INFINO_TEST_DISABLE_RUSTFS=1` to skip on offline hosts or
@@ -19,13 +22,17 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, Rec
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    InfinoError, VectorSearchOptions,
+    config::{Config, MemorySettings, StorageBackend, StorageSettings},
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
         Supertable,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{StorageError, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{
+        build_title_batch, default_supertable_options, lazy_foreground_disk_cache,
+    },
 };
 use infino_bench_utils::rustfs_server;
 use tempfile::TempDir;
@@ -36,6 +43,36 @@ const VECTOR_ROT_SEED: u64 = 17;
 const EMB_DIM: usize = 16;
 const EXPECTED_N_DOCS: u64 = 8;
 const BM25_TOP_K: usize = 10;
+/// Single-thread writer pool for budget e2es: one commit → one superfile.
+/// A multi-thread pool shards `BUDGET_N_ROWS` across many small superfiles;
+/// open-range prefetch then swallows each into a resident reader and the
+/// cold-fetch budget gate never fires.
+const BUDGET_WRITER_POOL_THREADS: usize = 1;
+/// Vector-search top-k and nprobe for the over-budget e2es.
+const VECTOR_SEARCH_K: usize = 3;
+const VECTOR_NPROBE: usize = 4;
+/// Connection memory budget for the over-budget e2e: 1 byte. The 90% gate
+/// floors to 0, so the first cold cluster-block fetch is refused.
+const TINY_BUDGET_BYTES: u64 = 1;
+/// Row count for the over-budget e2e fixture. Must be large enough that IVF
+/// cluster blocks are a genuine cold object-store fetch under the SQL TVF's
+/// default (fine-first) probe shape — not swallowed by the lazy reader's
+/// open-range / parquet-tail overlay. At 4K–16K rows the default path stays
+/// warm (peak 0); 64K pushes the probed codes outside that overlay.
+const BUDGET_N_ROWS: usize = 65_536;
+/// Expected peak reservation band for a measured cold vector search over
+/// `BUDGET_N_ROWS` (dim 16, `n_cent` 4, Sq8, default or `nprobe` 4). Assert a
+/// band around the observed ~156 KB fetch: tight enough to prove it's the
+/// real cluster fetch, loose enough to survive minor codec / layout drift.
+const CONTROL_PEAK_LOW_BYTES: usize = 120_000;
+const CONTROL_PEAK_HIGH_BYTES: usize = 200_000;
+/// Bounded budget set generously above one cold fetch (~156 KB); 90% gate is
+/// 900 KB. Proves an enforcing budget admits under-budget work.
+const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
+const AMPLE_BUDGET_GATE_BYTES: usize = 900_000;
+/// Shared multi-superfile budget: admits one ~156 KB fetch but not two
+/// concurrent ones (90% gate = 180 KB).
+const SHARED_BUDGET_BYTES: u64 = 200_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_smoke_via_rustfs_https() {
@@ -263,6 +300,18 @@ fn rustfs_vector_options(dim: usize) -> infino::supertable::SupertableOptions {
     .expect("rustfs TVF test options")
 }
 
+/// Options for budget e2es: same schema as [`rustfs_vector_options`], but a
+/// single-thread writer pool so each commit lands as one large superfile.
+fn rustfs_budget_options(dim: usize) -> infino::supertable::SupertableOptions {
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(BUDGET_WRITER_POOL_THREADS)
+            .build()
+            .expect("single-thread budget writer pool"),
+    );
+    rustfs_vector_options(dim).with_writer_pool(pool)
+}
+
 fn rustfs_vector_batch(dim: usize) -> RecordBatch {
     let titles = LargeStringArray::from(vec![
         "alpha vector one",
@@ -393,3 +442,445 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
         post.n_cold_fetches, post.current_bytes
     );
 }
+
+/// A `Config` that carries only a connection memory budget; storage backend is
+/// `None` so `apply_config` leaves storage / disk cache unattached (the caller
+/// wires those explicitly afterward).
+fn budget_only_config(connection_budget_bytes: u64) -> Config {
+    Config {
+        storage: StorageSettings {
+            backend: StorageBackend::None,
+            ..StorageSettings::default()
+        },
+        memory: MemorySettings {
+            connection_budget_bytes,
+        },
+        ..Config::default()
+    }
+}
+
+/// Open a fresh consumer against `storage` with a lazy-foreground disk cache
+/// (so vector reads stay cold / non-resident) and `connection_budget_bytes` as
+/// the connection budget (`0` = measured). Returns the handle plus the cache's
+/// `TempDir` guard.
+fn open_budget_consumer(
+    dim: usize,
+    storage: &Arc<dyn StorageProvider>,
+    connection_budget_bytes: u64,
+) -> (Supertable, TempDir) {
+    let cache_dir = TempDir::new().expect("budget consumer cache tempdir");
+    let cache = lazy_foreground_disk_cache(Arc::clone(storage), cache_dir.path());
+    let consumer = Supertable::open(
+        rustfs_budget_options(dim)
+            .apply_config(&budget_only_config(connection_budget_bytes))
+            .expect("apply budget config to consumer options")
+            .with_storage(Arc::clone(storage))
+            .with_disk_cache(cache),
+    )
+    .expect("Supertable::open via RustFS (budget consumer)");
+    (consumer, cache_dir)
+}
+
+/// Larger vector+FTS batch for the over-budget e2e: `BUDGET_N_ROWS` rows so
+/// IVF cluster blocks carry real bytes. One-hot embeddings at `row % dim`;
+/// titles carry the row index (and the word `budget` for hybrid BM25).
+fn budget_vector_batch(dim: usize, n_rows: usize) -> RecordBatch {
+    let titles = LargeStringArray::from(
+        (0..n_rows)
+            .map(|i| format!("budget vector row {i}"))
+            .collect::<Vec<_>>(),
+    );
+    let mut flat = Vec::with_capacity(n_rows * dim);
+    for row in 0..n_rows {
+        for d in 0..dim {
+            flat.push(if d == row % dim { 1.0 } else { 0.0 });
+        }
+    }
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let values = Float32Array::from(flat);
+    let vectors = FixedSizeListArray::try_new(item_field, dim as i32, Arc::new(values), None)
+        .expect("fixed-size vector array");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(dim), false),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(vectors)]).expect("batch")
+}
+
+/// Cold vector search under a tiny per-connection budget is refused with
+/// `InfinoError::OverBudget`. A measured control and an ample bounded budget
+/// then run the identical cold query to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_vector_search_over_budget_via_rustfs() {
+    if !rustfs_server::begin_rustfs_test("supertable_cold_vector_search_over_budget_via_rustfs") {
+        return;
+    }
+
+    let fixture = rustfs_server::open_test_fixture_async("")
+        .await
+        .expect("open budget fixture");
+    let dim = EMB_DIM;
+    let storage = Arc::clone(&fixture.storage);
+    eprintln!("[rustfs-budget] bucket={}", fixture.bucket);
+
+    {
+        let producer =
+            Supertable::create(rustfs_budget_options(dim).with_storage(Arc::clone(&storage)))
+                .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via RustFS");
+        assert_eq!(producer.manifest_id(), 1);
+    }
+
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    assert_eq!(consumer.manifest_id(), 1);
+    assert_eq!(consumer.reader().n_docs_total(), BUDGET_N_ROWS as u64);
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let result = consumer.vector_search(
+        "emb",
+        &q,
+        VECTOR_SEARCH_K,
+        VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+        None,
+        None,
+    );
+
+    match result {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[rustfs-budget] cold vector search refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(hits) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold vector search returned {} batch(es)",
+            hits.len()
+        ),
+    }
+
+    let bounded_budget = consumer.options().connection_budget();
+    eprintln!(
+        "[rustfs-budget] bounded budget: denials={} peak={} B",
+        bounded_budget.denials(),
+        bounded_budget.peak()
+    );
+    assert!(
+        bounded_budget.denials() >= 1,
+        "bounded budget must record >=1 denial; got {}",
+        bounded_budget.denials()
+    );
+    assert_eq!(
+        bounded_budget.peak(),
+        0,
+        "a refused cold fetch commits nothing, so peak must stay 0"
+    );
+
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_hits = control
+        .vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("measured cold vector search should run to completion");
+    let control_rows: usize = control_hits.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold vector search returned no rows over RustFS"
+    );
+    let control_budget = control.options().connection_budget();
+    eprintln!(
+        "[rustfs-budget] measured control: rows={control_rows} denials={} peak={} B",
+        control_budget.denials(),
+        control_budget.peak()
+    );
+    assert_eq!(
+        control_budget.denials(),
+        0,
+        "measured budget must never deny"
+    );
+    let control_peak = control_budget.peak();
+    assert!(
+        (CONTROL_PEAK_LOW_BYTES..=CONTROL_PEAK_HIGH_BYTES).contains(&control_peak),
+        "measured cold vector search peak {control_peak} B outside expected \
+         [{CONTROL_PEAK_LOW_BYTES}, {CONTROL_PEAK_HIGH_BYTES}] band; \
+         a peak near 0 means the budget was never exercised on the query path"
+    );
+
+    let (ample, _ample_guard) = open_budget_consumer(dim, &storage, AMPLE_BUDGET_BYTES);
+    let ample_budget = ample.options().connection_budget();
+    assert_eq!(
+        ample_budget.limit(),
+        Some(AMPLE_BUDGET_GATE_BYTES),
+        "ample budget must be bounded (an enforced gate), not measured"
+    );
+    let ample_hits = ample
+        .vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+        .expect("under-budget cold vector search should run under a bounded budget");
+    let ample_rows: usize = ample_hits.iter().map(|b| b.num_rows()).sum();
+    let ample_peak = ample_budget.peak();
+    eprintln!(
+        "[rustfs-budget] bounded-ample: rows={ample_rows} denials={} peak={ample_peak} B",
+        ample_budget.denials()
+    );
+    assert!(
+        ample_rows >= 1,
+        "bounded-ample cold vector search returned no rows"
+    );
+    assert_eq!(
+        ample_budget.denials(),
+        0,
+        "an under-budget query must not be denied by a bounded budget"
+    );
+    assert!(
+        (CONTROL_PEAK_LOW_BYTES..=CONTROL_PEAK_HIGH_BYTES).contains(&ample_peak),
+        "bounded-ample peak {ample_peak} B outside expected \
+         [{CONTROL_PEAK_LOW_BYTES}, {CONTROL_PEAK_HIGH_BYTES}] band"
+    );
+}
+
+/// Same cold-fetch budget refusal through the `vector_search` SQL table
+/// function. Pins that `OverBudget` survives the DataFusion error boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_vector_search_over_budget_via_sql_rustfs() {
+    if !rustfs_server::begin_rustfs_test("supertable_cold_vector_search_over_budget_via_sql_rustfs")
+    {
+        return;
+    }
+
+    let fixture = rustfs_server::open_test_fixture_async("")
+        .await
+        .expect("open budget SQL fixture");
+    let dim = EMB_DIM;
+    let storage = Arc::clone(&fixture.storage);
+
+    {
+        let producer =
+            Supertable::create(rustfs_budget_options(dim).with_storage(Arc::clone(&storage)))
+                .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via RustFS");
+    }
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let q_csv = q
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', {VECTOR_SEARCH_K})");
+
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    let result = consumer.reader().query_sql(&sql).map_err(InfinoError::from);
+    match result {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[rustfs-budget-sql] cold vector search in SQL refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(batches) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold vector search in SQL returned {} batch(es)",
+            batches.len()
+        ),
+    }
+    let bounded_budget = consumer.options().connection_budget();
+    assert!(
+        bounded_budget.denials() >= 1,
+        "bounded budget must record >=1 denial; got {}",
+        bounded_budget.denials()
+    );
+
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_rows: usize = control
+        .reader()
+        .query_sql(&sql)
+        .expect("measured cold vector search in SQL should run to completion")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold vector search in SQL returned no rows over RustFS"
+    );
+    assert_eq!(
+        control.options().connection_budget().denials(),
+        0,
+        "measured budget must never deny"
+    );
+}
+
+/// Same cold-fetch budget refusal through `hybrid_search` (BM25 + vector RRF).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
+    if !rustfs_server::begin_rustfs_test("supertable_cold_hybrid_search_over_budget_via_sql_rustfs")
+    {
+        return;
+    }
+
+    let fixture = rustfs_server::open_test_fixture_async("")
+        .await
+        .expect("open hybrid budget fixture");
+    let dim = EMB_DIM;
+    let storage = Arc::clone(&fixture.storage);
+
+    {
+        let producer =
+            Supertable::create(rustfs_budget_options(dim).with_storage(Arc::clone(&storage)))
+                .expect("create budget producer");
+        let mut w = producer.writer().expect("budget producer writer");
+        w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+            .expect("append large vector+FTS batch");
+        w.commit().expect("budget producer commit via RustFS");
+    }
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let q_csv = q
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT _id FROM hybrid_search('title', 'budget', 'emb', '{q_csv}', {VECTOR_SEARCH_K})"
+    );
+
+    let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
+    match consumer.reader().query_sql(&sql).map_err(InfinoError::from) {
+        Err(InfinoError::OverBudget(msg)) => {
+            eprintln!("[rustfs-budget-sql] cold hybrid search refused as OverBudget: {msg}");
+        }
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(batches) => panic!(
+            "expected InfinoError::OverBudget under a {TINY_BUDGET_BYTES}-byte budget; \
+             cold hybrid search returned {} batch(es)",
+            batches.len()
+        ),
+    }
+    assert!(
+        consumer.options().connection_budget().denials() >= 1,
+        "bounded budget must record >=1 denial"
+    );
+
+    let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
+    let control_rows: usize = control
+        .reader()
+        .query_sql(&sql)
+        .expect("measured cold hybrid search should run to completion")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        control_rows >= 1,
+        "measured cold hybrid search returned no rows over RustFS"
+    );
+    assert_eq!(
+        control.options().connection_budget().denials(),
+        0,
+        "measured budget must never deny"
+    );
+}
+
+/// The per-connection budget is shared across the multi-superfile fan-out.
+/// Two commits → two ~156 KB cold fetches; a budget that fits one but not two
+/// refuses the concurrent fan-out as `OverBudget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
+    if !rustfs_server::begin_rustfs_test(
+        "supertable_vector_budget_is_shared_across_superfiles_via_rustfs",
+    ) {
+        return;
+    }
+
+    let fixture = rustfs_server::open_test_fixture_async("")
+        .await
+        .expect("open shared-budget fixture");
+    let dim = EMB_DIM;
+    let storage = Arc::clone(&fixture.storage);
+    eprintln!("[rustfs-shared] bucket={}", fixture.bucket);
+
+    {
+        let producer =
+            Supertable::create(rustfs_budget_options(dim).with_storage(Arc::clone(&storage)))
+                .expect("create shared-budget producer");
+        for commit in 0..2 {
+            let mut w = producer.writer().expect("shared-budget producer writer");
+            w.append(&budget_vector_batch(dim, BUDGET_N_ROWS))
+                .expect("append large vector+FTS batch");
+            w.commit().expect("shared-budget producer commit via RustFS");
+            assert_eq!(producer.manifest_id(), commit + 1);
+        }
+    }
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+    let search = |table: &Supertable| {
+        table.vector_search(
+            "emb",
+            &q,
+            VECTOR_SEARCH_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            None,
+        )
+    };
+
+    let (measured, _measured_guard) = open_budget_consumer(dim, &storage, 0);
+    assert_eq!(measured.reader().n_superfiles(), 2);
+    assert_eq!(measured.reader().n_docs_total(), (BUDGET_N_ROWS as u64) * 2);
+    let measured_hits = search(&measured).expect("measured search over two superfiles runs");
+    let measured_rows: usize = measured_hits.iter().map(|b| b.num_rows()).sum();
+    let measured_peak = measured.options().connection_budget().peak();
+    eprintln!("[rustfs-shared] measured: rows={measured_rows} peak={measured_peak} B");
+    assert!(
+        measured_rows >= 1,
+        "measured two-superfile search returned no rows"
+    );
+    assert!(
+        measured_peak > CONTROL_PEAK_HIGH_BYTES,
+        "peak {measured_peak} B should exceed one superfile's fetch \
+         ({CONTROL_PEAK_HIGH_BYTES} B): the two fetches must sum on one budget"
+    );
+
+    let (bounded, _bounded_guard) = open_budget_consumer(dim, &storage, SHARED_BUDGET_BYTES);
+    let result = search(&bounded);
+    let bounded_budget = bounded.options().connection_budget();
+    eprintln!(
+        "[rustfs-shared] bounded: denials={} peak={} B result={}",
+        bounded_budget.denials(),
+        bounded_budget.peak(),
+        if result.is_ok() { "ok" } else { "over-budget" }
+    );
+    match result {
+        Err(InfinoError::OverBudget(_)) => {}
+        Err(other) => panic!("expected InfinoError::OverBudget, got {other:?}"),
+        Ok(hits) => panic!(
+            "two concurrent {CONTROL_PEAK_HIGH_BYTES}-B fetches must cross a \
+             {SHARED_BUDGET_BYTES}-B budget; got {} batch(es)",
+            hits.len()
+        ),
+    }
+    assert!(
+        bounded_budget.denials() >= 1,
+        "the shared budget must record the crossing"
+    );
+}
+
+
+
+
