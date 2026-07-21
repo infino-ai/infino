@@ -65,7 +65,7 @@ pub fn measure_cold_store<C>(
     let mut window_start = meter.snapshot();
     let first_query = window_start.since(&after_open);
 
-    let n = n_steady.max(1).min(STEADY_COLD_SAMPLES);
+    let n = n_steady.clamp(1, STEADY_COLD_SAMPLES);
     let mut steady: Vec<(f64, Option<f64>, ObjectStoreMeter)> = Vec::with_capacity(n);
     for i in 0..n {
         let cpu0 = cpu::process_cpu_ns();
