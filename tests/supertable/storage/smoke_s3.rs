@@ -186,10 +186,12 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
     eprintln!("[real-s3] bucket={bucket} prefix={prefix}");
 
     let storage_opts = s3_storage_options_from_env();
-    if !storage_opts.contains_key("aws_access_key_id") {
+    let has_access_key = storage_opts.contains_key("aws_access_key_id");
+    let has_secret_key = storage_opts.contains_key("aws_secret_access_key");
+    if !has_access_key || !has_secret_key {
         eprintln!(
             "supertable_real_s3_lazy_vector_and_fts_round_trip: skipped \
-             (missing AWS_ACCESS_KEY_ID in environment)"
+             (missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY in environment)"
         );
         return;
     }
@@ -206,9 +208,9 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
             let producer = Supertable::create(
                 real_s3_options(dim)
                     .apply_config(&cfg)
-                    .map_err(|e| format!("apply S3 config to producer options: {e:?}"))?,
+                    .map_err(|e| format!("apply S3 config to producer options: {e}"))?,
             )
-            .map_err(|e| format!("create unified supertable on real S3: {e:?}"))?;
+            .map_err(|e| format!("create unified supertable on real S3: {e}"))?;
             let mut writer = producer
                 .writer()
                 .map_err(|e| format!("real S3 producer writer: {e}"))?;

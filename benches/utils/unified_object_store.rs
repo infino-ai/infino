@@ -2134,11 +2134,13 @@ pub(crate) mod diag {
              (override via INFINO_DIAG_QUERY_SQL_ITERS, INFINO_BENCH_FULL=1 for 1M)"
         );
 
-        // 1. RustFS session + storage provider.
-        let storage: Arc<dyn StorageProvider> = rt.block_on(async {
-            let (storage, _uri, _lease) = setup_rustfs_fixture(superfile_bytes()).await;
-            storage
-        });
+        // 1. RustFS session + storage provider. Keep the bucket lease alive for
+        // the whole diagnostic (drop empties/deletes the ephemeral bucket).
+        let (storage, _rustfs_lease): (Arc<dyn StorageProvider>, RustFsBucketLease) =
+            rt.block_on(async {
+                let (storage, _uri, lease) = setup_rustfs_fixture(superfile_bytes()).await;
+                (storage, lease)
+            });
 
         // 2. Disk cache (so warm == mmap, not re-fetch).
         let cache_dir = TempDir::new().expect("cache tempdir");

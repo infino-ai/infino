@@ -115,13 +115,18 @@ async fn supertable_smoke_via_rustfs_https() {
         let producer =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
                 .expect("create");
-        let mut w = producer.writer().expect("writer");
-        w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
-            .expect("append");
-        w.commit().expect("first commit via RustFS");
-        w.append(&build_title_batch(&["echo foxtrot"]))
-            .expect("second append");
-        w.commit().expect("second commit via RustFS (If-Match OCC)");
+        {
+            let mut w = producer.writer().expect("writer");
+            w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
+                .expect("append");
+            w.commit().expect("first commit via RustFS");
+        }
+        {
+            let mut w = producer.writer().expect("writer for second commit");
+            w.append(&build_title_batch(&["echo foxtrot"]))
+                .expect("second append");
+            w.commit().expect("second commit via RustFS (If-Match OCC)");
+        }
         assert_eq!(producer.manifest_id(), 2);
     }
 

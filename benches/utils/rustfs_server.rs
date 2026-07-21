@@ -384,24 +384,34 @@ impl RustFsSession {
     }
 }
 
-static RUSTFS_SESSION: OnceLock<Result<Arc<RustFsSession>, String>> = OnceLock::new();
+static RUSTFS_SESSION: OnceLock<Arc<RustFsSession>> = OnceLock::new();
+static RUSTFS_SESSION_INIT: Mutex<()> = Mutex::new(());
 
 /// One RustFS daemon per process; lazy-loaded on first call. The child outlives
 /// all fixtures (see [`open_test_fixture`]).
+///
+/// Transient spawn/download failures are not cached: only a successful session
+/// is stored, so a later call can retry.
 pub fn session() -> Result<Arc<RustFsSession>, String> {
-    match RUSTFS_SESSION.get_or_init(|| {
-        let handle = spawn_rustfs_daemon()?;
-        Ok(Arc::new(RustFsSession {
-            endpoint: handle.endpoint.clone(),
-            access_key: handle.access_key.clone(),
-            secret_key: handle.secret_key.clone(),
-            ca_pem: handle.ca_pem.clone(),
-            _handle: handle,
-        }))
-    }) {
-        Ok(session) => Ok(Arc::clone(session)),
-        Err(err) => Err(err.clone()),
+    if let Some(session) = RUSTFS_SESSION.get() {
+        return Ok(Arc::clone(session));
     }
+    let _guard = RUSTFS_SESSION_INIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(session) = RUSTFS_SESSION.get() {
+        return Ok(Arc::clone(session));
+    }
+    let handle = spawn_rustfs_daemon()?;
+    let session = Arc::new(RustFsSession {
+        endpoint: handle.endpoint.clone(),
+        access_key: handle.access_key.clone(),
+        secret_key: handle.secret_key.clone(),
+        ca_pem: handle.ca_pem.clone(),
+        _handle: handle,
+    });
+    let _ = RUSTFS_SESSION.set(Arc::clone(&session));
+    Ok(session)
 }
 
 /// Scoped bucket on the shared session. Empties and deletes the bucket on drop
@@ -621,11 +631,20 @@ fn list_bucket_object_keys(session: &RustFsSession, bucket: &str) -> Result<Vec<
         let (page, next, truncated) =
             list_bucket_object_keys_page(session, bucket, continuation.as_deref())?;
         keys.extend(page);
-        if truncated {
-            continuation = next;
-        } else {
+        if !truncated {
             break;
         }
+        let next = next.ok_or_else(|| {
+            format!(
+                "ListObjectsV2 for {bucket} returned truncated=true without NextContinuationToken"
+            )
+        })?;
+        if continuation.as_deref() == Some(next.as_str()) {
+            return Err(format!(
+                "ListObjectsV2 for {bucket} repeated continuation token"
+            ));
+        }
+        continuation = Some(next);
     }
     Ok(keys)
 }
@@ -979,6 +998,13 @@ fn rustfs_version() -> String {
 fn which_rustfs_on_path() -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
+            #[cfg(windows)]
+            {
+                let exe = dir.join("rustfs.exe");
+                if exe.is_file() {
+                    return Some(exe);
+                }
+            }
             let candidate = dir.join("rustfs");
             candidate.is_file().then_some(candidate)
         })
