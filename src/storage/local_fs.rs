@@ -28,7 +28,7 @@ use object_store::{
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider};
+use super::{ObjectMeta, StorageError, StorageProvider, counting, io_counters};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -114,7 +114,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        crate::storage::io_counters::record_head();
+        io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -133,7 +133,7 @@ impl StorageProvider for LocalFsStorageProvider {
             last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
-        crate::storage::io_counters::record_get(bytes.len() as u64);
+        io_counters::record_get(bytes.len() as u64);
         Ok((bytes, meta))
     }
 
@@ -149,7 +149,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .await
             .map_err(|e| translate(uri, e));
         if let Ok(b) = &out {
-            crate::storage::io_counters::record_get(b.len() as u64);
+            io_counters::record_get(b.len() as u64);
         }
         out
     }
@@ -168,7 +168,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
-            crate::storage::io_counters::record_put(n);
+            io_counters::record_put(n);
         }
         out
     }
@@ -195,7 +195,7 @@ impl StorageProvider for LocalFsStorageProvider {
                     .map(|r| r.e_tag)
                     .map_err(|e| translate(uri, e));
                 if out.is_ok() {
-                    crate::storage::io_counters::record_put(n);
+                    io_counters::record_put(n);
                 }
                 out
             }
@@ -294,7 +294,7 @@ impl StorageProvider for LocalFsStorageProvider {
                         .map(|r| r.e_tag)
                         .map_err(|e| translate(uri, e));
                     if out.is_ok() {
-                        crate::storage::io_counters::record_put(put_bytes);
+                        io_counters::record_put(put_bytes);
                     }
                     out
                 }
@@ -311,15 +311,19 @@ impl StorageProvider for LocalFsStorageProvider {
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = Self::path(uri)?;
-        self.store
+        // CreateMultipartUpload is a billable request (0 payload bytes).
+        io_counters::record_put(0);
+        let upload = self
+            .store
             .put_multipart(&path)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e))?;
+        Ok(counting::wrap_multipart(upload))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = Self::path(uri)?;
-        crate::storage::io_counters::record_delete();
+        io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -331,7 +335,7 @@ impl StorageProvider for LocalFsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        crate::storage::io_counters::record_list();
+        io_counters::record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -350,9 +354,13 @@ impl StorageProvider for LocalFsStorageProvider {
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         // The prefix (root) is baked into the LocalFileSystem store, so
-        // the object key is the bare uri.
+        // the object key is the bare uri. Wrap so parquet range GETs issued
+        // against this handle are metered in io_counters.
         let path = Self::path(uri).ok()?;
-        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+        Some((
+            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>),
+            path,
+        ))
     }
 }
 
@@ -694,6 +702,52 @@ mod tests {
             .object_store_handle("seg/x.parquet")
             .expect("handle for valid uri");
         assert_eq!(path.to_string(), "seg/x.parquet");
+    }
+
+    /// Parquet / DataFusion range GETs go through `object_store_handle`
+    /// and must still increment engine `io_counters`.
+    #[tokio::test]
+    async fn object_store_handle_reads_are_metered() {
+        use object_store::ObjectStoreExt;
+
+        let (_dir, p) = provider();
+        p.put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
+            .await
+            .expect("put");
+        let (store, path) = p.object_store_handle("seg/x.bin").expect("handle");
+        let before = io_counters::snapshot();
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(bytes.as_ref(), b"0123456789");
+        let delta = io_counters::snapshot().since(&before);
+        // Process-global counters — lower bounds under parallel tests.
+        assert!(delta.get_count >= 1);
+        assert!(delta.get_bytes >= 10);
+    }
+
+    #[tokio::test]
+    async fn put_multipart_counts_create_part_and_complete() {
+        let (_dir, p) = provider();
+        let before = io_counters::snapshot();
+        let mut upload = p
+            .put_multipart("data/multi.bin")
+            .await
+            .expect("create multipart");
+        // Create already counted as a zero-byte PUT.
+        assert!(io_counters::snapshot().since(&before).put_count >= 1);
+
+        let part = upload.put_part(PutPayload::from_static(b"abcdef"));
+        part.await.expect("part");
+        upload.complete().await.expect("complete");
+        let delta = io_counters::snapshot().since(&before);
+        // create + part + complete
+        assert!(delta.put_count >= 3);
+        assert!(delta.put_bytes >= 6);
     }
 
     #[test]

@@ -22,8 +22,8 @@ use object_store::{
 };
 
 use super::{
-    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
-    retry,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
+    logical_list_key, options::apply, retry,
 };
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
@@ -190,7 +190,7 @@ impl StorageProvider for AzureStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        crate::storage::io_counters::record_head();
+        io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -200,7 +200,7 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
-        let tl = crate::storage::io_counters::timeline_start();
+        let tl = io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
         let out = retry::complete_get(uri, || async {
@@ -215,8 +215,8 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if let Ok((b, _)) = &out {
-            crate::storage::io_counters::record_get(b.len() as u64);
-            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+            io_counters::record_get(b.len() as u64);
+            io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
     }
@@ -228,8 +228,9 @@ impl StorageProvider for AzureStorageProvider {
     ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
         let path = self.path(uri)?;
         // Native `If-None-Match`: an unchanged blob comes back as a
-        // bodyless 304 instead of a full read.
-        retry::with_reissue(|| async {
+        // bodyless 304 instead of a full read. Both arms are still a
+        // billable GET (0 body bytes on 304).
+        let out = retry::with_reissue(|| async {
             let options = GetOptions {
                 if_none_match: Some(etag.to_string()),
                 ..GetOptions::default()
@@ -247,7 +248,13 @@ impl StorageProvider for AzureStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok(Some((bytes, meta)))
         })
-        .await
+        .await;
+        match &out {
+            Ok(Some((b, _))) => io_counters::record_get(b.len() as u64),
+            Ok(None) => io_counters::record_get(0),
+            Err(_) => {}
+        }
+        out
     }
 
     #[cfg_attr(
@@ -257,7 +264,7 @@ impl StorageProvider for AzureStorageProvider {
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
         let off = range.start;
-        let tl = crate::storage::io_counters::timeline_start();
+        let tl = io_counters::timeline_start();
         let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
@@ -266,8 +273,8 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if let Ok(b) = &out {
-            crate::storage::io_counters::record_get(b.len() as u64);
-            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+            io_counters::record_get(b.len() as u64);
+            io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
         }
         out
     }
@@ -313,7 +320,7 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if out.is_ok() {
-            crate::storage::io_counters::record_put(n);
+            io_counters::record_put(n);
         }
         out
     }
@@ -350,22 +357,26 @@ impl StorageProvider for AzureStorageProvider {
             .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
-            crate::storage::io_counters::record_put(n);
+            io_counters::record_put(n);
         }
         out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
-        self.store
+        // CreateMultipartUpload is a billable request (0 payload bytes).
+        io_counters::record_put(0);
+        let upload = self
+            .store
             .put_multipart(&path)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e))?;
+        Ok(counting::wrap_multipart(upload))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        crate::storage::io_counters::record_delete();
+        io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -377,7 +388,7 @@ impl StorageProvider for AzureStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        crate::storage::io_counters::record_list();
+        io_counters::record_list();
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -397,7 +408,10 @@ impl StorageProvider for AzureStorageProvider {
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
-        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+        Some((
+            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>),
+            path,
+        ))
     }
 }
 

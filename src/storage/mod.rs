@@ -37,6 +37,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub mod azure;
+pub(crate) mod counting;
 pub mod gcs;
 pub mod local_fs;
 pub(crate) mod options;
@@ -107,6 +108,16 @@ pub enum StorageError {
     },
 }
 
+/// Process-global object-store request counters.
+///
+/// Providers call [`record_get`] / [`record_put`] / … on each *successful*
+/// op (after retries), so re-issues are not double-counted. Embedders read
+/// [`snapshot`] for window deltas (`snapshot().since(&start)`).
+///
+/// **Overhead:** each record is one or two `AtomicU64` increments with
+/// `Relaxed` ordering — nanoseconds, negligible next to object-store RTT.
+/// Dollar formulas live in the bench cost model (`benches/utils/cost.rs`),
+/// not here; this module only accumulates request/byte counts.
 pub mod io_counters {
     use std::{
         future::Future,
@@ -690,7 +701,30 @@ impl StorageProvider for PrefixedStorageProvider {
     }
 
     async fn get(&self, uri: &str) -> Result<(bytes::Bytes, ObjectMeta), StorageError> {
-        self.inner.get(&self.prefixed(uri)).await
+        let out = self.inner.get(&self.prefixed(uri)).await;
+        if let Ok((b, _)) = &out {
+            io_counters::record_hidden_get(b.len() as u64);
+        }
+        out
+    }
+
+    async fn get_if_none_match(
+        &self,
+        uri: &str,
+        etag: &str,
+    ) -> Result<Option<(bytes::Bytes, ObjectMeta)>, StorageError> {
+        // Delegate so HTTP backends keep the native 304 path; tag every
+        // successful probe (body or not-modified) as hidden.
+        let out = self
+            .inner
+            .get_if_none_match(&self.prefixed(uri), etag)
+            .await;
+        match &out {
+            Ok(Some((b, _))) => io_counters::record_hidden_get(b.len() as u64),
+            Ok(None) => io_counters::record_hidden_get(0),
+            Err(_) => {}
+        }
+        out
     }
 
     async fn get_range(
@@ -706,7 +740,11 @@ impl StorageProvider for PrefixedStorageProvider {
     }
 
     async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {
-        self.inner.tail(&self.prefixed(uri), len).await
+        let out = self.inner.tail(&self.prefixed(uri), len).await;
+        if let Ok((b, _)) = &out {
+            io_counters::record_hidden_get(b.len() as u64);
+        }
+        out
     }
 
     async fn put_atomic(
@@ -774,8 +812,10 @@ impl StorageProvider for PrefixedStorageProvider {
         // table's superfiles resolve to a real object-store handle for the
         // async range-GET read paths (e.g. cold `_id`-column resolution).
         // Without this override the default `None` forces those paths to error
-        // on lazily-opened hidden superfiles.
-        self.inner.object_store_handle(&self.prefixed(uri))
+        // on lazily-opened hidden superfiles. Tag the returned handle so
+        // parquet range GETs count toward hidden as well as total.
+        let (store, path) = self.inner.object_store_handle(&self.prefixed(uri))?;
+        Some((counting::tag_hidden_object_store(store), path))
     }
 }
 
@@ -1105,5 +1145,58 @@ mod tests {
         assert!(delta.put_bytes >= 50);
         assert!(delta.list_count >= 1);
         assert!(delta.delete_count >= 1);
+    }
+
+    /// Hidden-namespace reads must tag `record_hidden_get` on get / range /
+    /// tail / object-store-handle paths (not only `get_range`).
+    #[tokio::test]
+    async fn prefixed_provider_tags_hidden_gets() {
+        use object_store::ObjectStoreExt;
+
+        use crate::storage::LocalFsStorageProvider;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let inner = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let prefixed = PrefixedStorageProvider::new(inner, "_hidden/");
+        prefixed
+            .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
+            .await
+            .expect("put");
+
+        let before = io_counters::snapshot();
+        let (got, _) = prefixed.get("seg/x.bin").await.expect("get");
+        assert_eq!(got.as_ref(), b"0123456789");
+        let delta = io_counters::snapshot().since(&before);
+        // Process-global counters — lower bounds under parallel tests.
+        assert!(delta.get_count >= 1);
+        assert!(delta.hidden_get_count >= 1);
+        assert!(delta.hidden_get_bytes >= 10);
+
+        let before = io_counters::snapshot();
+        let _ = prefixed.get_range("seg/x.bin", 0..4).await.expect("range");
+        let delta = io_counters::snapshot().since(&before);
+        assert!(delta.get_count >= 1);
+        assert!(delta.hidden_get_count >= 1);
+        assert!(delta.hidden_get_bytes >= 4);
+
+        let before = io_counters::snapshot();
+        let (tail, size) = prefixed.tail("seg/x.bin", 3).await.expect("tail");
+        assert_eq!(size, 10);
+        assert_eq!(tail.as_ref(), b"789");
+        let delta = io_counters::snapshot().since(&before);
+        // Default tail = HEAD + get_range; Prefixed tags the returned body once.
+        assert!(delta.get_count >= 1);
+        assert!(delta.hidden_get_count >= 1);
+        assert!(delta.hidden_get_bytes >= 3);
+
+        let before = io_counters::snapshot();
+        let (store, path) = prefixed
+            .object_store_handle("seg/x.bin")
+            .expect("handle");
+        let _ = store.get(&path).await.expect("os get");
+        let delta = io_counters::snapshot().since(&before);
+        assert!(delta.get_count >= 1);
+        assert!(delta.hidden_get_count >= 1);
+        assert!(delta.hidden_get_bytes >= 10);
     }
 }

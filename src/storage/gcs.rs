@@ -25,8 +25,8 @@ use object_store::{
 };
 
 use super::{
-    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
-    retry,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
+    logical_list_key, options::apply, retry,
 };
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS
@@ -194,6 +194,7 @@ impl StorageProvider for GcsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size,
             etag: version_token(&meta),
@@ -203,7 +204,8 @@ impl StorageProvider for GcsStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
-        retry::with_reissue(|| async {
+        let tl = io_counters::timeline_start();
+        let out = retry::with_reissue(|| async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size,
@@ -213,7 +215,12 @@ impl StorageProvider for GcsStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
         })
-        .await
+        .await;
+        if let Ok((b, _)) = &out {
+            io_counters::record_get(b.len() as u64);
+            io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+        }
+        out
     }
 
     #[cfg_attr(
@@ -222,13 +229,20 @@ impl StorageProvider for GcsStorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        retry::complete_range(uri, range, |r| async {
+        let off = range.start;
+        let tl = io_counters::timeline_start();
+        let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
                 .await
                 .map_err(|e| translate(uri, e))
         })
-        .await
+        .await;
+        if let Ok(b) = &out {
+            io_counters::record_get(b.len() as u64);
+            io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+        }
+        out
     }
 
     /// Single-RTT tail via GCS's native `Range: bytes=-len` suffix form; the
@@ -239,7 +253,8 @@ impl StorageProvider for GcsStorageProvider {
             return Ok((Bytes::new(), self.head(uri).await?.size));
         }
         let path = self.path(uri)?;
-        retry::with_reissue(|| async {
+        let tl = io_counters::timeline_start();
+        let out = retry::with_reissue(|| async {
             let opts = GetOptions {
                 range: Some(GetRange::Suffix(len)),
                 ..Default::default()
@@ -253,16 +268,28 @@ impl StorageProvider for GcsStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, size))
         })
-        .await
+        .await;
+        if let Ok((b, size)) = &out {
+            io_counters::record_get(b.len() as u64);
+            io_counters::timeline_record(
+                "tail",
+                uri,
+                size.saturating_sub(b.len() as u64),
+                b.len() as u64,
+                tl,
+            );
+        }
+        out
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
+        let n = bytes.len() as u64;
         // PutMode::Create maps to `x-goog-if-generation-match: 0` (native
         // create-if-absent). Re-issue only transient failures. Return the
         // new *generation* (r.version) — the CAS token callers chain forward
         // — not the HTTP etag (r.e_tag).
-        retry::with_reissue(|| {
+        let out = retry::with_reissue(|| {
             let bytes = bytes.clone();
             async {
                 let opts = PutOptions {
@@ -276,7 +303,11 @@ impl StorageProvider for GcsStorageProvider {
                     .map_err(|e| translate(uri, e))
             }
         })
-        .await
+        .await;
+        if out.is_ok() {
+            io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -286,6 +317,7 @@ impl StorageProvider for GcsStorageProvider {
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
+        let n = bytes.len() as u64;
         let opts = match expected_etag {
             // None == create-only-if-absent.
             None => PutOptions {
@@ -304,23 +336,33 @@ impl StorageProvider for GcsStorageProvider {
         };
         // Return the new generation (r.version), same as put_atomic — this is
         // the token the WAL/manifest OCC loops chain into the next CAS.
-        self.store
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.version)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
-        self.store
+        // CreateMultipartUpload is a billable request (0 payload bytes).
+        io_counters::record_put(0);
+        let upload = self
+            .store
             .put_multipart(&path)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e))?;
+        Ok(counting::wrap_multipart(upload))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
+        io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -332,6 +374,7 @@ impl StorageProvider for GcsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        io_counters::record_list();
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
@@ -351,7 +394,10 @@ impl StorageProvider for GcsStorageProvider {
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
-        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+        Some((
+            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>),
+            path,
+        ))
     }
 }
 
