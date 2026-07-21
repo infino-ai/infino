@@ -3884,7 +3884,7 @@ pub mod sql {
                     "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Cold = fresh disk cache + consumer per iteration, so each query pays the object-store cold open. Δ is vs the previous run.",
+                "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
                 &cold,
             );
             Some(cold)
@@ -3926,20 +3926,29 @@ pub mod sql {
         }
     }
 
-    /// One metered cold `query_sql` consumer (first scalar-battery query),
-    /// split at the phase boundaries the cost model prices: open window,
-    /// first query on the cold cache, then the same query repeated warm.
+    /// One metered cold `query_sql` consumer for the cost model: true cold
+    /// open → first query → steady second → repeat, same recipe as FTS
+    /// ([`cold_store::measure_cold_store`]).
+    ///
+    /// Open = consumer construct on a fresh disk cache only (no
+    /// `open_all_superfiles`). Queries are the warm-path equality /
+    /// filter projections (`fts_pushdown` shapes) — they open Parquet on
+    /// a cold miss. The scalar [`exec_sql::SQL_BATTERY`] aggregates stay
+    /// on the latency cold table; those answer from the manifest and are
+    /// not the cold-I/O cost cell.
     fn measure_cold_store(
         built: &supertable::IngestResult,
     ) -> Option<ColdStoreMeasurement> {
-        let query = exec_sql::SQL_BATTERY.first()?;
-        let steady: Vec<&crate::harness::SqlQuery> =
-            exec_sql::SQL_BATTERY.iter().skip(1).collect();
-        let steady = if steady.is_empty() {
-            vec![query]
-        } else {
-            steady
-        };
+        let sample_title = built.sql_sample_title.as_deref()?;
+        let sample_key = built.sql_sample_key.as_deref()?;
+        // Same shapes as warm `fts_pushdown` / filter projections: must
+        // scan row data, so first/steady cold windows accrue real GETs.
+        let first = format!("SELECT key FROM supertable WHERE key = '{sample_key}'");
+        let steady = [
+            format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
+            "SELECT title FROM supertable WHERE category = 'rust'".to_string(),
+            "SELECT title FROM supertable WHERE rating < 10".to_string(),
+        ];
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let measured = cold_store::measure_cold_store(
             &meter,
@@ -3957,23 +3966,27 @@ pub mod sql {
                 (cache_dir, consumer)
             },
             |(_cache, consumer)| {
-                let _ = consumer.query_rows(query.sql);
+                let _ = consumer.query_rows(&first);
             },
             |(_cache, consumer), i| {
-                let q = steady[i % steady.len()];
-                let _ = consumer.query_rows(q.sql);
+                let q = &steady[i % steady.len()];
+                let _ = consumer.query_rows(q);
             },
             steady.len().min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
-                let _ = consumer.query_rows(query.sql);
+                let _ = consumer.query_rows(&first);
             },
         );
         log_cold_split("supertable_sql", &measured.split);
         Some(measured)
     }
 
-    /// Cold-tier guard: fresh disk cache + consumer per open; the timed
-    /// `query_rows` pays the object-store cold open on the empty cache.
+    /// Cold-tier guard: fresh disk cache + consumer only. Do **not** call
+    /// `open_all_superfiles` here — that would pre-warm every superfile
+    /// before the timed cold search and hide true cold-after-open cost.
+    /// (FTS latency cold still pre-opens because BM25 always touches
+    /// postings; SQL covered aggregates do not, and pre-open made "cold
+    /// open" look like a full table fetch.)
     struct SupertableSqlColdGuard {
         _cache_dir: TempDir,
         consumer: Supertable,
@@ -3981,7 +3994,6 @@ pub mod sql {
     impl SupertableSqlColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, built);
-            crate::executors::open_all_superfiles(&consumer);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
