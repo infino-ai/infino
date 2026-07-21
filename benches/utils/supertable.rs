@@ -597,9 +597,7 @@ fn cold_trace_enabled() -> bool {
 
 /// Spread one cold consumer's metered + timed windows into the cost model's
 /// phase slots. Steady-state warm I/O is filled by the caller separately.
-fn store_phases_from_measurement(
-    measured: Option<ColdStoreMeasurement>,
-) -> cost::StorePhases {
+fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost::StorePhases {
     cost::StorePhases {
         cold_open: measured.as_ref().map(|m| m.split.open),
         cold_query: measured.as_ref().map(|m| m.split.first_query),
@@ -1106,9 +1104,7 @@ pub mod fts {
     /// One metered cold consumer (`ten_term_or`), split at the phase
     /// boundaries the cost model prices: open window, first query on the
     /// cold cache, then the same query repeated on the warm cache.
-    fn measure_cold_store(
-        built: &supertable::IngestResult,
-    ) -> Option<ColdStoreMeasurement> {
+    fn measure_cold_store(built: &supertable::IngestResult) -> Option<ColdStoreMeasurement> {
         let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
         // Distinct battery entries for steady cold (shared recipe).
         let steady: Vec<&FtsQuery> = FTS_BATTERY
@@ -2474,9 +2470,7 @@ pub mod vector {
                     steady_trace = Some(meter.take_trace());
                 }
             },
-            steady_queries
-                .len()
-                .min(STEADY_COLD_SAMPLES),
+            steady_queries.len().min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
                 let _ = consumer
                     .reader()
@@ -2779,9 +2773,7 @@ pub mod vector {
         });
     }
 
-    fn routing_cold_to_measurement(
-        cold: RoutingColdStat,
-    ) -> ColdStoreMeasurement {
+    fn routing_cold_to_measurement(cold: RoutingColdStat) -> ColdStoreMeasurement {
         ColdStoreMeasurement {
             split: cold.split,
             open_wall_s: cold.open_wall_s,
@@ -3936,9 +3928,7 @@ pub mod sql {
     /// a cold miss. The scalar [`exec_sql::SQL_BATTERY`] aggregates stay
     /// on the latency cold table; those answer from the manifest and are
     /// not the cold-I/O cost cell.
-    fn measure_cold_store(
-        built: &supertable::IngestResult,
-    ) -> Option<ColdStoreMeasurement> {
+    fn measure_cold_store(built: &supertable::IngestResult) -> Option<ColdStoreMeasurement> {
         let sample_title = built.sql_sample_title.as_deref()?;
         let sample_key = built.sql_sample_key.as_deref()?;
         // Same shapes as warm `fts_pushdown` / filter projections: must

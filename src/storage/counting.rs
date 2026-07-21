@@ -43,7 +43,8 @@ struct CountingObjectStore {
 
 impl fmt::Debug for CountingObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountingObjectStore").finish_non_exhaustive()
+        f.debug_struct("CountingObjectStore")
+            .finish_non_exhaustive()
     }
 }
 
@@ -164,8 +165,8 @@ impl MultipartUpload for CountingMultipart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
     use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn object_store_wrapper_counts_get() {

@@ -773,10 +773,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     {
         if let Some(per_q) = cold_query_usd.filter(|_| cold_query_req_usd.is_some()) {
             let io = cold_second_io.expect("guarded by cold_query_req_usd");
-            let search_s = c
-                .store
-                .cold_second_wall_s
-                .unwrap_or(q.search_s);
+            let search_s = c.store.cold_second_wall_s.unwrap_or(q.search_s);
             rate_rows.push(vec![
                 text("Cold query (CPU + requests, steady)"),
                 text(format!(

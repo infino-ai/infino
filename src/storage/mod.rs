@@ -50,9 +50,7 @@ pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
-pub use usage::{
-    ClassIo, N_URI_CLASSES, TraceEntry, UriClass, UsageMeter, UsageSnapshot,
-};
+pub use usage::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass, UsageMeter, UsageSnapshot};
 
 /// Object metadata returned by HEAD, GET, and list operations.
 ///
@@ -1044,8 +1042,7 @@ mod tests {
             LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
                 .expect("localfs"),
         );
-        let prefixed =
-            PrefixedStorageProvider::new(inner, "_infino_test_vector_index/");
+        let prefixed = PrefixedStorageProvider::new(inner, "_infino_test_vector_index/");
         prefixed
             .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
             .await
@@ -1076,9 +1073,7 @@ mod tests {
         assert_eq!(delta.hidden_get_bytes(), 3);
 
         let before = meter.snapshot();
-        let (store, path) = prefixed
-            .object_store_handle("seg/x.bin")
-            .expect("handle");
+        let (store, path) = prefixed.object_store_handle("seg/x.bin").expect("handle");
         let _ = store.get(&path).await.expect("os get");
         let delta = meter.snapshot().since(&before);
         assert_eq!(delta.get_count, 1);

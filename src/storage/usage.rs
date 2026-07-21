@@ -8,8 +8,7 @@
 //! counter implementation.
 
 use std::{
-    array,
-    fmt,
+    array, fmt,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -301,7 +300,10 @@ impl UsageMeter {
         let get_bytes = self.get_bytes.swap(0, Ordering::Relaxed);
         let mut hidden_count = 0u64;
         let mut hidden_bytes = 0u64;
-        for i in [UriClass::HiddenData.index(), UriClass::HiddenManifest.index()] {
+        for i in [
+            UriClass::HiddenData.index(),
+            UriClass::HiddenManifest.index(),
+        ] {
             hidden_count += self.class_get_count[i].swap(0, Ordering::Relaxed);
             hidden_bytes += self.class_get_bytes[i].swap(0, Ordering::Relaxed);
         }

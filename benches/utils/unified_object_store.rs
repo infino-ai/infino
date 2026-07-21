@@ -953,10 +953,7 @@ pub(crate) mod diag {
         fn object_store_handle(
             &self,
             uri: &str,
-        ) -> Option<(
-            Arc<dyn object_store::ObjectStore>,
-            object_store::path::Path,
-        )> {
+        ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
             self.inner.object_store_handle(uri)
         }
 

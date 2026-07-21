@@ -28,9 +28,7 @@ use object_store::{
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
-use super::{
-    ObjectMeta, StorageError, StorageProvider, counting, usage::UsageMeter,
-};
+use super::{ObjectMeta, StorageError, StorageProvider, counting, usage::UsageMeter};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -162,8 +160,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .await
             .map_err(|e| translate(uri, e));
         if let Ok(b) = &out {
-            self.meter
-                .record_get(uri, Some(requested), b.len() as u64);
+            self.meter.record_get(uri, Some(requested), b.len() as u64);
         }
         out
     }
@@ -372,7 +369,10 @@ impl StorageProvider for LocalFsStorageProvider {
         // against this handle share this provider's UsageMeter.
         let path = Self::path(uri).ok()?;
         Some((
-            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>, Arc::clone(&self.meter)),
+            counting::wrap_object_store(
+                Arc::clone(&self.store) as Arc<dyn ObjectStore>,
+                Arc::clone(&self.meter),
+            ),
             path,
         ))
     }

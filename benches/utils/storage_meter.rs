@@ -75,10 +75,7 @@ pub fn background_fill_meter(snap: &ObjectStoreMeter) -> ObjectStoreMeter {
 }
 
 /// Merge background-fill GETs from two windows.
-pub fn merge_background_fill(
-    a: &ObjectStoreMeter,
-    b: &ObjectStoreMeter,
-) -> ObjectStoreMeter {
+pub fn merge_background_fill(a: &ObjectStoreMeter, b: &ObjectStoreMeter) -> ObjectStoreMeter {
     ObjectStoreMeter {
         get_count: a.bg_get_count.saturating_add(b.bg_get_count),
         get_bytes: a.bg_get_bytes.saturating_add(b.bg_get_bytes),

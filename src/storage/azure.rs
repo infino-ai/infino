@@ -419,7 +419,10 @@ impl StorageProvider for AzureStorageProvider {
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
         Some((
-            counting::wrap_object_store(Arc::clone(&self.store) as Arc<dyn ObjectStore>, Arc::clone(&self.meter)),
+            counting::wrap_object_store(
+                Arc::clone(&self.store) as Arc<dyn ObjectStore>,
+                Arc::clone(&self.meter),
+            ),
             path,
         ))
     }
