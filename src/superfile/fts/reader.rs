@@ -278,7 +278,9 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
-    /// Number of docs in the table.
+    /// Number of docs in the table. Test-only: the query path indexes
+    /// by doc id and never needs the count.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.bytes.len()
     }
