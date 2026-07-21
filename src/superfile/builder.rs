@@ -1383,7 +1383,19 @@ fn scalar_batch_in_stable_id_order(
 
     let mut id_to_row: HashMap<i128, u32> = HashMap::with_capacity(id_col.len());
     for row in 0..id_col.len() {
-        id_to_row.insert(id_col.value(row), row as u32);
+        let stable_id = id_col.value(row);
+        if id_to_row.insert(stable_id, row as u32).is_some() {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "multi-cell merge: duplicate stable_id {stable_id} in scalar batches"
+            )));
+        }
+    }
+    if ordered_ids.len() != id_to_row.len() {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "multi-cell merge: {} ordered ids for {} visible scalar rows",
+            ordered_ids.len(),
+            id_to_row.len()
+        )));
     }
 
     let mut indices = Vec::with_capacity(ordered_ids.len());
@@ -3598,6 +3610,57 @@ mod tests {
             flat_n_cent > per_cell[0],
             "flat n_cent={flat_n_cent} collapsed to first cell n_cent={}",
             per_cell[0]
+        );
+    }
+
+    #[test]
+    fn scalar_batch_in_stable_id_order_rejects_duplicate_ids() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let ids = Decimal128Array::from_iter_values([10i128, 10])
+            .with_precision_and_scale(38, 0)
+            .expect("decimal");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("batch");
+        let err = scalar_batch_in_stable_id_order(&schema, "doc_id", &[batch], &[10, 11])
+            .expect_err("duplicate stable_id must fail");
+        assert!(
+            matches!(err, BuildError::VectorSchemaMismatch(ref m) if m.contains("duplicate")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_batch_in_stable_id_order_rejects_row_count_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let ids = Decimal128Array::from_iter_values([10i128, 11])
+            .with_precision_and_scale(38, 0)
+            .expect("decimal");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("batch");
+        // Two visible rows but only one ordered id — must not silently drop a row.
+        let err = scalar_batch_in_stable_id_order(&schema, "doc_id", &[batch], &[10])
+            .expect_err("ordered_ids/scalar len mismatch must fail");
+        assert!(
+            matches!(err, BuildError::VectorSchemaMismatch(ref m) if m.contains("ordered ids")),
+            "got {err:?}"
         );
     }
 
