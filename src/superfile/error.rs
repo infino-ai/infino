@@ -85,8 +85,10 @@ pub enum BuildError {
     #[error("row arrow_values has {actual} entries but schema has {expected} columns")]
     WrongRowShape { expected: usize, actual: usize },
 
-    #[error("RecordBatch schema does not match builder schema")]
-    BatchSchemaMismatch,
+    #[error(
+        "RecordBatch schema does not match builder schema\n  batch: {batch}\n  builder: {builder}"
+    )]
+    BatchSchemaMismatch { batch: String, builder: String },
 
     #[error("RecordBatch could not be read")]
     BatchReadError,
