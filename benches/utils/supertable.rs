@@ -1130,10 +1130,6 @@ pub mod fts {
                     cache,
                 );
                 let consumer = tiers::open_consumer(opts);
-                // Keep one-time postings/superfile fetches in the open
-                // window so first_query stays comparable to prior FTS
-                // cold-cost measurements.
-                crate::executors::open_all_superfiles(&consumer);
                 (cache_dir, consumer)
             },
             |(_cache, consumer)| {
