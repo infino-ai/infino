@@ -269,14 +269,14 @@ impl UsageMeter {
         let class = UriClass::of(uri).index();
         self.class_get_count[class].fetch_add(1, Ordering::Relaxed);
         self.class_get_bytes[class].fetch_add(bytes, Ordering::Relaxed);
-        if let Ok(mut trace) = self.trace.lock() {
-            if let Some(entries) = trace.as_mut() {
-                entries.push(TraceEntry {
-                    uri: uri.to_string(),
-                    range,
-                    bytes,
-                });
-            }
+        if let Ok(mut trace) = self.trace.lock()
+            && let Some(entries) = trace.as_mut()
+        {
+            entries.push(TraceEntry {
+                uri: uri.to_string(),
+                range,
+                bytes,
+            });
         }
     }
 
