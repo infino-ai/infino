@@ -101,10 +101,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 
 [dependencies]
 # Format / parquet
-arrow = "58"
-arrow-array = "58"
-arrow-schema = "58"
-parquet = { version = "58", features = ["async", "object_store"] }
+arrow = "59"
+arrow-array = "59"
+arrow-schema = "59"
+parquet = { version = "59", features = ["async", "object_store"] }
 
 # SIMD primitives
 bitpacking = "0.9"
@@ -163,7 +163,7 @@ tracing = "0.1"
 # against a per-Supertable cached Runtime. Tokio is single-worker
 # here: it drives DataFusion's I/O state machine, not CPU-bound work
 # (CPU work for skip + fan-out lives on the rayon reader pool).
-datafusion = "54"
+datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "96e8fdf3b" }
 # `macros` enables `#[tokio::test]` for the async DataFusion
 # integration tests; runtime weight on a release build is just the
 # proc-macro, so we keep it in [dependencies] rather than re-listing

@@ -16,19 +16,19 @@ bench = false
 
 
 [dependencies]
-arrow-array = "58"
-arrow-schema = "58"
+arrow-array = "59"
+arrow-schema = "59"
 async-trait = "0.1"
 bytemuck = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-datafusion = "54"
+datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "96e8fdf3b" }
 futures = "0.3"
 infino = { path = "../..", features = ["test-helpers"] }
 memmap2 = "0.9"
 num_cpus = "1"
 object_store = { version = "0.13", features = ["aws"] }
-parquet = "58"
+parquet = "59"
 rand = "0.10"
 rand_distr = "0.6"
 rayon = "1"
