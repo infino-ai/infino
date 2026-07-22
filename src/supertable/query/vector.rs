@@ -1250,9 +1250,12 @@ impl SupertableReader {
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
         // Admit:
-        //   * Unfiltered — global fine 1-bit first, exact-score fines only
-        //     on that shortlist, then fine-first cell selection. No exact
-        //     cell-centroid scan (the 1-bit stage replaces it).
+        //   * Unfiltered default — global fine 1-bit first, exact-score
+        //     fines only on that shortlist, then fine-first cell
+        //     selection. No exact cell-centroid scan.
+        //   * Unfiltered + explicit `nprobe` — pay the O(k) cell scan for
+        //     the grid half of grid∪fine (legacy widened-beam path); 1-bit
+        //     still gates exact fine scoring with empty must-include.
         //   * Filtered — pay the O(k) exact cell-centroid scan; those
         //     probe-cutoff picks are must-include so 1-bit cannot drop
         //     cells the wide filtered probe needs. Matching neighbors sit
@@ -1341,10 +1344,13 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
-            // Filtered: exact-score the resident cell grid (user grid on
-            // the global index, else VectorCell clusters). Unfiltered
-            // skips this scan — 1-bit admit ranks cells instead.
-            let grid_ranked: Option<Vec<(u32, f32)>> = if filtered {
+            // Exact cell-centroid ranking for paths that still need the
+            // grid half of grid∪fine: filtered search, and unfiltered
+            // with an explicit caller `nprobe` (the old widened-beam
+            // path). Default unfiltered skips this — 1-bit admit ranks
+            // cells instead.
+            let need_grid_ranking = filtered || options.nprobe.is_some();
+            let grid_ranked: Option<Vec<(u32, f32)>> = if need_grid_ranking {
                 let grid = manifest
                     .global_vector_index()
                     .filter(|g| g.column == column)
@@ -1364,13 +1370,28 @@ impl SupertableReader {
             } else {
                 None
             };
+            if filtered && matches!(grid_ranked.as_ref(), Some(ranked) if ranked.is_empty()) {
+                return Err(QueryError::Execute(
+                    "vector candidates name no cell present in the grid — \
+                     malformed cell tags"
+                        .into(),
+                ));
+            }
             let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
-            let filtered_must_include: Vec<u32> = match &grid_ranked {
-                Some(ranked) if !ranked.is_empty() => {
-                    let cutoff = cell_probe_cutoff(ranked, &cell_routing);
-                    ranked[..cutoff].iter().map(|(cell, _)| *cell).collect()
+            // Only filtered force-includes the cell-scan cutoff into the
+            // 1-bit shortlist. Unfiltered + explicit nprobe still uses
+            // grid_ranked for selection below, but keeps must-include
+            // empty so 1-bit alone gates exact fine scoring.
+            let filtered_must_include: Vec<u32> = if filtered {
+                match &grid_ranked {
+                    Some(ranked) => {
+                        let cutoff = cell_probe_cutoff(ranked, &cell_routing);
+                        ranked[..cutoff].iter().map(|(cell, _)| *cell).collect()
+                    }
+                    None => Vec::new(),
                 }
-                _ => Vec::new(),
+            } else {
+                Vec::new()
             };
             // Filtered with a grid: 1-bit + must-include the cell-scan
             // cutoff. Filtered without a grid: exact-score every fine
