@@ -1347,6 +1347,7 @@ impl SupertableReader {
             let grid_ranked: Option<Vec<(u32, f32)>> = if filtered {
                 let grid = manifest
                     .global_vector_index()
+                    .filter(|g| g.column == column)
                     .map(|g| g.user_grid())
                     .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
                     .or_else(|| {

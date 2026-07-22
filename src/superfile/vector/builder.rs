@@ -1207,7 +1207,9 @@ fn split_oversized_fine_runs(
     // sample row; any later round (or a missing/mismatched labeling)
     // re-assigns against the current centroids.
     let (mut assignments, mut need_assign) = match initial_assignments {
-        Some(a) if a.len() == sample_n => (a, false),
+        Some(a) if a.len() == sample_n && a.iter().all(|&idx| (idx as usize) < n_cent) => {
+            (a, false)
+        }
         _ => (vec![0u32; sample_n], true),
     };
     for round in 0..FINE_RUN_SPLIT_MAX_ROUNDS {
