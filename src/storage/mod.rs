@@ -136,16 +136,15 @@ pub mod io_counters {
         UsageMeter::process_default().snapshot()
     }
 
-    /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
-    ///
-    /// Fetch counts/bytes tell us breadth; they can't tell us whether the cold
-    /// floor is a *serial dependent chain* (each read gated on the prior's
-    /// offsets — gaps = network RTT) or *parallel breadth* (many overlapping
-    /// reads — wall-time = slowest single chain). This records each
-    /// object-store op's `[start, end)` relative to a shared epoch, so a
-    /// post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
-    /// implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
-    /// no-op (one relaxed env check) otherwise so the hot path is unaffected.
+    // Per-fetch *timeline* — diagnostic for the cold-search critical path.
+    // Fetch counts/bytes tell us breadth; they can't tell us whether the cold
+    // floor is a *serial dependent chain* (each read gated on the prior's
+    // offsets — gaps = network RTT) or *parallel breadth* (many overlapping
+    // reads — wall-time = slowest single chain). This records each
+    // object-store op's `[start, end)` relative to a shared epoch, so a
+    // post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
+    // implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
+    // no-op (one relaxed env check) otherwise so the hot path is unaffected.
 
     /// One recorded object-store fetch on the timeline.
     #[derive(Clone)]
