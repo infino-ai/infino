@@ -405,16 +405,18 @@ impl SupertableReader {
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
             async move {
-                // A cross-file floor can suppress score-tied single-term hits
-                // according to task completion order. Local BMW still prunes
-                // those queries; share the global floor only for multi-term
-                // paths.
-                let n_terms = must_arc.len() + should_arc.len();
-                let floor = if n_terms == 1 {
-                    f32::NEG_INFINITY
-                } else {
-                    shared.floor()
-                };
+                // Share the global kth-best floor with every superfile —
+                // single-term queries included — so each prunes its scored
+                // scan against the running top-k instead of returning a full
+                // local top-k for the merge to re-sort. Without this the
+                // fan-out churns ~(superfiles × k) candidates through the
+                // merge heap at large k, which dominates high-k latency.
+                // Ties stay correct: the floor prunes only scores strictly
+                // below the published kth-best (kernels compare via
+                // `floor.next_down()`), so the merged top-k — score ties
+                // included — matches an uncoordinated run; only the amount
+                // of skipped work depends on segment completion order.
+                let floor = shared.floor();
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
                     // queries (`fanout_for` never slices when a must
@@ -473,8 +475,7 @@ impl SupertableReader {
             }
         };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let mut hits = top_k_descending(per_unit, k);
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
     }
 
@@ -556,8 +557,7 @@ impl SupertableReader {
             }
         };
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let mut hits = top_k_descending(per_unit, k);
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
     }
 
@@ -1230,39 +1230,48 @@ fn build_work_units(
 /// Merge per-superfile hits and return the top-k by *descending*
 /// score (highest BM25 = most relevant). Uses a min-heap of size k
 /// so we never sort more than k elements.
-fn top_k_descending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    #[derive(PartialEq)]
-    struct MinByScore(SuperfileHit);
-    impl Eq for MinByScore {}
-    impl PartialOrd for MinByScore {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
+/// Select the global top-k deterministically and compaction-stably: order
+/// by score descending, breaking ties on the stable `_id` (ascending).
+///
+/// A plain score-only merge (`top_k_descending`) leaves the choice among
+/// score-tied hits to segment completion order — the cross-superfile floor
+/// changes which ties each segment returns, so the surviving tied docs vary
+/// run to run. Physical keys (superfile uuid + local offset) would break the
+/// tie but shift on every compaction. The stable `_id` is invariant across
+/// compaction, so tie-breaking on it yields the same top-k as a
+/// single-segment engine's docid-ordered ties, independent of layout or
+/// completion order. `_id`s are resolved up front here — cheap because the
+/// shared floor caps the candidate set near k.
+async fn select_top_k_stable(
+    tr: &SupertableReader,
+    per_unit: Vec<Vec<SuperfileHit>>,
+    k: usize,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let mut cands: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+    // Narrow to the top-k *by score plus its boundary ties* before touching
+    // `_id`. `_id` resolution costs a decode per hit, so it must stay
+    // top-k-sized (never per-candidate — that's what the fan-out defers).
+    // Partition at the k-th best score, then keep everything scoring at or
+    // above it: the strictly-better hits are always in, and the ties at the
+    // k-th score are the only ones whose inclusion the `_id` order decides.
+    if cands.len() > k {
+        cands.select_nth_unstable_by(k - 1, |a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
+        });
+        let kth_score = cands[k - 1].score;
+        cands.retain(|c| c.score >= kth_score);
     }
-    impl Ord for MinByScore {
-        fn cmp(&self, other: &Self) -> Ordering {
-            other
-                .0
-                .score
-                .partial_cmp(&self.0.score)
-                .unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let mut heap = BinaryHeap::with_capacity(k + 1);
-    for hit in per_superfile.into_iter().flatten() {
-        if heap.len() < k {
-            heap.push(MinByScore(hit));
-        } else if let Some(worst) = heap.peek()
-            && hit.score > worst.0.score
-        {
-            heap.pop();
-            heap.push(MinByScore(hit));
-        }
-    }
-    let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
-    result.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-    result
+    dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
+    // Total order: score desc, then stable `_id` asc — deterministic and
+    // invariant across compaction (unlike physical superfile/offset keys).
+    cands.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then(a.stable_id.cmp(&b.stable_id))
+    });
+    cands.truncate(k);
+    Ok(cands)
 }
 
 impl Supertable {
