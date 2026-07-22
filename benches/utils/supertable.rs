@@ -740,9 +740,9 @@ fn run_metered_delta_append(
 /// Measure/emit hook points between the shared FTS/SQL mutations.
 #[derive(Clone, Copy)]
 enum TextLifecyclePhase {
-    AfterDrain,
-    AfterDelta,
-    AfterCompact,
+    Drain,
+    Delta,
+    Compact,
 }
 
 /// Shared FTS/SQL mutation sequence: open a metered consumer, then
@@ -767,13 +767,13 @@ fn run_metered_text_lifecycle(
     );
     let consumer = tiers::open_consumer(opts);
     let drain = run_metered_drain(label, &consumer, &meter);
-    on_phase(TextLifecyclePhase::AfterDrain);
+    on_phase(TextLifecyclePhase::Drain);
     let delta_stats = run_metered_delta_append(label, &consumer, &meter, delta);
-    on_phase(TextLifecyclePhase::AfterDelta);
+    on_phase(TextLifecyclePhase::Delta);
     let compaction = run_metered_optimize(label, &consumer, &meter);
     drop(consumer);
     drop(cache_dir);
-    on_phase(TextLifecyclePhase::AfterCompact);
+    on_phase(TextLifecyclePhase::Compact);
     (drain, delta_stats, compaction)
 }
 
@@ -1143,17 +1143,17 @@ pub mod fts {
                 &delta_batch,
                 |phase| {
                     let (anchor_suffix, note) = match phase {
-                        TextLifecyclePhase::AfterDrain => (
+                        TextLifecyclePhase::Drain => (
                             "post-drain",
                             "Post-drain (after drain_vectors_to_cells; no-op without a hidden vector index). \
                              Same warm/cold recipe as pre-drain. Δ vs previous run.",
                         ),
-                        TextLifecyclePhase::AfterDelta => (
+                        TextLifecyclePhase::Delta => (
                             "post-delta",
                             "Post-delta (base commits + one undrained follow-up commit). Warm/cold recipe \
                              unchanged. Δ vs previous run.",
                         ),
-                        TextLifecyclePhase::AfterCompact => (
+                        TextLifecyclePhase::Compact => (
                             "post-compact",
                             "Post-compact (after optimize): fewer superfiles; warm/cold recipe unchanged. \
                              Steady-state layout the cost model prices. Δ vs previous run.",
@@ -1178,7 +1178,7 @@ pub mod fts {
                             None,
                         );
                     }
-                    if matches!(phase, TextLifecyclePhase::AfterCompact) {
+                    if matches!(phase, TextLifecyclePhase::Compact) {
                         warm_post = warm;
                         cold_post = cold;
                     }
@@ -4226,17 +4226,17 @@ pub mod sql {
                 &delta_batch,
                 |phase| {
                     let (suffix, warm_note, cold_note) = match phase {
-                        TextLifecyclePhase::AfterDrain => (
+                        TextLifecyclePhase::Drain => (
                             "post-drain",
                             "Post-drain (after drain_vectors_to_cells; no-op without a hidden vector index). Same warm recipe as pre-drain. Δ vs previous run.",
                             "Post-drain cold: open = construct only; search is the first query. Δ vs previous run.",
                         ),
-                        TextLifecyclePhase::AfterDelta => (
+                        TextLifecyclePhase::Delta => (
                             "post-delta",
                             "Post-delta (base commits + one undrained follow-up commit). Same warm recipe. Δ vs previous run.",
                             "Post-delta cold: open = construct only; search is the first query. Δ vs previous run.",
                         ),
-                        TextLifecyclePhase::AfterCompact => (
+                        TextLifecyclePhase::Compact => (
                             "post-compact",
                             "Post-compact (after optimize): fewer superfiles; same warm recipe. Steady-state layout for the cost model. Δ vs previous run.",
                             "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
@@ -4288,7 +4288,7 @@ pub mod sql {
                     } else {
                         None
                     };
-                    if matches!(phase, TextLifecyclePhase::AfterCompact) {
+                    if matches!(phase, TextLifecyclePhase::Compact) {
                         warm_sets_post = warm;
                         cold_post = cold;
                     }
