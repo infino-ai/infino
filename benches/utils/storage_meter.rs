@@ -10,8 +10,10 @@
 use std::sync::Arc;
 
 pub use infino::runtime_metrics::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass};
-use infino::runtime_metrics::{UsageMeter, UsageSnapshot};
-use infino::storage::StorageProvider;
+use infino::{
+    runtime_metrics::{UsageMeter, UsageSnapshot},
+    storage::StorageProvider,
+};
 
 use crate::rss;
 

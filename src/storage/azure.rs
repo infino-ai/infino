@@ -21,12 +21,11 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use crate::runtime_metrics::io::UsageMeter;
-
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
     logical_list_key, options::apply, retry,
 };
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.

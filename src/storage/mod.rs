@@ -118,8 +118,10 @@ pub enum StorageError {
 /// built outside a [`crate::catalog::Connection`]). Prefer
 /// `provider.usage_meter().snapshot()` for connection-scoped windows.
 pub mod io_counters {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+    use std::{
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
 
     use crate::runtime_metrics::io::{UsageMeter, UsageSnapshot, io_is_background};
 
