@@ -1664,24 +1664,24 @@ pub mod vector {
     ];
     /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
     /// (steady) cold query's data GETs. <5M: a probed cell spans ~6 MiB,
-    /// the whole probe coalesces to ONE GET on post-drain / post-compact
-    /// (measured 1 / 3 / 1 at 1M). Post-delta adds the undrained user
-    /// tail: measured 2 user data GETs + 1 hidden = 3 (the tail no
-    /// longer always coalesces to a single user GET). 5–20M: a probed
-    /// cell spans ~60 MiB and the selected runs occupy 2–4
+    /// the whole probe coalesces to ONE GET (measured 1 / 2 / 1 at 1M —
+    /// post-delta's extra GET is the undrained user tail). 5–20M: a
+    /// probed cell spans ~60 MiB and the selected runs occupy 2–4
     /// geometric-chain islands with 10–18 MiB gaps that are cheaper to
     /// fetch in parallel than to bridge (median 3–4 measured at 10M
-    /// under the 8 MiB cold windows). Post-compact matches post-delta at
-    /// mid scale — a budgeted optimize leaves the hidden table two shard
+    /// under the 8 MiB cold windows). Invariant across tiers:
+    /// post-delta = post-drain + 1 (the undrained user tail is exactly
+    /// one extra coalesced GET). Post-compact matches post-delta at mid
+    /// scale — a budgeted optimize leaves the hidden table two shard
     /// generations deep, so a probed cell's runs span two files
     /// (measured 5 at 10M: 3–4 islands in the old shard + 1 in the
     /// new); a full per-cell consolidation pass would earn post-drain's
-    /// ceiling back. The old 2-GET mid-tier value was calibrated against
-    /// the fat-open era (727 MiB opens staging all cell metadata) and is
-    /// not reachable on the v1-open architecture.
+    /// ceiling back. The old 2-GET value at this tier was calibrated
+    /// against the fat-open era (727 MiB opens staging all cell
+    /// metadata) and is not reachable on the v1-open architecture.
     const COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
         ("post-drain", 1, 4),
-        ("post-delta", 3, 5),
+        ("post-delta", 2, 5),
         ("post-compact", 1, 5),
     ];
     /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
