@@ -4143,8 +4143,13 @@ pub mod sql {
         let warm_sets_pre = if phases.warm {
             eprintln!("[supertable_sql] warm (pre-drain): opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-            let sets =
-                exec_sql::measure_query_sets(&consumer, &inputs, exec_sql::ITERS, "supertable_sql");
+            let sets = exec_sql::measure_query_sets(
+                &consumer,
+                &inputs,
+                exec_sql::ITERS,
+                "supertable_sql",
+                &[],
+            );
             drop(consumer);
             drop(cache_dir);
             let (anchor, title, note) = if run_lifecycle {
@@ -4245,6 +4250,7 @@ pub mod sql {
                             &inputs,
                             exec_sql::ITERS,
                             "supertable_sql",
+                            &[],
                         );
                         drop(c);
                         drop(cache_dir);

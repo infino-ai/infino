@@ -84,11 +84,12 @@ pub fn run() {
     eprintln!("[fts-diag] building supertable...");
     let build_t0 = Instant::now();
     let (table, _batches) = diag_common::build_supertable(&cfg);
-    eprintln!(
-        "[fts-diag] built in {:.1}s",
-        build_t0.elapsed().as_secs_f64()
-    );
     let reader = table.reader();
+    eprintln!(
+        "[fts-diag] built in {:.1}s ({} superfile(s) after optimize)",
+        build_t0.elapsed().as_secs_f64(),
+        reader.manifest().superfiles.len(),
+    );
 
     // Warm both paths for every shape (cache-hot before timing).
     for s in SHAPES {
@@ -97,16 +98,38 @@ pub fn run() {
             .expect("warm-up bm25_search");
     }
 
+    // Warm the count path too.
+    for s in SHAPES {
+        let _ = reader
+            .count(COLUMN, s.query, s.mode)
+            .expect("warm-up count");
+    }
+
+    // Decompose the scored path into three additive layers:
+    //   count  = posting traversal + block decode (no score, no heap)
+    //   kernel = count + BM25 scoring + top-k heap   (= bm25_hits)
+    //   full   = kernel + _id-resolution + result assembly (= bm25_search)
+    // so score+heap = kernel − count, and resolve = full − kernel. (At
+    // k=1000 over a large superfile the scored path prunes little, so
+    // count is a fair traverse/decode floor for it.)
     eprintln!();
     eprintln!(
-        "[fts-diag] {:<15}{:>8}{:>13}{:>13}{:>13}{:>10}",
-        "shape", "hits", "kernel p50", "full p50", "resolve p50", "resolve%"
+        "[fts-diag] {:<15}{:>8}{:>12}{:>12}{:>12}{:>13}{:>12}",
+        "shape", "hits", "count", "kernel", "full", "score+heap", "resolve"
     );
     for s in SHAPES {
         let hits = reader
             .bm25_hits(COLUMN, s.query, K, s.mode)
             .expect("bm25_hits")
             .len();
+
+        let mut count = Vec::with_capacity(cfg.iters);
+        for _ in 0..cfg.iters {
+            let t = Instant::now();
+            let out = reader.count(COLUMN, s.query, s.mode).expect("count");
+            count.push(t.elapsed());
+            std::hint::black_box(out);
+        }
 
         let mut kernel = Vec::with_capacity(cfg.iters);
         for _ in 0..cfg.iters {
@@ -128,22 +151,20 @@ pub fn run() {
             std::hint::black_box(out);
         }
 
+        let cp = diag_common::percentile(&mut count, 50);
         let kp = diag_common::percentile(&mut kernel, 50);
         let fp = diag_common::percentile(&mut full, 50);
+        let score_heap = kp.saturating_sub(cp);
         let resolve = fp.saturating_sub(kp);
-        let pct = if fp.as_nanos() > 0 {
-            resolve.as_nanos() as f64 / fp.as_nanos() as f64 * 100.0
-        } else {
-            0.0
-        };
         eprintln!(
-            "[fts-diag] {:<15}{:>8}{:>13}{:>13}{:>13}{:>9.0}%",
+            "[fts-diag] {:<15}{:>8}{:>12}{:>12}{:>12}{:>13}{:>12}",
             s.name,
             hits,
+            diag_common::fmt(cp),
             diag_common::fmt(kp),
             diag_common::fmt(fp),
+            diag_common::fmt(score_heap),
             diag_common::fmt(resolve),
-            pct,
         );
     }
 }

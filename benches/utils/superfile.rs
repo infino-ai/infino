@@ -1898,6 +1898,7 @@ pub mod sql {
                 &query_inputs,
                 exec_sql::ITERS,
                 "superfile_sql",
+                exec_sql::HIGH_CARD_SQL,
             );
             exec_sql::emit_query(
                 &mut report,

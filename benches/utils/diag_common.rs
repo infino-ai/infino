@@ -21,10 +21,12 @@ use std::{
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    OptimizeOptions,
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
 };
+use rayon::ThreadPoolBuilder;
 
 use crate::corpus::{self, MmapTextCorpus};
 
@@ -43,6 +45,17 @@ const DEFAULT_ITERS: usize = 15;
 pub struct DiagConfig {
     pub n_docs: usize,
     pub iters: usize,
+    /// Build the table as a **single superfile** (one writer, one commit)
+    /// instead of the default many-superfile layout (a commit produces
+    /// one superfile per writer thread = cpu/2). Lets a diagnostic
+    /// separate intrinsic single-superfile kernel cost from
+    /// cross-superfile fan-out. Set `INFINO_DIAG_SINGLE_SUPERFILE=1`.
+    pub single_superfile: bool,
+    /// Override the reader pool thread count (`INFINO_DIAG_READER_THREADS`).
+    /// `None` = engine default (num_cpu). Setting it to 1 disables the
+    /// intra-superfile sub-range fan-out (which triggers when
+    /// pool_threads > superfile count), isolating that machinery's cost.
+    pub reader_threads: Option<usize>,
 }
 
 /// Read the diagnostic config from the single shared set of knobs.
@@ -54,6 +67,10 @@ pub fn config() -> DiagConfig {
     DiagConfig {
         n_docs: corpus::supertable_docs(),
         iters,
+        reader_threads: std::env::var("INFINO_DIAG_READER_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        single_superfile: std::env::var("INFINO_DIAG_SINGLE_SUPERFILE").is_ok(),
     }
 }
 
@@ -103,16 +120,55 @@ pub fn chunk_batch(rows: &[(u64, &str)]) -> RecordBatch {
     .expect("chunk batch")
 }
 
-/// Build the diagnostic `Supertable` from a Zipfian `termNNNNN` corpus,
-/// committed one `WRITE_CHUNK` superfile at a time (in-memory store, warm
-/// by construction). Returns the table plus the chunk batches — the SQL
-/// diagnostic reuses them for its DataFusion baselines; callers that only
-/// need the table can ignore them (the batches own their data, so the
-/// corpus is dropped here).
+/// Build the diagnostic `Supertable` from a Zipfian `termNNNNN` corpus
+/// (in-memory store, warm by construction). Returns the table plus the
+/// chunk batches — the SQL diagnostic reuses them for its DataFusion
+/// baselines; callers that only need the table can ignore them (the
+/// batches own their data, so the corpus is dropped here).
+///
+/// Layout depends on [`DiagConfig::single_superfile`]: the default
+/// commits per `WRITE_CHUNK` chunk (one superfile per writer thread each
+/// commit ⇒ many superfiles), then runs default `optimize`; the
+/// single-superfile mode uses a one-thread writer and one commit so the
+/// whole table is one superfile (no cross-superfile fan-out).
 pub fn build_supertable(cfg: &DiagConfig) -> (Supertable, Vec<RecordBatch>) {
     let corpus = MmapTextCorpus::generate(cfg.n_docs, 1);
     let batches: Vec<RecordBatch> = corpus.rows().chunks(WRITE_CHUNK).map(chunk_batch).collect();
-    let table = Supertable::create(diag_options()).expect("create diag supertable");
+
+    // Optional reader-pool override (isolates the sub-range fan-out cost).
+    let with_reader = |o: SupertableOptions| -> SupertableOptions {
+        match cfg.reader_threads {
+            Some(n) => o.with_reader_pool(Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .expect("reader pool"),
+            )),
+            None => o,
+        }
+    };
+
+    if cfg.single_superfile {
+        // One writer thread + one commit ⇒ exactly one superfile.
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread writer pool"),
+        );
+        let table = Supertable::create(with_reader(diag_options().with_writer_pool(pool)))
+            .expect("create diag supertable");
+        {
+            let mut writer = table.writer().expect("writer");
+            for batch in &batches {
+                writer.append(batch).expect("append");
+            }
+            writer.commit().expect("commit");
+        }
+        return (table, batches);
+    }
+
+    let table = Supertable::create(with_reader(diag_options())).expect("create diag supertable");
     {
         let mut writer = table.writer().expect("writer");
         for batch in &batches {
@@ -120,6 +176,12 @@ pub fn build_supertable(cfg: &DiagConfig) -> (Supertable, Vec<RecordBatch>) {
             writer.commit().expect("commit");
         }
     }
+    // Optimize with defaults — the maintenance step a real deployment runs.
+    // (At small totals this leaves the per-commit superfiles as-is, since
+    // optimize only merges once the total exceeds the target size.)
+    table
+        .optimize(&OptimizeOptions::default())
+        .expect("optimize diag supertable");
     (table, batches)
 }
 
