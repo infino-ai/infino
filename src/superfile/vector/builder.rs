@@ -3573,14 +3573,8 @@ mod tests {
             before.iter().max().expect("nonempty")
         );
 
-        let n_cent = split_oversized_fine_runs(
-            &mut centroids,
-            &sample,
-            SPLIT_DIM,
-            SPLIT_REQUESTED,
-            7,
-            None,
-        );
+        let n_cent =
+            split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7, None);
         assert_eq!(centroids.len(), n_cent * SPLIT_DIM);
         assert!(n_cent > 5, "split must add sub-centroids");
         let after = run_counts(&sample, &centroids, n_cent);
@@ -3734,15 +3728,14 @@ mod tests {
                     centroids[c * SPLIT_DIM + d] = 1_000.0 + c as f32;
                 }
             }
-            let n =
-                split_oversized_fine_runs(
-                    &mut centroids,
-                    &sample,
-                    SPLIT_DIM,
-                    SPLIT_REQUESTED,
-                    7,
-                    None,
-                );
+            let n = split_oversized_fine_runs(
+                &mut centroids,
+                &sample,
+                SPLIT_DIM,
+                SPLIT_REQUESTED,
+                7,
+                None,
+            );
             (n, centroids)
         };
         assert_eq!(make(), make());
