@@ -208,12 +208,14 @@ const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
 ///
 /// * `Some(birth_versions)` — the hidden drain path. A drain wave writes one
 ///   packed superfile per shard, each spanning several cells, all sharing the
-///   wave's `birth_version`. Keep `keep_per_fragment` runs **per drain wave,
-///   pooled across every cell and shard that wave wrote**. A freshly drained
-///   delta wave keeps its share of the shortlist beside the large base wave,
-///   yet read volume tracks the number of drain waves — not the probed-cell
-///   count, which the older per-`(cell, superfile)` key multiplied against.
-/// * `None` — the user/pre-drain path. Keep `keep_per_fragment` per
+///   wave's `birth_version`. Keep `max(keep_floor, floor(keep_pct × runs))`
+///   runs **per drain wave, pooled across every cell and shard that wave
+///   wrote** — so depth scales with the wave's fine-run count. A freshly
+///   drained delta wave keeps its share of the shortlist beside the large base
+///   wave, yet read volume tracks the number of drain waves — not the
+///   probed-cell count, which the older per-`(cell, superfile)` key multiplied
+///   against.
+/// * `None` — the user/pre-drain path. Keep the same proportional amount per
 ///   `(cell, superfile)`: an undrained cell's rows scatter across every commit
 ///   fragment, so each fragment of a selected cell is probed (accepted read
 ///   amplification), and a small fragment is not crowded out by a larger
@@ -222,12 +224,23 @@ fn gate_fine_candidates_by_fragment(
     candidates: Vec<(usize, u32, f32, Option<u32>, u64)>,
     selected: &HashSet<u32>,
     selected_ordered: &[u32],
-    keep_per_fragment: usize,
+    keep_floor: usize,
+    keep_pct: f64,
     gated_target: u64,
     candidate_counts: &HashMap<(usize, u32), u64>,
     scored: &mut Vec<(usize, u32, f32)>,
     generation_of: Option<&[u64]>,
 ) -> Vec<(usize, u32, f32)> {
+    // Fine runs kept per group scale with the group's size: a fraction of its
+    // fine-cluster count, never below the floor. So large cells (more fine
+    // clusters) are probed proportionally deeper while small cells hold at the
+    // floor.
+    let fine_keep = |available: usize| -> usize {
+        ((keep_pct * available as f64).floor() as usize)
+            .max(keep_floor)
+            .max(1)
+            .min(available)
+    };
     // Shared global refill: append best-scored leftovers until the shortlist
     // holds `gated_target` postings.
     let refill = |mut gated: Vec<(usize, u32, f32)>,
@@ -255,7 +268,7 @@ fn gate_fine_candidates_by_fragment(
     };
     if let Some(gen_of) = generation_of {
         // Pool a drain wave's fine runs across all its cells and shards, keyed
-        // by `birth_version`, and keep the closest `keep_per_fragment` per wave.
+        // by `birth_version`, and keep the closest `fine_keep(runs)` per wave.
         let mut fine_by_generation: HashMap<u64, Vec<(usize, u32, f32, u64)>> = HashMap::new();
         for (si, cluster, score, cell, count) in candidates {
             match cell {
@@ -283,7 +296,7 @@ fn gate_fine_candidates_by_fragment(
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
-            let keep = keep_per_fragment.max(1).min(fine.len());
+            let keep = fine_keep(fine.len());
             let tail = fine.split_off(keep);
             gated.extend(
                 fine.into_iter()
@@ -321,7 +334,7 @@ fn gate_fine_candidates_by_fragment(
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             });
-            let keep = keep_per_fragment.max(1).min(fine.len());
+            let keep = fine_keep(fine.len());
             let tail = fine.split_off(keep);
             gated.extend(
                 fine.into_iter()
@@ -1310,7 +1323,7 @@ impl SupertableReader {
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
-            let mut cell_routing = if hidden_vector_index {
+            let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
                 if filtered && options.nprobe.is_some() {
                     // Explicit caller `nprobe` on a FILTERED query pins the
@@ -1358,19 +1371,18 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
-            // Diagnostic sweep knob: override the fine-first gate for
-            // UNFILTERED vector queries only. Off by default (unset ⇒ the
-            // manifest routing value). Filtered queries keep their own fine
-            // floor untouched, so the knob never widens or narrows a
-            // filtered sweep.
-            if !filtered
-                && let Some(fnp) = std::env::var("INFINO_VECTOR_FINE_NPROBE")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|&v| v > 0)
-            {
-                cell_routing.fine_nprobe = fnp;
-            }
+            // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
+            // count)), so depth scales with cell size. Filtered queries keep
+            // their own fixed fine floor (pct = 0); the proportional depth
+            // applies to the unfiltered default path. The floor comes from
+            // routing (config-defaulted, or the hidden manifest's stamp); the
+            // fraction is `vector.fine_nprobe_pct` (0.0 ⇒ off ⇒ fixed floor),
+            // set via config.yaml / ./infino.yaml — no env var, no rebuild.
+            let fine_nprobe_pct = if filtered {
+                0.0
+            } else {
+                config::global().vector.fine_nprobe_pct
+            };
             let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
                 .iter()
                 .filter(|(cell, _)| postings_by_cell.contains_key(cell))
@@ -1450,6 +1462,7 @@ impl SupertableReader {
                     &selected_cells,
                     &selected_cells_ordered,
                     cell_routing.fine_nprobe,
+                    fine_nprobe_pct,
                     gated_target,
                     &candidate_counts,
                     &mut scored,
@@ -1491,6 +1504,7 @@ impl SupertableReader {
                     &selected,
                     &selected_cells,
                     USER_FINE_RUNS_PER_FRAGMENT,
+                    0.0, // keep_pct: floor-only on the pre-drain user path
                     gated_target,
                     &candidate_counts,
                     &mut scored,
@@ -2977,8 +2991,9 @@ mod tests {
             candidates,
             &selected,
             &selected_ordered,
-            2, // keep_per_fragment
-            1, // gated_target: tiny so the global refill can't mask the floor
+            2,   // keep_floor
+            0.0, // keep_pct: floor-only for this test
+            1,   // gated_target: tiny so the global refill can't mask the floor
             &candidate_counts,
             &mut scored,
             None,
@@ -3021,8 +3036,9 @@ mod tests {
             candidates,
             &selected,
             &selected_ordered,
-            2, // keep_per_fragment
-            1, // gated_target: tiny so the global refill can't mask the floor
+            2,   // keep_floor
+            0.0, // keep_pct: floor-only for this test
+            1,   // gated_target: tiny so the global refill can't mask the floor
             &candidate_counts,
             &mut scored,
             Some(&birth_versions),
@@ -3036,6 +3052,45 @@ mod tests {
         // The two globally-best runs win the slots, regardless of cell.
         let kept: HashSet<u32> = gated.iter().map(|(_, c, _)| *c).collect();
         assert_eq!(kept, [10u32, 11].into_iter().collect());
+    }
+
+    #[test]
+    fn per_generation_keep_scales_with_fraction() {
+        // One drain wave, six fine runs. A 50% fraction keeps three
+        // (floor(0.5 × 6) = 3) — above the floor of one — so probe depth tracks the
+        // wave's run count instead of a fixed absolute. This is what holds
+        // recall as cells (and their fine-cluster counts) grow.
+        let candidates = vec![
+            (0usize, 10u32, 0.10f32, Some(0u32), 5u64),
+            (0, 11, 0.11, Some(0), 5),
+            (0, 12, 0.12, Some(0), 5),
+            (0, 20, 0.13, Some(1), 5),
+            (0, 21, 0.14, Some(1), 5),
+            (0, 22, 0.15, Some(1), 5),
+        ];
+        let selected: HashSet<u32> = [0, 1].into_iter().collect();
+        let selected_ordered = [0u32, 1];
+        let birth_versions = [100u64];
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let mut scored = Vec::new();
+        let gated = gate_fine_candidates_by_fragment(
+            candidates,
+            &selected,
+            &selected_ordered,
+            1,   // keep_floor: below the fraction, so the fraction wins
+            0.5, // keep_pct: 50% of the wave's six runs -> three
+            1,   // gated_target: tiny so the refill can't mask the fraction
+            &candidate_counts,
+            &mut scored,
+            Some(&birth_versions),
+        );
+        assert_eq!(gated.len(), 3, "fraction keep miscounted: {gated:?}");
+        // The three globally-best runs win the slots.
+        let kept: HashSet<u32> = gated.iter().map(|(_, c, _)| *c).collect();
+        assert_eq!(kept, [10u32, 11, 12].into_iter().collect());
     }
 
     /// Hidden path: a freshly drained delta wave sharing a cell with a large
@@ -3063,8 +3118,9 @@ mod tests {
             candidates,
             &selected,
             &selected_ordered,
-            2, // keep_per_fragment
-            1, // gated_target
+            2,   // keep_floor
+            0.0, // keep_pct: floor-only for this test
+            1,   // gated_target
             &candidate_counts,
             &mut scored,
             Some(&birth_versions),

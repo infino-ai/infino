@@ -255,6 +255,13 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
+/// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
+/// inside each selected cell. Small cells stay at this known-good minimum.
+const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
+/// Default proportional fine-probe fraction. `0.0` ⇒ proportional depth off:
+/// the probe is the fixed floor. `> 0` probes `floor(pct × cell fine clusters)`
+/// so depth tracks cell size (recall lever for large cells).
+const DEFAULT_VECTOR_FINE_NPROBE_PCT: f64 = 0.0;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
@@ -330,6 +337,17 @@ pub struct VectorSettings {
     /// number of eligible superfiles at query time; `Some(n)` forces
     /// exactly `n`.
     pub inner_budget: Option<usize>,
+    /// Per-cell fine-probe floor — the minimum number of fine IVF
+    /// clusters probed inside each selected cell. The user-table routing
+    /// default takes this value; the hidden index's per-table stamp in
+    /// the manifest overrides it. Pairs with [`Self::fine_nprobe_pct`]
+    /// as `max(floor, floor(pct × clusters))`.
+    pub fine_nprobe_floor: usize,
+    /// Proportional fine-probe fraction for UNFILTERED vector search:
+    /// probe `floor(pct × the cell's fine-cluster count)` so depth scales
+    /// with cell size. `0.0` (the default) turns the proportional depth
+    /// off, leaving the fixed floor. Filtered queries always ignore it.
+    pub fine_nprobe_pct: f64,
     /// Default rerank codec for cosine vector columns. Non-cosine
     /// metrics still use locally fitted [`RerankCodec::Sq8Residual`]
     /// at column construction time. Per-column overrides at table
@@ -387,6 +405,8 @@ impl Default for VectorSettings {
     fn default() -> Self {
         Self {
             inner_budget: None,
+            fine_nprobe_floor: DEFAULT_VECTOR_FINE_NPROBE_FLOOR,
+            fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
