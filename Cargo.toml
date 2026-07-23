@@ -163,7 +163,7 @@ tracing = "0.1"
 # against a per-Supertable cached Runtime. Tokio is single-worker
 # here: it drives DataFusion's I/O state machine, not CPU-bound work
 # (CPU work for skip + fan-out lives on the rayon reader pool).
-datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "4652d0ce9" }
+datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "0f8fda9ed" }
 # `macros` enables `#[tokio::test]` for the async DataFusion
 # integration tests; runtime weight on a release build is just the
 # proc-macro, so we keep it in [dependencies] rather than re-listing
