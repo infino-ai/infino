@@ -333,6 +333,45 @@ fn resolve_ids_arithmetic(
     )
 }
 
+/// Fill each hit's `stable_id` in place using the cheap, cache-backed
+/// resolution path: inline id / contiguous-span arithmetic where they
+/// apply, else a `_id`-column read routed through `resolve_columns` (and
+/// thus `decoded_scalar_cache`), so a warm reader decodes each superfile's
+/// `_id` column at most once and later queries hit the cache.
+///
+/// This is the resolution `resolve_hits` already uses for an id-only
+/// projection. The scored fan-out uses it to stamp its final top-k instead
+/// of a per-superfile `take_by_local_doc_ids`, which re-runs a scattered
+/// Parquet page read (~one page + decompress per hit) on *every* query and
+/// dominates large-k scored latency on real corpora (it is ~free only on a
+/// tiny table with few pages, which is why synthetic benches never saw it).
+pub(crate) async fn stamp_stable_ids(
+    reader: &SupertableReader,
+    hits: &mut [SuperfileHit],
+) -> DfResult<()> {
+    if hits.is_empty() || hits.iter().all(|h| h.stable_id.is_some()) {
+        return Ok(());
+    }
+    let id_batch = match resolve_ids_arithmetic(reader, hits) {
+        Some(batch) => batch?,
+        None => {
+            let id_column = reader.options().id_column.clone();
+            resolve_columns(reader, hits, &[id_column.as_str()]).await?
+        }
+    };
+    let ids = id_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution("stamp_stable_ids: _id column not Decimal128".into())
+        })?;
+    for (hit, id) in hits.iter_mut().zip(ids.values()) {
+        hit.stable_id = Some(*id);
+    }
+    Ok(())
+}
+
 /// Build the engine-native `_id` + `score` batch directly from already-resolved
 /// stable ids and per-hit scores — the same two-column shape `resolve_hits_named`
 /// returns for a `None` projection, but synthesized without opening any

@@ -53,7 +53,7 @@ use crate::{
         handle::SupertableReader,
         manifest::SuperfileEntry,
         query::{
-            exec::common::{take_rows_byte_source, take_rows_object_store},
+            exec::common::{stamp_stable_ids, take_rows_byte_source, take_rows_object_store},
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
@@ -308,44 +308,21 @@ pub(crate) async fn attach_stable_ids_to_hits(
     hits: &mut [SuperfileHit],
 ) -> Result<(), QueryError> {
     // Arithmetic-capable files were stamped at tag time ([`tag_hits`]);
-    // only hits from cell-packed / gapped-span files arrive unresolved. On
-    // such tables that is EVERY hit, so this must not copy hits: process
-    // contiguous same-file runs in place (unranked hits arrive file-grouped
-    // from the fan-out; ranked top-k interleaves, but is top-k-sized). Per
-    // run: one manifest lookup, one reader open, one in-place stamp.
-    let manifest = Arc::clone(table_reader.manifest());
-    let store = Arc::clone(&manifest.options.store);
-    let disk_cache = manifest.options.disk_cache.clone();
-    let storage = manifest.options.storage.clone();
-    let mut start = 0usize;
-    while start < hits.len() {
-        if hits[start].stable_id.is_some() {
-            start += 1;
-            continue;
-        }
-        let uri = hits[start].superfile;
-        let mut end = start + 1;
-        while end < hits.len() && hits[end].superfile == uri && hits[end].stable_id.is_none() {
-            end += 1;
-        }
-        let entry = manifest
-            .lookup_superfile_entry(uri)
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .ok_or_else(|| {
-                QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
-            })?;
-        // FTS post-topk id stamp — allow fill (same modality as the search).
-        let reader =
-            open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true).await?;
-        attach_stable_ids(&reader, &entry, &mut hits[start..end], true).await?;
-        if let Some(missing) = hits[start..end].iter().find(|h| h.stable_id.is_none()) {
-            return Err(QueryError::Execute(format!(
-                "hit {uri:?}/{} missing stable _id after search-wave stamping",
-                missing.local_doc_id
-            )));
-        }
-        start = end;
+    // only hits from cell-packed / gapped-span files arrive unresolved. Fill
+    // them through the shared, cache-backed id resolution: inline id / span
+    // arithmetic where possible, else a `_id`-column read via the decoded
+    // scalar cache (so a warm reader decodes each superfile's `_id` column
+    // once, not once per query). This replaces a per-superfile
+    // `take_by_local_doc_ids`, whose scattered per-query Parquet page reads
+    // dominated large-k scored latency on real corpora.
+    stamp_stable_ids(table_reader, hits)
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+    if let Some(missing) = hits.iter().find(|h| h.stable_id.is_none()) {
+        return Err(QueryError::Execute(format!(
+            "hit {:?}/{} missing stable _id after search-wave stamping",
+            missing.superfile, missing.local_doc_id
+        )));
     }
     Ok(())
 }
