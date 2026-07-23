@@ -16,8 +16,10 @@
 //! then it's a borrowed view).
 
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
+    mem,
     ops::Range,
     sync::Arc,
 };
@@ -1698,6 +1700,23 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         // The ranged (sub-range fan-out) path carries no negation in v1.
+        //
+        // Route non-dominant unions (no single term's upper bound dominates)
+        // to the windowed scorer: there MaxScore can't prune and degrades to
+        // scoring the whole union with per-doc f-way merge overhead, while
+        // the windowed scan is O(f) per window. A dominant-term union stays
+        // on MaxScore, whose block-skip pruning is the win there.
+        if prefer_windowed_union(&cursors) {
+            return self.run_windowed_union(
+                column_id,
+                cursors,
+                k,
+                None,
+                floor.next_down(),
+                doc_id_start,
+                doc_id_end,
+            );
+        }
         self.run_max_score_bmm_range(
             column_id,
             cursors,
@@ -3076,11 +3095,27 @@ impl FtsReader {
         // Floor-seeded threshold, identical to the MaxScore path.
         let mut threshold: f32 = floor_eff.max(0.0);
 
-        // Per-window state, allocated once and reused across windows.
-        // Cleared lazily during the drain (only touched slots), so reset
-        // cost is proportional to matches, not to OR_WINDOW.
-        let mut scores = vec![0.0f32; OR_WINDOW as usize];
-        let mut present = [0u64; OR_WINDOW_WORDS];
+        // Per-window state, reused across windows AND across calls. The
+        // fan-out invokes this once per (superfile, sub-range) — many calls
+        // per query — so a per-call `scores` allocation (`OR_WINDOW` f32s)
+        // dominates small/sparse unions where the scan itself is cheap.
+        // Keep the buffers in a thread-local (each reader-pool worker its
+        // own) and take / restore them; the drain leaves both fully zeroed,
+        // so reuse needs no re-zero. `touched` records which presence words
+        // a window sets, so the drain visits only those rather than scanning
+        // all `OR_WINDOW_WORDS` every window.
+        thread_local! {
+            static WINDOWED_SCRATCH: RefCell<(Vec<f32>, Vec<u64>, Vec<usize>)> =
+                const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+        }
+        let (mut scores, mut present, mut touched) =
+            WINDOWED_SCRATCH.with(|c| mem::take(&mut *c.borrow_mut()));
+        if scores.len() != OR_WINDOW as usize {
+            scores.resize(OR_WINDOW as usize, 0.0);
+        }
+        if present.len() != OR_WINDOW_WORDS {
+            present.resize(OR_WINDOW_WORDS, 0);
+        }
 
         loop {
             // Next non-empty window: smallest current doc among live
@@ -3138,7 +3173,11 @@ impl FtsReader {
                             for lane in 0..bm25::SCORE_SIMD_LANES {
                                 let local = (doc_ids[lane] - base) as usize;
                                 scores[local] += contributions[lane];
-                                present[local >> 6] |= 1u64 << (local & 63);
+                                let w = local >> 6;
+                                if present[w] == 0 {
+                                    touched.push(w);
+                                }
+                                present[w] |= 1u64 << (local & 63);
                             }
                             c.advance_by(bm25::SCORE_SIMD_LANES);
                             continue;
@@ -3150,16 +3189,24 @@ impl FtsReader {
                         c.current_tf(),
                         dl_norm_k1.get(d),
                     );
-                    present[local >> 6] |= 1u64 << (local & 63);
+                    let w = local >> 6;
+                    if present[w] == 0 {
+                        touched.push(w);
+                    }
+                    present[w] |= 1u64 << (local & 63);
                     c.next();
                 }
             }
 
             // Drain ascending; clear touched slots for reuse; apply
-            // negation; offer to the heap.
-            for (word_idx, word) in present.iter_mut().enumerate() {
-                let mut bits = *word;
-                *word = 0;
+            // negation; offer to the heap. Only the words this window set are
+            // visited (sorted for ascending doc order), so a sparse/spread
+            // window costs O(touched words) instead of a fixed
+            // O(OR_WINDOW_WORDS) full-bitset scan.
+            touched.sort_unstable();
+            for &word_idx in &touched {
+                let mut bits = present[word_idx];
+                present[word_idx] = 0;
                 while bits != 0 {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
@@ -3184,8 +3231,17 @@ impl FtsReader {
                     }
                 }
             }
+            touched.clear();
         }
 
+        // Restore the (drained, zeroed) buffers for the next call on this
+        // thread.
+        WINDOWED_SCRATCH.with(|c| {
+            let mut g = c.borrow_mut();
+            g.0 = scores;
+            g.1 = present;
+            g.2 = touched;
+        });
         Ok(drain_top_k_desc(heap))
     }
 
