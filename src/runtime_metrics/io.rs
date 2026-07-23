@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Connection-scoped object-store usage meter — the **sole** I/O ledger.
+//! Object-store I/O metering — the **sole** connection-scoped I/O ledger,
+//! plus background vs foreground attribution for that ledger.
 //!
-//! Providers and [`super::counting`] wrappers record here. Benches and the
-//! usage flush read [`UsageMeter::snapshot`]; they must not keep a parallel
-//! counter implementation.
+//! Parallel to [`super::cpu`] and [`super::rss`]: one resource family per
+//! module (`io` / `cpu` / `rss`).
+//!
+//! Storage providers and counting wrappers `record_*` here. Benches and
+//! `features = ["metering"]` consumers read [`UsageMeter::snapshot`];
+//! they must not keep a parallel counter implementation.
 
 use std::{
     array, fmt,
+    future::Future,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -17,7 +22,30 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::io_counters::io_is_background;
+tokio::task_local! {
+    /// Set to `true` inside a background cache-fill task so its
+    /// object-store reads are distinguishable from foreground
+    /// query reads. Absent (→ foreground) on the query path.
+    static IO_BACKGROUND: bool;
+}
+
+/// Whether the current task is a background cache-fill
+/// (`false` unless the task-local flag is set).
+pub fn io_is_background() -> bool {
+    IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
+}
+
+/// Run `fut` with [`io_is_background`] true for the current task.
+///
+/// Background cache-fill GETs wrap their object-store calls in this
+/// so meters and timelines can attribute them separately from
+/// foreground query reads.
+pub async fn scope_background<F>(fut: F) -> F::Output
+where
+    F: Future,
+{
+    IO_BACKGROUND.scope(true, fut).await
+}
 
 /// Path token of the hidden vector-index sibling's storage prefix
 /// (`_infino_<uuid>_vector_index/...` under the table root).
@@ -179,7 +207,7 @@ fn process_default_meter() -> Arc<UsageMeter> {
     Arc::clone(METER.get_or_init(UsageMeter::new))
 }
 
-/// Connection-scoped (or process-default) usage ledger.
+/// Connection-scoped (or process-default) object-store I/O ledger.
 pub struct UsageMeter {
     head_count: AtomicU64,
     get_count: AtomicU64,
@@ -257,7 +285,7 @@ impl UsageMeter {
     }
 
     /// Record a successful GET / range / tail. `uri` drives [`UriClass`];
-    /// background tasks (`io_counters::scope_background`) land in `bg_get_*`.
+    /// background tasks ([`scope_background`]) land in `bg_get_*`.
     pub fn record_get(&self, uri: &str, range: Option<(u64, u64)>, bytes: u64) {
         if io_is_background() {
             self.bg_get_count.fetch_add(1, Ordering::Relaxed);
@@ -333,7 +361,6 @@ impl UsageMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::io_counters::scope_background;
 
     #[test]
     fn uri_class_covers_user_and_hidden() {

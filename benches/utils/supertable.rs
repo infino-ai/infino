@@ -10,12 +10,11 @@
 //! single-modality peers: FTS-only, vector-only, SQL, and combined FTS +
 //! vector.
 //!
-//! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
-//! multi-commit build relies on conditional `If-Match` PUTs that the
-//! `s3s-fs` emulator does not implement, so this bench rejects `s3s_fs` (the
-//! default) and exits with a message otherwise. Every object the run writes
-//! lands under one unique prefix per shape, all deleted before the runner
-//! returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
+//! **RustFS (default), S3, or Azure** — the multi-commit build relies on
+//! conditional `If-Match` PUTs; the default local RustFS session implements
+//! them. Real S3 and Azure are also supported. Every object the run writes
+//! lands under one unique bucket/prefix per shape, all deleted before the
+//! runner returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
 //!
 //! ## Per-shape process isolation
 //!
@@ -31,6 +30,7 @@
 //! ## Invocation
 //!
 //! ```text
+//! cargo bench -- supertable
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench -- supertable
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
 //!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench -- supertable
@@ -46,6 +46,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow_array::RecordBatch;
 use infino::{
     OptimizeOptions,
     supertable::{
@@ -647,11 +648,26 @@ fn run_metered_optimize(
     (wall_s, io, peak_rss, cpu_s)
 }
 
-fn store_phases_with_compaction(
+/// Fill cold + drain + delta + compaction slots on [`cost::StorePhases`].
+fn store_phases_lifecycle(
     measured: Option<ColdStoreMeasurement>,
+    drain: Option<CompactionStats>,
+    delta: Option<CompactionStats>,
     compaction: Option<CompactionStats>,
 ) -> cost::StorePhases {
     let mut store = store_phases_from_measurement(measured);
+    if let Some((wall_s, io, peak_rss, cpu_s)) = drain {
+        store.drain = Some(io);
+        store.drain_wall_s = Some(wall_s);
+        store.drain_cpu_s = cpu_s;
+        store.drain_peak_rss_bytes = Some(peak_rss);
+    }
+    if let Some((wall_s, io, peak_rss, cpu_s)) = delta {
+        store.delta_commit = Some(io);
+        store.delta_commit_wall_s = Some(wall_s);
+        store.delta_commit_cpu_s = cpu_s;
+        store.delta_commit_peak_rss_bytes = Some(peak_rss);
+    }
     if let Some((wall_s, io, peak_rss, cpu_s)) = compaction {
         store.compaction = Some(io);
         store.compaction_wall_s = Some(wall_s);
@@ -661,13 +677,86 @@ fn store_phases_with_compaction(
     store
 }
 
-/// Open a metered consumer, run [`run_metered_optimize`], return stats.
-/// The table on `built.storage` is left in the compacted layout.
-fn optimize_built_table(
+/// Metered [`Supertable::drain_vectors_to_cells_sync`]. On FTS/SQL tables
+/// this is a no-op (no hidden vector index) but still brackets a real
+/// drain window so the lifecycle matches the vector cell.
+fn run_metered_drain(
+    label: &str,
+    consumer: &Supertable,
+    meter: &storage_meter::MeteredStorage,
+) -> CompactionStats {
+    eprintln!("[{label}] draining (hidden vector cells; no-op when absent)...");
+    let before = meter.snapshot();
+    let sampler = PeakSampler::start_default();
+    let (result, wall, cpu_s) = cpu::timed(|| consumer.drain_vectors_to_cells_sync());
+    result.expect("drain");
+    let wall_s = wall.as_secs_f64();
+    let rss_stats = sampler.stop_stats();
+    let peak_rss = rss_stats.peak_rss_bytes;
+    let io = meter.snapshot().since(&before);
+    eprintln!(
+        "[{label}] drain object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s \
+         (peak RSS {} / anon {} / file {})",
+        io.put_count,
+        rss::fmt_bytes(io.put_bytes),
+        io.get_count,
+        rss::fmt_bytes(io.get_bytes),
+        rss::fmt_bytes(peak_rss),
+        rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
+        rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
+    );
+    (wall_s, io, peak_rss, cpu_s)
+}
+
+/// Metered follow-up `append` of one normal commit (the undrained delta).
+fn run_metered_delta_append(
+    label: &str,
+    consumer: &Supertable,
+    meter: &storage_meter::MeteredStorage,
+    batch: &RecordBatch,
+) -> CompactionStats {
+    let n_rows = batch.num_rows();
+    eprintln!("[{label}] committing {n_rows} undrained delta rows...");
+    let before = meter.snapshot();
+    let sampler = PeakSampler::start_default();
+    let (result, wall, cpu_s) = cpu::timed(|| consumer.append(batch));
+    result.expect("delta append");
+    let wall_s = wall.as_secs_f64();
+    let rss_stats = sampler.stop_stats();
+    let peak_rss = rss_stats.peak_rss_bytes;
+    let io = meter.snapshot().since(&before);
+    eprintln!(
+        "[{label}] delta commit: {n_rows} rows, {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s \
+         (peak RSS {})",
+        io.put_count,
+        rss::fmt_bytes(io.put_bytes),
+        io.get_count,
+        rss::fmt_bytes(io.get_bytes),
+        rss::fmt_bytes(peak_rss),
+    );
+    (wall_s, io, peak_rss, cpu_s)
+}
+
+/// Measure/emit hook points between the shared FTS/SQL mutations.
+#[derive(Clone, Copy)]
+enum TextLifecyclePhase {
+    Drain,
+    Delta,
+    Compact,
+}
+
+/// Shared FTS/SQL mutation sequence: open a metered consumer, then
+/// drain → delta append → optimize, invoking `on_phase` after each
+/// step (and after the consumer is dropped post-optimize). Vector
+/// keeps its own OPANN-aware path. Drain is a no-op without a hidden
+/// vector index but is still metered for phase parity across modalities.
+fn run_metered_text_lifecycle(
     label: &str,
     modality: Modality,
     built: &supertable::IngestResult,
-) -> CompactionStats {
+    delta: &RecordBatch,
+    mut on_phase: impl FnMut(TextLifecyclePhase),
+) -> (CompactionStats, CompactionStats, CompactionStats) {
     let meter = storage_meter::wrap(Arc::clone(&built.storage));
     let (cache_dir, cache) =
         tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
@@ -677,10 +766,15 @@ fn optimize_built_table(
         cache,
     );
     let consumer = tiers::open_consumer(opts);
-    let stats = run_metered_optimize(label, &consumer, &meter);
+    let drain = run_metered_drain(label, &consumer, &meter);
+    on_phase(TextLifecyclePhase::Drain);
+    let delta_stats = run_metered_delta_append(label, &consumer, &meter, delta);
+    on_phase(TextLifecyclePhase::Delta);
+    let compaction = run_metered_optimize(label, &consumer, &meter);
     drop(consumer);
     drop(cache_dir);
-    stats
+    on_phase(TextLifecyclePhase::Compact);
+    (drain, delta_stats, compaction)
 }
 
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
@@ -857,25 +951,6 @@ fn build_measured(
     (built, metrics)
 }
 
-/// Obtain the search artifact for modalities that don't need the corpus after
-/// build (FTS, SQL): in dataset mode open the pre-uploaded dataset (no corpus,
-/// no ingest); otherwise generate the corpus and ingest it. Vector keeps its
-/// corpus for recall ground truth and calls [`build_measured`] directly.
-fn build_or_open(
-    modality: Modality,
-    phases: Phases,
-) -> (supertable::IngestResult, Option<ShapeMetrics>) {
-    // Dataset mode opens the pre-uploaded dataset only for read phases; a
-    // build phase is the prepare step, which still ingests (to the fixed
-    // prefix).
-    if crate::dataset::dataset_mode() && !phases.build {
-        return (supertable::open_dataset(modality), None);
-    }
-    // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-    let corpus = supertable::prepare_corpus(modality);
-    build_measured(modality, &corpus, phases)
-}
-
 fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
@@ -937,14 +1012,24 @@ pub mod fts {
             return;
         }
 
-        let (built, ingest_metrics) = build_or_open(Modality::Fts, phases);
+        // Fresh ingest retains the text corpus for the undrained delta commit.
+        let (built, ingest_metrics, mut corpus) = if crate::dataset::dataset_mode() && !phases.build
+        {
+            (supertable::open_dataset(Modality::Fts), None, None)
+        } else {
+            let corpus = supertable::prepare_corpus(Modality::Fts);
+            let (built, metrics) = build_measured(Modality::Fts, &corpus, phases);
+            (built, metrics, Some(corpus))
+        };
         if let Some(metrics) = &ingest_metrics {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
-        // Optimize + post-compact only on a fresh ingest in this process —
-        // without drain/delta/OPANN.
-        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
+        // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
+        // → compact → post-compact) on a fresh ingest in this process —
+        // same gate as the vector cell. Drain is a no-op without a hidden
+        // vector index but is still metered for phase parity.
+        let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
@@ -954,21 +1039,21 @@ pub mod fts {
             drop(cache_dir);
         }
 
-        // Pre-compact (or sole) search: fragmented post-ingest layout.
+        // Pre-drain (or sole) search: fragmented post-ingest layout.
         let (warm_pre, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
             Some((w, c, l)) => (Some(w), Some(c), Some(l)),
             None => (None, None, None),
         };
         let cold_pre = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
-            let (anchor, title, note) = if run_optimize {
+            let (anchor, title, note) = if run_lifecycle {
                 (
-                    "bench/fts/supertable/search-pre-compact",
+                    "bench/fts/supertable/search/pre-drain",
                     format!(
-                        "Supertable FTS — search pre-compact, multi-superfile / object-store ({} docs)",
+                        "Supertable FTS — search pre-drain, multi-superfile / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Pre-compact (post-ingest fanout): warm = shared consumer + disk cache; \
+                    "Pre-drain (post-ingest fanout): warm = shared consumer + disk cache; \
                      cold open = construct only; cold search = first bm25_search. Δ vs previous run."
                         .to_string(),
                 )
@@ -1040,38 +1125,78 @@ pub mod fts {
             );
         }
 
-        let compaction_stats =
-            run_optimize.then(|| optimize_built_table("supertable_fts", Modality::Fts, &built));
-
-        // Post-compact search + cost-cold (steady serving layout).
-        let (warm_post, cold_post) = if run_optimize {
-            let warm_post = phases.warm.then(|| {
-                let (w, _, _) = measure_warm(&built);
-                w
-            });
-            let cold_post = phases.cold.then(|| measure_cold(&built));
-            if phases.warm || phases.cold {
-                exec_fts::emit_search(
-                    &mut report,
-                    "bench/fts/supertable/search-post-compact",
-                    format!(
-                        "Supertable FTS — search post-compact, multi-superfile / object-store ({} docs)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact (after optimize): fewer superfiles; warm/cold recipe unchanged. \
-                     This is the steady-state layout the cost model prices. Δ vs previous run.",
-                    warm_post.as_deref(),
-                    cold_post.as_ref(),
-                    None,
-                );
-            }
+        let mut drain_stats = None;
+        let mut delta_stats = None;
+        let mut compaction_stats = None;
+        let (warm_post, cold_post) = if run_lifecycle {
+            let delta_batch = supertable::fts_delta_batch(
+                corpus
+                    .as_ref()
+                    .expect("FTS lifecycle retains text corpus for delta"),
+            );
+            let mut warm_post = None;
+            let mut cold_post = None;
+            let (drain, delta, compaction) = run_metered_text_lifecycle(
+                "supertable_fts",
+                Modality::Fts,
+                &built,
+                &delta_batch,
+                |phase| {
+                    let (anchor_suffix, note) = match phase {
+                        TextLifecyclePhase::Drain => (
+                            "post-drain",
+                            "Post-drain (after drain_vectors_to_cells; no-op without a hidden vector index). \
+                             Same warm/cold recipe as pre-drain. Δ vs previous run.",
+                        ),
+                        TextLifecyclePhase::Delta => (
+                            "post-delta",
+                            "Post-delta (base commits + one undrained follow-up commit). Warm/cold recipe \
+                             unchanged. Δ vs previous run.",
+                        ),
+                        TextLifecyclePhase::Compact => (
+                            "post-compact",
+                            "Post-compact (after optimize): fewer superfiles; warm/cold recipe unchanged. \
+                             Steady-state layout the cost model prices. Δ vs previous run.",
+                        ),
+                    };
+                    let warm = phases.warm.then(|| {
+                        let (w, _, _) = measure_warm(&built);
+                        w
+                    });
+                    let cold = phases.cold.then(|| measure_cold(&built));
+                    if phases.warm || phases.cold {
+                        exec_fts::emit_search(
+                            &mut report,
+                            &format!("bench/fts/supertable/search/{anchor_suffix}"),
+                            format!(
+                                "Supertable FTS — search {anchor_suffix}, multi-superfile / object-store ({} docs)",
+                                fmt_count(n_docs)
+                            ),
+                            note,
+                            warm.as_deref(),
+                            cold.as_ref(),
+                            None,
+                        );
+                    }
+                    if matches!(phase, TextLifecyclePhase::Compact) {
+                        warm_post = warm;
+                        cold_post = cold;
+                    }
+                },
+            );
+            drop(delta_batch);
+            drop(corpus.take());
+            drain_stats = Some(drain);
+            delta_stats = Some(delta);
+            compaction_stats = Some(compaction);
             (warm_post, cold_post)
         } else {
+            drop(corpus.take());
             (None, None)
         };
 
         if phases.warm || phases.cold {
-            let (warm_for_cost, cold_for_cost, pre_latencies) = if run_optimize {
+            let (warm_for_cost, cold_for_cost, pre_latencies) = if run_lifecycle {
                 (
                     warm_post.as_deref().unwrap_or(&[]),
                     cold_post.as_ref(),
@@ -1112,8 +1237,13 @@ pub mod fts {
                         Some(&cold_vec)
                     },
                     pre_refs,
-                    false,
-                    store_phases_with_compaction(cold_measured, compaction_stats),
+                    run_lifecycle,
+                    store_phases_lifecycle(
+                        cold_measured,
+                        drain_stats,
+                        delta_stats,
+                        compaction_stats,
+                    ),
                     None,
                 );
             }
@@ -3125,6 +3255,11 @@ pub mod vector {
                     == Some("1");
             let skip_vector_delta =
                 std::env::var(SKIP_VECTOR_DELTA_ENV).ok().as_deref() == Some("1");
+            // Force compaction (optimize) + post-compact on a reopened, already-drained
+            // table -- otherwise a drained existing prefix reports phase-derived only and
+            // never exercises the split.
+            let force_compact =
+                std::env::var("INFINO_BENCH_FORCE_COMPACT").ok().as_deref() == Some("1");
 
             let search_title = |phase: &str| {
                 format!(
@@ -3196,6 +3331,9 @@ pub mod vector {
             } else {
                 force_pre_post_drain
             };
+            // Run compaction/split + post-compact either in the forced drain
+            // lifecycle or when explicitly forced on a reopened drained table.
+            let run_compact = pre_post_drain || force_compact;
             let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
                 None;
             let mut delta_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
@@ -3697,7 +3835,7 @@ pub mod vector {
                 // Optimize compacts user + hidden physical files; when the
                 // delta phase ran it first drains that tail. The following
                 // state must therefore be hidden-only in either mode.
-                let compaction_stats = pre_post_drain.then(|| {
+                let compaction_stats = run_compact.then(|| {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
@@ -3731,7 +3869,7 @@ pub mod vector {
                     });
                 }
                 let mut cold_split_post = None;
-                if pre_post_drain {
+                if run_compact {
                     let compact_map = delta_id_to_dense.as_ref().unwrap_or(&id_to_dense);
                     let compact_truth = if skip_vector_delta {
                         &gt_correct
@@ -3956,7 +4094,16 @@ pub mod sql {
 
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_sql");
-        let (built, ingest_metrics) = build_or_open(Modality::Sql, phases);
+
+        // Fresh ingest retains the text corpus for the undrained delta commit.
+        let (built, ingest_metrics, mut corpus) = if crate::dataset::dataset_mode() && !phases.build
+        {
+            (supertable::open_dataset(Modality::Sql), None, None)
+        } else {
+            let corpus = supertable::prepare_corpus(Modality::Sql);
+            let (built, metrics) = build_measured(Modality::Sql, &corpus, phases);
+            (built, metrics, Some(corpus))
+        };
         if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
@@ -3987,9 +4134,11 @@ pub mod sql {
                 .expect("sql ingest sets sample_key"),
         };
 
-        // Optimize + post-compact only on a fresh ingest in this process —
-        // same gate as FTS.
-        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
+        // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
+        // → compact → post-compact) on a fresh ingest in this process —
+        // same gate as FTS/vector. Drain is a no-op without a hidden
+        // vector index but is still metered for phase parity.
+        let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
@@ -3998,9 +4147,9 @@ pub mod sql {
             drop(cache_dir);
         }
 
-        // Pre-compact (or sole) warm/cold on the post-ingest layout.
+        // Pre-drain (or sole) warm/cold on the post-ingest layout.
         let warm_sets_pre = if phases.warm {
-            eprintln!("[supertable_sql] warm (pre-compact): opening consumer...");
+            eprintln!("[supertable_sql] warm (pre-drain): opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
             let sets = exec_sql::measure_query_sets(
                 &consumer,
@@ -4011,14 +4160,14 @@ pub mod sql {
             );
             drop(consumer);
             drop(cache_dir);
-            let (anchor, title, note) = if run_optimize {
+            let (anchor, title, note) = if run_lifecycle {
                 (
-                    "bench/sql/supertable/warm-pre-compact",
+                    "bench/sql/supertable/warm/pre-drain",
                     format!(
-                        "Supertable SQL — warm queries pre-compact, warm cache / object-store ({} rows)",
+                        "Supertable SQL — warm queries pre-drain, warm cache / object-store ({} rows)",
                         fmt_count(n_docs)
                     ),
-                    "Pre-compact (post-ingest fanout): each query once untimed (cache fill), then p50 / p90 / p99. Δ vs previous run.",
+                    "Pre-drain (post-ingest fanout): each query once untimed (cache fill), then p50 / p90 / p99. Δ vs previous run.",
                 )
             } else {
                 (
@@ -4042,14 +4191,14 @@ pub mod sql {
                 COLD_ITERS,
                 "supertable_sql",
             );
-            let (anchor, title, note) = if run_optimize {
+            let (anchor, title, note) = if run_lifecycle {
                 (
-                    "bench/sql/supertable/cold-pre-compact",
+                    "bench/sql/supertable/cold/pre-drain",
                     format!(
-                        "Supertable SQL — cold queries pre-compact, fresh cache / object-store ({} rows)",
+                        "Supertable SQL — cold queries pre-drain, fresh cache / object-store ({} rows)",
                         fmt_count(n_docs)
                     ),
-                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. Δ vs previous run.",
+                    "Pre-drain cold: open = construct only; search is the first query on that cold consumer. Δ vs previous run.",
                 )
             } else {
                 (
@@ -4067,58 +4216,100 @@ pub mod sql {
             None
         };
 
-        let compaction_stats =
-            run_optimize.then(|| optimize_built_table("supertable_sql", Modality::Sql, &built));
-
-        let (warm_sets_post, cold_post) = if run_optimize {
-            let warm_sets_post = if phases.warm {
-                eprintln!("[supertable_sql] warm (post-compact): opening consumer...");
-                let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-                let sets = exec_sql::measure_query_sets(
-                    &consumer,
-                    &inputs,
-                    exec_sql::ITERS,
-                    "supertable_sql",
-                    &[],
-                );
-                drop(consumer);
-                drop(cache_dir);
-                exec_sql::emit_query(
-                    &mut report,
-                    "bench/sql/supertable/warm-post-compact",
-                    format!(
-                        "Supertable SQL — warm queries post-compact, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact (after optimize): fewer superfiles; same warm recipe. Steady-state layout for the cost model. Δ vs previous run.",
-                    &sets,
-                );
-                Some(sets)
-            } else {
-                None
-            };
-            let cold_post = if phases.cold {
-                let cold = exec_sql::measure_cold(
-                    || SupertableSqlColdGuard::open(&built),
-                    COLD_ITERS,
-                    "supertable_sql",
-                );
-                exec_sql::emit_cold(
-                    &mut report,
-                    "bench/sql/supertable/cold-post-compact",
-                    format!(
-                        "Supertable SQL — cold queries post-compact, fresh cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
-                    &cold,
-                );
-                Some(cold)
-            } else {
-                None
-            };
+        let mut drain_stats = None;
+        let mut delta_stats = None;
+        let mut compaction_stats = None;
+        let (warm_sets_post, cold_post) = if run_lifecycle {
+            let delta_batch = supertable::sql_delta_batch(
+                corpus
+                    .as_ref()
+                    .expect("SQL lifecycle retains text corpus for delta"),
+            );
+            let mut warm_sets_post = None;
+            let mut cold_post = None;
+            let (drain, delta, compaction) = run_metered_text_lifecycle(
+                "supertable_sql",
+                Modality::Sql,
+                &built,
+                &delta_batch,
+                |phase| {
+                    let (suffix, warm_note, cold_note) = match phase {
+                        TextLifecyclePhase::Drain => (
+                            "post-drain",
+                            "Post-drain (after drain_vectors_to_cells; no-op without a hidden vector index). Same warm recipe as pre-drain. Δ vs previous run.",
+                            "Post-drain cold: open = construct only; search is the first query. Δ vs previous run.",
+                        ),
+                        TextLifecyclePhase::Delta => (
+                            "post-delta",
+                            "Post-delta (base commits + one undrained follow-up commit). Same warm recipe. Δ vs previous run.",
+                            "Post-delta cold: open = construct only; search is the first query. Δ vs previous run.",
+                        ),
+                        TextLifecyclePhase::Compact => (
+                            "post-compact",
+                            "Post-compact (after optimize): fewer superfiles; same warm recipe. Steady-state layout for the cost model. Δ vs previous run.",
+                            "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
+                        ),
+                    };
+                    let warm = if phases.warm {
+                        eprintln!("[supertable_sql] warm ({suffix}): opening consumer...");
+                        let (cache_dir, c) = open_consumer(Modality::Sql, &built);
+                        let sets = exec_sql::measure_query_sets(
+                            &c,
+                            &inputs,
+                            exec_sql::ITERS,
+                            "supertable_sql",
+                            &[],
+                        );
+                        drop(c);
+                        drop(cache_dir);
+                        exec_sql::emit_query(
+                            &mut report,
+                            &format!("bench/sql/supertable/warm/{suffix}"),
+                            format!(
+                                "Supertable SQL — warm queries {suffix}, warm cache / object-store ({} rows)",
+                                fmt_count(n_docs)
+                            ),
+                            warm_note,
+                            &sets,
+                        );
+                        Some(sets)
+                    } else {
+                        None
+                    };
+                    let cold = if phases.cold {
+                        let cold = exec_sql::measure_cold(
+                            || SupertableSqlColdGuard::open(&built),
+                            COLD_ITERS,
+                            "supertable_sql",
+                        );
+                        exec_sql::emit_cold(
+                            &mut report,
+                            &format!("bench/sql/supertable/cold/{suffix}"),
+                            format!(
+                                "Supertable SQL — cold queries {suffix}, fresh cache / object-store ({} rows)",
+                                fmt_count(n_docs)
+                            ),
+                            cold_note,
+                            &cold,
+                        );
+                        Some(cold)
+                    } else {
+                        None
+                    };
+                    if matches!(phase, TextLifecyclePhase::Compact) {
+                        warm_sets_post = warm;
+                        cold_post = cold;
+                    }
+                },
+            );
+            drop(delta_batch);
+            drop(corpus.take());
+            drain_stats = Some(drain);
+            delta_stats = Some(delta);
+            compaction_stats = Some(compaction);
             (warm_sets_post, cold_post)
         } else {
+            drop(corpus.take());
             (None, None)
         };
 
@@ -4138,7 +4329,7 @@ pub mod sql {
             .as_ref()
             .map(cost::cold_from_timings)
             .unwrap_or_default();
-        let (warm_vec, cold_vec, pre_latencies) = if run_optimize {
+        let (warm_vec, cold_vec, pre_latencies) = if run_lifecycle {
             (
                 warm_post_vec.as_slice(),
                 cold_post_vec.as_slice(),
@@ -4159,8 +4350,8 @@ pub mod sql {
                 warm_vec,
                 (!cold_vec.is_empty()).then_some(cold_vec),
                 pre_latencies,
-                false,
-                store_phases_with_compaction(cold_measured, compaction_stats),
+                run_lifecycle,
+                store_phases_lifecycle(cold_measured, drain_stats, delta_stats, compaction_stats),
                 None,
             );
         }

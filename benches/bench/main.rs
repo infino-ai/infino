@@ -186,7 +186,7 @@ fn dataset_usage_and_exit(code: i32) -> ! {
          run     : prepare if absent, then bench\n\
          \n\
          Modality defaults to all three; phase (bench/run only) defaults to search (warm+cold).\n\
-         Doc count: INFINO_BENCH_SUPERTABLE_DOCS. Store: INFINO_BENCH_STORE (s3 | azure).\n"
+         Doc count: INFINO_BENCH_SUPERTABLE_DOCS. Store: INFINO_BENCH_STORE (rustfs | s3 | azure).\n"
     );
     std::process::exit(code);
 }

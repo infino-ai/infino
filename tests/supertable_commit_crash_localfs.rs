@@ -51,7 +51,7 @@
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
-//! filesystem behavior; s3s-fs's crash story is its own
+//! filesystem behavior; RustFS's crash story is its own
 //! concern.
 
 #![deny(clippy::unwrap_used)]

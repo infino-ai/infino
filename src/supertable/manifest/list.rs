@@ -71,8 +71,6 @@ const DEFAULT_CELL_NPROBE_MAX: usize = 1;
 /// Inert while `nprobe_max == nprobe_min`; acts only when a table
 /// explicitly widens its persisted routing.
 const DEFAULT_CELL_SLACK: f32 = 1.0;
-/// Fine IVF centroids probed inside the selected cell.
-const DEFAULT_CELL_FINE_NPROBE: usize = 8;
 
 // ---------- Public in-memory shapes ----------
 
@@ -348,7 +346,8 @@ pub struct CellRoutingParams {
     pub nprobe_max: usize,
     /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
     pub slack: f32,
-    /// Fine IVF centroids probed across the selected hidden cells.
+    /// Floor on fine IVF centroids probed per selected hidden cell. The
+    /// actual probe is `max(this, floor(pct × the cell's fine-cluster count))`.
     pub fine_nprobe: usize,
 }
 
@@ -358,7 +357,7 @@ impl Default for CellRoutingParams {
             nprobe_min: DEFAULT_CELL_NPROBE_MIN,
             nprobe_max: DEFAULT_CELL_NPROBE_MAX,
             slack: DEFAULT_CELL_SLACK,
-            fine_nprobe: DEFAULT_CELL_FINE_NPROBE,
+            fine_nprobe: crate::config::global().vector.fine_nprobe_floor,
         }
     }
 }

@@ -138,6 +138,18 @@ vector:
   # query time; set an integer to force exactly that many.
   inner_budget: ~
 
+  # Per-cell fine-probe floor: the minimum fine IVF clusters probed inside
+  # each selected cell. The user-table routing default takes this; the
+  # hidden index's per-table stamp in the manifest overrides it. Pairs with
+  # fine_nprobe_pct as max(floor, floor(pct × cell fine-cluster count)).
+  fine_nprobe_floor: 4
+
+  # Proportional fine-probe fraction for UNFILTERED vector search: probe
+  # floor(pct × the cell's fine-cluster count), so depth tracks cell size.
+  # 0.0 turns the proportional depth off (fixed floor); > 0 opts in — the
+  # recall lever for large cells. Filtered queries ignore this.
+  fine_nprobe_pct: 0.0
+
   # K-means training points per centroid for the drain's per-cell
   # sub-builds.
   kmeans_pts_per_centroid: 64

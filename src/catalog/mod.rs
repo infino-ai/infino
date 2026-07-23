@@ -47,9 +47,10 @@ use crate::{
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
+    runtime_metrics::io::{UsageMeter, UsageSnapshot},
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
-        StorageError, StorageProvider, UsageMeter, UsageSnapshot,
+        StorageError, StorageProvider,
     },
     superfile::{
         builder::FtsConfig,
@@ -199,15 +200,18 @@ impl Connection {
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
-    /// Not part of the curated public API — unit tests / `test-helpers` only.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Visible under `test-helpers`, `metering`, or `cfg(test)` — not part
+    /// of the curated default public API.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn usage_snapshot(&self) -> UsageSnapshot {
         self.inner.usage_meter.snapshot()
     }
 
     /// Object-store usage ledger for this connection. Shared by every table
     /// provider; benches and diagnostics hold the `Arc` across phases.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Visible under `test-helpers`, `metering`, or `cfg(test)` — not part
+    /// of the curated default public API.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.inner.usage_meter)
     }

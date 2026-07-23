@@ -1996,7 +1996,7 @@ pub mod sql {
     /// cold reads exercise `Supertable::open` + `reader().query_sql`.
     ///
     /// The write is a single commit at superfile scale; this keeps the
-    /// default `s3s_fs` fixture usable while still writing the same parquet
+    /// default RustFS fixture usable while still writing the same parquet
     /// superfile format that warm SQL reads.
     fn build_cold_artifact(rows: &[SqlRow<'_>]) -> ColdSqlArtifact {
         eprintln!(

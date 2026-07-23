@@ -39,7 +39,7 @@ use crate::{
             cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
             distance::{Metric, dequantize_sq8_residual_into, distance, mean_f32_cluster_major},
             ivf_merge::MergedIvfSubsection,
-            kmeans::{assign_to_centroids, kmeans},
+            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
@@ -104,18 +104,20 @@ const FINE_RUN_SPLIT_MAX_ROUNDS: usize = 4;
 const FINE_RUN_SPLIT_SEED_OFFSET: u64 = 101;
 
 /// Cell row count marking the consolidated-cell regime where the drain's
-/// per-cell k-means degenerates and the cell pack switches build policy:
-/// above it the byte-target `n_cent` goes uncapped and oversized runs are
-/// split; at or below it the legacy build ships byte-identical (row-count
-/// cap applied, no split). The value is bracketed by measurement: 10M's
-/// largest cell (65,918 rows) must keep the legacy layout — the armed
-/// 2-GET cold-probe gate was measured on it, and letting the new policy
-/// leak in moved the probe to 4 GETs — while 100M's median cell (95,801
-/// rows) trains 48×-imbalanced mega-runs under the legacy build (flat
-/// 0.81 fine-coverage curve) and needs both fixes. 80,000 sits strictly
-/// between the two design points. Distinct from the drain-sample boost
-/// threshold (65,536 in `reservoir.rs`), which is part of the measured
-/// 10M baseline and must keep covering its biggest cells.
+/// per-cell k-means degenerates and the cell pack drops the legacy
+/// row-count `n_cent` cap (byte-target count goes uncapped). Oversized
+/// fine-run splitting always runs — under fine-first `cells 1..1`, a
+/// 2×-skewed run parks its summary centroid at the blob center and
+/// caps post-drain recall (measured 0.985 vs 0.995 at 1M / 256 cells
+/// with identical cell membership). The value is bracketed by
+/// measurement: 10M's largest cell (65,918 rows) must keep the capped
+/// `n_cent` — the armed 2-GET cold-probe gate was measured on it, and
+/// uncapping alone moved the probe to 4 GETs — while 100M's median
+/// cell (95,801 rows) needs the uncapped byte-target count. 80,000
+/// sits strictly between the two design points. Distinct from the
+/// drain-sample boost threshold (65,536 in `reservoir.rs`), which is
+/// part of the measured 10M baseline and must keep covering its
+/// biggest cells.
 const CONSOLIDATED_CELL_ROWS_THRESHOLD: usize = 80_000;
 
 /// Target memory budget (~128 MiB) for one pass-2 rotated chunk
@@ -1134,12 +1136,13 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
         let n_cent = global.len() / dim.max(1);
         return (n_cent, global.to_vec());
     }
-    // Build policy switches at the consolidated-cell boundary (see
+    // `n_cent` cap switches at the consolidated-cell boundary (see
     // `CONSOLIDATED_CELL_ROWS_THRESHOLD`): consolidated cells take the
-    // row-derived byte-target `n_cent` uncapped and get oversized runs
-    // split; everything below ships the legacy build byte-identical —
-    // row-count cap applied, no split — because the 1M/10M layouts (and
-    // their armed cold-probe gates) were measured on exactly that build.
+    // row-derived byte-target uncapped; everything below keeps the
+    // legacy row-count cap so the 1M/10M cold-GET layout stays on the
+    // measured shape. Oversized fine-run splitting always runs — the
+    // cap alone does not stop Lloyd from parking 2×-skewed runs that
+    // flatten fine-first p=1 recall below 0.99.
     let consolidated = n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD;
     let requested = if consolidated {
         cfg.n_cent.max(1).min(n_docs.max(1))
@@ -1149,12 +1152,21 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
             .min(n_cent_row_count_cap(n_docs))
             .min(n_docs.max(1))
     };
-    let mut centroids = kmeans(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
-    let n_cent = if consolidated {
-        split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed)
-    } else {
-        requested
-    };
+    // Keep the final Lloyd assignments — `split_oversized_fine_runs`
+    // consumes them for the first bound check so a balanced pack (the
+    // common commit-cell case) does not pay a redundant full sample
+    // assign on top of the train. `kmeans` alone would drop them and
+    // force that duplicate pass (see `kmeans_with_assignments`).
+    let (mut centroids, assignments) =
+        kmeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
+    let n_cent = split_oversized_fine_runs(
+        &mut centroids,
+        sample,
+        dim,
+        requested,
+        cfg.rot_seed,
+        Some(assignments),
+    );
     order_centroids_geometrically(&mut centroids, dim, n_cent);
     (n_cent, centroids)
 }
@@ -1167,6 +1179,13 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
 /// in place). Single-run packs (the commit-time cell delta shape,
 /// `requested == 1`) can never exceed the bound and pass through untouched.
 ///
+/// When `initial_assignments` matches the current `centroids` (the final
+/// Lloyd labeling from [`kmeans_with_assignments`]), the first round
+/// skips `assign_to_centroids` and only scans counts — balanced packs
+/// return without another distance pass. Pass `None` when the caller
+/// has no labeling (tests / synthetic centroid fixtures); the first
+/// round then assigns normally.
+///
 /// Deterministic: assignment and sub-k-means are seeded from `seed` plus a
 /// fixed offset mixed with the round and run index.
 fn split_oversized_fine_runs(
@@ -1175,6 +1194,7 @@ fn split_oversized_fine_runs(
     dim: usize,
     requested: usize,
     seed: u64,
+    initial_assignments: Option<Vec<u32>>,
 ) -> usize {
     let mut n_cent = centroids.len() / dim.max(1);
     let sample_n = sample.len() / dim.max(1);
@@ -1183,9 +1203,20 @@ fn split_oversized_fine_runs(
     }
     let target = sample_n.div_ceil(requested.max(1)).max(1);
     let bound = target.saturating_mul(FINE_RUN_SPLIT_BOUND_FACTOR);
-    let mut assignments = vec![0u32; sample_n];
+    // Reuse the caller's Lloyd labeling on round 0 when it covers every
+    // sample row; any later round (or a missing/mismatched labeling)
+    // re-assigns against the current centroids.
+    let (mut assignments, mut need_assign) = match initial_assignments {
+        Some(a) if a.len() == sample_n && a.iter().all(|&idx| (idx as usize) < n_cent) => {
+            (a, false)
+        }
+        _ => (vec![0u32; sample_n], true),
+    };
     for round in 0..FINE_RUN_SPLIT_MAX_ROUNDS {
-        assign_to_centroids(sample, centroids, dim, n_cent, &mut assignments);
+        if need_assign {
+            assign_to_centroids(sample, centroids, dim, n_cent, &mut assignments);
+        }
+        need_assign = true;
         let mut counts = vec![0usize; n_cent];
         for &a in &assignments {
             counts[a as usize] += 1;
@@ -1966,9 +1997,9 @@ pub(crate) fn build_cell_subsection_from_source(
             }
         }
     }
-    // Mirrors the `materialized_centroids` policy switch so the sample is
-    // sized for the runs actually trained: consolidated cells uncapped,
-    // sub-threshold cells under the legacy row-count cap.
+    // Mirrors the `materialized_centroids` `n_cent` cap switch so the
+    // sample is sized for the runs actually trained: consolidated cells
+    // uncapped, sub-threshold cells under the legacy row-count cap.
     let requested_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
         cfg.n_cent.max(1).min(n_docs)
     } else {
@@ -3545,7 +3576,7 @@ mod tests {
         );
 
         let n_cent =
-            split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+            split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7, None);
         assert_eq!(centroids.len(), n_cent * SPLIT_DIM);
         assert!(n_cent > 5, "split must add sub-centroids");
         let after = run_counts(&sample, &centroids, n_cent);
@@ -3614,15 +3645,16 @@ mod tests {
         let sample = two_blob_sample();
         let mut centroids = vec![0.5f32; SPLIT_DIM];
         let original = centroids.clone();
-        let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7);
+        let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7, None);
         assert_eq!(n_cent, 1);
         assert_eq!(centroids, original);
     }
 
-    /// The cell-pack build policy switches at the consolidated-cell
-    /// boundary: at or below it the legacy row-count cap binds `n_cent`
-    /// (the measured 1M/10M layout); above it the byte-target count is
-    /// taken uncapped.
+    /// The cell-pack `n_cent` policy switches at the consolidated-cell
+    /// boundary: at or below it the legacy row-count cap binds the
+    /// *requested* count (the measured 1M/10M layout); above it the
+    /// byte-target count is taken uncapped. Run-split may grow past the
+    /// request on either side when Lloyd leaves an oversized run.
     #[test]
     fn materialized_centroids_caps_only_below_consolidated_threshold() {
         let dim = 8;
@@ -3641,16 +3673,49 @@ mod tests {
             };
             materialized_centroids(&cfg, n_docs, &sample).0
         };
-        assert_eq!(
-            mk(CONSOLIDATED_CELL_ROWS_THRESHOLD),
-            N_CENT_SMALL,
-            "sub-threshold cell keeps the legacy cap"
-        );
-        // Uncapped: at least the byte-target count (the run split may add
-        // sub-centroids on top; with the cap this would read exactly 64).
+        let below = mk(CONSOLIDATED_CELL_ROWS_THRESHOLD);
+        let above = mk(CONSOLIDATED_CELL_ROWS_THRESHOLD + 1);
+        // Sub-threshold trains from the legacy cap; run-split may grow a
+        // few sub-centroids on top, but must not jump to the uncapped
+        // byte-target request.
         assert!(
-            mk(CONSOLIDATED_CELL_ROWS_THRESHOLD + 1) >= requested,
+            below >= N_CENT_SMALL && below < requested,
+            "sub-threshold cell stays near the legacy cap (got {below}, cap {N_CENT_SMALL}, byte-target {requested})"
+        );
+        assert!(
+            above >= requested,
             "consolidated cell takes the byte-target count uncapped"
+        );
+    }
+
+    /// Sub-threshold cells still split oversized fine runs. Without this,
+    /// fine-first p=1 post-drain recall flaps 0.985↔0.995 at 1M/256c when
+    /// Lloyd parks a 2×-skewed run (same cell membership both ways).
+    #[test]
+    fn materialized_centroids_splits_oversized_runs_below_threshold() {
+        let sample = two_blob_sample();
+        let sample_n = sample.len() / SPLIT_DIM;
+        let target = sample_n.div_ceil(SPLIT_REQUESTED);
+        let bound = target * FINE_RUN_SPLIT_BOUND_FACTOR;
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: SPLIT_DIM,
+            n_cent: SPLIT_REQUESTED,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let (n_cent, centroids) =
+            materialized_centroids(&cfg, CONSOLIDATED_CELL_ROWS_THRESHOLD, &sample);
+        assert!(
+            n_cent >= SPLIT_REQUESTED,
+            "split may grow past the request, never shrink it"
+        );
+        let after = run_counts(&sample, &centroids, n_cent);
+        assert!(
+            after.iter().all(|&n| n <= bound),
+            "sub-threshold cell must still bound every fine run at {bound}: {after:?}"
         );
     }
 
@@ -3665,8 +3730,14 @@ mod tests {
                     centroids[c * SPLIT_DIM + d] = 1_000.0 + c as f32;
                 }
             }
-            let n =
-                split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+            let n = split_oversized_fine_runs(
+                &mut centroids,
+                &sample,
+                SPLIT_DIM,
+                SPLIT_REQUESTED,
+                7,
+                None,
+            );
             (n, centroids)
         };
         assert_eq!(make(), make());

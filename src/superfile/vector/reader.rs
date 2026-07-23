@@ -7901,7 +7901,7 @@ mod tests {
     /// Headline budget for the cold first-search phase
     /// (≤ 12 ranges, ≤ 5 MB at 1M × 384 sq8, nprobe = 8). The
     /// small-superfile test here pins the structural shape; the
-    /// s3s-fs bench measures the real wall-clock against AWS-
+    /// RustFS bench measures the real wall-clock against AWS-
     /// shape RTTs.
     ///
     /// "At most" because some probed clusters can be empty
