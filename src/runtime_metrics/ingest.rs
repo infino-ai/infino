@@ -48,8 +48,8 @@ mod tests {
         let body = LargeStringArray::from(vec!["hello", "world"]);
         let flat = Float32Array::from(vec![1.0_f32, 2.0, 3.0, 4.0]);
         let emb = FixedSizeListArray::new(item, 2, Arc::new(flat), None);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(body), Arc::new(emb)])
-            .expect("batch");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(body), Arc::new(emb)]).expect("batch");
         let (text, vector) = classify_batch_bytes(&batch);
         assert!(text > 0, "text columns must contribute bytes");
         assert!(vector > 0, "vector columns must contribute bytes");
