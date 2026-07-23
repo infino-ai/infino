@@ -711,8 +711,7 @@ impl Supertable {
         Ok(entries
             .iter()
             .filter_map(|entry| entry.subsection_offsets.as_ref())
-            .map(|offsets| offsets.total_size)
-            .sum())
+            .fold(0u64, |acc, offsets| acc.saturating_add(offsets.total_size)))
     }
 
     /// Total on-storage bytes of the committed superfiles across the user
@@ -3173,6 +3172,100 @@ mod tests {
             "explicit budgets are warned about, never changed"
         );
         drop(st);
+    }
+
+    /// Cold reopen with lazy manifest parts must not under-report the
+    /// billing footprint. `on_storage_footprint_bytes` reads only the
+    /// resident flat view (safe for raise-only cache reconcile);
+    /// `storage_bytes` forces every part to load first so meters see the
+    /// full user + hidden index footprint.
+    #[test]
+    fn storage_bytes_loads_lazy_parts_on_cold_reopen() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        use crate::superfile::{
+            builder::VectorConfig,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let n_rows = 32usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vec_schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field.clone(), dim as i32),
+            false,
+        )]));
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        // Threshold 0 ⇒ open never eager-loads parts; threshold 1 byte ⇒
+        // every commit spills into a real manifest part (not an inline flat
+        // view). Together they reproduce the cold undercount that billing
+        // must not see.
+        let make_options = || {
+            SupertableOptions::new(
+                vec_schema.clone(),
+                vec![],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                None,
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_eager_load_threshold(0)
+            .with_part_size_threshold_bytes(1)
+        };
+
+        let warm_bytes = {
+            let producer = Supertable::create(make_options()).expect("create");
+            let mut flat = Vec::<f32>::with_capacity(n_rows * dim);
+            for i in 0..n_rows {
+                for d in 0..dim {
+                    flat.push(if d == i % dim { 1.0 } else { 0.0 });
+                }
+            }
+            let fsl = FixedSizeListArray::new(
+                item_field,
+                dim as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            );
+            let batch = arrow_array::RecordBatch::try_new(
+                vec_schema.clone(),
+                vec![Arc::new(fsl) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = producer.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            producer.drain_vectors_to_cells_sync().expect("drain");
+            assert!(
+                producer.reader().vector_index_table().is_some(),
+                "drain must leave a hidden vector-index table"
+            );
+            producer.storage_bytes().expect("warm storage_bytes")
+        };
+        assert!(warm_bytes > 0, "committed + drained table has a footprint");
+
+        let cold = Supertable::open(make_options()).expect("cold reopen");
+        let resident = cold.on_storage_footprint_bytes();
+        let loaded = cold.storage_bytes().expect("cold storage_bytes");
+        assert!(
+            resident < loaded,
+            "resident flat view undercounts lazy parts ({resident} vs loaded {loaded})"
+        );
+        assert_eq!(
+            loaded, warm_bytes,
+            "cold storage_bytes must match the warm footprint (user + hidden)"
+        );
     }
 
     /// The hidden IVF superfiles must be made *resident* in the
