@@ -685,14 +685,34 @@ impl Supertable {
     }
 
     /// Total on-storage bytes of the committed superfiles across the user
-    /// table and the hidden vector-index table, from the currently loaded
-    /// manifest views (lazy, not-yet-loaded manifest parts contribute 0 —
-    /// the reconcile below is raise-only, so an undercount is safe).
+    /// table and the hidden vector-index table.
     ///
-    /// Exposed under `metering` for platform billing / Grafana scrapes.
+    /// Loads every lazy manifest part first (user + hidden index) so cold
+    /// handles do not under-report. Prefer this for billing / Grafana scrapes;
+    /// the resident-only footprint helper used for cache-budget reconcile can
+    /// still under-count unloaded parts by design.
     #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
-    pub fn storage_bytes(&self) -> u64 {
-        self.on_storage_footprint_bytes()
+    pub fn storage_bytes(&self) -> Result<u64, OpenError> {
+        let user = self.loaded_storage_footprint_bytes()?;
+        let hidden = match self.inner.vector_index_table.as_ref() {
+            Some(h) => h.loaded_storage_footprint_bytes()?,
+            None => 0,
+        };
+        Ok(user.saturating_add(hidden))
+    }
+
+    /// Sum `subsection_offsets.total_size` after loading all manifest parts.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
+    fn loaded_storage_footprint_bytes(&self) -> Result<u64, OpenError> {
+        let manifest = self.inner.manifest.load_full();
+        let entries = self
+            .block_on_query(manifest.get_all_superfiles_loaded())
+            .map_err(OpenError::ManifestLoadError)?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| entry.subsection_offsets.as_ref())
+            .map(|offsets| offsets.total_size)
+            .sum())
     }
 
     /// Total on-storage bytes of the committed superfiles across the user

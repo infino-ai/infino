@@ -561,10 +561,13 @@ impl Connection {
 
     /// On-storage byte footprint for `name` (user + hidden vector index).
     ///
-    /// Visible under `metering` for platform billing / Grafana scrapes.
+    /// Loads lazy manifest parts before summing so cold tables are not
+    /// under-counted. Visible under `metering` for platform billing / Grafana.
     #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
-        Ok(self.open_table(name)?.storage_bytes())
+        self.open_table(name)?
+            .storage_bytes()
+            .map_err(|e| InfinoError::from(e).with_context("table_storage_bytes", Some(name)))
     }
 
     /// List the names of every table registered in this catalog,
