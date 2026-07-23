@@ -34,7 +34,7 @@ use crate::{
     markdown::{fmt_count, fmt_time},
     report::{Better, Block, Cell, Report, Section, metric, text},
     rss::fmt_bytes,
-    storage_meter::ObjectStoreMeter,
+    storage_meter::{ObjectStoreMeter, background_fill_meter, merge_background_fill},
 };
 
 /// S3 Standard capacity, USD per GB-month (decimal GB).
@@ -338,6 +338,10 @@ pub struct StorePhases {
     /// cold per-query fetch once the first query's metadata warmup is
     /// resident. This is the "GETs per query" number for cold traffic.
     pub cold_second_query: Option<ObjectStoreMeter>,
+    /// Wall/CPU of [`Self::cold_second_query`] when the shared cold-store
+    /// helper timed the steady window (median across samples).
+    pub cold_second_wall_s: Option<f64>,
+    pub cold_second_cpu_s: Option<f64>,
     /// Pre-drain counterparts of `cold_open` / `cold_query`: the transient
     /// shape a fresh table serves (hidden IVF still in INCOMING) until
     /// maintenance drains it. Priced so the cost of querying *before*
@@ -669,18 +673,24 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             .map(|(_, p50_s, _)| *p50_s)
     };
 
-    // Per-query cold dollars = binding(MEASURED cold-search on-CPU, RAM leg
-    // over the warm-scale compute window) + measured object-store requests
-    // for the first-query fetch window. Cold search CPU is metered separately
-    // (includes decompress/decode/scoring); it is never copied from warm.
-    let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
-    let cold_query_usd = anchor_cold.map(|q| {
-        let window = warm_window_for(&q.name).unwrap_or(0.0);
-        q.search_cpu_s
-            .map(|cpu| inst.per_query_usd(cpu, window, c.resident_anon_bytes))
-            .unwrap_or(0.0)
-            + cold_query_req_usd.unwrap_or(0.0)
-    });
+    // Per-query cold dollars use the *steady* cold window only (cold_second),
+    // never the first-query metadata warmup. Object-store `get_bytes` are
+    // internal fetch volume — not customer egress — and are not priced here.
+    let cold_second_io = c.store.cold_second_query;
+    let cold_query_req_usd = cold_second_io.map(|io| request_usd(&io));
+    let cold_query_usd = match (
+        cold_second_io,
+        c.store.cold_second_cpu_s,
+        c.store.cold_second_wall_s,
+    ) {
+        // CPU + wall must both be from the steady sample; never borrow a
+        // warm / first-query window into the steady price.
+        (Some(io), Some(cpu), Some(window)) => {
+            Some(inst.per_query_usd(cpu, window, c.resident_anon_bytes) + request_usd(&io))
+        }
+        (Some(io), _, _) => Some(request_usd(&io)),
+        (None, _, _) => None,
+    };
 
     // ---- Block 1: rate card ----
     let warm_query_cell = if warm_costs.is_empty() {
@@ -757,15 +767,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         && let Some(q) = anchor_cold
     {
         if let Some(per_q) = cold_query_usd.filter(|_| cold_query_req_usd.is_some()) {
-            let io = c.store.cold_query.expect("guarded by cold_query_req_usd");
+            let io = cold_second_io.expect("guarded by cold_query_req_usd");
+            let search_s = c.store.cold_second_wall_s.unwrap_or(q.search_s);
             rate_rows.push(vec![
-                text("Cold query (CPU + requests)"),
+                text("Cold query (CPU + requests, steady)"),
                 text(format!(
                     "{} queries — {} GET/query, {}/query fetched ({} search, {})",
                     usd_per_million(per_q),
                     io.get_count,
                     fmt_bytes(io.get_bytes),
-                    fmt_time(q.search_s * 1e9),
+                    fmt_time(search_s * 1e9),
                     q.name,
                 )),
             ]);
@@ -962,9 +973,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             c.store.cold_second_query,
         );
         let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
-            (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
-            (Some(q), None) => Some(q.background_fill_meter()),
-            (None, Some(r)) => Some(r.background_fill_meter()),
+            (Some(q), Some(r)) => Some(merge_background_fill(&q, &r)),
+            (Some(q), None) => Some(background_fill_meter(&q)),
+            (None, Some(r)) => Some(background_fill_meter(&r)),
             (None, None) => None,
         };
         per_query_row(&mut io_rows, "Cache fill (during cold query)", fill);
@@ -1001,9 +1012,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             // Background lazy→mmap fill concurrent with the cold/repeat
             // windows — counted separately so query GETs stay foreground-only.
             let fill = match (state.io.cold_query, state.io.cold_repeat) {
-                (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
-                (Some(q), None) => Some(q.background_fill_meter()),
-                (None, Some(r)) => Some(r.background_fill_meter()),
+                (Some(q), Some(r)) => Some(merge_background_fill(&q, &r)),
+                (Some(q), None) => Some(background_fill_meter(&q)),
+                (None, Some(r)) => Some(background_fill_meter(&r)),
                 (None, None) => None,
             };
             per_query_row(&mut io_rows, &format!("Fill — {label}"), fill);

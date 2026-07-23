@@ -5,7 +5,8 @@ name: Release on merge
 # package's version changed in the merge gets its publish triggered — so a
 # release of any scope is: run release-prep, merge the PR, done.
 #
-#   - crate version changed  -> push the `v<version>` tag + publish the crate
+#   - crate version changed  -> push the `v<version>` tag, publish the GitHub
+#                               release (auto-generated notes) + the crate
 #   - Node version changed   -> dispatch `Node publish` (real, not dry-run)
 #   - Python version changed -> dispatch `Publish Python package` (PyPI)
 #
@@ -98,6 +99,20 @@ jobs:
         run: |
           git tag "v${{ steps.detect.outputs.crate_version }}"
           git push origin "v${{ steps.detect.outputs.crate_version }}"
+      # Publish the GitHub release for the fresh tag with auto-generated
+      # notes (the PR list since the previous tag). Crate tags only —
+      # binding-only releases are tagless by design (docs/versioning.md).
+      # `gh release create` fails if the release already exists, matching
+      # the tag-collision guard above.
+      - name: Create GitHub release
+        if: steps.detect.outputs.crate_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.detect.outputs.crate_version }}" \
+            --title "v${{ steps.detect.outputs.crate_version }}" \
+            --verify-tag \
+            --generate-notes
       # Dispatch at the fresh tag when one exists (immutable snapshot of the
       # merge); otherwise at main.
       - name: Kick off publish workflows

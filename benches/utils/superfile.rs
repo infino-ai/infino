@@ -185,6 +185,7 @@ pub mod fts {
         "two_term_or",
         "ten_term_or",
         "two_term_and",
+        "two_term_and_small",
     ];
     /// Large-union shapes that exist only to stress the multi-term count
     /// path. Excluded from the cold object-store search tier, where their
@@ -1897,6 +1898,7 @@ pub mod sql {
                 &query_inputs,
                 exec_sql::ITERS,
                 "superfile_sql",
+                exec_sql::HIGH_CARD_SQL,
             );
             exec_sql::emit_query(
                 &mut report,
@@ -1994,7 +1996,7 @@ pub mod sql {
     /// cold reads exercise `Supertable::open` + `reader().query_sql`.
     ///
     /// The write is a single commit at superfile scale; this keeps the
-    /// default `s3s_fs` fixture usable while still writing the same parquet
+    /// default RustFS fixture usable while still writing the same parquet
     /// superfile format that warm SQL reads.
     fn build_cold_artifact(rows: &[SqlRow<'_>]) -> ColdSqlArtifact {
         eprintln!(

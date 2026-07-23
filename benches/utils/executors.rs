@@ -406,6 +406,16 @@ pub mod fts {
             terms: &["term00001", "term00050"],
             mode: BoolMode::And,
         },
+        // Small intersection: two mid-rare terms whose overlap is well
+        // under a top-1000 request, so the top-k heap never fills and
+        // the block-max-AND skip cannot fire — every match is scored.
+        // Isolates the raw score-and-collect cost that the large
+        // `two_term_and` overlap hides behind pruning.
+        FtsQuery {
+            name: "two_term_and_small",
+            terms: &["term00500", "term01000"],
+            mode: BoolMode::And,
+        },
         FtsQuery {
             name: "three_wide_and",
             terms: &["term00001", "term00050", "term00100"],
@@ -1957,6 +1967,19 @@ pub mod sql {
         },
     ];
 
+    /// High-cardinality GROUP BY guard, run only on the in-memory superfile
+    /// tier (passed as `extra_scalar` to [`measure_query_sets`]). `title` is
+    /// near-unique per row, so the group key set is ~n_docs: the shape where
+    /// the aggregate's partial phase does almost no dedup yet re-hashes every
+    /// key (the case `PARTIAL_AGG_SKIP_PROBE_RATIO` targets). Kept off the
+    /// shared battery because a whole-table scan's working set blows the
+    /// supertable object-store tier's warm-settle window; the in-memory tier
+    /// has no such settle.
+    pub const HIGH_CARD_SQL: &[SqlQuery] = &[SqlQuery {
+        name: "group_by_title_highcard",
+        sql: "SELECT title, COUNT(*) AS n FROM supertable GROUP BY title ORDER BY n DESC LIMIT 10",
+    }];
+
     /// Query literals that depend on the built corpus (sample row values).
     pub struct QueryInputs {
         pub qv: String,
@@ -2097,6 +2120,7 @@ pub mod sql {
         inputs: &QueryInputs,
         iters: usize,
         log_prefix: &str,
+        extra_scalar: &[SqlQuery],
     ) -> QuerySets {
         let qv = inputs.qv.as_str();
         let sample_title = inputs.sample_title.as_str();
@@ -2104,10 +2128,11 @@ pub mod sql {
 
         eprintln!(
             "[{log_prefix}] scalar SQL battery ({} queries)...",
-            SQL_BATTERY.len()
+            SQL_BATTERY.len() + extra_scalar.len()
         );
         let scalar = SQL_BATTERY
             .iter()
+            .chain(extra_scalar)
             .map(|q| timed(reader, q.name, q.sql, iters))
             .collect();
 

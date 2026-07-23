@@ -1,0 +1,152 @@
+name: Release prep
+
+# Opens a release PR: stamps every version file for the requested scope
+# (via `make release-prep`, which validates the bump against
+# docs/versioning.md), pushes a `release-*` branch, opens the PR, and arms
+# auto-merge. Once the PR is approved and CI is green it merges itself, and
+# the `Release on merge` workflow takes over: tag, GitHub release, and the
+# per-package publishes.
+#
+# Scope (the PACKAGE param of `make release-prep`):
+#   - crate | node | python — single-package patch; needs `version`.
+#   - each                  — every package to its own next patch; no version.
+#   - all                   — coordinated minor/major; needs `version`, patch 0.
+#
+# Runs on a fresh checkout of main, so a stale or dirty local tree can never
+# leak into a release. All bump validation lives in scripts/release_prep.py;
+# a bad request fails here with the script's error, before anything is pushed.
+#
+# Needs the RELEASE_PAT secret: a fine-grained token with Contents and
+# Pull requests read/write on this repository. The default GITHUB_TOKEN can't
+# open PRs here (org policy), and PRs it creates wouldn't trigger CI.
+
+on:
+  # Weekly release train: Monday 09:00 IST (03:30 UTC; GitHub's scheduler
+  # can lag by some minutes). A scheduled run releases every package to its
+  # own next patch (scope `each`) and skips itself when there is nothing to
+  # release — no commits on main since the last release tag, or a release PR
+  # already open.
+  schedule:
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Release scope (PACKAGE for make release-prep)"
+        required: true
+        type: choice
+        options: [crate, node, python, each, all]
+      version:
+        description: "New version, plain X.Y.Z (leave empty for 'each')"
+        required: false
+        type: string
+
+permissions:
+  contents: read # pushes/PRs use RELEASE_PAT, not the workflow token
+
+# One release prep at a time; queue instead of cancelling.
+concurrency:
+  group: release-prep
+  cancel-in-progress: false
+
+jobs:
+  prep:
+    name: Stamp versions and open the release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Fail fast, before touching anything, if the token is missing or
+      # can't push — a clearer error than a failed `git push` later.
+      - name: Preflight RELEASE_PAT
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::RELEASE_PAT secret is not set (needs Contents + Pull requests read/write on this repo)"
+            exit 1
+          fi
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .permissions.push)" != "true" ]; then
+            echo "::error::RELEASE_PAT cannot push to $GITHUB_REPOSITORY (needs Contents read/write)"
+            exit 1
+          fi
+
+      # Check out with the PAT so the branch push below authenticates as it.
+      # Full history: the scheduled-run gate below needs the release tags.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PAT }}
+          fetch-depth: 0
+
+      # A scheduled run skips itself when there is nothing to release: no
+      # commits since the last release tag, or a release PR already open
+      # (an unmerged one from a previous week would collide on the branch).
+      # Manual dispatches always proceed.
+      - name: Gate the scheduled run
+        id: gate
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          last="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          if [ -n "$last" ] && [ "$(git rev-list "$last..HEAD" --count)" = "0" ]; then
+            echo "no commits on main since $last; nothing to release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif gh pr list --state open --json headRefName \
+              --jq '.[].headRefName' | grep -q '^release-'; then
+            echo "an open release-* PR already exists; not opening another"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `package` is enum-safe (a choice input); `version` is free text, so it
+      # goes through the environment, never interpolated into the script.
+      # A scheduled run has no inputs and defaults to the weekly `each` patch.
+      - name: Stamp version files
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          PACKAGE: ${{ inputs.package || 'each' }}
+          VERSION: ${{ inputs.version }}
+        run: make release-prep PACKAGE="$PACKAGE" VERSION="$VERSION"
+
+      - name: Push the release branch and open the PR
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          PACKAGE: ${{ inputs.package || 'each' }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          node="$(jq -r .version infino-node/package.json)"
+          python="$(sed -n 's/^version = "\(.*\)"/\1/p' infino-python/Cargo.toml | head -1)"
+          # Branch/commit slug: the requested version, or (for 'each', which
+          # takes none) the crate's freshly stamped version.
+          slug="${VERSION:-$crate}"
+          branch="release-$PACKAGE-$slug"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "release: $PACKAGE $slug"
+          git push origin "$branch"
+
+          body="Release PR stamped by the \`Release prep\` workflow \
+          (scope: \`$PACKAGE\`).
+
+          | Package | Version |
+          | ------- | ------- |
+          | crate   | $crate  |
+          | node    | $node   |
+          | python  | $python |
+
+          On merge, \`Release on merge\` tags and publishes whichever of \
+          these changed — see docs/versioning.md."
+          pr_url="$(gh pr create --base main --head "$branch" \
+            --title "release: $PACKAGE $slug" --body "$body")"
+          echo "opened $pr_url"
+
+          # Arm auto-merge: the PR merges itself once approved and green.
+          # Not fatal — if auto-merge is disabled in repo settings the PR
+          # still exists and can be merged by hand.
+          if ! gh pr merge --auto --squash "$pr_url"; then
+            echo "::warning::could not enable auto-merge on $pr_url — approve and merge it manually (or enable auto-merge in repository settings)"
+          fi

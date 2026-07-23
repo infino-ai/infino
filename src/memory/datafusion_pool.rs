@@ -53,6 +53,14 @@ struct ConnectionBudgetPool {
 /// used only in its diagnostics). The budget has no extra state worth printing.
 const POOL_NAME: &str = "ConnectionBudgetPool";
 
+/// Unique-key fraction above which DataFusion abandons the partial
+/// (per-partition) pre-aggregation phase of a grouped aggregate. DataFusion's
+/// default is 0.8; 0.5 abandons it sooner. On a high-cardinality `GROUP BY` the
+/// partial phase barely reduces the row count yet re-hashes every key, so
+/// skipping it and letting the final aggregate hash once is faster. Low-
+/// cardinality groupings, which still dedup below this fraction, keep it.
+const PARTIAL_AGG_SKIP_PROBE_RATIO: f64 = 0.5;
+
 impl fmt::Display for ConnectionBudgetPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(POOL_NAME)
@@ -123,6 +131,15 @@ pub(crate) fn budgeted_session_context(
     // One consequence: a column the user themselves declared `Utf8View` is also
     // converted, so SQL string results are always `LargeUtf8`, never a view.
     config.options_mut().optimizer.expand_views_at_output = true;
+
+    // Skip DataFusion's partial (pre-)aggregation sooner on high-cardinality
+    // GROUP BY (see PARTIAL_AGG_SKIP_PROBE_RATIO). Execution strategy only;
+    // results are identical.
+    config
+        .options_mut()
+        .execution
+        .skip_partial_aggregation_probe_ratio_threshold = PARTIAL_AGG_SKIP_PROBE_RATIO;
+
     Ok(SessionContext::new_with_config_rt(
         config,
         budgeted_runtime(budget)?,

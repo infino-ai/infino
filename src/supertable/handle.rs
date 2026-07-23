@@ -3522,6 +3522,170 @@ mod tests {
             .expect("user compaction should succeed after lazy pre-drain reads");
     }
 
+    /// SQL-shaped tables (multi-column FTS + Sq8 vector) must survive
+    /// `optimize()` after lazy disk-cache reads — the same path the SQL
+    /// supertable bench takes (pre-compact warm/cold → optimize).
+    #[test]
+    fn sql_shaped_optimize_after_lazy_reads() {
+        use arrow_array::{
+            Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+        };
+
+        use crate::{
+            superfile::{
+                builder::VectorConfig,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        };
+
+        const DIM: usize = 16;
+        const ROWS: usize = 64;
+        const COMMITS: usize = 4;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::LargeUtf8, false),
+            Field::new("key", DataType::LargeUtf8, false),
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new("rating", DataType::Int64, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![
+                    FtsConfig {
+                        column: "title".into(),
+                        positions: false,
+                    },
+                    FtsConfig {
+                        column: "bucket".into(),
+                        positions: false,
+                    },
+                    FtsConfig {
+                        column: "key".into(),
+                        positions: false,
+                    },
+                    FtsConfig {
+                        column: "category".into(),
+                        positions: false,
+                    },
+                ],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: DIM,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                Some(default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+
+        {
+            let producer = Supertable::create(make_options()).expect("create");
+            for c in 0..COMMITS {
+                let titles: Vec<String> = (0..ROWS).map(|i| format!("doc {c} {i}")).collect();
+                let buckets: Vec<String> = (0..ROWS).map(|i| format!("b{}", i % 10)).collect();
+                let keys: Vec<String> = (0..ROWS).map(|i| format!("k{c}_{i}")).collect();
+                let cats: Vec<String> = (0..ROWS)
+                    .map(|i| if i % 2 == 0 { "cat" } else { "dog" }.to_string())
+                    .collect();
+                let ratings: Vec<i64> = (0..ROWS).map(|i| i as i64).collect();
+                let flat = vec![1.0f32; ROWS * DIM];
+                let fsl = FixedSizeListArray::new(
+                    item_field.clone(),
+                    DIM as i32,
+                    Arc::new(Float32Array::from(flat)),
+                    None,
+                );
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(LargeStringArray::from(
+                            titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as Arc<dyn Array>,
+                        Arc::new(LargeStringArray::from(
+                            buckets.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as Arc<dyn Array>,
+                        Arc::new(LargeStringArray::from(
+                            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as Arc<dyn Array>,
+                        Arc::new(LargeStringArray::from(
+                            cats.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as Arc<dyn Array>,
+                        Arc::new(Int64Array::from(ratings)) as Arc<dyn Array>,
+                        Arc::new(fsl) as Arc<dyn Array>,
+                    ],
+                )
+                .expect("batch");
+                let mut w = producer.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            disk_budget_bytes: 1 << 30,
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            cold_fetch_streams: 4,
+            cold_fetch_chunk_bytes: 1 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            eviction: Box::new(LruPolicy::new()),
+            verify_crc_on_open: true,
+            ..Default::default()
+        };
+        let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> =
+            Arc::new(HashSet::new);
+        let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");
+        let consumer =
+            Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
+
+        // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
+        // pre-compact warm/cold queries against a disk-cache consumer).
+        use crate::superfile::fts::reader::BoolMode;
+        let hits = consumer
+            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .expect("bm25 pre-optimize");
+        assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
+
+        consumer
+            .optimize(&OptimizeOptions::compact(COMPACTION_TEST_SETTINGS))
+            .expect("sql-shaped optimize after lazy reads");
+
+        let hits_after = consumer
+            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .expect("bm25 post-optimize");
+        assert!(
+            !hits_after.is_empty(),
+            "FTS must remain searchable after Sq8+FTS optimize"
+        );
+    }
+
     /// Each drain APPENDS packed shard object(s) to the hidden manifest (no
     /// removals — the user superfiles stay as the durable source). Draining
     /// across successive commits accumulates multiple files under the same

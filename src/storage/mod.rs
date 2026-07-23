@@ -37,17 +37,20 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub mod azure;
+pub(crate) mod counting;
 pub mod gcs;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
 pub mod s3;
+pub mod usage;
 
 pub use azure::AzureStorageProvider;
 pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
+pub use usage::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass, UsageMeter, UsageSnapshot};
 
 /// Object metadata returned by HEAD, GET, and list operations.
 ///
@@ -107,128 +110,27 @@ pub enum StorageError {
     },
 }
 
+/// I/O diagnostics that are not the usage ledger: timeline, phase spans,
+/// and background-task tagging. Request/byte counts live only on
+/// [`usage::UsageMeter`] (per connection / provider).
+///
+/// [`take`] / [`snapshot`] read the **process-default** meter (providers
+/// built outside a [`crate::catalog::Connection`]). Prefer
+/// `provider.usage_meter().snapshot()` for connection-scoped windows.
 pub mod io_counters {
-    use std::{
-        future::Future,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::future::Future;
 
-    static FETCHES: AtomicU64 = AtomicU64::new(0);
-    static BYTES: AtomicU64 = AtomicU64::new(0);
-    static HIDDEN_FETCHES: AtomicU64 = AtomicU64::new(0);
-    static HIDDEN_BYTES: AtomicU64 = AtomicU64::new(0);
-    // Full per-op counters (read via [`snapshot`]; never reset by `take`, which
-    // stays scoped to the get-family for the existing timeline diagnostics).
-    static HEADS: AtomicU64 = AtomicU64::new(0);
-    static PUTS: AtomicU64 = AtomicU64::new(0);
-    static PUT_BYTES: AtomicU64 = AtomicU64::new(0);
-    static LISTS: AtomicU64 = AtomicU64::new(0);
-    static DELETES: AtomicU64 = AtomicU64::new(0);
+    use super::usage::{UsageMeter, UsageSnapshot};
 
-    /// Record one object-store range/get/tail fetch returning `bytes` bytes.
-    /// Every provider calls this on the successful result (after the retry
-    /// wrapper, so re-issues are not double-counted), so it counts the *total*.
-    pub fn record_get(bytes: u64) {
-        FETCHES.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Record one HEAD (metadata) request.
-    pub fn record_head() {
-        HEADS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record one PUT (or conditional PUT) writing `bytes` bytes.
-    pub fn record_put(bytes: u64) {
-        PUTS.fetch_add(1, Ordering::Relaxed);
-        PUT_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Record one LIST request.
-    pub fn record_list() {
-        LISTS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record one DELETE request.
-    pub fn record_delete() {
-        DELETES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Tag a fetch as targeting the hidden vector index (prefixed namespace).
-    /// Called by `PrefixedStorageProvider` *in addition to* the inner provider's
-    /// `record_get`, so `hidden ⊆ total` and `user = total − hidden`.
-    pub fn record_hidden_get(bytes: u64) {
-        HIDDEN_FETCHES.fetch_add(1, Ordering::Relaxed);
-        HIDDEN_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call;
-    /// resets those four. Derive the user-table share as `total − hidden`.
-    /// (Scoped to the get-family so the existing per-batch timeline diagnostics
-    /// keep working; use [`snapshot`] for the full, non-resetting picture.)
+    /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call on
+    /// the process-default meter; resets those get-family counters.
     pub fn take() -> (u64, u64, u64, u64) {
-        (
-            FETCHES.swap(0, Ordering::Relaxed),
-            BYTES.swap(0, Ordering::Relaxed),
-            HIDDEN_FETCHES.swap(0, Ordering::Relaxed),
-            HIDDEN_BYTES.swap(0, Ordering::Relaxed),
-        )
+        UsageMeter::process_default().take_gets()
     }
 
-    /// Cumulative per-op counts since process start (never reset). The
-    /// complete engine-side I/O picture across every provider — the counterpart
-    /// of the bench's storage meter, for embedders that read engine counters
-    /// directly rather than wrapping the provider.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct Snapshot {
-        pub get_count: u64,
-        pub get_bytes: u64,
-        pub hidden_get_count: u64,
-        pub hidden_get_bytes: u64,
-        pub head_count: u64,
-        pub put_count: u64,
-        pub put_bytes: u64,
-        pub list_count: u64,
-        pub delete_count: u64,
-    }
-
-    impl Snapshot {
-        /// Per-op counts accrued since an `earlier` snapshot — the window delta
-        /// to price. Makes window-scoped measurement first-class over the
-        /// process-global counters: snapshot, do work, `snapshot().since(&start)`.
-        /// Saturating, since a window never runs backwards.
-        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
-            Snapshot {
-                get_count: self.get_count.saturating_sub(earlier.get_count),
-                get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
-                hidden_get_count: self
-                    .hidden_get_count
-                    .saturating_sub(earlier.hidden_get_count),
-                hidden_get_bytes: self
-                    .hidden_get_bytes
-                    .saturating_sub(earlier.hidden_get_bytes),
-                head_count: self.head_count.saturating_sub(earlier.head_count),
-                put_count: self.put_count.saturating_sub(earlier.put_count),
-                put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
-                list_count: self.list_count.saturating_sub(earlier.list_count),
-                delete_count: self.delete_count.saturating_sub(earlier.delete_count),
-            }
-        }
-    }
-
-    /// Read all counters without resetting any.
-    pub fn snapshot() -> Snapshot {
-        Snapshot {
-            get_count: FETCHES.load(Ordering::Relaxed),
-            get_bytes: BYTES.load(Ordering::Relaxed),
-            hidden_get_count: HIDDEN_FETCHES.load(Ordering::Relaxed),
-            hidden_get_bytes: HIDDEN_BYTES.load(Ordering::Relaxed),
-            head_count: HEADS.load(Ordering::Relaxed),
-            put_count: PUTS.load(Ordering::Relaxed),
-            put_bytes: PUT_BYTES.load(Ordering::Relaxed),
-            list_count: LISTS.load(Ordering::Relaxed),
-            delete_count: DELETES.load(Ordering::Relaxed),
-        }
+    /// Snapshot of the process-default meter (not a connection meter).
+    pub fn snapshot() -> UsageSnapshot {
+        UsageMeter::process_default().snapshot()
     }
 
     /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
@@ -641,6 +543,14 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
         None
     }
+
+    /// Connection-scoped (or process-default) usage ledger this provider
+    /// records into. Benches and billing snapshot this meter — there is no
+    /// second counter wrapper. Default is the process-default meter (mocks /
+    /// ad-hoc providers); durable providers override with their injected Arc.
+    fn usage_meter(&self) -> Arc<usage::UsageMeter> {
+        usage::UsageMeter::process_default()
+    }
 }
 
 /// Convert an object-store LIST result back into the provider-relative key
@@ -690,7 +600,18 @@ impl StorageProvider for PrefixedStorageProvider {
     }
 
     async fn get(&self, uri: &str) -> Result<(bytes::Bytes, ObjectMeta), StorageError> {
+        // Prefixed URI is recorded by the inner provider; UriClass tags it Hidden*.
         self.inner.get(&self.prefixed(uri)).await
+    }
+
+    async fn get_if_none_match(
+        &self,
+        uri: &str,
+        etag: &str,
+    ) -> Result<Option<(bytes::Bytes, ObjectMeta)>, StorageError> {
+        self.inner
+            .get_if_none_match(&self.prefixed(uri), etag)
+            .await
     }
 
     async fn get_range(
@@ -698,11 +619,7 @@ impl StorageProvider for PrefixedStorageProvider {
         uri: &str,
         range: std::ops::Range<u64>,
     ) -> Result<bytes::Bytes, StorageError> {
-        let out = self.inner.get_range(&self.prefixed(uri), range).await;
-        if let Ok(b) = &out {
-            io_counters::record_hidden_get(b.len() as u64);
-        }
-        out
+        self.inner.get_range(&self.prefixed(uri), range).await
     }
 
     async fn tail(&self, uri: &str, len: u64) -> Result<(bytes::Bytes, u64), StorageError> {
@@ -770,12 +687,12 @@ impl StorageProvider for PrefixedStorageProvider {
         &self,
         uri: &str,
     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-        // Delegate to the parent with the sub-prefix applied, so the hidden
-        // table's superfiles resolve to a real object-store handle for the
-        // async range-GET read paths (e.g. cold `_id`-column resolution).
-        // Without this override the default `None` forces those paths to error
-        // on lazily-opened hidden superfiles.
+        // Prefixed object key is classified Hidden* by UriClass on record.
         self.inner.object_store_handle(&self.prefixed(uri))
+    }
+
+    fn usage_meter(&self) -> Arc<usage::UsageMeter> {
+        self.inner.usage_meter()
     }
 }
 
@@ -904,6 +821,10 @@ mod tests {
         async fn delete(&self, uri: &str) -> Result<(), StorageError> {
             self.objects.lock().expect("lock").remove(uri);
             Ok(())
+        }
+
+        fn usage_meter(&self) -> Arc<usage::UsageMeter> {
+            usage::UsageMeter::process_default()
         }
     }
 
@@ -1088,22 +1009,75 @@ mod tests {
     /// without resetting. Assertions are relative (before/after) because the
     /// counters are process-global and other tests may increment concurrently.
     #[test]
-    fn io_counters_record_and_snapshot_are_monotonic() {
-        use super::io_counters;
-        let before = io_counters::snapshot();
-        io_counters::record_get(100);
-        io_counters::record_head();
-        io_counters::record_put(50);
-        io_counters::record_list();
-        io_counters::record_delete();
-        let after = io_counters::snapshot();
-        let delta = after.since(&before);
+    fn usage_meter_record_and_snapshot_are_monotonic() {
+        let meter = usage::UsageMeter::new();
+        let before = meter.snapshot();
+        meter.record_get("seg/x", None, 100);
+        meter.record_head();
+        meter.record_put(50);
+        meter.record_list();
+        meter.record_delete();
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.get_count, 1);
+        assert_eq!(delta.get_bytes, 100);
+        assert_eq!(delta.head_count, 1);
+        assert_eq!(delta.put_count, 1);
+        assert_eq!(delta.put_bytes, 50);
+        assert_eq!(delta.list_count, 1);
+        assert_eq!(delta.delete_count, 1);
+    }
+
+    /// Hidden-namespace reads must tag `record_hidden_get` on get / range /
+    /// tail / object-store-handle paths (not only `get_range`).
+    #[tokio::test]
+    async fn prefixed_provider_tags_hidden_gets() {
+        use object_store::ObjectStoreExt;
+
+        use crate::storage::LocalFsStorageProvider;
+
+        // Prefix must contain `_vector_index` so UriClass classifies as Hidden*.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let meter = usage::UsageMeter::new();
+        let inner = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("localfs"),
+        );
+        let prefixed = PrefixedStorageProvider::new(inner, "_infino_test_vector_index/");
+        prefixed
+            .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
+            .await
+            .expect("put");
+
+        let before = meter.snapshot();
+        let (got, _) = prefixed.get("seg/x.bin").await.expect("get");
+        assert_eq!(got.as_ref(), b"0123456789");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.get_count, 1);
+        assert_eq!(delta.hidden_get_count(), 1);
+        assert_eq!(delta.hidden_get_bytes(), 10);
+
+        let before = meter.snapshot();
+        let _ = prefixed.get_range("seg/x.bin", 0..4).await.expect("range");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.get_count, 1);
+        assert_eq!(delta.hidden_get_count(), 1);
+        assert_eq!(delta.hidden_get_bytes(), 4);
+
+        let before = meter.snapshot();
+        let (tail, size) = prefixed.tail("seg/x.bin", 3).await.expect("tail");
+        assert_eq!(size, 10);
+        assert_eq!(tail.as_ref(), b"789");
+        let delta = meter.snapshot().since(&before);
         assert!(delta.get_count >= 1);
-        assert!(delta.get_bytes >= 100);
-        assert!(delta.head_count >= 1);
-        assert!(delta.put_count >= 1);
-        assert!(delta.put_bytes >= 50);
-        assert!(delta.list_count >= 1);
-        assert!(delta.delete_count >= 1);
+        assert_eq!(delta.hidden_get_count(), 1);
+        assert_eq!(delta.hidden_get_bytes(), 3);
+
+        let before = meter.snapshot();
+        let (store, path) = prefixed.object_store_handle("seg/x.bin").expect("handle");
+        let _ = store.get(&path).await.expect("os get");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.get_count, 1);
+        assert_eq!(delta.hidden_get_count(), 1);
+        assert_eq!(delta.hidden_get_bytes(), 10);
     }
 }

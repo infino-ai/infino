@@ -92,6 +92,11 @@ const ALLOWED_LICENSES: &[&str] = &[
     "bzip2-1.0.6",
     // Unlicense — public-domain-equivalent.
     "Unlicense",
+    // CDLA-Permissive-2.0 — Linux Foundation permissive attribution
+    // license (no copyleft). Pulled by `webpki-roots` via `reqwest`'s
+    // `rustls-tls` feature for the Mozilla CA bundle in bench GitHub
+    // downloads (`infino-bench-utils` / `rustfs_server.rs`).
+    "CDLA-Permissive-2.0",
 ];
 
 /// Per-package allow list for licenses outside [`ALLOWED_LICENSES`]

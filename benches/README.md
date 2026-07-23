@@ -84,17 +84,18 @@ which credentials happen to be set:
 
 | `INFINO_BENCH_STORE` | Backend | Extra env |
 |---|---|---|
-| _unset_ / `s3s_fs` | in-process s3s-fs emulator | — |
+| _unset_ / `rustfs` | local RustFS daemon (HTTPS, default) | optional `INFINO_RUSTFS_BIN`, `INFINO_RUSTFS_VERSION`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`; auto-download verifies the release zip against upstream `SHA256SUMS` |
 | `s3` | real AWS S3 | `INFINO_REAL_S3_BUCKET` + the standard `AWS_*` credentials |
 | `azure` | real Azure Blob | `INFINO_REAL_AZURE_CONTAINER` + `AZURE_STORAGE_ACCOUNT_NAME` + `AZURE_STORAGE_ACCOUNT_KEY` |
 | `gcs` | real Google Cloud Storage | `INFINO_REAL_GCS_BUCKET` + `GOOGLE_APPLICATION_CREDENTIALS` (service-account key path) |
 
 ```sh
-# Superfile cold tiers: any backend (s3s-fs is the zero-setup default).
+# Superfile cold tiers: any backend (RustFS is the default local backend;
+# first run may auto-download the release binary).
 cargo bench -- superfile fts cold
 
-# Supertable tests: real object store only (s3 or azure). s3s-fs lacks the
-# multi-commit If-Match CAS the supertable commit needs, so it is rejected.
+# Supertable benches: RustFS (default), real S3, or Azure.
+cargo bench -- supertable fts cold
 INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket \
   cargo bench -- supertable fts
 INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
@@ -103,8 +104,9 @@ INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
 ```
 
 A real-backend run writes under a unique prefix and deletes it on exit; set
-`INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). The s3s-fs
-emulator self-cleans and reproduces request/byte volume, not network latency.
+`INFINO_BENCH_KEEP_TABLE=1` to keep it (the prefix is logged). RustFS uses a
+fresh bucket per run (deleted on exit unless kept) and reproduces the HTTPS S3
+wire path with local process overhead.
 
 ## Vector search tuning
 
@@ -174,7 +176,8 @@ executors.rs                shared build/search/query executors + emitters
 harness/                    engine interfaces and generic drivers
 report.rs, markdown.rs      terminal + markdown rendering with deltas
 rss.rs                      per-phase RSS sampling
-tiers.rs                    object-store backend selection (s3s-fs / s3 / azure)
+tiers.rs                    object-store backend selection (rustfs / s3 / azure)
+rustfs_server.rs            local RustFS spawn, TLS, and HTTPS S3 provider for benches
 superfile.rs                superfile runners by modality (fts / vector / sql)
 supertable.rs               supertable object-store runners by modality
 ingest/, fixture/           supertable object-store helpers

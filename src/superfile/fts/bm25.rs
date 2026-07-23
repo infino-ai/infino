@@ -40,6 +40,58 @@ const IDF_SMOOTHING: f64 = 0.5;
 /// windowed-union path scores this many docs from one cursor.
 pub(super) const SCORE_SIMD_LANES: usize = 4;
 
+/// Document lengths below this are quantized to one byte with no loss;
+/// at or above it, an 8-bit floating representation kicks in. Equal to
+/// `2^(LEN_QUANT_MANTISSA_BITS + 1)` so the exact region and the
+/// float region join without a monotonicity gap.
+const LEN_QUANT_EXACT_MAX: u32 = 1 << (LEN_QUANT_MANTISSA_BITS + 1);
+
+/// Mantissa bits kept when a length is quantized into the float region.
+/// Three mantissa bits (plus the implicit leading 1) cap the decoded
+/// length's relative error at `2^-MANTISSA_BITS` = 12.5% (the codec
+/// truncates rather than rounds, which is what makes it idempotent) —
+/// and BM25 only feels a fraction of that, since the length enters the
+/// norm as `1 - b + b·dl/avgdl` (the `1 - b` term carries no error). In
+/// exchange the resident length-norm table shrinks 4× (one byte per doc
+/// instead of an `f32`), which is what keeps it cache-resident at scale.
+const LEN_QUANT_MANTISSA_BITS: u32 = 3;
+
+/// Quantize a document length into one byte via an 8-bit float:
+/// lengths `< LEN_QUANT_EXACT_MAX` are stored exactly; larger lengths
+/// keep the top `LEN_QUANT_MANTISSA_BITS` bits below the leading 1 plus
+/// an exponent. Monotonic non-decreasing in `len`, so it never reorders
+/// two docs whose true lengths differ by more than one bucket. Inverse
+/// of [`dequantize_len`].
+#[inline]
+pub(super) fn quantize_len(len: u32) -> u8 {
+    if len < LEN_QUANT_EXACT_MAX {
+        len as u8
+    } else {
+        // floor(log2 len); len >= LEN_QUANT_EXACT_MAX >= 8 ⇒ bits >= 3.
+        let bits = u32::BITS - 1 - len.leading_zeros();
+        let mantissa = (len >> (bits - LEN_QUANT_MANTISSA_BITS)) & 0x07;
+        // Exponent field is offset by 1 so the smallest float-region
+        // code sits just above the exact region (no gap, stays monotone).
+        let exponent = bits - LEN_QUANT_MANTISSA_BITS + 1;
+        ((exponent << LEN_QUANT_MANTISSA_BITS) | mantissa) as u8
+    }
+}
+
+/// Decode a byte produced by [`quantize_len`] back to a representative
+/// document length. The result is the exact length for small docs and a
+/// bucket representative (within ~6.25%) for larger ones.
+#[inline]
+pub(super) fn dequantize_len(b: u8) -> u32 {
+    let i = b as u32;
+    if i < LEN_QUANT_EXACT_MAX {
+        i
+    } else {
+        let mantissa = i & 0x07;
+        let exponent = (i >> LEN_QUANT_MANTISSA_BITS) - 1;
+        (mantissa | 0x08) << exponent
+    }
+}
+
 /// BM25 inverse-document-frequency. Plus-half smoothing keeps the log
 /// argument ≥ 1, so `idf(N, df) >= 0` for all valid `(N, df)`.
 ///
@@ -366,6 +418,60 @@ mod tests {
                 approx(simd[lane], scalar, 1e-6),
                 "lane {lane}: simd={} scalar={scalar}",
                 simd[lane]
+            );
+        }
+    }
+
+    // --- length quantization --------------------------------------------
+
+    #[test]
+    fn len_quant_is_exact_below_threshold() {
+        // Small documents (the common case) round-trip with zero error.
+        for len in 0..LEN_QUANT_EXACT_MAX {
+            let b = quantize_len(len);
+            assert_eq!(dequantize_len(b), len, "len {len} not exact");
+        }
+    }
+
+    #[test]
+    fn len_quant_is_monotonic_non_decreasing() {
+        // A larger true length never encodes to a smaller byte, so
+        // quantization can't invert the length ordering of two docs.
+        let mut prev = 0u8;
+        for len in 0..100_000u32 {
+            let b = quantize_len(len);
+            assert!(b >= prev, "len {len}: byte {b} < previous {prev}");
+            prev = b;
+        }
+    }
+
+    #[test]
+    fn len_quant_round_trip_relative_error_is_bounded() {
+        // Truncating codec: decoded length is within 2^-MANTISSA_BITS
+        // (12.5% at 3 mantissa bits) of the input, always rounding down.
+        let max_rel = 2f64.powi(-(LEN_QUANT_MANTISSA_BITS as i32));
+        for len in LEN_QUANT_EXACT_MAX..1_000_000u32 {
+            let decoded = dequantize_len(quantize_len(len));
+            let rel = (len as f64 - decoded as f64).abs() / len as f64;
+            assert!(
+                rel <= max_rel,
+                "len {len}: decoded {decoded}, rel err {rel} > {max_rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn len_quant_is_idempotent_over_realistic_lengths() {
+        // Decoding a quantized length and re-quantizing it yields the
+        // same byte — the byte↔length map is stable, so a doc's bucket
+        // never drifts across rebuilds. (Checked over lengths a real
+        // corpus can produce; bytes no length maps to are irrelevant.)
+        for len in 0..2_000_000u32 {
+            let b = quantize_len(len);
+            assert_eq!(
+                quantize_len(dequantize_len(b)),
+                b,
+                "len {len} → byte {b} not idempotent"
             );
         }
     }

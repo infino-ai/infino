@@ -146,6 +146,10 @@ pub use roaring;
 mod catalog;
 mod error;
 mod runtime_bridge;
+#[cfg(feature = "test-helpers")]
+pub mod runtime_metrics;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod runtime_metrics;
 mod utils;
 
 // ---- Curated public surface ----

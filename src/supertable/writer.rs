@@ -3343,12 +3343,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             continue;
         }
         let batch_t0 = std::time::Instant::now();
-        // Zero the I/O timeline so the readout below reflects only this batch's
-        // superfile reads (INFINO_IO_TIMELINE; a no-op otherwise).
-        if crate::storage::io_counters::timeline_enabled() {
-            let _ = crate::storage::io_counters::take();
+        // Timeline diagnostic only: snapshot GETs for this batch without
+        // clearing the shared usage meter (a no-op when the env gate is off).
+        let gets_before = if crate::storage::io_counters::timeline_enabled() {
+            let snap = storage_opt.as_ref().map(|s| s.usage_meter().snapshot());
             crate::storage::io_counters::timeline_reset();
-        }
+            snap
+        } else {
+            None
+        };
         let read_concurrency = drain_read_concurrency();
         // Open this batch's user superfiles FULLY RESIDENT: the splice/materialize
         // read via `try_get_range_sync` on rayon workers, which needs the whole
@@ -3405,7 +3408,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // materialize phase. Gated on INFINO_IO_TIMELINE.
         if crate::storage::io_counters::timeline_enabled() {
             let spans = crate::storage::io_counters::timeline_take();
-            let (range_gets, _, _, _) = crate::storage::io_counters::take();
+            let range_gets = match (storage_opt.as_ref(), gets_before.as_ref()) {
+                (Some(s), Some(before)) => s.usage_meter().snapshot().since(before).get_count,
+                _ => 0,
+            };
             let min_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
             let max_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
             let wall_us = max_end.saturating_sub(min_start);

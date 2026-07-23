@@ -22,8 +22,8 @@ use object_store::{
 };
 
 use super::{
-    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
-    retry,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
+    logical_list_key, options::apply, retry, usage::UsageMeter,
 };
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
@@ -33,6 +33,7 @@ pub struct AzureStorageProvider {
     container: String,
     prefix: String,
     store: Arc<MicrosoftAzure>,
+    meter: Arc<UsageMeter>,
 }
 
 impl AzureStorageProvider {
@@ -70,6 +71,7 @@ impl AzureStorageProvider {
             container,
             prefix: normalize_prefix(prefix),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         })
     }
 
@@ -93,6 +95,7 @@ impl AzureStorageProvider {
             container,
             prefix: String::new(),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         })
     }
 
@@ -103,7 +106,14 @@ impl AzureStorageProvider {
             container: container.into(),
             prefix: String::new(),
             store: Arc::new(store),
+            meter: UsageMeter::process_default(),
         }
+    }
+
+    /// Replace the usage meter (connection-scoped ledger).
+    pub fn with_usage_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = meter;
+        self
     }
 
     /// Container this provider is scoped to.
@@ -190,7 +200,7 @@ impl StorageProvider for AzureStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
-        crate::storage::io_counters::record_head();
+        self.meter.record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -200,7 +210,7 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
-        let tl = crate::storage::io_counters::timeline_start();
+        let tl = io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
         let out = retry::complete_get(uri, || async {
@@ -215,8 +225,8 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if let Ok((b, _)) = &out {
-            crate::storage::io_counters::record_get(b.len() as u64);
-            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+            self.meter.record_get(uri, None, b.len() as u64);
+            io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
     }
@@ -228,8 +238,9 @@ impl StorageProvider for AzureStorageProvider {
     ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
         let path = self.path(uri)?;
         // Native `If-None-Match`: an unchanged blob comes back as a
-        // bodyless 304 instead of a full read.
-        retry::with_reissue(|| async {
+        // bodyless 304 instead of a full read. Both arms are still a
+        // billable GET (0 body bytes on 304).
+        let out = retry::with_reissue(|| async {
             let options = GetOptions {
                 if_none_match: Some(etag.to_string()),
                 ..GetOptions::default()
@@ -247,7 +258,13 @@ impl StorageProvider for AzureStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok(Some((bytes, meta)))
         })
-        .await
+        .await;
+        match &out {
+            Ok(Some((b, _))) => self.meter.record_get(uri, None, b.len() as u64),
+            Ok(None) => self.meter.record_get(uri, None, 0),
+            Err(_) => {}
+        }
+        out
     }
 
     #[cfg_attr(
@@ -256,8 +273,9 @@ impl StorageProvider for AzureStorageProvider {
     )]
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
+        let requested = (range.start, range.end);
         let off = range.start;
-        let tl = crate::storage::io_counters::timeline_start();
+        let tl = io_counters::timeline_start();
         let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
@@ -266,8 +284,8 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if let Ok(b) = &out {
-            crate::storage::io_counters::record_get(b.len() as u64);
-            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+            self.meter.record_get(uri, Some(requested), b.len() as u64);
+            io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
         }
         out
     }
@@ -313,7 +331,7 @@ impl StorageProvider for AzureStorageProvider {
         })
         .await;
         if out.is_ok() {
-            crate::storage::io_counters::record_put(n);
+            self.meter.record_put(n);
         }
         out
     }
@@ -350,25 +368,35 @@ impl StorageProvider for AzureStorageProvider {
             .map(|r| r.e_tag)
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
-            crate::storage::io_counters::record_put(n);
+            self.meter.record_put(n);
         }
         out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
-        self.store
+        let upload = self
+            .store
             .put_multipart(&path)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e))?;
+        // CreateMultipartUpload is billable; count only after the session exists.
+        self.meter.record_put(0);
+        Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
-        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(ObjError::NotFound { .. }) => Ok(()),
+            Ok(()) => {
+                self.meter.record_delete();
+                Ok(())
+            }
+            // Idempotent delete: NotFound is success for the caller.
+            Err(ObjError::NotFound { .. }) => {
+                self.meter.record_delete();
+                Ok(())
+            }
             Err(e) => Err(translate(uri, e)),
         }
     }
@@ -377,9 +405,11 @@ impl StorageProvider for AzureStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
-        crate::storage::io_counters::record_list();
         let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
+        // LIST is billable once the stream exists (path already validated);
+        // a mid-iteration failure must not undercount the request.
+        self.meter.record_list();
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
             let location = meta.location.to_string();
@@ -397,7 +427,17 @@ impl StorageProvider for AzureStorageProvider {
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let path = self.path(uri).ok()?;
-        Some((Arc::clone(&self.store) as Arc<dyn ObjectStore>, path))
+        Some((
+            counting::wrap_object_store(
+                Arc::clone(&self.store) as Arc<dyn ObjectStore>,
+                Arc::clone(&self.meter),
+            ),
+            path,
+        ))
+    }
+
+    fn usage_meter(&self) -> Arc<UsageMeter> {
+        Arc::clone(&self.meter)
     }
 }
 
@@ -565,7 +605,7 @@ mod tests {
     // end-to-end against the Azurite emulator in the gated
     // `supertable_smoke_via_azure_wire_protocol` integration test. Azurite
     // is an out-of-process Docker emulator (no in-process server crate
-    // exists the way `s3s-fs` does for S3), so it cannot be stood up from
+    // exists the way RustFS does for S3), so it cannot be stood up from
     // a `#[cfg(test)]` unit test here; these unit tests therefore cover the
     // pure, server-free surface (constructors, `translate`, path/key
     // building) directly.

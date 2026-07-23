@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # The default github-hosted ubuntu runner has ~14 GB free at job
-      # start; infino's dep graph (datafusion + lance + tantivy + s3s)
+      # start; infino's dep graph (datafusion + lance + tantivy)
       # plus `cargo llvm-cov`'s separate `target/llvm-cov-target/`
       # directory (it instruments a second full build of everything)
       # overflows that, so the coverage step fails with ENOSPC. Free
@@ -39,12 +39,15 @@ jobs:
         with:
           cache-directories: |
             ~/.cargo/bin
+            target/infino-bench/rustfs
       - name: Install cargo-llvm-cov
         run: |
           if ! command -v cargo-llvm-cov &> /dev/null; then
             cargo install cargo-llvm-cov --locked
           fi
       - run: make ci
+      - name: RustFS storage wire + smoke tests
+        run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
 
   public-api:
     name: Public API surface

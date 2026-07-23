@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -70,7 +70,7 @@ bench = false
 # (`default-features = false`): a second global allocator dlopened into a
 # live process segfaults. Not part of the public API surface.
 default = ["mimalloc"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Exposes `infino::test_helpers` — convenience builders for
 # Decimal128 id columns, default tokenizers, default vector
 # configs. Enabled explicitly by the Makefile test / bench / coverage
@@ -116,6 +116,9 @@ bytemuck = { version = "1", features = ["min_const_generics"] }
 # Allocator strategy: mimalloc as #[global_allocator], bumpalo for
 # per-query scratch, plus the custom MemoryArena in fts/arena.rs.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# Exposes `mi_collect` so RSS sampling can purge retained arenas. Only
+# linked when the mimalloc feature (and thus the global allocator) is on.
+libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"
@@ -293,16 +296,6 @@ hdrhistogram = "7"
 # busy/idle timing output (`FmtSpan`). Dev-only; not part of the shipped
 # crate's dependency surface.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# s3s + s3s-fs power the "real S3 wire protocol" smoke test.
-# s3s is the S3-compatible HTTP server library; s3s-fs is its
-# filesystem backend. The test crate spawns s3s-fs on a random
-# port in a tempdir; the supertable's S3StorageProvider talks to
-# it via object_store::aws::AmazonS3.
-s3s = "0.14"
-s3s-fs = "0.14"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
-futures = "0.3"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"

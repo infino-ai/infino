@@ -41,8 +41,8 @@
 //!
 //! ```text
 //! cargo bench -- sql-diag
-//! INFINO_BENCH_SUPERFILE_DOCS=1000000 cargo bench -- sql-diag
-//! INFINO_SQL_DIAG_ITERS=20 cargo bench -- sql-diag
+//! INFINO_BENCH_SUPERTABLE_DOCS=1000000 cargo bench -- sql-diag
+//! INFINO_DIAG_ITERS=20 cargo bench -- sql-diag
 //! # delegate to the kernel-vs-query_sql TVF dispatch-tax diagnostic:
 //! INFINO_SQL_DIAG=tvf cargo bench -- sql-diag
 //! ```
@@ -53,32 +53,16 @@ use std::{
 };
 
 use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use datafusion::{
     datasource::MemTable,
     prelude::{ParquetReadOptions, SessionContext},
 };
-use infino::{
-    superfile::builder::FtsConfig,
-    supertable::{Supertable, SupertableOptions},
-    test_helpers::default_tokenizer,
-};
 use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
 use tokio::runtime::Runtime;
 
-use crate::{
-    corpus::{self, MmapTextCorpus},
-    markdown::fmt_count,
-};
-
-/// Rows per commit — mirrors `InfinoSqlEngine`'s `WRITE_CHUNK`, so the
-/// superfile count matches the headline SQL bench.
-const WRITE_CHUNK: usize = 65_536;
-
-/// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
-const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
+use crate::{diag_common, markdown::fmt_count};
 
 const TABLE: &str = "supertable";
 
@@ -114,84 +98,8 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
-/// Baseline-table schema (no `_id`; `query_sql` injects its own, but
-/// these shapes never project it). Order matches `raw_cols`.
-fn baseline_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("title", DataType::LargeUtf8, false),
-        Field::new("category", DataType::LargeUtf8, false),
-        Field::new("rating", DataType::Int64, false),
-    ]))
-}
-
-/// Supertable schema for the infino path: scalar + FTS only. No vector
-/// index — vectors are stripped to the embedded blob and never touch
-/// the scalar scan path, so omitting them keeps the build cheap while
-/// leaving the measured path identical.
-fn supertable_options() -> SupertableOptions {
-    SupertableOptions::new(
-        baseline_schema(),
-        vec![FtsConfig {
-            column: "title".into(),
-            positions: false,
-        }],
-        vec![],
-        Some(default_tokenizer()),
-    )
-    .expect("supertable sql-diag options")
-}
-
-fn chunk_batch(rows: &[(u64, &str)]) -> RecordBatch {
-    let titles = LargeStringArray::from(rows.iter().map(|&(_, t)| t).collect::<Vec<_>>());
-    let categories = LargeStringArray::from(
-        rows.iter()
-            .map(|&(id, _)| CATEGORIES[(id as usize) % CATEGORIES.len()])
-            .collect::<Vec<_>>(),
-    );
-    let ratings = Int64Array::from(
-        rows.iter()
-            .map(|&(id, _)| (id % 100) as i64)
-            .collect::<Vec<_>>(),
-    );
-    RecordBatch::try_new(
-        baseline_schema(),
-        vec![Arc::new(titles), Arc::new(categories), Arc::new(ratings)],
-    )
-    .expect("chunk batch")
-}
-
-fn percentile(samples: &mut [Duration], p: usize) -> Duration {
-    if samples.is_empty() {
-        return Duration::ZERO;
-    }
-    samples.sort_unstable();
-    let rank = ((p as f64 / 100.0) * samples.len() as f64).ceil() as usize;
-    samples[rank.saturating_sub(1).min(samples.len() - 1)]
-}
-
-fn fmt(d: Duration) -> String {
-    let us = d.as_secs_f64() * 1e6;
-    if us < 1000.0 {
-        format!("{us:>9.1} µs")
-    } else {
-        format!("{:>9.2} ms", us / 1000.0)
-    }
-}
-
-/// Time `f` once (warm) then `iters` times; return (p50, mean, rows).
-fn time_path(iters: usize, mut f: impl FnMut() -> usize) -> (Duration, Duration, usize) {
-    let rows = f();
-    let mut samples = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let t = Instant::now();
-        let out = f();
-        samples.push(t.elapsed());
-        std::hint::black_box(out);
-    }
-    let sum: u128 = samples.iter().map(|d| d.as_nanos()).sum();
-    let mean = Duration::from_nanos((sum / samples.len().max(1) as u128) as u64);
-    (percentile(&mut samples, 50), mean, rows)
-}
+// Table build, corpus, chunk batching, and the stat/format helpers are
+// shared with the FTS diagnostic — see `crate::diag_common`.
 
 /// Raw parquet-rs decode of `cols` from every superfile, applying `keep`
 /// to each row by hand and counting survivors — the direct-decode
@@ -256,34 +164,20 @@ pub fn run() {
         return;
     }
 
-    let n = corpus::superfile_docs();
-    let iters: usize = std::env::var("INFINO_SQL_DIAG_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15);
+    let cfg = diag_common::config();
+    let n = cfg.n_docs;
+    let iters = cfg.iters;
     eprintln!(
         "[sql-diag] scalar scan decomposition: n_docs={} iters={iters} \
-         (knobs: INFINO_BENCH_SUPERFILE_DOCS, INFINO_SQL_DIAG_ITERS)",
+         (knobs: INFINO_BENCH_SUPERTABLE_DOCS, INFINO_DIAG_ITERS)",
         fmt_count(n)
     );
 
-    // ── Shared corpus + per-chunk batches (the "superfiles"). ──────────
-    eprintln!("[sql-diag] generating {}-row corpus...", fmt_count(n));
-    let corpus = MmapTextCorpus::generate(n, 1);
-    let corpus_rows = corpus.rows();
-    let batches: Vec<RecordBatch> = corpus_rows.chunks(WRITE_CHUNK).map(chunk_batch).collect();
-
-    // ── infino Supertable (scalar + FTS), committed per chunk. ───────
+    // ── Shared corpus + supertable build (see `diag_common`); the chunk
+    //    batches come back for the DataFusion MemTable baseline below. ──
     eprintln!("[sql-diag] building infino supertable...");
     let build_t0 = Instant::now();
-    let table = Supertable::create(supertable_options()).expect("create supertable");
-    {
-        let mut writer = table.writer().expect("writer");
-        for batch in &batches {
-            writer.append(batch).expect("append");
-            writer.commit().expect("commit");
-        }
-    }
+    let (table, batches) = diag_common::build_supertable(&cfg);
     eprintln!(
         "[sql-diag] supertable built in {:.1}s",
         build_t0.elapsed().as_secs_f64()
@@ -334,7 +228,7 @@ pub fn run() {
 
     for shape in SHAPES {
         // 1. infino query_sql (full path).
-        let (full_p50, full_mean, full_rows) = time_path(iters, || {
+        let (full_p50, full_mean, full_rows) = diag_common::time_path(iters, || {
             table
                 .reader()
                 .query_sql(shape.sql)
@@ -355,8 +249,8 @@ pub fn run() {
             ex.push(t1.elapsed());
             df_rows = count_rows(&out);
         }
-        let pp_p50 = percentile(&mut pp, 50);
-        let ex_p50 = percentile(&mut ex, 50);
+        let pp_p50 = diag_common::percentile(&mut pp, 50);
+        let ex_p50 = diag_common::percentile(&mut ex, 50);
 
         // 2. vanilla DataFusion over the same parquet files (no infino).
         let (dfq_p50, dfq_mean, dfq_rows) = {
@@ -394,7 +288,7 @@ pub fn run() {
             }
             let sum: u128 = samples.iter().map(|d| d.as_nanos()).sum();
             (
-                percentile(&mut samples, 50),
+                diag_common::percentile(&mut samples, 50),
                 Duration::from_nanos((sum / samples.len().max(1) as u128) as u64),
                 rows,
             )
@@ -402,8 +296,8 @@ pub fn run() {
 
         // 3. DataFusion MemTable over the already-decoded Arrow batches.
         let (mem_p50, mem_mean, mem_rows) = {
-            let provider =
-                MemTable::try_new(baseline_schema(), vec![batches.clone()]).expect("memtable");
+            let provider = MemTable::try_new(diag_common::diag_schema(), vec![batches.clone()])
+                .expect("memtable");
             let provider = Arc::new(provider);
             let mut samples = Vec::with_capacity(iters);
             // warm
@@ -429,14 +323,14 @@ pub fn run() {
             }
             let sum: u128 = samples.iter().map(|d| d.as_nanos()).sum();
             (
-                percentile(&mut samples, 50),
+                diag_common::percentile(&mut samples, 50),
                 Duration::from_nanos((sum / samples.len().max(1) as u128) as u64),
                 rows,
             )
         };
 
         // 4. raw parquet-rs decode floor.
-        let (raw_p50, raw_mean, raw_rows) = time_path(iters, || {
+        let (raw_p50, raw_mean, raw_rows) = diag_common::time_path(iters, || {
             raw_decode(&superfiles, shape.raw_cols, shape.keep)
         });
 
@@ -465,27 +359,27 @@ pub fn run() {
         eprintln!(
             "[sql-diag] {:<16} {} {} {} {} {}   {}",
             shape.name,
-            fmt(full_p50),
-            fmt(pp_p50),
-            fmt(ex_p50),
-            fmt(dfq_p50),
-            fmt(mem_p50),
+            diag_common::fmt(full_p50),
+            diag_common::fmt(pp_p50),
+            diag_common::fmt(ex_p50),
+            diag_common::fmt(dfq_p50),
+            diag_common::fmt(mem_p50),
             fmt_count(full_rows),
         );
         eprintln!(
             "[sql-diag] {:<16} {} {} {} {} {}   (mean; raw-decode floor below)",
             "",
-            fmt(full_mean),
-            fmt(Duration::ZERO),
-            fmt(Duration::ZERO),
-            fmt(dfq_mean),
-            fmt(mem_mean),
+            diag_common::fmt(full_mean),
+            diag_common::fmt(Duration::ZERO),
+            diag_common::fmt(Duration::ZERO),
+            diag_common::fmt(dfq_mean),
+            diag_common::fmt(mem_mean),
         );
         eprintln!(
             "[sql-diag] {:<16} raw parquet-rs decode floor: p50 {} / mean {}",
             "",
-            fmt(raw_p50),
-            fmt(raw_mean),
+            diag_common::fmt(raw_p50),
+            diag_common::fmt(raw_mean),
         );
         eprintln!();
     }

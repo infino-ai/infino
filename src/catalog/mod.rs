@@ -47,7 +47,10 @@ use crate::{
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
-    storage::{StorageError, StorageProvider},
+    storage::{
+        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+        StorageError, StorageProvider, UsageMeter, UsageSnapshot,
+    },
     superfile::{
         builder::FtsConfig,
         fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
@@ -95,10 +98,11 @@ pub fn connect_with(
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
     let backend = parse_uri(uri.as_ref())?;
+    let usage_meter = UsageMeter::new();
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
         _ => {
-            let root = backend_to_provider(&backend, &options)?
+            let root = backend_to_provider(&backend, &options, Arc::clone(&usage_meter))?
                 .expect("non-memory backend yields a storage provider");
             // Opt-in probe: fail at connect on bad credentials, not first use.
             if options.validate {
@@ -128,6 +132,7 @@ pub fn connect_with(
             options,
             store,
             connection_memory_budget,
+            usage_meter,
         }),
     })
 }
@@ -147,6 +152,9 @@ struct ConnectionInner {
     /// (cloned `Arc`) into every table's `SupertableOptions`. See
     /// [`crate::memory`].
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// Sole object-store usage ledger for this connection (shared into every
+    /// table provider). Benches and billing snapshot this meter.
+    usage_meter: Arc<UsageMeter>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -188,6 +196,22 @@ enum CatalogStore {
 }
 
 impl Connection {
+    /// Cumulative object-store usage for this connection (read-only snapshot).
+    /// Shared by every table provider created through this connection; take
+    /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
+    /// Not part of the curated public API — unit tests / `test-helpers` only.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.inner.usage_meter.snapshot()
+    }
+
+    /// Object-store usage ledger for this connection. Shared by every table
+    /// provider; benches and diagnostics hold the `Arc` across phases.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn usage_meter(&self) -> Arc<UsageMeter> {
+        Arc::clone(&self.inner.usage_meter)
+    }
+
     /// Create a new table named `name` with the given Arrow `schema` and
     /// search `indexes`. Fails with [`InfinoError::AlreadyExists`] if a
     /// table of that name already exists. Returns the open handle.
@@ -271,10 +295,13 @@ impl Connection {
                     created_at_unix: now_unix(),
                 };
 
-                let table_storage =
-                    backend_to_provider(&self.inner.backend.join(&location), &self.inner.options)
-                        .map_err(|e| e.with_context("create_table", Some(name)))?
-                        .expect("non-memory backend yields a storage provider");
+                let table_storage = backend_to_provider(
+                    &self.inner.backend.join(&location),
+                    &self.inner.options,
+                    Arc::clone(&self.inner.usage_meter),
+                )
+                .map_err(|e| e.with_context("create_table", Some(name)))?
+                .expect("non-memory backend yields a storage provider");
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
                 // cache directory; superfile keys carry the location, so a
@@ -408,6 +435,7 @@ impl Connection {
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
                     &self.inner.options,
+                    Arc::clone(&self.inner.usage_meter),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?
                 .expect("non-memory backend yields a storage provider");
@@ -703,30 +731,30 @@ fn table_tokenizer(indexes: &IndexSpec) -> Option<Arc<dyn Tokenizer>> {
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).
+/// Every durable provider records into the connection's `usage_meter`.
 fn backend_to_provider(
     backend: &Backend,
     options: &ConnectOptions,
+    usage_meter: Arc<UsageMeter>,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
-    use crate::storage::{
-        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
-    };
-
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
-        Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new(root.clone())?)),
-        Backend::S3 { bucket, prefix } => Some(Arc::new(S3StorageProvider::new_with_prefix(
-            bucket,
-            prefix,
-            &options.storage_options,
+        Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new_with_meter(
+            root.clone(),
+            usage_meter,
         )?)),
-        Backend::Azure { container, prefix } => Some(Arc::new(
-            AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?,
+        Backend::S3 { bucket, prefix } => Some(Arc::new(
+            S3StorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
+                .with_usage_meter(usage_meter),
         )),
-        Backend::Gcs { bucket, prefix } => Some(Arc::new(GcsStorageProvider::new_with_prefix(
-            bucket,
-            prefix,
-            &options.storage_options,
-        )?)),
+        Backend::Azure { container, prefix } => Some(Arc::new(
+            AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?
+                .with_usage_meter(usage_meter),
+        )),
+        Backend::Gcs { bucket, prefix } => Some(Arc::new(
+            GcsStorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
+                .with_usage_meter(usage_meter),
+        )),
     };
     Ok(provider)
 }
@@ -2341,5 +2369,29 @@ mod tests {
         let err = conn.query_sql("NOT VALID SQL @@@").expect_err("bad sql");
         assert!(matches!(err, InfinoError::Query(_)));
         assert!(err.to_string().contains("query_sql:"), "got: {err}");
+    }
+
+    #[test]
+    fn usage_meters_are_isolated_across_connections() {
+        let a_dir = tempfile::tempdir().expect("a");
+        let b_dir = tempfile::tempdir().expect("b");
+        let a = connect(a_dir.path().to_str().expect("utf8")).expect("connect a");
+        let b = connect(b_dir.path().to_str().expect("utf8")).expect("connect b");
+        let before_a = a.usage_snapshot();
+        let before_b = b.usage_snapshot();
+        a.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create a")
+            .append(&build_title_batch(&["alpha"]))
+            .expect("append a");
+        let delta_a = a.usage_snapshot().since(&before_a);
+        let delta_b = b.usage_snapshot().since(&before_b);
+        assert!(
+            delta_a.put_count > 0 || delta_a.get_count > 0 || delta_a.list_count > 0,
+            "connection A must record I/O: {delta_a:?}"
+        );
+        assert!(
+            delta_b.is_zero(),
+            "connection B must stay quiet while A writes: {delta_b:?}"
+        );
     }
 }

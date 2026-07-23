@@ -225,6 +225,80 @@ fn two_term_has_rare_anchor(cursors: &[TermCursor]) -> bool {
     lo > 0 && hi >= lo.saturating_mul(WAND_BMW_2TERM_DF_RATIO)
 }
 
+/// Per-doc BM25 length normalizer, quantized to one byte per doc.
+///
+/// The scorer needs `dl_norm_k1[doc] = K1·(1 - B + B·dl/avgdl)` for
+/// every scored doc. Held as an `f32` per doc, that table is 4 bytes ×
+/// n_docs — at multi-million-doc scale too large to stay cache-resident,
+/// so each scored doc pays a scattered load from a table that overflows
+/// cache. Instead the doc length is quantized to one byte
+/// ([`bm25::quantize_len`]) and a 256-entry table decodes each bucket to
+/// its norm value: the per-doc table is 4× smaller (one byte), and the
+/// decode table is 1 KiB (L1-resident). A scored doc reads
+/// `lut[bytes[doc]]` — one load from the small per-doc table plus one L1
+/// lookup — instead of one load from a 4×-larger table.
+#[derive(Debug, Clone)]
+pub struct NormTable {
+    /// Per-doc quantized length bucket. Empty for a column with no docs.
+    bytes: Vec<u8>,
+    /// Bucket → `K1·(1 - B + B·dequantize_len(bucket)/avgdl)`. A fixed
+    /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
+    /// scanned by non-scoring paths — column lookup, listing) while the
+    /// `u8` bucket index into a fixed-length array lets the compiler drop
+    /// the bounds check in `get`.
+    lut: Box<[f32; 256]>,
+}
+
+impl NormTable {
+    /// Build from a column's per-doc lengths and average length. An
+    /// `avgdl` of `0.0` (empty column) yields an empty table; it is
+    /// never indexed because `search` short-circuits on empty columns.
+    fn new(doc_lengths: impl Iterator<Item = u32>, n_docs: usize, avgdl: f32) -> Self {
+        if avgdl <= 0.0 {
+            return Self::empty();
+        }
+        let inv_avgdl = 1.0_f32 / avgdl;
+        // Fill the boxed table in place so the 256 f32s land on the heap
+        // directly rather than being built on the stack and moved.
+        let mut lut = Box::new([0.0_f32; 256]);
+        for (b, slot) in lut.iter_mut().enumerate() {
+            let dl = bm25::dequantize_len(b as u8) as f32;
+            *slot = bm25::K1 * (1.0 - bm25::B + bm25::B * dl * inv_avgdl);
+        }
+        let mut bytes = Vec::with_capacity(n_docs);
+        for dl in doc_lengths {
+            bytes.push(bm25::quantize_len(dl));
+        }
+        Self { bytes, lut }
+    }
+
+    /// `dl_norm_k1` for a doc (length quantized): one per-doc byte load
+    /// plus one L1 decode-table lookup. Hot path — keep it inlined.
+    #[inline(always)]
+    fn get(&self, doc: u32) -> f32 {
+        self.lut[self.bytes[doc as usize] as usize]
+    }
+
+    /// Number of docs in the table. Test-only: the query path indexes
+    /// by doc id and never needs the count.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// An empty table: `bytes` is empty, so `get` must never be called on
+    /// it. For call sites that need a `&NormTable` but provably never index
+    /// it — an unranked (`bar == NEG_INFINITY`) phrase seek, which does no
+    /// scoring. The `lut` is a zeroed 256-entry table, allocated but never
+    /// read.
+    fn empty() -> Self {
+        Self {
+            bytes: Vec::new(),
+            lut: Box::new([0.0; 256]),
+        }
+    }
+}
+
 /// Per-column metadata, indexed by column_id (declaration order).
 #[derive(Debug, Clone)]
 pub struct ColumnMeta {
@@ -235,13 +309,12 @@ pub struct ColumnMeta {
     /// Average doc length across this column. `0.0` if the column has
     /// no docs.
     pub avgdl: f32,
-    /// Precomputed BM25 denominator constant per doc:
-    /// `dl_norm_k1[d] = K1 * (1 - B + B * dl[d] / avgdl)`. The hot
-    /// scoring loop multiplies-out to `idf * tf * (K1+1) / (tf +
-    /// dl_norm_k1[d])`, so each scoring call shaves a load + mul +
-    /// add + mul vs recomputing on the fly. Computed once per
-    /// reader at `open` time.
-    pub dl_norm_k1: Vec<f32>,
+    /// Per-doc BM25 length normalizer, byte-quantized — see
+    /// [`NormTable`]. Computed once per reader at `open` time from the
+    /// column's on-disk doc-lengths array. The hot scoring loop reads
+    /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf · (K1+1) /
+    /// (tf + dl_norm_k1.get(d))`.
+    pub dl_norm_k1: NormTable,
     /// Whether this column's index carries token positions (from
     /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
@@ -685,19 +758,15 @@ impl FtsReader {
             }
 
             let avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
-            // Precompute per-doc length normalizer:
-            //   dl_norm_k1[d] = K1 * (1 - B + B * dl[d] / avgdl)
-            // For avgdl == 0 (empty column) leave the table empty;
-            // it'll never be indexed since `search` short-circuits.
-            let mut dl_norm_k1 = Vec::with_capacity(n_docs as usize);
-            if avgdl > 0.0 {
-                let inv_avgdl = 1.0_f32 / avgdl;
-                for d in 0..(n_docs as usize) {
-                    let dl = read_u32_le(&array_region[d * 4..d * 4 + 4]) as f32;
-                    let norm = 1.0 - bm25::B + bm25::B * dl * inv_avgdl;
-                    dl_norm_k1.push(bm25::K1 * norm);
-                }
-            }
+            // Per-doc length normalizer, byte-quantized (see `NormTable`).
+            // For avgdl == 0 (empty column) this is an empty table; it'll
+            // never be indexed since `search` short-circuits.
+            let n = n_docs as usize;
+            let dl_norm_k1 = NormTable::new(
+                (0..n).map(|d| read_u32_le(&array_region[d * 4..d * 4 + 4])),
+                n,
+                avgdl,
+            );
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
@@ -946,7 +1015,7 @@ impl FtsReader {
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1.as_slice();
+        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
 
@@ -977,7 +1046,7 @@ impl FtsReader {
                     None => true,
                 };
                 if admitted {
-                    let norm = dl_norm_k1[doc as usize];
+                    let norm = dl_norm_k1.get(doc);
                     let score: f32 = shoulds
                         .iter()
                         .filter(|a| !a.is_exhausted() && a.current_doc_id() == doc)
@@ -1056,7 +1125,7 @@ impl FtsReader {
                     None => true,
                 };
             if admitted {
-                let norm = dl_norm_k1[aligned as usize];
+                let norm = dl_norm_k1.get(aligned);
                 let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
                 for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
                     sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
@@ -1723,7 +1792,7 @@ impl FtsReader {
                 {
                     return Ok(Vec::new());
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
+                let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok(Vec::new());
@@ -1752,7 +1821,7 @@ impl FtsReader {
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
@@ -1796,8 +1865,7 @@ impl FtsReader {
                     continue;
                 }
                 let tf = buf_t[j];
-                let score =
-                    bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1[doc_id as usize]);
+                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1.get(doc_id));
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.
@@ -1882,7 +1950,7 @@ impl FtsReader {
                         true => 1,
                         false => tf,
                     };
-                    let dl_norm_k1 = col_meta.dl_norm_k1[doc_id as usize];
+                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
                     cursors.push(TermCursor::new_inline(
                         doc_id,
                         tf,
@@ -1939,7 +2007,7 @@ impl FtsReader {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // `search_multi` passes `k = usize::MAX` to gather every
         // matching doc before weighting across columns; cap initial
@@ -2071,7 +2139,7 @@ impl FtsReader {
             // beyond the prefix may also be at pivot_doc — they
             // contribute too). SIMD-pack up to 4 cursors per scoring
             // call.
-            let norm = dl_norm_k1[pivot_doc as usize];
+            let norm = dl_norm_k1.get(pivot_doc);
             let mut score: f32 = 0.0;
             let mut idfs = [0.0_f32; 4];
             let mut tfs = [0.0_f32; 4];
@@ -2197,7 +2265,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Smallest-df cursor at index 0 = leader. The remaining order
         // doesn't matter for correctness but ascending-df reduces the
@@ -2237,7 +2305,7 @@ impl FtsReader {
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
         must_cursors.sort_by_key(|c| c.block_count());
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
@@ -2268,7 +2336,7 @@ impl FtsReader {
             return Vec::new();
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CollectSink { out: Vec::new() };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
@@ -2284,7 +2352,7 @@ impl FtsReader {
             return 0;
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CountSink { n: 0 };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
@@ -2302,7 +2370,7 @@ impl FtsReader {
     fn and_flat_merge<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
-        dl_norm_k1: &[f32],
+        dl_norm_k1: &NormTable,
         sink: &mut S,
     ) {
         if cursors.len() == 2 {
@@ -2324,7 +2392,7 @@ impl FtsReader {
     fn and_flat_merge_general<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
-        dl_norm_k1: &[f32],
+        dl_norm_k1: &NormTable,
         sink: &mut S,
     ) {
         'outer: loop {
@@ -2426,7 +2494,7 @@ impl FtsReader {
                 }
                 if all_match {
                     let score = if sink.needs_score() {
-                        let norm = dl_norm_k1[a as usize];
+                        let norm = dl_norm_k1.get(a);
                         let mut score =
                             bm25::score_with_dl_norm_k1(c0.idf_x_k1p1, c0.block_tfs[i], norm);
                         for o in others.iter() {
@@ -2472,7 +2540,7 @@ impl FtsReader {
     fn and_flat_merge_2term<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
-        dl_norm_k1: &[f32],
+        dl_norm_k1: &NormTable,
         sink: &mut S,
     ) {
         debug_assert_eq!(cursors.len(), 2);
@@ -2547,7 +2615,7 @@ impl FtsReader {
                     j += 1;
                 } else {
                     let score = if sink.needs_score() {
-                        let norm = dl_norm_k1[a as usize];
+                        let norm = dl_norm_k1.get(a);
                         bm25::score_with_dl_norm_k1(c0_idf, c0.block_tfs[i], norm)
                             + bm25::score_with_dl_norm_k1(c1_idf, c1.block_tfs[j], norm)
                     } else {
@@ -2604,7 +2672,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Sub-range seek: jump every cursor past any doc_id below
         // the lower bound. Cursors already past the bound stay where
@@ -2713,7 +2781,7 @@ impl FtsReader {
                         cursors[0].next();
                         continue;
                     }
-                    let norm = dl_norm_k1[candidate as usize];
+                    let norm = dl_norm_k1.get(candidate);
                     let essential_score = bm25::score_with_dl_norm_k1(
                         cursors[0].idf_x_k1p1,
                         cursors[0].current_tf(),
@@ -2852,7 +2920,7 @@ impl FtsReader {
                 // scoring has no early-bail; non-essential scoring below
                 // does, so it stays scalar to keep `score` always
                 // up-to-date for the bail check.)
-                let norm = dl_norm_k1[candidate as usize];
+                let norm = dl_norm_k1.get(candidate);
                 let mut score: f32 = 0.0;
                 let mut idfs = [0.0_f32; 4];
                 let mut tfs = [0.0_f32; 4];
@@ -2995,7 +3063,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         if doc_id_start > 0 {
             for c in &mut cursors {
@@ -3061,10 +3129,10 @@ impl FtsReader {
                                     c.block_tfs[pos + 3],
                                 ],
                                 [
-                                    dl_norm_k1[doc_ids[0] as usize],
-                                    dl_norm_k1[doc_ids[1] as usize],
-                                    dl_norm_k1[doc_ids[2] as usize],
-                                    dl_norm_k1[doc_ids[3] as usize],
+                                    dl_norm_k1.get(doc_ids[0]),
+                                    dl_norm_k1.get(doc_ids[1]),
+                                    dl_norm_k1.get(doc_ids[2]),
+                                    dl_norm_k1.get(doc_ids[3]),
                                 ],
                             );
                             for lane in 0..bm25::SCORE_SIMD_LANES {
@@ -3080,7 +3148,7 @@ impl FtsReader {
                     scores[local] += bm25::score_with_dl_norm_k1(
                         c.idf_x_k1p1,
                         c.current_tf(),
-                        dl_norm_k1[d as usize],
+                        dl_norm_k1.get(d),
                     );
                     present[local >> 6] |= 1u64 << (local & 63);
                     c.next();
@@ -3183,7 +3251,7 @@ impl FtsReader {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1.as_slice();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -3209,7 +3277,7 @@ impl FtsReader {
             // Score: sum BM25 from every cursor positioned at the
             // candidate doc. Pack up to 4 cursors per SIMD scoring
             // call, matching the BMM essential-scoring shape.
-            let norm = dl_norm_k1[candidate as usize];
+            let norm = dl_norm_k1.get(candidate);
             let mut score: f32 = 0.0;
             let mut idfs = [0.0_f32; 4];
             let mut tfs = [0.0_f32; 4];
@@ -3559,7 +3627,7 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
         };
-        cursor.seek_match(0, f32::NEG_INFINITY, &[])?;
+        cursor.seek_match(0, f32::NEG_INFINITY, &NormTable::empty())?;
         Ok(cursor)
     }
 
@@ -3578,7 +3646,7 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target, f32::NEG_INFINITY, &[])
+        self.seek_match(target, f32::NEG_INFINITY, &NormTable::empty())
     }
 
     /// [`Self::skip_to`] for ranked walks: additionally skips docs
@@ -3593,7 +3661,7 @@ impl PhraseCursor {
         &mut self,
         target: u32,
         bar: f32,
-        dl_norm_k1: &[f32],
+        dl_norm_k1: &NormTable,
     ) -> Result<(), FtsError> {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
@@ -3610,7 +3678,12 @@ impl PhraseCursor {
     /// the run decode. (`<`, not `<=`: a doc exactly at the bar can
     /// still displace the incumbent kth-best on the ascending-doc-id
     /// tie-break, so it must be verified.)
-    fn seek_match(&mut self, mut from: u32, bar: f32, dl_norm_k1: &[f32]) -> Result<(), FtsError> {
+    fn seek_match(
+        &mut self,
+        mut from: u32,
+        bar: f32,
+        dl_norm_k1: &NormTable,
+    ) -> Result<(), FtsError> {
         'docs: loop {
             // Align every member to the same doc ≥ `from`.
             let mut aligned = from;
@@ -3640,11 +3713,8 @@ impl PhraseCursor {
                     .map(|m| m.cursor.current_tf())
                     .min()
                     .expect("members >= 2");
-                let ub = bm25::score_with_dl_norm_k1(
-                    self.idf_x_k1p1,
-                    min_tf,
-                    dl_norm_k1[aligned as usize],
-                );
+                let ub =
+                    bm25::score_with_dl_norm_k1(self.idf_x_k1p1, min_tf, dl_norm_k1.get(aligned));
                 if ub < bar {
                     from = match aligned.checked_add(1) {
                         Some(next) => next,
@@ -3771,7 +3841,7 @@ impl AnyCursor {
         &mut self,
         target: u32,
         bar: f32,
-        dl_norm_k1: &[f32],
+        dl_norm_k1: &NormTable,
     ) -> Result<(), FtsError> {
         match self {
             AnyCursor::Term(c) => {
@@ -3979,7 +4049,7 @@ struct MustShouldSink<'a> {
     should_ub: f32,
     /// Per-doc BM25 length normalization for the column, for scoring
     /// the should terms at emitted docs.
-    dl_norm_k1: &'a [f32],
+    dl_norm_k1: &'a NormTable,
 }
 
 impl AndSink for MustShouldSink<'_> {
@@ -4006,7 +4076,7 @@ impl AndSink for MustShouldSink<'_> {
     }
 
     fn emit(&mut self, doc: u32, must_score: f32) {
-        let norm = self.dl_norm_k1[doc as usize];
+        let norm = self.dl_norm_k1.get(doc);
         let mut score = must_score;
         for c in &mut self.shoulds {
             c.skip_to(doc);
@@ -5523,6 +5593,49 @@ mod tests {
         // populated per-doc normalization table.
         assert!(cols[0].avgdl > 0.0);
         assert_eq!(cols[0].dl_norm_k1.len(), 3);
+    }
+
+    #[test]
+    fn norm_table_footprint_is_one_byte_per_doc() {
+        // Memory guard: the resident length-norm table must stay at one
+        // byte per doc (plus the fixed 256-entry decode LUT), not the
+        // 4-byte-per-doc `f32` table it replaced. Build enough
+        // varied-length docs that the per-doc term dominates the LUT.
+        const N: u32 = 5_000;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for d in 0..N {
+            // Lengths cycle 1..=40 tokens so norms span many buckets and
+            // the table isn't a degenerate single value.
+            let words = (d % 40) + 1;
+            let text: String = (0..words).map(|w| format!("t{}x{w} ", d % 97)).collect();
+            b.add_doc(0, d, text.trim()).expect("add doc");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        let nt = &r.columns[0].dl_norm_k1;
+
+        let per_doc = nt.bytes.capacity(); // 1 byte/doc
+        let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB
+        let m2_bytes = per_doc + lut;
+        let f32_baseline = N as usize * std::mem::size_of::<f32>();
+
+        assert_eq!(nt.bytes.len(), N as usize, "one bucket byte per doc");
+        assert_eq!(nt.lut.len(), 256, "fixed 256-entry decode table");
+        // The whole point: strictly smaller than the old f32 table, and
+        // asymptotically 4× smaller (per-doc term is 1 byte vs 4).
+        assert!(
+            m2_bytes < f32_baseline,
+            "norm table {m2_bytes} B not smaller than f32 baseline {f32_baseline} B"
+        );
+        assert_eq!(
+            per_doc * 4,
+            f32_baseline,
+            "per-doc term is exactly 4× smaller"
+        );
     }
 
     #[test]

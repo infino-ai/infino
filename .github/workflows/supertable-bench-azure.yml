@@ -45,6 +45,11 @@ on:
         required: false
         default: "main"
         type: string
+      is_fork_pr:
+        description: "Simulate a fork PR (runner checks out base tooling, not the ref; routes to the approval-gated env). For verifying fork-safe checkout."
+        required: false
+        default: false
+        type: boolean
       keep_table:
         description: "Keep the bench blob prefix after the run (debug)."
         required: false
@@ -153,13 +158,22 @@ jobs:
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
-      # The bench itself builds/runs on the VM, but the runner needs the repo
-      # for the AI-summary script. Match the ref under test so the summarizer
-      # tracks the PR. Cleans the workdir, so it must precede baseline staging.
+      # Runner-side checkout is TRUSTED context (base GITHUB_TOKEN + secrets)
+      # and only runs infino's own tooling (bench_summary.py) over metrics
+      # scp'd back from the VM — it never needs the code under test. So it must
+      # NOT fetch fork code: a fork PR could swap the helper script and run
+      # arbitrary code here with secrets (a "pwn request"). actions/checkout
+      # now refuses fork code under pull_request_target for exactly this reason,
+      # and an environment approval does not make it safe (a reviewer won't
+      # reliably catch a malicious helper-script edit). So fork PRs check out
+      # the base default branch's trusted tooling; same-repo PRs (already
+      # trusted) may use the ref under test. The fork's code-under-test is
+      # cloned/built/run only on the isolated, approval-gated VM below.
+      # Cleans the workdir, so it must precede baseline staging.
       - name: Checkout (runner-side tooling)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.is_fork_pr && github.event.repository.default_branch || inputs.ref }}
 
       - name: Resolve bench selection
         id: resolve
@@ -310,9 +324,24 @@ jobs:
           git clone --filter=blob:none \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$HOME/infino-src"
           cd "$HOME/infino-src"
-          git checkout "$REF" 2>/dev/null \
-            || { git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; }
-          echo "Checked out: $(git rev-parse --short HEAD)"
+          # The VM is the isolated, approval-gated place where the code under
+          # test actually runs, so it may hold fork code. It clones the BASE
+          # repo, so the ref resolves directly for a same-repo PR. For a FORK
+          # PR the sha lives in the fork; it resolves here only if the base repo
+          # exposes it via refs/pull/*. Diagnose which path fires so we know
+          # whether the VM clone must instead target the fork repo directly
+          # (thread head_repo through) — rather than silently benchmarking the
+          # wrong code.
+          echo "[vm-clone] REPO=$REPO REF=$REF"
+          if git checkout "$REF" 2>/dev/null; then
+            echo "[vm-clone] resolved directly from clone (same-repo ref)"
+          elif git fetch --depth 1 origin "$REF" && git checkout FETCH_HEAD; then
+            echo "[vm-clone] resolved via 'fetch origin $REF' (base-repo PR-head object) — fork code IS reachable from the base repo; head_repo threading NOT required"
+          else
+            echo "::error::[vm-clone] ref $REF is not obtainable from $REPO — the fork's code is not reachable from the base repo. The VM clone must target the fork repo directly (thread head_repo through bench.yml). Benchmarking base code here would be misleading, so failing."
+            exit 1
+          fi
+          echo "[vm-clone] HEAD=$(git rev-parse HEAD) (requested $REF)"
           REMOTE
 
       - name: Build (sccache, on VM)
