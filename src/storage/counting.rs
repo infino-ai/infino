@@ -3,7 +3,7 @@
 
 //! Meters for the raw [`ObjectStore`] handle and multipart uploads.
 //!
-//! Records into the same [`UsageMeter`] as [`super::StorageProvider`] methods
+//! Records into the same [`UsageMeter`] as [`crate::storage::StorageProvider`] methods
 //! so parquet range GETs and multipart parts share one ledger.
 
 use std::{fmt, ops::Range, sync::Arc};
@@ -17,7 +17,7 @@ use object_store::{
     Result as ObjectStoreResult, UploadPart, path::Path as ObjPath,
 };
 
-use super::usage::UsageMeter;
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Wrap an [`ObjectStore`] so every successful read increments `meter`.
 pub(crate) fn wrap_object_store(

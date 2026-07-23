@@ -43,14 +43,14 @@ pub mod local_fs;
 pub(crate) mod options;
 mod retry;
 pub mod s3;
-pub mod usage;
 
 pub use azure::AzureStorageProvider;
 pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
-pub use usage::{ClassIo, N_URI_CLASSES, TraceEntry, UriClass, UsageMeter, UsageSnapshot};
+
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Object metadata returned by HEAD, GET, and list operations.
 ///
@@ -110,17 +110,20 @@ pub enum StorageError {
     },
 }
 
-/// I/O diagnostics that are not the usage ledger: timeline, phase spans,
-/// and background-task tagging. Request/byte counts live only on
-/// [`usage::UsageMeter`] (per connection / provider).
+/// I/O diagnostics that are not the usage ledger: timeline and phase spans.
+/// Request/byte counts and background tagging live in
+/// [`crate::runtime_metrics::io`] — import that module, not here.
 ///
 /// [`take`] / [`snapshot`] read the **process-default** meter (providers
 /// built outside a [`crate::catalog::Connection`]). Prefer
 /// `provider.usage_meter().snapshot()` for connection-scoped windows.
 pub mod io_counters {
-    use std::future::Future;
+    use std::{
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
 
-    use super::usage::{UsageMeter, UsageSnapshot};
+    use crate::runtime_metrics::io::{UsageMeter, UsageSnapshot, io_is_background};
 
     /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call on
     /// the process-default meter; resets those get-family counters.
@@ -133,18 +136,15 @@ pub mod io_counters {
         UsageMeter::process_default().snapshot()
     }
 
-    /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
-    ///
-    /// Fetch counts/bytes tell us breadth; they can't tell us whether the cold
-    /// floor is a *serial dependent chain* (each read gated on the prior's
-    /// offsets — gaps = network RTT) or *parallel breadth* (many overlapping
-    /// reads — wall-time = slowest single chain). This records each
-    /// object-store op's `[start, end)` relative to a shared epoch, so a
-    /// post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
-    /// implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
-    /// no-op (one relaxed env check) otherwise so the hot path is unaffected.
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+    // Per-fetch *timeline* — diagnostic for the cold-search critical path.
+    // Fetch counts/bytes tell us breadth; they can't tell us whether the cold
+    // floor is a *serial dependent chain* (each read gated on the prior's
+    // offsets — gaps = network RTT) or *parallel breadth* (many overlapping
+    // reads — wall-time = slowest single chain). This records each
+    // object-store op's `[start, end)` relative to a shared epoch, so a
+    // post-hoc dump shows overlap (parallel) vs back-to-back (serial) and the
+    // implied concurrency `Σdur / wall`. Gated on `INFINO_IO_TIMELINE`; a
+    // no-op (one relaxed env check) otherwise so the hot path is unaffected.
 
     /// One recorded object-store fetch on the timeline.
     #[derive(Clone)]
@@ -159,31 +159,6 @@ pub mod io_counters {
         /// `true` if issued by a background cache-fill task (off the
         /// query-critical path), `false` for foreground query reads.
         pub background: bool,
-    }
-
-    tokio::task_local! {
-        /// Set to `true` inside a background cache-fill task so its
-        /// object-store reads are distinguishable from foreground
-        /// query reads. Absent (→ foreground) on the query path.
-        static IO_BACKGROUND: bool;
-    }
-
-    /// Whether the current task is a background cache-fill
-    /// (`false` unless the task-local flag is set).
-    pub fn io_is_background() -> bool {
-        IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
-    }
-
-    /// Run `fut` with [`io_is_background`] true for the current task.
-    ///
-    /// Background cache-fill GETs wrap their object-store calls in this
-    /// so meters and timelines can attribute them separately from
-    /// foreground query reads.
-    pub async fn scope_background<F>(fut: F) -> F::Output
-    where
-        F: Future,
-    {
-        IO_BACKGROUND.scope(true, fut).await
     }
 
     static TIMELINE_ON: OnceLock<bool> = OnceLock::new();
@@ -548,8 +523,8 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// records into. Benches and billing snapshot this meter — there is no
     /// second counter wrapper. Default is the process-default meter (mocks /
     /// ad-hoc providers); durable providers override with their injected Arc.
-    fn usage_meter(&self) -> Arc<usage::UsageMeter> {
-        usage::UsageMeter::process_default()
+    fn usage_meter(&self) -> Arc<UsageMeter> {
+        UsageMeter::process_default()
     }
 }
 
@@ -691,7 +666,7 @@ impl StorageProvider for PrefixedStorageProvider {
         self.inner.object_store_handle(&self.prefixed(uri))
     }
 
-    fn usage_meter(&self) -> Arc<usage::UsageMeter> {
+    fn usage_meter(&self) -> Arc<UsageMeter> {
         self.inner.usage_meter()
     }
 }
@@ -823,8 +798,8 @@ mod tests {
             Ok(())
         }
 
-        fn usage_meter(&self) -> Arc<usage::UsageMeter> {
-            usage::UsageMeter::process_default()
+        fn usage_meter(&self) -> Arc<UsageMeter> {
+            UsageMeter::process_default()
         }
     }
 
@@ -1010,7 +985,7 @@ mod tests {
     /// counters are process-global and other tests may increment concurrently.
     #[test]
     fn usage_meter_record_and_snapshot_are_monotonic() {
-        let meter = usage::UsageMeter::new();
+        let meter = UsageMeter::new();
         let before = meter.snapshot();
         meter.record_get("seg/x", None, 100);
         meter.record_head();
@@ -1037,7 +1012,7 @@ mod tests {
 
         // Prefix must contain `_vector_index` so UriClass classifies as Hidden*.
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let meter = usage::UsageMeter::new();
+        let meter = UsageMeter::new();
         let inner = Arc::new(
             LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
                 .expect("localfs"),

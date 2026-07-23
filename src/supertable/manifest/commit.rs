@@ -646,7 +646,7 @@ mod tests {
     //
     // Drive the storage-touching helpers through LocalFs so the
     // success + storage-not-found + CAS-failure branches all
-    // get coverage without spinning up the s3s test harness.
+    // get coverage without spinning up the RustFS test harness.
 
     fn local_storage() -> (TempDir, Arc<dyn StorageProvider>) {
         let dir = TempDir::new().expect("tempdir");

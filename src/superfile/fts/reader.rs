@@ -4427,13 +4427,21 @@ impl TermMeta {
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // The builder ceil()s on encode, so the stored fixed-point
-        // value is a true upper bound on the block's BM25 — decode is
-        // a plain unscale.
+        // Decode to a guaranteed upper bound on the block's BM25. The
+        // builder ceil()s on encode, but `x1000 as f32 / SCALE` can still
+        // round a hair below the true max (f32 division), and superfiles
+        // written before the encode-side ceil truncated outright. Add one
+        // fixed-point step before unscaling so the decoded bound is always
+        // >= the true block max. This matters for the cross-superfile
+        // floor: block-skip compares `block_max <= floor`, and a bound
+        // that dips below a score-tied block's true max would let a rising
+        // floor skip that block, dropping tied hits by completion order
+        // (nondeterministic top-k). The +1 step costs ~1/SCALE of pruning
+        // tightness — negligible — and keeps the top-k deterministic.
         (
             last_doc_id,
             block_offset,
-            max_bm25_x1000 as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            max_bm25_x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
         )
     }
 

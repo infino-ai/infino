@@ -398,11 +398,14 @@ pub struct CellCost<'a> {
     pub cold_pre: Option<&'a [ColdQuery]>,
     /// Measured object-store I/O per phase.
     pub store: StorePhases,
-    /// Whether this cell has the vector maintenance lifecycle (drain,
-    /// compaction, filtered search, pre/post-drain split). Those ledger
-    /// rows always render on such a cell — as "NOT METERED" when the
-    /// harness failed to measure them — and never render elsewhere
-    /// (an FTS cell has no drain to meter).
+    /// Whether this cell runs the full maintenance lifecycle (pre-drain →
+    /// drain → post-drain → delta → post-delta → compact → post-compact).
+    /// Ledger rows for drain / delta / optimize / pre-drain cold always
+    /// render on such a cell — as "NOT METERED" when the harness failed
+    /// to measure them — and never render elsewhere. Named for the
+    /// vector cell that introduced the shape; FTS/SQL set this too when
+    /// they run the same phase sequence (drain is a no-op without a
+    /// hidden vector index).
     pub vector_cell: bool,
     /// Assumed retention for the capacity line (GB-months). Default 1 month.
     pub storage_months: Option<f64>,

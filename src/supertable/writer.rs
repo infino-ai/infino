@@ -6321,6 +6321,25 @@ fn superfile_storage_path(uri: &SuperfileUri) -> String {
 /// 16-MiB chunk reads on the way back out. Parts are pushed in declaration
 /// order and driven in bounded concurrent groups so mmap-backed shards remain
 /// memory-bounded during upload.
+/// Write `bytes` to `path`, routing through multipart (staged blocks) at or
+/// above `multipart_threshold` and a single `put_atomic` below it. A single
+/// `Put Blob`/`PutObject` is capped at ~5 GiB by Azure/S3, so any blob that can
+/// grow past that (e.g. the slow-vector-state centroid blob at 100M+ docs) must
+/// take the multipart path. Content-addressed callers treat `PreconditionFailed`
+/// as "identical bytes already durable" and swallow it.
+pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
+    storage: &dyn StorageProvider,
+    path: &str,
+    bytes: Bytes,
+    multipart_threshold: u64,
+) -> Result<(), StorageError> {
+    if (bytes.len() as u64) >= multipart_threshold {
+        put_superfile_multipart(storage, path, bytes).await
+    } else {
+        storage.put_atomic(path, bytes).await.map(|_| ())
+    }
+}
+
 async fn put_superfile_multipart(
     storage: &dyn StorageProvider,
     path: &str,

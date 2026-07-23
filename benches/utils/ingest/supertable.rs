@@ -153,6 +153,8 @@ pub struct IngestResult {
     pub cleanup: Option<tiers::PrefixCleanup>,
     pub sql_sample_title: Option<String>,
     pub sql_sample_key: Option<String>,
+    /// Keeps local RustFS daemon processes alive through search.
+    _keepalive: tiers::StorageKeepalive,
 }
 
 /// Which index shapes a supertable build includes. Drives apples-to-apples
@@ -355,45 +357,44 @@ impl PreparedCorpus {
 pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let n_docs = n_docs();
     let explicit_vector_path = env::var_os(VECTOR_CORPUS_PATH_ENV).map(PathBuf::from);
-    let vector_docs = if modality == Modality::Vector {
-        n_docs + docs_per_commit()
-    } else {
-        n_docs
-    };
+    // Every modality's lifecycle appends one undrained follow-up commit
+    // after the measured base ingest (vector: post-drain delta; FTS/SQL:
+    // post-drain → delta → compact). Generate base + that tail once so
+    // the delta batch does not regenerate.
+    let corpus_docs = n_docs + docs_per_commit();
     let text = modality.has_text().then(|| {
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
-            fmt_count(n_docs)
+            fmt_count(corpus_docs)
         );
-        MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED)
+        MmapTextCorpus::generate(corpus_docs, CORPUS_TEXT_SEED)
     });
     let vectors = modality.has_vector().then(|| {
         if let Some(path) = explicit_vector_path.as_deref() {
-            // A persisted corpus is either base-only (`n_docs` rows) or —
-            // for the vector modality — carries the undrained delta tail
-            // (`vector_docs` rows, the shape `generate` writes). Accept
-            // both; `vector_delta_batch` regenerates the tail when only
-            // the base rows are present.
+            // A persisted corpus is either base-only (`n_docs` rows) or
+            // carries the undrained delta tail (`corpus_docs` rows, the
+            // shape `generate` writes). Accept both; `vector_delta_batch`
+            // regenerates the tail when only the base rows are present.
             eprintln!(
                 "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
                 fmt_count(n_docs),
                 path.display()
             );
-            MmapVectorCorpus::open(path, vector_docs)
+            MmapVectorCorpus::open(path, corpus_docs)
                 .or_else(|_| MmapVectorCorpus::open(path, n_docs))
                 .unwrap_or_else(|error| {
                     panic!(
                         "failed to open {VECTOR_CORPUS_PATH_ENV}={} with either \
-                         {vector_docs} (base + delta) or {n_docs} (base-only) rows: {error}",
+                         {corpus_docs} (base + delta) or {n_docs} (base-only) rows: {error}",
                         path.display()
                     )
                 })
         } else {
             eprintln!(
                 "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-                fmt_count(vector_docs)
+                fmt_count(corpus_docs)
             );
-            MmapVectorCorpus::generate(vector_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+            MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
         }
     });
     PreparedCorpus { text, vectors }
@@ -422,6 +423,41 @@ pub fn vector_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
         .expect("vector delta RecordBatch")
 }
 
+/// The next normal FTS commit after the measured base ingest.
+pub fn fts_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    text_delta_batch(Modality::Fts, corpus)
+}
+
+/// The next normal SQL commit after the measured base ingest.
+pub fn sql_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    text_delta_batch(Modality::Sql, corpus)
+}
+
+fn text_delta_batch(modality: Modality, corpus: &PreparedCorpus) -> RecordBatch {
+    assert!(
+        matches!(modality, Modality::Fts | Modality::Sql),
+        "text delta is FTS/SQL only"
+    );
+    let start = n_docs();
+    let len = docs_per_commit();
+    let end = start + len;
+    let text = corpus
+        .text
+        .as_ref()
+        .expect("FTS/SQL delta requires a prepared text corpus");
+    assert!(
+        text.n_docs() >= end,
+        "text corpus must include the delta tail ({} docs, need {end})",
+        text.n_docs()
+    );
+    let schema = if modality.has_sql() {
+        sql_schema()
+    } else {
+        schema_for(modality)
+    };
+    chunk_batch(modality, corpus, &schema, start, end, len)
+}
+
 /// Stream the prepared on-disk corpus → append → commit → object
 /// storage, building only the index shapes named by `modality`. One
 /// loop for every modality — each chunk is copied into Arrow heap
@@ -445,7 +481,6 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             tiers::supertable_storage_fixture().await
         }
     });
-    let cleanup = storage_backend.cleanup.clone();
     // Meter the whole ingest window so the cost model prices measured PUT
     // counts (multipart parts included), never the old superfiles+commits
     // estimate. The wrapper forwards everything; the producer is dropped
@@ -562,15 +597,17 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             sql_sample_key.clone(),
         );
     }
+    let (storage, storage_label, cleanup, keepalive) = storage_backend.into_ingest_parts();
     IngestResult {
-        storage: storage_backend.storage,
-        storage_label: storage_backend.storage_label,
+        storage,
+        storage_label,
         n_superfiles,
         total_index_bytes,
         ingest_io: Some(ingest_io),
         cleanup,
         sql_sample_title,
         sql_sample_key,
+        _keepalive: keepalive,
     }
 }
 
@@ -618,15 +655,17 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         meta.total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
     );
+    let (storage, storage_label, _, keepalive) = storage_backend.into_ingest_parts();
     IngestResult {
-        storage: storage_backend.storage,
-        storage_label: storage_backend.storage_label,
+        storage,
+        storage_label,
         n_superfiles: meta.n_superfiles,
         total_index_bytes: meta.total_index_bytes,
         ingest_io: None,
         cleanup: None,
         sql_sample_title: meta.sql_sample_title,
         sql_sample_key: meta.sql_sample_key,
+        _keepalive: keepalive,
     }
 }
 
@@ -653,15 +692,17 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
         total_index_bytes as f64 / GIB_BYTES as f64,
         fixture.storage_label,
     );
+    let (storage, storage_label, _, keepalive) = fixture.into_ingest_parts();
     IngestResult {
-        storage: fixture.storage,
-        storage_label: fixture.storage_label,
+        storage,
+        storage_label,
         n_superfiles,
         total_index_bytes,
         ingest_io: None,
         cleanup: None,
         sql_sample_title: None,
         sql_sample_key: None,
+        _keepalive: keepalive,
     }
 }
 

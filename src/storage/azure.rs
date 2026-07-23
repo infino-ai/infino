@@ -23,8 +23,9 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry, usage::UsageMeter,
+    logical_list_key, options::apply, retry,
 };
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.
@@ -605,7 +606,7 @@ mod tests {
     // end-to-end against the Azurite emulator in the gated
     // `supertable_smoke_via_azure_wire_protocol` integration test. Azurite
     // is an out-of-process Docker emulator (no in-process server crate
-    // exists the way `s3s-fs` does for S3), so it cannot be stood up from
+    // exists the way RustFS does for S3), so it cannot be stood up from
     // a `#[cfg(test)]` unit test here; these unit tests therefore cover the
     // pure, server-free surface (constructors, `translate`, path/key
     // building) directly.
