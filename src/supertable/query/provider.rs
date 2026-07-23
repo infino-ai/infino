@@ -250,11 +250,28 @@ impl fmt::Debug for SupertableProvider {
 ///   plan output, so the view stays internal and SQL results expose no view.
 /// - FTS columns keep their stored type: pruning resolves them by it, so
 ///   viewing one would silently disable its pruning.
+/// EXPERIMENT (measurement branch only): columns scanned as
+/// `Dictionary(Int32, Utf8)` instead of `Utf8View`, so the stored dictionary
+/// encoding survives into scalar-function evaluation (the regex kernel then
+/// evaluates once per distinct value). Hardcoded allowlist for measurement;
+/// the shipped version derives this from column statistics and requires the
+/// column never to be a raw group key.
+const DICT_SCAN_COLUMNS: &[&str] = &["Referer"];
+
 pub(crate) fn view_string_schema(schema: &Schema, fts_columns: &HashSet<&str>) -> SchemaRef {
     let fields = schema
         .fields()
         .iter()
         .map(|f| match f.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8
+                if DICT_SCAN_COLUMNS.contains(&f.name().as_str())
+                    && !fts_columns.contains(f.name().as_str()) =>
+            {
+                Arc::new(f.as_ref().clone().with_data_type(DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Utf8),
+                )))
+            }
             DataType::Utf8 | DataType::LargeUtf8 if !fts_columns.contains(f.name().as_str()) => {
                 // clone + retype: keeps nullability and metadata (`Field::new` drops it).
                 Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View))

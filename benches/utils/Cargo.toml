@@ -22,7 +22,7 @@ async-trait = "0.1"
 bytemuck = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "96e8fdf3b" }
+datafusion = { git = "https://github.com/infino-ai/datafusion", rev = "d5e63c0d6" }
 futures = "0.3"
 infino = { path = "../..", features = ["test-helpers"] }
 memmap2 = "0.9"
