@@ -128,7 +128,8 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 // would just move the surface without simplifying the Python-facing signature.
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
-                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None))]
+                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None,
+                    api_key=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -138,6 +139,7 @@ fn connect(
     connection_memory_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
     validate: Option<bool>,
+    api_key: Option<String>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
@@ -168,6 +170,10 @@ fn connect(
         }
         if let Some(v) = validate {
             opts = opts.with_validate(v);
+            has_options = true;
+        }
+        if let Some(key) = api_key {
+            opts = opts.with_api_key(key);
             has_options = true;
         }
         // Preserve the plain `connect(uri)` path when no options are set.

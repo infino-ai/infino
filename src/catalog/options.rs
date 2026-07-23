@@ -71,6 +71,11 @@ pub struct ConnectOptions {
     /// Probe the backend at `connect`. Default `false`; opt in for
     /// fail-fast on bad credentials.
     pub(crate) validate: bool,
+    /// API key for a hosted (`https://…`) connect target, sent as a bearer
+    /// credential on every request. Ignored by local (object-store) backends.
+    /// When unset, a hosted connection falls back to the `INFINO_API_KEY`
+    /// environment variable.
+    pub(crate) api_key: Option<String>,
 }
 
 impl ConnectOptions {
@@ -127,6 +132,22 @@ impl ConnectOptions {
         self.validate = validate;
         self
     }
+
+    /// Set the API key for a hosted (`https://<host>/<db>`) connect target,
+    /// sent as a bearer credential. Ignored by local backends. When unset, a
+    /// hosted connection falls back to the `INFINO_API_KEY` environment
+    /// variable. Chainable.
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    /// The configured API key, if any (used by the hosted transport). Only the
+    /// `remote` transport reads this, so it is dead code in a build without it.
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
+    pub(crate) fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +161,12 @@ mod tests {
             o.storage_options.get("aws_region").map(String::as_str),
             Some("us-east-1")
         );
+    }
+
+    #[test]
+    fn with_api_key_round_trips() {
+        let o = ConnectOptions::new().with_api_key("ik_test");
+        assert_eq!(o.api_key(), Some("ik_test"));
+        assert_eq!(ConnectOptions::new().api_key(), None);
     }
 }

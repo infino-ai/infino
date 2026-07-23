@@ -19,7 +19,7 @@ path = "src/lib.rs"
 # a Python extension module must not install a second global allocator
 # into the interpreter process (it segfaults), so the module uses the
 # system allocator.
-infino = { path = "..", default-features = false }
+infino = { path = "..", default-features = false, features = ["remote"] }
 # Arrow is the interchange. The `pyarrow` feature pulls `arrow-pyarrow`
 # (pyo3 0.28), so pyo3 here is pinned to the SAME version to share types.
 arrow = { version = "58", features = ["pyarrow"] }

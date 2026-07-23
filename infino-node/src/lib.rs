@@ -225,6 +225,10 @@ pub struct ConnectOptions {
     /// Probe the object store at `connect` (default `false`). `true` fails
     /// fast on bad credentials instead of on first use.
     pub validate: Option<bool>,
+    /// API key for a hosted (`https://<host>/<db>`) connect target, sent as a
+    /// bearer credential. Ignored by local backends; falls back to the
+    /// `INFINO_API_KEY` environment variable when omitted.
+    pub api_key: Option<String>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -388,6 +392,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             }
             if let Some(v) = o.validate {
                 opts = opts.with_validate(v);
+            }
+            if let Some(key) = o.api_key {
+                opts = opts.with_api_key(key);
             }
             infino::connect_with(&uri, opts)
         }

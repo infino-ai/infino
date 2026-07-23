@@ -13,6 +13,9 @@ RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+	# The `remote` transport is off in the shipped library, so the line above
+	# never lints it. Lint it explicitly (alongside `test-helpers`) or it rots.
+	cargo clippy --all-targets --features test-helpers,remote -- -D warnings
 	$(MAKE) api-parity
 	$(MAKE) version-sync
 	$(MAKE) doc-check
@@ -154,6 +157,14 @@ asan:
 doctest:
 	cargo test --doc
 
+# Remote-transport lane. The `remote` feature is off in the default gates
+# (it is off in the shipped library and excluded from the coverage %), so its
+# tests never run above — run them explicitly here or the transport bit-rots.
+# The wire codec's unit tests plus the hermetic HTTP round-trip tests.
+test-remote:
+	cargo test --features remote --lib catalog::remote::wire
+	cargo test --features remote --test remote
+
 # Build the API docs locally, exactly as docs.rs renders them: crate only
 # (`--no-deps`), default features, opened in a browser. The landing page is
 # the README (lib.rs pulls it in via `include_str!`); the rest is rustdoc
@@ -261,7 +272,7 @@ node-verify:
 	cd infino-node && ./scripts/verify-pack.sh
 
 # Local "pre-PR" check — same gates CI runs
-ci: check doctest coverage
+ci: check doctest coverage test-remote
 	@echo "✓ ready to PR"
 
 clean:

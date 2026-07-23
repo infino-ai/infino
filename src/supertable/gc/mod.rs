@@ -9,11 +9,10 @@ use std::{
 use tracing::{debug, warn};
 
 use crate::{
-    Supertable,
     runtime_bridge::bridge_on_runtime,
     storage::StorageError,
     supertable::{
-        ManifestSnapshot,
+        ManifestSnapshot, Supertable,
         error::GcError,
         handle::SupertableInner,
         manifest::{

@@ -95,6 +95,11 @@ bench-diagnostics = []
 # / `info!` / …) are independent of this flag and stay compiled in
 # regardless. Not part of the public API surface.
 detailed-tracing = []
+# Remote (hosted-service) transport: a synchronous HTTP client so a
+# connection can target a hosted endpoint (`https://host/db`) instead of
+# local object storage. OFF by default — with the feature absent no
+# networking dependency is compiled and the engine is embedded-only.
+remote = ["dep:ureq"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
@@ -133,6 +138,12 @@ thiserror = "2"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Remote transport (hosted service): a synchronous HTTP client, compiled
+# only under the `remote` feature. Sync fits the engine's blocking public
+# API and needs no tokio runtime, so it can't nest a runtime inside a host
+# process (e.g. a language binding). rustls for a pure-Rust TLS stack.
+ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
 
 # Supertable: lock-free manifest swap + superfile ids + FTS bloom hash.
 # Manifest is held in ArcSwap<Manifest> for reader-writer isolation;
@@ -306,6 +317,16 @@ s3s-fs = "0.14"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 futures = "0.3"
+
+# Hermetic HTTP mock server for the remote-transport tests: asserts the
+# request shape (method/path/headers/body) the sync client emits and
+# returns canned Arrow/JSON. Test-only; not in the shipped surface.
+wiremock = "0.6"
+# The remote-transport integration test builds canned Arrow-IPC responses and
+# JSON request-matchers. Same versions as the normal deps (no new surface);
+# listed here so the separate integration-test crate can name them directly.
+arrow = "58"
+serde_json = "1"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"

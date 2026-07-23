@@ -158,6 +158,12 @@ mod utils;
 /// Import as `infino::arrow_schema` and `infino::arrow_array`.
 pub use arrow_array;
 pub use arrow_schema;
+/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
+/// / `vector_search` / `schema`. The public handle is the catalog wrapper,
+/// which serves a local or a hosted table behind one type; the engine's
+/// concrete handle stays internal (reachable as `supertable::Supertable`
+/// only under `test-helpers`).
+pub use catalog::Supertable;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
@@ -167,9 +173,6 @@ pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
 pub use superfile::{fts::reader::BoolMode, vector::distance::Metric};
-/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
-/// / `vector_search` / `schema`.
-pub use supertable::Supertable;
 pub use supertable::{
     GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
 };

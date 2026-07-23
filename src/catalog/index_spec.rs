@@ -83,6 +83,15 @@ impl IndexSpec {
         &self.fts
     }
 
+    /// Vector index declarations as `(column, dim, n_centroids, metric)`, in
+    /// declaration order. Used by the remote transport to serialize the spec.
+    #[cfg(feature = "remote")]
+    pub(crate) fn vector_indexes(&self) -> impl Iterator<Item = (&str, usize, usize, Metric)> {
+        self.vectors
+            .iter()
+            .map(|v| (v.column.as_str(), v.dim, v.n_cent, v.metric))
+    }
+
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
     /// supertable options take. `rot_seed` / `rerank_codec` are not part
     /// of the public spec — defaults are applied here.

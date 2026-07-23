@@ -84,7 +84,7 @@ impl TableResolver {
         {
             return Ok(t.clone());
         }
-        let table = self.conn.open_table(name).map_err(|e| {
+        let table = self.conn.open_table_handle(name).map_err(|e| {
             DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
         })?;
         table.ensure_fresh();

@@ -162,6 +162,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::CompactionSettings
 pub struct infino::ConnectOptions
 impl infino::ConnectOptions
 pub fn infino::ConnectOptions::new() -> Self
+pub fn infino::ConnectOptions::with_api_key(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::ConnectOptions::with_cache_budget_bytes(self, u64) -> Self
 pub fn infino::ConnectOptions::with_cache_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn infino::ConnectOptions::with_cold_fetch_mode(self, infino::ColdFetchMode) -> Self

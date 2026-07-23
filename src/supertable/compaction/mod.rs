@@ -30,12 +30,11 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
     superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
     supertable::{
-        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, Supertable,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
@@ -759,10 +758,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        BoolMode, Supertable,
+        BoolMode,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
         supertable::{
+            Supertable,
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
