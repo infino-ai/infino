@@ -559,6 +559,14 @@ impl Connection {
         }
     }
 
+    /// On-storage byte footprint for `name` (user + hidden vector index).
+    ///
+    /// Visible under `metering` for platform billing / Grafana scrapes.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
+    pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
+        Ok(self.open_table(name)?.storage_bytes())
+    }
+
     /// List the names of every table registered in this catalog,
     /// alphabetically.
     ///
@@ -568,13 +576,6 @@ impl Connection {
     /// # let _ = names;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    /// On-storage byte footprint for `name` (user + hidden vector index).
-    /// Visible under `metering` for platform billing / Grafana scrapes.
-    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
-    pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
-        Ok(self.open_table(name)?.storage_bytes())
-    }
-
     pub fn list_tables(&self) -> Result<Vec<String>, InfinoError> {
         match &self.inner.store {
             CatalogStore::Memory(map) => {
