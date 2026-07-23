@@ -688,6 +688,17 @@ impl Supertable {
     /// table and the hidden vector-index table, from the currently loaded
     /// manifest views (lazy, not-yet-loaded manifest parts contribute 0 —
     /// the reconcile below is raise-only, so an undercount is safe).
+    ///
+    /// Exposed under `metering` for platform billing / Grafana scrapes.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
+    pub fn storage_bytes(&self) -> u64 {
+        self.on_storage_footprint_bytes()
+    }
+
+    /// Total on-storage bytes of the committed superfiles across the user
+    /// table and the hidden vector-index table, from the currently loaded
+    /// manifest views (lazy, not-yet-loaded manifest parts contribute 0 —
+    /// the reconcile below is raise-only, so an undercount is safe).
     pub(crate) fn on_storage_footprint_bytes(&self) -> u64 {
         let table_bytes = |inner: &SupertableInner| -> u64 {
             inner
