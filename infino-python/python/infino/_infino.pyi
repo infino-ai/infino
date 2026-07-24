@@ -66,6 +66,7 @@ class Table:
         query: Sequence[float],
         k: int,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         filter_column: str | None = ...,
         filter_query: str | None = ...,
         filter_mode: BoolMode | None = ...,

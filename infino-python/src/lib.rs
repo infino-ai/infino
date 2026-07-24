@@ -459,7 +459,11 @@ impl Table {
     /// query terms — a pushdown pre-filter, so kNN ranks only among the
     /// matching rows rather than post-filtering the global top-`k`.
     /// `filter_mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    ///
+    /// `rerank_mult` sets how many coarse candidates are re-scored
+    /// exactly (`k * rerank_mult`) — the primary recall/latency lever.
+    /// Omitting it keeps the engine default.
+    #[pyo3(signature = (column, query, k, nprobe=None, rerank_mult=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
@@ -468,6 +472,7 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         filter_column: Option<String>,
         filter_query: Option<String>,
         filter_mode: Option<&str>,
@@ -476,6 +481,9 @@ impl Table {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         // Optional text-predicate filter (pushdown). `filter_column` and
         // `filter_query` must be supplied together; `filter_mode` is only
