@@ -101,6 +101,19 @@ impl MutationStats {
     pub fn n_not_found(&self) -> usize {
         self.n_not_found
     }
+
+    /// Build stats from a hosted (remote) mutation response. `wal_id` is a
+    /// server-side recovery detail with no meaning — and no public accessor —
+    /// for a remote client, so it is left nil.
+    #[cfg(feature = "remote")]
+    pub(crate) fn from_remote(matched: usize, n_tombstoned: usize, n_not_found: usize) -> Self {
+        Self {
+            wal_id: WalId(0),
+            matched,
+            n_tombstoned,
+            n_not_found,
+        }
+    }
 }
 
 /// Cap on the number of rows one mutation call can target.

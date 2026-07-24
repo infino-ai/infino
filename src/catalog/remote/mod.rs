@@ -177,7 +177,7 @@ fn map_send(
 }
 
 /// Read a JSON response body.
-fn read_json(op: &str, response: ureq::Response) -> Result<Value, InfinoError> {
+pub(crate) fn read_json(op: &str, response: ureq::Response) -> Result<Value, InfinoError> {
     response
         .into_json::<Value>()
         .map_err(|e| InfinoError::Backend(format!("{op}: parsing response: {e}")))

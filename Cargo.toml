@@ -318,10 +318,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # returns canned Arrow/JSON. Test-only; not in the shipped surface.
 wiremock = "0.6"
 # The remote-transport integration test builds canned Arrow-IPC responses and
-# JSON request-matchers. Same versions as the normal deps (no new surface);
-# listed here so the separate integration-test crate can name them directly.
+# JSON request-matchers, and DataFusion `Expr` predicates for update/delete.
+# Same versions as the normal deps (no new surface); listed here so the separate
+# integration-test crate can name them directly.
 arrow = "58"
 serde_json = "1"
+datafusion = "54"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"

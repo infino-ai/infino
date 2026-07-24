@@ -16,7 +16,11 @@ use std::sync::Arc;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use infino::{BoolMode, ConnectOptions, IndexSpec, InfinoError};
+use datafusion::prelude::{col, lit};
+use infino::{
+    BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError, OptimizeOptions, VectorFilter,
+    VectorSearchOptions,
+};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -206,24 +210,239 @@ async fn open_table_missing_maps_to_not_found() {
     assert!(matches!(err, InfinoError::NotFound(_)), "got {err:?}");
 }
 
-#[tokio::test]
-async fn unsupported_op_errors_without_a_request() {
-    let server = MockServer::start().await;
-    // schema fetch for open_table; no vector_search mock — a request would 501.
+/// Mount the schema endpoint so `open_table("posts")` succeeds — the other
+/// table ops fetch the schema on open.
+async fn mount_schema(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/schema/mydb"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {"name": "id", "type": "i32", "nullable": false}
         ])))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn token_match_sends_json_and_decodes_arrow() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/token_match/mydb"))
+        .and(body_partial_json(json!({
+            "table_name": "posts", "field_name": "id", "query": "a b", "mode": "and",
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![1, 2])), ARROW_CT),
+        )
+        .expect(1)
         .mount(&server)
         .await;
 
-    let err = with_connection(server.uri(), |db| {
-        let table = db.open_table("posts").expect("open_table");
-        table
-            .vector_search("v", &[0.0], 5, Default::default(), None, None)
-            .expect_err("vector_search is not supported remotely")
+    let rows = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .token_match("id", "a b", BoolMode::And, None)
+            .expect("token_match")
     })
     .await;
-    assert!(matches!(err, InfinoError::Backend(_)), "got {err:?}");
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+#[tokio::test]
+async fn exact_match_sends_json_and_decodes_arrow() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/exact_match/mydb"))
+        .and(body_partial_json(json!({
+            "table_name": "posts", "field_name": "id", "value": "7",
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![7])), ARROW_CT),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rows = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .exact_match("id", "7", None)
+            .expect("exact_match")
+    })
+    .await;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn count_parses_json_count() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/count/mydb"))
+        .and(body_partial_json(json!({
+            "table_name": "posts", "field_name": "id", "query": "x", "mode": "or",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 42 })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let n = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .count("id", "x", BoolMode::Or)
+            .expect("count")
+    })
+    .await;
+    assert_eq!(n, 42);
+}
+
+#[tokio::test]
+async fn vector_search_sends_query_filter_and_decodes_arrow() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/vector_search/mydb"))
+        .and(body_partial_json(json!({
+            "table_name": "posts",
+            "field_name": "emb",
+            "query": [1.0, 0.0],
+            "k": 5,
+            "filter": {"field_name": "id", "query": "1", "mode": "or"},
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![9])), ARROW_CT),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rows = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open");
+        let filter = VectorFilter {
+            column: "id",
+            query: "1",
+            mode: BoolMode::Or,
+        };
+        table
+            .vector_search(
+                "emb",
+                &[1.0, 0.0],
+                5,
+                VectorSearchOptions::new(),
+                Some(filter),
+                None,
+            )
+            .expect("vector_search")
+    })
+    .await;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn hybrid_search_sends_text_and_vector_fields() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/hybrid_search/mydb"))
+        .and(body_partial_json(json!({
+            "table_name": "posts",
+            "text_field": "id",
+            "text_query": "hi",
+            "mode": "or",
+            "vector_field": "emb",
+            "vector_query": [1.0, 0.0],
+            "k": 5,
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![3])), ARROW_CT),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rows = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .hybrid_search(
+                "id",
+                "hi",
+                BoolMode::Or,
+                "emb",
+                &[1.0, 0.0],
+                VectorSearchOptions::new(),
+                5,
+                None,
+            )
+            .expect("hybrid_search")
+    })
+    .await;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn update_unparses_predicate_and_returns_stats() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/update/mydb"))
+        .and(query_param("table", "posts"))
+        .and(header("content-type", ARROW_CT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "matched": 1, "n_tombstoned": 1, "n_not_found": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let stats = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .update(col("id").gt(lit(1_i32)), &id_batch(vec![7]))
+            .expect("update")
+    })
+    .await;
+    assert_eq!(stats.matched(), 1);
+    assert_eq!(stats.n_tombstoned(), 1);
+}
+
+#[tokio::test]
+async fn delete_unparses_predicate_and_returns_stats() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/delete/mydb"))
+        .and(query_param("table", "posts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "matched": 2, "n_tombstoned": 2, "n_not_found": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let stats = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .delete(col("id").lt(lit(5_i32)))
+            .expect("delete")
+    })
+    .await;
+    assert_eq!(stats.n_tombstoned(), 2);
+}
+
+#[tokio::test]
+async fn optimize_is_client_unsupported_without_a_request() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+    // No /v1/optimize mock: optimize is a server-side operation on a hosted
+    // table, so it must short-circuit client-side and never send a request.
+    let err = with_connection(server.uri(), |db| {
+        db.open_table("posts")
+            .expect("open")
+            .optimize(&OptimizeOptions::default())
+            .expect_err("optimize is server-side for a hosted table")
+    })
+    .await;
+    assert!(matches!(err, OptimizeError::NoStorage), "got {err:?}");
 }
