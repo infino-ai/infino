@@ -165,6 +165,13 @@ const OR_WINDOW_MIN_TERMS: usize = 3;
 /// dominant rare term sits well above it (MaxScore prunes hard → it stays
 /// on MaxScore). Calibrated on the 1M tier.
 const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
+/// Minimum `k` for routing a non-dominant union to the windowed scorer.
+/// At small `k` MaxScore's top-k threshold rises fast and its block-skip
+/// pruning is effective even on a non-dominant union, so windowed (which
+/// scores the whole union) loses; the windowed win only appears at large
+/// `k`, where the k-th-best threshold is too low to prune. Conservative —
+/// below this, keep the union on MaxScore.
+const OR_WINDOW_MIN_K: usize = 256;
 
 /// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
 /// MaxScore. WAND's pivot pruning needs a high top-k threshold to skip
@@ -1702,11 +1709,12 @@ impl FtsReader {
         // The ranged (sub-range fan-out) path carries no negation in v1.
         //
         // Route non-dominant unions (no single term's upper bound dominates)
-        // to the windowed scorer: there MaxScore can't prune and degrades to
-        // scoring the whole union with per-doc f-way merge overhead, while
-        // the windowed scan is O(f) per window. A dominant-term union stays
-        // on MaxScore, whose block-skip pruning is the win there.
-        if prefer_windowed_union(&cursors) {
+        // to the windowed scorer at large k: there MaxScore can't prune and
+        // degrades to scoring the whole union with per-doc f-way merge
+        // overhead, while the windowed scan is O(f) per window. At small k,
+        // or when a term dominates, MaxScore's block-skip pruning wins, so
+        // those stay on MaxScore.
+        if k >= OR_WINDOW_MIN_K && prefer_windowed_union(&cursors) {
             return self.run_windowed_union(
                 column_id,
                 cursors,
