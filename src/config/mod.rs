@@ -246,13 +246,14 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
 // Vector-tuning defaults. Kept equal to the historical inline
 // literals so folding these knobs into config preserves behavior.
-/// Default overflow threshold before a merged cell superfile is split. STOPGAP:
-/// Max docs in a global cell before compaction splits it in two. Set high: a
-/// cell this size serves well on its own (the per-cell fine IVF prunes within
-/// it), so the grid stays coarse and split-free at <= 10M (cells stay ~156K at
-/// 64 cells even at 10M). The split engages only at 100M/1B to bound cell size;
-/// lower this if higher-scale recall needs a finer grid.
-const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
+/// Default overflow threshold before a merged cell superfile is split: the max
+/// docs in a global cell. Set just above the measured good cell size (~39K
+/// docs/cell, the size 256 cells give at 10M with ~0.98 recall) — above it the
+/// per-cell shortlist over-crowds and within-cell recall drops. A fixed cap
+/// holds cell size roughly constant as the corpus grows, so the cell count
+/// scales with the data (256-cell tables at <= 10M stay split-free) and the grid
+/// refines automatically at higher scale instead of being pinned to one count.
+const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 40_000;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
@@ -1174,7 +1175,7 @@ supertable:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.vector, VectorSettings::default());
         assert_eq!(cfg.vector.inner_budget, None);
-        assert_eq!(cfg.vector.cell_split_doc_cap, 500_000);
+        assert_eq!(cfg.vector.cell_split_doc_cap, 40_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
         assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8FixedResidual);

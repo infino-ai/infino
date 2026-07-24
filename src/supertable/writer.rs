@@ -51,7 +51,7 @@
 use std::sync::Mutex as StdMutex;
 use std::{
     cmp,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     env, fmt, fs,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
@@ -1586,6 +1586,7 @@ impl SupertableWriter {
             partition_strategy: None,
             global_vector_index: pending_gvi.clone(),
             drained_ranges: None,
+            superseded_cells_additions: None,
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -3910,6 +3911,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }),
             drained_ranges: Some(new_drained),
             global_vector_index: None,
+            superseded_cells_additions: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
         let new_manifest = persist_commit_async(
@@ -4008,31 +4010,6 @@ async fn load_materialized_rows_from_ivf_superfile(
     materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref()).await
 }
 
-/// Per-cell live rows from a packed (`MultiCellIvf`) entry, opening it exactly
-/// once (a single multi-cell decode) and returning `(cell_id, rows)` grouped by
-/// cell with this entry's tombstones applied. The cell-split republish needs
-/// each kept cell's rows separately; calling the flattening loader per cell
-/// re-opened and re-decoded the same entry once per cell (S decodes where one
-/// does).
-async fn load_materialized_rows_by_cell_from_ivf_superfile(
-    inner: &SupertableInner,
-    entry: &Arc<SuperfileEntry>,
-    column: &str,
-    now: time::Instant,
-    only_cells: &[u32],
-) -> Result<Vec<(u32, Vec<MaterializedIvfRow>)>, BuildError> {
-    let (reader, bitmap) = open_ivf_reader_with_tombstones(inner, entry, now).await?;
-    let vec_reader = reader
-        .vec()
-        .ok_or_else(|| BuildError::Store("IVF cell superfile missing vector index".into()))?;
-    if !vec_reader.is_multi_cell() {
-        return Err(BuildError::Store(
-            "per-cell row load requires a packed multi-cell entry".into(),
-        ));
-    }
-    group_multicell_rows(vec_reader, column, Some(only_cells), bitmap.as_deref()).await
-}
-
 /// Open a maintenance reader for `entry` plus its tombstone bitmap (if a
 /// tombstone cache is attached). Shared by the flattening and per-cell loaders.
 async fn open_ivf_reader_with_tombstones(
@@ -4103,6 +4080,7 @@ async fn group_multicell_rows(
 async fn cell_doc_counts_for_entry(
     inner: &SupertableInner,
     entry: &Arc<SuperfileEntry>,
+    superseded: Option<&BTreeSet<u32>>,
 ) -> Result<Vec<(u32, u32)>, BuildError> {
     let storage = inner
         .options
@@ -4121,9 +4099,15 @@ async fn cell_doc_counts_for_entry(
     let v = reader
         .vec()
         .ok_or_else(|| BuildError::Store("IVF entry missing vector index".into()))?;
+    // A superseded cell's on-disk blocks are dead (replaced by a split's
+    // children elsewhere), so it contributes no live docs — excluding it here
+    // keeps split-selection and parent-discovery from re-counting the same
+    // rows that already live in the child cells.
+    let is_superseded = |cell: u32| superseded.is_some_and(|s| s.contains(&cell));
     if v.is_multi_cell() {
         Ok(v.packed_cell_ids()
             .iter()
+            .filter(|&&cell| !is_superseded(cell))
             .filter_map(|&cell| {
                 let n = v.packed_cell_n_docs(cell)?;
                 Some((cell, n))
@@ -4131,7 +4115,11 @@ async fn cell_doc_counts_for_entry(
             .collect())
     } else {
         let cell = entry.partition_hint.unwrap_or(0);
-        Ok(vec![(cell, entry.n_docs as u32)])
+        if is_superseded(cell) {
+            Ok(vec![])
+        } else {
+            Ok(vec![(cell, entry.n_docs as u32)])
+        }
     }
 }
 
@@ -5166,18 +5154,22 @@ const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
 /// this small delta in memory so it can choose the next overflow without
 /// reopening every superfile to rebuild the complete count table.
 pub(in crate::supertable) struct CellSplitOutcome {
-    new_cell_id: u32,
-    retained_docs: u64,
-    new_cell_docs: u64,
+    /// Post-split `(cell_id, live_docs)` for every sub-cell (index 0 is the
+    /// reused split-cell id; the rest are the appended ids). The caller folds
+    /// these into its in-memory count table to pick the next overflow.
+    child_counts: Vec<(u32, u64)>,
 }
 
-/// Split one over-cap **global cell** into two balanced sub-cells. Extracts the
-/// cell's live rows (dropping tombstones) from every superfile that holds it,
-/// median-splits them into two centroids, rebuilds both sub-cells (and
-/// republishes any other cells that shared a packed shard) as fresh packed
-/// superfiles, and atomically swaps the grid `{..,P,..}` → `{..,P,new..}` in one
-/// commit. `split_cell` stays live and queryable until the swap lands. The
-/// caller ([`split_overflow_cells`]) picks the cell from physical file counts.
+/// Split one over-cap **global cell** into `K = ⌈rows/cap⌉` sub-cells. Extracts
+/// the cell's live rows (dropping tombstones) from every superfile that holds it,
+/// k-means-partitions them into `K` sub-centroids — nearest-centroid assignment,
+/// identical to query routing, so a split doc lands in the very cell its query
+/// probes — writes the `K` children as one appended packed superfile, and marks
+/// the parent cell superseded in the manifest. No republish, no removal: the
+/// parent's rows stay live and queryable (readers skip the superseded cell) until
+/// a later merge reclaims them; the grid grows `{..,P,..}` → `{..,child0(=P),new..}`
+/// in one atomic commit. The caller ([`split_overflow_cells`]) picks the cell
+/// from physical file counts.
 ///
 /// Returns the committed physical count delta. `None` is a defensive no-op
 /// result; the caller remembers it for this pass so unchanged physical counts
@@ -5213,46 +5205,44 @@ pub(in crate::supertable) async fn split_overflow_cell(
         .clone()
         .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
 
-    // Shadow split scoped to `split_cell`: extract its live rows, route them
-    // into two sub-cells, and swap atomically. No neighbor rebalance (deferred;
-    // nprobe >= 2 covers the shifted boundary), no count zeroing, no INCOMING
-    // staging. `split_cell` stays live and queryable until the swap commit.
+    // In-place split scoped to `split_cell`: extract its live rows, route them
+    // into two sub-cells written as freshly appended superfiles, and mark the
+    // cell superseded on every superfile that still holds it. The parent blocks
+    // stay on disk (dead) until merge or dead-fraction compaction reclaims them
+    // — no neighbor rebalance (nprobe >= 2 covers the shifted boundary), no
+    // republish of cells that merely shared a shard. `split_cell` stays live and
+    // queryable until the swap commit.
     let neighborhood_slice = [split_cell];
+    let superseded_map = manifest.get_superseded_cells();
 
-    // Select files that actually contain a neighborhood cell (cell directory
-    // for packed; partition_hint == cell_id for legacy).
-    let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
-    let mut keep_cells_by_entry: Vec<(Arc<SuperfileEntry>, Vec<u32>)> = Vec::new();
+    // Parents = superfiles that still hold `split_cell` as a live cell (cell
+    // directory for packed; partition_hint == cell_id for legacy). One whose
+    // `split_cell` an earlier split already superseded is skipped — those rows
+    // live in the earlier children, not here.
+    let mut parents: Vec<Arc<SuperfileEntry>> = Vec::new();
     for entry in manifest.superfiles.iter() {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
         if entry.vector_layout == VectorLayout::MultiCellIvf {
-            let counts = cell_doc_counts_for_entry(&inner, entry).await?;
-            let has_neighborhood = counts
+            let counts = cell_doc_counts_for_entry(&inner, entry, superseded).await?;
+            if counts
                 .iter()
-                .any(|(cell, _)| neighborhood_slice.contains(cell));
-            if !has_neighborhood {
-                continue;
-            }
-            let keep: Vec<u32> = counts
-                .into_iter()
-                .map(|(cell, _)| cell)
-                .filter(|cell| !neighborhood_slice.contains(cell))
-                .collect();
-            to_remove.push(Arc::clone(entry));
-            if !keep.is_empty() {
-                keep_cells_by_entry.push((Arc::clone(entry), keep));
+                .any(|(cell, _)| neighborhood_slice.contains(cell))
+            {
+                parents.push(Arc::clone(entry));
             }
         } else {
             let Some(hint) = entry.partition_hint else {
                 continue;
             };
-            if neighborhood_slice.contains(&hint) {
-                to_remove.push(Arc::clone(entry));
+            if neighborhood_slice.contains(&hint) && !superseded.is_some_and(|s| s.contains(&hint))
+            {
+                parents.push(Arc::clone(entry));
             }
         }
     }
 
     let mut all_materialized: Vec<MaterializedIvfRow> = Vec::new();
-    for entry in &to_remove {
+    for entry in &parents {
         let mut rows = load_materialized_rows_from_ivf_superfile(
             &inner,
             entry,
@@ -5267,79 +5257,36 @@ pub(in crate::supertable) async fn split_overflow_cell(
         return Ok(None);
     }
 
-    // Plan the binary split over exactly the extracted (live) rows: `assign[i]`
-    // routes all_materialized[i] to sub-cell 0 (keeps split_cell's id) or 1
-    // (new_cell_id). Insert the second sub-centroid into the grid.
-    // Borrow the encoded rows into the planner instead of cloning the whole
-    // (largest) cell's Sq8+ε payload — a clone here doubled the biggest cell's
-    // resident bytes at split time (a RAM cliff at 100M/1B).
+    // Partition the extracted (live) rows k-ways via k-means: `assign[i]`
+    // routes all_materialized[i] to sub-cell `0..k`; sub-cell 0 keeps
+    // `split_cell`'s id, `1..k` are appended. `k = ceil(rows / cap)` sizes the
+    // split so every child lands under the cap in one pass — `k = 2` for a cell
+    // just over cap (steady incremental growth), larger only for a bulk
+    // overflow. k-means assigns each row to its NEAREST sub-centroid, so split
+    // membership == query routing; that match is what keeps split recall at
+    // native parity (a geometric median cut assigns off-routing and loses
+    // recall — kept only as the planner's degenerate fallback). Borrow the
+    // encoded rows into the planner instead of cloning the whole (largest)
+    // cell's Sq8+ε payload — a clone here doubled the biggest cell's resident
+    // bytes at split time (a RAM cliff at 100M/1B).
     let split_refs: Vec<&EncodedCellRow> = all_materialized.iter().map(|r| &r.encoded).collect();
-    let (sub0, sub1, assign) =
-        maint_pool()?.install(|| opann::plan_sq8_split(&split_refs, &clusters, split_cell, metric));
-    let mut sub_centroids = sub0;
-    sub_centroids.extend_from_slice(&sub1);
-    let (updated_clusters, new_cell_id) =
-        opann::insert_split_centroid(&clusters, split_cell, &sub_centroids);
+    let cap = opann::cell_split_doc_cap().max(1) as usize;
+    let k = all_materialized.len().div_ceil(cap).max(2);
+    let (sub_centroids, assign) = maint_pool()?.install(|| {
+        opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k, true)
+    });
+    let (updated_clusters, child_ids) =
+        opann::insert_split_centroids(&clusters, split_cell, &sub_centroids, k);
 
-    // Republish non-neighborhood cells that shared a packed shard so they are
-    // not deleted with the neighborhood extract. Use the tombstone-aware
-    // loader so deleted locals are not resurrected.
-    let mut prepared_keep: Vec<PreparedSuperfile> = Vec::new();
-    for (entry, keep_ids) in &keep_cells_by_entry {
-        // One decode of the entry for all kept cells, grouped by cell.
-        let groups = load_materialized_rows_by_cell_from_ivf_superfile(
-            &inner, entry, &column, now, keep_ids,
-        )
-        .await?;
-        let mut packed: Vec<(u32, MergedIvfSubsection, Vec<i128>)> = Vec::new();
-        for (cell_id, mut rows) in groups {
-            if rows.is_empty() {
-                continue;
-            }
-            for (i, row) in rows.iter_mut().enumerate() {
-                row.local_doc_id = i as u32;
-            }
-            let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-            let mut cfg = inner
-                .options
-                .vector_columns
-                .first()
-                .cloned()
-                .ok_or_else(|| BuildError::Store("missing vector column".into()))?;
-            let n_cent = rows
-                .iter()
-                .map(|r| r.cluster as usize + 1)
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            cfg.n_cent = n_cent;
-            let sub = build_merged_subsection_from_materialized(cfg, rows)?;
-            packed.push((cell_id, sub, stable_ids));
-        }
-        if packed.is_empty() {
-            continue;
-        }
-        let shard_id = entry.partition_hint.unwrap_or_else(|| {
-            packed_cell_shard(packed[0].0, packed_cell_shard_count(&inner.options)) as u32
-        });
-        prepared_keep.push(build_prepared_from_packed_cells(&inner, shard_id, packed)?);
-    }
-
-    // Route the extracted rows into the two sub-cells and build each as a packed
-    // cell with the same builder the republish above uses (no new packing).
-    // Rows keep their inherited L2 fine-cluster ordinal (a per-sub-cell
-    // re-cluster is a later refinement).
-    let mut group0: Vec<MaterializedIvfRow> = Vec::new();
-    let mut group1: Vec<MaterializedIvfRow> = Vec::new();
+    // Route the extracted rows into the k sub-cells and build each as a packed
+    // cell. Sub-cell 0 reuses `split_cell`'s id; the rest are the appended ids.
+    // Each child's fine IVF is rebuilt from its own rows by the packer.
+    let mut groups: Vec<Vec<MaterializedIvfRow>> =
+        (0..child_ids.len()).map(|_| Vec::new()).collect();
     for (row, &side) in all_materialized.into_iter().zip(assign.iter()) {
-        if side == 0 {
-            group0.push(row);
-        } else {
-            group1.push(row);
-        }
+        groups[(side as usize).min(child_ids.len() - 1)].push(row);
     }
-    let n0 = group0.len() as u32;
-    let n1 = group1.len() as u32;
+    let child_counts: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
     let build_subcell = |cell_id: u32,
                          mut rows: Vec<MaterializedIvfRow>|
      -> Result<Option<PreparedSuperfile>, BuildError> {
@@ -5350,43 +5297,54 @@ pub(in crate::supertable) async fn split_overflow_cell(
             row.local_doc_id = i as u32;
         }
         let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-        let mut cfg = inner
+        let base_cfg = inner
             .options
             .vector_columns
             .first()
             .cloned()
             .ok_or_else(|| BuildError::Store("missing vector column".into()))?;
-        cfg.n_cent = rows
-            .iter()
-            .map(|r| r.cluster as usize + 1)
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        // Size the child's fine IVF to ITS OWN row count via the native drain
+        // policy, rather than inheriting the parent's fine-cluster count: a
+        // ~13K-row child carrying a ~126K-row parent's `n_cent` over-fragments
+        // its fine routing.
+        let cfg = drain_cell_vector_config(&base_cfg, rows.len());
         let sub = build_merged_subsection_from_materialized(cfg, rows)?;
         let shard_id = packed_cell_shard(cell_id, packed_cell_shard_count(&inner.options)) as u32;
         build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)])
             .map(Some)
     };
-    let mut all_prepared = prepared_keep;
-    all_prepared.extend(build_subcell(split_cell, group0)?);
-    all_prepared.extend(build_subcell(new_cell_id, group1)?);
+    let mut all_prepared = Vec::new();
+    for (group, &cell_id) in groups.into_iter().zip(child_ids.iter()) {
+        all_prepared.extend(build_subcell(cell_id, group)?);
+    }
     if all_prepared.is_empty() {
         return Ok(None);
     }
 
-    // Set the two sub-cell counts from the routing; every other cell unchanged.
-    let updated_clusters = opann::apply_cell_count_updates(
-        &updated_clusters,
-        &std::collections::HashMap::from([(split_cell, n0), (new_cell_id, n1)]),
-    );
+    // Set every sub-cell's count from the routing; other cells unchanged.
+    let count_updates: std::collections::HashMap<u32, u32> = child_ids
+        .iter()
+        .copied()
+        .zip(child_counts.iter().copied())
+        .collect();
+    let updated_clusters = opann::apply_cell_count_updates(&updated_clusters, &count_updates);
 
     let batch = collect_prepared_superfiles(&inner, all_prepared)?;
 
-    // Publish the new grid in the same OCC attempt as the replacement
-    // membership. Pre-storing the strategy is not atomic with the CAS and
-    // is lost on contention refresh. `drained_ranges` and every other
-    // manifest field ride through `update` unchanged — a hidden-space reorg
-    // consumes no user commit and must not disturb coverage.
+    // Mark `split_cell` superseded on every parent that still holds it: readers,
+    // per-cell counts, merges, and split selection all exclude it, so the parent
+    // blocks are logically dead and reclaimed later without a rewrite here.
+    let superseded_additions: BTreeMap<Uuid, BTreeSet<u32>> = parents
+        .iter()
+        .map(|e| (e.superfile_id, BTreeSet::from([split_cell])))
+        .collect();
+
+    // Publish the child superfiles, the supersede markers, and the new grid in
+    // one OCC attempt. The parents are NOT removed (they hold other live cells);
+    // only their `split_cell` blocks are marked dead. Re-applied on every retry
+    // so a contention refresh cannot drop the stamp. Every other manifest field
+    // rides through `update` unchanged — a hidden-space reorg consumes no user
+    // commit and must not disturb coverage.
     let list_metadata = CommitListMetadata {
         partition_strategy: Some(PartitionStrategy::VectorCell {
             column: column.clone(),
@@ -5395,13 +5353,15 @@ pub(in crate::supertable) async fn split_overflow_cell(
         }),
         drained_ranges: None,
         global_vector_index: None,
+        superseded_cells_additions: Some(superseded_additions),
     };
 
+    let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = persist_commit_async(
         &inner,
         Arc::clone(&storage),
         batch.new_entries,
-        &to_remove,
+        &no_removals,
         batch.pending_storage_writes,
         Vec::new(),
         list_metadata,
@@ -5414,9 +5374,11 @@ pub(in crate::supertable) async fn split_overflow_cell(
     schedule_background_storage_reclaim(Arc::clone(&inner));
 
     Ok(Some(CellSplitOutcome {
-        new_cell_id,
-        retained_docs: u64::from(n0),
-        new_cell_docs: u64::from(n1),
+        child_counts: child_ids
+            .iter()
+            .copied()
+            .zip(child_counts.iter().map(|&c| u64::from(c)))
+            .collect(),
     }))
 }
 
@@ -5446,9 +5408,11 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // Compute physical counts once. Each successful split returns the two
     // replacement counts, so later iterations update this table in O(1)
     // instead of reopening every superfile for another full recount.
+    let superseded_map = manifest.get_superseded_cells();
     let mut cell_counts: HashMap<u32, u64> = HashMap::new();
     for entry in manifest.superfiles.iter() {
-        for (cell, n) in cell_doc_counts_for_entry(&inner, entry).await? {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
+        for (cell, n) in cell_doc_counts_for_entry(&inner, entry, superseded).await? {
             *cell_counts.entry(cell).or_default() += u64::from(n);
         }
     }
@@ -5478,8 +5442,9 @@ pub(in crate::supertable) async fn split_overflow_cells(
         }
         match split_overflow_cell(Arc::clone(&inner), split_cell).await? {
             Some(outcome) => {
-                cell_counts.insert(split_cell, outcome.retained_docs);
-                cell_counts.insert(outcome.new_cell_id, outcome.new_cell_docs);
+                for (cell, docs) in outcome.child_counts {
+                    cell_counts.insert(cell, docs);
+                }
             }
             None => {
                 unsplittable.insert(split_cell);
@@ -5750,6 +5715,11 @@ pub(crate) struct CommitListMetadata {
     pub(crate) partition_strategy: Option<PartitionStrategy>,
     pub(crate) global_vector_index: Option<GlobalVectorIndex>,
     pub(crate) drained_ranges: Option<DrainedVersionRanges>,
+    /// Cells to mark superseded on existing superfiles this commit — merged
+    /// (union) into the carried-forward map. A cell split stamps its parent
+    /// superfiles here so their now-dead blocks are excluded from reads,
+    /// counts, and merges without rewriting the parents.
+    pub(crate) superseded_cells_additions: Option<BTreeMap<Uuid, BTreeSet<u32>>>,
 }
 
 impl CommitListMetadata {
@@ -5761,6 +5731,7 @@ impl CommitListMetadata {
         self.partition_strategy.is_none()
             && self.global_vector_index.is_none()
             && self.drained_ranges.is_none()
+            && self.superseded_cells_additions.is_none()
     }
 
     /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
@@ -5776,6 +5747,9 @@ impl CommitListMetadata {
         }
         if let Some(ranges) = self.drained_ranges.clone() {
             out = out.with_drained_ranges(ranges);
+        }
+        if let Some(additions) = &self.superseded_cells_additions {
+            out = out.with_superseded_cells_added(additions);
         }
         out
     }

@@ -66,7 +66,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
     sync::Arc,
     time::Instant,
@@ -77,6 +77,7 @@ use arrow_array::{Array, Decimal128Array};
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::join;
+use uuid::Uuid;
 
 use super::{
     SuperfileHit,
@@ -380,6 +381,7 @@ fn postings_by_cell_from_summaries(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
 ) -> (HashMap<u32, u64>, bool) {
     let mut postings: HashMap<u32, u64> = HashMap::new();
     let mut any_tagged = false;
@@ -394,6 +396,15 @@ fn postings_by_cell_from_summaries(
             let Some(cell_id) = cell.cell_id else {
                 continue;
             };
+            // Cells superseded by an in-place split carry dead on-disk
+            // blocks: exclude them so they are never routed to, scored,
+            // or fetched — the split's successor cells hold the live rows.
+            if superseded
+                .get(&entry.superfile_id)
+                .is_some_and(|s| s.contains(&cell_id))
+            {
+                continue;
+            }
             any_tagged = true;
             let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
             *postings.entry(cell_id).or_default() += n;
@@ -1314,8 +1325,12 @@ impl SupertableReader {
             * f64::from(config::global().vector.drain_replica_target_factor.max(1.0)))
         .ceil() as u64;
         let allow_ref = allow.as_ref();
+        // Cells retired by an in-place split are excluded from routing so
+        // their dead on-disk blocks are never selected or fetched.
+        let empty_superseded = BTreeMap::new();
+        let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
         let (postings_by_cell, any_tagged) =
-            postings_by_cell_from_summaries(&superfiles, column, allow_ref);
+            postings_by_cell_from_summaries(&superfiles, column, allow_ref, superseded);
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();
@@ -2817,7 +2832,7 @@ impl Supertable {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         sync::Arc,
     };
 
@@ -2828,8 +2843,8 @@ mod tests {
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
         admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, projection_is_id_score_only,
-        union_cell_selection, vector_read_query_error,
+        hidden_hits_user_ids, is_hidden_vector_manifest, postings_by_cell_from_summaries,
+        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -3649,6 +3664,72 @@ mod tests {
         .expect("filter");
         assert_eq!(hits, original);
     }
+
+    /// A cell listed in a superfile's vector summary is routable and
+    /// contributes a posting entry — unless the manifest marks it
+    /// superseded (its on-disk blocks replaced by an in-place split), in
+    /// which case it is dropped from the posting map so it is never
+    /// selected, scored, or fetched. Supersession is keyed per superfile,
+    /// so an entry for a different superfile leaves this one untouched.
+    #[test]
+    fn postings_by_cell_from_summaries_skips_superseded_cells() {
+        use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
+
+        const DIM: u32 = 4;
+        let column = "emb";
+
+        // One single-cluster cell carrying `count` indexed rows, so a
+        // present cell contributes a nonzero posting sum.
+        let cell = |cell_id: u32, count: u32| CellVectorSummary {
+            cell_id: Some(cell_id),
+            clusters: ClusterCentroids::from_fp32(
+                1,
+                DIM,
+                &vec![cell_id as f32; DIM as usize],
+                vec![count],
+            ),
+        };
+
+        let sf_id = Uuid::from_u128(0xC0FFEE);
+        let mut entry = synthetic_entry(sf_id);
+        entry.vector_summary.insert(
+            column.into(),
+            VectorSummary {
+                centroid: vec![0.0; DIM as usize],
+                cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
+            },
+        );
+        let entries = vec![Arc::new(entry)];
+
+        // No supersessions: every tagged cell is routable.
+        let empty = BTreeMap::new();
+        let (postings, any_tagged) =
+            postings_by_cell_from_summaries(&entries, column, None, &empty);
+        assert!(any_tagged);
+        assert_eq!(postings.get(&1), Some(&10));
+        assert_eq!(postings.get(&2), Some(&20));
+        assert_eq!(postings.get(&3), Some(&30));
+
+        // Cell 2 superseded for this superfile: dropped, the rest remain.
+        let mut superseded = BTreeMap::new();
+        superseded.insert(sf_id, BTreeSet::from([2u32]));
+        let (postings, any_tagged) =
+            postings_by_cell_from_summaries(&entries, column, None, &superseded);
+        assert!(any_tagged, "surviving cells still tag");
+        assert!(!postings.contains_key(&2), "superseded cell is skipped");
+        assert_eq!(postings.get(&1), Some(&10));
+        assert_eq!(postings.get(&3), Some(&30));
+
+        // A supersession keyed to a different superfile does not affect
+        // this one.
+        let mut other = BTreeMap::new();
+        other.insert(Uuid::from_u128(0xDEAD), BTreeSet::from([1u32]));
+        let (postings, _) = postings_by_cell_from_summaries(&entries, column, None, &other);
+        assert_eq!(postings.get(&1), Some(&10));
+        assert_eq!(postings.get(&2), Some(&20));
+        assert_eq!(postings.get(&3), Some(&30));
+    }
+
     #[test]
     fn hybrid_vector_leg_uses_user_superfiles_not_hidden() {
         let dim = 16usize;

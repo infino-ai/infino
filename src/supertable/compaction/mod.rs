@@ -417,7 +417,9 @@ impl Supertable {
             tombstone_cache.prefetch(&superfile_ids, now).await;
         }
 
+        let superseded_map = manifest.get_superseded_cells();
         let mut readers_with_tombstones = Vec::with_capacity(readers.len());
+        let mut superseded_per_reader = Vec::with_capacity(readers.len());
         for (superfile_id, reader) in readers {
             let bitmap = tombstone_cache
                 .as_ref()
@@ -426,6 +428,11 @@ impl Supertable {
                 .map_err(|e| BuildError::Store(e.to_string()))?;
 
             let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            let superseded = superseded_map
+                .and_then(|m| m.get(&superfile_id))
+                .cloned()
+                .unwrap_or_default();
+            superseded_per_reader.push(superseded);
             readers_with_tombstones.push((reader.clone(), bitmap));
         }
 
@@ -440,7 +447,10 @@ impl Supertable {
                     .map(|c| c.rerank_codec.is_sq8_residual_family())
             });
             if multi_cell && sq8_merge == Some(true) {
-                SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&readers_with_tombstones)?
+                SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+                    &readers_with_tombstones,
+                    &superseded_per_reader,
+                )?
             } else if sq8_merge == Some(true) {
                 SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
             } else {
@@ -528,38 +538,59 @@ impl Supertable {
         }
 
         let merged_segment = match self.merge_superfiles(&inputs).await {
-            Ok(seg) => seg,
+            Ok(seg) => Some(seg),
+            // Every input was fully dead — all cells tombstoned, or all
+            // superseded by an in-place cell split. There is nothing live to
+            // write, so commit the inputs' removal with no replacement entry:
+            // a pure reclaim of the dead superfiles.
+            Err(BuildError::NoDocsToBuild) => None,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
                 return Err(CompactionError::Build(e.to_string()));
             }
         };
 
-        let PreparedSuperfile {
-            entry: merged_prepared,
+        let (
+            new_entries,
+            mut pending_storage_writes,
             bytes_for_store,
-            bytes_for_storage,
             bytes_for_cache,
-        } = merged_segment;
-        let merged_entry = Arc::new(SuperfileEntry {
-            // Carry the OLDEST input's birth_version so a merge of
-            // already-drained inputs stays <= the drain watermark (skipped, not
-            // re-drained). See the hidden-index `drained_ranges` design.
-            birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
-            // Left empty: the manifest's `update()` stamps the
-            // partition key at commit time from `partition_hint`.
-            partition_key: Vec::new(),
-            partition_hint: inputs.first().and_then(|e| e.partition_hint),
-            vector_layout: inputs
-                .first()
-                .map(|e| e.vector_layout)
-                .unwrap_or(VectorLayout::Ivf),
-            ..(*merged_prepared).clone()
-        });
-        let merged_superfile_id = merged_entry.superfile_id;
-        let new_entries = vec![merged_entry];
-        let mut pending_storage_writes =
-            vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?];
+            merged_superfile_id,
+        ) = match merged_segment {
+            Some(PreparedSuperfile {
+                entry: merged_prepared,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            }) => {
+                let merged_entry = Arc::new(SuperfileEntry {
+                    // Carry the OLDEST input's birth_version so a merge of
+                    // already-drained inputs stays <= the drain watermark
+                    // (skipped, not re-drained). See the hidden-index
+                    // `drained_ranges` design.
+                    birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
+                    // Left empty: the manifest's `update()` stamps the
+                    // partition key at commit time from `partition_hint`.
+                    partition_key: Vec::new(),
+                    partition_hint: inputs.first().and_then(|e| e.partition_hint),
+                    vector_layout: inputs
+                        .first()
+                        .map(|e| e.vector_layout)
+                        .unwrap_or(VectorLayout::Ivf),
+                    ..(*merged_prepared).clone()
+                });
+                let id = merged_entry.superfile_id;
+                (
+                    vec![merged_entry],
+                    vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?],
+                    bytes_for_store,
+                    bytes_for_cache,
+                    id,
+                )
+            }
+            // Pure reclaim: remove the dead inputs, add no replacement.
+            None => (Vec::new(), Vec::new(), None, None, Uuid::nil()),
+        };
 
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();

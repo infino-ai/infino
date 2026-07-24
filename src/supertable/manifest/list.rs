@@ -17,7 +17,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
 };
 
 use arrow::compute::concat;
@@ -166,6 +166,11 @@ pub struct Manifest {
     /// readers skip the storage GET entirely. Entries are dropped when
     /// their superfile leaves the manifest (compaction/removal).
     pub tombstone_seqs: BTreeMap<Uuid, u64>,
+    /// Per superfile, the set of cell-ids whose on-disk blocks were
+    /// superseded by an in-place cell split. The reader skips these
+    /// blocks and merge drops them; the entry leaves the manifest when
+    /// its superfile is merged away (mirrors [`Self::tombstone_seqs`]).
+    pub superseded_cells: BTreeMap<Uuid, BTreeSet<u32>>,
 }
 
 /// Content-addressed reference to a sibling object of a manifest
@@ -1070,7 +1075,8 @@ struct ManifestDto {
     #[serde(default)]
     drained_ranges: Vec<(u64, u64)>,
     parts: Vec<ManifestPartEntryDto>,
-    tombstone_seqs: BTreeMap<String, u64>, // UUID keys
+    tombstone_seqs: BTreeMap<String, u64>,        // UUID keys
+    superseded_cells: BTreeMap<String, Vec<u32>>, // UUID keys
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1607,6 +1613,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .iter()
             .map(|(id, seq)| (id.to_string(), *seq))
             .collect(),
+        superseded_cells: l
+            .superseded_cells
+            .iter()
+            .map(|(id, cells)| (id.to_string(), cells.iter().copied().collect()))
+            .collect(),
     })
 }
 
@@ -1709,6 +1720,15 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
                 Uuid::parse_str(&id)
                     .map(|u| (u, seq))
                     .map_err(|_| ListParseError::BadFieldValue("tombstone_seqs", id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
+        superseded_cells: d
+            .superseded_cells
+            .into_iter()
+            .map(|(id, cells)| {
+                Uuid::parse_str(&id)
+                    .map(|u| (u, cells.into_iter().collect::<BTreeSet<u32>>()))
+                    .map_err(|_| ListParseError::BadFieldValue("superseded_cells", id))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?,
     })
@@ -2282,6 +2302,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2452,6 +2473,18 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.tombstone_seqs, list.tombstone_seqs);
+    }
+
+    #[test]
+    fn superseded_cells_roundtrip() {
+        let mut list = empty_list();
+        list.superseded_cells
+            .insert(Uuid::from_u128(0x42), [3u32, 7].into_iter().collect());
+        list.superseded_cells
+            .insert(Uuid::from_u128(0x43), [1u32].into_iter().collect());
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.superseded_cells, list.superseded_cells);
     }
 
     #[test]

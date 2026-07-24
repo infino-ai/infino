@@ -3869,12 +3869,13 @@ mod tests {
         );
     }
 
-    /// Splitting a cell whose packed shard also holds *other* cells must
-    /// republish those neighbours intact (the keep-cells branch). Ingest two
-    /// vector directions (→ two cells in one shard), split the busiest, and
-    /// confirm both directions still resolve afterward.
+    /// Splitting a cell whose packed shard also holds *other* cells must leave
+    /// those neighbours in place: the parent superfile is not removed, only its
+    /// split cell is marked superseded. Ingest two vector directions (→ two
+    /// cells in one shard), split the busiest, and confirm the parent survives
+    /// with the split cell superseded while the neighbour keeps its docs.
     #[test]
-    fn split_overflow_cell_republishes_neighbour_cells() {
+    fn split_overflow_cell_supersedes_parent_keeps_neighbour() {
         use std::sync::Arc;
 
         use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
@@ -3986,13 +3987,17 @@ mod tests {
                 other => panic!("hidden must be VectorCell after drain, got {other:?}"),
             };
 
+        let superfiles_before: usize = hidden.reader().manifest().superfiles.len();
+
         hidden
             .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest))
             .expect("split");
 
-        // The split grows the grid by one sub-cell and republishes the
-        // neighbour cell untouched — its doc count is unchanged.
-        match hidden.reader().manifest().get_partition_strategy() {
+        // The split grows the grid by one sub-cell; the neighbour cell keeps its
+        // docs because its parent superfile is left in place (not republished).
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        match manifest.get_partition_strategy() {
             PartitionStrategy::VectorCell { clusters, .. } => {
                 assert_eq!(
                     clusters.n_cent,
@@ -4001,11 +4006,32 @@ mod tests {
                 );
                 assert_eq!(
                     clusters.counts[neighbour as usize], neighbour_count,
-                    "the republished neighbour cell keeps its docs"
+                    "the neighbour cell keeps its docs"
                 );
             }
             other => panic!("still VectorCell, got {other:?}"),
         }
+
+        // The parent that held the busiest cell is NOT removed (it still holds
+        // the neighbour cell live); its busiest-cell blocks are marked
+        // superseded so reads, counts, and merges skip them. The two child
+        // superfiles are appended on top, so the superfile count only grows.
+        let superseded = manifest
+            .get_superseded_cells()
+            .expect("persisted list carries a superseded map");
+        let parent_superseded = manifest.superfiles.iter().any(|e| {
+            superseded
+                .get(&e.superfile_id)
+                .is_some_and(|cells| cells.contains(&busiest))
+        });
+        assert!(
+            parent_superseded,
+            "the parent superfile survives with the split cell marked superseded"
+        );
+        assert!(
+            manifest.superfiles.len() > superfiles_before,
+            "child superfiles are appended, none removed"
+        );
     }
 
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The
@@ -4147,6 +4173,164 @@ mod tests {
             }
             other => panic!("still VectorCell after split, got {other:?}"),
         }
+    }
+
+    /// End-to-end reclaim loop: a cell split appends its children and marks the
+    /// parent cell superseded (no removal); a later merge drops those superseded
+    /// blocks and reclaims the parent. Every doc must resolve exactly once at
+    /// each stage — no loss (children carry them) and no resurrection (the merge
+    /// must not carry the superseded parent copy alongside the children).
+    #[test]
+    fn split_then_merge_reclaims_superseded_without_resurrection() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                writer::{refresh_slow_vector_state, split_overflow_cell},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Identical embeddings route every doc into one global cell.
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // Query top-2N: only N docs exist, so exactly N hits is both "no loss"
+        // and "no duplicate". Reused after split and after merge.
+        let q = vec![1.0f32; dim];
+        let live_hit_count = || {
+            st.reader()
+                .vector_hits("emb", &q, 2 * N, VectorSearchOptions::new(), None)
+                .expect("vector search")
+                .len()
+        };
+        assert_eq!(live_hit_count(), N, "all docs resolve before the split");
+
+        let split_cell = match hidden.reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("a populated cell"),
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell))
+            .expect("split")
+            .expect("live rows present, split commits");
+
+        // Publish the post-split slow state so the query path sees the new grid
+        // + child superfiles — production does this at the end of `compact`.
+        let hinner = hidden.inner().clone();
+        hidden
+            .block_on_query(refresh_slow_vector_state(&hinner))
+            .expect("refresh slow state after split");
+
+        // After the split the parent still holds the (now superseded) cell, yet
+        // the children carry the live rows — so the doc count is unchanged.
+        assert_eq!(live_hit_count(), N, "all docs resolve after the split");
+        {
+            let reader = hidden.reader();
+            let manifest = reader.manifest();
+            assert!(
+                manifest
+                    .get_superseded_cells()
+                    .is_some_and(|m| m.values().any(|cells| cells.contains(&split_cell))),
+                "the split cell is marked superseded on its parent"
+            );
+        }
+
+        // Merge the hidden index: the superseded parent blocks are dropped and
+        // the parent superfile is reclaimed.
+        hidden
+            .compact(&hidden_vector_index_compaction_settings())
+            .expect("hidden merge");
+
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        // Conservation: exactly N live physical docs remain — no loss (children
+        // carried them) and no resurrection (the superseded parent copy was not
+        // carried into the merged output; that would read as 2N).
+        let live_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
+        assert_eq!(
+            live_docs, N as u64,
+            "post-merge physical docs equal N — no loss, no resurrection"
+        );
+        assert!(
+            manifest.get_superseded_cells().is_none_or(|m| m.is_empty()),
+            "the reclaimed parent's superseded marker is dropped by the merge"
+        );
+        // Retrievable after the merge (routing/recall is a separate concern; a
+        // split needs nprobe >= 2 to cover both sub-cells near the boundary).
+        assert!(live_hit_count() > 0, "docs still resolve after the merge");
     }
 
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most

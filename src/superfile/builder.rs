@@ -80,7 +80,7 @@
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
     sync::Arc,
@@ -827,6 +827,7 @@ impl SuperfileBuilder {
     /// empty tombstones use the byte-splice path.
     pub fn build_from_multi_cell_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        superseded_per_reader: &[BTreeSet<u32>],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts = BuilderOptions::new_from_reader(&first.0);
@@ -876,12 +877,20 @@ impl SuperfileBuilder {
             // Also track the max fine-cluster count seen per cell so rebuilds
             // keep the source IVF width (empty clusters stay empty).
             let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
-            for (reader, deleted) in readers {
+            for (reader_idx, (reader, deleted)) in readers.iter().enumerate() {
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+                let superseded = superseded_per_reader.get(reader_idx);
                 let mut file_doc_base = 0u32;
                 let cell_cols: Vec<&ColumnReader> = v.vector_columns_config().collect();
                 for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
                     let col = cell_cols.get(ci).ok_or(BuildError::VectorReadError)?;
+                    // A superseded cell's rows live in replacement children in
+                    // another superfile; skip them here but still advance the
+                    // file-local doc base so the tombstone bitmap stays aligned.
+                    if superseded.is_some_and(|s| s.contains(&cell_id)) {
+                        file_doc_base = file_doc_base.saturating_add(col.n_docs);
+                        continue;
+                    }
                     let mut rows = v.materialized_cell_rows_at(ci)?;
                     if let Some(deny) = deleted.as_ref() {
                         rows.retain(|r| !deny.contains(file_doc_base + r.local_doc_id));
@@ -924,7 +933,11 @@ impl SuperfileBuilder {
             let mut by_cell: HashMap<u32, Vec<(usize, usize, Sq8IvfMergeInput)>> = HashMap::new();
             for (reader_idx, (reader, _)) in readers.iter().enumerate() {
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+                let superseded = superseded_per_reader.get(reader_idx);
                 for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
+                    if superseded.is_some_and(|s| s.contains(&cell_id)) {
+                        continue;
+                    }
                     let inp = v.sq8_ivf_merge_input_at(ci, 0)?;
                     by_cell
                         .entry(cell_id)
@@ -998,9 +1011,13 @@ impl SuperfileBuilder {
         }
 
         if packed_cells.is_empty() {
-            return Err(BuildError::VectorSchemaMismatch(
-                "multi-cell merge produced no live cells after tombstone filter".into(),
-            ));
+            // Every input cell was dropped (all tombstoned, or all superseded by
+            // an in-place cell split). Return an empty (0-doc) result — the same
+            // shape `build_from_readers` yields when every row is deleted — so it
+            // flows through `prepare_superfile` -> None -> NoDocsToBuild and the
+            // compaction caller reclaims the dead inputs (removes them, writes no
+            // replacement), instead of a hard schema error.
+            return Ok((Vec::new(), SuperfileStats::from_children(&[])));
         }
 
         // Parquet rows must follow the same cell-directory order as the packed
@@ -1016,7 +1033,17 @@ impl SuperfileBuilder {
         superfile_builder.add_batch_ids_only(&scalar_batch)?;
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
         let bytes = superfile_builder.finish()?;
-        let stats = SuperfileStats::from_children(stats_collector.as_slice());
+        let mut stats = SuperfileStats::from_children(stats_collector.as_slice());
+        if scalar_schema.fields().len() == 1 {
+            // Hidden id-only index: the merged doc set is exactly `all_stable_ids`
+            // (superseded cells were dropped from the packed subsections), so its
+            // count and id bounds come from that, not from summing the per-reader
+            // inputs — which would double-count a superseded parent merged
+            // alongside its replacement children.
+            stats.n_docs = all_stable_ids.len() as u64;
+            stats.id_min = all_stable_ids.iter().copied().min().unwrap_or(0);
+            stats.id_max = all_stable_ids.iter().copied().max().unwrap_or(0);
+        }
         Ok((bytes, stats))
     }
 
@@ -3672,7 +3699,7 @@ mod tests {
         assert_eq!(a.n_docs(), 5);
 
         let (merged_bytes, stats) =
-            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)], &[])
                 .expect("merge");
         assert_eq!(stats.n_docs, 10);
 
@@ -3699,7 +3726,7 @@ mod tests {
         let b = pack_cells_superfile(2_000, &[(0, 2, 1), (1, 3, 2)]);
 
         let (merged_bytes, stats) =
-            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)], &[])
                 .expect("merge with mismatched fine n_cent");
         assert_eq!(stats.n_docs, 13);
 
@@ -3722,7 +3749,7 @@ mod tests {
         let mut expected = rerank_payloads(&a);
         expected.extend(rerank_payloads(&b));
         let (merged_bytes, _) =
-            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)], &[])
                 .expect("fixed mismatch merge");
         let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open fixed merge");
         assert_eq!(rerank_payloads(&merged), expected);
@@ -3743,9 +3770,11 @@ mod tests {
         deny.insert(1);
         deny.insert(3);
 
-        let (merged_bytes, _stats) =
-            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, Some(Arc::new(deny)))])
-                .expect("merge with tombstones");
+        let (merged_bytes, _stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+            &[(a, Some(Arc::new(deny)))],
+            &[],
+        )
+        .expect("merge with tombstones");
 
         let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
         assert_eq!(merged.n_docs(), 3);
@@ -3757,6 +3786,70 @@ mod tests {
     }
 
     #[test]
+    fn multi_cell_merge_skips_superseded_cell() {
+        let a = pack_two_cell_superfile(1_000); // cell0: 3 docs, cell1: 2 docs
+        let b = pack_two_cell_superfile(2_000);
+        // Supersede cell 0 in the first input only: its rows live in replacement
+        // children elsewhere, so the merge must drop them. The second input's
+        // cell 0 and both inputs' cell 1 survive.
+        let superseded = [
+            std::collections::BTreeSet::from([0u32]),
+            std::collections::BTreeSet::new(),
+        ];
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+            &[(a, None), (b, None)],
+            &superseded,
+        )
+        .expect("merge with superseded cell");
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
+        let v = merged.vec().expect("vec");
+        assert_eq!(v.packed_cell_ids(), &[0, 1]);
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols[0].n_docs, 3); // cell0: only b's 3 docs (a's superseded)
+        assert_eq!(cols[1].n_docs, 4); // cell1: a's 2 + b's 2
+        assert_eq!(merged.n_docs(), 7);
+        // id-only stats come from the actual merged id set, not summed inputs.
+        assert_eq!(stats.n_docs, 7);
+    }
+
+    #[test]
+    fn multi_cell_merge_all_superseded_yields_empty() {
+        // A superfile whose every cell is superseded (all replaced in place by a
+        // split's children) merges to nothing: an EMPTY result (0 docs), not a
+        // hard error — so the compaction caller reclaims it (removes the dead
+        // input, writes no replacement), same as a fully-tombstoned user table.
+        let a = pack_two_cell_superfile(1_000); // cells 0, 1
+        let superseded = [std::collections::BTreeSet::from([0u32, 1u32])];
+        let (bytes, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None)], &superseded)
+                .expect("all-superseded merge returns empty, not error");
+        assert!(bytes.is_empty(), "0-cell merge writes no bytes");
+        assert_eq!(stats.n_docs, 0, "0 docs once every cell is superseded");
+    }
+
+    #[test]
+    fn multi_cell_merge_superseded_keeps_tombstone_alignment() {
+        // Supersede cell 0 (file-local docs 0,1,2) AND tombstone file-local doc 3
+        // — the first doc of cell 1. If the superseded cell fails to advance the
+        // file-local doc base, the tombstone bit lands on the wrong row.
+        let a = pack_two_cell_superfile(1_000);
+        let mut deny = RoaringBitmap::new();
+        deny.insert(3); // cell1 local 0 → stable_id 1100
+        let superseded = [std::collections::BTreeSet::from([0u32])];
+        let (merged_bytes, _stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+            &[(a, Some(Arc::new(deny)))],
+            &superseded,
+        )
+        .expect("merge superseded + tombstone");
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
+        let v = merged.vec().expect("vec");
+        assert_eq!(v.packed_cell_ids(), &[1]); // cell0 superseded away entirely
+        assert_eq!(merged.n_docs(), 1); // cell1 keeps only local 1 (1101)
+    }
+
+    #[test]
     fn fixed_multi_cell_tombstone_rebuild_preserves_survivor_payloads() {
         let codec = RerankCodec::Sq8FixedResidual;
         let source = pack_cells_superfile_with_codec(1_000, &[(0, 3, 2), (1, 2, 2)], codec);
@@ -3764,10 +3857,10 @@ mod tests {
         let mut deny = RoaringBitmap::new();
         deny.insert(1);
         deny.insert(3);
-        let (merged_bytes, _) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(
-            source,
-            Some(Arc::new(deny)),
-        )])
+        let (merged_bytes, _) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(
+            &[(source, Some(Arc::new(deny)))],
+            &[],
+        )
         .expect("fixed tombstone merge");
         let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
         let after = rerank_payloads(&merged);

@@ -12,12 +12,16 @@
 //!   3. Compaction merges multiple small IVF superfiles per cell toward one packed
 //!      base via the standard `merge_superfiles` path.
 //!   4. Locally refresh touched cell centroids and counts.
-//!   5. Split overflow cells (Sq8+ε k-means, N→N+1 centroids).
-//!   6. Reassign vectors in the split neighborhood (P−1, P, P₂, P+1).
-//!   7. Redrive reassigned rows through the incoming staging region; route
-//!      them into per-cell IVF superfiles (same path as commit ingest).
+//!   5. Split overflow cells in place: partition an over-cap cell K-way
+//!      (Sq8+ε k-means, K = ⌈rows/cap⌉ so each child lands under the cap),
+//!      append the K children as one packed superfile (child 0 keeps the cell
+//!      id, the rest appended), and mark the parent cell superseded in the
+//!      manifest — no rewrite, no removal at split time.
+//!   6. Readers, per-cell counts, merges, and split selection all skip the
+//!      superseded parent; its blocks are logically dead.
+//!   7. Compaction later reclaims the superseded parent's dead blocks.
 //!
-//! Split/reassign stays on stored Sq8+ε bytes. Row assignment dequantizes
+//! Split stays on stored Sq8+ε bytes. Row assignment dequantizes
 //! manifest centroids and rows to fp32 before [`distance`]; rows are
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
@@ -31,6 +35,7 @@ use crate::{
             medoid_index_by,
         },
         distance::{Metric, distance, nearest_k_centroids_transposed, relative_score_window},
+        kmeans::kmeans,
     },
     supertable::manifest::{
         ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
@@ -368,31 +373,90 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     out
 }
 
-pub(crate) fn plan_sq8_split(
+/// K-way split of `split_cell` into `k` sub-cells. Returns `k * dim` centroid
+/// components and a `0..k` per-row assignment aligned to `rows`. `use_kmeans`
+/// assigns each row to its NEAREST sub-centroid (assignment == query routing,
+/// so a split doc lands in the cell its query probes); otherwise a diameter
+/// median cut into `k` equal-population bins (balanced but assign != route).
+/// `k = 2` reproduces the binary split.
+pub(crate) fn plan_sq8_split_kway(
     rows: &[&EncodedCellRow],
     clusters: &ClusterCentroids,
     split_cell: u32,
     metric: Metric,
-) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+    k: usize,
+    use_kmeans: bool,
+) -> (Vec<f32>, Vec<u32>) {
     let dim = clusters.dim as usize;
     let p = split_cell as usize;
-    let mut assign = vec![0u8; rows.len()];
+    let k = k.max(2).min(rows.len().max(2));
+    let mut assign = vec![0u32; rows.len()];
     if rows.len() < 2 {
         // Caller guards on MIN_ROWS_TO_SPLIT_CELL; stay defensive so a degenerate
         // input can't panic in medoid_index on an empty shard.
         let c = manifest_centroid_components_from_row(rows[0], dim);
-        return (c.clone(), c, assign);
+        let mut cents = Vec::with_capacity(k * dim);
+        for _ in 0..k {
+            cents.extend_from_slice(&c);
+        }
+        return (cents, assign);
     }
 
-    // Bisect along a DIAMETER of the cell: project every row onto the `seed0 →
-    // seed1` axis and split at the MEDIAN. This makes the two sub-cells equal-
-    // sized (±1) regardless of density, so any cell up to 2× the cap converges
-    // in a single pass. A nearest-seed (k-means) assignment instead lets the
-    // dense bulk fall to whichever seed it is closer to — lopsided in high
-    // dimensions, where the two farthest points are outliers and the bulk favors
-    // one — leaving sub-cells over-cap that re-split for several passes. The flat
-    // median cut costs no recall: per-sub-cell fine re-clustering downstream
-    // restores intra-cell routing.
+    // k-means: assign each row to its NEAREST sub-centroid — identical to
+    // query-time routing, so a split doc lands in the very cell its query
+    // probes. Trains on a sample; assigns the full cell under `metric`.
+    if use_kmeans {
+        let sample_n = rows.len().min((k * 2048).max(4096));
+        let mut sample = Vec::with_capacity(sample_n * dim);
+        for s in 0..sample_n {
+            let idx = s * rows.len() / sample_n;
+            sample.extend_from_slice(&dequantize_row(rows[idx], dim));
+        }
+        let cents = kmeans(
+            &sample,
+            dim,
+            k,
+            10,
+            (split_cell as u64) ^ 0x5157_5f4b_4d45_414e,
+        );
+        if cents.len() >= k * dim {
+            let mut populated = vec![false; k];
+            for (i, row) in rows.iter().copied().enumerate() {
+                let rv = dequantize_row(row, dim);
+                let mut best = 0usize;
+                let mut best_d = f32::INFINITY;
+                for c in 0..k {
+                    let d = distance(metric, &rv, &cents[c * dim..(c + 1) * dim]);
+                    if d < best_d {
+                        best_d = d;
+                        best = c;
+                    }
+                }
+                assign[i] = best as u32;
+                populated[best] = true;
+            }
+            // Accept any non-degenerate result (≥ 2 populated sub-cells). We do
+            // NOT gate on balance or cap: assignment is pure NEAREST-centroid,
+            // so `assign == route` and nprobe=1 recall holds. A child left over
+            // cap is fine — the split loop re-selects it and re-splits, and on
+            // real data that converges to ≤cap without a size threshold (the
+            // loop, not a gate, bounds cell size; validated at 10M). Only a
+            // genuine collapse (<2 populated: near-identical vectors that can't
+            // be clustered, and route together anyway) falls through to the
+            // axis cut below, purely to guarantee forward progress.
+            if populated.iter().filter(|&&u| u).count() >= 2 {
+                return (cents, assign);
+            }
+            assign.iter_mut().for_each(|a| *a = 0);
+        }
+    }
+
+    // Diameter median cut, generalized to `k` equal-population bins along the
+    // `seed0 → seed1` axis. Balanced (±1) regardless of density, so children
+    // converge in one pass. Assignment is by axis position, not nearest
+    // centroid, so it does NOT match query routing (the recall cost k-means
+    // avoids). `seed1` is the row farthest from the cell centroid; `seed0` the
+    // row farthest from `seed1` — the two diameter endpoints.
     let (seed0, seed1) = pick_split_seeds(rows, clusters, p, metric);
     let v0 = dequantize_row(rows[seed0], dim);
     let v1 = dequantize_row(rows[seed1], dim);
@@ -409,60 +473,101 @@ pub(crate) fn plan_sq8_split(
         })
         .collect();
     proj.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let mid = rows.len() / 2;
+    let n = rows.len();
     for (rank, (i, _)) in proj.iter().enumerate() {
-        assign[*i] = u8::from(rank >= mid);
+        assign[*i] = ((rank * k) / n).min(k - 1) as u32;
     }
 
-    // Shards borrow the input rows (no payload clone) — the split extracts up
-    // to a full over-cap cell (≈2× the ~500K cap), so cloning every row's
-    // Sq8+ε bytes here would double the biggest cell's resident footprint.
-    let mut shard0: Vec<&EncodedCellRow> = Vec::new();
-    let mut shard1: Vec<&EncodedCellRow> = Vec::new();
-    for (i, row) in rows.iter().copied().enumerate() {
-        if assign[i] == 0 {
-            shard0.push(row);
-        } else {
-            shard1.push(row);
+    // Each bin's centroid is its medoid. Shards borrow the input rows (no
+    // payload clone): the split extracts up to a full over-cap cell, so cloning
+    // every row's Sq8+ε bytes would double the biggest cell's resident bytes.
+    let mut cents = vec![0f32; k * dim];
+    for c in 0..k {
+        let shard: Vec<&EncodedCellRow> = rows
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| assign[*i] == c as u32)
+            .map(|(_, r)| r)
+            .collect();
+        if shard.is_empty() {
+            continue;
         }
+        let m = medoid_index(metric, &shard);
+        cents[c * dim..(c + 1) * dim]
+            .copy_from_slice(&manifest_centroid_components_from_row(shard[m], dim));
     }
-
-    let m0 = medoid_index(metric, &shard0);
-    let m1 = medoid_index(metric, &shard1);
-    (
-        manifest_centroid_components_from_row(shard0[m0], dim),
-        manifest_centroid_components_from_row(shard1[m1], dim),
-        assign,
-    )
+    (cents, assign)
 }
 
-/// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.
-pub(crate) fn insert_split_centroid(
+/// Binary median-cut split (`k = 2`, `use_kmeans = false`). Test-only wrapper
+/// over [`plan_sq8_split_kway`] preserving the two-centroid / `u8`-assignment
+/// shape the median-cut unit tests were written against. The production split
+/// path calls [`plan_sq8_split_kway`] directly with k-means assignment.
+#[cfg(test)]
+pub(crate) fn plan_sq8_split(
+    rows: &[&EncodedCellRow],
+    clusters: &ClusterCentroids,
+    split_cell: u32,
+    metric: Metric,
+) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+    let dim = clusters.dim as usize;
+    let (cents, assign) = plan_sq8_split_kway(rows, clusters, split_cell, metric, 2, false);
+    let c0 = cents[..dim].to_vec();
+    let c1 = cents[dim..2 * dim].to_vec();
+    (c0, c1, assign.iter().map(|&a| a as u8).collect())
+}
+
+/// Replace cell `cell_id`'s centroid with sub-cell 0 and append sub-cells
+/// `1..k` as fresh cells at the end of the grid. Returns the grown grid and the
+/// `k` sub-cell ids (index 0 == the reused `cell_id`; the rest are the new
+/// ids), aligned to `sub_centroids` (`k * dim` fp32).
+pub(crate) fn insert_split_centroids(
     base: &ClusterCentroids,
     cell_id: u32,
     sub_centroids: &[f32],
-) -> (ClusterCentroids, u32) {
+    k: usize,
+) -> (ClusterCentroids, Vec<u32>) {
     let dim = base.dim as usize;
     let p = cell_id as usize;
     let old_n = base.n_cent as usize;
-    let new_cell_id = base.n_cent;
-    let new_n = old_n + 1;
+    let new_n = old_n + (k - 1);
 
     let mut fp32 = vec![0f32; new_n * dim];
     for c in 0..old_n {
         fp32[c * dim..(c + 1) * dim].copy_from_slice(base.centroid(c));
     }
+    // Sub-cell 0 reuses the split cell's slot; 1..k append.
     fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
-    fp32[old_n * dim..new_n * dim].copy_from_slice(&sub_centroids[dim..2 * dim]);
+    let mut ids = vec![cell_id];
+    for j in 1..k {
+        let new_id = old_n + (j - 1);
+        fp32[new_id * dim..(new_id + 1) * dim]
+            .copy_from_slice(&sub_centroids[j * dim..(j + 1) * dim]);
+        ids.push(new_id as u32);
+    }
 
-    // Counts must have one entry per cell: grow to `new_n` so the split cell and
-    // the new sub-cell both have a slot. Cloning `base.counts` alone leaves it at
-    // `old_n`, which silently passes in-memory but truncates the wire encoding
-    // (counts and centroids are adjacent) → the grid fails to reopen from storage.
+    // Counts must have one entry per cell: grow to `new_n` so every sub-cell has
+    // a slot. Cloning `base.counts` alone leaves it at `old_n`, which silently
+    // passes in-memory but truncates the wire encoding (counts and centroids are
+    // adjacent) → the grid fails to reopen from storage.
     let mut counts = base.counts.clone();
     counts.resize(new_n, 0);
     let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
-    (updated, new_cell_id)
+    (updated, ids)
+}
+
+/// Binary variant (`k = 2`): replace `cell_id`'s centroid and append one new
+/// sub-cell. Test-only wrapper preserving the single-new-id shape the unit
+/// tests use; the production split path calls [`insert_split_centroids`].
+#[cfg(test)]
+pub(crate) fn insert_split_centroid(
+    base: &ClusterCentroids,
+    cell_id: u32,
+    sub_centroids: &[f32],
+) -> (ClusterCentroids, u32) {
+    let (updated, ids) = insert_split_centroids(base, cell_id, sub_centroids, 2);
+    (updated, ids[1])
 }
 
 #[cfg(test)]

@@ -157,14 +157,16 @@ vector:
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #
-  # Max docs in a global cell before compaction splits it into two. A cell this
-  # size serves fine on its own (bench: ~500K docs/cell → recall 0.994, ~17 MiB
-  # per query, since the per-cell fine IVF prunes within the cell), so the cap is
-  # set high to keep the grid coarse and split-free at ≤10M (at 64 cells, cells
-  # stay ~156K even at 10M). The split only engages at 100M/1B, where it bounds
-  # cell size so build/query cost stays flat; lower this if higher-scale recall
-  # needs a finer grid.
-  cell_split_doc_cap: 500000
+  # Max docs in a global cell before compaction splits it. Set just above the
+  # measured good cell size (~39K docs/cell, the size 256 cells give at 10M with
+  # ~0.98 recall): a larger cell over-crowds its per-cell shortlist and
+  # within-cell recall drops; a much smaller one fragments the grid into many
+  # tiny cells. A fixed cap holds cell SIZE roughly constant as the corpus grows,
+  # so the cell COUNT scales with the data — the grid stays coarse at small scale
+  # (256-cell tables at <=10M stay split-free) and refines automatically at
+  # higher scale rather than being pinned to one count. The split is the adaptive
+  # form of choosing a finer grid.
+  cell_split_doc_cap: 40000
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
