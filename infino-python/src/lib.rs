@@ -64,6 +64,7 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::AlreadyExists(m)
         | CoreError::Schema(m)
         | CoreError::Cardinality(m)
+        | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed

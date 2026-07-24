@@ -67,6 +67,36 @@ def test_memory_roundtrip():
     assert db.list_tables() == []
 
 
+def test_fts_standard_analyzer_keeps_non_ascii():
+    # The `analyzer` kwarg selects the tokenizer. The default ascii_lower
+    # drops non-ASCII (so "café" is unsearchable); the standard analyzer
+    # (UAX #29 + lowercase) keeps it.
+    db = infino.connect("memory://")
+
+    std_tbl = db.create_table(
+        "std", _title_schema(), infino.IndexSpec().fts("title", analyzer="standard")
+    )
+    std_tbl.append(_title_batch(["café latte"]))
+    assert std_tbl.bm25_search("title", "café", 10).num_rows == 1
+
+    ascii_tbl = db.create_table("ascii", _title_schema(), infino.IndexSpec().fts("title"))
+    ascii_tbl.append(_title_batch(["café latte"]))
+    try:
+        ascii_hits = ascii_tbl.bm25_search("title", "café", 10).num_rows
+    except infino.InfinoError:
+        ascii_hits = 0
+    assert ascii_hits == 0
+
+
+def test_fts_unknown_analyzer_is_rejected():
+    # An unknown analyzer is a configuration error, surfaced as ValueError.
+    db = infino.connect("memory://")
+    with pytest.raises(ValueError):
+        db.create_table(
+            "bad", _title_schema(), infino.IndexSpec().fts("title", analyzer="nonesuch")
+        )
+
+
 def test_connect_accepts_cache_options(tmp_path):
     # Cache options are a no-op for local storage but must parse and apply.
     db = infino.connect(
