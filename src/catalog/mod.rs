@@ -1000,6 +1000,120 @@ mod tests {
         assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
     }
 
+    /// Two text columns, different analyzers: `title` = standard,
+    /// `body` = ascii_lower. A non-ASCII term in BOTH columns is
+    /// searchable via `title` but not `body`, and an ASCII term is
+    /// searchable via `body` — proving each column is indexed AND
+    /// queried with its own tokenizer (not column 0's for all).
+    fn schema_title_body() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    fn title_body_batch(schema: Arc<Schema>, title: &str, body: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![title])),
+                Arc::new(LargeStringArray::from(vec![body])),
+            ],
+        )
+        .expect("batch shape matches schema")
+    }
+
+    #[test]
+    fn mixed_per_column_analyzers_index_and_query_independently() {
+        let conn = connect("memory://").expect("connect");
+        let schema = schema_title_body();
+        let table = conn
+            .create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new()
+                    .fts_with_analyzer("title", "standard")
+                    .fts_with_analyzer("body", "ascii_lower"),
+            )
+            .expect("create_table");
+        table
+            .append(&title_body_batch(schema, "café latte", "café latte"))
+            .expect("append");
+
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column matches the non-ASCII term"
+        );
+
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
+
+        // The ascii_lower column is genuinely indexed (not empty): an
+        // ASCII term still matches there.
+        let body_latte = table
+            .bm25_search("body", "latte", TOP_K, BoolMode::Or, None)
+            .expect("body search");
+        assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
+    }
+
+    #[test]
+    fn mixed_analyzers_survive_reopen_on_storage() {
+        // Storage-backed: a fresh connection reopens the table by
+        // reconstructing the per-column analyzers from the catalog
+        // (TableEntry.fts_analyzers), so query tokenization still honors
+        // each column's tokenizer after reopen.
+        let dir = std::env::temp_dir().join(format!("infino-mixed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts_with_analyzer("title", "standard")
+                        .fts_with_analyzer("body", "ascii_lower"),
+                )
+                .expect("create_table");
+            table
+                .append(&title_body_batch(
+                    schema.clone(),
+                    "café latte",
+                    "café latte",
+                ))
+                .expect("append");
+        }
+        // Fresh connection → open_table rebuilds the spec from the catalog.
+        let conn2 = connect(&uri).expect("reconnect");
+        let table = conn2.open_table("docs").expect("open_table");
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column still matches non-ASCII after reopen"
+        );
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(
+            body_cafe, 0,
+            "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn create_table_range_only_with_cache_dir_is_rejected() {
         let dir = std::env::temp_dir().join(format!("infino-test-ro-{}", uuid::Uuid::new_v4()));

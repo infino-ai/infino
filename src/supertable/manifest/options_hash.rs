@@ -255,6 +255,7 @@ mod tests {
     use crate::{
         superfile::{
             builder::{FtsConfig, VectorConfig},
+            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -496,6 +497,32 @@ mod tests {
     /// identical by construction.
     const ALL_FALSE_GOLDEN_HEX: &str =
         "a89715d00cba061aed0b06910a2fde77a9b980c1f7a25c1d5eca901790c6f24a";
+
+    #[test]
+    fn compute_options_hash_analyzer_choice() {
+        let strat = time_range();
+        let ascii = compute_options_hash(&fts_opts(), &strat);
+
+        // The standard analyzer changes the hash: its superfiles are
+        // tokenized differently, so the options identity must differ.
+        let standard = compute_options_hash(
+            &fts_opts().with_fts_tokenizers(vec![Arc::new(StandardTokenizer)]),
+            &strat,
+        );
+        assert_ne!(ascii.0, standard.0, "analyzer choice must change the hash");
+
+        // Explicit ascii_lower equals the default: the analyzer block is
+        // emitted only for a non-ascii_lower analyzer, so all-ascii_lower
+        // tables keep the pre-analyzer hash (see ALL_FALSE_GOLDEN_HEX).
+        let ascii_explicit = compute_options_hash(
+            &fts_opts().with_fts_tokenizers(vec![Arc::new(AsciiLowerTokenizer)]),
+            &strat,
+        );
+        assert_eq!(
+            ascii.0, ascii_explicit.0,
+            "all-ascii_lower hash must be unchanged"
+        );
+    }
 
     #[test]
     fn compute_options_hash_changes_with_vector_columns() {

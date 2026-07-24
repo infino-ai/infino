@@ -827,6 +827,22 @@ mod tests {
     }
 
     #[test]
+    fn standard_empty_and_whitespace_yield_nothing() {
+        assert_eq!(std_tokens(""), Vec::<String>::new());
+        assert_eq!(std_tokens("   \t\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standard_query_parse_keeps_non_ascii_and_sigils() {
+        // Query-side tokenization (via the default `tokenize_each_query`
+        // → `parse`) must keep non-ASCII and honor +/- clause sigils.
+        let p = StandardTokenizer.parse("Café -Résumé +Ötzi");
+        assert_eq!(p.positives, vec!["café"]);
+        assert_eq!(p.negatives, vec!["résumé"]);
+        assert_eq!(p.musts, vec!["ötzi"]);
+    }
+
+    #[test]
     fn tokenizer_for_name_resolves_known_and_rejects_unknown() {
         assert!(tokenizer_for_name(ASCII_LOWER_TOKENIZER).is_some());
         assert!(tokenizer_for_name(STANDARD_TOKENIZER).is_some());
