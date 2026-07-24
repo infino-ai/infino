@@ -583,12 +583,12 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
-    /// `vector_column` / `vector_query` (with optional `nprobe`) drive
-    /// vector kNN. `k` bounds each retriever and the fused result.
-    /// Returns a pyarrow `Table` like `bm25_search`, with `score` the
-    /// fused RRF score (higher is better); `projection` follows the same
-    /// rules.
-    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None))]
+    /// `vector_column` / `vector_query` (with optional `nprobe` and
+    /// `rerank_mult`) drive vector kNN. `k` bounds each retriever and the
+    /// fused result. Returns a pyarrow `Table` like `bm25_search`, with
+    /// `score` the fused RRF score (higher is better); `projection`
+    /// follows the same rules.
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, rerank_mult=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn hybrid_search<'py>(
         &self,
@@ -600,12 +600,16 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mode = parse_mode(mode)?;
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         let batches = py
             .detach(|| {

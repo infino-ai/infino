@@ -100,6 +100,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
     def delete(self, predicate: str) -> MutationStats: ...
