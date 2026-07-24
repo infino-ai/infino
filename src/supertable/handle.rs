@@ -4267,9 +4267,19 @@ mod tests {
         // Query top-2N: only N docs exist, so exactly N hits is both "no loss"
         // and "no duplicate". Reused after split and after merge.
         let q = vec![1.0f32; dim];
+        // Exhaustive probe (every cell) so the count measures true
+        // retrievability — conservation — not nprobe routing. A split or merge
+        // that silently drops rows or leaves them unroutable shows up as != N.
+        const EXHAUSTIVE_NPROBE: usize = 1 << 12;
         let live_hit_count = || {
             st.reader()
-                .vector_hits("emb", &q, 2 * N, VectorSearchOptions::new(), None)
+                .vector_hits(
+                    "emb",
+                    &q,
+                    2 * N,
+                    VectorSearchOptions::new().with_nprobe(EXHAUSTIVE_NPROBE),
+                    None,
+                )
                 .expect("vector search")
                 .len()
         };
@@ -4328,9 +4338,14 @@ mod tests {
             manifest.get_superseded_cells().is_none_or(|m| m.is_empty()),
             "the reclaimed parent's superseded marker is dropped by the merge"
         );
-        // Retrievable after the merge (routing/recall is a separate concern; a
-        // split needs nprobe >= 2 to cover both sub-cells near the boundary).
-        assert!(live_hit_count() > 0, "docs still resolve after the merge");
+        // Exhaustive retrieval must still return exactly N after the merge —
+        // catches a merge that silently drops rows or leaves them unroutable
+        // (half-recall), which a `> 0` check would miss.
+        assert_eq!(
+            live_hit_count(),
+            N,
+            "all docs retrievable after the merge — no loss, no half-recall"
+        );
     }
 
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most

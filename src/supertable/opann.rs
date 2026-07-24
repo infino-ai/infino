@@ -90,6 +90,19 @@ pub(crate) const REPLICA_CLOSURE_MAX_REPLICAS: usize = 3;
 /// cell, not only the single second-nearest.
 pub(crate) const REPLICA_CLOSURE_DISTANCE_RATIO: f32 = 1.2;
 
+/// K-means sample size for the cell-split planner: `clusters × this`, floored
+/// at [`SPLIT_KMEANS_SAMPLE_MIN`]. Centroids train on a strided sample of the
+/// cell, then the full cell is assigned under `metric`.
+const SPLIT_KMEANS_SAMPLE_PER_CLUSTER: usize = 2048;
+/// Lower bound on the split planner's k-means training sample.
+const SPLIT_KMEANS_SAMPLE_MIN: usize = 4096;
+/// Lloyd iterations for the split planner's k-means — short, since it trains on
+/// a sample and the per-child pack re-trains fine centroids downstream.
+const SPLIT_KMEANS_ITERS: usize = 10;
+/// Fixed XOR mixed into the split cell id to seed the split's k-means, keeping
+/// its PRNG stream distinct from other per-cell seeds.
+const SPLIT_KMEANS_SEED_XOR: u64 = 0x5157_5f4b_4d45_414e;
+
 /// Primary cell assignment plus the row's replica-candidate cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BoundaryAssignment {
@@ -406,7 +419,9 @@ pub(crate) fn plan_sq8_split_kway(
     // query-time routing, so a split doc lands in the very cell its query
     // probes. Trains on a sample; assigns the full cell under `metric`.
     if use_kmeans {
-        let sample_n = rows.len().min((k * 2048).max(4096));
+        let sample_n = rows
+            .len()
+            .min((k * SPLIT_KMEANS_SAMPLE_PER_CLUSTER).max(SPLIT_KMEANS_SAMPLE_MIN));
         let mut sample = Vec::with_capacity(sample_n * dim);
         for s in 0..sample_n {
             let idx = s * rows.len() / sample_n;
@@ -416,8 +431,8 @@ pub(crate) fn plan_sq8_split_kway(
             &sample,
             dim,
             k,
-            10,
-            (split_cell as u64) ^ 0x5157_5f4b_4d45_414e,
+            SPLIT_KMEANS_ITERS,
+            (split_cell as u64) ^ SPLIT_KMEANS_SEED_XOR,
         );
         if cents.len() >= k * dim {
             let mut populated = vec![false; k];
@@ -822,23 +837,43 @@ mod tests {
         );
     }
 
+    /// Termination guarantee behind the split loop, on a density-skewed cell.
+    /// The diameter/median cut (the fallback when k-means collapses to <2
+    /// populated) slices into `K = ⌈rows/cap⌉` equal-population bins by axis
+    /// rank, so every child lands at ≈rows/K — under the cap in ONE pass —
+    /// regardless of density (a nearest-seed cut would peel the far tail into
+    /// one lopsided child instead). A balanced K-way cut needs no re-split, so
+    /// the split loop cannot thrash on pathological input; `MAX_SPLITS_PER_OPTIMIZE`
+    /// is only a safety backstop, never the actual bound.
     #[test]
-    fn plan_sq8_split_median_cut_balances_skewed_cell() {
+    fn plan_sq8_split_kway_median_balances_skewed_cell_under_cap_in_one_pass() {
         let dim = 4usize;
-        // A dense core (16 rows near origin) plus a far sparse tail (4 rows). A
-        // nearest-seed split would peel the 4 tail rows off (16/4); the median cut
-        // splits by count regardless of density, so the halves come out ~10/10.
+        // Dense core (16 rows near origin) + far sparse tail (4 rows): a
+        // nearest-seed split would peel the 4 tail rows off; the median cut
+        // splits by rank regardless of density.
         let mut rows = synth_rows(dim, 16, 0.0);
         rows.extend(synth_rows(dim, 4, 50.0));
+        let n = rows.len(); // 20
         let clusters =
-            ClusterCentroids::from_fp32(1, dim as u32, &vec![0.0f32; dim], vec![rows.len() as u32]);
+            ClusterCentroids::from_fp32(1, dim as u32, &vec![0.0f32; dim], vec![n as u32]);
         let refs: Vec<&EncodedCellRow> = rows.iter().collect();
-        let (_c0, _c1, assign) = plan_sq8_split(&refs, &clusters, 0, Metric::L2Sq);
-        let ones = assign.iter().filter(|&&a| a == 1).count();
-        let zeros = assign.len() - ones;
+        // K sized as ⌈rows/cap⌉ for a notional cap of 5.
+        let k = 4usize;
+        let (_cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, k, false);
+        let mut counts = vec![0usize; k];
+        for &a in &assign {
+            counts[a as usize] += 1;
+        }
+        let target = n.div_ceil(k); // 5
         assert!(
-            (ones as i64 - zeros as i64).abs() <= 1,
-            "median cut must balance the split, got {zeros} vs {ones}"
+            counts.iter().all(|&c| c > 0),
+            "every child populated — no collapse, got {counts:?}"
+        );
+        let max_bin = *counts.iter().max().expect("k >= 1, so counts is non-empty");
+        assert!(
+            max_bin <= target,
+            "median K-way puts every child at <= ceil(rows/K)={target} in one pass \
+             (balanced despite density skew, no re-split, no thrash), got {counts:?}"
         );
     }
 }
