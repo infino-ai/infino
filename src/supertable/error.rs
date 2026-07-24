@@ -284,7 +284,7 @@ pub enum OpenError {
     Commit(#[from] CommitError),
 }
 
-/// Errors raised by [`crate::supertable::Supertable::optimize`].
+/// Errors raised by [`crate::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {
     /// No durable storage backend is configured (e.g. `memory://`); optimize
@@ -404,7 +404,7 @@ pub(crate) enum CompactionError {
     AlreadyCompacting,
 }
 
-/// Errors raised by [`crate::supertable::Supertable::gc`].
+/// Errors raised by [`crate::Supertable::gc`].
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
     /// No durable storage backend is configured (e.g. `memory://`); gc needs

@@ -296,22 +296,16 @@ impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
-pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
-pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
-impl infino::Supertable
 pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
+pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-impl infino::Supertable
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
-impl infino::Supertable
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], infino::VectorSearchOptions, usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
-impl infino::Supertable
 pub fn infino::Supertable::optimize(&self, &infino::OptimizeOptions) -> core::result::Result<(), infino::OptimizeError>
-impl infino::Supertable
 pub fn infino::Supertable::schema(&self) -> arrow_schema::schema::SchemaRef
-impl infino::Supertable
+pub fn infino::Supertable::token_match(&self, &str, &str, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::update(&self, datafusion_expr::expr::Expr, &arrow_array::record_batch::RecordBatch) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::vector_search(&self, &str, &[f32], usize, infino::VectorSearchOptions, core::option::Option<infino::VectorFilter<'_>>, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 impl core::clone::Clone for infino::Supertable
 pub fn infino::Supertable::clone(&self) -> infino::Supertable
