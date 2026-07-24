@@ -919,7 +919,15 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let tok = AsciiLowerTokenizer;
+        // Tokenize with the target column's configured tokenizer so
+        // query terms match how the column was indexed (ascii_lower /
+        // standard). Falls back to ascii_lower when there is no FTS
+        // index or column; the search then fails downstream as before.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
 
         // Split the query into clause lists and resolve the bare
         // tokens' polarity from the default operator. The parsed
@@ -1092,8 +1100,14 @@ impl SuperfileReader {
     /// only affects pruning, never the raw-string comparison.
     pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
-        // string's tokens (a superset of the exact matches).
-        let tokens: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        // string's tokens (a superset of the exact matches). Tokenize
+        // with the column's configured tokenizer to match the index.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        let tokens: Vec<String> = tok.tokenize(value).collect();
         let candidates: Vec<u32> = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
             (0..self.n_docs() as u32).collect()

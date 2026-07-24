@@ -49,9 +49,14 @@
 
 use std::{error::Error, fmt};
 
-use crate::supertable::{
-    manifest::{encoding::encode_cluster_centroids, list::PartitionStrategy, part::ContentHash},
-    options::SupertableOptions,
+use crate::{
+    superfile::fts::tokenize::ASCII_LOWER_TOKENIZER,
+    supertable::{
+        manifest::{
+            encoding::encode_cluster_centroids, list::PartitionStrategy, part::ContentHash,
+        },
+        options::SupertableOptions,
+    },
 };
 
 /// Compute the canonical options-hash from `opts` + the
@@ -93,6 +98,24 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
         push_tag(&mut buf, b"fts_positions");
         for c in &opts.fts_columns {
             buf.push(c.positions as u8);
+        }
+    }
+    // 3c. per-column analyzer names — appended as a tagged block, and
+    //     ONLY when some column uses a non-default (non-ascii_lower)
+    //     analyzer. An all-ascii_lower table's stream stays
+    //     byte-identical to hashes stamped before per-column analyzers
+    //     existed, so pre-existing manifests keep verifying; a table
+    //     built with a different analyzer hashes differently (its
+    //     superfiles are tokenized differently, so the options identity
+    //     must differ too).
+    if opts
+        .fts_tokenizers
+        .iter()
+        .any(|t| t.name() != ASCII_LOWER_TOKENIZER)
+    {
+        push_tag(&mut buf, b"fts_analyzers");
+        for t in &opts.fts_tokenizers {
+            push_str(&mut buf, t.name());
         }
     }
 

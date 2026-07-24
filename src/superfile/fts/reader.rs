@@ -45,7 +45,7 @@ use crate::superfile::{
         fst_value::FstValue,
         positions::{decode_run, skip_run},
         posting::{BLOCK_LEN, decode_block},
-        tokenize::{AsciiLowerTokenizer, Tokenizer as _},
+        tokenize::{Tokenizer, tokenizer_for_name},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
@@ -318,6 +318,11 @@ pub struct ColumnMeta {
     /// Whether this column's index carries token positions (from
     /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
+    /// Tokenizer for this column, reconstructed at open time from the
+    /// `tokenizer` name in `inf.fts.columns`. Query terms for this
+    /// column must be tokenized with it to match how the column was
+    /// indexed.
+    pub tokenizer: Arc<dyn Tokenizer>,
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV
@@ -767,12 +772,19 @@ impl FtsReader {
                 n,
                 avgdl,
             );
+            let tokenizer = tokenizer_for_name(&col_cfg.tokenizer).ok_or_else(|| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "inf.fts.columns: unknown tokenizer {:?} for column {:?}",
+                    col_cfg.tokenizer, col_cfg.name
+                )))
+            })?;
             columns.push(ColumnMeta {
                 name: col_cfg.name.clone(),
                 doc_lengths_range: doc_lengths_offset..array_end,
                 avgdl,
                 dl_norm_k1,
                 positions: col_cfg.positions,
+                tokenizer,
             });
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
@@ -804,6 +816,14 @@ impl FtsReader {
 
     pub fn fts_columns_config(&self) -> impl Iterator<Item = &ColumnMeta> {
         self.columns.iter()
+    }
+
+    /// Tokenizer configured for `column`, for tokenizing query text so
+    /// it matches how the column was indexed. Errors if `column` is not
+    /// a registered FTS column.
+    pub fn column_tokenizer(&self, column: &str) -> Result<Arc<dyn Tokenizer>, FtsError> {
+        let id = self.resolve_column_id(column)?;
+        Ok(Arc::clone(&self.columns[id as usize].tokenizer))
     }
 
     fn dict_bytes(&self) -> Result<Bytes, FtsError> {
@@ -1719,15 +1739,16 @@ impl FtsReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        // One tokenizer for all columns; per-column tokenizers would
-        // require splitting this call to use the column's configured
-        // tokenizer.
-        let tok = AsciiLowerTokenizer;
-        let term_strings: Vec<String> = tok.tokenize(query).collect();
-        let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
-
+        // Tokenize the query with each column's configured tokenizer so
+        // per-column analyzers are honored (all columns in a table share
+        // one analyzer today, but resolving per column keeps this correct
+        // if that ever loosens).
         let mut combined: HashMap<u32, f32> = HashMap::new();
         for (col_name, weight) in columns {
+            let col_id = self.resolve_column_id(col_name)?;
+            let tok = &self.columns[col_id as usize].tokenizer;
+            let term_strings: Vec<String> = tok.tokenize(query).collect();
+            let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
             let per_col = self.search(col_name, &term_refs, usize::MAX, mode).await?;
             for (doc_id, s) in per_col {
                 *combined.entry(doc_id).or_insert(0.0) += s * weight;
@@ -4901,7 +4922,10 @@ mod tests {
     use std::{collections::HashSet, sync::Arc};
 
     use super::*;
-    use crate::superfile::{BytesLazyByteSource, fts::builder::FtsBuilder};
+    use crate::superfile::{
+        BytesLazyByteSource,
+        fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer},
+    };
 
     fn build_blob() -> (Bytes, String) {
         // 3 docs, 1 column.

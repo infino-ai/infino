@@ -2314,6 +2314,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "uuid",
  "wide",
  "xxhash-rust",

@@ -8,6 +8,7 @@
 
 use crate::superfile::{
     builder::FtsConfig,
+    fts::tokenize::ASCII_LOWER_TOKENIZER,
     vector::{builder::VectorConfig, distance::Metric},
 };
 
@@ -25,6 +26,14 @@ struct VectorIndex {
     metric: Metric,
 }
 
+/// A full-text index declaration: the column and the analyzer
+/// (tokenizer) name applied to it.
+#[derive(Debug, Clone)]
+struct FtsIndex {
+    column: String,
+    analyzer: String,
+}
+
 /// Declares the search indexes to build over a table's columns.
 ///
 /// Built fluently; every column named here must exist in the table's
@@ -40,7 +49,7 @@ struct VectorIndex {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct IndexSpec {
-    fts: Vec<String>,
+    fts: Vec<FtsIndex>,
     vectors: Vec<VectorIndex>,
 }
 
@@ -50,10 +59,29 @@ impl IndexSpec {
         Self::default()
     }
 
-    /// Mark `column` as full-text (BM25) indexed. The column must be a
-    /// UTF-8 string column in the schema.
-    pub fn fts(mut self, column: impl Into<String>) -> Self {
-        self.fts.push(column.into());
+    /// Mark `column` as full-text (BM25) indexed with the default
+    /// `ascii_lower` analyzer (ASCII split + lowercase, non-ASCII
+    /// dropped). The column must be a UTF-8 string column in the schema.
+    /// Use [`fts_with_analyzer`](Self::fts_with_analyzer) to pick a
+    /// different analyzer.
+    pub fn fts(self, column: impl Into<String>) -> Self {
+        self.fts_with_analyzer(column, ASCII_LOWER_TOKENIZER)
+    }
+
+    /// Mark `column` as full-text (BM25) indexed with a named analyzer
+    /// (`"ascii_lower"` or `"standard"` — the Unicode-aware UAX #29
+    /// tokenizer that keeps non-ASCII text). All FTS columns in a table
+    /// must use the same analyzer; a table mixing analyzers is rejected
+    /// at [`create_table`](crate::Connection::create_table).
+    pub fn fts_with_analyzer(
+        mut self,
+        column: impl Into<String>,
+        analyzer: impl Into<String>,
+    ) -> Self {
+        self.fts.push(FtsIndex {
+            column: column.into(),
+            analyzer: analyzer.into(),
+        });
         self
     }
 
@@ -79,19 +107,27 @@ impl IndexSpec {
     }
 
     /// FTS column names, in declaration order.
-    pub(crate) fn fts_columns(&self) -> &[String] {
-        &self.fts
+    pub(crate) fn fts_columns(&self) -> Vec<String> {
+        self.fts.iter().map(|f| f.column.clone()).collect()
+    }
+
+    /// FTS analyzer names, in declaration order (parallel to
+    /// [`fts_columns`](Self::fts_columns)).
+    pub(crate) fn fts_analyzers(&self) -> Vec<String> {
+        self.fts.iter().map(|f| f.analyzer.clone()).collect()
     }
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
     /// supertable options take. `rot_seed` / `rerank_codec` are not part
-    /// of the public spec — defaults are applied here.
+    /// of the public spec — defaults are applied here. The analyzer
+    /// choice rides on the options' shared tokenizer (resolved by
+    /// `table_tokenizer`), not on `FtsConfig`.
     pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
         let fts = self
             .fts
             .iter()
-            .map(|column| FtsConfig {
-                column: column.clone(),
+            .map(|f| FtsConfig {
+                column: f.column.clone(),
                 positions: false,
             })
             .collect();
@@ -109,10 +145,5 @@ impl IndexSpec {
             })
             .collect();
         (fts, vectors)
-    }
-
-    /// Has at least one FTS column (so a tokenizer is required).
-    pub(crate) fn has_fts(&self) -> bool {
-        !self.fts.is_empty()
     }
 }

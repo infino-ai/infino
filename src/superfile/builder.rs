@@ -210,9 +210,13 @@ pub struct BuilderOptions {
     /// fuses results from `bm25_search(text_col, ...)` and
     /// `vector_search(emb_col, ...)`.
     pub vector_columns: Vec<VectorConfig>,
-    /// Shared tokenizer for all FTS columns. Required iff
-    /// `fts_columns` is non-empty.
+    /// Default tokenizer, required iff `fts_columns` is non-empty. Seeds
+    /// the per-column default for `fts_tokenizers`.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// Per-column tokenizers, aligned to `fts_columns`. Defaults in
+    /// [`Self::new`] to `tokenizer` applied to every column;
+    /// [`Self::with_fts_tokenizers`] overrides for per-field analysis.
+    pub fts_tokenizers: Vec<Arc<dyn Tokenizer>>,
     /// Parquet target row-group size (number of rows).
     pub row_group_size: usize,
     /// Parquet column-chunk compression.
@@ -258,12 +262,20 @@ impl BuilderOptions {
         vector_columns: Vec<VectorConfig>,
         tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Self {
+        // Default per-column tokenizers: the single tokenizer applied to
+        // every FTS column (`with_fts_tokenizers` overrides for per-field
+        // analyzers).
+        let fts_tokenizers = match &tokenizer {
+            Some(t) => fts_columns.iter().map(|_| Arc::clone(t)).collect(),
+            None => Vec::new(),
+        };
         Self {
             schema,
             id_column: id_column.into(),
             fts_columns,
             vector_columns,
             tokenizer,
+            fts_tokenizers,
             row_group_size: 65_536,
             compression: Compression::ZSTD(
                 ZstdLevel::try_new(3).expect("zstd level 3 is in the valid 1..=22 range"),
@@ -275,6 +287,14 @@ impl BuilderOptions {
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
+        self
+    }
+
+    /// Override the per-column FTS tokenizers (per-field analysis). Must
+    /// be aligned to `fts_columns` (one per FTS column, declaration
+    /// order).
+    pub(crate) fn with_fts_tokenizers(mut self, tokenizers: Vec<Arc<dyn Tokenizer>>) -> Self {
+        self.fts_tokenizers = tokenizers;
         self
     }
 
@@ -293,19 +313,32 @@ impl BuilderOptions {
     }
 
     pub fn new_from_reader(reader: &SuperfileReader) -> Self {
-        // TODO: Fetch tokenizer from reader. Not possible at the moment because we don't
-        // store the tokenizer in the reader. Should work for now because we only have AsciiLowerTokenizer.
-        let tokenizer = Arc::new(AsciiLowerTokenizer);
-        let fts_columns = if let Some(fts) = &reader.fts() {
-            fts.fts_columns_config()
-                .map(|c| FtsConfig {
-                    column: c.name.clone(),
-                    positions: c.positions,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // Recover each FTS column's tokenizer from the source reader so a
+        // rebuild (compaction) re-indexes with the same analyzer it was
+        // built with, instead of defaulting to ASCII.
+        let (fts_columns, fts_tokenizers): (Vec<FtsConfig>, Vec<Arc<dyn Tokenizer>>) =
+            if let Some(fts) = &reader.fts() {
+                fts.fts_columns_config()
+                    .map(|c| {
+                        (
+                            FtsConfig {
+                                column: c.name.clone(),
+                                positions: c.positions,
+                            },
+                            Arc::clone(&c.tokenizer),
+                        )
+                    })
+                    .unzip()
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        // Seed the single-tokenizer field with the first column's analyzer
+        // (ASCII default when there are no FTS columns); `fts_tokenizers`
+        // is authoritative for per-column indexing.
+        let tokenizer: Arc<dyn Tokenizer> = fts_tokenizers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
 
         let (vector_columns, vector_layout) = if let Some(vec) = &reader.vec() {
             if vec.is_multi_cell() {
@@ -355,6 +388,7 @@ impl BuilderOptions {
             vector_columns,
             Some(tokenizer),
         )
+        .with_fts_tokenizers(fts_tokenizers)
         .with_vector_layout(vector_layout)
     }
 
@@ -543,9 +577,20 @@ impl SuperfileBuilder {
                 .as_ref()
                 .expect("validated non-empty FTS implies Some tokenizer")
                 .clone();
+            debug_assert_eq!(
+                opts.fts_columns.len(),
+                opts.fts_tokenizers.len(),
+                "fts_tokenizers must align 1:1 with fts_columns"
+            );
             let mut fb = FtsBuilder::new(tk);
-            for fc in &opts.fts_columns {
-                fb.register_column(fc.column.clone(), fc.positions)?;
+            // Register each column with its own analyzer (per-field
+            // analysis). `fts_tokenizers` is aligned to `fts_columns`.
+            for (fc, tok) in opts.fts_columns.iter().zip(&opts.fts_tokenizers) {
+                fb.register_column_with_tokenizer(
+                    fc.column.clone(),
+                    fc.positions,
+                    Arc::clone(tok),
+                )?;
             }
             Some(fb)
         };
@@ -1301,9 +1346,11 @@ fn superfile_kvs(
         (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
     ];
     if !options.fts_columns.is_empty() {
+        // Each column records its own analyzer name (per-field analysis);
+        // `fts_tokenizers` is aligned 1:1 with `fts_columns`.
         kvs.push((
             kv::FTS_COLUMNS.into(),
-            fts_columns_json(&options.fts_columns),
+            fts_columns_json(&options.fts_columns, &options.fts_tokenizers),
         ));
     }
     if !options.vector_columns.is_empty() {
@@ -1494,10 +1541,12 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 /// JSON per column.
 ///
 /// Output shape per column:
-/// `{"name":"<escaped>","tokenizer":"ascii_lower"}`.
-/// `ascii_lower` is hardcoded today because that's the only
-/// tokenizer the format supports.
-fn fts_columns_json(cols: &[FtsConfig]) -> String {
+/// `{"name":"<escaped>","tokenizer":"<name>"}`.
+/// `tokenizer` is that column's analyzer name (`"ascii_lower"` or
+/// `"standard"`), taken from `tokenizers[i]` — the reader reconstructs
+/// the matching tokenizer from it for query-time tokenization.
+/// `tokenizers` is aligned 1:1 with `cols`.
+fn fts_columns_json(cols: &[FtsConfig], tokenizers: &[Arc<dyn Tokenizer>]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
@@ -1505,7 +1554,9 @@ fn fts_columns_json(cols: &[FtsConfig]) -> String {
         }
         s.push_str(r#"{"name":""#);
         s.push_str(&escape_json(&c.column));
-        s.push_str(r#"","tokenizer":"ascii_lower""#);
+        s.push_str(r#"","tokenizer":""#);
+        s.push_str(&escape_json(tokenizers[i].name()));
+        s.push('"');
         // Emitted only when set: a positionless column's JSON stays
         // byte-identical to files written before positions existed
         // (the reader defaults a missing field to false).
@@ -1941,7 +1992,9 @@ mod tests {
                 positions: false,
             },
         ];
-        let s = fts_columns_json(&cols);
+        let toks: Vec<Arc<dyn Tokenizer>> =
+            vec![Arc::new(AsciiLowerTokenizer), Arc::new(AsciiLowerTokenizer)];
+        let s = fts_columns_json(&cols, &toks);
         assert!(s.starts_with('['));
         assert!(s.contains(r#""name":"title""#));
         assert!(s.contains(r#""name":"body""#));
@@ -1967,7 +2020,9 @@ mod tests {
                 positions: false,
             },
         ];
-        let s = fts_columns_json(&cols);
+        let toks: Vec<Arc<dyn Tokenizer>> =
+            vec![Arc::new(AsciiLowerTokenizer), Arc::new(AsciiLowerTokenizer)];
+        let s = fts_columns_json(&cols, &toks);
         assert!(
             s.contains(r#"{"name":"title","tokenizer":"ascii_lower","positions":true}"#),
             "positional column carries the flag: {s}"
@@ -1975,6 +2030,33 @@ mod tests {
         assert!(
             s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
             "positionless column stays in the legacy shape: {s}"
+        );
+    }
+
+    /// Per-column analyzers: each column records its own tokenizer name.
+    #[test]
+    fn fts_columns_json_per_column_analyzers() {
+        use crate::superfile::fts::tokenize::StandardTokenizer;
+        let cols = vec![
+            FtsConfig {
+                column: "title".into(),
+                positions: false,
+            },
+            FtsConfig {
+                column: "body".into(),
+                positions: false,
+            },
+        ];
+        let toks: Vec<Arc<dyn Tokenizer>> =
+            vec![Arc::new(StandardTokenizer), Arc::new(AsciiLowerTokenizer)];
+        let s = fts_columns_json(&cols, &toks);
+        assert!(
+            s.contains(r#"{"name":"title","tokenizer":"standard"}"#),
+            "title uses the standard analyzer: {s}"
+        );
+        assert!(
+            s.contains(r#"{"name":"body","tokenizer":"ascii_lower"}"#),
+            "body uses ascii_lower: {s}"
         );
     }
 
