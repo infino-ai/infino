@@ -88,6 +88,138 @@ pub fn kmeans_with_assignments(
         centroids[i * dim..(i + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
 
+    lloyd_refine(vectors, dim, k, iters, centroids)
+}
+
+/// k-means++ (D²-weighted) init followed by the same Lloyd refinement. Returns
+/// `k * dim` centroids and the final assignments.
+///
+/// The random init in [`kmeans_with_assignments`] draws `k` seeds uniformly, so
+/// at k > 2 in high dimension several seeds land in one dense blob and leave
+/// other blobs merged into a single oversized cluster — the exact imbalance the
+/// cell-split planner hits (one child absorbing several data centers). D²
+/// seeding spreads the initial centers across the cloud, so each blob gets a
+/// seed and the split stays balanced. Scoped
+/// to the split planner; the fine-index build keeps random init (validated).
+pub fn kmeans_pp_with_assignments(
+    vectors: &[f32],
+    dim: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<u32>) {
+    assert!(dim > 0, "kmeans_pp: dim must be > 0");
+    assert!(k > 0, "kmeans_pp: k must be > 0");
+    assert_eq!(
+        vectors.len() % dim,
+        0,
+        "kmeans_pp: vectors len {} not multiple of dim {dim}",
+        vectors.len()
+    );
+    let n = vectors.len() / dim;
+    assert!(n > 0, "kmeans_pp: at least one doc required");
+    assert!(k <= n, "kmeans_pp: k ({k}) > n_docs ({n})");
+
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(KMEANS_SEED_OFFSET));
+    let centroids = kmeanspp_init(vectors, dim, k, n, &mut rng);
+    lloyd_refine(vectors, dim, k, iters, centroids)
+}
+
+/// Centroids-only k-means++ (drops assignments), mirroring [`kmeans`].
+pub fn kmeans_pp(vectors: &[f32], dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    kmeans_pp_with_assignments(vectors, dim, k, iters, seed).0
+}
+
+/// L2² between two `dim`-length rows.
+#[inline]
+fn l2_sq(a: &[f32], b: &[f32], dim: usize) -> f32 {
+    let mut s = 0f32;
+    for j in 0..dim {
+        let d = a[j] - b[j];
+        s += d * d;
+    }
+    s
+}
+
+/// Greedy k-means++ seed selection. The first center is uniform; each
+/// subsequent center is chosen by drawing `local_trials` candidates
+/// D²-proportionally and keeping the one that most reduces the total potential
+/// (Σ nearest-center D²). Greedy ++ reaches the quality of many plain-++
+/// restarts in a single run — plain ++ (one D²-weighted draw per step) can
+/// settle a colliding basin where one cluster owns several blobs, and escaping
+/// it took ~16 restarts; the greedy local search finds the balanced basin
+/// directly. `local_trials = 2 + ⌊ln k⌋` (the standard scikit default).
+fn kmeanspp_init(vectors: &[f32], dim: usize, k: usize, n: usize, rng: &mut StdRng) -> Vec<f32> {
+    let local_trials = 2 + (k as f64).ln() as usize;
+    let mut centroids = Vec::with_capacity(k * dim);
+    let first = rng.random_range(0..n);
+    centroids.extend_from_slice(&vectors[first * dim..(first + 1) * dim]);
+    // `d2[i]` = L2² from point i to its nearest chosen center so far.
+    let mut d2 = vec![f32::INFINITY; n];
+    {
+        let c = &centroids[0..dim];
+        d2.par_iter_mut().enumerate().for_each(|(i, di)| {
+            *di = l2_sq(&vectors[i * dim..(i + 1) * dim], c, dim);
+        });
+    }
+    for _ in 1..k {
+        let total: f64 = d2.iter().map(|&x| x as f64).sum();
+        // Draw `local_trials` D²-weighted candidates; keep the one whose
+        // addition minimizes the resulting potential Σ min(d2[i], D²(i, cand)).
+        let mut best_cand = n - 1;
+        let mut best_potential = f64::INFINITY;
+        for _ in 0..local_trials {
+            let cand = if total <= 0.0 {
+                rng.random_range(0..n)
+            } else {
+                let mut target = rng.random::<f64>() * total;
+                let mut idx = n - 1;
+                for (i, &di) in d2.iter().enumerate() {
+                    target -= di as f64;
+                    if target <= 0.0 {
+                        idx = i;
+                        break;
+                    }
+                }
+                idx
+            };
+            let cand_vec = &vectors[cand * dim..(cand + 1) * dim];
+            let potential: f64 = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let dd = l2_sq(&vectors[i * dim..(i + 1) * dim], cand_vec, dim);
+                    f64::from(dd.min(d2[i]))
+                })
+                .sum();
+            if potential < best_potential {
+                best_potential = potential;
+                best_cand = cand;
+            }
+        }
+        // Commit the winner: copy it out, then fold it into `d2`.
+        let chosen: Vec<f32> = vectors[best_cand * dim..(best_cand + 1) * dim].to_vec();
+        d2.par_iter_mut().enumerate().for_each(|(i, di)| {
+            let dd = l2_sq(&vectors[i * dim..(i + 1) * dim], &chosen, dim);
+            if dd < *di {
+                *di = dd;
+            }
+        });
+        centroids.extend_from_slice(&chosen);
+    }
+    centroids
+}
+
+/// Lloyd refinement from a given initial centroid set. Shared by the random-init
+/// [`kmeans_with_assignments`] and the D²-init [`kmeans_pp_with_assignments`] so
+/// the assign/update kernel stays single-sourced.
+fn lloyd_refine(
+    vectors: &[f32],
+    dim: usize,
+    k: usize,
+    iters: usize,
+    mut centroids: Vec<f32>,
+) -> (Vec<f32>, Vec<u32>) {
+    let n = vectors.len() / dim;
     let mut assignments = vec![0u32; n];
 
     for _ in 0..iters {

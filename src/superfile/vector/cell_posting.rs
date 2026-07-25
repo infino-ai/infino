@@ -814,43 +814,6 @@ pub(crate) use crate::superfile::vector::distance::{
     dequantize_sq8_residual_into, sq8_residual_norm_sq,
 };
 
-/// Cap on the medoid all-pairs search. A medoid here is only a centroid *seed*
-/// (the split's discrete k-means update), so a representative sample suffices —
-/// and the exact O(n²) loop would otherwise spin for minutes on a split-cap
-/// shard (~50k rows). Same bounded-sample rationale as the k-means training.
-const MEDOID_SAMPLE_CAP: usize = 512;
-
-/// Index of the medoid row — the one minimizing the summed pairwise distance to
-/// all others — under an arbitrary row↔row distance `dist`. Used as a centroid
-/// seed by the split's discrete k-means in `supertable::opann`.
-///
-/// Bounded to O(cap²): on a shard larger than [`MEDOID_SAMPLE_CAP`] it evaluates
-/// a strided sample of candidate rows against a strided sample of reference rows
-/// (the same strided-sample shape the materialized k-means uses), and returns an
-/// index into the *original* shard. For `len <= cap` it is the exact all-pairs
-/// medoid (`step == 1`), so small shards are unchanged.
-pub(crate) fn medoid_index_by<F>(shard: &[&EncodedCellRow], dist: F) -> usize
-where
-    F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,
-{
-    let n = shard.len();
-    let step = n.div_ceil(MEDOID_SAMPLE_CAP).max(1);
-    let refs: Vec<&EncodedCellRow> = shard.iter().step_by(step).copied().collect();
-    let mut best_idx = 0usize;
-    let mut best_sum = f32::INFINITY;
-    let mut i = 0usize;
-    while i < n {
-        let row_i = shard[i];
-        let sum: f32 = refs.iter().map(|row_j| dist(row_i, row_j)).sum();
-        if sum < best_sum {
-            best_sum = sum;
-            best_idx = i;
-        }
-        i += step;
-    }
-    best_idx
-}
-
 /// Sq8+ε row → `dim` fp32 components (manifest centroids, medoid seeds, etc.).
 pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];

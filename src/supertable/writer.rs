@@ -5259,24 +5259,28 @@ pub(in crate::supertable) async fn split_overflow_cell(
 
     // Partition the extracted (live) rows k-ways via k-means: `assign[i]`
     // routes all_materialized[i] to sub-cell `0..k`; sub-cell 0 keeps
-    // `split_cell`'s id, `1..k` are appended. `k = ceil(rows / cap)` sizes the
-    // split so every child lands under the cap in one pass — `k = 2` for a cell
-    // just over cap (steady incremental growth), larger only for a bulk
-    // overflow. k-means assigns each row to its NEAREST sub-centroid, so split
-    // membership == query routing; that match is what keeps split recall at
-    // native parity (a geometric median cut assigns off-routing and loses
-    // recall — kept only as the planner's degenerate fallback). Borrow the
+    // `split_cell`'s id, `1..k` are appended. `k = ceil(rows / cap)` is the
+    // starting child count — `k = 2` for a cell just over cap (steady
+    // incremental growth), larger for a bulk overflow — which the planner
+    // self-tunes upward until each child's rows route to it (see
+    // `plan_sq8_split_kway`). Capacitated k-means assigns each row to its
+    // NEAREST sub-centroid, so split membership == query routing; that match is
+    // what keeps split recall at native parity. Borrow the
     // encoded rows into the planner instead of cloning the whole (largest)
     // cell's Sq8+ε payload — a clone here doubled the biggest cell's resident
     // bytes at split time (a RAM cliff at 100M/1B).
     let split_refs: Vec<&EncodedCellRow> = all_materialized.iter().map(|r| &r.encoded).collect();
     let cap = opann::cell_split_doc_cap().max(1) as usize;
     let k = all_materialized.len().div_ceil(cap).max(2);
-    let (sub_centroids, assign) = maint_pool()?.install(|| {
-        opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k, true)
-    });
+    let (sub_centroids, assign) = maint_pool()?
+        .install(|| opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k));
+    // The planner self-tunes k UPWARD for route fidelity (a cell packing many
+    // natural groups splits into more, smaller children so each holds ~whole
+    // groups), so the actual child count is the returned centroid count, not the
+    // requested cap-minimum `k`.
+    let actual_k = (sub_centroids.len() / (clusters.dim as usize)).max(1);
     let (updated_clusters, child_ids) =
-        opann::insert_split_centroids(&clusters, split_cell, &sub_centroids, k);
+        opann::insert_split_centroids(&clusters, split_cell, &sub_centroids, actual_k);
 
     // Route the extracted rows into the k sub-cells and build each as a packed
     // cell. Sub-cell 0 reuses `split_cell`'s id; the rest are the appended ids.
@@ -5423,6 +5427,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // Hidden user deletes use the resident deleted-id set, not hidden
     // tombstones; this is not the normal delete-heavy-table path.
     let mut unsplittable: HashSet<u32> = HashSet::new();
+    let mut splits_committed = 0usize;
     for iteration in 0..MAX_SPLITS_PER_OPTIMIZE {
         let mut best: Option<(u32, u64)> = None;
         for (cell, n) in &cell_counts {
@@ -5435,13 +5440,14 @@ pub(in crate::supertable) async fn split_overflow_cells(
             }
         }
         let Some((split_cell, n)) = best else {
-            return Ok(());
+            break;
         };
         if (n as usize) < MIN_ROWS_TO_SPLIT_CELL {
-            return Ok(());
+            break;
         }
         match split_overflow_cell(Arc::clone(&inner), split_cell).await? {
             Some(outcome) => {
+                splits_committed += 1;
                 for (cell, docs) in outcome.child_counts {
                     cell_counts.insert(cell, docs);
                 }
@@ -5456,6 +5462,24 @@ pub(in crate::supertable) async fn split_overflow_cells(
                  over-cap cells remain and will converge on the next optimize"
             );
         }
+    }
+    // Convergence summary for this optimize's split pass. `over_cap > 0` here
+    // means some cells still exceed the cap (unsplittable rows, or the
+    // MAX_SPLITS bound) and will misrank until a later optimize finishes them.
+    if splits_committed > 0 {
+        let over_cap = cell_counts
+            .values()
+            .filter(|&&n| opann::split_overflow_needed(n))
+            .count();
+        let max_cell = cell_counts.values().copied().max().unwrap_or(0);
+        tracing::debug!(
+            splits = splits_committed,
+            cells = cell_counts.len(),
+            over_cap,
+            max_cell,
+            unsplittable = unsplittable.len(),
+            "cell split pass done"
+        );
     }
     Ok(())
 }
