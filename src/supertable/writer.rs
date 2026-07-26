@@ -3038,16 +3038,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let Some(gvi) = user_inner.manifest.load_full().get_global_vector_index() else {
         return Ok(());
     };
-    let clusters = gvi.grid;
     let column = gvi.column;
+    // Assignment grid. On the FIRST drain the hidden index has no data-derived
+    // grid yet, so bootstrap from the user grid (trained at first commit).
+    // Afterwards the hidden grid is the source of truth: the split GROWS it, so
+    // the drain must READ AND EXTEND it. Re-seeding from the frozen user grid on
+    // every drain would wipe the split's growth — orphaning the split children
+    // and re-coarsening routing back to the initial cell count each drain.
+    // `routing` (query tuning) is preserved from the hidden grid either way.
+    let hidden_manifest = hidden_inner.manifest.load_full();
+    let hidden_bootstrapped = !hidden_manifest.get_drained_ranges().is_empty();
+    let (clusters, routing) = match hidden_manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters, routing, ..
+        } if hidden_bootstrapped => (clusters, routing),
+        PartitionStrategy::VectorCell { routing, .. } => (gvi.grid, routing),
+        _ => (gvi.grid, CellRoutingParams::default()),
+    };
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(());
     }
-    // Preserve any existing hidden-side query tuning (`routing`) across drains.
-    let routing = match hidden_inner.manifest.load_full().get_partition_strategy() {
-        PartitionStrategy::VectorCell { routing, .. } => routing,
-        _ => CellRoutingParams::default(),
-    };
 
     // Source: every user-table vector superfile, processed in BOUNDED BATCHES so
     // drain working-set RAM stays O(batch) instead of O(corpus) (the >3M memory
@@ -3225,15 +3235,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .unwrap_or((Metric::L2Sq, 0));
     // assign-skip: with global-aligned user superfiles (`vector.user_centroids:
     // global`) cluster c == cell c, so group by the row's own cluster ordinal
-    // instead of the O(n·n_cent) per-row nearest-cell scoring.
-    let assign_skip = config::global().vector.user_centroids == CentroidAlignment::Global;
+    // instead of the O(n·n_cent) per-row nearest-cell scoring. Valid ONLY while
+    // the hidden grid equals the user grid — i.e. the first drain. Once split has
+    // grown the hidden grid, user-superfile cluster ordinals no longer map 1:1 to
+    // hidden cells, so the skip would misroute; fall back to real assignment.
+    let assign_skip =
+        !hidden_bootstrapped && config::global().vector.user_centroids == CentroidAlignment::Global;
     let column_name = column.clone();
 
     let drain_t0 = std::time::Instant::now();
     let drain_rss0 = proc_rss_mib();
     let n_batches = batches.len();
-    // Carries per-cell counts cumulatively across batches; the centroids
-    // are immutable (owned by the user manifest), so each batch's
+    // Carries per-cell counts cumulatively across batches; the centroids are
+    // the hidden grid's (bootstrapped from the user grid on the first drain,
+    // then grown by split) and held fixed within a drain, so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
     // The batch budget bounds source materialization. Kmeans rows accumulate
