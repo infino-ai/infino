@@ -36,7 +36,10 @@ use std::sync::Arc;
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::reader::{Bm25Stats, BoolMode},
+    },
     supertable::{
         Supertable, SupertableOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -128,7 +131,14 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // query.
     let hits = consumer
         .reader()
-        .bm25_search("title", "echo", BM25_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "echo",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -172,7 +182,14 @@ fn bm25_term_in_no_part_loads_nothing() {
     // already rejected without needing the part bytes).
     let hits = consumer
         .reader()
-        .bm25_search("title", "zoo", BM25_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "zoo",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -843,7 +860,14 @@ fn eager_mode_query_paths_observationally_unchanged() {
     // BM25 hits.
     let hits = consumer
         .reader()
-        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "alpha",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     assert!(!hits.is_empty());
 

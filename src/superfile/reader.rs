@@ -954,6 +954,7 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
+                global_idf: None,
             },
             k,
             f32::NEG_INFINITY,
@@ -1232,6 +1233,7 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
+            None,
         )
         .await
     }
@@ -1246,6 +1248,7 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        global_idf: Option<&fts_reader::GlobalTermIdf>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
@@ -1258,6 +1261,7 @@ impl SuperfileReader {
                 doc_id_start,
                 doc_id_end,
                 floor,
+                global_idf,
             )
             .await?)
     }
@@ -2234,6 +2238,7 @@ mod tests {
                 0,
                 4,
                 1e9,
+                None,
             )
             .await
             .expect("floored ranged search");

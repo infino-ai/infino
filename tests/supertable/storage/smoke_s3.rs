@@ -252,6 +252,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                infino::Bm25Stats::PerSuperfile,
                 None,
             )
             .map_err(|e| format!("cold BM25 over real S3: {e}"))?;

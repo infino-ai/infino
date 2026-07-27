@@ -88,6 +88,34 @@ def test_fts_standard_analyzer_keeps_non_ascii():
     assert ascii_hits == 0
 
 
+def test_bm25_stats_kwarg():
+    # `stats` selects the BM25 corpus statistics. Both modes return the
+    # matching docs; the default is per-superfile. Correctness of the
+    # global ranking is covered by the Rust oracle; here we just exercise
+    # the binding and the string parsing.
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ["the quick brown fox", "a lazy dog", "the quick red fox"]:
+        t.append(_title_batch([title]))
+
+    default_hits = t.bm25_search("title", "fox", 10)
+    per_sf = t.bm25_search("title", "fox", 10, stats="per_superfile")
+    global_hits = t.bm25_search("title", "fox", 10, stats="global")
+
+    assert default_hits.num_rows == 2
+    assert per_sf.num_rows == 2
+    assert global_hits.num_rows == 2
+
+
+def test_bm25_unknown_stats_is_rejected():
+    # An unknown stats mode is a configuration error, surfaced as ValueError.
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+    with pytest.raises(ValueError):
+        t.bm25_search("title", "fox", 10, stats="nonesuch")
+
+
 def test_fts_unknown_analyzer_is_rejected():
     # An unknown analyzer is a configuration error, surfaced as ValueError.
     db = infino.connect("memory://")

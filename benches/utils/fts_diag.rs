@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use infino::superfile::fts::reader::BoolMode;
+use infino::superfile::fts::reader::{Bm25Stats, BoolMode};
 
 use crate::{diag_common, markdown::fmt_count};
 
@@ -94,7 +94,7 @@ pub fn run() {
     // Warm both paths for every shape (cache-hot before timing).
     for s in SHAPES {
         let _ = reader
-            .bm25_search(COLUMN, s.query, K, s.mode, None)
+            .bm25_search(COLUMN, s.query, K, s.mode, Bm25Stats::PerSuperfile, None)
             .expect("warm-up bm25_search");
     }
 
@@ -145,7 +145,7 @@ pub fn run() {
         for _ in 0..cfg.iters {
             let t = Instant::now();
             let out = reader
-                .bm25_search(COLUMN, s.query, K, s.mode, None)
+                .bm25_search(COLUMN, s.query, K, s.mode, Bm25Stats::PerSuperfile, None)
                 .expect("full bm25_search");
             full.push(t.elapsed());
             std::hint::black_box(out);

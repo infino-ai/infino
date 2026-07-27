@@ -21,7 +21,7 @@
 use std::{sync::Arc, thread};
 
 use infino::{
-    BoolMode, ConnectOptions, Connection, IndexSpec, InfinoError, Supertable,
+    Bm25Stats, BoolMode, ConnectOptions, Connection, IndexSpec, InfinoError, Supertable,
     arrow_array::RecordBatch,
     connect_with,
     test_helpers::{build_title_batch, schema_id_title},
@@ -107,7 +107,14 @@ fn concurrent_ingest_and_query_stay_within_one_connection_budget() {
                             Err(InfinoError::OverBudget(_)) => {}
                             Err(other) => panic!("append: non-budget error {other:?}"),
                         }
-                        match t.bm25_search("title", "budget", TOP_K, BoolMode::Or, None) {
+                        match t.bm25_search(
+                            "title",
+                            "budget",
+                            TOP_K,
+                            BoolMode::Or,
+                            Bm25Stats::PerSuperfile,
+                            None,
+                        ) {
                             Ok(_) | Err(InfinoError::OverBudget(_)) => {}
                             Err(other) => panic!("query: non-budget error {other:?}"),
                         }
@@ -172,8 +179,15 @@ fn measured_budget_admits_the_same_concurrent_load() {
                 for _ in 0..APPENDS_PER_TABLE {
                     t.append(batch)
                         .expect("measured budget never refuses an append");
-                    t.bm25_search("title", "budget", TOP_K, BoolMode::Or, None)
-                        .expect("measured budget never refuses a query");
+                    t.bm25_search(
+                        "title",
+                        "budget",
+                        TOP_K,
+                        BoolMode::Or,
+                        Bm25Stats::PerSuperfile,
+                        None,
+                    )
+                    .expect("measured budget never refuses a query");
                 }
             });
         }

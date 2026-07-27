@@ -3791,9 +3791,16 @@ mod tests {
 
         // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
         // pre-compact warm/cold queries against a disk-cache consumer).
-        use crate::superfile::fts::reader::BoolMode;
+        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         let hits = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
             .expect("bm25 pre-optimize");
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
@@ -3802,7 +3809,14 @@ mod tests {
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
             .expect("bm25 post-optimize");
         assert!(
             !hits_after.is_empty(),

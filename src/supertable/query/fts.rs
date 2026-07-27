@@ -11,11 +11,11 @@
 //! ```ignore
 //! // Bare call: `_id` + `score` only — no scalar decode.
 //! let ids: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, None)?;
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Bm25Stats::PerSuperfile, None)?;
 //!
 //! // Materialize row data by naming the columns to decode.
 //! let rows: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Some(&["_id", "title", "score"]))?;
+//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Bm25Stats::PerSuperfile, Some(&["_id", "title", "score"]))?;
 //!
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
@@ -47,18 +47,27 @@
 //!
 //! ## Score comparability across superfiles
 //!
-//! BM25's IDF is computed from per-superfile `n_docs` and `df`,
-//! so a rare term in a small superfile can score higher than the
-//! same term in a larger superfile. This is the classical sharded-
-//! BM25 problem:
-//! treating per-superfile scores as comparable is a documented
-//! approximation, accepted in v1 because (a) global IDF would
-//! require either a manifest-wide df table or a two-pass query
-//! (df gather + score), both with non-trivial memory/latency
-//! cost; (b) for k ≥ 10 and reasonably balanced superfiles the top-k
-//! *set* converges to the global answer even if score *order*
-//! within the set wiggles. Oracle tests assert set membership at
-//! `k = 10` against a single-superfile ground truth.
+//! This is the classical sharded-BM25 problem: when IDF is computed
+//! from each superfile's own `n_docs` and `df`, a rare term in a small
+//! superfile can score higher than the same term in a larger one, so
+//! per-superfile scores are only approximately comparable and ranking
+//! drifts as the table fragments. [`Bm25Stats`] selects how a query
+//! handles this:
+//!
+//!  - [`Bm25Stats::PerSuperfile`] (default) scores each superfile
+//!    against its own local statistics — no extra pass, fastest. For
+//!    `k ≥ 10` and reasonably balanced superfiles the top-k *set* still
+//!    converges to the global answer even if score *order* within the
+//!    set wiggles.
+//!  - [`Bm25Stats::Global`] gathers the corpus-wide document count and
+//!    per-term document-frequencies once (a bloom-pruned, dictionary-
+//!    only df pass) and scores every superfile against that single
+//!    table-wide IDF, so a fragmented table ranks like one unified
+//!    corpus. Costs a df-gather pass before scoring.
+//!
+//! Oracle tests assert `Global` over a fragmented table reproduces the
+//! single-superfile ranking, and that `PerSuperfile` set membership at
+//! `k = 10` matches a single-superfile ground truth.
 //!
 //! ManifestSnapshot-level skip pruning is wired in: each call computes a
 //! per-superfile keep/prune mask from the FTS bloom (exact-term
@@ -91,12 +100,15 @@ use crate::{
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
-        fts::reader::ClauseLists,
+        fts::{
+            bm25,
+            reader::{Bm25Stats, ClauseLists, GlobalTermIdf},
+        },
     },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::SuperfileEntry,
+        manifest::{ManifestSnapshot, SuperfileEntry},
         query::{
             SuperfileHit, dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
@@ -265,6 +277,7 @@ impl SupertableReader {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if k == 0 {
             return Ok(Vec::new());
@@ -349,6 +362,32 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
+        // Under global stats, gather corpus-wide idf per scored term once
+        // (global N from the manifest + df summed across the superfiles
+        // that contain the term), then score every superfile against it
+        // instead of its own per-superfile idf. Only the scored bare
+        // terms (musts + shoulds) are globalized here; a phrase-bearing
+        // query keeps local idf for its phrase components, which a
+        // follow-up will extend.
+        let global_idf: Option<Arc<GlobalTermIdf>> = match stats {
+            Bm25Stats::PerSuperfile => None,
+            Bm25Stats::Global => {
+                let mut scored: Vec<String> = Vec::new();
+                for t in musts.iter().chain(shoulds.iter()) {
+                    if !scored.contains(t) {
+                        scored.push(t.clone());
+                    }
+                }
+                match scored.is_empty() {
+                    true => None,
+                    false => Some(Arc::new(
+                        self.gather_global_term_idf(manifest.as_ref(), column, &scored)
+                            .await?,
+                    )),
+                }
+            }
+        };
+
         // Build the work-unit list. When the reader pool has more
         // threads than there are kept superfiles AND we're on the
         // multi-term OR hot path, slice each superfile into doc_id
@@ -405,6 +444,7 @@ impl SupertableReader {
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
+            let global_idf = global_idf.clone();
             async move {
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
@@ -432,6 +472,7 @@ impl SupertableReader {
                             start,
                             end,
                             floor,
+                            global_idf.as_deref(),
                         )
                         .await
                         .map_err(fts_read_error)?
@@ -450,6 +491,7 @@ impl SupertableReader {
                                 must_phrases: &must_ph_arc,
                                 should_phrases: &should_ph_arc,
                                 negative_phrases: &neg_ph_arc,
+                                global_idf: global_idf.as_deref(),
                             },
                             k,
                             floor,
@@ -478,6 +520,65 @@ impl SupertableReader {
         let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
         let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
+    }
+
+    /// Gather global BM25 idf per scored term for [`Bm25Stats::Global`]:
+    /// corpus-wide `N` from the manifest, plus each term's `df` summed
+    /// across the superfiles that contain it (bloom-pruned — a superfile
+    /// absent the term contributes `df = 0`, so the pruned set covers
+    /// every term's postings). The `df` read is `O(1)` per superfile
+    /// from the stored dictionary value.
+    async fn gather_global_term_idf(
+        &self,
+        manifest: &ManifestSnapshot,
+        column: &str,
+        terms: &[String],
+    ) -> Result<GlobalTermIdf, QueryError> {
+        let mut map = GlobalTermIdf::with_capacity(terms.len());
+        let global_n = manifest.n_docs_total();
+        if terms.is_empty() || global_n == 0 {
+            return Ok(map);
+        }
+        let prune = PruneLeaf::TermPresence {
+            column: column.to_owned(),
+            terms: terms.to_vec(),
+            mode: BoolMode::Or,
+        };
+        let kept = select_superfiles(manifest, slice::from_ref(&prune)).await?;
+        let column_arc = Arc::new(column.to_owned());
+        let terms_arc: Arc<Vec<String>> = Arc::new(terms.to_vec());
+        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let per_sf: Vec<Vec<u64>> = dispatch::fanout_with(
+            self,
+            units,
+            false,
+            true,
+            move |r, _entry, _sidecars, _now, _params: ()| {
+                let column_arc = Arc::clone(&column_arc);
+                let terms_arc = Arc::clone(&terms_arc);
+                async move {
+                    let mut dfs = Vec::with_capacity(terms_arc.len());
+                    for t in terms_arc.iter() {
+                        dfs.push(r.term_df(&column_arc, t).await.map_err(fts_read_error)?);
+                    }
+                    Ok::<Vec<u64>, QueryError>(dfs)
+                }
+            },
+        )
+        .await?;
+        let mut global_df = vec![0u64; terms.len()];
+        for sf in per_sf {
+            for (i, d) in sf.into_iter().enumerate() {
+                global_df[i] += d;
+            }
+        }
+        for (i, t) in terms.iter().enumerate() {
+            // df can't exceed the collection size; clamp so idf's
+            // df <= n_docs invariant holds under gross-vs-live counts.
+            let df = global_df[i].min(global_n);
+            map.insert(t.clone(), bm25::idf(global_n, df));
+        }
+        Ok(map)
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -1012,11 +1113,14 @@ impl SupertableReader {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
-            let hits = self.bm25_search_async(column, query, k, mode).await?;
+            let hits = self
+                .bm25_search_async(column, query, k, mode, stats)
+                .await?;
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
@@ -1053,7 +1157,7 @@ impl SupertableReader {
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
-        self.block_on(self.bm25_search_async(column, query, k, mode))
+        self.block_on(self.bm25_search_async(column, query, k, mode, Bm25Stats::PerSuperfile))
     }
 
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
@@ -1325,17 +1429,17 @@ impl Supertable {
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
     /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, BoolMode, IndexSpec};
+    /// # use infino::{connect, Bm25Stats, BoolMode, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
     /// // Bare call → `_id` + `score`, no scalar decode:
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, None)?;
+    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Bm25Stats::PerSuperfile, None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
     /// // Name columns to materialize row data:
-    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, Some(&["_id", "body", "score"]))?;
+    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, Bm25Stats::PerSuperfile, Some(&["_id", "body", "score"]))?;
     /// assert_eq!(rows[0].num_columns(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -1349,11 +1453,12 @@ impl Supertable {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, k, mode = ?mode, "bm25_search");
         self.reader()
-            .bm25_search(column, query, k, mode, projection)
+            .bm25_search(column, query, k, mode, stats, projection)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("bm25_search", None))
     }
@@ -1481,7 +1586,7 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use tokio::runtime::Builder;
 
-    use super::{BoolMode, FanOut, build_work_units, fanout_for};
+    use super::{Bm25Stats, BoolMode, FanOut, build_work_units, fanout_for};
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
@@ -1540,6 +1645,147 @@ mod tests {
     fn build_batch(_start: u64, titles: &[&str]) -> RecordBatch {
         let titles_arr = LargeStringArray::from(titles.to_vec());
         RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles_arr)]).expect("batch")
+    }
+
+    /// All `(title, score)` hits for a bm25_search, in ranked order.
+    ///
+    /// Projects the `title` column rather than `_id`: the
+    /// supertable-injected `_id` embeds superfile/commit identity, so it
+    /// is NOT comparable across two independently-built tables. The doc
+    /// content is. `k` is set large enough to return every match, so
+    /// there is no top-k truncation boundary where score ties could pick
+    /// different docs in the two tables.
+    fn all_scored(st: &Supertable, query: &str, stats: Bm25Stats) -> Vec<(String, f32)> {
+        use arrow_array::{Float32Array, LargeStringArray};
+        const K_ALL: usize = 1000;
+        let batches = st
+            .reader()
+            .bm25_search(
+                "title",
+                query,
+                K_ALL,
+                BoolMode::Or,
+                stats,
+                Some(&["title", "score"]),
+            )
+            .expect("bm25_search");
+        let mut out = Vec::new();
+        for b in &batches {
+            let titles = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title utf8");
+            let scores = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("score f32");
+            for i in 0..b.num_rows() {
+                out.push((titles.value(i).to_string(), scores.value(i)));
+            }
+        }
+        out
+    }
+
+    /// Oracle for `Bm25Stats::Global`: a table split across many
+    /// superfiles, scored with global stats, must rank identically to
+    /// the same docs in a single superfile (where per-superfile stats
+    /// already ARE global). Docs are uniform length so `avgdl` matches
+    /// everywhere and global idf is the only variable the `Global` path
+    /// changes.
+    #[test]
+    fn global_stats_multi_superfile_matches_single_superfile() {
+        // 24 uniform-length (4-token) docs. The first three tokens carry
+        // the query terms (so df/idf drives ranking); the trailing `dNN`
+        // is a per-doc unique tag that keeps every title distinct without
+        // changing length. It never appears in a query, so it does not
+        // affect scores — it only lets us identify a doc across the two
+        // independently-built tables by content.
+        let titles: Vec<String> = (0..24)
+            .map(|i| {
+                let topic = ["alpha", "beta", "gamma"][i % 3];
+                let band = ["red", "green"][(i / 3) % 2];
+                format!("{topic} shared {band} d{i:02}")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+
+        // SINGLE: one commit → one superfile (local stats == global).
+        let single = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = single.writer().expect("writer");
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(
+            single.reader().manifest().get_all_superfiles().len(),
+            1,
+            "single table must be one superfile"
+        );
+
+        // MULTI: four commits of six docs → four superfiles, same docs.
+        let multi = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = multi.writer().expect("writer");
+            for chunk in refs.chunks(6) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        assert!(
+            multi.reader().manifest().get_all_superfiles().len() > 1,
+            "multi table must be fragmented across superfiles"
+        );
+
+        // Titles are unique, so `title -> score` fully identifies a
+        // result. Comparing the map (not the ranked list) is robust to
+        // tie-break order, which differs between the two tables because
+        // it falls back to local doc ids.
+        let score_map = |hits: Vec<(String, f32)>| -> std::collections::HashMap<String, f32> {
+            hits.into_iter().collect()
+        };
+
+        for q in ["alpha shared", "beta red", "gamma green d05", "shared red"] {
+            let single_ref = score_map(all_scored(&single, q, Bm25Stats::PerSuperfile));
+            let multi_global = score_map(all_scored(&multi, q, Bm25Stats::Global));
+            let multi_local = score_map(all_scored(&multi, q, Bm25Stats::PerSuperfile));
+
+            // Global stats over the fragmented table reproduce the
+            // single-superfile result exactly: same docs (by content),
+            // same per-doc score.
+            assert_eq!(
+                single_ref.len(),
+                multi_global.len(),
+                "hit count mismatch for {q:?}"
+            );
+            for (title, s_score) in &single_ref {
+                let g_score = multi_global
+                    .get(title)
+                    .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
+                assert!(
+                    (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
+                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
+                );
+            }
+
+            // Sanity: per-superfile stats on the fragmented table do NOT
+            // reproduce the single-superfile scores — otherwise the test
+            // could pass without Global doing anything.
+            if q == "alpha shared" {
+                let local_diverges = single_ref.len() != multi_local.len()
+                    || single_ref.iter().any(|(title, s)| {
+                        multi_local
+                            .get(title)
+                            .is_none_or(|l| (s - l).abs() > 1e-4 * s.abs().max(1.0))
+                    });
+                assert!(
+                    local_diverges,
+                    "per-superfile stats unexpectedly matched single-superfile for {q:?}; \
+                     the oracle would not be exercising Global"
+                );
+            }
+        }
     }
 
     /// Build a single SuperfileBuilder containing the same docs as
@@ -1947,7 +2193,14 @@ mod tests {
 
         // Bare call → `_id` + `score` only (no scalar decode).
         let bare = st
-            .bm25_search("title", "fox", 10, BoolMode::Or, None)
+            .bm25_search(
+                "title",
+                "fox",
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
             .expect("bm25 rows");
         assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(bare[0].num_columns(), 2, "_id + score");
@@ -1959,6 +2212,7 @@ mod tests {
                 "fox",
                 10,
                 BoolMode::Or,
+                Bm25Stats::PerSuperfile,
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25 projected rows");

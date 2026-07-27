@@ -1965,6 +1965,7 @@ pub mod fts {
                     &query,
                     TOP_K,
                     exec_fts::to_infino_mode(q.mode),
+                    infino::Bm25Stats::PerSuperfile,
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2076,7 +2077,14 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered cold bm25_search");
             },
             |(_cache, consumer), i| {
@@ -2085,7 +2093,14 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(q.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
@@ -2094,7 +2109,14 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered repeat cold bm25_search");
             },
         );
@@ -2131,7 +2153,14 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, None)
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2147,7 +2176,14 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    Some(&["_id", column, "score"]),
+                )
                 .expect("cold bm25_search fetched")
                 .iter()
                 .map(|b| b.num_rows())
