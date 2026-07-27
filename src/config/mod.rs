@@ -246,14 +246,12 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
 // Vector-tuning defaults. Kept equal to the historical inline
 // literals so folding these knobs into config preserves behavior.
-/// Default overflow threshold before a merged cell superfile is split: the max
-/// docs in a global cell. Set just above the measured good cell size (~39K
-/// docs/cell, the size 256 cells give at 10M with ~0.98 recall) — above it the
-/// per-cell shortlist over-crowds and within-cell recall drops. A fixed cap
-/// holds cell size roughly constant as the corpus grows, so the cell count
-/// scales with the data (256-cell tables at <= 10M stay split-free) and the grid
-/// refines automatically at higher scale instead of being pinned to one count.
-const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 40_000;
+/// Default cell-split doc cap; must equal config.yaml `cell_split_doc_cap` (see
+/// there for the rationale behind the large 500K value).
+const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
+/// Default modality-split threshold; `0.0` = off. Must equal config.yaml
+/// `cell_split_modality_d` (see there for the working value and why it ships off).
+const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 0.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
@@ -361,6 +359,11 @@ pub struct VectorSettings {
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
+    /// Ashman-D threshold that triggers a modality-driven cell split. `0.0`
+    /// keeps the plain `cell_split_doc_cap` trigger; `> 0` splits a cell whose
+    /// tentative two-means partition is bimodal by at least this D (with
+    /// `cell_split_doc_cap` demoted to a hard ceiling).
+    pub cell_split_modality_d: f64,
     /// How user-superfile clusters align to the global cell grid.
     pub user_centroids: CentroidAlignment,
     /// User superfiles the hidden-index drain materializes per batch
@@ -411,6 +414,7 @@ impl Default for VectorSettings {
             rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
+            cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
@@ -1175,7 +1179,7 @@ supertable:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.vector, VectorSettings::default());
         assert_eq!(cfg.vector.inner_budget, None);
-        assert_eq!(cfg.vector.cell_split_doc_cap, 40_000);
+        assert_eq!(cfg.vector.cell_split_doc_cap, 500_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
         assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8FixedResidual);

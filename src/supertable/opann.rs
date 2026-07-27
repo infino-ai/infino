@@ -54,6 +54,44 @@ pub(crate) fn split_overflow_needed(n_docs: u64) -> bool {
     n_docs > cell_split_doc_cap()
 }
 
+/// Ashman-D threshold that triggers a modality-driven split, or `0.0` when the
+/// plain [`cell_split_doc_cap`] trigger is in force. Sourced from
+/// `vector.cell_split_modality_d`.
+pub(crate) fn cell_split_modality_d() -> f64 {
+    config::global().vector.cell_split_modality_d
+}
+
+/// Target number of *whole* modes grouped per cell for the modality trigger. A
+/// cell holding `<= R` modes is healthy and left whole; one holding more splits
+/// into `ceil(K/R)` children of ~R whole modes each. Grouping (R>1), not
+/// one-mode-per-cell, because 1-mode/cell routes *worst* at nprobe=1 (measured
+/// 0.967 vs 0.996 at 4/cell) — tight one-mode centroids mis-route boundary
+/// queries. The `<= R` stop bounds the grid: children settle at `<= R` modes and
+/// aren't re-split, so the cell count converges rather than running away.
+const MODALITY_MODES_PER_CELL: usize = 4;
+
+/// Smallest cell (in live rows) the modality recursion will split — a pure
+/// sliver-guard tied to the fine-IVF granularity (a child needs ~≥2 fine
+/// clusters at `kmeans_pts_per_centroid`≈64 to be viable), NOT a mode-isolation
+/// bar. It must sit *below* the natural mode size at every scale, or the
+/// recursion can't reach one-mode leaves: e.g. at a 200k drain (mode ≈195 docs)
+/// a floor of 512 stops recursion at ~390-doc 2-mode leaves, which then grow
+/// past 512 and re-split every batch → runaway over-fragmentation (200k×5 →
+/// 1759 cells / 0.758). At 128 the D-stop (unimodal) governs instead, so the
+/// recursion isolates one-mode leaves at any scale. Larger scales are
+/// unaffected (their modes ≫ any small floor; the D-stop fires first).
+pub(crate) const MODALITY_MIN_CELL_DOCS: u64 = 128;
+
+/// True when a cell is a *candidate* for the modality-driven split — either it
+/// overflows the hard cap, or the modality trigger is on and the cell is large
+/// enough to test. The actual split decision (Ashman D) is made in
+/// [`crate::supertable::writer::split_overflow_cell`], where the rows are
+/// resident; this only gates which cells that decision runs on.
+pub(crate) fn split_candidate(n_docs: u64) -> bool {
+    split_overflow_needed(n_docs)
+        || (cell_split_modality_d() > 0.0 && n_docs >= MODALITY_MIN_CELL_DOCS)
+}
+
 /// Append-only count bookkeeping for touched cells.
 pub(crate) fn apply_cell_count_updates(
     base: &ClusterCentroids,
@@ -289,6 +327,199 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     out
 }
 
+/// Ashman D of a two-means partition, measured on the 1-D projection onto the
+/// inter-centroid axis. A k=2 split of a single coherent mode is not free: along
+/// the split axis each half is a half-normal, so a unimodal cell sits at a
+/// baseline `D ~= 2.6-3.1` (means +/-0.8 sigma over within-std ~0.6 sigma), NOT
+/// near zero. A cell spanning two cleanly separated modes scores far higher —
+/// the inter-mode gap dwarfs the within-mode spread, so D runs into the tens or
+/// hundreds. The operating threshold must therefore sit *above* the unimodal
+/// baseline (~4-5 leaves ample margin); a threshold near 2 would split every
+/// cell. The projection is what makes this work in high dimension: spread is
+/// measured only along the inter-centroid axis, not diluted by the `dim - 1`
+/// directions the split does not separate (the failure mode of a raw
+/// variance/inertia ratio). `points` is a flat `m * dim` buffer, `cents` is
+/// `2 * dim`; the axis length cancels in D, so the raw projection `p · (c1 - c0)`
+/// suffices. `0.0` for a degenerate partition (identical centroids or one empty
+/// side); `f32::INFINITY` for zero within-side spread (perfectly separated).
+fn ashman_d(points: &[f32], dim: usize, cents: &[f32]) -> f64 {
+    let m = points.len() / dim;
+    if m < 2 || dim == 0 || cents.len() < 2 * dim {
+        return 0.0;
+    }
+    let mut axis = vec![0f32; dim];
+    let mut norm2 = 0f64;
+    for j in 0..dim {
+        let d = cents[dim + j] - cents[j];
+        axis[j] = d;
+        norm2 += f64::from(d) * f64::from(d);
+    }
+    if norm2 <= 1e-12 {
+        return 0.0;
+    }
+    let project =
+        |v: &[f32]| -> f64 { (0..dim).map(|j| f64::from(v[j]) * f64::from(axis[j])).sum() };
+    // Split the projection at the midpoint between the two centroid feet, and
+    // accumulate per-side mean/variance of the projection coordinate.
+    let mid = 0.5 * (project(&cents[..dim]) + project(&cents[dim..2 * dim]));
+    let mut cnt = [0f64; 2];
+    let mut sum = [0f64; 2];
+    let mut sumsq = [0f64; 2];
+    for i in 0..m {
+        let p = project(&points[i * dim..(i + 1) * dim]);
+        let s = usize::from(p >= mid);
+        cnt[s] += 1.0;
+        sum[s] += p;
+        sumsq[s] += p * p;
+    }
+    if cnt[0] < 1.0 || cnt[1] < 1.0 {
+        return 0.0;
+    }
+    let mean = [sum[0] / cnt[0], sum[1] / cnt[1]];
+    let var = [
+        (sumsq[0] / cnt[0] - mean[0] * mean[0]).max(0.0),
+        (sumsq[1] / cnt[1] - mean[1] * mean[1]).max(0.0),
+    ];
+    let denom = (var[0] + var[1]).sqrt();
+    if denom <= 0.0 {
+        return f64::INFINITY;
+    }
+    std::f64::consts::SQRT_2 * (mean[1] - mean[0]).abs() / denom
+}
+
+/// Max recursion depth of the in-memory k-finder — bounds k to `2^depth`.
+const MODALITY_MAX_DEPTH: usize = 6;
+
+/// Per-branch seed perturbations mixed into the child recursion seeds so the
+/// left and right sub-groups draw *decorrelated* strided samples (an unperturbed
+/// seed would resample the same strides on both sides).
+const MODALITY_RECURSE_SEED_LEFT: u64 = 0x1111;
+const MODALITY_RECURSE_SEED_RIGHT: u64 = 0x2222;
+
+/// Decode a cell's encoded rows to one flat `n * dim` fp32 buffer, once, so the
+/// in-memory recursion re-clusters on fp32 without re-dequantizing per level.
+/// The old cross-pass cascade re-materialized and re-decoded every cell at every
+/// level; this decodes each cell exactly once.
+fn decode_rows(rows: &[&EncodedCellRow], dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows.len() * dim);
+    for &row in rows {
+        out.extend_from_slice(&dequantize_row(row, dim));
+    }
+    out
+}
+
+/// Reliable mode count by recursive binary bisection of a cell's rows, entirely
+/// in memory. At each node: take a fresh strided sample of *this sub-group's*
+/// rows (a fresh sample of the real sub-group, NOT a shrinking sub-slice — that
+/// noise is what made earlier in-memory counters over-fragment), two-means +
+/// [`ashman_d`]; below `threshold` the node is one mode (leaf), else partition
+/// the sub-group by nearest centroid and recurse both sides. Leaf count = k.
+/// `idx` indexes rows into `decoded`. This is the same validated per-cut test as
+/// the cross-pass binary cascade (→ the reliable k), but without the per-level
+/// Blob re-reads.
+fn recursive_binary_k(
+    decoded: &[f32],
+    dim: usize,
+    idx: &[usize],
+    seed: u64,
+    threshold: f64,
+    depth: usize,
+) -> usize {
+    let m = idx.len();
+    if (m as u64) < MODALITY_MIN_CELL_DOCS || depth == 0 {
+        return 1;
+    }
+    let sample_n = m.min((2 * SPLIT_KMEANS_SAMPLE_PER_CLUSTER).max(SPLIT_KMEANS_SAMPLE_MIN));
+    let mut sample = Vec::with_capacity(sample_n * dim);
+    for s in 0..sample_n {
+        let i = idx[s * m / sample_n];
+        sample.extend_from_slice(&decoded[i * dim..(i + 1) * dim]);
+    }
+    let cents = kmeans(&sample, dim, 2, SPLIT_KMEANS_ITERS, seed);
+    if cents.len() < 2 * dim || ashman_d(&sample, dim, &cents) < threshold {
+        return 1;
+    }
+    let (c0, c1) = (&cents[..dim], &cents[dim..2 * dim]);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for &i in idx {
+        let v = &decoded[i * dim..(i + 1) * dim];
+        if distance(Metric::L2Sq, v, c0) <= distance(Metric::L2Sq, v, c1) {
+            left.push(i);
+        } else {
+            right.push(i);
+        }
+    }
+    if left.is_empty() || right.is_empty() {
+        return 1;
+    }
+    let seed_l = seed ^ MODALITY_RECURSE_SEED_LEFT;
+    let seed_r = seed ^ MODALITY_RECURSE_SEED_RIGHT;
+    recursive_binary_k(decoded, dim, &left, seed_l, threshold, depth - 1)
+        + recursive_binary_k(decoded, dim, &right, seed_r, threshold, depth - 1)
+}
+
+/// The split plan for a candidate cell given its resident `rows`:
+/// `Some((k, self_tune))` — split into `k` children — or `None` to leave it
+/// whole. Over the hard `cell_split_doc_cap` a cell splits into the cap-derived
+/// `k` with the executor self-tuning `k` up for route fidelity (the backstop
+/// path). Otherwise, when the modality trigger is on (`cell_split_modality_d >
+/// 0`), an **in-memory recursive binary** finds the reliable mode count `k` (one
+/// materialize, no cross-pass cascade — see [`recursive_binary_k`]); a cell with
+/// `<= R` modes is left whole, one with more splits into `g = ceil(K/R)` children
+/// with the executor self-tuning `k` up from `g` for route fidelity. The count
+/// must come from the recursion on rows — every up-front / summary estimate
+/// over-counts on real embeddings (recursive-Ashman-on-centroids 6692 / 0.344 vs
+/// validated binary-on-rows 1025 / 0.996). With the trigger off (default) this is
+/// the plain over-cap check.
+pub(crate) fn cell_split_plan(
+    rows: &[&EncodedCellRow],
+    dim: usize,
+    split_cell: u32,
+) -> Option<(usize, bool)> {
+    let n_docs = rows.len() as u64;
+    let cap = cell_split_doc_cap().max(1) as usize;
+    let k_by_cap = rows.len().div_ceil(cap).max(2);
+    let threshold = cell_split_modality_d();
+    // Modality trigger off (default): the caller's over-cap gate is the sole
+    // split trigger, so a cell that reaches here is a confirmed split — partition
+    // into the cap-derived k (the executor self-tunes k upward for route
+    // fidelity). A just-over-cap cell splits 2-way; a bulk overflow into more.
+    if threshold <= 0.0 {
+        return Some((k_by_cap, true));
+    }
+    // Modality trigger on: a hard-cap overflow still always splits; below the
+    // cap, split only a genuinely multimodal cell (Ashman D below), leaving a
+    // unimodal cell whole (`None`).
+    if split_overflow_needed(n_docs) {
+        return Some((k_by_cap, true));
+    }
+    if n_docs < MODALITY_MIN_CELL_DOCS {
+        return None;
+    }
+    let seed = (split_cell as u64) ^ SPLIT_KMEANS_SEED_XOR;
+    let decoded = decode_rows(rows, dim);
+    let idx: Vec<usize> = (0..rows.len()).collect();
+    // In-memory recursive binary finds the reliable mode count K (materialize once, no
+    // cross-pass cascade). The count must come from the ROWS — every summary estimate
+    // over-counts on real embeddings, incl. recursing on the fine centroids
+    // (6692 cells / 0.344) vs the validated binary-on-rows (1025 / 0.996), because
+    // averaged centroids shed within-mode noise and read as extra modes.
+    let k = recursive_binary_k(&decoded, dim, &idx, seed, threshold, MODALITY_MAX_DEPTH);
+    // Whole-mode grouping: split only when the cell holds MORE than R whole modes, into
+    // ceil(K/R) children of ~R modes each (never one-mode-per-cell). A cell already at
+    // `<= R` modes is healthy and left whole — the stop that keeps the grid from running
+    // away under streaming. `self_tune = true`: the executor raises k from this start
+    // toward route fidelity, so a grouped child whose centroid mis-routes its modes gets
+    // sub-split until assign == route.
+    let r = MODALITY_MODES_PER_CELL;
+    if k <= r {
+        return None;
+    }
+    let g = k.div_ceil(r).max(2);
+    Some((g, true))
+}
+
 /// One capacitated split attempt at a fixed `k`: greedy-k-means++ (random at
 /// `k = 2`) centroids on a strided sample, then a capacity-bounded
 /// nearest-centroid assignment (`cap_target` rows per child, spilling the
@@ -390,6 +621,7 @@ pub(crate) fn plan_sq8_split_kway(
     split_cell: u32,
     metric: Metric,
     k: usize,
+    self_tune: bool,
 ) -> (Vec<f32>, Vec<u32>) {
     let dim = clusters.dim as usize;
     let k = k.max(2).min(rows.len().max(2));
@@ -413,7 +645,14 @@ pub(crate) fn plan_sq8_split_kway(
     // recall is preserved even when a coarse cell packs many natural groups.
     let n = rows.len();
     let cap_target = n.div_ceil(k).max(1);
-    let k_max = k.saturating_mul(SPLIT_SELF_TUNE_K_MAX_FACTOR).min(n).max(k);
+    // `self_tune = false` pins the split to exactly `k` (the caller already
+    // knows the right child count — e.g. the recursive mode count); `true`
+    // raises `k` toward the route-fidelity target for the cap-derived backstop.
+    let k_max = if self_tune {
+        k.saturating_mul(SPLIT_SELF_TUNE_K_MAX_FACTOR).min(n).max(k)
+    } else {
+        k
+    };
     let mut best: Option<(f64, Vec<f32>, Vec<u32>)> = None;
     let mut k_try = k;
     loop {
@@ -466,7 +705,7 @@ pub(crate) fn plan_sq8_split(
     metric: Metric,
 ) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
     let dim = clusters.dim as usize;
-    let (cents, assign) = plan_sq8_split_kway(rows, clusters, split_cell, metric, 2);
+    let (cents, assign) = plan_sq8_split_kway(rows, clusters, split_cell, metric, 2, true);
     let c0 = cents[..dim].to_vec();
     let c1 = cents[dim..2 * dim].to_vec();
     (c0, c1, assign.iter().map(|&a| a as u8).collect())
@@ -751,6 +990,59 @@ mod tests {
     }
 
     #[test]
+    fn modality_primitives_separate_and_count_k() {
+        let dim = 64usize;
+        let threshold = 4.0;
+        // Ashman D of the cell's strongest two-means seam, on a strided sample.
+        let d_sample = |rows: &[EncodedCellRow], seed: u64| -> f64 {
+            let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+            let decoded = decode_rows(&refs, dim);
+            let c = kmeans(&decoded, dim, 2, SPLIT_KMEANS_ITERS, seed);
+            ashman_d(&decoded, dim, &c)
+        };
+        // The in-memory recursive binary mode count.
+        let k_of = |rows: &[EncodedCellRow], seed: u64| -> usize {
+            let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+            let decoded = decode_rows(&refs, dim);
+            let idx: Vec<usize> = (0..rows.len()).collect();
+            recursive_binary_k(&decoded, dim, &idx, seed, threshold, MODALITY_MAX_DEPTH)
+        };
+        // A k=2 split of a single isotropic gaussian is not a no-op: along the
+        // split axis each half is a half-normal, so Ashman D sits near the
+        // unimodal baseline (~2.6-3.1). The recursive counter returns 1.
+        for (sigma, seed) in [(0.1f32, 11u64), (0.03, 13)] {
+            let uni = synth_gaussian_cell(dim, 1, 1000, sigma, seed);
+            let d = d_sample(&uni, 0);
+            assert!(
+                (2.0..4.0).contains(&d),
+                "unimodal (sigma {sigma}) D should sit near the ~3 baseline, got {d}"
+            );
+            assert_eq!(
+                k_of(&uni, 0),
+                1,
+                "unimodal cell -> k = 1, got {}",
+                k_of(&uni, 0)
+            );
+        }
+        // Two well-separated modes score far above the baseline (~3 vs hundreds).
+        let bi = synth_gaussian_cell(dim, 2, 700, 0.02, 12);
+        assert!(
+            d_sample(&bi, 0) > 100.0,
+            "separated modes should score far above the baseline, got {}",
+            d_sample(&bi, 0)
+        );
+        // Three well-separated modes: the recursive counter recovers k = 3,
+        // stopping each branch at the unimodal D threshold (not over-fragmenting).
+        let tri = synth_gaussian_cell(dim, 3, 700, 0.02, 21);
+        assert_eq!(
+            k_of(&tri, 0),
+            3,
+            "three separated modes -> k = 3, got {}",
+            k_of(&tri, 0)
+        );
+    }
+
+    #[test]
     fn plan_sq8_split_separates_two_blobs() {
         let dim = 4usize;
         let mut rows = synth_rows(dim, 10, 0.0);
@@ -808,7 +1100,7 @@ mod tests {
         let n = rows.len();
         let clusters = synth_centroids(1, dim as u32);
         let refs: Vec<&EncodedCellRow> = rows.iter().collect();
-        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, k);
+        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, k, true);
         // The planner self-tunes k UPWARD for route fidelity, so the child count
         // is the returned centroid count, not the requested `k`.
         let kk = (cents.len() / dim).max(1);
@@ -904,7 +1196,7 @@ mod tests {
         let rows = synth_gaussian_cell(dim, 16, 100, 0.05, 42);
         let clusters = synth_centroids(1, dim as u32);
         let refs: Vec<&EncodedCellRow> = rows.iter().collect();
-        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, 2);
+        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, 2, true);
         let kk = cents.len() / dim;
         let populated = {
             let mut seen = vec![false; kk.max(1)];

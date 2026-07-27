@@ -5285,10 +5285,21 @@ pub(in crate::supertable) async fn split_overflow_cell(
     // cell's Sq8+ε payload — a clone here doubled the biggest cell's resident
     // bytes at split time (a RAM cliff at 100M/1B).
     let split_refs: Vec<&EncodedCellRow> = all_materialized.iter().map(|r| &r.encoded).collect();
-    let cap = opann::cell_split_doc_cap().max(1) as usize;
-    let k = all_materialized.len().div_ceil(cap).max(2);
-    let (sub_centroids, assign) = maint_pool()?
-        .install(|| opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k));
+    // Decide whether to split and into how many children (see `cell_split_plan`):
+    // over the hard cap => cap-derived `k` backstop (executor self-tunes k up for
+    // route fidelity); otherwise, with the modality trigger on, an in-memory
+    // recursive binary finds the reliable mode count `k` and the executor splits
+    // into exactly that `k` in one pass (`self_tune = false`) — no cross-pass
+    // cascade. Trigger off (default) => exactly the over-cap check. `None` is a
+    // no-op; the caller marks the cell unsplittable for the pass.
+    let Some((k, self_tune)) = maint_pool()?
+        .install(|| opann::cell_split_plan(&split_refs, clusters.dim as usize, split_cell))
+    else {
+        return Ok(None);
+    };
+    let (sub_centroids, assign) = maint_pool()?.install(|| {
+        opann::plan_sq8_split_kway(&split_refs, &clusters, split_cell, metric, k, self_tune)
+    });
     // The planner self-tunes k UPWARD for route fidelity (a cell packing many
     // natural groups splits into more, smaller children so each holds ~whole
     // groups), so the actual child count is the returned centroid count, not the
@@ -5306,6 +5317,14 @@ pub(in crate::supertable) async fn split_overflow_cell(
         groups[(side as usize).min(child_ids.len() - 1)].push(row);
     }
     let child_counts: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
+    tracing::debug!(
+        cell = split_cell,
+        rows = child_counts.iter().sum::<u32>(),
+        k = child_counts.len(),
+        child_min = child_counts.iter().min().copied().unwrap_or(0),
+        child_max = child_counts.iter().max().copied().unwrap_or(0),
+        "cell split committed"
+    );
     let build_subcell = |cell_id: u32,
                          mut rows: Vec<MaterializedIvfRow>|
      -> Result<Option<PreparedSuperfile>, BuildError> {
@@ -5447,7 +5466,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
         let mut best: Option<(u32, u64)> = None;
         for (cell, n) in &cell_counts {
             let n = *n;
-            if opann::split_overflow_needed(n)
+            if opann::split_candidate(n)
                 && !unsplittable.contains(cell)
                 && best.is_none_or(|(_, b)| n > b)
             {
@@ -5465,6 +5484,18 @@ pub(in crate::supertable) async fn split_overflow_cells(
                 splits_committed += 1;
                 for (cell, docs) in outcome.child_counts {
                     cell_counts.insert(cell, docs);
+                    // A fresh split's children are already resolved — the modality
+                    // recursion emits *unimodal* leaves. Mark any child that isn't
+                    // itself over the hard cap unsplittable, so the modality
+                    // candidate floor (`n >= MODALITY_MIN_CELL_DOCS`) doesn't
+                    // re-select it and re-materialize it from the store on this
+                    // pass just to decline it (the dominant cost at scale — one
+                    // wasted read per child). Children still over cap stay
+                    // selectable so the over-cap backstop re-splits them. No-op for
+                    // the doc-cap path (its ≤cap children were never candidates).
+                    if !opann::split_overflow_needed(docs) {
+                        unsplittable.insert(cell);
+                    }
                 }
             }
             None => {

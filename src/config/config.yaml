@@ -157,16 +157,36 @@ vector:
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #
-  # Max docs in a global cell before compaction splits it. Set just above the
-  # measured good cell size (~39K docs/cell, the size 256 cells give at 10M with
-  # ~0.98 recall): a larger cell over-crowds its per-cell shortlist and
-  # within-cell recall drops; a much smaller one fragments the grid into many
-  # tiny cells. A fixed cap holds cell SIZE roughly constant as the corpus grows,
-  # so the cell COUNT scales with the data — the grid stays coarse at small scale
-  # (256-cell tables at <=10M stay split-free) and refines automatically at
-  # higher scale rather than being pinned to one count. The split is the adaptive
-  # form of choosing a finer grid.
-  cell_split_doc_cap: 40000
+  # Max docs in a global cell before it is split (hard ceiling; also the primary
+  # trigger when cell_split_modality_d = 0, i.e. by default).
+  #
+  # 500K, deliberately large. A brief experiment lowered this to 40K (≈ the ~39K
+  # size 256 cells give at 10M / ~0.98) on the theory that cells must be kept
+  # small — that was wrong. Measurement: native no-split cells at 100M/256 =
+  # ~390K docs/cell HOLD ~0.98 recall, so the split is NOT needed to keep recall
+  # at these sizes; and forcing a split down to 40K instead over-fragments the
+  # grid under streaming (cell count runs away → boundary loss → recall craters).
+  # So the large cap makes the default path native-ish: it splits only genuinely
+  # huge cells (100M/256 = 390K < 500K → no split; ~1B/256 = 3.9M → splits). Lower
+  # it only if a measured within-cell ceiling shows up at some large docs/cell.
+  cell_split_doc_cap: 500000
+
+  # Ashman-D threshold for a modality-driven split. Spread measured on the axis
+  # between a tentative two-means partition's centroids (so it isn't diluted by
+  # the ~1023 dimensions the split doesn't separate). A k=2 split of a single mode
+  # scores ~3 (half-normal baseline); two separated modes score in the
+  # tens-to-hundreds. With this > 0, cell_split_doc_cap becomes a hard ceiling and
+  # cells track natural cluster boundaries: the recursion counts modes K, a cell
+  # with K > MODALITY_MODES_PER_CELL (=4) splits into ceil(K/4) children, and the
+  # executor self-tunes k up for route fidelity.
+  #
+  # 0.0 (OFF) is the default — DELIBERATELY, pending validation. The value that
+  # worked in experiments is 8.0 (with R=4 + self_tune): 0.99+ recall at 1M/300k
+  # single- and multi-batch. It is OFF because (a) native no-split holds ~0.98 to
+  # 100M (see cell_split_doc_cap) so modality isn't needed for the common case,
+  # and (b) R=4+self_tune's behavior at 10M+ is still under validation (a coarse
+  # bootstrap over-fragmented). Enable (8.0) only once the scale run confirms it.
+  cell_split_modality_d: 0.0
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
