@@ -241,8 +241,8 @@ impl SupertableReader {
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
     /// descending by score.
     ///
-    /// `query` is tokenized by the v1 [`AsciiLowerTokenizer`] —
-    /// the same tokenizer used at index time. Returns
+    /// `query` is tokenized by the same tokenizer the column was
+    /// indexed with (its per-column analyzer). Returns
     /// [`QueryError::Store`] if any superfile is unreachable, or
     /// [`QueryError::Parquet`] if a superfile's bytes can't be
     /// queried (column missing from the superfile's FTS index, etc.).

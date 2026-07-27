@@ -330,11 +330,10 @@ pub struct ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// Currently always `"ascii_lower"`. A missing field
-    /// deserializes to `"ascii_lower"` too — the only
-    /// tokenizer that has ever existed for this format, so
-    /// any file written without the field can only have
-    /// been emitted with it implicitly.
+    /// The column's analyzer name: `"ascii_lower"` (the default) or
+    /// `"standard"`. A missing field deserializes to `"ascii_lower"`
+    /// for backward compatibility with files written before the
+    /// analyzer name was recorded.
     #[serde(default = "default_tokenizer")]
     pub tokenizer: String,
     /// Whether this column's index records token positions (phrase
@@ -1740,9 +1739,8 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         // Tokenize the query with each column's configured tokenizer so
-        // per-column analyzers are honored (all columns in a table share
-        // one analyzer today, but resolving per column keeps this correct
-        // if that ever loosens).
+        // per-column analyzers are honored — a table may index different
+        // columns with different analyzers.
         let mut combined: HashMap<u32, f32> = HashMap::new();
         for (col_name, weight) in columns {
             let col_id = self.resolve_column_id(col_name)?;

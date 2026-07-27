@@ -51,34 +51,24 @@
 //! themselves. A typed `add_row(&[ScalarValue], ...)` helper can be
 //! added later if profiling shows row-at-a-time callers need it.
 //!
-//! ## Tokenizer scope: one shared instance
+//! ## Tokenizer scope: per-column
 //!
-//! `BuilderOptions` carries a single `tokenizer: Option<Arc<dyn
-//! Tokenizer>>` used for every FTS column. `FtsConfig` carries only
-//! the column name. Why:
+//! `BuilderOptions` carries a default `tokenizer: Option<Arc<dyn
+//! Tokenizer>>` (required when any FTS column exists) plus a
+//! per-column `fts_tokenizers` vec aligned to `fts_columns`; the
+//! default seeds every column unless an entry overrides it.
+//! `FtsConfig` itself carries only the column name and its positions
+//! flag. `FtsBuilder` holds the default tokenizer and a parallel
+//! `column_tokenizers` vec — `register_column` uses the default,
+//! `register_column_with_tokenizer` sets a per-column analyzer — and
+//! dispatches per (column, doc) at `add_doc` time.
 //!
-//!   1. There is one tokenizer implementation today
-//!      (`AsciiLowerTokenizer`); per-column variation has no caller.
-//!   2. The underlying `FtsBuilder` takes one tokenizer for the
-//!      whole index. Threading per-column tokenizers through it
-//!      without inner refactor leaves only awkward options
-//!      (silently use the first column's tokenizer; `Arc::ptr_eq`
-//!      validate that all columns share an instance; or extend
-//!      `FtsBuilder` to hold `Vec<Arc<dyn Tokenizer>>` indexed by
-//!      column_id and dispatch per (col, doc) pair).
-//!   3. The third is the right shape when we ship a second tokenizer
-//!      — but it's a real interior refactor across `FtsBuilder`,
-//!      `FtsReader`, and the `inf.fts.columns` JSON, and there is no
-//!      caller asking for it.
-//!
-//! Forward-compat: when a second tokenizer ships (Unicode segmenter,
-//! language-specific stemmers, …), `FtsConfig` grows a `tokenizer`
-//! field, `BuilderOptions.tokenizer` becomes a per-column override
-//! or is removed, and `FtsBuilder::new` becomes
-//! `FtsBuilder::with_tokenizers(Vec<Arc<dyn Tokenizer>>)`. The
-//! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
-//! each entry (currently always `"ascii_lower"`), so the on-disk
-//! format is forward-compatible without a file rewrite.
+//! Two tokenizers ship: `AsciiLowerTokenizer` (the default) and the
+//! Unicode-aware `StandardTokenizer`, selectable per column. The
+//! `inf.fts.columns` JSON persists each column's tokenizer name, so a
+//! column is re-tokenized at rebuild / compaction with the analyzer it
+//! was indexed with. Further analyzers (language-specific stemmers, …)
+//! implement the `Tokenizer` trait and need no change to this plumbing.
 use std::{
     collections::{HashMap, HashSet},
     fmt,

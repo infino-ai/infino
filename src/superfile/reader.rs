@@ -896,8 +896,8 @@ impl SuperfileReader {
 
     /// Single-column BM25 search across the unified FTS reader.
     ///
-    /// `query` is tokenized by the same v1 tokenizer used at build
-    /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
+    /// `query` is tokenized by the same tokenizer the column was built
+    /// with (its per-column analyzer). Returns `(local_doc_id, score)`
     /// hits ordered by descending score — this is the hit kernel, not a
     /// row-returning search; row materialization is `take_by_local_doc_ids`.
     ///
@@ -972,10 +972,10 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must be already lower-cased ASCII alphanumeric tokens
-    /// — the FST keys are stored in that form. Callers using the
-    /// v1 tokenizer can produce them via
-    /// `AsciiLowerTokenizer.tokenize(query)`.
+    /// Terms must already be tokenized to the column's FST key form —
+    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
+    /// column (already-lowercased ASCII alphanumerics) or
+    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
