@@ -1915,7 +1915,14 @@ pub mod fts {
             &|| {
                 black_box(
                     reader
-                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode, None)
+                        .bm25_search(
+                            supertable::TEXT_COLUMN,
+                            &query,
+                            TOP_K,
+                            mode,
+                            infino::Bm25Stats::PerSuperfile,
+                            None,
+                        )
                         .expect("routing-state warm bm25 search"),
                 );
             },

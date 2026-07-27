@@ -822,10 +822,24 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> ((u64, u64), (u64, u64)) {
             let search = self
-                .bm25_search(column, query, k, mode, None)
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("supertable bm25_search payload");
             let fetched = self
-                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    Some(&["_id", column, "score"]),
+                )
                 .expect("supertable bm25_search fetched payload");
             (payload_bytes(&search), payload_bytes(&fetched))
         }
