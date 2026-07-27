@@ -682,7 +682,20 @@ impl Connection {
     /// under-counted. Visible under `metering` for platform billing / Grafana.
     #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
-        self.open_table(name)?
+        // `storage_bytes` is a local measurement of the on-storage superfile
+        // footprint; a hosted connection has no local storage to measure, so
+        // reject it there rather than reaching for a handle that doesn't exist.
+        #[cfg(feature = "remote")]
+        if matches!(self.inner.store, CatalogStore::Remote(_)) {
+            return Err(InfinoError::Backend(
+                "table_storage_bytes is a local measurement, not available over the remote transport"
+                    .to_string(),
+            )
+            .with_context("table_storage_bytes", Some(name)));
+        }
+        // The concrete engine handle carries `storage_bytes`; the public
+        // wrapper returned by `open_table` does not.
+        self.open_table_handle(name)?
             .storage_bytes()
             .map_err(|e| InfinoError::from(e).with_context("table_storage_bytes", Some(name)))
     }
