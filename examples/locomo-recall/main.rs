@@ -43,7 +43,7 @@ use std::{
 };
 
 use infino::{
-    Bm25Stats, BoolMode, IndexSpec, Metric, VectorSearchOptions,
+    Bm25SearchOptions, IndexSpec, Metric, VectorSearchOptions,
     arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
     connect,
@@ -284,8 +284,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "text",
             &question,
             k,
-            BoolMode::Or,
-            Bm25Stats::PerSuperfile,
+            Bm25SearchOptions::new(),
             Some(&["id", "score"]),
         )?)?;
         let hybrid = ids_in_order(&db.query_sql(&format!(

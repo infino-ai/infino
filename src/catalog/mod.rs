@@ -1060,7 +1060,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25Stats, BoolMode,
+        Bm25SearchOptions,
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -1108,14 +1108,7 @@ mod tests {
         // Re-open by name and search.
         let reopened = conn.open_table("docs").expect("open_table");
         let hits = reopened
-            .bm25_search(
-                "title",
-                "fox",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox'");
 
@@ -1139,14 +1132,7 @@ mod tests {
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
         let ascii_hits = ascii
-            .bm25_search(
-                "title",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
@@ -1165,14 +1151,7 @@ mod tests {
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
         let hits = std_tbl
-            .bm25_search(
-                "title",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
@@ -1232,14 +1211,7 @@ mod tests {
             .expect("append");
 
         let title_cafe = table
-            .bm25_search(
-                "title",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("title search");
         assert_eq!(
             n_rows(&title_cafe),
@@ -1248,14 +1220,7 @@ mod tests {
         );
 
         let body_cafe = table
-            .bm25_search(
-                "body",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
@@ -1263,14 +1228,7 @@ mod tests {
         // The ascii_lower column is genuinely indexed (not empty): an
         // ASCII term still matches there.
         let body_latte = table
-            .bm25_search(
-                "body",
-                "latte",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("body", "latte", TOP_K, Bm25SearchOptions::new(), None)
             .expect("body search");
         assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
     }
@@ -1308,14 +1266,7 @@ mod tests {
         let conn2 = connect(&uri).expect("reconnect");
         let table = conn2.open_table("docs").expect("open_table");
         let title_cafe = table
-            .bm25_search(
-                "title",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("title search");
         assert_eq!(
             n_rows(&title_cafe),
@@ -1323,14 +1274,7 @@ mod tests {
             "standard column still matches non-ASCII after reopen"
         );
         let body_cafe = table
-            .bm25_search(
-                "body",
-                "café",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(
@@ -1399,14 +1343,7 @@ mod tests {
 
         // Starts empty.
         let before = opened
-            .bm25_search(
-                "title",
-                "fox",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search on empty table");
         assert_eq!(n_rows(&before), 0, "freshly opened table starts empty");
 
@@ -1416,14 +1353,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append via reopened handle");
         let hits = opened
-            .bm25_search(
-                "title",
-                "fox",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search after append");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
     }
@@ -1886,14 +1816,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &first
-                    .bm25_search(
-                        "title",
-                        "fox",
-                        TOP_K,
-                        BoolMode::Or,
-                        Bm25Stats::PerSuperfile,
-                        None
-                    )
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             1
@@ -1909,14 +1832,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &second
-                    .bm25_search(
-                        "title",
-                        "fox",
-                        TOP_K,
-                        BoolMode::Or,
-                        Bm25Stats::PerSuperfile,
-                        None
-                    )
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -1953,14 +1869,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &docs
-                    .bm25_search(
-                        "title",
-                        "fox",
-                        TOP_K,
-                        BoolMode::Or,
-                        Bm25Stats::PerSuperfile,
-                        None
-                    )
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -2548,14 +2457,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
         let hits = table
-            .bm25_search(
-                "title",
-                "fox",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("search");
         assert_eq!(n_rows(&hits), 1);
         // The disk cache got a per-table subdirectory.
@@ -2764,14 +2666,7 @@ mod tests {
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
         let table = conn.open_table("docs").expect("open_table");
         let hits = table
-            .bm25_search(
-                "title",
-                "fox",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
@@ -2824,14 +2719,7 @@ mod tests {
         assert!(err.to_string().contains("update:"), "got: {err}");
 
         let err = posts
-            .bm25_search(
-                "title",
-                "-onlyneg",
-                TOP_K,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("title", "-onlyneg", TOP_K, Bm25SearchOptions::new(), None)
             .expect_err("negation-only query");
         assert!(matches!(err, InfinoError::Query(_)));
         assert!(err.to_string().contains("bm25_search:"), "got: {err}");

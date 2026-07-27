@@ -11,11 +11,11 @@
 //! ```ignore
 //! // Bare call: `_id` + `score` only — no scalar decode.
 //! let ids: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Bm25Stats::PerSuperfile, None)?;
+//!     table.bm25_search("title", "rust async", 10, Bm25SearchOptions::new(), None)?;
 //!
 //! // Materialize row data by naming the columns to decode.
 //! let rows: Vec<RecordBatch> =
-//!     table.bm25_search("title", "rust async", 10, BoolMode::Or, Bm25Stats::PerSuperfile, Some(&["_id", "title", "score"]))?;
+//!     table.bm25_search("title", "rust async", 10, Bm25SearchOptions::new(), Some(&["_id", "title", "score"]))?;
 //!
 //! // Unranked candidate sets (Arrow rows, score == 0.0).
 //! let any = table.token_match("title", "rust async", BoolMode::Or, None)?;
@@ -1438,17 +1438,17 @@ impl Supertable {
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
     /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, Bm25Stats, BoolMode, IndexSpec};
+    /// # use infino::{connect, Bm25SearchOptions, IndexSpec};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
     /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
     /// # posts.append(&RecordBatch::try_new(
     /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
     /// // Bare call → `_id` + `score`, no scalar decode:
-    /// let hits = posts.bm25_search("body", "fox", 10, BoolMode::Or, Bm25Stats::PerSuperfile, None)?;
+    /// let hits = posts.bm25_search("body", "fox", 10, Bm25SearchOptions::new(), None)?;
     /// assert_eq!(hits[0].num_columns(), 2);
     /// // Name columns to materialize row data:
-    /// let rows = posts.bm25_search("body", "fox", 10, BoolMode::Or, Bm25Stats::PerSuperfile, Some(&["_id", "body", "score"]))?;
+    /// let rows = posts.bm25_search("body", "fox", 10, Bm25SearchOptions::new(), Some(&["_id", "body", "score"]))?;
     /// assert_eq!(rows[0].num_columns(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```

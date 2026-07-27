@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
 use infino::{
-    Bm25Stats, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, IndexSpec, Metric, VectorFilter, VectorSearchOptions,
     arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
     connect,
@@ -62,8 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "title",
         "fox",
         SEARCH_TOP_K,
-        BoolMode::Or,
-        Bm25Stats::PerSuperfile,
+        Bm25SearchOptions::new(),
         Some(&["_id", "title", "score"]),
     )?;
     print_batches(&hits);

@@ -60,14 +60,15 @@ const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 /// carrying an explicit clause sigil keep their polarity regardless
 /// of mode: `+term` is a must (every hit contains it), `-term` a
 /// must-not (hard exclusion).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum BoolMode {
     /// Bare terms are musts: all of them must match the doc.
     And,
     /// Bare terms are shoulds: any of them matching contributes to
     /// the doc's score. When the query also carries `+must` terms,
     /// the musts alone define the match set and bare terms become
-    /// scoring-only.
+    /// scoring-only. The default.
+    #[default]
     Or,
 }
 
@@ -99,6 +100,43 @@ impl From<&str> for Bm25Stats {
             "global" => Bm25Stats::Global,
             _ => Bm25Stats::PerSuperfile,
         }
+    }
+}
+
+/// Options for a BM25 search: the boolean `mode` and the corpus-statistics
+/// `stats`. Set fields with the `with_*` builders; [`Default`] is
+/// [`BoolMode::Or`] with [`Bm25Stats::PerSuperfile`].
+///
+/// ```ignore
+/// // OR mode, per-superfile stats (the defaults):
+/// Bm25SearchOptions::new()
+/// // AND mode, global stats:
+/// Bm25SearchOptions::new().with_mode(BoolMode::And).with_stats(Bm25Stats::Global)
+/// ```
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct Bm25SearchOptions {
+    /// Boolean mode for the query's bare terms (`Or` = should, `And` = must).
+    pub mode: BoolMode,
+    /// Which BM25 corpus statistics to score with.
+    pub stats: Bm25Stats,
+}
+
+impl Bm25SearchOptions {
+    /// Default options: `Or` mode, per-superfile statistics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the boolean mode for the query's bare terms.
+    pub fn with_mode(mut self, mode: BoolMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set which BM25 corpus statistics to score with.
+    pub fn with_stats(mut self, stats: Bm25Stats) -> Self {
+        self.stats = stats;
+        self
     }
 }
 

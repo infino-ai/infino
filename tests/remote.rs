@@ -18,8 +18,8 @@ use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25Stats, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError, OptimizeOptions,
-    VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
+    OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -150,14 +150,7 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
     let rows = with_connection(server.uri(), |db| {
         let table = db.open_table("posts").expect("open_table");
         table
-            .bm25_search(
-                "id",
-                "hello",
-                10,
-                BoolMode::Or,
-                Bm25Stats::PerSuperfile,
-                None,
-            )
+            .bm25_search("id", "hello", 10, Bm25SearchOptions::new(), None)
             .expect("bm25_search")
     })
     .await;

@@ -31,8 +31,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError,
-    InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
     VectorSearchOptions,
 };
 
@@ -464,13 +464,14 @@ impl Table {
         projection: Option<Vec<String>>,
         stats: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mode = parse_mode(mode)?;
-        let stats = parse_stats(stats)?;
+        let opts = Bm25SearchOptions::new()
+            .with_mode(parse_mode(mode)?)
+            .with_stats(parse_stats(stats)?);
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
                 self.inner
-                    .bm25_search(column, query, k, mode, stats, names.as_deref())
+                    .bm25_search(column, query, k, opts, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)

@@ -19,7 +19,7 @@ use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
 
 use crate::{
-    Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
     OptimizeOptions, VectorFilter, VectorSearchOptions, supertable::Supertable as SupertableHandle,
 };
 
@@ -37,8 +37,7 @@ pub(crate) trait Table: Send + Sync {
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn token_match(
@@ -108,11 +107,10 @@ impl Table for SupertableHandle {
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, mode, stats, projection)
+        SupertableHandle::bm25_search(self, column, query, k, opts.mode, opts.stats, projection)
     }
     fn token_match(
         &self,
@@ -226,21 +224,21 @@ impl Supertable {
 
     /// Ranked BM25 full-text search over one FTS column.
     ///
-    /// `stats` selects the BM25 corpus statistics: [`Bm25Stats::PerSuperfile`]
-    /// (the default, each segment scored against its own local statistics)
-    /// or [`Bm25Stats::Global`] (one table-wide idf across all segments, so a
-    /// fragmented table ranks like a single unified corpus).
+    /// `opts` ([`Bm25SearchOptions`]) carries the boolean `mode` and the
+    /// corpus-statistics selector: [`Bm25Stats::PerSuperfile`](crate::Bm25Stats::PerSuperfile)
+    /// (the default, each segment scored against its own local statistics) or
+    /// [`Bm25Stats::Global`](crate::Bm25Stats::Global) (one table-wide idf
+    /// across all segments, so a fragmented table ranks like a single unified
+    /// corpus). `Bm25SearchOptions::new()` is `Or` mode + per-superfile stats.
     pub fn bm25_search(
         &self,
         column: &str,
         query: &str,
         k: usize,
-        mode: BoolMode,
-        stats: Bm25Stats,
+        opts: Bm25SearchOptions,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        self.inner
-            .bm25_search(column, query, k, mode, stats, projection)
+        self.inner.bm25_search(column, query, k, opts, projection)
     }
 
     /// Unranked token match over one FTS column.

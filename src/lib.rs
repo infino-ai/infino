@@ -175,7 +175,7 @@ pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
 pub use superfile::{
-    fts::reader::{Bm25Stats, BoolMode},
+    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
     vector::distance::Metric,
 };
 pub use supertable::{

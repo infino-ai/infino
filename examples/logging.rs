@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use infino::{Bm25Stats, BoolMode, IndexSpec, connect};
+use infino::{Bm25SearchOptions, IndexSpec, connect};
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,8 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "title",
         "fox",
         10,
-        BoolMode::Or,
-        Bm25Stats::PerSuperfile,
+        Bm25SearchOptions::new(),
         Some(&["_id", "title"]),
     )?;
     let _ = db.query_sql("SELECT _id, title FROM docs ORDER BY _id")?;
