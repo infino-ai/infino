@@ -19,8 +19,8 @@ use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
 
 use crate::{
-    BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError, OptimizeOptions,
-    VectorFilter, VectorSearchOptions, supertable::Supertable as SupertableHandle,
+    Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    OptimizeOptions, VectorFilter, VectorSearchOptions, supertable::Supertable as SupertableHandle,
 };
 
 /// The operation surface shared by every table implementation (local or
@@ -38,6 +38,7 @@ pub(crate) trait Table: Send + Sync {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn token_match(
@@ -108,9 +109,10 @@ impl Table for SupertableHandle {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        SupertableHandle::bm25_search(self, column, query, k, mode, projection)
+        SupertableHandle::bm25_search(self, column, query, k, mode, stats, projection)
     }
     fn token_match(
         &self,
@@ -223,15 +225,22 @@ impl Supertable {
     }
 
     /// Ranked BM25 full-text search over one FTS column.
+    ///
+    /// `stats` selects the BM25 corpus statistics: [`Bm25Stats::PerSuperfile`]
+    /// (the default, each segment scored against its own local statistics)
+    /// or [`Bm25Stats::Global`] (one table-wide idf across all segments, so a
+    /// fragmented table ranks like a single unified corpus).
     pub fn bm25_search(
         &self,
         column: &str,
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
-        self.inner.bm25_search(column, query, k, mode, projection)
+        self.inner
+            .bm25_search(column, query, k, mode, stats, projection)
     }
 
     /// Unranked token match over one FTS column.

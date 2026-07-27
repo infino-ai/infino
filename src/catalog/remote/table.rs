@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError, OptimizeOptions,
-    VectorFilter, VectorSearchOptions, catalog::table::Table,
+    Bm25Stats, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    OptimizeOptions, VectorFilter, VectorSearchOptions, catalog::table::Table,
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
@@ -47,6 +47,15 @@ fn mode_str(mode: BoolMode) -> &'static str {
     match mode {
         BoolMode::And => "and",
         BoolMode::Or => "or",
+    }
+}
+
+/// Wire spelling for the BM25 statistics mode
+/// (`"per_superfile"` / `"global"`).
+fn stats_str(stats: Bm25Stats) -> &'static str {
+    match stats {
+        Bm25Stats::PerSuperfile => "per_superfile",
+        Bm25Stats::Global => "global",
     }
 }
 
@@ -126,6 +135,7 @@ impl Table for RemoteTable {
         query: &str,
         k: usize,
         mode: BoolMode,
+        stats: Bm25Stats,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         let body = json!({
@@ -134,6 +144,7 @@ impl Table for RemoteTable {
             "query": query,
             "k": k,
             "mode": mode_str(mode),
+            "stats": stats_str(stats),
             "projection": projection,
         });
         let response = self.catalog.post_json("bm25_search", body)?;
