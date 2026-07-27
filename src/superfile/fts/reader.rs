@@ -987,6 +987,7 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         phrases: &[Vec<String>],
+        global_idf: Option<&GlobalTermIdf>,
     ) -> Result<Vec<Option<AnyCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         if !phrases.is_empty() && !col_meta.positions {
@@ -996,13 +997,19 @@ impl FtsReader {
         }
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
         for term in terms {
-            let mut cursors = self.build_term_cursors(column_id, &[term], None).await?;
+            let mut cursors = self
+                .build_term_cursors(column_id, &[term], global_idf)
+                .await?;
             out.push(cursors.pop().map(AnyCursor::Term));
         }
         for phrase in phrases {
             let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
+            // A phrase's score is Σ member idf (see `PhraseCursor::new`), so
+            // globalizing the members' idf globalizes the phrase — the
+            // per-member rescale ratio cancels out of the phrase's tf/length
+            // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, None)
+                .build_term_cursors(column_id, &member_refs, global_idf)
                 .await?;
             if cursors.len() != member_refs.len() {
                 // A member is absent — the phrase can never match.
@@ -1291,7 +1298,10 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<Vec<u32>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        // Unranked: idf is irrelevant to the match set, so build local.
+        let built = self
+            .build_atom_cursors(column_id, terms, phrases, None)
+            .await?;
         let atoms: Vec<AnyCursor> = match mode {
             BoolMode::And => {
                 if built.iter().any(Option::is_none) {
@@ -1319,7 +1329,10 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<u64, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        // Unranked: idf is irrelevant to the match set, so build local.
+        let built = self
+            .build_atom_cursors(column_id, terms, phrases, None)
+            .await?;
         let atoms: Vec<AnyCursor> = match mode {
             BoolMode::And => {
                 if built.iter().any(Option::is_none) {
@@ -1490,7 +1503,7 @@ impl FtsReader {
         if lists.has_phrases() {
             // Phrase-bearing query: the heterogeneous atom walks.
             let must_atoms = self
-                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .build_atom_cursors(column_id, lists.musts, lists.must_phrases, lists.global_idf)
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile.
@@ -1498,13 +1511,20 @@ impl FtsReader {
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
             let should_atoms: Vec<AnyCursor> = self
-                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .build_atom_cursors(
+                    column_id,
+                    lists.shoulds,
+                    lists.should_phrases,
+                    lists.global_idf,
+                )
                 .await?
                 .into_iter()
                 .flatten()
                 .collect();
+            // Negatives are a hard exclusion filter, not scored, so their
+            // idf is irrelevant — always build them local.
             let negative_atoms: Vec<AnyCursor> = self
-                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases)
+                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases, None)
                 .await?
                 .into_iter()
                 .flatten()

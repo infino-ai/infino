@@ -365,17 +365,26 @@ impl SupertableReader {
         // Under global stats, gather corpus-wide idf per scored term once
         // (global N from the manifest + df summed across the superfiles
         // that contain the term), then score every superfile against it
-        // instead of its own per-superfile idf. Only the scored bare
-        // terms (musts + shoulds) are globalized here; a phrase-bearing
-        // query keeps local idf for its phrase components, which a
-        // follow-up will extend.
+        // instead of its own per-superfile idf. The scored set is every
+        // term that contributes to a score: the bare musts + shoulds, plus
+        // each member of a scored (must/should) phrase — a phrase's score
+        // is Σ member idf. Negated terms/phrases are pure exclusions, so
+        // their idf never matters and they stay out of the gather.
         let global_idf: Option<Arc<GlobalTermIdf>> = match stats {
             Bm25Stats::PerSuperfile => None,
             Bm25Stats::Global => {
                 let mut scored: Vec<String> = Vec::new();
-                for t in musts.iter().chain(shoulds.iter()) {
+                let mut add = |t: &String| {
                     if !scored.contains(t) {
                         scored.push(t.clone());
+                    }
+                };
+                for t in musts.iter().chain(shoulds.iter()) {
+                    add(t);
+                }
+                for phrase in must_phrases.iter().chain(should_phrases.iter()) {
+                    for member in phrase {
+                        add(member);
                     }
                 }
                 match scored.is_empty() {
@@ -1783,6 +1792,118 @@ mod tests {
                     local_diverges,
                     "per-superfile stats unexpectedly matched single-superfile for {q:?}; \
                      the oracle would not be exercising Global"
+                );
+            }
+        }
+    }
+
+    /// Like [`options_one_superfile_per_commit`] but with the `title`
+    /// column positions-indexed, so phrase queries are answerable.
+    fn options_positions_one_superfile_per_commit() -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: true,
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// A.1 oracle: `Bm25Stats::Global` must rank phrase-bearing queries
+    /// on a fragmented table identically to a single superfile too — a
+    /// phrase's score is Σ member idf, so globalizing the members
+    /// globalizes the phrase.
+    #[test]
+    fn global_stats_phrase_query_matches_single_superfile() {
+        // 24 uniform-length (4-token) docs: `<topic> quick <w2> dNN`.
+        // "quick" is in every doc; "brown" only in the even docs (so
+        // "brown" and the phrase "quick brown" have a df that varies by
+        // superfile once fragmented). `dNN` keeps titles unique.
+        let titles: Vec<String> = (0..24)
+            .map(|i| {
+                let topic = ["alpha", "beta", "gamma"][i % 3];
+                let w2 = if i % 2 == 0 { "brown" } else { "red" };
+                format!("{topic} quick {w2} d{i:02}")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+
+        let single =
+            Supertable::create(options_positions_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = single.writer().expect("writer");
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(
+            single.reader().manifest().get_all_superfiles().len(),
+            1,
+            "single table must be one superfile"
+        );
+
+        let multi =
+            Supertable::create(options_positions_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = multi.writer().expect("writer");
+            for chunk in refs.chunks(6) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        assert!(
+            multi.reader().manifest().get_all_superfiles().len() > 1,
+            "multi table must be fragmented across superfiles"
+        );
+
+        let score_map = |hits: Vec<(String, f32)>| -> std::collections::HashMap<String, f32> {
+            hits.into_iter().collect()
+        };
+
+        // A bare-should term + a phrase (exercises both gather paths:
+        // the bare term and the phrase members), and a pure phrase.
+        for q in ["alpha \"quick brown\"", "\"quick brown\""] {
+            let single_ref = score_map(all_scored(&single, q, Bm25Stats::PerSuperfile));
+            let multi_global = score_map(all_scored(&multi, q, Bm25Stats::Global));
+            let multi_local = score_map(all_scored(&multi, q, Bm25Stats::PerSuperfile));
+
+            assert!(!single_ref.is_empty(), "query {q:?} matched nothing");
+            assert_eq!(
+                single_ref.len(),
+                multi_global.len(),
+                "hit count mismatch for {q:?}"
+            );
+            for (title, s_score) in &single_ref {
+                let g_score = multi_global
+                    .get(title)
+                    .unwrap_or_else(|| panic!("global result missing {title:?} for {q:?}"));
+                assert!(
+                    (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
+                    "global score {g_score} != single score {s_score} for {title:?} / {q:?}"
+                );
+            }
+
+            // The phrase query must actually be sensitive to global stats,
+            // else it isn't exercising the phrase idf globalization.
+            if q == "\"quick brown\"" {
+                let local_diverges = single_ref.len() != multi_local.len()
+                    || single_ref.iter().any(|(title, s)| {
+                        multi_local
+                            .get(title)
+                            .is_none_or(|l| (s - l).abs() > 1e-4 * s.abs().max(1.0))
+                    });
+                assert!(
+                    local_diverges,
+                    "per-superfile phrase stats unexpectedly matched single-superfile for {q:?}"
                 );
             }
         }
