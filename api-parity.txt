@@ -6,6 +6,7 @@
 # <method>\tcovered\t<engine signature>
 # <method>\texempt\t<reason>
 
+Connection::create_database	covered	(&self) -> Result<(), InfinoError>
 Connection::create_table	covered	(&self, &str, SchemaRef, IndexSpec) -> Result<Supertable, InfinoError>
 Connection::drop_table	covered	(&self, &str, bool) -> Result<(), InfinoError>
 Connection::list_tables	covered	(&self) -> Result<Vec<String>, InfinoError>

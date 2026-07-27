@@ -243,6 +243,14 @@ struct Connection {
 
 #[pymethods]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (raises if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    fn create_database(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.create_database()).map_err(py_err)
+    }
+
     /// Create a table from a pyarrow `Schema` and an `IndexSpec`.
     fn create_table(
         &self,

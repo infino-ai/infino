@@ -270,6 +270,35 @@ impl Connection {
         Arc::clone(&self.inner.usage_meter)
     }
 
+    /// Provision the database this connection targets.
+    ///
+    /// A connection is bound to a single database — the path segment of a
+    /// hosted URL (`https://host/<database>`), or the catalog root for a local
+    /// backend. This registers that database so tables can be created in it,
+    /// without a separate provisioning step outside the code.
+    ///
+    /// For a hosted connection it registers the database on the service and
+    /// fails with [`InfinoError::AlreadyExists`] if it is already registered.
+    /// For a local backend (`file://`, `s3://`, `memory://`, …) the catalog
+    /// root *is* the database and comes into being with the first table, so
+    /// this is a no-op success — kept on the surface so the same setup code
+    /// runs against either target.
+    ///
+    /// ```
+    /// # let db = infino::connect("memory://")?;
+    /// db.create_database()?; // no-op for a local backend
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_database(&self) -> Result<(), InfinoError> {
+        match &self.inner.store {
+            // A local catalog root is created lazily by the first table; there
+            // is no separate database to register.
+            CatalogStore::Memory(_) | CatalogStore::Storage { .. } => Ok(()),
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.create_database(),
+        }
+    }
+
     /// Create a new table named `name` with the given Arrow `schema` and
     /// search `indexes`. Fails with [`InfinoError::AlreadyExists`] if a
     /// table of that name already exists. Returns the open handle.
@@ -996,6 +1025,28 @@ mod tests {
     /// Total rows across the materialized search batches.
     fn n_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// `create_database` is a no-op success on a local backend (the catalog
+    /// root is the database), so the same "provision then create a table" setup
+    /// code that a hosted target needs runs unchanged against a durable local
+    /// one — it doesn't error, and a table created afterward is queryable.
+    #[test]
+    fn local_create_database_is_a_noop_then_table_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        conn.create_database()
+            .expect("create_database is a no-op success for a local backend");
+        // Idempotent: a second call is still fine.
+        conn.create_database().expect("second create_database");
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table after create_database")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+        assert_eq!(count_rows(&conn, "docs"), 1);
     }
 
     #[test]

@@ -184,6 +184,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for infino::ConnectOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::ConnectOptions
 pub struct infino::Connection
 impl infino::Connection
+pub fn infino::Connection::create_database(&self) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::create_table(&self, &str, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> core::result::Result<infino::Supertable, infino::InfinoError>
 pub fn infino::Connection::drop_table(&self, &str, bool) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>

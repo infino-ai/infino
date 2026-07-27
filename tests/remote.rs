@@ -446,3 +446,40 @@ async fn optimize_is_client_unsupported_without_a_request() {
     .await;
     assert!(matches!(err, OptimizeError::NoStorage), "got {err:?}");
 }
+
+#[tokio::test]
+async fn create_database_posts_name_to_account_scoped_endpoint() {
+    let server = MockServer::start().await;
+    // The endpoint is account-scoped: no `/mydb` path segment, and the target
+    // database travels in the body as `name`.
+    Mock::given(method("POST"))
+        .and(path("/v1/databases"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(body_partial_json(json!({ "name": "mydb" })))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    with_connection(server.uri(), |db| {
+        db.create_database().expect("create_database");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn create_database_conflict_maps_to_already_exists() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/databases"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("database exists"))
+        .mount(&server)
+        .await;
+
+    let err = with_connection(server.uri(), |db| {
+        db.create_database()
+            .expect_err("a duplicate database must error")
+    })
+    .await;
+    assert!(matches!(err, InfinoError::AlreadyExists(_)), "got {err:?}");
+}

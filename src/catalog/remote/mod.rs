@@ -96,6 +96,21 @@ impl RemoteCatalog {
         map_send(op, request.send_bytes(&body))
     }
 
+    /// Register the database this connection targets on the hosted service.
+    /// `POST /v1/databases` with `{name}` — this endpoint is account-scoped
+    /// (the account is identified by the API key), so unlike the per-database
+    /// operations its path carries no database segment. A `201` is success; a
+    /// `409` (already registered) surfaces as [`InfinoError::AlreadyExists`].
+    pub(crate) fn create_database(&self) -> Result<(), InfinoError> {
+        let url = format!("{}/v1/databases", self.base_url);
+        let request = self.agent.post(&url).set("Authorization", &self.bearer());
+        map_send(
+            "create_database",
+            request.send_json(json!({ "name": self.database })),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn create_table(
         self: &Arc<Self>,
         name: &str,

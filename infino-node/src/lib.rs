@@ -418,6 +418,15 @@ pub struct Connection {
 
 #[napi]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (throws if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    #[napi]
+    pub fn create_database(&self) -> Result<()> {
+        self.inner.create_database().map_err(map_err)
+    }
+
     /// Create a table from an Arrow `Schema` (sent as an IPC `Buffer` —
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.
