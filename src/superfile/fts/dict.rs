@@ -36,8 +36,11 @@ use crate::superfile::format::FST_SEPARATOR;
 ///
 /// Callers must ensure `column_name` does not itself contain the
 /// separator byte — see [`validate_column_name`]. `term` may be any
-/// bytes the tokenizer produced; v1's `AsciiLowerTokenizer` produces
-/// only `[a-z0-9]+`, so the separator can never appear in a term.
+/// bytes a tokenizer produced; the separator `0x1F` is a C0 control
+/// byte, which no shipped tokenizer emits inside a token
+/// (`AsciiLowerTokenizer` keeps only `[a-z0-9]+`; `StandardTokenizer`
+/// emits UAX #29 word segments, which never contain a control byte),
+/// so the separator can never appear in a term.
 pub fn make_key(column_name: &str, term: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(column_name.len() + 1 + term.len());
     k.extend_from_slice(column_name.as_bytes());
@@ -248,9 +251,9 @@ mod tests {
 
     #[test]
     fn make_key_preserves_term_bytes() {
-        // The tokenizer drops non-ASCII tokens, but make_key itself is
-        // byte-transparent. Multi-byte UTF-8 in the term comes through
-        // exactly.
+        // AsciiLowerTokenizer drops non-ASCII tokens, but make_key itself
+        // is byte-transparent: multi-byte UTF-8 in a term (e.g. from the
+        // standard tokenizer) comes through exactly.
         let key = make_key("body", "café");
         assert_eq!(&key[0..4], b"body");
         assert_eq!(key[4], FST_SEPARATOR);

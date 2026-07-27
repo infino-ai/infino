@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -132,6 +132,10 @@ libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"
+
+# Tokenization: UAX#29 word segmentation for the Unicode-aware standard
+# analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
+unicode-segmentation = "1"
 
 # Numerics
 rand = "0.10"

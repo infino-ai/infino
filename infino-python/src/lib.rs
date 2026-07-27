@@ -64,6 +64,7 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::AlreadyExists(m)
         | CoreError::Schema(m)
         | CoreError::Cardinality(m)
+        | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
@@ -192,7 +193,8 @@ fn connect(
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    fts: Vec<String>,
+    /// `(column, analyzer)`; `analyzer` `None` means the default.
+    fts: Vec<(String, Option<String>)>,
     /// `(column, dim, n_cent, metric)`.
     vectors: Vec<(String, usize, usize, String)>,
 }
@@ -205,9 +207,13 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    fn fts(&self, column: String) -> Self {
+    /// `analyzer` selects the tokenizer: `"ascii_lower"` (default —
+    /// ASCII split + lowercase, non-ASCII dropped) or `"standard"` (the
+    /// Unicode-aware UAX #29 tokenizer that keeps non-ASCII text).
+    #[pyo3(signature = (column, analyzer = None))]
+    fn fts(&self, column: String, analyzer: Option<String>) -> Self {
         let mut next = self.clone();
-        next.fts.push(column);
+        next.fts.push((column, analyzer));
         next
     }
 
@@ -225,8 +231,11 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for column in &self.fts {
-            spec = spec.fts(column.clone());
+        for (column, analyzer) in &self.fts {
+            spec = match analyzer {
+                Some(a) => spec.fts_with_analyzer(column.clone(), a.clone()),
+                None => spec.fts(column.clone()),
+            };
         }
         for (column, dim, n_cent, metric) in &self.vectors {
             spec = spec.vector(column.clone(), *dim, *n_cent, metric_from_str(metric)?);
@@ -473,7 +482,11 @@ impl Table {
     /// query terms — a pushdown pre-filter, so kNN ranks only among the
     /// matching rows rather than post-filtering the global top-`k`.
     /// `filter_mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    ///
+    /// `rerank_mult` sets how many coarse candidates are re-scored
+    /// exactly (`k * rerank_mult`) — the primary recall/latency lever.
+    /// Omitting it keeps the engine default.
+    #[pyo3(signature = (column, query, k, nprobe=None, rerank_mult=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
@@ -482,6 +495,7 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         filter_column: Option<String>,
         filter_query: Option<String>,
         filter_mode: Option<&str>,
@@ -490,6 +504,9 @@ impl Table {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         // Optional text-predicate filter (pushdown). `filter_column` and
         // `filter_query` must be supplied together; `filter_mode` is only
@@ -589,12 +606,12 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
-    /// `vector_column` / `vector_query` (with optional `nprobe`) drive
-    /// vector kNN. `k` bounds each retriever and the fused result.
-    /// Returns a pyarrow `Table` like `bm25_search`, with `score` the
-    /// fused RRF score (higher is better); `projection` follows the same
-    /// rules.
-    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None))]
+    /// `vector_column` / `vector_query` (with optional `nprobe` and
+    /// `rerank_mult`) drive vector kNN. `k` bounds each retriever and the
+    /// fused result. Returns a pyarrow `Table` like `bm25_search`, with
+    /// `score` the fused RRF score (higher is better); `projection`
+    /// follows the same rules.
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, rerank_mult=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn hybrid_search<'py>(
         &self,
@@ -606,12 +623,16 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mode = parse_mode(mode)?;
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         let batches = py
             .detach(|| {

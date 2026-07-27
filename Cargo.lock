@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2344,6 +2344,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "unicode-segmentation",
  "uuid",
  "wide",
  "wiremock",

@@ -68,9 +68,9 @@ use crate::{
 ///   definitely-absent term prunes the whole superfile).
 ///
 /// `query_terms` are the terms after the same tokenizer used at
-/// index time. Per the v1 tokenizer (`AsciiLowerTokenizer`) that
-/// means already-lowercased ASCII tokens — no whitespace splits
-/// inside individual entries.
+/// index time (the column's analyzer). For an `ascii_lower` column
+/// that means already-lowercased ASCII tokens; there are no
+/// whitespace splits inside individual entries.
 ///
 /// An empty `query_terms` slice short-circuits to all-keep (the
 /// BM25 search itself returns an empty result, but pruning

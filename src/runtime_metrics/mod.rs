@@ -13,9 +13,11 @@
 //! `/proc` parsers or parallel I/O counters.
 
 pub mod cpu;
+pub mod ingest;
 pub mod io;
 pub mod rss;
 
+pub use ingest::classify_batch_bytes;
 pub use io::{
     ClassIo, N_URI_CLASSES, TraceEntry, UriClass, UsageMeter, UsageSnapshot, io_is_background,
     scope_background,

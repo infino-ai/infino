@@ -54,6 +54,12 @@ pub(crate) struct TableEntry {
     pub(crate) schema_ipc: Vec<u8>,
     /// FTS-indexed column names.
     pub(crate) fts: Vec<String>,
+    /// FTS analyzer names, parallel to `fts` (`"ascii_lower"` /
+    /// `"standard"`). Absent in catalogs written before per-column
+    /// analyzers existed; a missing or short entry defaults to
+    /// `ascii_lower` on reopen.
+    #[serde(default)]
+    pub(crate) fts_analyzers: Vec<String>,
     /// Vector-indexed columns.
     pub(crate) vectors: Vec<VectorEntry>,
     /// Creation time, seconds since the Unix epoch.
@@ -167,6 +173,7 @@ mod tests {
             location: "docs".into(),
             schema_ipc: schema_to_ipc(&sample_schema()).expect("ipc"),
             fts: vec!["title".into()],
+            fts_analyzers: vec!["ascii_lower".into()],
             vectors: vec![VectorEntry {
                 column: "emb".into(),
                 dim: 8,

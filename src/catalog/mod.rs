@@ -58,7 +58,7 @@ use crate::{
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::tokenize::{ASCII_LOWER_TOKENIZER, Tokenizer, tokenizer_for_name},
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
@@ -323,7 +323,8 @@ impl Connection {
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
-        let tokenizer = table_tokenizer(&indexes);
+        let tokenizers =
+            table_tokenizers(&indexes).map_err(|e| e.with_context("create_table", Some(name)))?;
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -331,7 +332,7 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizer,
+                    tokenizers,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -377,7 +378,8 @@ impl Connection {
                     location: location.clone(),
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
-                    fts: indexes.fts_columns().to_vec(),
+                    fts: indexes.fts_columns(),
+                    fts_analyzers: indexes.fts_analyzers(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -399,7 +401,7 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizer,
+                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -496,8 +498,15 @@ impl Connection {
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
                 let mut spec = IndexSpec::new();
-                for column in &entry.fts {
-                    spec = spec.fts(column.clone());
+                for (i, column) in entry.fts.iter().enumerate() {
+                    // Catalogs written before per-column analyzers omit
+                    // `fts_analyzers`; those columns default to ascii_lower.
+                    let analyzer = entry
+                        .fts_analyzers
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(ASCII_LOWER_TOKENIZER);
+                    spec = spec.fts_with_analyzer(column.clone(), analyzer);
                 }
                 for v in &entry.vectors {
                     spec = spec.vector(
@@ -509,7 +518,8 @@ impl Connection {
                     );
                 }
                 let (fts_cfg, vec_cfg) = spec.to_configs();
-                let tokenizer = table_tokenizer(&spec);
+                let tokenizers = table_tokenizers(&spec)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
 
                 let table_storage = backend_to_provider(
                     &self.inner.backend.join(&entry.location),
@@ -527,7 +537,7 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizer,
+                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -664,6 +674,17 @@ impl Connection {
             #[cfg(feature = "remote")]
             CatalogStore::Remote(c) => c.drop_table(name, purge),
         }
+    }
+
+    /// On-storage byte footprint for `name` (user + hidden vector index).
+    ///
+    /// Loads lazy manifest parts before summing so cold tables are not
+    /// under-counted. Visible under `metering` for platform billing / Grafana.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
+    pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
+        self.open_table(name)?
+            .storage_bytes()
+            .map_err(|e| InfinoError::from(e).with_context("table_storage_bytes", Some(name)))
     }
 
     /// List the names of every table registered in this catalog,
@@ -819,11 +840,16 @@ fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
-    tokenizer: Option<Arc<dyn Tokenizer>>,
+    tokenizers: Vec<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
-    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    // Seed the default tokenizer with the first column's analyzer (None
+    // when there are no FTS columns), then set the authoritative
+    // per-column tokenizers for per-field analysis.
+    let seed = tokenizers.first().cloned();
+    let mut opts =
+        SupertableOptions::new(schema, fts, vectors, seed)?.with_fts_tokenizers(tokenizers);
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -841,13 +867,18 @@ fn sql_exec_error(e: DataFusionError) -> InfinoError {
     }
 }
 
-/// The v1 default tokenizer, required iff the spec has FTS columns.
-fn table_tokenizer(indexes: &IndexSpec) -> Option<Arc<dyn Tokenizer>> {
-    if indexes.has_fts() {
-        Some(Arc::new(AsciiLowerTokenizer))
-    } else {
-        None
-    }
+/// Resolve each FTS column's analyzer name to a tokenizer instance,
+/// in declaration order (per-field analysis). Empty when there are no
+/// FTS columns. An unknown analyzer name is a configuration error.
+fn table_tokenizers(indexes: &IndexSpec) -> Result<Vec<Arc<dyn Tokenizer>>, InfinoError> {
+    indexes
+        .fts_analyzers()
+        .iter()
+        .map(|name| {
+            tokenizer_for_name(name)
+                .ok_or_else(|| InfinoError::Config(format!("unknown FTS analyzer: {name:?}")))
+        })
+        .collect()
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).
@@ -1074,6 +1105,170 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn standard_analyzer_keeps_non_ascii_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+
+        // Default (ascii_lower) drops non-ASCII, so "café" is unsearchable.
+        let ascii = conn
+            .create_table("ascii", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create ascii table");
+        ascii
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let ascii_hits = ascii
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
+
+        // The standard analyzer keeps non-ASCII, so "café" matches — the
+        // full create → append → search path honors the chosen analyzer
+        // at both index and query time.
+        let std_tbl = conn
+            .create_table(
+                "std",
+                schema_id_title(),
+                IndexSpec::new().fts_with_analyzer("title", "standard"),
+            )
+            .expect("create standard table");
+        std_tbl
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let hits = std_tbl
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "standard analyzer matches the non-ASCII term"
+        );
+
+        // An unknown analyzer is a configuration error at create time.
+        let err = conn
+            .create_table(
+                "bad",
+                schema_id_title(),
+                IndexSpec::new().fts_with_analyzer("title", "nonesuch"),
+            )
+            .expect_err("unknown analyzer must be rejected");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+    }
+
+    /// Two text columns, different analyzers: `title` = standard,
+    /// `body` = ascii_lower. A non-ASCII term in BOTH columns is
+    /// searchable via `title` but not `body`, and an ASCII term is
+    /// searchable via `body` — proving each column is indexed AND
+    /// queried with its own tokenizer (not column 0's for all).
+    fn schema_title_body() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    fn title_body_batch(schema: Arc<Schema>, title: &str, body: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![title])),
+                Arc::new(LargeStringArray::from(vec![body])),
+            ],
+        )
+        .expect("batch shape matches schema")
+    }
+
+    #[test]
+    fn mixed_per_column_analyzers_index_and_query_independently() {
+        let conn = connect("memory://").expect("connect");
+        let schema = schema_title_body();
+        let table = conn
+            .create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new()
+                    .fts_with_analyzer("title", "standard")
+                    .fts_with_analyzer("body", "ascii_lower"),
+            )
+            .expect("create_table");
+        table
+            .append(&title_body_batch(schema, "café latte", "café latte"))
+            .expect("append");
+
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column matches the non-ASCII term"
+        );
+
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
+
+        // The ascii_lower column is genuinely indexed (not empty): an
+        // ASCII term still matches there.
+        let body_latte = table
+            .bm25_search("body", "latte", TOP_K, BoolMode::Or, None)
+            .expect("body search");
+        assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
+    }
+
+    #[test]
+    fn mixed_analyzers_survive_reopen_on_storage() {
+        // Storage-backed: a fresh connection reopens the table by
+        // reconstructing the per-column analyzers from the catalog
+        // (TableEntry.fts_analyzers), so query tokenization still honors
+        // each column's tokenizer after reopen.
+        let dir = std::env::temp_dir().join(format!("infino-mixed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts_with_analyzer("title", "standard")
+                        .fts_with_analyzer("body", "ascii_lower"),
+                )
+                .expect("create_table");
+            table
+                .append(&title_body_batch(
+                    schema.clone(),
+                    "café latte",
+                    "café latte",
+                ))
+                .expect("append");
+        }
+        // Fresh connection → open_table rebuilds the spec from the catalog.
+        let conn2 = connect(&uri).expect("reconnect");
+        let table = conn2.open_table("docs").expect("open_table");
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column still matches non-ASCII after reopen"
+        );
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(
+            body_cafe, 0,
+            "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

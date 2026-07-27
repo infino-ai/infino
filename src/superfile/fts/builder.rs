@@ -1144,7 +1144,14 @@ fn open_partition_sorted<const N: usize>(
 }
 
 pub struct FtsBuilder {
-    tokenizer: Arc<dyn Tokenizer>,
+    /// Tokenizer applied to columns registered via
+    /// [`Self::register_column`] (the default). Per-column overrides go
+    /// through [`Self::register_column_with_tokenizer`].
+    default_tokenizer: Arc<dyn Tokenizer>,
+    /// Tokenizer for each registered column, indexed by column_id — the
+    /// analyzer that column's text is tokenized with at index time.
+    /// Grown in lockstep with `columns`.
+    column_tokenizers: Vec<Arc<dyn Tokenizer>>,
     columns: Vec<ColumnState>,
     /// Per-column posting accumulator. Each entry starts in
     /// `ColumnPostings::InRam` and transitions to `Spilled` exactly
@@ -1248,7 +1255,8 @@ impl FtsBuilder {
 
     fn from_parts(tokenizer: Arc<dyn Tokenizer>, scratch_dir: tempfile::TempDir) -> Self {
         Self {
-            tokenizer,
+            default_tokenizer: tokenizer,
+            column_tokenizers: Vec::new(),
             columns: Vec::new(),
             postings: Vec::new(),
             scratch_dir,
@@ -1326,9 +1334,23 @@ impl FtsBuilder {
         self.max_partition_bytes = bytes;
     }
 
-    /// Register an FTS column up-front. Returns its `column_id` (its
-    /// index in declaration order).
+    /// Register an FTS column up-front, tokenized with the builder's
+    /// default tokenizer. Returns its `column_id` (its index in
+    /// declaration order).
     pub fn register_column(&mut self, name: String, positions: bool) -> Result<u32, BuildError> {
+        let tokenizer = Arc::clone(&self.default_tokenizer);
+        self.register_column_with_tokenizer(name, positions, tokenizer)
+    }
+
+    /// Register an FTS column tokenized with an explicit `tokenizer`,
+    /// overriding the builder default. Returns its `column_id`. Lets
+    /// each column carry its own analyzer (per-field analysis).
+    pub fn register_column_with_tokenizer(
+        &mut self,
+        name: String,
+        positions: bool,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Result<u32, BuildError> {
         if name.as_bytes().contains(&FST_SEPARATOR) {
             return Err(BuildError::ReservedSeparatorInColumnName(name));
         }
@@ -1346,6 +1368,7 @@ impl FtsBuilder {
             positions,
         });
         self.postings.push(ColumnPostings::new());
+        self.column_tokenizers.push(tokenizer);
         Ok(column_id)
     }
 
@@ -1543,7 +1566,7 @@ impl FtsBuilder {
         // Downcast once per call so the tokenize_each_inline fast
         // path is reachable. See the original `add_doc` for the
         // ~150M dyn-dispatch savings this buys on the 1M-doc bench.
-        let tokenizer = &self.tokenizer;
+        let tokenizer = &self.column_tokenizers[col_idx];
         let ascii_tok = tokenizer
             .as_ref()
             .as_any()
@@ -1777,7 +1800,7 @@ impl FtsBuilder {
         local_doc_id: u32,
         text: &str,
     ) -> Result<(), BuildError> {
-        let tokenizer = &self.tokenizer;
+        let tokenizer = &self.column_tokenizers[col_idx];
         let ascii_tok = tokenizer
             .as_ref()
             .as_any()
@@ -2116,7 +2139,8 @@ impl FtsBuilder {
     /// 1M-doc Zipfian bench measures.
     fn finish_to_inram<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
-            tokenizer: _,
+            default_tokenizer: _,
+            column_tokenizers: _,
             columns,
             postings,
             scratch_dir,
@@ -2283,7 +2307,8 @@ impl FtsBuilder {
     /// accumulator stayed under threshold).
     fn finish_to_spilled<W: Write>(self, mut w: W) -> Result<(), BuildError> {
         let FtsBuilder {
-            tokenizer: _,
+            default_tokenizer: _,
+            column_tokenizers: _,
             columns,
             postings,
             scratch_dir,

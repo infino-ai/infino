@@ -91,10 +91,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
-        fts::{
-            reader::ClauseLists,
-            tokenize::{AsciiLowerTokenizer, Tokenizer},
-        },
+        fts::reader::ClauseLists,
     },
     supertable::{
         error::QueryError,
@@ -244,8 +241,8 @@ impl SupertableReader {
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
     /// descending by score.
     ///
-    /// `query` is tokenized by the v1 [`AsciiLowerTokenizer`] —
-    /// the same tokenizer used at index time. Returns
+    /// `query` is tokenized by the same tokenizer the column was
+    /// indexed with (its per-column analyzer). Returns
     /// [`QueryError::Store`] if any superfile is unreachable, or
     /// [`QueryError::Parquet`] if a superfile's bytes can't be
     /// queried (column missing from the superfile's FTS index, etc.).
@@ -282,7 +279,11 @@ impl SupertableReader {
         // ('static) data for tokio::spawn, so this is the one place
         // the tokens are copied — the prune and every per-superfile
         // search reuse them.
-        let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+        let clauses = manifest
+            .options
+            .fts_tokenizer_for(column)
+            .parse(query)
+            .into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
@@ -600,7 +601,12 @@ impl SupertableReader {
         ),
         QueryError,
     > {
-        let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
+        let clauses = self
+            .manifest()
+            .options
+            .fts_tokenizer_for(column)
+            .parse(query)
+            .into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
         let negatives: Vec<String> = clauses.negatives.into_iter().map(Cow::into_owned).collect();
@@ -906,7 +912,11 @@ impl SupertableReader {
         value: &str,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let term_strings: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        let term_strings: Vec<String> = manifest
+            .options
+            .fts_tokenizer_for(column)
+            .tokenize(value)
+            .collect();
         // Tokens prune superfiles via the term bloom (AND); a token-less
         // value (e.g. punctuation only) can't prune, so keep all.
         let leaves = if term_strings.is_empty() {

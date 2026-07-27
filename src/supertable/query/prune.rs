@@ -410,7 +410,8 @@ mod tests {
         // builds; measure the drop each tier makes for that leaf.
         let s = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let expr = col("x").eq(lit(5_i64)).or(col("x").eq(lit(205_i64)));
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None);
+        let leaves =
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &|_| default_tokenizer());
         let (column, values) = match leaves.as_slice() {
             [PruneLeaf::ScalarValueSet { column, values }] => (column.as_str(), values.clone()),
             _ => panic!("expected one ScalarValueSet leaf from the OR"),

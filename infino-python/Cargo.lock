@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2159,6 +2159,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "unicode-segmentation",
  "uuid",
  "wide",
  "xxhash-rust",
@@ -2167,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "infino-python"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arrow",
  "arrow-array",

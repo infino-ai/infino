@@ -46,7 +46,7 @@ class Connection:
 
 class IndexSpec:
     def __init__(self) -> None: ...
-    def fts(self, column: str) -> IndexSpec: ...
+    def fts(self, column: str, analyzer: str | None = None) -> IndexSpec: ...
     # `dim` must be in [16, 4096]; out-of-range raises at `create_table`.
     def vector(self, column: str, dim: int, n_cent: int, metric: Metric) -> IndexSpec: ...
 
@@ -66,6 +66,7 @@ class Table:
         query: Sequence[float],
         k: int,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         filter_column: str | None = ...,
         filter_query: str | None = ...,
         filter_mode: BoolMode | None = ...,
@@ -99,6 +100,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
     def delete(self, predicate: str) -> MutationStats: ...

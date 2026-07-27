@@ -896,8 +896,8 @@ impl SuperfileReader {
 
     /// Single-column BM25 search across the unified FTS reader.
     ///
-    /// `query` is tokenized by the same v1 tokenizer used at build
-    /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
+    /// `query` is tokenized by the same tokenizer the column was built
+    /// with (its per-column analyzer). Returns `(local_doc_id, score)`
     /// hits ordered by descending score — this is the hit kernel, not a
     /// row-returning search; row materialization is `take_by_local_doc_ids`.
     ///
@@ -919,7 +919,15 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let tok = AsciiLowerTokenizer;
+        // Tokenize with the target column's configured tokenizer so
+        // query terms match how the column was indexed (ascii_lower /
+        // standard). Falls back to ascii_lower when there is no FTS
+        // index or column; the search then fails downstream as before.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
 
         // Split the query into clause lists and resolve the bare
         // tokens' polarity from the default operator. The parsed
@@ -964,10 +972,10 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must be already lower-cased ASCII alphanumeric tokens
-    /// — the FST keys are stored in that form. Callers using the
-    /// v1 tokenizer can produce them via
-    /// `AsciiLowerTokenizer.tokenize(query)`.
+    /// Terms must already be tokenized to the column's FST key form —
+    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
+    /// column (already-lowercased ASCII alphanumerics) or
+    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
@@ -1092,8 +1100,14 @@ impl SuperfileReader {
     /// only affects pruning, never the raw-string comparison.
     pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
-        // string's tokens (a superset of the exact matches).
-        let tokens: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        // string's tokens (a superset of the exact matches). Tokenize
+        // with the column's configured tokenizer to match the index.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        let tokens: Vec<String> = tok.tokenize(value).collect();
         let candidates: Vec<u32> = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
             (0..self.n_docs() as u32).collect()
