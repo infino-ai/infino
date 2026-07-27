@@ -96,7 +96,12 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 /// residuals for unbounded metrics. Codec choice is engine configuration
 /// (`vector.rerank_codec` in YAML), not a bench env knob.
 pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
-    let codec = if metric == Metric::Cosine {
+    // Diagnostic (env-gated): force an EXACT fp32 rerank column to isolate Sq8
+    // codec loss from routing/coverage. INFINO_BENCH_RERANK_CODEC=fp32 → if the
+    // recall ceiling jumps to ~1.0, the residual gap was the Sq8 quantization.
+    let codec = if std::env::var("INFINO_BENCH_RERANK_CODEC").as_deref() == Ok("fp32") {
+        RerankCodec::Fp32
+    } else if metric == Metric::Cosine {
         RerankCodec::default()
     } else {
         RerankCodec::Sq8Residual

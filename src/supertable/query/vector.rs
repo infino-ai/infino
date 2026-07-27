@@ -1317,17 +1317,23 @@ impl SupertableReader {
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if filtered && options.nprobe.is_some() {
-                    // Explicit caller `nprobe` on a FILTERED query pins the
-                    // hidden cell sweep — the width dial calibration and
-                    // the bench sweep turn (depth stays at the filtered
-                    // default so the sweep isolates width). Unfiltered
-                    // hidden routing keeps ignoring caller nprobe
-                    // (persisted params own it).
+                if options.nprobe.is_some() {
+                    // Explicit caller `nprobe` wins for hidden queries — filtered
+                    // AND unfiltered — so the bench's coverage-vs-depth breadth
+                    // sweep can actually widen the cell probe. Production never
+                    // sets `nprobe` (default `None` → the `else` arms below keep
+                    // the persisted p=1 routing), so this changes nothing in the
+                    // serving path. Filtered queries additionally lift per-cell
+                    // fine depth to the filtered floor; unfiltered keeps the
+                    // persisted fine depth.
                     CellRoutingParams {
                         nprobe_min: nprobe.max(1),
                         nprobe_max: nprobe.max(1),
-                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        fine_nprobe: if filtered {
+                            base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE)
+                        } else {
+                            base.fine_nprobe
+                        },
                         ..base
                     }
                 } else if filtered {

@@ -45,7 +45,7 @@ const MIN_COMMIT_CHUNKS: usize = 16;
 /// Capping docs-per-commit at that measured-safe size keeps ingest
 /// RSS flat at any scale: larger runs commit more chunks, not bigger
 /// ones.
-const MAX_DOCS_PER_COMMIT: usize = 3_125_000;
+pub(crate) const MAX_DOCS_PER_COMMIT: usize = 3_125_000;
 
 /// Ingest commit count for this run's scale: the fixed 16-commit
 /// shape up to 50M docs, growing past it so no commit exceeds
@@ -201,7 +201,7 @@ impl Modality {
     }
 }
 
-fn schema_for(modality: Modality) -> Arc<Schema> {
+pub(crate) fn schema_for(modality: Modality) -> Arc<Schema> {
     let mut fields = Vec::with_capacity(3);
     if modality.has_text() {
         fields.push(Field::new(TEXT_COLUMN, DataType::LargeUtf8, false));
@@ -796,7 +796,7 @@ fn chunk_batch(
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
 }
 
-fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
+pub(crate) fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
     Arc::new(
         FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),

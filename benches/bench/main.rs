@@ -70,6 +70,7 @@ enum Diagnostic {
     FtsDiag,
     ObjectStore,
     Concurrent,
+    RecallWhileIngest,
 }
 
 impl Diagnostic {
@@ -82,6 +83,7 @@ impl Diagnostic {
             Diagnostic::FtsDiag => "fts-diag",
             Diagnostic::ObjectStore => "object-store",
             Diagnostic::Concurrent => "concurrent",
+            Diagnostic::RecallWhileIngest => "recall_while_ingest",
         }
     }
 
@@ -94,6 +96,7 @@ impl Diagnostic {
             Diagnostic::FtsDiag => infino_bench_utils::fts_diag::run(),
             Diagnostic::ObjectStore => infino_bench_utils::unified_object_store::run(),
             Diagnostic::Concurrent => infino_bench_utils::concurrent::run(),
+            Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
         }
     }
 }
@@ -300,8 +303,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          Phase     : build | warm | cold | search  (search = warm+cold; omitted => all)\n\
          all       : every tier x modality x phase (the default for a bare\n\
          \x20           `cargo bench`); matrix only — never implies diagnostics\n\
-         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent,\n\
-         \x20           or `diagnostic` for all six / `diagnostic <names>` for a subset\n\
+         Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | recall_while_ingest,\n\
+         \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
          Examples:\n\
          \x20 cargo bench\n\
@@ -388,6 +391,7 @@ fn parse_args() -> Selection {
             "fts-diag" | "fts_diag" => diagnostics.push(Diagnostic::FtsDiag),
             "object-store" | "object_store" => diagnostics.push(Diagnostic::ObjectStore),
             "concurrent" => diagnostics.push(Diagnostic::Concurrent),
+            "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
             other => unknown.push(other.to_string()),
         }

@@ -34,6 +34,37 @@ use crate::corpus::{self, MmapTextCorpus};
 /// diagnostic's superfile count mirrors production shapes.
 pub const WRITE_CHUNK: usize = 65_536;
 
+// ─── Shared env-knob parsers ────────────────────────────────────────────────
+// One definition for every diagnostic's numeric/boolean knobs (concurrent,
+// recall_while_ingest, …), so their parse semantics can't drift apart.
+
+/// Parse a `usize` from env `key` (whitespace-trimmed); falls back to
+/// `default` when unset or unparseable.
+pub(crate) fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parse a `u64` from env `key` (whitespace-trimmed); falls back to `default`
+/// when unset or unparseable.
+pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Boolean env knob defaulting to `true`: unset (or a truthy value) → true;
+/// `0` / `false` / `no` (case-insensitive) → false.
+pub(crate) fn env_bool_default_true(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => true,
+    }
+}
+
 /// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
 pub const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
 
