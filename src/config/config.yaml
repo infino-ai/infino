@@ -160,15 +160,19 @@ vector:
   # Max docs in a global cell before it is split (hard ceiling; also the primary
   # trigger when cell_split_modality_d = 0, i.e. by default).
   #
-  # 500K, deliberately large. A brief experiment lowered this to 40K (≈ the ~39K
-  # size 256 cells give at 10M / ~0.98) on the theory that cells must be kept
-  # small — that was wrong. Measurement: native no-split cells at 100M/256 =
-  # ~390K docs/cell HOLD ~0.98 recall, so the split is NOT needed to keep recall
-  # at these sizes; and forcing a split down to 40K instead over-fragments the
-  # grid under streaming (cell count runs away → boundary loss → recall craters).
-  # So the large cap makes the default path native-ish: it splits only genuinely
-  # huge cells (100M/256 = 390K < 500K → no split; ~1B/256 = 3.9M → splits). Lower
-  # it only if a measured within-cell ceiling shows up at some large docs/cell.
+  # 500K, deliberately large. A brief experiment lowered this to 40K (≈ the size
+  # 256 cells reach at 10M) on the theory that cells must be kept small — that was
+  # wrong. On a synthetic multi-modal stress corpus at nprobe=1, native no-split
+  # cells at 100M/256 (~390K docs/cell) hold ~0.98 recall@10 — stable, not
+  # decaying — so the split is NOT needed to keep recall from cratering at these
+  # sizes; forcing a split down to 40K instead over-fragments the grid under
+  # streaming (cell count runs away → boundary loss → recall craters). The large
+  # cap therefore makes the default path native-ish: it splits only genuinely
+  # huge cells (100M/256 = 390K < 500K → no split; ~1B/256 = 3.9M → splits).
+  # ~0.98 here is the nprobe=1 floor on this stress corpus, not a target — to lift
+  # it, raise fine_nprobe_pct (within-cell depth) or enable cell_split_modality_d
+  # (finer grid, ~0.99 measured). Lower this cap only if a measured within-cell
+  # ceiling shows up at some large docs/cell.
   cell_split_doc_cap: 500000
 
   # Ashman-D threshold for a modality-driven split. Spread measured on the axis
@@ -180,12 +184,14 @@ vector:
   # with K > MODALITY_MODES_PER_CELL (=4) splits into ceil(K/4) children, and the
   # executor self-tunes k up for route fidelity.
   #
-  # 0.0 (OFF) is the default — DELIBERATELY, pending validation. The value that
-  # worked in experiments is 8.0 (with R=4 + self_tune): 0.99+ recall at 1M/300k
-  # single- and multi-batch. It is OFF because (a) native no-split holds ~0.98 to
-  # 100M (see cell_split_doc_cap) so modality isn't needed for the common case,
-  # and (b) R=4+self_tune's behavior at 10M+ is still under validation (a coarse
-  # bootstrap over-fragmented). Enable (8.0) only once the scale run confirms it.
+  # 0.0 (OFF) is the default — DELIBERATELY, pending wider-scale validation. With
+  # R=4 + self_tune, 8.0 measured 0.99+ recall@10 at 1M and 0.991 at 10M (splits
+  # engaged, grid grown to ~3548 cells) vs ~0.983 for the fixed 256-cell grid —
+  # i.e. modality is the lever that lifts nprobe=1 recall above the fixed-grid
+  # ~0.98 floor. It is OFF because (a) the fixed grid already holds ~0.98 stably
+  # to 100M (see cell_split_doc_cap) so modality isn't needed for the common case,
+  # and (b) at 100M the recall/cost trade (a finer grid costs ~14x the cells) is
+  # still being validated. Enable (8.0) once that trade is confirmed.
   cell_split_modality_d: 0.0
 
   # How user-superfile clusters align to the global cell grid:

@@ -496,8 +496,19 @@ fn score_fine_candidates(
     metric: Metric,
     admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
 ) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
     let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
+    // A cell superseded by an in-place split carries dead on-disk blocks. Skip
+    // it in both the admit shortlist and the scoring/defer loop below, so its
+    // blocks are never fine-scored, gated, or fetched — the same guard
+    // `postings_by_cell_from_summaries` applies to routing. The split's
+    // successor cells hold the live rows.
+    let is_superseded = |entry: &Arc<SuperfileEntry>, cell_id: u32| {
+        superseded
+            .get(&entry.superfile_id)
+            .is_some_and(|s| s.contains(&cell_id))
+    };
 
     let shortlist: Option<HashSet<u32>> = if let Some((admit_q, must_include)) = admit {
         let mut cell_best: HashMap<u32, f32> = HashMap::new();
@@ -507,6 +518,9 @@ fn score_fine_candidates(
                 let Some(cell_id) = cell.cell_id else {
                     continue;
                 };
+                if is_superseded(entry, cell_id) {
+                    continue;
+                }
                 let Some(est) = cell.clusters.estimate_min_admit_score(metric, admit_q) else {
                     continue;
                 };
@@ -548,9 +562,10 @@ fn score_fine_candidates(
         for cell in &vs.cells {
             // Flat cluster ids must stay identical whether or not a cell is
             // skipped, so flat_base always advances.
-            let skipped = shortlist
-                .as_ref()
-                .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
+            let skipped = cell.cell_id.is_some_and(|cid| is_superseded(entry, cid))
+                || shortlist
+                    .as_ref()
+                    .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
             if !skipped {
                 if cell.clusters.vectors_resident() {
                     cell.clusters
@@ -1429,6 +1444,7 @@ impl SupertableReader {
                 metric,
                 Some((&admit_q, must_include.as_slice())),
                 allow_ref,
+                superseded,
             )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
@@ -1531,8 +1547,15 @@ impl SupertableReader {
             // (legacy flat path, no prefilter). Stripped summaries defer to
             // the exact rescore — untagged legacy tables have no per-cell
             // gating to absorb estimate noise.
-            let (mut candidates, deferred) =
-                score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
+            let (mut candidates, deferred) = score_fine_candidates(
+                &superfiles,
+                column,
+                query,
+                metric,
+                None,
+                allow_ref,
+                superseded,
+            )?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
                     &superfiles,
@@ -2844,7 +2867,8 @@ mod tests {
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
         admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
         hidden_hits_user_ids, is_hidden_vector_manifest, postings_by_cell_from_summaries,
-        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
+        projection_is_id_score_only, score_fine_candidates, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -3728,6 +3752,75 @@ mod tests {
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
         assert_eq!(postings.get(&3), Some(&30));
+    }
+
+    /// `score_fine_candidates` must skip a superseded cell exactly as the
+    /// posting map does: a cell whose blocks were replaced by an in-place split
+    /// is never fine-scored or deferred (hence never fetched), so the dead
+    /// parent blocks cost nothing on queries that hit the split cell. Without
+    /// the guard the parent's blocks are re-scored and re-fetched every query
+    /// until a merge reclaims them (correct only via downstream stable-id dedup,
+    /// but wasteful).
+    #[test]
+    fn score_fine_candidates_skips_superseded_cells() {
+        use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
+
+        const DIM: u32 = 4;
+        let column = "emb";
+        let cell = |cell_id: u32, count: u32| CellVectorSummary {
+            cell_id: Some(cell_id),
+            clusters: ClusterCentroids::from_fp32(
+                1,
+                DIM,
+                &vec![cell_id as f32; DIM as usize],
+                vec![count],
+            ),
+        };
+        let sf_id = Uuid::from_u128(0xC0FFEE);
+        let mut entry = synthetic_entry(sf_id);
+        entry.vector_summary.insert(
+            column.into(),
+            VectorSummary {
+                centroid: vec![0.0; DIM as usize],
+                cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
+            },
+        );
+        let entries = vec![Arc::new(entry)];
+        let query = vec![0.0f32; DIM as usize];
+
+        // Every cell `score_fine_candidates` touches — scored (candidate
+        // `cell_id`) or deferred (`DeferredCellRescore.cell_id`).
+        let touched = |superseded: &BTreeMap<Uuid, BTreeSet<u32>>| -> HashSet<u32> {
+            let (cands, deferred) = score_fine_candidates(
+                &entries,
+                column,
+                &query,
+                Metric::L2Sq,
+                None,
+                None,
+                superseded,
+            )
+            .expect("score");
+            cands
+                .iter()
+                .filter_map(|(_, _, _, cid, _)| *cid)
+                .chain(deferred.iter().filter_map(|d| d.cell_id))
+                .collect()
+        };
+
+        // No supersession: all three cells are touched.
+        let empty = BTreeMap::new();
+        assert_eq!(touched(&empty), HashSet::from([1, 2, 3]));
+
+        // Cell 2 superseded for this superfile: never scored or deferred, so its
+        // blocks are never fetched.
+        let mut superseded = BTreeMap::new();
+        superseded.insert(sf_id, BTreeSet::from([2u32]));
+        assert_eq!(
+            touched(&superseded),
+            HashSet::from([1, 3]),
+            "superseded cell is not fine-scored or fetched"
+        );
     }
 
     #[test]
