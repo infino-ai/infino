@@ -379,11 +379,9 @@ impl ExecutionPlan for VectorSearchExec {
                 .iter()
                 .map(|c| c.column.as_str())
                 .collect();
-            let plan = CandidatePlan::from_filters(
-                &filters,
-                &fts_cols,
-                manifest.options.tokenizer.as_ref(),
-            );
+            let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
+                manifest.options.fts_tokenizer_for(col)
+            });
             let hits = match plan {
                 CandidatePlan::Unbounded => {
                     reader
