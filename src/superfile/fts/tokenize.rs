@@ -26,6 +26,14 @@
 //!   - Lowercase each token via full Unicode case folding.
 //!   - Non-ASCII letters and digits are preserved (not dropped), so
 //!     accented and non-Latin scripts remain searchable.
+//!   - **No Unicode normalization** (NFC/NFD): a token is emitted in its
+//!     input code-point encoding. This matches the `standard` analyzer in
+//!     Lucene / Elasticsearch, which applies normalization only through a
+//!     separate, opt-in ICU filter — never in the standard pipeline.
+//!     Canonicalizing equivalent encodings (e.g. precomposed `é` vs. the
+//!     base `e` + combining acute) is therefore a distinct analyzer's job:
+//!     a normalizing analyzer plugs in through the [`Tokenizer`] trait
+//!     rather than altering `standard`'s semantics.
 
 use std::{
     any::Any,
