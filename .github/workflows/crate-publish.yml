@@ -50,6 +50,8 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    # Never run in a fork: only this repo publishes to the registry.
+    if: github.repository == 'infino-ai/infino'
     timeout-minutes: 60
     # CARGO_REGISTRY_TOKEN is read from a repository secret. To gate real
     # publishes behind required reviewers, move that secret into a GitHub

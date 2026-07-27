@@ -54,7 +54,8 @@ jobs:
     # minor/major (patch == 0, tag ends in `.0`). A crate-only patch tag skips
     # the bindings (build + publish need this job, so they skip too). A manual
     # run always proceeds (independent Python patch).
-    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
+    # Never run in a fork: only this repo publishes to the registry.
+    if: ${{ github.repository == 'infino-ai/infino' && (github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0')) }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
