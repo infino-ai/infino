@@ -50,7 +50,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::Mutex as TokioMutex;
 
 use super::{
-    error::BuildError,
+    error::{BuildError, QueryError},
     reader_cache::{
         ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
         SuperfileReaderCache,
@@ -781,14 +781,61 @@ impl SupertableOptions {
 
     /// Tokenizer configured for `column`, for tokenizing query text so
     /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column (the query
-    /// then fails downstream on the unknown column).
+    /// default when `column` is not a registered FTS column (callers
+    /// reject that case up front via [`Self::require_fts_column`]).
     pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
         self.fts_columns
             .iter()
             .position(|c| c.column == column)
             .and_then(|i| self.fts_tokenizers.get(i).cloned())
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
+    }
+
+    /// Reject `column` unless it carries a full-text index. The search
+    /// paths call this before any fan-out, so an absent and an unindexed
+    /// column are told apart regardless of what the superfiles hold.
+    pub(crate) fn require_fts_column(&self, column: &str) -> Result<(), QueryError> {
+        if self.fts_columns.iter().any(|c| c.column == column) {
+            return Ok(());
+        }
+        Err(self.no_index(
+            column,
+            "full-text",
+            self.fts_columns.iter().map(|c| c.column.as_str()),
+        ))
+    }
+
+    /// Resolve `column`'s vector index — see [`Self::require_fts_column`].
+    pub(crate) fn require_vector_column(&self, column: &str) -> Result<&VectorConfig, QueryError> {
+        self.vector_columns
+            .iter()
+            .find(|c| c.column == column)
+            .ok_or_else(|| {
+                self.no_index(
+                    column,
+                    "vector",
+                    self.vector_columns.iter().map(|c| c.column.as_str()),
+                )
+            })
+    }
+
+    /// The error for a column carrying no `kind` index, distinguishing a
+    /// name absent from the schema from one that is merely unindexed.
+    fn no_index<'a>(
+        &self,
+        column: &str,
+        kind: &str,
+        declared: impl Iterator<Item = &'a str>,
+    ) -> QueryError {
+        if !self.schema.fields().iter().any(|f| f.name() == column) {
+            return QueryError::InvalidQuery(format!("no column `{column}` in this table"));
+        }
+        let declared: Vec<&str> = declared.collect();
+        QueryError::InvalidQuery(format!(
+            "column `{column}` has no {kind} index (indexed: [{}]); \
+             search indexes are declared when the table is created and cannot be added later",
+            declared.join(", ")
+        ))
     }
 
     /// Attach a disk cache for storage-backed reads.
@@ -2022,5 +2069,92 @@ supertable:
             .apply_config(&cfg)
             .expect_err("missing container");
         assert!(matches!(err, BuildError::Store(_)), "{err:?}");
+    }
+
+    fn message(err: QueryError) -> String {
+        match err {
+            QueryError::InvalidQuery(m) => m,
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_column_resolves_an_indexed_column() {
+        let opts = SupertableOptions::new(
+            schema_with_vector(16),
+            vec![fc("title")],
+            vec![vc("emb", 16)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        opts.require_fts_column("title").expect("title is indexed");
+        let config = opts.require_vector_column("emb").expect("emb is indexed");
+        assert_eq!(config.dim, 16, "resolves the column's own config");
+    }
+
+    #[test]
+    fn require_column_reports_the_indexed_columns_for_an_unindexed_one() {
+        let opts = SupertableOptions::new(
+            schema_with_vector(16),
+            vec![fc("title")],
+            vec![vc("emb", 16)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        assert_eq!(
+            message(
+                opts.require_fts_column("emb")
+                    .expect_err("emb has no FTS index")
+            ),
+            "column `emb` has no full-text index (indexed: [title]); search indexes are declared \
+             when the table is created and cannot be added later"
+        );
+        assert_eq!(
+            message(
+                opts.require_vector_column("title")
+                    .expect_err("title has no vector index")
+            ),
+            "column `title` has no vector index (indexed: [emb]); search indexes are declared \
+             when the table is created and cannot be added later"
+        );
+    }
+
+    /// A table with no indexes names an empty indexed set rather than
+    /// claiming the column is absent — it isn't, it just has nothing to
+    /// search.
+    #[test]
+    fn require_column_reports_an_empty_indexed_set() {
+        let opts = SupertableOptions::new(schema_with_vector(16), vec![], vec![], None)
+            .expect("valid options");
+        assert!(
+            message(opts.require_fts_column("title").expect_err("no FTS index"))
+                .contains("has no full-text index (indexed: [])")
+        );
+        assert!(
+            message(
+                opts.require_vector_column("emb")
+                    .expect_err("no vector index")
+            )
+            .contains("has no vector index (indexed: [])")
+        );
+    }
+
+    #[test]
+    fn require_column_distinguishes_an_absent_column() {
+        let opts = SupertableOptions::new(
+            schema_with_vector(16),
+            vec![fc("title")],
+            vec![vc("emb", 16)],
+            Some(tok()),
+        )
+        .expect("valid options");
+        for err in [
+            opts.require_fts_column("ghost")
+                .expect_err("no such column"),
+            opts.require_vector_column("ghost")
+                .expect_err("no such column"),
+        ] {
+            assert_eq!(message(err), "no column `ghost` in this table");
+        }
     }
 }

@@ -169,6 +169,17 @@ fn assert_all_error(st: &Supertable, label: &str, queries: &[String]) {
     }
 }
 
+/// Assert `query` is rejected with a message containing `expected`. For a
+/// column-naming mistake the message *is* the contract — it's the only
+/// thing telling the caller which of the two mistakes they made.
+fn assert_error_contains(st: &Supertable, query: &str, expected: &str) {
+    let err = st.reader().query_sql(query).expect_err(query).to_string();
+    assert!(
+        err.contains(expected),
+        "expected {expected:?} in the error for {query}, got: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // bm25_search — arity + type validators in fts_exec.rs::Bm25SearchFunc.
 // ---------------------------------------------------------------------
@@ -476,6 +487,104 @@ fn empty_result_queries_return_no_rows() {
     ] {
         let b = st.reader().query_sql(&q).expect("empty-result query");
         assert_eq!(row_count(&b), 0, "expected no matches: {q}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Column naming — an absent column vs an unindexed one.
+// ---------------------------------------------------------------------
+
+/// Expected rejection for a schema column with no FTS index, over the
+/// `[title (FTS), rating, emb (vector)]` fixture.
+const NO_FTS: &str = "has no full-text index (indexed: [title])";
+/// The vector-side counterpart of [`NO_FTS`].
+const NO_VECTOR: &str = "has no vector index (indexed: [emb])";
+
+/// Every search TVF, driven against a schema column that carries no index
+/// of the kind it searches. The message must name the kind and list the
+/// columns that do carry it: the schema reports the column as present, so
+/// "unknown column" would send the caller hunting a typo that isn't there.
+#[test]
+fn unindexed_column_errors_name_the_indexed_columns() {
+    let st = demo_table();
+    let qv = csv_one_hot(0);
+    for (query, expected) in [
+        (
+            format!("SELECT _id FROM bm25_search('rating', 'rust', {SURFACE_TOP_K})"),
+            NO_FTS,
+        ),
+        (
+            format!("SELECT _id FROM bm25_search_prefix('emb', 'rus', {SURFACE_TOP_K})"),
+            NO_FTS,
+        ),
+        (
+            "SELECT _id FROM token_match('rating', 'rust')".into(),
+            NO_FTS,
+        ),
+        (
+            "SELECT _id FROM exact_match('rating', 'rust async')".into(),
+            NO_FTS,
+        ),
+        (
+            format!("SELECT _id FROM vector_search('title', '{qv}', {SURFACE_TOP_K})"),
+            NO_VECTOR,
+        ),
+        // Hybrid fuses both retrievers: a bad column on either side is an
+        // error, never a side that silently contributes nothing.
+        (
+            format!(
+                "SELECT _id FROM hybrid_search('rating', 'rust', 'emb', '{qv}', {SURFACE_TOP_K})"
+            ),
+            NO_FTS,
+        ),
+        (
+            format!(
+                "SELECT _id FROM hybrid_search('title', 'rust', 'title', '{qv}', {SURFACE_TOP_K})"
+            ),
+            NO_VECTOR,
+        ),
+    ] {
+        assert_error_contains(&st, &query, expected);
+    }
+}
+
+/// A name absent from the schema reports exactly that, not the unindexed
+/// message — the two mistakes have different fixes.
+#[test]
+fn absent_column_errors_say_no_such_column() {
+    let st = demo_table();
+    let qv = csv_one_hot(0);
+    for query in [
+        format!("SELECT _id FROM bm25_search('ghost', 'rust', {SURFACE_TOP_K})"),
+        format!("SELECT _id FROM vector_search('ghost', '{qv}', {SURFACE_TOP_K})"),
+        "SELECT _id FROM token_match('ghost', 'rust')".into(),
+    ] {
+        assert_error_contains(&st, &query, "no column `ghost` in this table");
+    }
+}
+
+/// The checks read the table's declared indexes, not the committed
+/// superfiles, so an empty table rejects a bad column instead of answering
+/// it with an empty result set.
+#[test]
+fn column_checks_apply_before_the_first_commit() {
+    let st = Supertable::create(options_title_rating_emb()).expect("create");
+    let qv = csv_one_hot(0);
+    for (query, expected) in [
+        (
+            format!("SELECT _id FROM bm25_search('rating', 'rust', {SURFACE_TOP_K})"),
+            "has no full-text index",
+        ),
+        (
+            format!("SELECT _id FROM vector_search('title', '{qv}', {SURFACE_TOP_K})"),
+            "has no vector index",
+        ),
+        (
+            "SELECT _id FROM token_match('ghost', 'rust')".into(),
+            "no column `ghost`",
+        ),
+    ] {
+        assert_error_contains(&st, &query, expected);
     }
 }
 

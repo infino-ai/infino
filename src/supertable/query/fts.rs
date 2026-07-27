@@ -266,10 +266,11 @@ impl SupertableReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        manifest.options.require_fts_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
@@ -499,10 +500,11 @@ impl SupertableReader {
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        manifest.options.require_fts_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
         let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
@@ -601,8 +603,9 @@ impl SupertableReader {
         ),
         QueryError,
     > {
-        let clauses = self
-            .manifest()
+        let manifest = self.manifest();
+        manifest.options.require_fts_column(column)?;
+        let clauses = manifest
             .options
             .fts_tokenizer_for(column)
             .parse(query)
@@ -912,6 +915,7 @@ impl SupertableReader {
         value: &str,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
+        manifest.options.require_fts_column(column)?;
         let term_strings: Vec<String> = manifest
             .options
             .fts_tokenizer_for(column)
@@ -1909,7 +1913,12 @@ mod tests {
         let err = r
             .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
-        assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+        // Rejected up front by name, not as a per-superfile scan failure —
+        // a column that isn't in the schema is a caller error, not I/O.
+        assert!(
+            matches!(&err, QueryError::InvalidQuery(m) if m.contains("no column `missing_column`")),
+            "got {err:?}"
+        );
     }
 
     #[test]

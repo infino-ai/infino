@@ -1251,11 +1251,8 @@ impl SupertableReader {
         // column's row codes).
         let (metric, rot_seed) = manifest
             .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| (vc.metric, vc.rot_seed))
-            .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
+            .require_vector_column(column)
+            .map(|vc| (vc.metric, vc.rot_seed))?;
 
         let grid = manifest
             .global_vector_index()
@@ -1778,10 +1775,11 @@ impl SupertableReader {
         options: VectorSearchOptions,
         filter: VectorFilter<'_>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        manifest.options.require_vector_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
         // Tokenize the predicate once with the index tokenizer (the same
         // tokenizer used at build time, so the terms match the postings AND
         // the manifest term blooms). No tokens (empty / punctuation-only) ⇒
@@ -2419,10 +2417,11 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        manifest.options.require_vector_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
         let superfiles = manifest
             .get_all_superfiles_loaded()
             .await
@@ -2443,6 +2442,7 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.manifest().options.require_vector_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -3490,7 +3490,7 @@ mod tests {
         // not the old shape (silent metric default + blind per-superfile
         // probe, surfacing later as a kernel decode error).
         assert!(
-            matches!(&err, QueryError::Execute(m) if m.contains("unknown vector column")),
+            matches!(&err, QueryError::InvalidQuery(m) if m.contains("no column `nope`")),
             "got {err:?}"
         );
     }
