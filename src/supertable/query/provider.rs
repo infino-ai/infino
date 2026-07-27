@@ -1541,9 +1541,12 @@ mod tests {
     use tokio::runtime;
 
     use super::*;
-    use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer};
     use crate::{
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::FtsConfig,
+            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
+            vector::layout::VectorLayout,
+        },
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri},
