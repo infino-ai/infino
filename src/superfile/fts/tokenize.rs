@@ -731,7 +731,16 @@ impl Tokenizer for StandardTokenizer {
                 f(word);
             } else {
                 buf.clear();
-                buf.extend(word.chars().flat_map(char::to_lowercase));
+                // Context-aware full-string lowercasing, matching
+                // `tokenize`. `str::to_lowercase` applies Unicode
+                // special-casing such as Final_Sigma (a word-final `Σ`
+                // lowercases to `ς`, but to `σ` elsewhere); a char-by-char
+                // fold has no word context and would emit `σ` in both
+                // spots. The two paths must agree — text is indexed
+                // through `tokenize_each` and queried through `tokenize`,
+                // so any divergence indexes a term under one form and
+                // searches it under another.
+                buf.push_str(&word.to_lowercase());
                 f(&buf);
             }
         }
@@ -824,6 +833,26 @@ mod tests {
         // the borrow fast path and the copy path must emit the same set.
         let text = "alpha Beta 42 gamma2 Δelta";
         assert_eq!(std_tokens(text), std_tokens_each(text));
+    }
+
+    #[test]
+    fn standard_copy_path_lowercases_final_sigma_like_tokenize() {
+        // Regression: the copy path must lowercase with context-aware
+        // `str::to_lowercase`, not char-by-char. A word-final capital `Σ`
+        // folds to `ς` (final sigma) but to `σ` elsewhere; a char-by-char
+        // fold has no word context and would emit `σ` in both places. Text
+        // is indexed through `tokenize_each` and queried through
+        // `tokenize`, so any divergence stores a Greek term under one form
+        // and searches it under another — the document becomes unfindable.
+        let text = "ΟΔΟΣ"; // one Greek word; the final Σ must fold to ς
+        // Both tokenizer paths agree, and both equal Rust's context-aware
+        // folding (which the char-by-char version would not).
+        assert_eq!(std_tokens(text), std_tokens_each(text));
+        assert_eq!(std_tokens_each(text), vec![text.to_lowercase()]);
+        assert!(
+            std_tokens_each(text)[0].ends_with('ς'),
+            "word-final Σ must fold to final sigma ς, not σ"
+        );
     }
 
     #[test]
