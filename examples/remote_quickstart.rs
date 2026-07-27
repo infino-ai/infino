@@ -3,11 +3,12 @@
 
 //! Remote (hosted) quickstart — the local→cloud one-line diff in action.
 //!
-//! Run against a hosted endpoint you control:
+//! Point `INFINO_REMOTE_URL` at a hosted endpoint and `INFINO_API_KEY` at a
+//! key for it, then run:
 //!
 //! ```sh
-//! export INFINO_REMOTE_URL="http://localhost:8080/mydb"  # https:// for a real host
-//! export INFINO_API_KEY="ik_…"                            # a key minted for the service
+//! export INFINO_REMOTE_URL="https://your-endpoint/mydb"  # http:// only for a loopback address
+//! export INFINO_API_KEY="ik_…"
 //! cargo run --features remote --example remote_quickstart
 //! ```
 //!

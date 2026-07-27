@@ -3,16 +3,18 @@
 """Live smoke test for the remote (hosted) transport.
 
 Skipped unless INFINO_REMOTE_URL and INFINO_API_KEY are set, so `pytest`
-passes with no server. Run manually against a locally-running hosted service:
+passes with no endpoint configured. To run it, point the two variables at a
+hosted endpoint and a key for it:
 
     cd infino-python
     maturin develop
-    export INFINO_REMOTE_URL=http://localhost:8080/mydb
+    export INFINO_REMOTE_URL=https://your-endpoint/mydb
     export INFINO_API_KEY=ik_...
     pytest tests/test_remote_smoke.py
 
 The only difference from a local connection is the connect target: an
-``https://host/db`` (or ``http://localhost/db``) URL plus an API key.
+``https://host/db`` URL (plaintext ``http://`` is accepted only for a loopback
+address) plus an API key.
 """
 
 import os

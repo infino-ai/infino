@@ -3,14 +3,16 @@
 //
 // Live smoke test for the remote (hosted) transport. Skipped unless
 // INFINO_REMOTE_URL and INFINO_API_KEY are set, so `npm test` passes with no
-// server. Run manually against a locally-running hosted service:
+// endpoint configured. To run it, point the two variables at a hosted endpoint
+// and a key for it:
 //
 //     cd infino-node
 //     npm install && npm run build
-//     INFINO_REMOTE_URL=http://localhost:8080/mydb INFINO_API_KEY=ik_... npm test
+//     INFINO_REMOTE_URL=https://your-endpoint/mydb INFINO_API_KEY=ik_... npm test
 //
 // The only difference from a local connection is the connect target: an
-// `https://host/db` (or `http://localhost/db`) URL plus an API key.
+// `https://host/db` URL (plaintext `http://` is accepted only for a loopback
+// address) plus an API key.
 
 import test from "node:test";
 import assert from "node:assert/strict";

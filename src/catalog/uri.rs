@@ -135,9 +135,11 @@ pub(crate) fn parse_uri(uri: &str) -> Result<Backend, InfinoError> {
                 "remote URI missing host: {uri}"
             )));
         }
-        // A bearer credential must never travel in the clear, so plaintext
-        // `http://` is accepted only for a local endpoint; any other host
-        // must use `https://`.
+        // A bearer credential must never travel in the clear: reject plaintext
+        // `http://` for any remote host. Loopback is the one exception, because
+        // the request never leaves the machine — this is what lets the SDK talk
+        // to a service on the same host over `http://127.0.0.1` (the hermetic
+        // test suite connects to a mock server exactly this way).
         if is_http && !is_localhost(host) {
             return Err(InfinoError::Backend(format!(
                 "http:// is only allowed for localhost; use https:// for a remote host: {uri}"
