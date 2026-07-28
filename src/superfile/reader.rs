@@ -1502,12 +1502,6 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
-    /// Diagnostic, bench/test builds only: when set, an explicit `nprobe`
-    /// widens the coarse cell probe on UNFILTERED hidden-indexed queries too.
-    /// Always `false` in production — the setter is `#[cfg(feature =
-    /// "test-helpers")]`, so it cannot be reached from the public API and the
-    /// serving path never sees it.
-    pub(crate) widen_unfiltered_hidden_cells: bool,
 }
 
 impl VectorSearchOptions {
@@ -1529,16 +1523,6 @@ impl VectorSearchOptions {
     /// the cost of more work.
     pub fn with_nprobe(mut self, n: usize) -> Self {
         self.nprobe = Some(n);
-        self
-    }
-
-    /// Diagnostic, bench/test builds only: let an explicit `nprobe` widen the
-    /// coarse cell probe on UNFILTERED hidden-indexed queries (used by the
-    /// recall breadth-sweep). Absent from production builds, so it never
-    /// affects the serving path.
-    #[cfg(feature = "test-helpers")]
-    pub fn widen_unfiltered_hidden_cells(mut self) -> Self {
-        self.widen_unfiltered_hidden_cells = true;
         self
     }
 

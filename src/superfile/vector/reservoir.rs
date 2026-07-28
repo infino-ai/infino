@@ -198,6 +198,14 @@ impl Reservoir {
     ///
     /// Panics if `vec.len() != self.dim`.
     pub fn update(&mut self, vec: &[f32]) {
+        let _ = self.update_traced(vec);
+    }
+
+    /// [`Self::update`], reporting where the vector landed: `Some(slot)`
+    /// when it was appended (fill phase) or replaced an existing sample,
+    /// `None` when it passed by. Lets a caller keep per-sample metadata
+    /// (e.g. row ids) in lockstep with the reservoir.
+    pub(crate) fn update_traced(&mut self, vec: &[f32]) -> Option<usize> {
         assert_eq!(
             vec.len(),
             self.dim,
@@ -218,7 +226,7 @@ impl Reservoir {
                 self.w = (Self::nonzero_uniform(&mut self.rng).ln() / k as f64).exp();
                 self.next_replace_at = i + 1 + Self::skip(&mut self.rng, self.w);
             }
-            return;
+            return Some(i as usize);
         }
 
         // Full phase. Replace at the precomputed skip
@@ -228,7 +236,9 @@ impl Reservoir {
             self.buf[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(vec);
             self.w *= (Self::nonzero_uniform(&mut self.rng).ln() / k as f64).exp();
             self.next_replace_at = i + 1 + Self::skip(&mut self.rng, self.w);
+            return Some(slot);
         }
+        None
     }
 
     /// Number of vectors observed via [`Self::update`].

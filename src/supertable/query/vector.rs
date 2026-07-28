@@ -1345,32 +1345,11 @@ impl SupertableReader {
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
-            let cell_routing = if hidden_vector_index {
+            // Base routing shape first (per branch), then one shared caller
+            // override on top.
+            let mut cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if options.nprobe.is_some() && (filtered || options.widen_unfiltered_hidden_cells) {
-                    // Explicit caller `nprobe` pins the hidden cell sweep. FILTERED
-                    // queries always honor it (the width-dial calibration and the
-                    // filtered sweep). UNFILTERED hidden queries honor it only when
-                    // `widen_unfiltered_hidden_cells` is set — a diagnostic whose
-                    // setter is `#[cfg(feature = "test-helpers")]`, so it is
-                    // unreachable from the production public API and used only by
-                    // the recall breadth-sweep bench. In production the flag is
-                    // always `false`, so an explicit `nprobe` on an unfiltered
-                    // hidden query keeps the persisted p=1 routing (the `else` arms
-                    // below) — `with_nprobe` does not change serving behavior.
-                    // Filtered queries additionally lift per-cell fine depth to the
-                    // filtered floor; unfiltered keeps the persisted fine depth.
-                    CellRoutingParams {
-                        nprobe_min: nprobe.max(1),
-                        nprobe_max: nprobe.max(1),
-                        fine_nprobe: if filtered {
-                            base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE)
-                        } else {
-                            base.fine_nprobe
-                        },
-                        ..base
-                    }
-                } else if filtered {
+                if filtered {
                     // Allow-set queries widen to the filtered floor and
                     // probe DEEPER fine runs per cell — the matching
                     // neighbors sit past the unfiltered top runs; the
@@ -1383,12 +1362,6 @@ impl SupertableReader {
                     }
                 } else {
                     base
-                }
-            } else if options.nprobe.is_some() {
-                CellRoutingParams {
-                    nprobe_min: nprobe.max(1),
-                    nprobe_max: nprobe.max(1),
-                    ..CellRoutingParams::default()
                 }
             } else if filtered {
                 // Filtered UNDRAINED-tail fan: the default user-table
@@ -1403,6 +1376,45 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
+            // Per-table probe-width law: when the drain calibrated one and
+            // the caller passed nothing, the law's width for this `k` acts
+            // exactly like an explicit caller `nprobe` — same pin, same
+            // per-fragment gating downstream. How far the true top-k
+            // spreads over cells is a property of the corpus (synthetic
+            // clustered data calibrates to 1 cell at k=10; Cohere-1M/768d
+            // measured ~30 of 256 cells at k=100), so the default width
+            // must be per-table and per-k, never a constant. A law width
+            // of 1 resolves to `None` and keeps the fine-first p=1 path
+            // byte-for-byte.
+            let law_width: Option<usize> =
+                if hidden_vector_index && !filtered && options.nprobe.is_none() {
+                    hidden_routing
+                        .and_then(|r| r.width_for_k_at(k))
+                        .filter(|w| *w > 1)
+                } else {
+                    None
+                };
+            // Explicit caller `nprobe` pins the cell sweep width on every
+            // branch — an override is honored, never discarded. The
+            // persisted hidden routing (fine-first p=1) stays the
+            // no-override default, but measured on Cohere-1M/768d at k=100
+            // the single probed cell caps recall at 0.61 even scanned in
+            // full, so callers need the width dial to buy recall past that
+            // ceiling. Fine depth is untouched by the pin: the filtered
+            // floors above still apply, unfiltered keeps its branch's depth.
+            if options.nprobe.is_some() {
+                cell_routing.nprobe_min = nprobe.max(1);
+                cell_routing.nprobe_max = nprobe.max(1);
+            } else if let Some(width) = law_width {
+                cell_routing.nprobe_min = width;
+                cell_routing.nprobe_max = width;
+                // The law was calibrated against exact top-k, so its
+                // coverage numbers assume a probed cell is read in full
+                // (measured: half-depth caps recall at 0.964 where full
+                // depth reaches 0.995). Depth rides with the law; the
+                // per-fragment gate clamps to each fragment's run count.
+                cell_routing.fine_nprobe = usize::MAX;
+            }
             // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
             // count)), so depth scales with cell size. Filtered queries keep
             // their own fixed fine floor (pct = 0); the proportional depth
@@ -1490,6 +1502,22 @@ impl SupertableReader {
                     union_cell_selection(&grid_cells, &fine_cells)
                 };
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
+                // Wave-pooled depth is the p=1 read-volume model: keep runs
+                // per drain wave so reads track wave count, not probed-cell
+                // count — which also means widening the cell sweep alone
+                // cannot deepen the read (measured flat 0.443 recall@100
+                // from nprobe=4 through 256 on Cohere-1M). An explicit
+                // caller `nprobe` — or the calibrated width law standing in
+                // for one — is a request to actually read N cells, so gate
+                // per (cell, fragment) exactly like the pre-drain user path:
+                // depth follows width, read amplification is what was asked
+                // for (explicitly by the caller, or measured as necessary
+                // by the drain's calibration).
+                let generation_of = if options.nprobe.is_some() || law_width.is_some() {
+                    None
+                } else {
+                    Some(birth_versions.as_slice())
+                };
                 gated = gate_fine_candidates_by_fragment(
                     candidates,
                     &selected_cells,
@@ -1499,7 +1527,7 @@ impl SupertableReader {
                     gated_target,
                     &candidate_counts,
                     &mut scored,
-                    Some(&birth_versions),
+                    generation_of,
                 );
             } else {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
@@ -4041,6 +4069,124 @@ mod tests {
             )
             .expect("filtered wide search");
         assert!(!filtered.is_empty(), "filtered wide search returns hits");
+    }
+
+    /// Score bound separating planted neighbors from orthogonal docs in the
+    /// drained one-hot fixture: query-aligned directions score well below
+    /// it, every other direction scores exactly 1.0 (cos = 0).
+    const ORTHOGONAL_SCORE: f32 = 0.9;
+    /// Docs planted per one-hot direction (128 docs mod 16 dims).
+    const DOCS_PER_DIRECTION: usize = 8;
+
+    /// Drained planted fixture shared by the probe-width tests: 128 one-hot
+    /// docs over 16 directions in 4 commits, drained into per-direction
+    /// cells, plus a query leaning on three directions — its exact top-24
+    /// spans three cells. Returns `(tempdir, table, query, k)`; the tempdir
+    /// must outlive the table.
+    fn drained_three_direction_fixture() -> (tempfile::TempDir, Supertable, Vec<f32>, usize) {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        for c in 0..4u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        q[1] = 0.9;
+        q[2] = 0.8;
+        (dir, st, q, 3 * DOCS_PER_DIRECTION)
+    }
+
+    /// Planted neighbors among `hits` (orthogonal docs score exactly 1.0).
+    fn near_count(hits: &[SuperfileHit]) -> usize {
+        hits.iter().filter(|h| h.score < ORTHOGONAL_SCORE).count()
+    }
+
+    /// Explicit caller `nprobe` widens the post-drain UNFILTERED cell sweep.
+    ///
+    /// Regression test for the discarded-override bug: unfiltered hidden
+    /// routing used to keep the persisted p=1 params and ignore
+    /// `with_nprobe`, so a query whose true top-k spans several cells could
+    /// never recover the neighbors outside the single probed cell (measured
+    /// on Cohere-1M/768d at k=100: recall capped at 0.61 with the probed
+    /// cell scanned in full). The corpus below plants the top-k across
+    /// THREE cells — two would pass even without the fix, because the
+    /// no-override union selection already admits `UNION_FINE_PICKS_MIN = 2`
+    /// fine-ranked cells.
+    #[test]
+    fn caller_nprobe_widens_unfiltered_post_drain_sweep() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+
+        // Narrow override: the drain calibrated a wide width law for this
+        // corpus, but `with_nprobe(1)` pulls the sweep back below it — the
+        // override wins in both directions, it is never merely a floor.
+        // (nprobe=1 still reads the grid∪fine union's UNION_FINE_PICKS_MIN
+        // fine picks, so "narrow" means fewer cells than the law, not one.)
+        let narrow_hits = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new().with_nprobe(1),
+                None,
+            )
+            .expect("narrow search");
+        let narrow = near_count(&narrow_hits);
+        assert!(
+            narrow >= DOCS_PER_DIRECTION && narrow < k,
+            "with_nprobe(1) must narrow the sweep below the law-widened \
+             default (got {narrow} of {k})"
+        );
+
+        // Wide override: recovers the full exact top-k across three cells.
+        let wide_hits = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new().with_nprobe(DOCS_PER_DIRECTION),
+                None,
+            )
+            .expect("wide search");
+        assert_eq!(
+            near_count(&wide_hits),
+            k,
+            "with_nprobe must widen the unfiltered post-drain sweep to all \
+             {k} exact neighbors across three cells — caller nprobe is an \
+             override, never discarded"
+        );
+    }
+
+    /// A clean drain calibrates the probe-width law from the table's own
+    /// rows and stamps it into the manifest routing; a DEFAULT search (no
+    /// nprobe, no config) then widens to the calibrated width. On this
+    /// planted corpus the exact top-24 spans three cells, which the old
+    /// fixed p=1 default could never recover (it returned one direction's
+    /// 8 docs); the law measures the spread and buys the coverage without
+    /// the caller knowing any knob exists.
+    #[test]
+    fn drain_calibrated_width_law_widens_default_search() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search");
+        let near = near_count(&hits);
+        assert_eq!(
+            near, k,
+            "drain-calibrated width law must widen the default sweep to all \
+             {k} exact neighbors across three cells, got {near}"
+        );
     }
 
     /// The `Supertable::vector_search` handle wrapper (tests normally call

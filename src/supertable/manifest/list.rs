@@ -341,6 +341,11 @@ pub struct VectorColumnInfo {
     pub metric: String,
 }
 
+/// Canonical `k` points the drain calibrates the probe-width law at.
+/// Chosen log-spaced so query-time log-interpolation between neighbors
+/// stays within one decade of a measured point.
+pub(crate) const WIDTH_LAW_KS: [usize; 4] = [1, 10, 100, 1000];
+
 /// Adaptive cell-probe tuning for the hidden VectorCell index.
 /// Calibrated per table; persisted in the manifest list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -354,6 +359,16 @@ pub struct CellRoutingParams {
     /// Floor on fine IVF centroids probed per selected hidden cell. The
     /// actual probe is `max(this, floor(pct × the cell's fine-cluster count))`.
     pub fine_nprobe: usize,
+    /// Per-table probe-width law: cells (in grid-nearest order) needed for
+    /// mean 0.99 coverage of the exact top-k, measured by the drain at each
+    /// [`WIDTH_LAW_KS`] point on a held-out row sample. `0` = uncalibrated
+    /// point; all zeros = no law (pre-law manifests, or drain calibration
+    /// skipped). How many cells the true top-k spreads over is a property
+    /// of the data — synthetic clustered corpora calibrate narrow, real
+    /// text embeddings wide (measured on Cohere-1M/768d: ~30 cells of 256
+    /// at k=100 under a converged grid, ~1 at k=1) — so the default cannot
+    /// be a constant; it has to be measured per table.
+    pub width_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl Default for CellRoutingParams {
@@ -363,7 +378,41 @@ impl Default for CellRoutingParams {
             nprobe_max: DEFAULT_CELL_NPROBE_MAX,
             slack: DEFAULT_CELL_SLACK,
             fine_nprobe: crate::config::global().vector.fine_nprobe_floor,
+            width_for_k: [0; WIDTH_LAW_KS.len()],
         }
+    }
+}
+
+impl CellRoutingParams {
+    /// Resolve the calibrated probe width for a query's `k`, or `None`
+    /// when no usable law is persisted (all-zero, or every point at or
+    /// around `k` is uncalibrated).
+    ///
+    /// Interpolates log-linearly in `k` between the two calibrated
+    /// [`WIDTH_LAW_KS`] points bracketing the query's `k` (zero entries
+    /// are skipped), clamping to the nearest calibrated point outside
+    /// the calibrated range. Width is rounded up: under-probing costs
+    /// recall, over-probing costs one cell's read.
+    pub(crate) fn width_for_k_at(&self, k: usize) -> Option<usize> {
+        let pts: Vec<(f64, f64)> = WIDTH_LAW_KS
+            .iter()
+            .zip(self.width_for_k.iter())
+            .filter(|(_, w)| **w > 0)
+            .map(|(k_pt, w)| ((*k_pt as f64).ln(), f64::from(*w)))
+            .collect();
+        let (first, last) = (pts.first()?, pts.last()?);
+        let x = (k.max(1) as f64).ln();
+        if x <= first.0 {
+            return Some(first.1.ceil() as usize);
+        }
+        if x >= last.0 {
+            return Some(last.1.ceil() as usize);
+        }
+        let hi = pts.iter().position(|(px, _)| *px >= x)?;
+        let (x0, w0) = pts[hi - 1];
+        let (x1, w1) = pts[hi];
+        let t = (x - x0) / (x1 - x0);
+        Some((w0 + t * (w1 - w0)).ceil() as usize)
     }
 }
 
@@ -1159,6 +1208,11 @@ struct CellRoutingParamsDto {
     slack: Option<f32>,
     #[serde(default)]
     fine_nprobe: usize,
+    /// Probe-width law measured at the [`WIDTH_LAW_KS`] points; zero
+    /// entries are uncalibrated. Absent on pre-law manifests (defaults
+    /// to all-zero = no law).
+    #[serde(default)]
+    width_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 impl From<CellRoutingParams> for CellRoutingParamsDto {
@@ -1168,6 +1222,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             nprobe_max: r.nprobe_max,
             slack: Some(r.slack),
             fine_nprobe: r.fine_nprobe,
+            width_for_k: r.width_for_k,
         }
     }
 }
@@ -1187,6 +1242,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         if d.fine_nprobe > 0 {
             r.fine_nprobe = d.fine_nprobe;
         }
+        r.width_for_k = d.width_for_k;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2549,6 +2605,84 @@ mod tests {
             CellRoutingParams::default().slack,
             "absent slack keeps the default"
         );
+    }
+
+    /// The probe-width law round-trips through the list encoding, and a
+    /// JSON body without the field (pre-law manifests) decodes to no law.
+    #[test]
+    fn cell_routing_width_law_roundtrip_and_legacy_default() {
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(1, 4, &[0.5, 0.5, 0.5, 0.5], vec![1]),
+            routing: CellRoutingParams {
+                width_for_k: [1, 2, 30, 48],
+                ..CellRoutingParams::default()
+            },
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
+            panic!("VectorCell strategy must survive the round-trip");
+        };
+        assert_eq!(routing.width_for_k, [1, 2, 30, 48]);
+
+        // Strip the whole `"width_for_k": [...]` member (the encoder
+        // pretty-prints, so cut structurally: from the comma preceding the
+        // key through the closing bracket).
+        let s = from_utf8(&bytes).expect("utf8");
+        let key = s
+            .find("\"width_for_k\"")
+            .expect("field present in encoding");
+        let comma = s[..key].rfind(',').expect("preceding member comma");
+        let close = key + s[key..].find(']').expect("array close") + 1;
+        let stripped = format!("{}{}", &s[..comma], &s[close..]);
+        assert_ne!(stripped, s, "fixture must actually strip the field");
+        let legacy = decode(stripped.as_bytes()).expect("decode without width law");
+        let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
+            panic!("VectorCell strategy must survive the stripped decode");
+        };
+        assert_eq!(
+            routing.width_for_k,
+            [0; WIDTH_LAW_KS.len()],
+            "absent law decodes to all-zero (no law)"
+        );
+        assert_eq!(routing.width_for_k_at(100), None, "no law resolves None");
+    }
+
+    /// Width-law resolution: log-interpolation between calibrated points,
+    /// clamping outside the calibrated range, skipping zero entries, and
+    /// `None` for an absent law.
+    #[test]
+    fn width_for_k_at_interpolates_clamps_and_skips_zeros() {
+        let law = |w: [u32; WIDTH_LAW_KS.len()]| CellRoutingParams {
+            width_for_k: w,
+            ..CellRoutingParams::default()
+        };
+        // Calibrated at all four points: k = 1, 10, 100, 1000.
+        let full = law([1, 2, 30, 48]);
+        assert_eq!(full.width_for_k_at(1), Some(1));
+        assert_eq!(full.width_for_k_at(10), Some(2));
+        assert_eq!(full.width_for_k_at(100), Some(30));
+        assert_eq!(full.width_for_k_at(1000), Some(48));
+        // Clamped outside the calibrated range (k=0 treated as 1).
+        assert_eq!(full.width_for_k_at(0), Some(1));
+        assert_eq!(full.width_for_k_at(100_000), Some(48));
+        // Interpolated between points, rounded up (under-probing costs
+        // recall): halfway in log-k between 10 and 100.
+        let mid = full.width_for_k_at(32).expect("interpolated");
+        assert!(
+            (2..=30).contains(&mid) && mid > 2,
+            "k=32 interpolates strictly between the k=10 and k=100 widths, got {mid}"
+        );
+        // Zero (uncalibrated) points are skipped: with only the k=100
+        // point calibrated, every k clamps to it.
+        let single = law([0, 0, 30, 0]);
+        assert_eq!(single.width_for_k_at(1), Some(30));
+        assert_eq!(single.width_for_k_at(100), Some(30));
+        assert_eq!(single.width_for_k_at(5000), Some(30));
+        // All-zero = no law.
+        assert_eq!(law([0; WIDTH_LAW_KS.len()]).width_for_k_at(10), None);
     }
 
     #[test]
