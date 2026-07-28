@@ -250,8 +250,8 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 /// there for the rationale behind the large 500K value).
 const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 /// Default modality-split threshold; `0.0` = off. Must equal config.yaml
-/// `cell_split_modality_d` (see there for the working value and why it ships off).
-const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 0.0;
+/// `cell_split_modality_d` (see there for the working value and why it ships on).
+const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed

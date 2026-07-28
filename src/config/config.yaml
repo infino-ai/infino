@@ -157,8 +157,10 @@ vector:
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #
-  # Max docs in a global cell before it is split (hard ceiling; also the primary
-  # trigger when cell_split_modality_d = 0, i.e. by default).
+  # Max docs in a global cell before it is split (hard ceiling). With the
+  # modality trigger on by default (cell_split_modality_d > 0) this cap is the
+  # upper backstop; set cell_split_modality_d = 0 to make the cap the sole
+  # trigger.
   #
   # 500K, deliberately large. A brief experiment lowered this to 40K (≈ the size
   # 256 cells reach at 10M) on the theory that cells must be kept small — that was
@@ -184,15 +186,14 @@ vector:
   # with K > MODALITY_MODES_PER_CELL (=4) splits into ceil(K/4) children, and the
   # executor self-tunes k up for route fidelity.
   #
-  # 0.0 (OFF) is the default — DELIBERATELY, pending wider-scale validation. With
-  # R=4 + self_tune, 8.0 measured 0.99+ recall@10 at 1M and 0.991 at 10M (splits
-  # engaged, grid grown to ~3548 cells) vs ~0.983 for the fixed 256-cell grid —
-  # i.e. modality is the lever that lifts nprobe=1 recall above the fixed-grid
-  # ~0.98 floor. It is OFF because (a) the fixed grid already holds ~0.98 stably
-  # to 100M (see cell_split_doc_cap) so modality isn't needed for the common case,
-  # and (b) at 100M the recall/cost trade (a finer grid costs ~14x the cells) is
-  # still being validated. Enable (8.0) once that trade is confirmed.
-  cell_split_modality_d: 0.0
+  # 8.0 (ON) is the default. The modality split lifts nprobe=1 recall above the
+  # fixed 256-cell grid's ~0.98 floor where the grid is too coarse — most clearly
+  # at small scale (~0.998 vs ~0.94 at 100K, ~0.997 vs ~0.962 at 1M) and slightly
+  # ahead at scale (0.991 vs 0.983 at 10M). The finer grid (~14x the cells) adds
+  # per-cell drain generations, but compaction consolidates them
+  # (compaction_min_fill_percent = 0), so post-compact cold GET stays bounded.
+  # Set 0.0 to fall back to the fixed-grid path (cap trigger only).
+  cell_split_modality_d: 8.0
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
@@ -251,10 +252,11 @@ vector:
   #
   # 0 disables the byte floor, so a cell consolidates on fragment count alone
   # (the >= 2 merge floor): drain generations collapse and post-compact cold
-  # GET stays at the post-drain level. This is safe now that the post-compaction
-  # cell split is disabled (see cell_split_doc_cap) — merging no longer triggers
-  # the broken split path. Contrast the user table, which keeps an 80% floor to
-  # amortize writes on its transient data.
+  # GET stays at the post-drain level. Safe because the cell split is now the
+  # in-place append-child split (validated), so a merge that pushes a cell over
+  # the cap (or into multimodality with the trigger on) splits it correctly
+  # rather than hitting the old broken post-merge split path. Contrast the user
+  # table, which keeps an 80% floor to amortize writes on its transient data.
   compaction_target_mb: 2048
   compaction_min_fill_percent: 0
   compaction_max_memory_mb: 4096
