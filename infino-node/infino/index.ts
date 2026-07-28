@@ -408,6 +408,15 @@ export class Connection {
     this.inner = inner;
   }
 
+  /**
+   * Provision the database this connection targets. On the hosted service this
+   * registers the database (throws if it already exists); on a local backend the
+   * catalog root is the database, so it is a no-op success.
+   */
+  createDatabase(): void {
+    this.inner.createDatabase();
+  }
+
   /** Create a table from an apache-arrow `Schema` or `{ column: type }`. */
   createTable(name: string, schema: arrow.Schema | SchemaDescriptor | Buffer, indexes: IndexSpec): Table {
     return new Table(this.inner.createTable(name, schemaToIpc(schema), indexes));
