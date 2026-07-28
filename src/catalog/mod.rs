@@ -322,6 +322,7 @@ impl Connection {
         indexes: IndexSpec,
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
+        validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         let tokenizers =
             table_tokenizers(&indexes).map_err(|e| e.with_context("create_table", Some(name)))?;
@@ -998,6 +999,24 @@ fn validate_name(name: &str) -> Result<(), InfinoError> {
             "invalid table name {name:?}: use non-empty [A-Za-z0-9_-], not starting with '_'"
         )))
     }
+}
+
+/// Reject a schema that the engine can build but can never query. Arrow
+/// permits a `Schema` with duplicate field names, yet any query against a
+/// table built from one fails on the ambiguous column. Catching it here turns
+/// a table that would otherwise error on every read into a create-time
+/// rejection.
+fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {
+    let mut seen = HashSet::new();
+    for field in schema.fields() {
+        if !seen.insert(field.name().as_str()) {
+            return Err(InfinoError::Schema(format!(
+                "duplicate column name: {}",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A unique-per-creation physical subtree for a table. The catalog name
@@ -1781,6 +1800,24 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         let bad = conn.create_table("has space", schema_id_title(), IndexSpec::new());
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn duplicate_column_names_rejected() {
+        // Arrow accepts a schema with two fields named `a`, but a table built
+        // from it can never be queried — every query fails on the ambiguous
+        // column. `create_table` rejects it up front rather than yielding a
+        // table that errors on every read.
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("a", DataType::LargeUtf8, true),
+        ]));
+        let err = conn
+            .create_table("dupcol", schema, IndexSpec::new())
+            .expect_err("a schema with duplicate column names is rejected");
+        assert!(matches!(err, InfinoError::Schema(_)), "got {err:?}");
+        assert!(err.to_string().contains("duplicate column name: a"));
     }
 
     #[test]

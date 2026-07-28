@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "table": "chunks",
+  "vectors": "ready",
+  "embedder": {
+    "provider": "local",
+    "model": "Xenova/all-MiniLM-L6-v2",
+    "dim": 384,
+    "dtype": "q8"
+  },
+  "files": 352,
+  "chunks": 4274,
+  "languages": {
+    "txt": 13,
+    "md": 86,
+    "ts": 9,
+    "js": 28,
+    "rs": 3960,
+    "make": 6,
+    "json": 12,
+    "py": 72,
+    "toml": 19,
+    "sh": 3,
+    "yaml": 66
+  },
+  "indexedAt": "2026-07-28T09:39:17.615Z",
+  "indexMs": 1152,
+  "embedMs": 76920
+}
