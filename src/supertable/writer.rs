@@ -5194,6 +5194,7 @@ pub(in crate::supertable) struct CellSplitOutcome {
 pub(in crate::supertable) async fn split_overflow_cell(
     inner: Arc<SupertableInner>,
     split_cell: u32,
+    modality_d: f64,
 ) -> Result<Option<CellSplitOutcome>, BuildError> {
     let manifest = inner.manifest.load_full();
     let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
@@ -5292,9 +5293,9 @@ pub(in crate::supertable) async fn split_overflow_cell(
     // into exactly that `k` in one pass (`self_tune = false`) — no cross-pass
     // cascade. Trigger off (default) => exactly the over-cap check. `None` is a
     // no-op; the caller marks the cell unsplittable for the pass.
-    let Some((k, self_tune)) = maint_pool()?
-        .install(|| opann::cell_split_plan(&split_refs, clusters.dim as usize, split_cell))
-    else {
+    let Some((k, self_tune)) = maint_pool()?.install(|| {
+        opann::cell_split_plan(&split_refs, clusters.dim as usize, split_cell, modality_d)
+    }) else {
         return Ok(None);
     };
     let (sub_centroids, assign) = maint_pool()?.install(|| {
@@ -5479,7 +5480,13 @@ pub(in crate::supertable) async fn split_overflow_cells(
         if (n as usize) < MIN_ROWS_TO_SPLIT_CELL {
             break;
         }
-        match split_overflow_cell(Arc::clone(&inner), split_cell).await? {
+        match split_overflow_cell(
+            Arc::clone(&inner),
+            split_cell,
+            opann::cell_split_modality_d(),
+        )
+        .await?
+        {
             Some(outcome) => {
                 splits_committed += 1;
                 for (cell, docs) in outcome.child_counts {

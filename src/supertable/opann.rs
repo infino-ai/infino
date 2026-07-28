@@ -476,11 +476,12 @@ pub(crate) fn cell_split_plan(
     rows: &[&EncodedCellRow],
     dim: usize,
     split_cell: u32,
+    modality_d: f64,
 ) -> Option<(usize, bool)> {
     let n_docs = rows.len() as u64;
     let cap = cell_split_doc_cap().max(1) as usize;
     let k_by_cap = rows.len().div_ceil(cap).max(2);
-    let threshold = cell_split_modality_d();
+    let threshold = modality_d;
     // Modality trigger off (default): the caller's over-cap gate is the sole
     // split trigger, so a cell that reaches here is a confirmed split — partition
     // into the cap-derived k (the executor self-tunes k upward for route

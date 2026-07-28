@@ -3990,7 +3990,7 @@ mod tests {
         let superfiles_before: usize = hidden.reader().manifest().superfiles.len();
 
         hidden
-            .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest))
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest, 0.0))
             .expect("split");
 
         // The split grows the grid by one sub-cell; the neighbour cell keeps its
@@ -4144,7 +4144,7 @@ mod tests {
 
         // Split the over-cap cell directly (bypasses the 500k cap gate).
         let split_outcome = hidden
-            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell))
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
             .expect("split");
         assert!(
             split_outcome.is_some(),
@@ -4293,7 +4293,7 @@ mod tests {
         };
 
         hidden
-            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell))
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
             .expect("split")
             .expect("live rows present, split commits");
 
