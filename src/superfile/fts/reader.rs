@@ -4726,15 +4726,18 @@ impl TermCursor {
         let term_meta = TermMeta::parse(postings, metadata_offset, positional)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
-        // Stored per-block BMW upper bounds bake in the LOCAL idf. When a
-        // global idf overrides, rescale each block max (and
-        // `term_max_bm25`) by global/local: block_max =
-        // local_idf_x_k1p1 × (an idf-independent tf-factor), so the
-        // linear rescale is exact and keeps the BMW skip UBs consistent
-        // with the global-idf scores computed from `idf_x_k1p1` below.
-        let idf_ratio = match global_idf {
-            Some(_) if local_idf > 0.0 => idf / local_idf,
-            _ => 1.0,
+        // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a
+        // global-idf override needs to rescale them by global/local:
+        // block_max = local_idf_x_k1p1 × (an idf-independent tf-factor),
+        // so the linear rescale is exact and keeps the BMW skip UBs
+        // consistent with the global-idf scores computed from
+        // `idf_x_k1p1` below. `None` (the default per-superfile path, and
+        // the case where a gathered global idf happens to equal the
+        // local one) leaves the stored value untouched — the block loop
+        // does no extra work, matching the per-superfile scorer exactly.
+        let idf_rescale = match global_idf {
+            Some(_) if local_idf > 0.0 && idf != local_idf => Some(idf / local_idf),
+            _ => None,
         };
 
         let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
@@ -4742,7 +4745,10 @@ impl TermCursor {
         for i in 0..term_meta.num_blocks {
             let (last_doc_id, block_offset_in_term, raw_block_max) =
                 term_meta.skip_entry(postings, i);
-            let block_max_bm25 = raw_block_max * idf_ratio;
+            let block_max_bm25 = match idf_rescale {
+                Some(ratio) => raw_block_max * ratio,
+                None => raw_block_max,
+            };
             term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
             blocks.push(BlockMeta {
