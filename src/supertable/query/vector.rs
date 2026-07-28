@@ -114,6 +114,15 @@ use crate::{
     },
 };
 
+/// Oversample factor on the per-sweep rerank budget. Dividing
+/// `k x rerank_mult` evenly across the sweep under-serves the nearest
+/// cells (they hold most true neighbors, and the 1-bit estimate ranks
+/// some of them deep within their cell): an even split measured
+/// 0.9695 recall@100 on Cohere-1M vs 0.9937 for undivided caps, and 2x
+/// headroom still only 0.9865. 4x holds the bar while keeping the total
+/// survivor budget well below the undivided width sweep.
+const WIDTH_BUDGET_OVERSAMPLE: usize = 4;
+
 /// Candidate growth when a deleted row occupies a current top-k slot.
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
@@ -1341,6 +1350,9 @@ impl SupertableReader {
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();
+        // Width the sweep was pinned to (caller nprobe or the width law);
+        // `None` on the fine-first default and legacy paths.
+        let mut sweep_width: Option<usize> = None;
         // Assigned in both admit arms; used below for the posting-aware
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
@@ -1405,9 +1417,11 @@ impl SupertableReader {
             if options.nprobe.is_some() {
                 cell_routing.nprobe_min = nprobe.max(1);
                 cell_routing.nprobe_max = nprobe.max(1);
+                sweep_width = Some(nprobe.max(1));
             } else if let Some(width) = law_width {
                 cell_routing.nprobe_min = width;
                 cell_routing.nprobe_max = width;
+                sweep_width = Some(width);
                 // The law was calibrated against exact top-k, so its
                 // coverage numbers assume a probed cell is read in full
                 // (measured: half-depth caps recall at 0.964 where full
@@ -1722,6 +1736,24 @@ impl SupertableReader {
         // capping the number of concurrent superfiles keeps that transient
         // memory bounded by instance configuration instead of table size.
         // Skipped superfiles issue zero GETs.
+        // Per-sweep rerank budget. The `k x rerank_mult` shortlist cap was
+        // sized for the fine-first p=1 read: applied per probed cell it
+        // exceeds any cell's row count, so at width every row of every
+        // probed cell "survives" the 1-bit prune and the survivor-only
+        // rerank fetch degenerates into fetching whole cells (measured:
+        // ~6.5 MB x 54 cells per query at w=54). Divide the cap across the
+        // sweep so the TOTAL survivor budget stays ~k x rerank_mult —
+        // measured sufficient at that total: 0.9957 recall@100 on
+        // Cohere-1M with ~25.6K survivors.
+        let options = match sweep_width {
+            Some(w) if w > 1 => {
+                let (_, rerank_mult) = options.resolve(filtered);
+                options.with_rerank_mult(
+                    (rerank_mult * WIDTH_BUDGET_OVERSAMPLE).div_ceil(w).max(1),
+                )
+            }
+            _ => options,
+        };
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
