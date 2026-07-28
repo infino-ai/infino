@@ -1742,7 +1742,14 @@ pub mod vector {
         title: String,
         note: &str,
     ) -> Vec<RecallRow> {
-        let q0 = &q_cal[0];
+        // Representative query for the latency probes below. Prefer a
+        // calibration query; fall back to the correctness set, which a
+        // skip-calibration reopen loads from the oracle bin without any
+        // calibration queries (so `q_cal` is legitimately empty there).
+        let q0 = q_cal
+            .first()
+            .or_else(|| q_correct.first())
+            .expect("run_search needs at least one held-out query");
         let mut rows: Vec<RecallRow> = Vec::new();
         let default_recall: Option<f32>;
         if skip_calibration {

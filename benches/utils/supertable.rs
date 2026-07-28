@@ -3120,10 +3120,36 @@ pub mod vector {
         // gate are forced off below and queries are corpus-free.
         let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
 
-        // Always prepare the corpus for vector benches so recall is always
-        // measurable (including existing-prefix runs).
+        // On a reopen (existing prefix) with a persisted oracle bin, load the
+        // held-out queries + exact labels straight from the bin and skip the
+        // corpus entirely: the bin already holds both, so regenerating the
+        // (potentially ~400 GB) corpus solely to rebuild the query vectors is
+        // pure waste. Fresh ingest / dataset / bin-less reopen still prepare it.
+        let reopen_oracle = if existing.is_some() && (phases.warm || phases.cold) {
+            corpus::grading::oracle_path()
+                .filter(|path| path.exists())
+                .map(|path| {
+                    let oracle = corpus::grading::load_oracle(&path).unwrap_or_else(|error| {
+                        panic!("failed to load oracle bin {}: {error}", path.display())
+                    });
+                    eprintln!(
+                        "[vector reopen] loaded {} queries + labels from oracle bin {}; \
+                         skipping corpus regeneration",
+                        oracle.queries.len(),
+                        path.display()
+                    );
+                    oracle
+                })
+        } else {
+            None
+        };
+
         crate::rss::log_rss_breakdown("supertable_vector before corpus prepare");
-        let mut corpus = Some(supertable::prepare_corpus(Modality::Vector));
+        let mut corpus = if reopen_oracle.is_some() {
+            None
+        } else {
+            Some(supertable::prepare_corpus(Modality::Vector))
+        };
         crate::rss::log_rss_breakdown("supertable_vector after corpus prepare");
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
@@ -3168,69 +3194,97 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
-                let corpus = corpus
-                    .as_ref()
-                    .expect("vector benches always prepare a corpus");
-                // The ingested vectors are still mmapped from the prepared
-                // corpus — queries and ground truth come from them instead
-                // of a regeneration. Skip-calibration still computes
-                // correctness/default recall (and filtered recall); it only
-                // skips the recall-target calibration sweep.
-                let vslice = corpus
-                    .vectors()
-                    .expect("vector modality prepared a vector corpus")
-                    .as_slice();
-                let base_vectors = &vslice[..n_docs * DIM];
-                let q_correct = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CORRECTNESS_QUERIES,
-                    QUERY_CORRECTNESS_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let q_cal = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CALIBRATION_QUERIES,
-                    QUERY_CALIBRATION_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let augmented_docs = n_docs + supertable::docs_per_commit();
-                let all_queries: Vec<Vec<f32>> = if skip_cal {
-                    q_correct.clone()
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) =
+                if let Some(oracle) = reopen_oracle {
+                    // Reopen: queries + exact labels came straight from the
+                    // persisted oracle bin, so no corpus was prepared. Split the
+                    // combined query/label sets at the correctness boundary exactly
+                    // as the corpus path does below.
+                    let corpus::grading::CachedOracle {
+                        mut queries,
+                        mut labels,
+                        n_docs: oracle_docs,
+                        top_k: oracle_top_k,
+                        correctness_query_count,
+                    } = oracle;
+                    assert_eq!(
+                        oracle_docs, n_docs,
+                        "oracle bin n_docs does not match the reopened table"
+                    );
+                    assert_eq!(oracle_top_k, TOP_K, "oracle bin top_k mismatch");
+                    let q_cal = queries.split_off(correctness_query_count);
+                    let gt_cal = labels.base.split_off(correctness_query_count);
+                    (
+                        queries,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 } else {
-                    q_correct.iter().chain(&q_cal).cloned().collect()
-                };
-                let mut labels = corpus::grading::lifecycle_ground_truth_cached(
-                    corpus::grading::LifecycleGradingOptions {
-                        vectors: vslice,
+                    let corpus = corpus
+                        .as_ref()
+                        .expect("vector benches always prepare a corpus");
+                    // The ingested vectors are still mmapped from the prepared
+                    // corpus — queries and ground truth come from them instead
+                    // of a regeneration. Skip-calibration still computes
+                    // correctness/default recall (and filtered recall); it only
+                    // skips the recall-target calibration sweep.
+                    let vslice = corpus
+                        .vectors()
+                        .expect("vector modality prepared a vector corpus")
+                        .as_slice();
+                    let base_vectors = &vslice[..n_docs * DIM];
+                    let q_correct = corpus::generate_realistic_queries(
+                        base_vectors,
                         n_docs,
-                        augmented_docs,
-                        corpus_seed: supertable::CORPUS_VEC_SEED,
-                        normalized_vectors: true,
-                        filter_keep_every: FILTER_KEEP_EVERY,
-                        top_k: TOP_K,
-                        correctness_query_count: q_correct.len(),
-                        queries: &all_queries,
-                    },
-                );
-                let gt_cal = if skip_cal {
-                    Vec::new()
-                } else {
-                    labels.base.split_off(q_correct.len())
+                        N_CORRECTNESS_QUERIES,
+                        QUERY_CORRECTNESS_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let q_cal = corpus::generate_realistic_queries(
+                        base_vectors,
+                        n_docs,
+                        N_CALIBRATION_QUERIES,
+                        QUERY_CALIBRATION_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let augmented_docs = n_docs + supertable::docs_per_commit();
+                    let all_queries: Vec<Vec<f32>> = if skip_cal {
+                        q_correct.clone()
+                    } else {
+                        q_correct.iter().chain(&q_cal).cloned().collect()
+                    };
+                    let mut labels = corpus::grading::lifecycle_ground_truth_cached(
+                        corpus::grading::LifecycleGradingOptions {
+                            vectors: vslice,
+                            n_docs,
+                            augmented_docs,
+                            corpus_seed: supertable::CORPUS_VEC_SEED,
+                            normalized_vectors: true,
+                            filter_keep_every: FILTER_KEEP_EVERY,
+                            top_k: TOP_K,
+                            correctness_query_count: q_correct.len(),
+                            queries: &all_queries,
+                        },
+                    );
+                    let gt_cal = if skip_cal {
+                        Vec::new()
+                    } else {
+                        labels.base.split_off(q_correct.len())
+                    };
+                    (
+                        q_correct,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 };
-                (
-                    q_correct,
-                    q_cal,
-                    labels.base,
-                    gt_cal,
-                    Some(labels.filtered),
-                    labels.augmented,
-                )
-            };
             // Queries + ground truth extracted. Keep the mapping for the
             // normal follow-up commit, but evict its pages while measuring
             // pre/post-drain search.
@@ -3989,15 +4043,26 @@ pub mod vector {
                     phases
                         .cold
                         .then(|| {
+                            // Latency probe only (not graded); a skip-calibration
+                            // reopen loads no calibration queries, so q_cal is
+                            // empty there -- fall back to the correctness set.
+                            let (cold_probe, cold_rest): (&Vec<f32>, &[Vec<f32>]) =
+                                match q_cal.first() {
+                                    Some(first) => (
+                                        first,
+                                        if q_cal.len() > 1 {
+                                            &q_cal[1..]
+                                        } else {
+                                            &q_cal[..]
+                                        },
+                                    ),
+                                    None => (&q_correct[0], &q_correct[1..]),
+                                };
                             measure_cold_store(
                                 "steady-state",
                                 &built,
-                                &q_cal[0],
-                                if q_cal.len() > 1 {
-                                    &q_cal[1..]
-                                } else {
-                                    &q_cal[..]
-                                },
+                                cold_probe,
+                                cold_rest,
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
