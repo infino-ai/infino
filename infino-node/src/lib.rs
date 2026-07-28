@@ -46,8 +46,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric, OptimizeError,
-    OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    VectorSearchOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +196,23 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
         other => Err(Error::new(
             Status::InvalidArg,
             format!("mode must be 'or' or 'and', got {other:?}"),
+        )),
+    }
+}
+
+/// Parse a BM25 statistics-scope string (`"per_superfile"` default, or
+/// `"global"` for corpus-wide IDF across superfiles).
+fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
+    match stats
+        .unwrap_or("per_superfile")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
+        "global" => Ok(Bm25Stats::Global),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("stats must be 'per_superfile' or 'global', got {other:?}"),
         )),
     }
 }
@@ -509,15 +527,18 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
+        stats: Option<String>,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
-        let mode = parse_mode(mode.as_deref())?;
+        let opts = Bm25SearchOptions::new()
+            .with_mode(parse_mode(mode.as_deref())?)
+            .with_stats(parse_stats(stats.as_deref())?);
         let proj: Option<Vec<&str>> = projection
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .bm25_search(&column, &query, k as usize, mode, proj.as_deref())
+            .bm25_search(&column, &query, k as usize, opts, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
