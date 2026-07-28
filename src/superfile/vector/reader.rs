@@ -3103,49 +3103,66 @@ impl VectorReader {
             running = running.saturating_add(col.n_docs);
         }
 
-        let mut merged: Vec<(u32, f32)> = Vec::new();
-        for (cell_idx, locals) in by_cell {
+        // Probe the selected cells CONCURRENTLY — the same wave shape the
+        // supertable's cross-superfile fan-out (and FTS) already uses, one
+        // level down. A width sweep selects many cells inside one packed
+        // shard; awaiting them serially stacked their fetch+scan+rerank
+        // walls (measured ~1.2 ms x width per query at w=54 on Cohere-1M).
+        // Each cell's probe is independent: own ProbeCtx, own blocks, own
+        // rerank; the merge below is order-independent (re-sorted).
+        let cell_probes = by_cell.into_iter().filter_map(|(cell_idx, locals)| {
             let col = &self.columns[cell_idx];
             if col.n_docs == 0 {
-                continue;
+                return None;
             }
             let base = doc_base[cell_idx];
             // Allow/deny are file-local; each cell IVF checks cell-local ids.
             let cell_allow = self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
             let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
-            let sub_start = col.subsection_range.start;
-            let idx_start = sub_start + col.cluster_idx_off;
-            let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-            let cluster_idx = self
-                .source
-                .range_async(idx_start..idx_end)
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
-            let mut q_rot = vec![0f32; col.dim];
-            col.rot.apply(query, &mut q_rot);
             // No inverse-selectivity rerank inflation — same reasoning as
             // [`Self::search_clusters_async`]: the shortlist is allow-first
             // (matching rows only), so the standard `k × rerank_mult`
             // contract holds unchanged under a filter.
             if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
-                continue;
+                return None;
             }
-            let ctx = ProbeCtx {
-                q_rot: &q_rot,
-                k,
-                rerank_mult,
-                allow: cell_allow,
-                deny: cell_deny,
-                pool: pool.clone(),
-                budget: budget.clone(),
-            };
-            let hits = self
-                .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
-                .await?;
-            for (local_id, score) in hits {
-                merged.push((base.saturating_add(local_id), score));
-            }
-        }
+            let pool = pool.clone();
+            let budget = budget.clone();
+            Some(async move {
+                let sub_start = col.subsection_range.start;
+                let idx_start = sub_start + col.cluster_idx_off;
+                let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
+                let cluster_idx = self
+                    .source
+                    .range_async(idx_start..idx_end)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let mut q_rot = vec![0f32; col.dim];
+                col.rot.apply(query, &mut q_rot);
+                let ctx = ProbeCtx {
+                    q_rot: &q_rot,
+                    k,
+                    rerank_mult,
+                    allow: cell_allow,
+                    deny: cell_deny,
+                    pool,
+                    budget,
+                };
+                let hits = self
+                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .await?;
+                Ok::<Vec<(u32, f32)>, VectorError>(
+                    hits.into_iter()
+                        .map(|(local_id, score)| (base.saturating_add(local_id), score))
+                        .collect(),
+                )
+            })
+        });
+        let mut merged: Vec<(u32, f32)> = try_join_all(cell_probes)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         // Distance ascending (smaller = closer), matching every other vector
         // search path. Descending here kept the farthest k hits and collapsed
         // packed-shard recall to ~0.
