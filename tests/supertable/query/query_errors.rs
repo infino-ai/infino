@@ -548,6 +548,36 @@ fn unindexed_column_errors_name_the_indexed_columns() {
     }
 }
 
+/// A predicate that survives no rows must not swallow the column check:
+/// the filtered and allow-set vector paths short-circuit on an empty
+/// candidate set, and that early return sits ahead of the fan-out.
+#[test]
+fn column_checks_survive_a_predicate_that_matches_nothing() {
+    let st = demo_table();
+    let qv = csv_one_hot(0);
+    for query in [
+        // Scalar predicate: not FTS-resolvable, so the kNN runs unbounded.
+        format!(
+            "SELECT _id FROM vector_search('title', '{qv}', {SURFACE_TOP_K}) WHERE rating > 9999"
+        ),
+        // FTS-resolvable predicate matching nothing: lowers to a bounded
+        // candidate plan whose surviving set is empty.
+        format!(
+            "SELECT _id FROM vector_search('title', '{qv}', {SURFACE_TOP_K}) \
+             WHERE title = 'zzzznomatch'"
+        ),
+        format!(
+            "SELECT _id FROM vector_search('ghost', '{qv}', {SURFACE_TOP_K}) \
+             WHERE title = 'zzzznomatch'"
+        ),
+    ] {
+        assert!(
+            st.reader().query_sql(&query).is_err(),
+            "a bad column must error even when the predicate prunes everything: {query}"
+        );
+    }
+}
+
 /// A name absent from the schema reports exactly that, not the unindexed
 /// message — the two mistakes have different fixes.
 #[test]

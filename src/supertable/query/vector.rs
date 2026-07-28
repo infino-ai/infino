@@ -1245,10 +1245,9 @@ impl SupertableReader {
         // fp32 centroids. Rank every (superfile, cluster) with [`distance`]
         // on the resident centroid slices (zero-copy, no dequant), then
         // probe only the globally-closest clusters.
-        // Undeclared column = caller error, rejected here — not a silent
-        // L2Sq default that fails later with a per-superfile decode error.
-        // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
-        // column's row codes).
+        // The column is already validated at every entry point; this
+        // re-resolves it for its metric and `rot_seed`, which feeds the
+        // 1-bit admit prefilter (same rotation as the column's row codes).
         let (metric, rot_seed) = manifest
             .options
             .require_vector_column(column)
@@ -1902,10 +1901,11 @@ impl SupertableReader {
         options: VectorSearchOptions,
         plan: &CandidatePlan,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let manifest = self.manifest();
+        manifest.options.require_vector_column(column)?;
         if k == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
         let superfiles = match plan.surviving_superfile_ids(manifest).await? {
             None => manifest
                 .get_all_superfiles_loaded()
@@ -2298,6 +2298,7 @@ impl SupertableReader {
         options: VectorSearchOptions,
         prepared: &PreparedGlobalAllow,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.manifest().options.require_vector_column(column)?;
         if k == 0 || prepared.allow_by_uri.is_empty() {
             return Ok(Vec::new());
         }

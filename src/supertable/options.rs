@@ -1310,6 +1310,30 @@ mod tests {
 
     use crate::test_helpers::default_tokenizer as tok;
 
+    /// Vector width for the `require_*_column` fixtures.
+    const INDEX_DIM: usize = 16;
+
+    /// `[title (FTS), emb (vector)]` — each column indexed for one kind
+    /// only, so it is unindexed from the other kind's point of view.
+    fn indexed_opts() -> SupertableOptions {
+        SupertableOptions::new(
+            schema_with_vector(INDEX_DIM),
+            vec![fc("title")],
+            vec![vc("emb", INDEX_DIM)],
+            Some(tok()),
+        )
+        .expect("valid options")
+    }
+
+    /// The message of an [`QueryError::InvalidQuery`], which is the whole
+    /// contract for a column-naming mistake.
+    fn message(err: QueryError) -> String {
+        match err {
+            QueryError::InvalidQuery(m) => m,
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+    }
+
     #[test]
     fn valid_options_with_fts_and_vector_succeeds() {
         let s = schema_with_vector(16);
@@ -2071,36 +2095,17 @@ supertable:
         assert!(matches!(err, BuildError::Store(_)), "{err:?}");
     }
 
-    fn message(err: QueryError) -> String {
-        match err {
-            QueryError::InvalidQuery(m) => m,
-            other => panic!("expected InvalidQuery, got {other:?}"),
-        }
-    }
-
     #[test]
     fn require_column_resolves_an_indexed_column() {
-        let opts = SupertableOptions::new(
-            schema_with_vector(16),
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = indexed_opts();
         opts.require_fts_column("title").expect("title is indexed");
         let config = opts.require_vector_column("emb").expect("emb is indexed");
-        assert_eq!(config.dim, 16, "resolves the column's own config");
+        assert_eq!(config.dim, INDEX_DIM, "resolves the column's own config");
     }
 
     #[test]
     fn require_column_reports_the_indexed_columns_for_an_unindexed_one() {
-        let opts = SupertableOptions::new(
-            schema_with_vector(16),
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = indexed_opts();
         assert_eq!(
             message(
                 opts.require_fts_column("emb")
@@ -2124,7 +2129,7 @@ supertable:
     /// search.
     #[test]
     fn require_column_reports_an_empty_indexed_set() {
-        let opts = SupertableOptions::new(schema_with_vector(16), vec![], vec![], None)
+        let opts = SupertableOptions::new(schema_with_vector(INDEX_DIM), vec![], vec![], None)
             .expect("valid options");
         assert!(
             message(opts.require_fts_column("title").expect_err("no FTS index"))
@@ -2141,13 +2146,7 @@ supertable:
 
     #[test]
     fn require_column_distinguishes_an_absent_column() {
-        let opts = SupertableOptions::new(
-            schema_with_vector(16),
-            vec![fc("title")],
-            vec![vc("emb", 16)],
-            Some(tok()),
-        )
-        .expect("valid options");
+        let opts = indexed_opts();
         for err in [
             opts.require_fts_column("ghost")
                 .expect_err("no such column"),
