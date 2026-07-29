@@ -1317,15 +1317,19 @@ impl SupertableReader {
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if options.nprobe.is_some() {
-                    // Explicit caller `nprobe` wins for hidden queries — filtered
-                    // AND unfiltered — so the bench's coverage-vs-depth breadth
-                    // sweep can actually widen the cell probe. Production never
-                    // sets `nprobe` (default `None` → the `else` arms below keep
-                    // the persisted p=1 routing), so this changes nothing in the
-                    // serving path. Filtered queries additionally lift per-cell
-                    // fine depth to the filtered floor; unfiltered keeps the
-                    // persisted fine depth.
+                if options.nprobe.is_some() && (filtered || cfg!(feature = "test-helpers")) {
+                    // Explicit caller `nprobe` pins the hidden cell sweep. For
+                    // FILTERED queries this is the production path — the width-dial
+                    // calibration and the filtered sweep. For UNFILTERED hidden
+                    // queries it fires only under the `test-helpers` feature, i.e.
+                    // the bench/test build, where the recall breadth-sweep needs to
+                    // actually widen the cell probe. In a production build
+                    // `test-helpers` is off, so an explicit `nprobe` on an
+                    // unfiltered hidden query keeps the persisted p=1 routing (the
+                    // `else` arms below) — `with_nprobe` does not change serving
+                    // behavior. Filtered queries additionally lift per-cell fine
+                    // depth to the filtered floor; unfiltered keeps the persisted
+                    // fine depth.
                     CellRoutingParams {
                         nprobe_min: nprobe.max(1),
                         nprobe_max: nprobe.max(1),

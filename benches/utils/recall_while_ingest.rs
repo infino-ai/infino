@@ -87,6 +87,11 @@ const QUERY_SEED: u64 = 17;
 const QUERY_SIGMA: f32 = 0.05;
 /// Producer memory budget (steers the disk cache's post-commit madvise sweep).
 const WRITER_MEMORY_BUDGET_BYTES: u64 = 8 << 30;
+
+/// Coarse cell-probe widths swept by the breadth diagnostic (recall vs. how
+/// many cells are probed). The table's current cell count is appended at the
+/// call site so the sweep also probes every cell.
+const BREADTH_SWEEP_NPROBE_STEPS: [usize; 5] = [2, 4, 8, 16, 32];
 /// Cron poll granularity — checks the cadence deadline this often.
 const CRON_POLL: Duration = Duration::from_millis(200);
 
@@ -382,7 +387,6 @@ fn trace_misses(
     // retained vector, no engine/codec/IVF) vs the GT heap. It MUST be ~1.0 — if
     // not, the GT pipeline itself is inconsistent and every engine recall number
     // was measured against a broken baseline. Parallel over queries.
-    use rayon::prelude::*;
     let bf: f32 = queries
         .par_iter()
         .zip(heaps.par_iter())
@@ -716,8 +720,9 @@ pub fn run() {
         // built table. If recall climbs toward 1.0 as more cells are probed,
         // the loss is coverage/route-fidelity (breadth), not within-cell depth.
         let cells_now = stats.cells.unwrap_or(0);
-        for np in [2usize, 4, 8, 16, 32, cells_now]
+        for np in BREADTH_SWEEP_NPROBE_STEPS
             .into_iter()
+            .chain([cells_now])
             .filter(|&x| x > 0)
         {
             let r = measure_recall(&st, &queries, &heaps, &id_map, np);
