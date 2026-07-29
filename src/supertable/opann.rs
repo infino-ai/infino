@@ -759,15 +759,14 @@ pub(crate) struct WidthLawCalibration {
     slot_ids: Vec<i128>,
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
-    /// Per-query `(score, cell)` candidates, truncated to the largest law
-    /// `k` as cells merge in. Lock poisoning is recovered, not propagated:
-    /// each merge is an atomic append+truncate, so a panicked pack worker
-    /// leaves the held data usable. NOTE: candidates are not deduplicated
-    /// by stable id — boundary replicas (drain replica factor > 1.0) could
-    /// let one neighbor occupy several top-k slots and narrow the law;
-    /// inert while replication is off, to be resolved with the replication
-    /// repair.
-    tops: Mutex<Vec<Vec<(f32, u32)>>>,
+    /// Per-query `(score, cell, stable id)` candidates, truncated to the
+    /// largest law `k` as cells merge in. The stable id lets [`Self::finish`]
+    /// deduplicate boundary replicas (drain replica factor > 1.0) to their
+    /// best-scored copy, so one neighbor can never occupy several top-k
+    /// slots and narrow the law. Lock poisoning is recovered, not
+    /// propagated: each merge is an atomic append+truncate, so a panicked
+    /// pack worker leaves the held data usable.
+    tops: Mutex<Vec<Vec<(f32, u32, i128)>>>,
 }
 
 impl WidthLawCalibration {
@@ -819,7 +818,7 @@ impl WidthLawCalibration {
             return Ok(());
         }
         let k_max = *WIDTH_LAW_KS.last().expect("law has k points");
-        let mut partial: Vec<Vec<(f32, u32)>> = vec![Vec::new(); n_queries];
+        let mut partial: Vec<Vec<(f32, u32, i128)>> = vec![Vec::new(); n_queries];
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
@@ -841,7 +840,7 @@ impl WidthLawCalibration {
                     if row.stable_id == frozen.ids[qi] {
                         continue;
                     }
-                    partial[qi].push((distance(self.metric, q, &scratch), cell));
+                    partial[qi].push((distance(self.metric, q, &scratch), cell, row.stable_id));
                 }
             }
             // Bound the per-cell partials the same way the merge does.
@@ -888,7 +887,12 @@ impl WidthLawCalibration {
                     *slot = rank as u32;
                 }
             }
+            // Best-scored copy per stable id first: boundary replicas of
+            // one row must count as ONE neighbor, or replicated tables
+            // would measure narrower coverage than a query experiences.
             let mut sorted = cand.clone();
+            sorted.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
+            sorted.dedup_by_key(|c| c.2);
             sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
                 if sorted.len() < k {
@@ -898,7 +902,7 @@ impl WidthLawCalibration {
                 // Per-rank counts of this query's top-k, then a prefix walk
                 // accumulates the mean coverage curve.
                 let mut per_rank = vec![0u32; n_cells];
-                for (_, cell) in &sorted[..k] {
+                for (_, cell, _) in &sorted[..k] {
                     per_rank[rank_of_cell[*cell as usize] as usize] += 1;
                 }
                 let mut covered = 0u32;
@@ -922,7 +926,7 @@ impl WidthLawCalibration {
 }
 
 /// Keep the ascending-best `cap` candidates in place.
-fn truncate_ascending(cand: &mut Vec<(f32, u32)>, cap: usize) {
+fn truncate_ascending(cand: &mut Vec<(f32, u32, i128)>, cap: usize) {
     if cand.len() > cap {
         cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         cand.truncate(cap);
@@ -1004,6 +1008,58 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Boundary replicas must count as ONE neighbor in the width law:
+    /// [`WidthLawCalibration::finish`] dedups candidates to the
+    /// best-scored copy per stable id before measuring coverage. The
+    /// fixture plants one id three times in the two query-nearest cells;
+    /// without the dedup those copies pad the top-10 and the law would
+    /// stop at width 2, hiding the two real neighbors in the 4th-ranked
+    /// cell.
+    #[test]
+    fn width_law_finish_dedups_replicated_rows() {
+        const DIM: usize = 4;
+        // Grid ranked against the e0 query: cells 0, 1, 2, 3 in order.
+        let grid = ClusterCentroids::from_fp32(
+            4,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.9, 0.1, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            vec![1; 4],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // (score, cell, stable id): id 1 replicated across cells 0 and 1;
+        // ids 2..=8 fill the near cells; ids 9 and 10 sit in cell 3 and
+        // only enter the top-10 once the replicas collapse to one slot.
+        let mut cands = vec![(0.01, 0, 1), (0.02, 1, 1), (0.03, 1, 1)];
+        cands.extend((2..=8).map(|id| (0.03 + id as f32 * 0.01, (id % 2) as u32, id as i128)));
+        cands.push((0.5, 3, 9));
+        cands.push((0.6, 3, 10));
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![cands];
+
+        let law = cal.finish(&grid).expect("law from planted candidates");
+        // k=1: the best copy of id 1 sits in the top-ranked cell.
+        assert_eq!(law[0], 1, "top-1 coverage is the nearest cell");
+        // k=10: deduped top-10 = ids 1..=10, whose coverage needs the
+        // 4th-ranked cell. Replica padding would have stopped at 2.
+        assert_eq!(
+            law[1], 4,
+            "replicated copies must not pad top-k coverage (got width {})",
+            law[1]
+        );
+        // 10 deduped candidates cannot support the k=100/1000 points.
+        assert_eq!(&law[2..], &[0, 0], "unsupported points stay uncalibrated");
+    }
     use crate::superfile::vector::{
         cell_posting::{encode_blob, load_encoded_rows_from_blob},
         rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},

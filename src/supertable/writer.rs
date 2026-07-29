@@ -3960,6 +3960,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // small tightly-clustered append would under-probe older data).
         // Widening on new evidence is always recall-safe; the law narrows
         // only when a full rebuild re-measures everything.
+        //
+        // Known staleness bound, accepted for the drain's O(delta) cost
+        // model: the incremental sample scores only tail candidates, so a
+        // distribution-shifting append whose true neighbors span old
+        // packed cells is not fully measured — the merged law can lag the
+        // real cross-generation spread until a full rebuild recalibrates.
+        // The alternative (rescoring every packed cell per incremental
+        // drain) would make drain cost track table size, not delta size.
         if let Some(cal) = width_law.take()
             && let Some(law) = cal.finish(&running_clusters)
         {
