@@ -114,6 +114,11 @@ use crate::{
     },
 };
 
+/// A calibrated law width at or below this resolves to `None`: one cell
+/// is exactly the fine-first default's sweep, so the law only engages
+/// when it demands a WIDER read than the default already performs.
+const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
+
 /// Oversample factor on the per-sweep rerank budget. Dividing
 /// `k x rerank_mult` evenly across the sweep under-serves the nearest
 /// cells (they hold most true neighbors, and the 1-bit estimate ranks
@@ -1402,7 +1407,7 @@ impl SupertableReader {
                 if hidden_vector_index && !filtered && options.nprobe.is_none() {
                     hidden_routing
                         .and_then(|r| r.width_for_k_at(k))
-                        .filter(|w| *w > 1)
+                        .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
                 } else {
                     None
                 };
@@ -1748,9 +1753,7 @@ impl SupertableReader {
         let options = match sweep_width {
             Some(w) if w > 1 => {
                 let (_, rerank_mult) = options.resolve(filtered);
-                options.with_rerank_mult(
-                    (rerank_mult * WIDTH_BUDGET_OVERSAMPLE).div_ceil(w).max(1),
-                )
+                options.with_rerank_mult((rerank_mult * WIDTH_BUDGET_OVERSAMPLE).div_ceil(w).max(1))
             }
             _ => options,
         };
@@ -4107,8 +4110,16 @@ mod tests {
     /// drained one-hot fixture: query-aligned directions score well below
     /// it, every other direction scores exactly 1.0 (cos = 0).
     const ORTHOGONAL_SCORE: f32 = 0.9;
+    /// Fixture dimensionality — one one-hot direction per dim.
+    const FIXTURE_DIM: usize = 16;
+    /// Commits in the drained fixture (each its own user superfile).
+    const FIXTURE_COMMITS: u64 = 4;
+    /// Rows per fixture commit; `FIXTURE_COMMITS x this / FIXTURE_DIM`
+    /// docs land on each one-hot direction.
+    const FIXTURE_ROWS_PER_COMMIT: usize = 32;
     /// Docs planted per one-hot direction (128 docs mod 16 dims).
-    const DOCS_PER_DIRECTION: usize = 8;
+    const DOCS_PER_DIRECTION: usize =
+        FIXTURE_COMMITS as usize * FIXTURE_ROWS_PER_COMMIT / FIXTURE_DIM;
 
     /// Drained planted fixture shared by the probe-width tests: 128 one-hot
     /// docs over 16 directions in 4 commits, drained into per-direction
@@ -4116,17 +4127,22 @@ mod tests {
     /// spans three cells. Returns `(tempdir, table, query, k)`; the tempdir
     /// must outlive the table.
     fn drained_three_direction_fixture() -> (tempfile::TempDir, Supertable, Vec<f32>, usize) {
-        let dim = 16usize;
+        let dim = FIXTURE_DIM;
         let schema = schema_with_vector(dim);
         let opts = options_one_superfile_per_commit(dim);
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
         let st = Supertable::create(opts.with_storage(storage)).expect("create");
-        for c in 0..4u64 {
+        for c in 0..FIXTURE_COMMITS {
             let mut w = st.writer().expect("writer");
-            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
-                .expect("append");
+            w.append(&build_vector_batch(
+                c * FIXTURE_ROWS_PER_COMMIT as u64,
+                FIXTURE_ROWS_PER_COMMIT,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append");
             w.commit().expect("commit");
         }
         st.drain_vectors_to_cells_sync().expect("drain");
