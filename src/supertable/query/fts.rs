@@ -1669,14 +1669,28 @@ mod tests {
     /// there is no top-k truncation boundary where score ties could pick
     /// different docs in the two tables.
     fn all_scored(st: &Supertable, query: &str, stats: Bm25Stats) -> Vec<(String, f32)> {
-        use arrow_array::{Float32Array, LargeStringArray};
+        // `k` large enough to return every match (no top-k truncation).
         const K_ALL: usize = 1000;
+        top_k_scored(st, query, stats, K_ALL)
+    }
+
+    /// Ranked top-`k` `(title, score)` for an `Or`-mode bm25_search. A
+    /// small `k` (well below the match count) fills the top-k heap and
+    /// engages the BMW/MaxScore pruning path; a large `k` returns the
+    /// whole match set.
+    fn top_k_scored(
+        st: &Supertable,
+        query: &str,
+        stats: Bm25Stats,
+        k: usize,
+    ) -> Vec<(String, f32)> {
+        use arrow_array::{Float32Array, LargeStringArray};
         let batches = st
             .reader()
             .bm25_search(
                 "title",
                 query,
-                K_ALL,
+                k,
                 BoolMode::Or,
                 stats,
                 Some(&["title", "score"]),
@@ -1911,6 +1925,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Small-`k` oracle for `Bm25Stats::Global`: with `k` far below the
+    /// match count the top-k heap fills, so the BMW/MaxScore pruning
+    /// path genuinely runs. The stored per-block skip upper bounds are
+    /// rescaled by the global/local idf ratio; if that rescale produced
+    /// an invalid (too-low) bound the pruner would wrongly skip a
+    /// top-scoring doc and corrupt the result. This asserts the pruned
+    /// global top-k still equals the single-superfile top-k.
+    #[test]
+    fn global_stats_small_k_pruning_matches_single_superfile() {
+        // `common` is in every doc, so its postings span more than one
+        // BLOCK_LEN(=128) block and the pruner has whole blocks it can
+        // skip. Three "boost" docs additionally carry a rare, high-idf
+        // term at distinct term frequencies, giving them the three
+        // strictly-highest, distinct scores — an unambiguous top-3.
+        const N: usize = 160;
+        const L: usize = 8; // tokens/doc; uniform so avgdl matches everywhere
+        const K: usize = 3;
+        // (doc index, boost tf). Distinct tf ⇒ distinct scores; the docs
+        // are spread past BLOCK_LEN so a top-k doc sits in a later block
+        // the walk must not wrongly prune.
+        let boosts = [(10usize, 3u32), (90, 2), (150, 1)];
+        let titles: Vec<String> = (0..N)
+            .map(|i| {
+                let bt = boosts
+                    .iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map(|(_, tf)| *tf as usize)
+                    .unwrap_or(0);
+                let mut toks: Vec<String> = vec!["common".to_string()];
+                for _ in 0..bt {
+                    toks.push("boost".to_string());
+                }
+                while toks.len() < L {
+                    toks.push("pad".to_string());
+                }
+                // Unique tag (df=1, never queried, replaces a pad token so
+                // length stays L): keeps every title distinct so a top-k
+                // doc is identifiable across the two independently-built
+                // tables, without affecting any query score.
+                toks[L - 1] = format!("d{i:03}");
+                toks.join(" ")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+
+        // SINGLE: one commit → one superfile (local stats == global).
+        let single = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = single.writer().expect("writer");
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(single.reader().manifest().get_all_superfiles().len(), 1);
+
+        // MULTI: many small commits → many superfiles, same docs.
+        let multi = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        {
+            let mut w = multi.writer().expect("writer");
+            for chunk in refs.chunks(20) {
+                w.append(&build_batch(0, chunk)).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        assert!(multi.reader().manifest().get_all_superfiles().len() > 1);
+
+        // `+common` is the (huge) match set; the rare `boost` is a
+        // scoring-only should whose contribution lifts its docs into the
+        // top-k. The must-driven walk prunes candidates using the
+        // shoulds' `term_max` upper bound, so a `boost` term_max left
+        // un-rescaled (too low) would make the walk over-prune and drop
+        // the very docs that belong in the top-k.
+        let q = "+common boost";
+        let single_ref = top_k_scored(&single, q, Bm25Stats::PerSuperfile, K);
+        let multi_global = top_k_scored(&multi, q, Bm25Stats::Global, K);
+
+        // The heap truly filled: `k` results, far below the ~160 matches.
+        assert_eq!(
+            single_ref.len(),
+            K,
+            "top-k should be truncated to k (heap full)"
+        );
+        assert_eq!(multi_global.len(), K, "global top-k should also be k");
+
+        // Same docs, same order, same scores as the single superfile.
+        for ((s_title, s_score), (g_title, g_score)) in single_ref.iter().zip(&multi_global) {
+            assert_eq!(s_title, g_title, "top-{K} doc/order mismatch under pruning");
+            assert!(
+                (s_score - g_score).abs() <= 1e-5 * s_score.abs().max(1.0),
+                "top-{K} score mismatch: single {s_score} vs global {g_score}"
+            );
+        }
+
+        // Sanity: the top-k really is the three boost docs (only they
+        // carry the rare term), so pruning had to reach them.
+        assert!(
+            multi_global.iter().all(|(t, _)| t.contains("boost")),
+            "top-{K} must be the boost docs, got {multi_global:?}"
+        );
     }
 
     /// Build a single SuperfileBuilder containing the same docs as
