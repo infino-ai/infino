@@ -903,7 +903,14 @@ impl WidthLawCalibration {
                 // accumulates the mean coverage curve.
                 let mut per_rank = vec![0u32; n_cells];
                 for (_, cell, _) in &sorted[..k] {
-                    per_rank[rank_of_cell[*cell as usize] as usize] += 1;
+                    // Candidate cell ids come from the same drain that built
+                    // `grid` and split parents keep their slot when
+                    // superseded, so an out-of-range id is unreachable today
+                    // — but calibration is best-effort diagnostics: an
+                    // inconsistent input abandons the law (unstamped ⇒
+                    // default routing) rather than panicking the drain.
+                    let &rank = rank_of_cell.get(*cell as usize)?;
+                    per_rank[rank as usize] += 1;
                 }
                 let mut covered = 0u32;
                 for (rank, count) in per_rank.iter().enumerate() {
@@ -1152,6 +1159,42 @@ mod tests {
              to the k=10 width instead of stamping a recall inversion"
         );
         assert_eq!(law[3], 0, "k=1000 has no supporting query and stays 0");
+    }
+
+    /// An out-of-range cell id in the candidates (impossible in the current
+    /// drain flow, by construction) abandons the law instead of panicking —
+    /// calibration is diagnostics riding a drain and must never abort one.
+    #[test]
+    fn width_law_bails_on_out_of_range_cell_id() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(
+            2,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0,
+            ],
+            vec![1; 2],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // Cell 7 does not exist in the two-cell grid.
+        let mut acc = Vec::new();
+        merge_candidates(
+            &mut acc,
+            vec![(0.01, 7, 1)],
+            *WIDTH_LAW_KS.last().expect("knots"),
+        );
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        assert!(
+            cal.finish(&grid).is_none(),
+            "inconsistent calibration input must abandon the law, not panic"
+        );
     }
     use crate::superfile::vector::{
         cell_posting::{encode_blob, load_encoded_rows_from_blob},
