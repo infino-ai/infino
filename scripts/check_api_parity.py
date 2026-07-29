@@ -12,7 +12,8 @@ method — the free `connect` / `connect_with` and the `Connection::*` /
 
 The check fails (non-zero exit) when:
   (a) an engine method is missing from api-parity.txt        — new, undecided
-  (b) a `covered` method has no wrapper in a binding          — not exposed
+  (b) a `covered` method has no wrapper in a binding — the Node addon,
+      the Node JS wrapper (index.ts), or Python                — not exposed
   (c) a `covered` method's engine signature drifted           — re-verify wrappers
   (d) an api-parity.txt entry is no longer in public-api.txt  — stale
 
@@ -35,6 +36,11 @@ PUBLIC_API = ROOT / "public-api.txt"
 PARITY = ROOT / "api-parity.txt"
 NODE_SRC = ROOT / "infino-node" / "src"
 PY_SRC = ROOT / "infino-python" / "src"
+# The Node *public* API is the hand-written JS wrapper (index.ts), not the napi
+# addon under src/. A method present in the addon but missing from the wrapper is
+# invisible to users (it shipped once — `createDatabase`), so check both, in the
+# wrapper's camelCase spelling.
+NODE_JS_WRAPPER = ROOT / "infino-node" / "infino" / "index.ts"
 
 # Trait-derive / plumbing methods that aren't part of the operation surface.
 NOISE = {"clone", "fmt", "eq", "from", "default", "serialize", "deserialize",
@@ -105,6 +111,17 @@ def binding_has(src_dir: Path, fn_name: str) -> bool:
     return any(pat.search(f.read_text()) for f in src_dir.rglob("*.rs"))
 
 
+def snake_to_camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(w[:1].upper() + w[1:] for w in rest)
+
+
+def js_wrapper_has(camel: str, text: str) -> bool:
+    """The wrapper defines/exposes `camel(...)`. Excludes `.camel(` — that is a
+    `this.inner.camel(...)` call into the addon, not the wrapper's own method."""
+    return re.search(rf"(?<![.\w]){re.escape(camel)}\s*\(", text) is not None
+
+
 def render(covered_sigs: dict, exempt: dict) -> str:
     lines = [
         "# Parity map for the engine's public operation surface — enforced by",
@@ -151,12 +168,18 @@ def check() -> int:
         if method not in engine:
             errors.append(f"STALE api-parity.txt entry (not in public-api.txt): {method}  -> remove it.")
 
+    node_js = NODE_JS_WRAPPER.read_text()
     for method, recorded in sorted(covered.items()):
         if method not in engine:
             continue
         name = wrapper_name(method)
         if not binding_has(NODE_SRC, name):
-            errors.append(f"COVERED but no Node wrapper `fn {name}`: {method}")
+            errors.append(f"COVERED but no Node addon `fn {name}`: {method}")
+        if not js_wrapper_has(snake_to_camel(name), node_js):
+            errors.append(
+                f"COVERED but not exposed in the Node JS wrapper "
+                f"(infino/index.ts `{snake_to_camel(name)}`): {method}"
+            )
         if not binding_has(PY_SRC, name):
             errors.append(f"COVERED but no Python wrapper `fn {name}`: {method}")
         if normalize_sig(recorded) != engine[method]:

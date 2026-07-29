@@ -35,8 +35,8 @@ pub use infino_engine::{
     InfinoFtsEngine, InfinoFtsIndex, build_positionless, parallel_build_positionless,
 };
 pub use infino_sql_engine::{
-    InfinoSqlEngine, InfinoSqlIndex, build_supertable_with_options, emb_for, sample_query_csv,
-    scatter_key, sql_options, sql_schema,
+    InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, build_supertable_with_options, emb_for,
+    sample_query_csv, scatter_key, sql_options, sql_schema,
 };
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
 pub use sql_driver::{

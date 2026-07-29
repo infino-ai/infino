@@ -695,6 +695,42 @@ mod tests {
         );
     }
 
+    /// Process-default get counters and the timeline/phase helpers must
+    /// be callable (and no-op cleanly when the diagnostic YAML flags are
+    /// off) — these APIs are the bench/diag surface.
+    #[test]
+    fn io_counters_take_snapshot_timeline_and_phase_apis() {
+        let _before = io_counters::take();
+        let snap = io_counters::snapshot();
+        // Snapshot is a plain value; just confirm it is constructed.
+        let _ = snap.get_count;
+
+        io_counters::timeline_reset();
+        let start = io_counters::timeline_start();
+        io_counters::timeline_record("get", "s3://bucket/key", 0, 64, start);
+        let spans = io_counters::timeline_take();
+        if io_counters::timeline_enabled() {
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].op, "get");
+            assert_eq!(spans[0].len, 64);
+        } else {
+            assert!(spans.is_empty(), "timeline off ⇒ record is a no-op");
+        }
+
+        io_counters::phase_reset();
+        let v = io_counters::phase_timed("unit", || 7u32);
+        assert_eq!(v, 7);
+        let phases = io_counters::phase_take();
+        if io_counters::phase_enabled() {
+            assert_eq!(phases.len(), 1);
+            assert_eq!(phases[0].0, "unit");
+        } else {
+            assert!(phases.is_empty());
+        }
+        // Second take after an empty window is empty either way.
+        assert!(io_counters::phase_take_summed().is_empty());
+    }
+
     /// Minimal in-memory [`StorageProvider`] implementing only the
     /// required methods, leaving `tail`, `list_with_prefix`, and
     /// `object_store_handle` at their trait defaults — those default
@@ -1054,5 +1090,49 @@ mod tests {
         assert_eq!(delta.get_count, 1);
         assert_eq!(delta.hidden_get_count(), 1);
         assert_eq!(delta.hidden_get_bytes(), 10);
+    }
+
+    /// Prefixed list APIs strip the namespace prefix from returned keys
+    /// so callers see the logical sub-tree, not the full storage path.
+    #[tokio::test]
+    async fn prefixed_provider_list_strips_sub_prefix_and_metadata() {
+        use crate::storage::LocalFsStorageProvider;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let inner = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let prefixed =
+            PrefixedStorageProvider::new(Arc::clone(&inner) as _, "_infino_test_vector_index/");
+        prefixed
+            .put_atomic("seg/a.bin", Bytes::from_static(b"aaa"))
+            .await
+            .expect("put a");
+        prefixed
+            .put_atomic("seg/b.bin", Bytes::from_static(b"bbbb"))
+            .await
+            .expect("put b");
+        prefixed
+            .put_atomic("other/c.bin", Bytes::from_static(b"c"))
+            .await
+            .expect("put c");
+
+        let mut keys = prefixed.list_with_prefix("seg/").await.expect("list");
+        keys.sort();
+        assert_eq!(keys, vec!["seg/a.bin".to_string(), "seg/b.bin".to_string()]);
+
+        let mut metas = prefixed
+            .list_with_prefix_metadata("seg/")
+            .await
+            .expect("list meta");
+        metas.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].0, "seg/a.bin");
+        assert_eq!(metas[0].1.size, 3);
+        assert_eq!(metas[1].0, "seg/b.bin");
+        assert_eq!(metas[1].1.size, 4);
+
+        // Empty sub-prefix lists the whole prefixed namespace.
+        let all = prefixed.list_with_prefix("").await.expect("list all");
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|k| !k.contains("_infino_test_vector_index")));
     }
 }

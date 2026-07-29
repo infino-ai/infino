@@ -328,6 +328,12 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
 pub struct PreparedCorpus {
     text: Option<MmapTextCorpus>,
     vectors: Option<MmapVectorCorpus>,
+    // The SQL shape's `emb` column (see `harness::infino_sql_engine`) is
+    // generated inline per-row by `chunk_batch`/`emb_for`, not through the
+    // `vectors` mmap corpus above (`Modality::Sql.has_vector()` is false) —
+    // so its bytes are tracked here instead, or `byte_size()` would ignore
+    // the largest column the SQL shape actually ingests.
+    sql_embed_bytes: u64,
 }
 
 impl PreparedCorpus {
@@ -339,7 +345,8 @@ impl PreparedCorpus {
     }
 
     /// Logical size of the raw input corpus fed to ingest — text bytes
-    /// plus vector f32 bytes. This is the *source* data size, distinct
+    /// plus vector f32 bytes (plus the SQL shape's inline `emb` column,
+    /// see `sql_embed_bytes`). This is the *source* data size, distinct
     /// from the index bytes the supertable writes to object storage.
     pub fn byte_size(&self) -> u64 {
         let text = self.text.as_ref().map(|t| t.total_bytes()).unwrap_or(0);
@@ -348,7 +355,7 @@ impl PreparedCorpus {
             .as_ref()
             .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
             .unwrap_or(0);
-        text + vec
+        text + vec + self.sql_embed_bytes
     }
 }
 
@@ -397,7 +404,20 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
             MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
         }
     });
-    PreparedCorpus { text, vectors }
+    // `Modality::Sql` is the one shape that ingests an embedding column
+    // without going through the `vectors` mmap corpus above (it has no
+    // vector index, so `has_vector()` is false) — sized here so
+    // `byte_size()` still counts it.
+    let sql_embed_bytes = if modality.has_sql() {
+        (n_docs * DIM * size_of::<f32>()) as u64
+    } else {
+        0
+    };
+    PreparedCorpus {
+        text,
+        vectors,
+        sql_embed_bytes,
+    }
 }
 
 /// The next normal vector commit after the measured base ingest.

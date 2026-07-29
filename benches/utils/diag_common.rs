@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     OptimizeOptions,
     superfile::builder::FtsConfig,
-    supertable::{Supertable, SupertableOptions},
+    supertable::{OptimizeError, Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
 };
 use rayon::ThreadPoolBuilder;
@@ -123,7 +123,7 @@ pub fn diag_options() -> SupertableOptions {
         diag_schema(),
         vec![FtsConfig {
             column: "title".into(),
-            positions: false,
+            positions: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -210,9 +210,16 @@ pub fn build_supertable(cfg: &DiagConfig) -> (Supertable, Vec<RecordBatch>) {
     // Optimize with defaults — the maintenance step a real deployment runs.
     // (At small totals this leaves the per-commit superfiles as-is, since
     // optimize only merges once the total exceeds the target size.)
-    table
-        .optimize(&OptimizeOptions::default())
-        .expect("optimize diag supertable");
+    // Best-effort: this table is in-memory (no storage provider), so once
+    // the total crosses the merge target the compaction step returns
+    // `NoStorage` — the same class GC already tolerates in `optimize`. The
+    // diag's timed kernel/resolve split runs over the per-commit
+    // superfiles either way; tolerate it so the diag scales past the merge
+    // threshold instead of aborting.
+    match table.optimize(&OptimizeOptions::default()) {
+        Ok(_) | Err(OptimizeError::NoStorage) => {}
+        Err(other) => panic!("optimize diag supertable: {other}"),
+    }
     (table, batches)
 }
 

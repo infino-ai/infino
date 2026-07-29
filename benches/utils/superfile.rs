@@ -56,6 +56,8 @@ fn emit_cost_warm(
     title: String,
     ingest_wall_s: f64,
     writers: u32,
+    ingest_cpu_s: Option<f64>,
+    ingest_peak_rss_bytes: Option<u64>,
     stored_bytes: u64,
     corpus_bytes: u64,
     n_docs: usize,
@@ -72,8 +74,8 @@ fn emit_cost_warm(
         &cost::CellCost {
             ingest_wall_s,
             writers,
-            ingest_peak_rss_bytes: None,
-            ingest_cpu_s: None,
+            ingest_peak_rss_bytes,
+            ingest_cpu_s,
             // A single-superfile commit is exactly one `put_atomic`.
             n_commits: 1,
             unmetered_put_count: Some(1),
@@ -89,6 +91,7 @@ fn emit_cost_warm(
             vector_cell: false,
             storage_months: None,
             cold_open_amortized: false,
+            serving_groups: None,
         },
     );
 }
@@ -146,9 +149,9 @@ pub mod fts {
 
     use crate::{
         corpus::{self, MmapTextCorpus, block_on_inmem},
-        cost,
+        cost, cpu,
         executors::{
-            ColdTiming, fts as exec_fts,
+            fts as exec_fts,
             fts::{FTS_BATTERY, FtsRead},
         },
         harness::{
@@ -191,7 +194,6 @@ pub mod fts {
     /// path. Excluded from the cold object-store search tier, where their
     /// near-full-corpus unions cost ~1 s per fresh-cache iteration for no
     /// added count signal (the count battery runs warm).
-    const LARGE_UNION_NAMES: &[&str] = &["twenty_term_or", "forty_term_or"];
     /// Timed warm-search samples per query (after a short warmup); p50 /
     /// p90 / p99 are computed over these.
     pub const WARM_ITERS: usize = 50;
@@ -501,19 +503,27 @@ pub mod fts {
                     .map(|(name, query, mode)| (*name, negation_p50(index.reader(), query, *mode)))
                     .collect::<Vec<(&'static str, Duration)>>()
             });
-            if phases.warm || probes.is_some() {
+            // Cold is measured up front so warm and cold land in ONE table:
+            // a shape's full economics read across a single row.
+            let cold = phases.cold.then(|| measure_cold_queries(&index));
+            if phases.warm || phases.cold || probes.is_some() {
                 exec_fts::emit_search(
                     &mut report,
                     "bench/fts/superfile/search",
                     format!(
-                        "Superfile FTS — search, single-superfile / in-memory ({} docs)",
+                        "Superfile FTS — queries + cost, single superfile ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Warm = `SuperfileReader::open` in memory (per-query p50 / p90 / p99; Δ gates on \
-                     `p50`); cold = same `.parquet` on object storage via `DiskCacheStore::reader` -> \
-                     `bm25_search` (production cold path). Δ is vs the previous run.",
+                    "One row per shape, warm and cold together. Warm = `SuperfileReader::open` in \
+                     memory (p50 / p90 / p99; Δ gates on `p50`); cold = the same `.parquet` on \
+                     object storage read through `DiskCacheStore::reader` with a fresh cache per \
+                     iteration (production cold path). `+fetch` columns are the same search plus \
+                     materializing the top-k text. Payload is the logical size of the returned \
+                     values; $/1M = compute + object-store requests + egress on that payload. The \
+                     raw-kernel query phase returns `(doc, score)` pairs rather than an Arrow \
+                     result, so its payload is 0 at this tier. Δ is vs the previous run.",
                     warm.as_deref(),
-                    None,
+                    cold.as_ref(),
                     probes.as_deref(),
                 );
             }
@@ -623,26 +633,12 @@ pub mod fts {
                     format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
                     b.phase.wall.as_secs_f64(),
                     b.writers as u32,
+                    b.cpu_s,
+                    Some(b.phase.rss.peak_rss_bytes),
                     index.bytes().len() as u64,
                     corpus.total_bytes(),
                     n_docs,
                     &cost::warm_from_fts(warm_stats),
-                );
-            }
-            if phases.cold {
-                let cold = measure_cold_queries(&index);
-                exec_fts::emit_search(
-                    &mut report,
-                    "bench/fts/superfile/cold",
-                    format!(
-                        "Superfile FTS — cold search, object-store ({} docs)",
-                        fmt_count(n_docs)
-                    ),
-                    "Cold = same `.parquet` committed to object storage, read through \
-                     `DiskCacheStore::reader` with a fresh cache per iteration. Δ is vs the previous run.",
-                    None,
-                    Some(&cold),
-                    None,
                 );
             }
         }
@@ -698,9 +694,7 @@ pub mod fts {
         let docs = corpus.rows();
         eprintln!("[superfile_fts] default-config (positionless) build probes...");
         let sampler = rss::PeakSampler::start_default();
-        let t0 = Instant::now();
-        let bytes = build_positionless(FTS_COLUMN, &docs);
-        let wall = t0.elapsed();
+        let (bytes, wall, cpu_s) = cpu::timed(|| build_positionless(FTS_COLUMN, &docs));
         let rss_stats = sampler.stop_stats();
         let default_stored = bytes.len() as u64;
         drop(bytes);
@@ -710,18 +704,20 @@ pub mod fts {
                 wall,
                 rss: rss_stats,
             },
+            cpu_s,
         }];
         let writers = corpus::parallel_writers();
         if writers > 1 {
             let sampler = rss::PeakSampler::start_default();
-            let t0 = Instant::now();
-            parallel_build_positionless(FTS_COLUMN, &docs, writers);
+            let ((), wall, cpu_s) =
+                cpu::timed(|| parallel_build_positionless(FTS_COLUMN, &docs, writers));
             builds.push(BuildStat {
                 writers,
                 phase: PhaseStats {
-                    wall: t0.elapsed(),
+                    wall,
                     rss: sampler.stop_stats(),
                 },
+                cpu_s,
             });
         }
         (builds, default_stored)
@@ -758,22 +754,21 @@ pub mod fts {
 
     /// Cold tier: commit the same bytes to object storage, then read each
     /// query through the production cold path.
-    fn measure_cold_queries(index: &InfinoFtsIndex) -> HashMap<&'static str, ColdTiming> {
+    fn measure_cold_queries(
+        index: &InfinoFtsIndex,
+    ) -> HashMap<&'static str, exec_fts::FtsColdStat> {
         eprintln!(
             "[superfile_fts] uploading measured 1-writer artifact to object storage for cold tier..."
         );
         let committed = tiers::block_on(tiers::commit_superfile(&Bytes::copy_from_slice(
             index.bytes(),
         )));
-        // Skip the large-union shapes in the cold tier: their
-        // near-full-corpus unions cost ~1 s per fresh-cache iteration
-        // (object-store reads, no warm cache) and add no cold signal the
-        // smaller shapes don't — they exist to stress the warm count path.
-        let cold_battery: Vec<_> = FTS_BATTERY
-            .iter()
-            .copied()
-            .filter(|q| !LARGE_UNION_NAMES.contains(&q.name))
-            .collect();
+        // Every warm shape is also measured cold — including the wide
+        // unions. They are the most expensive cold shapes (near-full-corpus
+        // posting fetches), which makes them the ones a cost model least
+        // affords to omit; excluding them would cap the reported cost curve
+        // exactly where it climbs.
+        let cold_battery: Vec<_> = FTS_BATTERY.to_vec();
         eprintln!(
             "[superfile_fts] cold search: {} queries × {COLD_ITERS} fresh-cache iters...",
             cold_battery.len(),
@@ -786,6 +781,9 @@ pub mod fts {
             FTS_COLUMN,
             K,
             COLD_ITERS,
+            // The raw cold reader has no lazy row-take path; cold fetch is
+            // measured at the supertable tier through the public projection.
+            false,
             "superfile_fts",
         )
     }
@@ -832,6 +830,16 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> usize {
             exec_fts::superfile_rows_fetched(&self.reader, column, query, k, mode)
+        }
+
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> ((u64, u64), (u64, u64)) {
+            self.reader.bm25_payloads(column, query, k, mode)
         }
 
         fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
@@ -1522,6 +1530,8 @@ pub mod vector {
                     ),
                     b.wall.as_secs_f64(),
                     b.writers as u32,
+                    b.cpu_s,
+                    Some(b.rss.peak_rss_bytes),
                     index.bytes().len() as u64,
                     corpus_bytes,
                     n_docs,
@@ -1843,7 +1853,7 @@ pub mod sql {
         cost,
         executors::{sql as exec_sql, sql::SqlRead},
         harness::{
-            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SqlRow, SqlRunConfig,
+            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlRow, SqlRunConfig,
             build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
             sql_options,
         },
@@ -1891,24 +1901,32 @@ pub mod sql {
             let stored = stored_bytes(&index);
             emit_build(&mut report, n_docs, &corpus, &result, stored);
         }
-        if phases.warm {
+        let warm_sets = phases.warm.then(|| {
             exec_sql::assert_correct(&index, n_docs, "superfile_sql");
-            let sets = exec_sql::measure_query_sets(
+            exec_sql::measure_query_sets(
                 &index,
                 &query_inputs,
                 exec_sql::ITERS,
                 "superfile_sql",
                 exec_sql::HIGH_CARD_SQL,
-            );
+            )
+        });
+        let cold = phases.cold.then(|| {
+            let corpus_rows = corpus.rows();
+            let rows = sql_rows(&corpus_rows);
+            measure_cold_queries(&rows)
+        });
+        if let Some(sets) = &warm_sets {
             exec_sql::emit_query(
                 &mut report,
                 "bench/sql/query",
                 format!(
-                    "Superfile SQL — query, single superfile / in-memory ({} rows)",
+                    "Superfile SQL — queries + cost, single superfile ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm p50 / p90 / p99 over `query_sql` against the canonical 1-writer table, all through infino's own path (the DataFusion-only control arms are not run here); Δ gates on `p50`. Blocks: aggregations & count-filters, FTS-pushdown equality, aggregates over an FTS candidate set, and the search table functions. `Rows` is the result-set size. Δ is vs the previous run.",
-                &sets,
+                "Warm + cold per shape in one table: warm p50 / p90 / p99 over `query_sql` against                  the canonical 1-writer table (in-memory); cold = the same table committed to                  object storage, fresh disk cache per iteration (manifest-answered aggregates                  only — the object-storage scan realism lives at the supertable tier). $/1M =                  compute + requests + egress on the returned payload. Δ gates on warm/cold p50.",
+                sets,
+                cold.as_ref(),
             );
             let b = result
                 .builds
@@ -1920,25 +1938,12 @@ pub mod sql {
                 format!("Superfile SQL — cost model ({} rows)", fmt_count(n_docs)),
                 b.wall.as_secs_f64(),
                 b.writers as u32,
+                b.cpu_s,
+                Some(b.rss.peak_rss_bytes),
                 stored_bytes(&index),
                 corpus.total_bytes(),
                 n_docs,
-                &cost::warm_from_sql(&sets),
-            );
-        }
-        if phases.cold {
-            let corpus_rows = corpus.rows();
-            let rows = sql_rows(&corpus_rows);
-            let cold = measure_cold_queries(&rows);
-            exec_sql::emit_cold(
-                &mut report,
-                "bench/sql/superfile/cold",
-                format!(
-                    "Superfile SQL — cold query, object-store ({} rows)",
-                    fmt_count(n_docs)
-                ),
-                "Cold p50 over `reader().query_sql` after reopening the same SQL table shape from object storage with a fresh disk cache per iteration. Δ is vs the previous run.",
-                &cold,
+                &cost::warm_from_sql(sets),
             );
         }
         report.save();
@@ -1966,6 +1971,7 @@ pub mod sql {
             qv: sample_query_csv(),
             sample_title: corpus_rows[mid].1.replace('\'', "''"),
             sample_key: scatter_key(corpus_rows[mid].0),
+            n_docs,
         };
         let rows = sql_rows(&corpus_rows);
 
@@ -2045,9 +2051,16 @@ pub mod sql {
     ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
         const COLD_ITERS: usize = 5;
         let artifact = build_cold_artifact(rows);
+        // In-memory single-superfile tier — cold is served locally, so the
+        // scalar aggregate battery is fine here (the object-storage scan
+        // realism only matters for the supertable tier).
+        let battery: Vec<(&'static str, &str)> = exec_sql::SQL_BATTERY
+            .iter()
+            .map(|q| (q.name, q.sql))
+            .collect();
         eprintln!(
             "[superfile_sql] cold queries: {} queries × {COLD_ITERS} fresh-cache iters...",
-            exec_sql::SQL_BATTERY.len(),
+            battery.len(),
         );
         let cold = exec_sql::measure_cold(
             || {
@@ -2058,6 +2071,7 @@ pub mod sql {
                     table,
                 }
             },
+            &battery,
             COLD_ITERS,
             "superfile_sql",
         );
@@ -2076,6 +2090,9 @@ pub mod sql {
     impl SqlRead for SqlColdGuard {
         fn query_rows(&self, sql: &str) -> usize {
             self.table.query_rows(sql)
+        }
+        fn query_payload(&self, sql: &str) -> (u64, u64) {
+            self.table.query_payload(sql)
         }
         fn query_count(&self, sql: &str) -> i64 {
             self.table.query_count(sql)
@@ -2134,7 +2151,13 @@ pub mod sql {
         result: &EngineSqlResult,
         stored_bytes: u64,
     ) {
-        let corpus_bytes = corpus.total_bytes();
+        // The ingested schema also carries a `SQL_DIM`-wide `emb` column
+        // (see `harness::infino_sql_engine::sql_schema`) generated inline by
+        // `emb_for`, not through this `MmapTextCorpus` — so the text-only
+        // `total_bytes()` must be topped up with the embedding bytes or
+        // "Corpus"/"Bandwidth"/"Stored %" silently ignore the largest
+        // ingested column.
+        let corpus_bytes = corpus.total_bytes() + (n_docs * SQL_DIM * size_of::<f32>()) as u64;
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -2160,7 +2183,7 @@ pub mod sql {
         report.emit(&Section {
             anchor: "bench/sql/build".into(),
             title: format!(
-                "Superfile SQL — ingest, single superfile / in-memory ({} rows: title + category + score)",
+                "Superfile SQL — ingest, single superfile / in-memory ({} rows: title + bucket + key + category + rating + emb[{SQL_DIM}])",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, through \
