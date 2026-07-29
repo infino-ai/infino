@@ -4056,7 +4056,12 @@ pub mod vector {
                                             &q_cal[..]
                                         },
                                     ),
-                                    None => (&q_correct[0], &q_correct[1..]),
+                                    None => (
+                                        q_correct
+                                            .first()
+                                            .expect("correctness query set is non-empty"),
+                                        &q_correct[1..],
+                                    ),
                                 };
                             measure_cold_store(
                                 "steady-state",

@@ -187,6 +187,9 @@ pub fn load_oracle(path: &Path) -> Result<CachedOracle> {
     let top_k = key.top_k as usize;
     let base = pull_ground_truth(&mut cursor, key.query_count as usize, top_k)?;
     let correctness = key.correctness_query_count as usize;
+    if correctness > queries.len() {
+        return invalid_data("lifecycle ground-truth cache correctness count exceeds query count");
+    }
     let filtered = pull_ground_truth(&mut cursor, correctness, top_k)?;
     let augmented = pull_ground_truth(&mut cursor, correctness, top_k)?;
     if !cursor.is_empty() {
@@ -381,6 +384,16 @@ fn pull_queries(cursor: &mut &[u8]) -> Result<Vec<Vec<f32>>> {
     let dim = read_u64(cursor)? as usize;
     if dim != DIM {
         return invalid_data("lifecycle ground-truth cache query dim mismatch");
+    }
+    // Bound the claimed count by the bytes actually present before allocating,
+    // so a corrupt count can't drive a huge Vec::with_capacity (mirrors the
+    // validate-before-allocate guard in pull_ground_truth).
+    if count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .is_none_or(|need| need > cursor.len())
+    {
+        return invalid_data("lifecycle ground-truth cache query count exceeds buffer");
     }
     let mut queries = Vec::with_capacity(count);
     for _ in 0..count {
