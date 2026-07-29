@@ -82,7 +82,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use super::{
@@ -3982,8 +3982,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
                 *slot = (*slot).max(measured);
             }
-            eprintln!(
-                "[supertable drain] probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
+            info!(
+                "supertable drain: probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
                 routing.width_for_k
             );
         }
