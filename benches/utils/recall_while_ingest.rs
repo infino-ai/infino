@@ -239,7 +239,7 @@ fn hidden_stats(consumer: &Supertable, cell_cap: Option<u64>) -> HiddenStats {
     let over_cap = cell_cap.map(|cap| rows_by_cell.values().filter(|&&rows| rows > cap).count());
 
     // drained% = user superfiles whose birth version is in the drained set.
-    let user_reader = consumer.reader();
+    let user_reader = consumer.reader().expect("reader");
     let user_sfs = user_reader.manifest().get_all_superfiles();
     let drained_ranges = hidden.pinned_reader().manifest().get_drained_ranges();
     let drained_pct = if user_sfs.is_empty() {
@@ -298,6 +298,7 @@ impl IdMap {
         self.next_dense = 0;
         let batches = consumer
             .reader()
+            .expect("reader")
             .query_sql("SELECT _id FROM supertable ORDER BY _id")
             .expect("SELECT _id for id map");
         for batch in &batches {
@@ -328,7 +329,7 @@ fn measure_recall(
     id_map: &IdMap,
     nprobe: usize,
 ) -> f32 {
-    let reader = consumer.reader();
+    let reader = consumer.reader().expect("reader");
     // nprobe == ENGINE_DEFAULT (0) keeps engine-default routing; a positive
     // value overrides the coarse cell-probe width (breadth) via search_opts.
     // INFINO_BENCH_RERANK_MULT (diagnostic) overrides the Sq8 rerank shortlist
@@ -379,7 +380,7 @@ fn trace_misses(
     id_map: &IdMap,
     retained: &[f32],
 ) {
-    let reader = consumer.reader();
+    let reader = consumer.reader().expect("reader");
     let opts = exec_vec::search_opts(exec_vec::ENGINE_DEFAULT, exec_vec::ENGINE_DEFAULT);
     let n_retained = retained.len() / DIM;
 
