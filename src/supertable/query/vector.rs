@@ -68,7 +68,8 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    mem,
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -97,6 +98,7 @@ use crate::{
         vector::{
             distance::{Metric, distance, relative_score_window},
             layout::VectorLayout,
+            reader::ScanCandidate,
         },
     },
     supertable::{
@@ -1694,8 +1696,10 @@ impl SupertableReader {
         // for every entry would `expect`-panic on exactly those
         // filtered-out superfiles; gating it behind the selection guard
         // keeps the lookup on the path where presence is invariant.
-        let mut units: Vec<(Arc<SuperfileEntry>, (Vec<u32>, Option<Arc<RoaringBitmap>>))> =
-            Vec::new();
+        let mut units: Vec<(
+            Arc<SuperfileEntry>,
+            (usize, Vec<u32>, Option<Arc<RoaringBitmap>>),
+        )> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
             let Some(ids) = per_seg.remove(&si) else {
                 continue;
@@ -1707,7 +1711,7 @@ impl SupertableReader {
                 },
                 None => None,
             };
-            units.push((Arc::clone(entry), (ids, bitmap)));
+            units.push((Arc::clone(entry), (si, ids, bitmap)));
         }
         if units.is_empty() {
             if let Some(t0) = admit_t0 {
@@ -1735,20 +1739,40 @@ impl SupertableReader {
         // sweep so the TOTAL survivor budget stays ~k x rerank_mult —
         // measured sufficient at that total: 0.9957 recall@100 on
         // Cohere-1M with ~25.6K survivors.
+        // On the hidden width sweep the divide is superseded by GLOBAL
+        // shortlist selection: warm cells scan at the undivided cap and the
+        // supertable keeps the best `k x rerank_mult` estimates across the
+        // whole sweep — exact, no even-split heuristic (measured 0.9937
+        // undivided vs 0.9914 divided recall@100 on Cohere-1M). Cold cells
+        // still rerank inside their own probe under the divided budget:
+        // deferring them would hold their fetched blocks and their budget
+        // reservation across the entire fan-out.
+        let global_shortlist_width = if hidden_vector_index {
+            sweep_width.filter(|w| *w > 1)
+        } else {
+            None
+        };
+        let mut cold_rerank_mult = 0;
         let options = match sweep_width {
             Some(w) if w > 1 => {
                 let (_, rerank_mult) = options.resolve(filtered);
-                options.with_rerank_mult(
-                    rerank_mult
-                        .saturating_mul(WIDTH_BUDGET_OVERSAMPLE)
-                        .div_ceil(w)
-                        .max(1),
-                )
+                let divided = rerank_mult
+                    .saturating_mul(WIDTH_BUDGET_OVERSAMPLE)
+                    .div_ceil(w)
+                    .max(1);
+                if global_shortlist_width.is_some() {
+                    cold_rerank_mult = divided;
+                    options
+                } else {
+                    options.with_rerank_mult(divided)
+                }
             }
             _ => options,
         };
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let column_arc2 = Arc::clone(&column_arc);
+        let query_arc2 = Arc::clone(&query_arc);
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
         // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
         let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
@@ -1762,76 +1786,112 @@ impl SupertableReader {
         // dropped after ranking by identity instead. The hidden path skips
         // sidecars entirely: its deletes ride inline in the hidden manifest
         // and are applied after remapping to user `_id`s.
-        let body = move |reader: Arc<SuperfileReader>,
-                         entry: Arc<SuperfileEntry>,
-                         tombstone_cache: Option<Arc<SidecarCache>>,
-                         now: Instant,
-                         (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
-            let column = Arc::clone(&column_arc);
-            let query = Arc::clone(&query_arc);
-            let reader_pool = Arc::clone(&reader_pool);
-            let budget = budget.clone();
-            let storage = storage.clone();
-            async move {
-                // Unfiltered user path on row-addressable locals: resolve the
-                // bitmap once (warm after the orchestrator's prefetch) and
-                // push it down. Filtered search leaves it `None` — its
-                // allow-set already excludes tombstones.
-                let deny_pushdown = !hidden_vector_index
-                    && bitmap.is_none()
-                    && entry.vector_layout != VectorLayout::MultiCellIvf;
-                let deny = match tombstone_cache.as_ref() {
-                    Some(cache) if deny_pushdown => {
-                        dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
-                    }
-                    _ => None,
-                };
-                let pool = Some(Arc::clone(&reader_pool));
-                // Replicated hidden cells store boundary duplicates; fetch
-                // enough extra slots that the post-merge stable-id dedup
-                // still leaves k distinct rows.
-                let replica_overhead = reader
-                    .vec()
-                    .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
-                    .unwrap_or(0);
-                let k_fetch = k.saturating_add(replica_overhead);
-                let reader_for_ids = Arc::clone(&reader);
-                let hits = reader
-                    .vector_search_clusters_filtered(
-                        &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
-                    )
-                    .await
-                    .map_err(vector_read_query_error)?;
-                let mut tagged = dispatch::tag_hits(&entry, hits);
-                // Prefer manifest span arithmetic; only touch `_id` pages /
-                // inline IVF regions when the layout is cell-packed or gapped.
-                io_counters::phase_timed_async("vec.stable_id", async {
-                    dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await
-                })
-                .await?;
-                if !hidden_vector_index && !deny_pushdown {
-                    // MultiCell user files (and any path that skipped the
-                    // push-down): drop deleted rows by identity post-rank.
-                    dispatch::apply_resolved_tombstone_filter(
-                        &reader_for_ids,
-                        storage.as_ref(),
-                        tombstone_cache.as_ref(),
-                        &entry,
-                        &mut tagged,
-                        now,
-                    )
+        // Warm-cell estimate survivors from every scanned unit, pooled for
+        // the global selection: (unit index, rot seed, candidates).
+        let scan_pool: Arc<Mutex<Vec<(usize, u64, Vec<ScanCandidate>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let scan_pool_body = Arc::clone(&scan_pool);
+        let body =
+            move |reader: Arc<SuperfileReader>,
+                  entry: Arc<SuperfileEntry>,
+                  tombstone_cache: Option<Arc<SidecarCache>>,
+                  now: Instant,
+                  (si, ids, bitmap): (usize, Vec<u32>, Option<Arc<RoaringBitmap>>)| {
+                let column = Arc::clone(&column_arc);
+                let query = Arc::clone(&query_arc);
+                let reader_pool = Arc::clone(&reader_pool);
+                let budget = budget.clone();
+                let storage = storage.clone();
+                let scan_pool = Arc::clone(&scan_pool_body);
+                async move {
+                    // Unfiltered user path on row-addressable locals: resolve the
+                    // bitmap once (warm after the orchestrator's prefetch) and
+                    // push it down. Filtered search leaves it `None` — its
+                    // allow-set already excludes tombstones.
+                    let deny_pushdown = !hidden_vector_index
+                        && bitmap.is_none()
+                        && entry.vector_layout != VectorLayout::MultiCellIvf;
+                    let deny = match tombstone_cache.as_ref() {
+                        Some(cache) if deny_pushdown => {
+                            dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                        }
+                        _ => None,
+                    };
+                    let pool = Some(Arc::clone(&reader_pool));
+                    // Replicated hidden cells store boundary duplicates; fetch
+                    // enough extra slots that the post-merge stable-id dedup
+                    // still leaves k distinct rows.
+                    let replica_overhead = reader
+                        .vec()
+                        .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                        .unwrap_or(0);
+                    let k_fetch = k.saturating_add(replica_overhead);
+                    let reader_for_ids = Arc::clone(&reader);
+                    let hits = if global_shortlist_width.is_some() {
+                        // Deferred-rerank scan: exact hits from cold cells now;
+                        // warm-cell estimate survivors pooled for the global
+                        // selection (phase C reranks the winners).
+                        let scan = reader
+                            .vector_scan_clusters_filtered(
+                                &column,
+                                &query,
+                                k_fetch,
+                                &ids,
+                                options,
+                                cold_rerank_mult,
+                                bitmap,
+                                deny,
+                                pool,
+                                budget,
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?;
+                        if !scan.candidates.is_empty() {
+                            scan_pool
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push((si, scan.rot_seed, scan.candidates));
+                        }
+                        scan.hits
+                    } else {
+                        reader
+                            .vector_search_clusters_filtered(
+                                &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?
+                    };
+                    let mut tagged = dispatch::tag_hits(&entry, hits);
+                    // Prefer manifest span arithmetic; only touch `_id` pages /
+                    // inline IVF regions when the layout is cell-packed or gapped.
+                    io_counters::phase_timed_async("vec.stable_id", async {
+                        dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
+                            .await
+                    })
                     .await?;
+                    if !hidden_vector_index && !deny_pushdown {
+                        // MultiCell user files (and any path that skipped the
+                        // push-down): drop deleted rows by identity post-rank.
+                        dispatch::apply_resolved_tombstone_filter(
+                            &reader_for_ids,
+                            storage.as_ref(),
+                            tombstone_cache.as_ref(),
+                            &entry,
+                            &mut tagged,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                 }
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            }
-        };
+            };
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
-        let per_superfile = if allow.is_some() {
+        let mut per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
             let mut collected = Vec::new();
             while !units.is_empty() {
@@ -1846,6 +1906,86 @@ impl SupertableReader {
         } else {
             dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
         };
+
+        // Phase C of the deferred-rerank width sweep: select the best
+        // `k x rerank_mult` estimates ACROSS every warm-scanned cell and
+        // superfile, then rerank only those winners where they live. The
+        // estimates are comparable across units — one rotation seed per
+        // column, table-wide — asserted here at the only place different
+        // units' estimates ever meet.
+        if global_shortlist_width.is_some() {
+            let pooled = {
+                let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
+                mem::take(&mut *guard)
+            };
+            if !pooled.is_empty() {
+                debug_assert!(
+                    pooled.windows(2).all(|w| w[0].1 == w[1].1),
+                    "pooled 1-bit estimates require one rotation seed per column"
+                );
+                let (_, rerank_mult) = options.resolve(filtered);
+                let mut flat: Vec<(usize, ScanCandidate)> = pooled
+                    .into_iter()
+                    .flat_map(|(si, _, cands)| cands.into_iter().map(move |c| (si, c)))
+                    .collect();
+                flat = select_global_shortlist(flat, k.saturating_mul(rerank_mult));
+                let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+                for (si, cand) in flat {
+                    winners_by_seg.entry(si).or_default().push(cand);
+                }
+                let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> = superfiles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(si, entry)| {
+                        winners_by_seg
+                            .remove(&si)
+                            .map(|sel| (Arc::clone(entry), sel))
+                    })
+                    .collect();
+                let column = Arc::clone(&column_arc2);
+                let query = Arc::clone(&query_arc2);
+                let reader_pool = Arc::clone(&manifest.options.reader_pool);
+                let body_c = move |reader: Arc<SuperfileReader>,
+                                   entry: Arc<SuperfileEntry>,
+                                   _tombstone_cache: Option<Arc<SidecarCache>>,
+                                   _now: Instant,
+                                   selected: Vec<ScanCandidate>| {
+                    let column = Arc::clone(&column);
+                    let query = Arc::clone(&query);
+                    let reader_pool = Arc::clone(&reader_pool);
+                    async move {
+                        // Hidden-path invariants: no tombstone sidecars (the
+                        // manifest's deletes apply after the stable-id
+                        // remap upstream), replica slack mirrors phase A.
+                        let replica_overhead = reader
+                            .vec()
+                            .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                            .unwrap_or(0);
+                        let k_fetch = k.saturating_add(replica_overhead);
+                        let reader_for_ids = Arc::clone(&reader);
+                        let hits = reader
+                            .vector_rerank_selected(
+                                &column,
+                                &query,
+                                k_fetch,
+                                selected,
+                                Some(reader_pool),
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?;
+                        let mut tagged = dispatch::tag_hits(&entry, hits);
+                        io_counters::phase_timed_async("vec.stable_id", async {
+                            dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
+                                .await
+                        })
+                        .await?;
+                        Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+                    }
+                };
+                per_superfile
+                    .extend(dispatch::fanout_with(self, rerank_units, false, false, body_c).await?);
+            }
+        }
         if let Some(t0) = fanout_t0 {
             io_counters::phase_record("vec.fanout_wall", t0.elapsed().as_micros() as u64);
         }
@@ -2806,6 +2946,29 @@ fn apply_width_pin(
     }
 }
 
+/// Deterministic global shortlist selection for deferred-rerank width
+/// sweeps: keep the `limit` best 1-bit estimates pooled across every
+/// scanned unit. Higher estimate = better; ties break on
+/// (unit, cell, pos, did), a total order, so the KEPT SET is
+/// insertion-order independent across concurrent scans. O(n) partition,
+/// not a sort — the winners need no internal order (phase C regroups by
+/// unit and the rerank is exact).
+fn select_global_shortlist(
+    mut pooled: Vec<(usize, ScanCandidate)>,
+    limit: usize,
+) -> Vec<(usize, ScanCandidate)> {
+    let cmp = |a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)| {
+        b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
+            (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
+        })
+    };
+    if pooled.len() > limit {
+        pooled.select_nth_unstable_by(limit, cmp);
+        pooled.truncate(limit);
+    }
+    pooled
+}
+
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     // Total order over hits: distance ascending, then the unique
     // `(superfile, local_doc_id)` key. The tie-break makes the kept set
@@ -2963,11 +3126,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
-        admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
         gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
         postings_by_cell_from_summaries, projection_is_id_score_only, score_fine_candidates,
-        union_cell_selection, vector_read_query_error,
+        select_global_shortlist, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -4309,6 +4472,79 @@ mod tests {
         let sweep = apply_width_pin(&mut r, None, None, false, 256);
         assert_eq!(r, base);
         assert_eq!(sweep, None);
+    }
+
+    /// The deferred-rerank width sweep under the tightest possible rerank
+    /// budget: `rerank_mult = 1` leaves the global selection exactly `k`
+    /// slots across ALL probed cells — the even-split divide would hand
+    /// each cell a starved slice, but the global pool ranks every cell's
+    /// estimates together, so the planted neighbors (whose one-hot
+    /// estimates dominate the orthogonal rest) all survive selection and
+    /// rerank to the exact top-k.
+    #[test]
+    fn global_shortlist_survives_minimal_rerank_budget() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new()
+                    .with_nprobe(DOCS_PER_DIRECTION)
+                    .with_rerank_mult(1),
+                None,
+            )
+            .expect("wide search, minimal budget");
+        assert_eq!(
+            near_count(&hits),
+            k,
+            "global shortlist selection at k x 1 must keep every planted \
+             neighbor across three cells"
+        );
+    }
+
+    /// [`select_global_shortlist`] is deterministic and order-independent:
+    /// the same candidates in any arrival order produce the same cut, ties
+    /// on estimate break on (unit, cell, pos, did), and the limit is a
+    /// hard truncation.
+    #[test]
+    fn select_global_shortlist_is_deterministic() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        let a = vec![
+            (0usize, cand(0.9, 0, 1, 1)),
+            (1usize, cand(0.9, 0, 1, 1)),
+            (0usize, cand(0.5, 1, 2, 2)),
+            (1usize, cand(0.7, 0, 3, 3)),
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let pick = |v: Vec<(usize, ScanCandidate)>| {
+            select_global_shortlist(v, 3)
+                .into_iter()
+                .map(|(si, c)| (si, c.cell_idx, c.pos, c.did))
+                .collect::<Vec<_>>()
+        };
+        let mut from_a = pick(a);
+        let mut from_b = pick(b);
+        from_a.sort_unstable();
+        from_b.sort_unstable();
+        assert_eq!(
+            from_a, from_b,
+            "the kept SET must be arrival-order independent (its internal \
+             order is unspecified — the partition does not sort)"
+        );
+        assert_eq!(from_a.len(), 3, "limit is a hard truncation");
+        // Tie on estimate 0.9 breaks by unit, so both 0.9 copies stay and
+        // the 0.7 candidate takes the last slot; 0.5 falls off the cut.
+        assert_eq!(from_a, vec![(0, 0, 1, 1), (1, 0, 1, 1), (1, 0, 3, 3)]);
     }
 
     /// A clean drain calibrates the probe-width law from the table's own
