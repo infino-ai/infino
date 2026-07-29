@@ -1381,7 +1381,11 @@ pub mod vector {
     pub fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
         let mut opts = VectorSearchOptions::default();
         if nprobe != ENGINE_DEFAULT {
-            opts = opts.with_nprobe(nprobe);
+            // Bench diagnostic: also let the explicit nprobe widen the coarse
+            // cell probe on unfiltered hidden-indexed queries (the breadth
+            // sweep). No-op for filtered queries / production (setter is
+            // test-helpers-gated).
+            opts = opts.with_nprobe(nprobe).widen_unfiltered_hidden_cells();
         }
         if rerank_mult != ENGINE_DEFAULT {
             opts = opts.with_rerank_mult(rerank_mult);
