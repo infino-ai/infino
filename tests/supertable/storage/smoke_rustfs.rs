@@ -62,8 +62,15 @@ const BUDGET_N_ROWS: usize = 65_536;
 /// `BUDGET_N_ROWS` (dim 16, `n_cent` 4, Sq8, default or `nprobe` 4). Assert a
 /// band around the observed ~156 KB fetch: tight enough to prove it's the
 /// real cluster fetch, loose enough to survive minor codec / layout drift.
+// The manifest-calibrated probe-width law widened the default cold sweep
+// from the fine-first single probe to width(k) cells across several
+// units, each unit reserving its selected cells' blocks concurrently —
+// the same fixture now peaks ~5x the single-probe band (measured
+// 622,592 B). The band still pins both failure modes: ~0 = budget not
+// exercised on the query path; far above = reservations leaking past
+// the sweep's working set.
 const CONTROL_PEAK_LOW_BYTES: usize = 120_000;
-const CONTROL_PEAK_HIGH_BYTES: usize = 200_000;
+const CONTROL_PEAK_HIGH_BYTES: usize = 800_000;
 /// Bounded budget set generously above one cold fetch (~156 KB); 90% gate is
 /// 900 KB. Proves an enforcing budget admits under-budget work.
 const AMPLE_BUDGET_BYTES: u64 = 1_000_000;
