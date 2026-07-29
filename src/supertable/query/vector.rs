@@ -1419,14 +1419,26 @@ impl SupertableReader {
             // full, so callers need the width dial to buy recall past that
             // ceiling. Fine depth is untouched by the pin: the filtered
             // floors above still apply, unfiltered keeps its branch's depth.
+            //
+            // `sweep_width` — the per-sweep rerank-budget divide and the
+            // per-fragment fine gating downstream — engages on UNFILTERED
+            // sweeps only: a filtered query keeps its pre-width budget and
+            // wave-pooled gating even under an explicit `nprobe`, because a
+            // sparse allow-set's shortlist divided across cells starves.
+            // The width is clamped to the cells that actually carry
+            // postings: the budget divide must split by what the sweep can
+            // read, not by an override larger than the populated grid.
+            let populated_cells = postings_by_cell.len().max(1);
             if options.nprobe.is_some() {
                 cell_routing.nprobe_min = nprobe.max(1);
                 cell_routing.nprobe_max = nprobe.max(1);
-                sweep_width = Some(nprobe.max(1));
+                if !filtered {
+                    sweep_width = Some(nprobe.clamp(1, populated_cells));
+                }
             } else if let Some(width) = law_width {
                 cell_routing.nprobe_min = width;
                 cell_routing.nprobe_max = width;
-                sweep_width = Some(width);
+                sweep_width = Some(width.min(populated_cells));
                 // The law was calibrated against exact top-k, so its
                 // coverage numbers assume a probed cell is read in full
                 // (measured: half-depth caps recall at 0.964 where full
@@ -1532,7 +1544,7 @@ impl SupertableReader {
                 // depth follows width, read amplification is what was asked
                 // for (explicitly by the caller, or measured as necessary
                 // by the drain's calibration).
-                let generation_of = if options.nprobe.is_some() || law_width.is_some() {
+                let generation_of = if sweep_width.is_some() {
                     None
                 } else {
                     Some(birth_versions.as_slice())
@@ -1753,7 +1765,12 @@ impl SupertableReader {
         let options = match sweep_width {
             Some(w) if w > 1 => {
                 let (_, rerank_mult) = options.resolve(filtered);
-                options.with_rerank_mult((rerank_mult * WIDTH_BUDGET_OVERSAMPLE).div_ceil(w).max(1))
+                options.with_rerank_mult(
+                    rerank_mult
+                        .saturating_mul(WIDTH_BUDGET_OVERSAMPLE)
+                        .div_ceil(w)
+                        .max(1),
+                )
             }
             _ => options,
         };
@@ -4081,13 +4098,21 @@ mod tests {
                 None,
             )
             .expect("wide search");
+        let unfiltered_exact = near_count(&hits);
         assert!(
-            hits.len() >= 8,
-            "e_0 has 8 exact matches across commits; wide search must find them, got {}",
-            hits.len()
+            unfiltered_exact >= 8,
+            "e_0 has 8 exact matches across commits; wide search must find \
+             them, got {unfiltered_exact}"
         );
 
-        // Filtered variant over the same corpus.
+        // Filtered variant over the same corpus. The title predicate
+        // matches every row, so the allow-set machinery runs with full
+        // coverage and must recover the SAME exact matches as the
+        // unfiltered sweep — pinning that a filtered query with an explicit
+        // `nprobe` keeps its full per-cell shortlist (the width-era
+        // rerank-budget divide and per-fragment gating are unfiltered-only
+        // semantics; a filtered sweep that picked them up would starve a
+        // sparse allow-set).
         let filtered = st
             .reader()
             .expect("reader")
@@ -4103,7 +4128,12 @@ mod tests {
                 }),
             )
             .expect("filtered wide search");
-        assert!(!filtered.is_empty(), "filtered wide search returns hits");
+        assert_eq!(
+            near_count(&filtered),
+            unfiltered_exact,
+            "filtered+nprobe must find the same exact matches as the \
+             unfiltered sweep"
+        );
     }
 
     /// Score bound separating planted neighbors from orthogonal docs in the
