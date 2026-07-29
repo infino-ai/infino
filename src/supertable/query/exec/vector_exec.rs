@@ -752,7 +752,11 @@ mod tests {
             "SELECT _id, title, score FROM vector_search('emb', '{}', {n})",
             csv_one_hot(dim, 0)
         );
-        let batches = st.reader().query_sql(&sql).expect("query_sql");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&sql)
+            .expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, n, "single superfile, k=n → all docs resolved");
 
@@ -786,6 +790,7 @@ mod tests {
         let query = csv_one_hot(dim, 0);
         let resolved = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT _id, title FROM vector_search('emb', '{query}', {n})"
             ))
@@ -825,6 +830,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT _id FROM vector_search('emb', '{query}', {n})"
             ))
@@ -848,6 +854,7 @@ mod tests {
         // the condition the pushdown exists to fix.
         let unfiltered = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT title, score FROM vector_search('emb', '{q}', {k})"
             ))
@@ -863,6 +870,7 @@ mod tests {
         // exactly the k nearest rare docs — no underflow, every row matches.
         let filtered = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE title = 'rare'"
             ))
@@ -897,6 +905,7 @@ mod tests {
         // unbounded path still returns correct results end-to-end.
         let rows = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT title, score FROM vector_search('emb', '{q}', {k}) WHERE score >= 0.0"
             ))
@@ -913,7 +922,11 @@ mod tests {
             "SELECT * FROM vector_search('emb', '{}', 3)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.reader().query_sql(&sql).expect("query_sql");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&sql)
+            .expect("query_sql");
         let b = &batches[0];
         // Scalar schema (_id, title) + score.
         assert_eq!(b.num_columns(), 3);
@@ -931,7 +944,11 @@ mod tests {
             "SELECT score FROM vector_search('emb', '{}', 2)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.reader().query_sql(&sql).expect("query_sql");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&sql)
+            .expect("query_sql");
         let b = &batches[0];
         assert_eq!(b.num_columns(), 1);
         assert_eq!(b.schema().field(0).name(), "score");
@@ -948,12 +965,14 @@ mod tests {
         let q = csv_one_hot(dim, 0);
         let full = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT _id, title, score FROM vector_search('emb', '{q}', 5)"
             ))
             .expect("query_sql");
         let only = st
             .reader()
+            .expect("reader")
             .query_sql(&format!("SELECT score FROM vector_search('emb', '{q}', 5)"))
             .expect("query_sql");
 
@@ -983,7 +1002,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("SELECT title FROM vector_search('emb', [{arr}], 1)");
-        let batches = st.reader().query_sql(&sql).expect("query_sql");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&sql)
+            .expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
         assert_eq!(col_str(&batches[0], "title").value(0), "doc 0");
@@ -997,7 +1020,11 @@ mod tests {
             "SELECT _id, score FROM vector_search('emb', '{}', 5)",
             csv_one_hot(dim, 0)
         );
-        let batches = st.reader().query_sql(&sql).expect("query_sql");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(&sql)
+            .expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
     }
@@ -1099,6 +1126,7 @@ mod tests {
         // 2 args (missing k) → planning error.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql(&format!(
                     "SELECT _id FROM vector_search('emb', '{}')",
                     csv_one_hot(dim, 0)
@@ -1115,7 +1143,7 @@ mod tests {
     async fn vector_table_and_exec_trait_methods() {
         let dim = 16;
         let st = supertable_one_superfile(dim, 8);
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let func = VectorSearchFunc::new(reader, scalar_schema);
@@ -1148,6 +1176,7 @@ mod tests {
         let st = supertable_one_superfile(dim, 8);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "EXPLAIN SELECT _id FROM vector_search('emb', '{}', 5)",
                 csv_one_hot(dim, 0)

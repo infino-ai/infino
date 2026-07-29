@@ -115,6 +115,14 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
+    /// The table was dropped and purged while this handle was open, so the
+    /// commit had no pointer to fence against. Carried as its own variant
+    /// rather than folded into [`Self::Store`] so the public mapping can
+    /// report a missing table instead of a backend fault — see
+    /// [`CommitError::PointerVanished`] and `From<BuildError> for InfinoError`.
+    #[error("table was dropped and purged while this handle was open")]
+    TableGone,
+
     #[error("merge needs more memory than the connection budget allows: {0}")]
     MemoryBudgetExceeded(String),
 
@@ -152,6 +160,20 @@ impl BuildError {
         match self {
             BuildError::OverBudget(m) => Some(m),
             _ => None,
+        }
+    }
+}
+
+impl From<CommitError> for BuildError {
+    /// Commit failures reach the build path as `Store` carrying the message —
+    /// except a vanished pointer, which keeps its own variant so the public
+    /// mapping can report the table missing rather than a backend fault. A
+    /// stringified error cannot be matched on, and the append path converts
+    /// here before any caller sees it.
+    fn from(e: CommitError) -> Self {
+        match e {
+            CommitError::PointerVanished => BuildError::TableGone,
+            other => BuildError::Store(other.to_string()),
         }
     }
 }
@@ -194,6 +216,11 @@ pub enum CommitError {
     /// loop later is non-breaking.
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
+
+    /// The pointer this commit would have fenced against is gone: the table
+    /// was dropped and purged while this handle stayed open. Not retryable.
+    #[error("manifest pointer was deleted while this handle was open")]
+    PointerVanished,
 }
 
 #[derive(Debug, Error)]

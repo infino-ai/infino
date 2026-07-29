@@ -80,6 +80,7 @@ fn build_table() -> Supertable {
 fn explain(st: &Supertable, sql: &str) -> String {
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql(&format!("EXPLAIN {sql}"))
         .expect("explain");
     let mut out = String::new();
@@ -99,7 +100,7 @@ fn explain(st: &Supertable, sql: &str) -> String {
 }
 
 fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
-    let batches = st.reader().query_sql(sql).expect("sql");
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     batch
         .column(0)
@@ -110,7 +111,7 @@ fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
 }
 
 fn scalar_f64(st: &Supertable, sql: &str) -> f64 {
-    let batches = st.reader().query_sql(sql).expect("sql");
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     batch
         .column(0)

@@ -178,7 +178,7 @@ impl WorkloadState {
 /// sidecar bitmap is hit twice (idempotent union; bitmap stays
 /// the same shape but the cache's last-written etag advances).
 fn drive_tombstones(st: &Supertable, ws: &WalStore, fraction: f64, churn: bool) {
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let mut targets: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles().iter() {
         let n = (entry.n_docs as f64 * fraction).ceil() as i64;
@@ -244,6 +244,7 @@ fn p50(samples: &mut [Duration]) -> Duration {
 fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
         .reader()
+        .expect("reader")
         .bm25_search(
             "title",
             QUERY_TERM,
@@ -259,6 +260,7 @@ fn measure_fts(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let hits = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 black_box("title"),
                 black_box(QUERY_TERM),
@@ -278,6 +280,7 @@ fn measure_fts(st: &Supertable) -> Duration {
 fn measure_sql(st: &Supertable) -> Duration {
     let warm = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) FROM supertable")
         .expect("sql");
     black_box(warm);
@@ -286,6 +289,7 @@ fn measure_sql(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
             .expect("sql");
         samples.push(t0.elapsed());

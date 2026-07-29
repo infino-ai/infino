@@ -189,10 +189,14 @@ async fn supertable_real_gcs_round_trip() {
     )
     .expect("open real gcs supertable");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_docs_total(), EXPECTED_N_DOCS);
+    assert_eq!(
+        consumer.reader().expect("reader").n_docs_total(),
+        EXPECTED_N_DOCS
+    );
 
     let bm25 = consumer
         .reader()
+        .expect("reader")
         .bm25_search(
             "title",
             "alpha",
@@ -208,6 +212,7 @@ async fn supertable_real_gcs_round_trip() {
     query[0] = 1.0;
     let vectors = consumer
         .reader()
+        .expect("reader")
         .vector_search(
             "emb",
             &query,
@@ -221,6 +226,7 @@ async fn supertable_real_gcs_round_trip() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query real gcs");
     assert_eq!(batches.len(), 1);

@@ -205,6 +205,7 @@ fn demo_supertable() {
     // the public, row-returning path is `Supertable::bm25_search`.
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "fox", SEARCH_TOP_K, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across superfiles -> {} hit(s)", hits.len());
@@ -215,6 +216,7 @@ fn demo_supertable() {
     // SQL surfaces the real auto-injected `_id` alongside the payload.
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id, title FROM supertable ORDER BY _id")
         .expect("query_sql");
     let table = pretty_format_batches(&batches).expect("format");

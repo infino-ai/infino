@@ -100,6 +100,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // Follow-up SQL query no longer returns the row.
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -123,6 +124,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // batch, so assert on the row count, not the batch count.
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_search(
             "title",
             "bravo",
@@ -205,6 +207,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     // later assertion exercises invalidation, not a cold read.
     let n_rows: usize = reader_handle
         .reader()
+        .expect("reader")
         .bm25_search(
             "title",
             "bravo",
@@ -233,6 +236,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     // The very next query on the other worker must drop the row.
     let n_rows: usize = reader_handle
         .reader()
+        .expect("reader")
         .bm25_search(
             "title",
             "bravo",
@@ -249,6 +253,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
 
     let batches = reader_handle
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("post-delete sql");
     let titles: Vec<String> = batches
@@ -315,6 +320,7 @@ async fn writer_update_replaces_matching_rows() {
 
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -394,7 +400,7 @@ async fn update_emitted_superfile_carries_subsection_offsets() {
     w.commit().expect("commit update");
     drop(w);
 
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let manifest = reader.manifest();
     let emitted = manifest
         .get_all_superfiles()

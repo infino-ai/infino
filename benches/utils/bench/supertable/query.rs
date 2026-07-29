@@ -16,7 +16,7 @@ pub fn vector_topk_global(
     options: VectorSearchOptions,
 ) -> Vec<i128> {
     let batches = st
-        .reader()
+        .reader().expect("reader")
         .vector_search(VEC_COLUMN, query, k, options, None, None)
         .expect("vector_search");
     corpus::id_scores_from_vector_search(&batches)

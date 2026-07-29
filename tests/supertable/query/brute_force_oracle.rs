@@ -182,7 +182,7 @@ fn supertable_to_global_ids(
     hits: Vec<SuperfileHit>,
     chunk_size: usize,
 ) -> Vec<u64> {
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let manifest = r.manifest();
     hits.into_iter()
         .map(|h| {
@@ -199,6 +199,7 @@ fn supertable_to_global_ids(
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", query, k, BoolMode::Or)
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -212,6 +213,7 @@ fn supertable_search_and_global(
 ) -> Vec<u64> {
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", query, k, BoolMode::And)
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -225,6 +227,7 @@ fn supertable_prefix_global(
 ) -> Vec<u64> {
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_search_prefix("title", prefix, k)
         .expect("supertable bm25_prefix");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -519,7 +522,7 @@ fn prefix_skip_prunes_superfiles_without_matching_lex_range() {
         .collect();
     corp[0].1.push_str(" quokka_unique");
     let infino = build_supertable(&corp, SUPERFILES);
-    let r = infino.reader();
+    let r = infino.reader().expect("reader");
     let hits = r
         .bm25_search_prefix("title", "quokka", ORACLE_TOP_K_SMALL)
         .expect("prefix");

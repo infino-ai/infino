@@ -1557,6 +1557,7 @@ pub mod vector {
             let batches = self
                 .table
                 .reader()
+                .expect("reader")
                 .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
                 .expect("supertable vector_search");
             corpus::id_scores_from_vector_search(&batches)
@@ -1582,6 +1583,7 @@ pub mod vector {
             let batches = self
                 .table
                 .reader()
+                .expect("reader")
                 .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
                 .expect("supertable vector_search payload");
             super::payload_bytes(&batches)
@@ -2120,7 +2122,14 @@ pub mod vector {
         title: String,
         note: &str,
     ) -> Vec<RecallRow> {
-        let q0 = &q_cal[0];
+        // Representative query for the latency probes below. Prefer a
+        // calibration query; fall back to the correctness set, which a
+        // skip-calibration reopen loads from the oracle bin without any
+        // calibration queries (so `q_cal` is legitimately empty there).
+        let q0 = q_cal
+            .first()
+            .or_else(|| q_correct.first())
+            .expect("run_search needs at least one held-out query");
         let mut rows: Vec<RecallRow> = Vec::new();
         let default_recall: Option<f32>;
         if skip_calibration {
@@ -2581,6 +2590,7 @@ pub mod sql {
                 &self
                     .table()
                     .reader()
+                    .expect("reader")
                     .query_sql(sql)
                     .expect("query_sql payload"),
             )
@@ -2590,6 +2600,7 @@ pub mod sql {
                 &self
                     .table()
                     .reader()
+                    .expect("reader")
                     .query_sql(sql)
                     .expect("query_sql count"),
             )
@@ -2599,6 +2610,7 @@ pub mod sql {
     impl SqlRead for Supertable {
         fn query_rows(&self, sql: &str) -> usize {
             self.reader()
+                .expect("reader")
                 .query_sql(sql)
                 .expect("query_sql")
                 .iter()
@@ -2606,10 +2618,22 @@ pub mod sql {
                 .sum()
         }
         fn query_payload(&self, sql: &str) -> (u64, u64) {
-            payload_bytes(&self.reader().query_sql(sql).expect("query_sql payload"))
+            payload_bytes(
+                &self
+                    .reader()
+                    .expect("reader")
+                    .query_sql(sql)
+                    .expect("query_sql payload"),
+            )
         }
         fn query_count(&self, sql: &str) -> i64 {
-            scalar_i64(&self.reader().query_sql(sql).expect("query_sql count"))
+            scalar_i64(
+                &self
+                    .reader()
+                    .expect("reader")
+                    .query_sql(sql)
+                    .expect("query_sql count"),
+            )
         }
         fn settle_warm(&self) {
             self.wait_until_warm(WARM_SETTLE_TIMEOUT)

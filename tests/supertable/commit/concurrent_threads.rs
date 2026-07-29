@@ -91,7 +91,7 @@ fn build_batch(start: u64, n: usize) -> RecordBatch {
 fn reader_pinned_before_writer_starts_never_sees_commits() {
     let st = Supertable::create(options()).expect("create");
     // Pin BEFORE any commit; capture the snapshot.
-    let pinned = st.reader();
+    let pinned = st.reader().expect("reader");
     assert_eq!(pinned.manifest_id(), 0);
     assert_eq!(pinned.n_superfiles(), 0);
 
@@ -132,7 +132,7 @@ fn reader_pinned_before_writer_starts_never_sees_commits() {
     assert_eq!(pinned.n_superfiles(), 0);
 
     // A FRESH reader sees the post-commit state.
-    let fresh = st.reader();
+    let fresh = st.reader().expect("reader");
     assert_eq!(fresh.manifest_id(), 5);
     assert_eq!(fresh.n_superfiles(), 5);
     assert_eq!(fresh.n_docs_total(), 5 * 3);
@@ -148,7 +148,7 @@ fn reader_obtained_after_writer_finishes_sees_full_state() {
     }
     drop(w);
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.manifest_id(), 3);
     assert_eq!(r.n_superfiles(), 3);
     assert_eq!(r.n_docs_total(), 12);
@@ -162,7 +162,7 @@ fn pinned_reader_holds_arc_across_subsequent_commits() {
     w.commit().expect("c1");
 
     // Pin reader at manifest_id=1.
-    let r1 = st.reader();
+    let r1 = st.reader().expect("reader");
     let r1_arc = Arc::clone(r1.manifest());
     assert_eq!(r1.manifest_id(), 1);
 
@@ -179,7 +179,7 @@ fn pinned_reader_holds_arc_across_subsequent_commits() {
     );
 
     // Fresh reader sees the new state.
-    let r2 = st.reader();
+    let r2 = st.reader().expect("reader");
     assert_eq!(r2.manifest_id(), 3);
     assert!(!Arc::ptr_eq(r1.manifest(), r2.manifest()));
 }
@@ -203,7 +203,7 @@ fn concurrent_readers_at_same_commit_share_arc_pointer() {
         let bar = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             bar.wait();
-            let r = st.reader();
+            let r = st.reader().expect("reader");
             Arc::clone(r.manifest())
         }));
     }
@@ -228,11 +228,11 @@ fn manifest_id_monotonic_across_serially_pinned_readers() {
     let st = Supertable::create(options()).expect("create");
     let mut w = st.writer().expect("writer");
     let mut observed: Vec<u64> = Vec::new();
-    observed.push(st.reader().manifest_id());
+    observed.push(st.reader().expect("reader").manifest_id());
     for i in 0..5u64 {
         w.append(&build_batch(i * 10, 2)).expect("append");
         w.commit().expect("commit");
-        observed.push(st.reader().manifest_id());
+        observed.push(st.reader().expect("reader").manifest_id());
     }
     drop(w);
 
@@ -272,7 +272,7 @@ fn many_concurrent_readers_during_writer_commits_no_inconsistencies() {
         reader_handles.push(thread::spawn(move || {
             let mut max_seen: u64 = 0;
             for _ in 0..pins_per_reader {
-                let r = st.reader();
+                let r = st.reader().expect("reader");
                 let id_before = r.manifest_id();
                 let n_before = r.n_superfiles();
                 // Brief hold so we straddle a commit boundary
@@ -303,7 +303,7 @@ fn many_concurrent_readers_during_writer_commits_no_inconsistencies() {
     // After the writer is done, the FINAL fresh reader must show
     // exactly n_commits — independent of how reader threads
     // observed intermediate state.
-    let final_r = st_arc.reader();
+    let final_r = st_arc.reader().expect("reader");
     assert_eq!(final_r.manifest_id(), n_commits);
     assert_eq!(final_r.n_superfiles(), n_commits as usize);
 
@@ -342,14 +342,14 @@ fn fresh_reader_sequence_taken_during_concurrent_commits_is_monotonic() {
     let mut samples: Vec<u64> = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        samples.push(st.reader().manifest_id());
+        samples.push(st.reader().expect("reader").manifest_id());
         if samples.last() == Some(&n_commits) {
             break;
         }
     }
     writer.join().expect("writer joined");
     // Final sample after writer fully finished.
-    samples.push(st.reader().manifest_id());
+    samples.push(st.reader().expect("reader").manifest_id());
 
     for w in samples.windows(2) {
         assert!(

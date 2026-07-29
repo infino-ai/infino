@@ -107,7 +107,7 @@ async fn fts_query_excludes_tombstoned_row() {
 
     // Resolve the middle row's `_id`. The producer assigned ids
     // contiguously starting at `id_min`, so middle = id_min + 1.
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let entry = manifest
         .get_all_superfiles()
         .first()
@@ -127,6 +127,7 @@ async fn fts_query_excludes_tombstoned_row() {
     // middle row.
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
@@ -152,7 +153,7 @@ async fn sql_query_excludes_tombstoned_row() {
     w.commit().expect("commit");
     drop(w);
 
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let entry = manifest
         .get_all_superfiles()
         .first()
@@ -178,6 +179,7 @@ async fn sql_query_excludes_tombstoned_row() {
     // tombstoned rows).
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);
@@ -191,6 +193,7 @@ async fn sql_query_excludes_tombstoned_row() {
     // `SELECT title` should return only the un-tombstoned rows.
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<&str> = batches
@@ -326,7 +329,7 @@ async fn vector_query_excludes_tombstoned_row() {
     w.commit().expect("commit");
     drop(w);
 
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let entry = manifest
         .get_all_superfiles()
         .first()
@@ -346,6 +349,7 @@ async fn vector_query_excludes_tombstoned_row() {
     // so a no-backfill filter returns empty. It must return row 1.
     let top1 = st
         .reader()
+        .expect("reader")
         .vector_hits("embedding", &q, 1, VectorSearchOptions::new(), None)
         .expect("vector k=1");
     assert_eq!(
@@ -362,6 +366,7 @@ async fn vector_query_excludes_tombstoned_row() {
     // A wider k must never surface the tombstoned row either.
     let hits = st
         .reader()
+        .expect("reader")
         .vector_hits(
             "embedding",
             &q,
@@ -500,7 +505,7 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
         }
     }
     assert!(
-        st.reader().n_superfiles() > 1,
+        st.reader().expect("reader").n_superfiles() > 1,
         "fixture must span multiple superfiles to exercise the merge backfill"
     );
 
@@ -512,6 +517,7 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
 
     let before = st
         .reader()
+        .expect("reader")
         .vector_search("embedding", &q, K, opts, None, Some(&proj))
         .expect("search before");
     let deleted: Vec<String> = titles_of(&before);
@@ -528,6 +534,7 @@ async fn vector_query_backfills_across_superfiles_after_deletes() {
     // ranks across superfiles, none of them the deleted ones.
     let after = st
         .reader()
+        .expect("reader")
         .vector_search("embedding", &q, K, opts, None, Some(&proj))
         .expect("search after");
     let survivors = titles_of(&after);

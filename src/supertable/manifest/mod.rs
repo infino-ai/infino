@@ -2167,6 +2167,11 @@ pub enum ManifestLoadError {
     /// Pointer not found in storage.
     #[error("pointer not found in storage")]
     PointerNotFound,
+    /// The pointer this handle had been reading has since been deleted, i.e.
+    /// the table was dropped and purged. Unlike [`Self::PointerNotFound`]
+    /// ("never had one"), the handle must be discarded, not refreshed.
+    #[error("manifest pointer was deleted while this handle was open")]
+    PointerVanished,
     #[error("already loaded")]
     AlreadyLoaded,
     /// Pointer parse error.

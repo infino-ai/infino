@@ -329,6 +329,7 @@ async fn reader_loop(
         let t0 = Instant::now();
         let _ = black_box(
             st.reader()
+                .expect("reader")
                 .bm25_search(
                     QUERY_FIELD,
                     QUERY_TERM,

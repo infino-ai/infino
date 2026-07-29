@@ -84,7 +84,7 @@ pub fn run() {
     eprintln!("[fts-diag] building supertable...");
     let build_t0 = Instant::now();
     let (table, _batches) = diag_common::build_supertable(&cfg);
-    let reader = table.reader();
+    let reader = table.reader().expect("reader");
     eprintln!(
         "[fts-diag] built in {:.1}s ({} superfile(s) after optimize)",
         build_t0.elapsed().as_secs_f64(),

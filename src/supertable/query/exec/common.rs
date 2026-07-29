@@ -969,6 +969,7 @@ mod tests {
         let st = demo(16);
         let batches = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "rust",
@@ -990,6 +991,7 @@ mod tests {
         let st = demo(16);
         let batches = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "rust",
@@ -1012,6 +1014,7 @@ mod tests {
         let st = demo(16);
         let batches = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "rust",
@@ -1036,7 +1039,7 @@ mod tests {
     #[test]
     fn resolve_hits_named_unknown_column_errors() {
         let st = demo(16);
-        let res = st.reader().bm25_search(
+        let res = st.reader().expect("reader").bm25_search(
             "title",
             "rust",
             10,
@@ -1052,6 +1055,7 @@ mod tests {
         let st = demo(16);
         let batches = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "nonexistentterm",
@@ -1094,7 +1098,7 @@ mod tests {
         // columns (the cost-first "open no readers" branch): `needed`
         // is empty, `score` is synthesized straight from the hits.
         let st = demo(16);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
         let scalar_schema = reader.options().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
@@ -1128,7 +1132,7 @@ mod tests {
         // `_id`+`score` default) materializes every scalar column plus
         // the trailing synthesized `score`, in schema order.
         let st = demo(16);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let mut hits = two_hits(&reader);
         reader
             .block_on(
@@ -1161,7 +1165,7 @@ mod tests {
         // columns but must still report `hits.len()` rows — the
         // `with_row_count` path.
         let st = demo(16);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
         let scalar_schema = reader.options().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
@@ -1231,7 +1235,7 @@ mod tests {
         // n_docs`, so row `local` resolves to `id_min + local` with no file
         // read.
         let st = demo_fts_only();
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let entry = Arc::clone(&reader.manifest().superfiles[0]);
         let last = (entry.n_docs - 1) as u32;
         let hits = vec![
@@ -1269,7 +1273,7 @@ mod tests {
         // rows are cell-ordered, not id-ordered — span arithmetic must bail
         // to the id-page read even though the id span looks contiguous.
         let st = demo(16);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let entry = Arc::clone(&reader.manifest().superfiles[0]);
         assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
         let hits = vec![SuperfileHit {
@@ -1290,7 +1294,7 @@ mod tests {
         // lookup, so arithmetic bails to `None` and the caller falls
         // back to the id-page read.
         let st = demo(16);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let hits = vec![SuperfileHit {
             superfile: SuperfileUri::new_v4(),
             local_doc_id: 0,
@@ -1517,7 +1521,7 @@ mod tests {
         w.append(&build_title_batch(&["rust systems", "go routines"]))
             .expect("second append");
         w.commit().expect("commit");
-        let reader = producer.reader();
+        let reader = producer.reader().expect("reader");
         let entry = reader
             .manifest()
             .superfiles
@@ -1577,6 +1581,7 @@ mod tests {
 
         let batches = consumer
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "rust",
@@ -1616,6 +1621,7 @@ mod tests {
 
         let batches = consumer
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "rust",
@@ -1642,6 +1648,7 @@ mod tests {
 
         let batches = consumer
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "nonexistentterm",

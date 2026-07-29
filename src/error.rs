@@ -29,6 +29,7 @@ use crate::{
             BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError,
             QueryError,
         },
+        manifest::ManifestLoadError,
         mutations::{CommitError as MutationCommitError, MutationError},
     },
 };
@@ -134,6 +135,19 @@ impl From<QueryError> for InfinoError {
     }
 }
 
+impl From<ManifestLoadError> for InfinoError {
+    fn from(e: ManifestLoadError) -> Self {
+        let msg = e.to_string();
+        match e {
+            // The table this handle was reading has been dropped and purged, so
+            // the name it was opened under no longer resolves to anything —
+            // `NotFound`, not a backend fault, is what a caller must react to.
+            ManifestLoadError::PointerVanished => InfinoError::NotFound(msg),
+            _ => InfinoError::Backend(msg),
+        }
+    }
+}
+
 impl From<SuperfileReadError> for InfinoError {
     fn from(e: SuperfileReadError) -> Self {
         if let Some(msg) = e.over_budget() {
@@ -154,13 +168,25 @@ impl From<SupertableBuildError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        // A commit that found its table dropped and purged is not a schema
+        // problem; it is the name no longer resolving. Same answer the read
+        // path gives, so a caller can match one condition, not three.
+        if matches!(e, SupertableBuildError::TableGone) {
+            return InfinoError::NotFound(e.to_string());
+        }
         InfinoError::Schema(e.to_string())
     }
 }
 
 impl From<SupertableCommitError> for InfinoError {
     fn from(e: SupertableCommitError) -> Self {
-        InfinoError::Backend(e.to_string())
+        let msg = e.to_string();
+        match e {
+            // Reached by commit paths that surface the typed error directly
+            // (the append path converts to `BuildError::TableGone` first).
+            SupertableCommitError::PointerVanished => InfinoError::NotFound(msg),
+            _ => InfinoError::Backend(msg),
+        }
     }
 }
 
@@ -181,6 +207,8 @@ impl From<MutationError> for InfinoError {
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
             MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
+            // Matches the read path: a purged table's name resolves to nothing.
+            MutationError::TableGone => InfinoError::NotFound(msg),
             _ => InfinoError::Backend(msg),
         }
     }
@@ -190,6 +218,15 @@ impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
+        }
+        // `Supertable::append` lands here, so this is the arm that decides what
+        // appending to a purged table reports. Narrow on purpose: every other
+        // append-flush failure keeps its existing `Backend` shape.
+        if matches!(
+            &e,
+            MutationCommitError::AppendFlush(SupertableBuildError::TableGone)
+        ) {
+            return InfinoError::NotFound(e.to_string());
         }
         InfinoError::Backend(e.to_string())
     }

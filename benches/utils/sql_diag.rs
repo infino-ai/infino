@@ -182,7 +182,7 @@ pub fn run() {
         "[sql-diag] supertable built in {:.1}s",
         build_t0.elapsed().as_secs_f64()
     );
-    let reader = table.reader();
+    let reader = table.reader().expect("reader");
     let manifest = reader.manifest();
     let superfiles: Vec<Bytes> = manifest
         .superfiles
@@ -231,6 +231,7 @@ pub fn run() {
         let (full_p50, full_mean, full_rows) = diag_common::time_path(iters, || {
             table
                 .reader()
+                .expect("reader")
                 .query_sql(shape.sql)
                 .map(|b| count_rows(&b))
                 .expect("query_sql")

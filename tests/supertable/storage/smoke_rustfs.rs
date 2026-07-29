@@ -133,7 +133,7 @@ async fn supertable_smoke_via_rustfs_https() {
     let consumer = Supertable::open(default_supertable_options().with_storage(storage))
         .expect("open from RustFS");
     assert_eq!(consumer.manifest_id(), 2);
-    assert_eq!(consumer.reader().n_docs_total(), 3);
+    assert_eq!(consumer.reader().expect("reader").n_docs_total(), 3);
 
     eprintln!("[rustfs-smoke] smoke done bucket={}", fixture.bucket);
 }
@@ -380,7 +380,10 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
     )
     .expect("Supertable::open via RustFS (tvf consumer)");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_docs_total(), EXPECTED_N_DOCS);
+    assert_eq!(
+        consumer.reader().expect("reader").n_docs_total(),
+        EXPECTED_N_DOCS
+    );
 
     let pre = cache.stats();
 
@@ -399,6 +402,7 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
 
     let bm25 = consumer
         .reader()
+        .expect("reader")
         .query_sql(&format!(
             "SELECT _id FROM bm25_search('title', 'alpha', {BM25_TOP_K})"
         ))
@@ -412,6 +416,7 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
     let vec_sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', 3)");
     let vector = consumer
         .reader()
+        .expect("reader")
         .query_sql(&vec_sql)
         .expect("vector_search via query_sql over RustFS");
     assert!(
@@ -423,6 +428,7 @@ async fn supertable_tvfs_through_query_sql_via_rustfs() {
         format!("SELECT _id FROM hybrid_search('title', 'alpha', 'emb', '{q_csv}', 5)");
     let hybrid = consumer
         .reader()
+        .expect("reader")
         .query_sql(&hybrid_sql)
         .expect("hybrid_search via query_sql over RustFS");
     let hyb_rows = count_rows(&hybrid);
@@ -539,7 +545,10 @@ async fn supertable_cold_vector_search_over_budget_via_rustfs() {
 
     let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_docs_total(), BUDGET_N_ROWS as u64);
+    assert_eq!(
+        consumer.reader().expect("reader").n_docs_total(),
+        BUDGET_N_ROWS as u64
+    );
 
     let mut q = vec![0.0f32; dim];
     q[0] = 1.0;
@@ -690,7 +699,11 @@ async fn supertable_cold_vector_search_over_budget_via_sql_rustfs() {
     let sql = format!("SELECT _id FROM vector_search('emb', '{q_csv}', {VECTOR_SEARCH_K})");
 
     let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
-    let result = consumer.reader().query_sql(&sql).map_err(InfinoError::from);
+    let result = consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&sql)
+        .map_err(InfinoError::from);
     match result {
         Err(InfinoError::OverBudget(msg)) => {
             eprintln!("[rustfs-budget-sql] cold vector search in SQL refused as OverBudget: {msg}");
@@ -712,6 +725,7 @@ async fn supertable_cold_vector_search_over_budget_via_sql_rustfs() {
     let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
     let control_rows: usize = control
         .reader()
+        .expect("reader")
         .query_sql(&sql)
         .expect("measured cold vector search in SQL should run to completion")
         .iter()
@@ -764,7 +778,12 @@ async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
     );
 
     let (consumer, _cache_guard) = open_budget_consumer(dim, &storage, TINY_BUDGET_BYTES);
-    match consumer.reader().query_sql(&sql).map_err(InfinoError::from) {
+    match consumer
+        .reader()
+        .expect("reader")
+        .query_sql(&sql)
+        .map_err(InfinoError::from)
+    {
         Err(InfinoError::OverBudget(msg)) => {
             eprintln!("[rustfs-budget-sql] cold hybrid search refused as OverBudget: {msg}");
         }
@@ -783,6 +802,7 @@ async fn supertable_cold_hybrid_search_over_budget_via_sql_rustfs() {
     let (control, _control_cache_guard) = open_budget_consumer(dim, &storage, 0);
     let control_rows: usize = control
         .reader()
+        .expect("reader")
         .query_sql(&sql)
         .expect("measured cold hybrid search should run to completion")
         .iter()
@@ -845,8 +865,11 @@ async fn supertable_vector_budget_is_shared_across_superfiles_via_rustfs() {
     };
 
     let (measured, _measured_guard) = open_budget_consumer(dim, &storage, 0);
-    assert_eq!(measured.reader().n_superfiles(), 2);
-    assert_eq!(measured.reader().n_docs_total(), (BUDGET_N_ROWS as u64) * 2);
+    assert_eq!(measured.reader().expect("reader").n_superfiles(), 2);
+    assert_eq!(
+        measured.reader().expect("reader").n_docs_total(),
+        (BUDGET_N_ROWS as u64) * 2
+    );
     let measured_hits = search(&measured).expect("measured search over two superfiles runs");
     let measured_rows: usize = measured_hits.iter().map(|b| b.num_rows()).sum();
     let measured_peak = measured.options().connection_budget().peak();

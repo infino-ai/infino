@@ -195,7 +195,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(text_col, vec_col, k, "hybrid_search");
-        let reader = self.reader();
+        let reader = self.reader()?;
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
@@ -811,6 +811,7 @@ mod tests {
 
         let hybrid = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql(&format!(
                     "SELECT _id FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k})"
                 ))
@@ -818,6 +819,7 @@ mod tests {
         );
         let bm25 = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql(&format!(
                     "SELECT _id FROM bm25_search('title', 'rust', {k})"
                 ))
@@ -825,6 +827,7 @@ mod tests {
         );
         let vector = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql(&format!(
                     "SELECT _id FROM vector_search('emb', '{qv}', {k})"
                 ))
@@ -844,6 +847,7 @@ mod tests {
         let st = demo(dim);
         let res = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT title, score FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
                 csv_one_hot(dim, 0)
@@ -867,6 +871,7 @@ mod tests {
         let st = demo(dim);
         let res = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT title FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
                 csv_one_hot(dim, 7)
@@ -893,6 +898,7 @@ mod tests {
         let st = demo(dim);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT * FROM hybrid_search('title', 'rust', 'emb', '{}', 3)",
                 csv_one_hot(dim, 0)
@@ -912,6 +918,7 @@ mod tests {
         let st = Supertable::create(options_title_emb(dim)).expect("create");
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT _id, score FROM hybrid_search('title', 'rust', 'emb', '{}', 5)",
                 csv_one_hot(dim, 0)
@@ -928,6 +935,7 @@ mod tests {
         // 4 args (missing k) → planning error.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '1,0')")
                 .is_err()
         );
@@ -940,6 +948,7 @@ mod tests {
         // Non-integer k (5th arg).
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', '1,0', 'five')")
                 .is_err(),
             "non-integer k must error"
@@ -947,6 +956,7 @@ mod tests {
         // Unparseable query vector (4th arg).
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM hybrid_search('title', 'rust', 'emb', 'a,b', 3)")
                 .is_err(),
             "bad query vector must error"
@@ -963,6 +973,7 @@ mod tests {
         qv[0] = 1.0; // one-hot at dim 0 → doc 0 exact vector match.
         let hits = st
             .reader()
+            .expect("reader")
             .hybrid_search(
                 "title",
                 "async",
@@ -1022,6 +1033,7 @@ mod tests {
 
         let via_sql = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql(&format!(
                     "SELECT _id FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
                     csv_one_hot(dim, 0)
@@ -1036,6 +1048,7 @@ mod tests {
     fn explain(st: &Supertable, sql: &str) -> String {
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!("EXPLAIN {sql}"))
             .expect("explain");
         let mut out = String::new();
@@ -1064,7 +1077,7 @@ mod tests {
 
         let dim = 16;
         let st = demo(dim);
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let func = HybridSearchFunc::new(reader, scalar_schema);
@@ -1273,16 +1286,19 @@ mod tests {
         // The three single-retriever result sets — the oracle inputs.
         let fts = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM bm25_search('title', 'rust', 8)")
                 .expect("bm25 query_sql"),
         );
         let vector = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql(&format!("SELECT _id FROM vector_search('emb', '{qv}', 5)"))
                 .expect("vector query_sql"),
         );
         let scalar = id_set(
             &st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM supertable WHERE category = 'systems'")
                 .expect("scalar query_sql"),
         );
@@ -1297,6 +1313,7 @@ mod tests {
         // spanning two superfiles.
         let combined_batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!(
                 "SELECT b._id, b.title AS title, b.category AS category, b.score AS score \
                  FROM bm25_search('title', 'rust', 8) AS b \

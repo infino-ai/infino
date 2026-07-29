@@ -2206,9 +2206,9 @@ mod tests {
         w.append(&cat_title_batch(&["lang", "lang"], &["delta", "sigma"]))
             .expect("a3");
         w.commit().expect("c3");
-        assert_eq!(st.reader().n_superfiles(), 3);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),
@@ -2258,7 +2258,7 @@ mod tests {
         w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),
@@ -2435,7 +2435,7 @@ mod tests {
         w.append(&num_batch(&[Some(10), Some(20)])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),

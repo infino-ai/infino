@@ -1264,6 +1264,7 @@ pub fn engine_id_to_dense(
 
     let batches = table
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable ORDER BY _id")
         .expect("SELECT _id FROM supertable ORDER BY _id");
     let mut ids = Vec::with_capacity(n_docs);

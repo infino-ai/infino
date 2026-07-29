@@ -206,6 +206,7 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
     .expect("open consumer");
     let _ = consumer
         .reader()
+        .expect("reader")
         .bm25_hits("title", "common", K, BoolMode::Or)
         .expect("prewarm");
     consumer
@@ -309,7 +310,7 @@ fn time_p50(mut f: impl FnMut()) -> (Duration, u64) {
 #[ignore = "perf microbench, not a correctness gate"]
 fn fanout_floor_decomposition() {
     let (st, _guards) = build_supertable();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     // The writer row-shards each commit (cpus/2 shards), so the real
     // segment count is a multiple of the commit count — report it.
     let n_segments = reader.n_superfiles();

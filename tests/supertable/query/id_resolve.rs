@@ -108,7 +108,7 @@ fn bare_projection_ids_match_id_page_read_path() {
         w.commit().expect("commit");
     }
     drop(w);
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
 
     // `common` is in every doc → hits span segments; per-doc unique
     // tokens keep scores distinct so rank order is meaningful.
