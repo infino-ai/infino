@@ -849,18 +849,19 @@ impl WidthLawCalibration {
             }
         }
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
-        for (qi, mut cand) in partial.into_iter().enumerate() {
-            tops[qi].append(&mut cand);
-            truncate_ascending(&mut tops[qi], k_max);
+        for (qi, cand) in partial.into_iter().enumerate() {
+            merge_candidates(&mut tops[qi], cand, k_max);
         }
         Ok(())
     }
 
     /// Extract the width law: cells (in the grid's routing order) needed
     /// for mean [`WIDTH_LAW_TARGET_COVERAGE`] coverage of the exact top-k
-    /// at each [`WIDTH_LAW_KS`] point. Points the sample cannot support
-    /// (k exceeding any query's candidate count) stay `0` (uncalibrated).
-    /// `None` when nothing was sampled.
+    /// at each [`WIDTH_LAW_KS`] point. Each point is measured over the
+    /// queries whose candidate count reaches its `k` — one boundary-starved
+    /// query excludes itself, not the whole sample. Points NO query can
+    /// support stay `0` (uncalibrated). Measured points are floored to be
+    /// monotone in `k`. `None` when nothing was sampled.
     pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<[u32; WIDTH_LAW_KS.len()]> {
         let frozen = self.frozen?;
         let n_queries = frozen.ids.len();
@@ -877,7 +878,7 @@ impl WidthLawCalibration {
         // fresh drains, the normal calibration moment, have neither.
         let mut law = [0u32; WIDTH_LAW_KS.len()];
         let mut coverage_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
-        let mut supported = [true; WIDTH_LAW_KS.len()];
+        let mut support = [0usize; WIDTH_LAW_KS.len()];
         let mut rank_of_cell = vec![0u32; n_cells];
         for (qi, cand) in tops.iter().enumerate() {
             let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
@@ -887,18 +888,17 @@ impl WidthLawCalibration {
                     *slot = rank as u32;
                 }
             }
-            // Best-scored copy per stable id first: boundary replicas of
-            // one row must count as ONE neighbor, or replicated tables
-            // would measure narrower coverage than a query experiences.
+            // [`merge_candidates`] keeps one entry per stable id, so the
+            // accumulator only needs ranking by score for the prefix walk.
             let mut sorted = cand.clone();
-            sorted.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
-            sorted.dedup_by_key(|c| c.2);
             sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
                 if sorted.len() < k {
-                    supported[ki] = false;
+                    // Below this point's k: the query measures the smaller
+                    // points and sits out this one.
                     continue;
                 }
+                support[ki] += 1;
                 // Per-rank counts of this query's top-k, then a prefix walk
                 // accumulates the mean coverage curve.
                 let mut per_rank = vec![0u32; n_cells];
@@ -913,16 +913,39 @@ impl WidthLawCalibration {
             }
         }
         for (ki, sums) in coverage_sums.iter().enumerate() {
-            if !supported[ki] {
+            if support[ki] == 0 {
                 continue;
             }
-            let target = WIDTH_LAW_TARGET_COVERAGE * n_queries as f64;
+            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
             if let Some(rank) = sums.iter().position(|&s| s >= target) {
                 law[ki] = (rank + 1) as u32;
             }
         }
+        // Coverage need only grows with k, so each measured point is floored
+        // by the measured points below it — sampling noise near the target
+        // must never let a larger k probe FEWER cells than a smaller one (a
+        // recall inversion at query time). Unmeasured points (0) stay 0; the
+        // interpolator skips them.
+        let mut floor = 0u32;
+        for w in law.iter_mut().filter(|w| **w > 0) {
+            *w = (*w).max(floor);
+            floor = *w;
+        }
         (law.iter().any(|&w| w > 0)).then_some(law)
     }
+}
+
+/// Merge one cell's candidates into a query's accumulator: collapse to the
+/// best-scored copy per stable id FIRST (boundary replicas of one row are
+/// one neighbor), then keep the ascending-best `cap`. The dedup must
+/// precede the truncate — replicated copies of near rows filling raw slots
+/// would evict distinct farther neighbors and stamp a narrower law than a
+/// real query experiences.
+fn merge_candidates(acc: &mut Vec<(f32, u32, i128)>, mut cand: Vec<(f32, u32, i128)>, cap: usize) {
+    acc.append(&mut cand);
+    acc.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
+    acc.dedup_by_key(|c| c.2);
+    truncate_ascending(acc, cap);
 }
 
 /// Keep the ascending-best `cap` candidates in place.
@@ -1045,7 +1068,11 @@ mod tests {
         cands.extend((2..=8).map(|id| (0.03 + id as f32 * 0.01, (id % 2) as u32, id as i128)));
         cands.push((0.5, 3, 9));
         cands.push((0.6, 3, 10));
-        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![cands];
+        // Plant through the same merge the scorer uses — dedup happens
+        // there, BEFORE the truncate, so replicas can never occupy slots.
+        let mut acc = Vec::new();
+        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         let law = cal.finish(&grid).expect("law from planted candidates");
         // k=1: the best copy of id 1 sits in the top-ranked cell.
@@ -1059,6 +1086,72 @@ mod tests {
         );
         // 10 deduped candidates cannot support the k=100/1000 points.
         assert_eq!(&law[2..], &[0, 0], "unsupported points stay uncalibrated");
+    }
+
+    /// Per-query point support and the monotone floor. Query A (10
+    /// candidates spread over four cells) cannot support k=100 — it must
+    /// sit that point out rather than zero it for the whole sample. Query B
+    /// (100 candidates in one cell) then measures k=100 alone at width 1,
+    /// NARROWER than the two-query k=10 point (width 4) — the monotone
+    /// floor lifts it, because a larger k probing fewer cells would invert
+    /// recall at query time.
+    #[test]
+    fn width_law_supports_points_per_query_and_stays_monotone() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(
+            4,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.9, 0.1, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            vec![1; 4],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut queries = vec![0.0f32; 2 * DIM];
+        queries[0] = 1.0;
+        queries[DIM] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries,
+            ids: vec![998, 999],
+        });
+        let k_max = *WIDTH_LAW_KS.last().expect("knots");
+        // A: distinct ids 1..=10 spread 2/2/3/3 over cells 0..=3, so its
+        // 0.99 top-10 coverage needs the 4th-ranked cell.
+        let a: Vec<(f32, u32, i128)> = (1..=10)
+            .map(|id| {
+                let cell = match id {
+                    1 | 2 => 0u32,
+                    3 | 4 => 1,
+                    5..=7 => 2,
+                    _ => 3,
+                };
+                (id as f32 * 0.01, cell, id as i128)
+            })
+            .collect();
+        // B: distinct ids 100..=199, every one in the top-ranked cell.
+        let b: Vec<(f32, u32, i128)> = (100..200)
+            .map(|id| (id as f32 * 0.001, 0u32, id as i128))
+            .collect();
+        let (mut acc_a, mut acc_b) = (Vec::new(), Vec::new());
+        merge_candidates(&mut acc_a, a, k_max);
+        merge_candidates(&mut acc_b, b, k_max);
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
+
+        let law = cal.finish(&grid).expect("law from planted candidates");
+        assert_eq!(law[0], 1, "top-1: both queries covered by the nearest cell");
+        assert_eq!(
+            law[1], 4,
+            "k=10 measured over both queries needs A's spread"
+        );
+        assert_eq!(
+            law[2], 4,
+            "k=100: B alone measures width 1; the monotone floor lifts it \
+             to the k=10 width instead of stamping a recall inversion"
+        );
+        assert_eq!(law[3], 0, "k=1000 has no supporting query and stays 0");
     }
     use crate::superfile::vector::{
         cell_posting::{encode_blob, load_encoded_rows_from_blob},
