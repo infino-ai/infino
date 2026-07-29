@@ -394,12 +394,18 @@ impl CellRoutingParams {
     /// the calibrated range. Width is rounded up: under-probing costs
     /// recall, over-probing costs one cell's read.
     pub(crate) fn width_for_k_at(&self, k: usize) -> Option<usize> {
-        let pts: Vec<(f64, f64)> = WIDTH_LAW_KS
-            .iter()
-            .zip(self.width_for_k.iter())
-            .filter(|(_, w)| **w > 0)
-            .map(|(k_pt, w)| ((*k_pt as f64).ln(), f64::from(*w)))
-            .collect();
+        // Calibrated (ln k, width) points, gathered on the stack — at most
+        // `WIDTH_LAW_KS.len()` of them, resolved once per query, so no
+        // per-query heap allocation.
+        let mut pts = [(0f64, 0f64); WIDTH_LAW_KS.len()];
+        let mut n = 0;
+        for (k_pt, w) in WIDTH_LAW_KS.iter().zip(self.width_for_k.iter()) {
+            if *w > 0 {
+                pts[n] = ((*k_pt as f64).ln(), f64::from(*w));
+                n += 1;
+            }
+        }
+        let pts = &pts[..n];
         let (first, last) = (pts.first()?, pts.last()?);
         let x = (k.max(1) as f64).ln();
         if x <= first.0 {
