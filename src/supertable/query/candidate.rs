@@ -260,11 +260,16 @@ impl CandidatePlan {
                     if tokens.is_empty() {
                         return Ok(n_docs);
                     }
-                    // Intersection ≤ the rarest token's df.
-                    let mut min_df = u64::MAX;
-                    for t in tokens {
-                        min_df = min_df.min(reader.term_df(column, t).await?);
-                    }
+                    // Intersection ≤ the rarest token's df — resolved with
+                    // one batched df lookup (single FST parse + coalesced
+                    // header fetch) rather than one parse + fetch per token.
+                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                    let min_df = reader
+                        .term_dfs(column, &refs)
+                        .await?
+                        .into_iter()
+                        .min()
+                        .unwrap_or(u64::MAX);
                     Ok(min_df.min(n_docs))
                 }
                 CandidatePlan::And(children) => {
