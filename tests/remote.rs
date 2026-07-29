@@ -11,7 +11,7 @@
 
 #![cfg(feature = "remote")]
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::{Int32Array, RecordBatch};
@@ -483,4 +483,173 @@ async fn create_database_conflict_maps_to_already_exists() {
     })
     .await;
     assert!(matches!(err, InfinoError::AlreadyExists(_)), "got {err:?}");
+}
+
+/// Collect the sorted, deduped `<op>` segment from each `/v1/<op>/…` path.
+fn path_segments(paths: impl Iterator<Item = String>) -> Vec<String> {
+    let mut segs: Vec<String> = paths
+        .filter_map(|p| {
+            p.strip_prefix("/v1/")
+                .map(|rest| rest.split('/').next().unwrap_or_default().to_string())
+        })
+        .collect();
+    segs.sort();
+    segs.dedup();
+    segs
+}
+
+/// The request-body schema name the spec defines for `(method, <op>)`, if the
+/// operation carries a JSON body. `None` for bodyless ops (binary/query-param).
+fn request_schema_name(spec: &serde_json::Value, method: &str, seg: &str) -> Option<String> {
+    for (path, methods) in spec["paths"].as_object()? {
+        if path.split('/').nth(2) != Some(seg) {
+            continue;
+        }
+        let Some(op) = methods.get(method) else {
+            continue;
+        };
+        if let Some(r) = op
+            .pointer("/requestBody/content/application~1json/schema/$ref")
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(r.rsplit('/').next().unwrap_or_default().to_string());
+        }
+    }
+    None
+}
+
+/// The remote client's wire calls must match the published data-plane API spec.
+///
+/// The spec (`fixtures/hosted-openapi.json`) is the source of truth, refreshed
+/// from the deployed `/openapi.json` by the `refresh-hosted-openapi` workflow.
+/// This drives every public method against a mock server, captures the requests
+/// the client emits, and checks them against the spec at two levels:
+///
+/// 1. **Operations** — the set of `/v1/<op>` paths called equals the spec's
+///    paths. A hosted operation added or removed fails here.
+/// 2. **Request signatures** — for each operation with a JSON body, the fields
+///    the client sends conform to the spec's request schema: every required
+///    field is present, and no field is undefined (the server's
+///    `deny_unknown_fields` would 400 an undefined one). A renamed, newly
+///    required, or removed field fails here.
+///
+/// The Rust remote transport is the single place these requests are built; the
+/// node and python bindings call through it, so this one check covers all three
+/// bindings. A failure means: the hosted API changed — update the transport.
+///
+/// `#[ignore]`d on purpose: this checks conformance to an external, moving
+/// contract (the hosted API), so it is deliberately kept out of `make ci` — a
+/// hosted-service change must never gate an OSS engine release. It is run
+/// explicitly by the `hosted-api-drift` workflow (on spec/transport changes)
+/// via `cargo test … -- --ignored`.
+#[tokio::test]
+#[ignore = "hosted-API conformance; run by the hosted-api-drift workflow, not make ci"]
+async fn remote_client_matches_the_published_api_spec() {
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+
+    // Drive every operation. Only `open_table` needs a parseable response; the
+    // rest go unmatched (404) but their requests are still recorded — we assert
+    // on what the client sends, not on the responses. Searches pass a projection
+    // so the required field is present (the projection-optionality question is
+    // tracked separately). `optimize`/`gc` short-circuit and send nothing.
+    with_connection(server.uri(), |db| {
+        let _ = db.create_database();
+        let _ = db.create_table("posts", id_schema(), IndexSpec::new());
+        let _ = db.list_tables();
+        let _ = db.drop_table("posts", false);
+        let _ = db.query_sql("SELECT id FROM posts");
+        if let Ok(table) = db.open_table("posts") {
+            let _ = table.append(&id_batch(vec![1]));
+            let _ = table.update(col("id").gt(lit(0_i32)), &id_batch(vec![1]));
+            let _ = table.delete(col("id").lt(lit(0_i32)));
+            let _ = table.bm25_search("id", "x", 1, Bm25SearchOptions::new(), Some(&["_id"]));
+            let _ = table.token_match("id", "x", BoolMode::Or, Some(&["_id"]));
+            let _ = table.exact_match("id", "x", Some(&["_id"]));
+            let _ = table.count("id", "x", BoolMode::Or);
+            let _ = table.vector_search(
+                "id",
+                &[1.0],
+                1,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id"]),
+            );
+            let _ = table.hybrid_search(
+                "id",
+                "x",
+                BoolMode::Or,
+                "id",
+                &[1.0],
+                VectorSearchOptions::new(),
+                1,
+                Some(&["_id"]),
+            );
+            let _ = table.optimize(&OptimizeOptions::default());
+            let _ = table.gc(Duration::from_secs(0));
+        }
+    })
+    .await;
+
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-openapi.json"))
+            .expect("valid hosted API spec fixture");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+
+    // Tier 1: operation-set parity.
+    let client_ops = path_segments(requests.iter().map(|r| r.url.path().to_string()));
+    let spec_ops = path_segments(spec["paths"].as_object().expect("paths").keys().cloned());
+    assert_eq!(
+        client_ops, spec_ops,
+        "the remote client's operations drifted from the published API spec \
+         (a hosted operation was added or removed); reconcile the transport"
+    );
+
+    // Tier 2: request-signature conformance for JSON-body operations.
+    for req in &requests {
+        let method = req.method.to_string().to_lowercase();
+        let Some(seg) = req
+            .url
+            .path()
+            .strip_prefix("/v1/")
+            .map(|rest| rest.split('/').next().unwrap_or_default())
+        else {
+            continue;
+        };
+        let Some(schema_name) = request_schema_name(&spec, &method, seg) else {
+            continue; // bodyless op (binary/query-param) — nothing to conform.
+        };
+        let schema = &spec["components"]["schemas"][&schema_name];
+        let required: BTreeSet<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        let properties: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+        let Some(obj) = body.as_object() else {
+            continue; // non-JSON body — not a schema-typed request.
+        };
+        let sent: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+
+        let missing: Vec<&&str> = required.difference(&sent).collect();
+        assert!(
+            missing.is_empty(),
+            "{method} /v1/{seg}: client omits required field(s) {missing:?} that \
+             {schema_name} requires — the request signature drifted from the spec"
+        );
+        let unknown: Vec<&&str> = sent.difference(&properties).collect();
+        assert!(
+            unknown.is_empty(),
+            "{method} /v1/{seg}: client sends field(s) {unknown:?} not defined by \
+             {schema_name} — the request signature drifted (the server would reject these)"
+        );
+    }
 }

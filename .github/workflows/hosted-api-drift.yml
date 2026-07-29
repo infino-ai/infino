@@ -1,0 +1,36 @@
+name: Hosted API drift
+
+# Checks that the remote transport still conforms to the published hosted API
+# spec (`tests/fixtures/hosted-openapi.json`). Runs ONLY when the vendored spec
+# or the remote transport changes — never on unrelated engine work — and is
+# deliberately NOT part of `make ci`, so a hosted-service change can't gate an
+# OSS engine release. The drift test is `#[ignore]`d for that reason and run
+# explicitly here.
+#
+# This surfaces on the refresh PR (which the refresh-hosted-openapi workflow
+# opens when the spec changes): red means the client no longer matches the API —
+# update the transport in `src/catalog/remote/` (the node and python bindings
+# call through it, so fixing the Rust core covers all three).
+
+on:
+  pull_request:
+    paths:
+      - "tests/fixtures/hosted-openapi.json"
+      - "src/catalog/remote/**"
+      - "tests/remote.rs"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  drift:
+    name: Remote transport ⇄ hosted API spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--ignored` runs exactly the ignored drift test (kept out of `make ci`).
+      - run: cargo test --features remote --test remote -- --ignored

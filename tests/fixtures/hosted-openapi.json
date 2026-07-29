@@ -1,0 +1,1367 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Infino API",
+    "description": "The Infino hosted data-plane API: per-database table operations — create, ingest, search, and SQL.",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.platform.infino.ai",
+      "description": "Infino Enterprise"
+    }
+  ],
+  "paths": {
+    "/v1/append/{database}": {
+      "post": {
+        "tags": [
+          "Rows"
+        ],
+        "summary": "Append rows",
+        "description": "Append rows to a table. The body is an Arrow IPC stream, or a JSON `{\"data\": [...]}` envelope.",
+        "operationId": "append",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "query",
+            "description": "Target table.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rows appended. Body is an Arrow IPC row stream (application/vnd.apache.arrow.stream), or a JSON `{\"data\": [...]}` envelope."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/bm25_search/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "BM25 full-text search",
+        "description": "Ranked BM25 full-text search over a full-text-indexed column.",
+        "operationId": "bm25_search",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Bm25SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/count/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Count matches",
+        "description": "Count the rows matching a full-text query.",
+        "operationId": "count",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Match count as JSON `{\"count\": <n>}`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/create_table/{database}": {
+      "post": {
+        "tags": [
+          "Tables"
+        ],
+        "summary": "Create a table",
+        "description": "Create a table with an Arrow schema and optional full-text and vector indexes.",
+        "operationId": "create_table",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Table created."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/databases": {
+      "get": {
+        "tags": [
+          "Databases"
+        ],
+        "summary": "List databases",
+        "description": "List your account's databases and their state.",
+        "operationId": "list_databases",
+        "responses": {
+          "200": {
+            "description": "The account's databases.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDatabasesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Databases"
+        ],
+        "summary": "Create a database",
+        "description": "Register a new database for your account.",
+        "operationId": "create_database",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDatabaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Database registered."
+          },
+          "401": {
+            "description": "No valid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Database already exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{name}": {
+      "delete": {
+        "tags": [
+          "Databases"
+        ],
+        "summary": "Delete a database",
+        "description": "Begin deleting a database. Idempotent.",
+        "operationId": "delete_database",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The database name to delete.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Database deletion begun (idempotent)."
+          },
+          "401": {
+            "description": "No valid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/delete/{database}": {
+      "post": {
+        "tags": [
+          "Rows"
+        ],
+        "summary": "Delete rows",
+        "description": "Delete rows matching a predicate. `table` and `predicate` are query parameters; no body.",
+        "operationId": "delete",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "predicate",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row counts as JSON `{matched, n_tombstoned, n_not_found}`."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/drop_table/{database}": {
+      "post": {
+        "tags": [
+          "Tables"
+        ],
+        "summary": "Drop a table",
+        "description": "Drop a table from the database.",
+        "operationId": "drop_table",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DropTableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Table dropped."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/exact_match/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Exact match",
+        "description": "Exact-value match over a column.",
+        "operationId": "exact_match",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExactMatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/hybrid_search/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Hybrid search",
+        "description": "Hybrid BM25 and vector search, fused with reciprocal-rank fusion.",
+        "operationId": "hybrid_search",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HybridSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/list_tables/{database}": {
+      "post": {
+        "tags": [
+          "Tables"
+        ],
+        "summary": "List tables",
+        "description": "List the tables in the database.",
+        "operationId": "list_tables",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON array of table names."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/query_sql/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Run a SQL query",
+        "description": "Run a read-only SQL query across the database's tables.",
+        "operationId": "sql_query",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SqlQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/schema/{database}": {
+      "post": {
+        "tags": [
+          "Tables"
+        ],
+        "summary": "Describe a table's schema",
+        "description": "Return a table's column schema.",
+        "operationId": "schema",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SchemaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "JSON array of column descriptors."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/token_match/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Token match",
+        "description": "Unranked token match over a full-text-indexed column.",
+        "operationId": "token_match",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenMatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/update/{database}": {
+      "post": {
+        "tags": [
+          "Rows"
+        ],
+        "summary": "Update rows",
+        "description": "Replace rows matching a predicate. `table` and `predicate` are query parameters; the body carries the replacement rows (Arrow IPC or JSON).",
+        "operationId": "update",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "predicate",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row counts as JSON `{matched, n_tombstoned, n_not_found}`. Body is the replacement rows as an Arrow IPC stream."
+          },
+          "400": {
+            "description": "Invalid request."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/vector_search/{database}": {
+      "post": {
+        "tags": [
+          "Search"
+        ],
+        "summary": "Vector search",
+        "description": "Vector (kNN) search over a vector column, with an optional full-text pre-filter.",
+        "operationId": "vector_search",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "path",
+            "description": "Target database.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VectorSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching rows as an Arrow IPC stream (application/vnd.apache.arrow.stream), or JSON when the request sends `Accept: application/json`."
+          },
+          "400": {
+            "description": "Invalid request body."
+          },
+          "401": {
+            "description": "Missing or invalid API key."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Bm25SearchRequest": {
+        "type": "object",
+        "description": "`POST /v1/bm25_search/{database}`. Projection is optional (absent ⇒ the\nengine-native `_id` + `score`).",
+        "required": [
+          "table_name",
+          "field_name",
+          "query",
+          "k",
+          "mode"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/Mode"
+          },
+          "projection": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "query": {
+            "type": "string"
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CountRequest": {
+        "type": "object",
+        "description": "`POST /v1/count/{database}`. Count of rows matching a keyword query.",
+        "required": [
+          "table_name",
+          "field_name",
+          "query",
+          "mode"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/Mode"
+          },
+          "query": {
+            "type": "string"
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateDatabaseRequest": {
+        "type": "object",
+        "description": "Create-database request.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The database name, unique within the account."
+          }
+        }
+      },
+      "CreateTableRequest": {
+        "type": "object",
+        "description": "`POST /v1/create_table/{database}`.",
+        "required": [
+          "table_name",
+          "schema"
+        ],
+        "properties": {
+          "indexes": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Indexes"
+              }
+            ]
+          },
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaField"
+            }
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DatabaseSummary": {
+        "type": "object",
+        "description": "One database in the account's list, with its lifecycle state.",
+        "required": [
+          "name",
+          "state",
+          "created_ms"
+        ],
+        "properties": {
+          "created_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix epoch milliseconds when the database was created, or `0` if unknown\n(a database registered before creation time was tracked).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "The database name, unique within the account."
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle state: `registered` (usable) or `purging` (being deleted)."
+          }
+        }
+      },
+      "DropTableRequest": {
+        "type": "object",
+        "description": "`POST /v1/drop_table/{database}`.",
+        "required": [
+          "table_name",
+          "purge"
+        ],
+        "properties": {
+          "purge": {
+            "type": "boolean"
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "A JSON error body.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message."
+          }
+        }
+      },
+      "ExactMatchRequest": {
+        "type": "object",
+        "description": "`POST /v1/exact_match/{database}`. Unranked; projection required.",
+        "required": [
+          "table_name",
+          "field_name",
+          "value",
+          "projection"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "table_name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HybridSearchRequest": {
+        "type": "object",
+        "description": "`POST /v1/hybrid_search/{database}`. BM25 + vector fused with RRF.\nProjection is optional; `nprobe` / `rerank_mult` tune the vector leg.",
+        "required": [
+          "table_name",
+          "text_field",
+          "text_query",
+          "mode",
+          "vector_field",
+          "vector_query",
+          "k"
+        ],
+        "properties": {
+          "k": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/Mode"
+          },
+          "nprobe": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "projection": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "rerank_mult": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "table_name": {
+            "type": "string"
+          },
+          "text_field": {
+            "type": "string"
+          },
+          "text_query": {
+            "type": "string"
+          },
+          "vector_field": {
+            "type": "string"
+          },
+          "vector_query": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "Indexes": {
+        "type": "object",
+        "description": "Index declarations for `create_table`.",
+        "properties": {
+          "fts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "FTS-indexed column names."
+          },
+          "vector": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/VectorIndex"
+            },
+            "description": "Vector index declarations."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListDatabasesResponse": {
+        "type": "object",
+        "description": "The databases in your account.",
+        "required": [
+          "databases"
+        ],
+        "properties": {
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DatabaseSummary"
+            },
+            "description": "The account's databases, order unspecified."
+          }
+        }
+      },
+      "Metric": {
+        "type": "string",
+        "description": "Vector distance metric. Accepted case-insensitively, with the aliases\n`l2` → `l2sq` and `dot` → `negdot`; serialized canonically.",
+        "enum": [
+          "cosine",
+          "l2sq",
+          "negdot"
+        ]
+      },
+      "Mode": {
+        "type": "string",
+        "description": "Boolean mode for a multi-term FTS query. Accepted case-insensitively on the\nwire (`\"or\"`, `\"Or\"`, `\"OR\"`); serialized canonically lowercase.",
+        "enum": [
+          "or",
+          "and"
+        ]
+      },
+      "SchemaField": {
+        "type": "object",
+        "description": "One column in a `create_table` schema. A scalar column is `{name, type}` where `type` is a scalar spelling (`\"i32\"`, `\"large_utf8\"`, …); a vector column is `{name, type: \"vector\", dim}`; a list column is `{name, type: \"list\", item}`. `dim` is required for `\"vector\"` and `item` for `\"list\"`.",
+        "required": [
+          "name",
+          "type"
+        ],
+        "properties": {
+          "dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Fixed length, required for `type: \"vector\"`.",
+            "minimum": 0
+          },
+          "item": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Element scalar type, required for `type: \"list\"`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Column name."
+          },
+          "nullable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Defaults to `true` when omitted."
+          },
+          "type": {
+            "type": "string",
+            "description": "Scalar spelling, or `\"vector\"` / `\"list\"`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchemaRequest": {
+        "type": "object",
+        "description": "`POST /v1/schema/{database}`.",
+        "required": [
+          "table_name"
+        ],
+        "properties": {
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SqlQueryRequest": {
+        "type": "object",
+        "description": "`POST /v1/sql_query/{database}`.",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TokenMatchRequest": {
+        "type": "object",
+        "description": "`POST /v1/token_match/{database}`. Unranked; projection required.",
+        "required": [
+          "table_name",
+          "field_name",
+          "query",
+          "mode",
+          "projection"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/Mode"
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "query": {
+            "type": "string"
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "VectorFilter": {
+        "type": "object",
+        "description": "Optional text pre-filter for `vector_search`: kNN ranks only among rows\nwhose FTS-indexed `field_name` matches `query`.",
+        "required": [
+          "field_name",
+          "query",
+          "mode"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/Mode"
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "VectorIndex": {
+        "type": "object",
+        "description": "One vector index declaration under `indexes.vector`.",
+        "required": [
+          "column",
+          "metric"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Redundant with the schema column's declared width; the server resolves\nthe dimension from the schema, so this is optional and, if given, must\nagree.",
+            "minimum": 0
+          },
+          "metric": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "n_centroids": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "IVF centroid count. Optional; the server applies a default when omitted.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "VectorSearchRequest": {
+        "type": "object",
+        "description": "`POST /v1/vector_search/{database}`. Projection required; `nprobe` /\n`rerank_mult` / `filter` are optional tuning knobs.",
+        "required": [
+          "table_name",
+          "field_name",
+          "query",
+          "k",
+          "projection"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string"
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VectorFilter"
+              }
+            ]
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nprobe": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "query": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "rerank_mult": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "table_name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "session_cookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "infino_session"
+      },
+      "session_token": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Session-Token"
+      }
+    }
+  },
+  "security": [
+    {
+      "api_key": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Databases",
+      "description": "Create, list, and delete the databases in your account."
+    },
+    {
+      "name": "Tables",
+      "description": "Create, drop, and list tables, and describe a table's schema."
+    },
+    {
+      "name": "Rows",
+      "description": "Append, update, and delete rows."
+    },
+    {
+      "name": "Search",
+      "description": "BM25, vector, and hybrid search, token and exact match, count, and SQL."
+    }
+  ]
+}

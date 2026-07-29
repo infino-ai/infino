@@ -1,0 +1,61 @@
+name: Refresh hosted API spec
+
+# Keeps the vendored hosted API spec (`tests/fixtures/hosted-openapi.json`) in
+# step with what the service actually publishes at `/openapi.json`. The
+# remote-transport drift test (`tests/remote.rs`) validates the client's wire
+# calls against this fixture, so refreshing it is how a hosted API change turns
+# into a failing test that says "the client needs updating".
+#
+# It fetches the published spec and, if it changed, opens a PR — the drift test
+# runs on that PR, so any incompatibility surfaces in review rather than at
+# runtime. A human merges the refresh.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # weekly safety net
+  workflow_dispatch:
+    inputs:
+      spec_url:
+        description: "OpenAPI spec URL to fetch"
+        default: "https://api.platform.infino.ai/openapi.json"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-hosted-openapi
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # Only on the canonical repo — forks have no reason to refresh.
+    if: github.repository == 'infino-ai/infino'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the published spec
+        run: |
+          URL="${{ github.event.inputs.spec_url || 'https://api.platform.infino.ai/openapi.json' }}"
+          echo "fetching $URL"
+          curl -fsS "$URL" -o tests/fixtures/hosted-openapi.json
+          # Fail loudly if it isn't valid JSON, rather than committing garbage.
+          python3 -m json.tool tests/fixtures/hosted-openapi.json > /dev/null
+
+      - name: Open a refresh PR if the spec changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: tests/fixtures/hosted-openapi.json
+          branch: bot/refresh-hosted-openapi
+          commit-message: "test: refresh the vendored hosted API spec"
+          title: "Refresh the vendored hosted API spec"
+          body: |
+            Automated refresh of `tests/fixtures/hosted-openapi.json` from the
+            published hosted API spec.
+
+            If the remote-transport drift test fails on this PR, the client's
+            wire calls no longer match the API — update the remote transport in
+            `src/catalog/remote/` (the node and python bindings call through it,
+            so fixing the Rust core covers all three). No-op if the spec is
+            unchanged.
