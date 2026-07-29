@@ -31,7 +31,15 @@ export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
 
-/** Storage and cache config the `connect` URI can't carry. All optional. */
+/**
+ * Storage and cache config the `connect` URI can't carry. All optional.
+ *
+ * Which options apply depends on the backend: `apiKey` is for a hosted
+ * (Infino Cloud) connection, while the storage/cache options — `storageOptions`,
+ * `cacheDir`, `cacheBudgetBytes`, `coldFetchMode`, `validate` — apply to **local
+ * connections only**; Infino Cloud manages storage, so it ignores them.
+ * `connectionMemoryBudgetBytes` applies to both.
+ */
 export interface ConnectOptions {
   /**
    * Credentials/tuning for the URI-selected backend, keyed by `object_store`
@@ -59,6 +67,12 @@ export interface ConnectOptions {
    * on bad credentials instead of on the first table operation.
    */
   validate?: boolean;
+  /**
+   * API key for a hosted (`https://<host>/<database>`) connection, sent as a
+   * bearer credential. Ignored by local backends. Falls back to the
+   * `INFINO_API_KEY` environment variable when omitted.
+   */
+  apiKey?: string;
 }
 
 /** Row counts returned by `update` / `delete`. */
@@ -301,8 +315,10 @@ function decode(buf: Buffer, asArrow?: boolean): RowRecord[] | arrow.Table {
 
 // --- friendly handles ---
 
+/** A table handle. Obtain one from {@link Connection.createTable} or {@link Connection.openTable}. */
 export class Table {
   private inner: any;
+  /** @hidden */
   constructor(inner: any) {
     this.inner = inner;
   }
@@ -388,22 +404,34 @@ export class Table {
     return this.inner.delete(predicate);
   }
 
-  /** Merge small / underfilled superfiles into larger ones (omit `settings`
-   * for engine defaults). */
+  /**
+   * Merge small / underfilled superfiles into larger ones (omit `settings`
+   * for engine defaults).
+   *
+   * **Local connections only.** On Infino Cloud, compaction is managed for you,
+   * so calling this on a hosted (`https://…`) connection throws.
+   */
   optimize(settings?: OptimizeOptions): void {
     this.inner.optimize(settings);
   }
 
-  /** Delete orphaned storage objects left by compaction or interrupted writes.
+  /**
+   * Delete orphaned storage objects left by compaction or interrupted writes.
    * Only objects older than `graceSecs` (a safety window against racing
-   * readers/writers) are removed. Requires durable storage (not `memory://`). */
+   * readers/writers) are removed. Requires durable storage (not `memory://`).
+   *
+   * **Local connections only.** On Infino Cloud, cleanup is managed for you, so
+   * calling this on a hosted connection throws.
+   */
   gc(graceSecs: number): GcReport {
     return this.inner.gc(graceSecs);
   }
 }
 
+/** A catalog connection. Create one with {@link connect}. */
 export class Connection {
   private inner: any;
+  /** @hidden */
   constructor(inner: any) {
     this.inner = inner;
   }
@@ -442,7 +470,26 @@ export class Connection {
   }
 }
 
-/** Open (or create) a catalog rooted at `uri`. */
+/**
+ * Open a connection to Infino. The `uri` selects the backend:
+ *
+ * - a local path (`"./data"`) or `"memory://"` — embedded, in-process;
+ * - an object-store URI (`"s3://…"`, `"gs://…"`, `"az://…"`) — embedded over
+ *   your own bucket;
+ * - `"https://<host>/<database>"` — Infino Cloud, the hosted service.
+ *
+ * For a hosted (`https://`) target, authenticate with an API key: pass
+ * {@link ConnectOptions.apiKey}, or set the `INFINO_API_KEY` environment
+ * variable. Storage and cache tuning the URI can't carry also goes in
+ * `options` (see {@link ConnectOptions}).
+ *
+ * ```ts
+ * // local
+ * const db = connect("./data");
+ * // Infino Cloud
+ * const cloud = connect("https://api.platform.infino.ai/my-app", { apiKey: "inf_…" });
+ * ```
+ */
 export function connect(uri: string, options?: ConnectOptions): Connection {
   return new Connection(nativeConnect(uri, options as any));
 }

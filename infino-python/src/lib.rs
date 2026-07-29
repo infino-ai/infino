@@ -112,12 +112,20 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
     }
 }
 
-/// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments: `storage_options` (a map
-/// of `object_store` config keys — `aws_*` / `azure_*` / `google_*`) and the optional
-/// local disk cache. Pass `validate=True` to probe the object store at
-/// connect (off by default) so bad credentials fail there. Omit all for
-/// local / `memory://` / ambient-credential object storage.
+/// Open a connection to Infino. The `uri` selects the backend: a local path
+/// (`"./data"`) or `"memory://"` (embedded), an object-store URI (`"s3://…"` /
+/// `"gs://…"` / `"az://…"`, embedded over your bucket), or
+/// `"https://<host>/<database>"` for Infino Cloud, the hosted service.
+///
+/// For a hosted (`https://`) target, authenticate with an API key: pass
+/// `api_key=`, or set the `INFINO_API_KEY` environment variable. The
+/// storage/cache keyword arguments — `storage_options` (a map of `object_store`
+/// config keys, `aws_*` / `azure_*` / `google_*`), `cache_dir`,
+/// `cache_budget_bytes`, `cold_fetch_mode`, and `validate` — apply to **local
+/// connections only**; Infino Cloud manages storage and ignores them. Pass
+/// `validate=True` to probe the object store at connect (off by default) so bad
+/// credentials fail there. Omit all for local / `memory://` /
+/// ambient-credential object storage.
 ///
 /// `connection_memory_budget_bytes` caps this connection's heap: the memory
 /// used to ingest data and run queries over it (keyword, vector, hybrid, or
@@ -702,6 +710,9 @@ impl Table {
 
     /// Merge small / underfilled superfiles into larger ones. Omit
     /// `settings` for engine defaults.
+    ///
+    /// Local connections only — on Infino Cloud, compaction is managed for you
+    /// and this raises `InfinoError`.
     #[pyo3(signature = (settings=None))]
     fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
@@ -727,6 +738,9 @@ impl Table {
     /// Delete orphaned storage objects left by compaction or interrupted
     /// writes. Only objects older than `grace_secs` (a safety window against
     /// racing readers/writers) are removed. Requires durable storage.
+    ///
+    /// Local connections only — on Infino Cloud, cleanup is managed for you
+    /// and this raises `InfinoError`.
     fn gc(&self, py: Python<'_>, grace_secs: f64) -> PyResult<GcReport> {
         let grace = Duration::from_secs_f64(grace_secs.max(0.0));
         let report = py.detach(|| self.inner.gc(grace)).map_err(gc_err)?;

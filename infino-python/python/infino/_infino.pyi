@@ -28,6 +28,7 @@ def connect(
     connection_memory_budget_bytes: int | None = ...,
     cold_fetch_mode: ColdFetchMode | None = ...,
     validate: bool | None = ...,
+    api_key: str | None = ...,
 ) -> Connection: ...
 
 class InfinoError(Exception):
