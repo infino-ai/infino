@@ -420,7 +420,9 @@ pub async fn get_current_manifest_etag(
         .await
         .map_err(|e| CommitError::PointerParse(e.to_string()))?
     else {
-        return Ok(None);
+        // An absent pointer means the table was dropped and purged. ( because
+        // create_table publishes a pointer before any writer runs )
+        return Err(CommitError::PointerVanished);
     };
     let Some(meta_list) = current.list.as_ref() else {
         // no manifest list for in-memory supertables

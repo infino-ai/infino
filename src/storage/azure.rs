@@ -23,8 +23,9 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry, usage::UsageMeter,
+    logical_list_key, options::apply, retry,
 };
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Azure Blob-backed `StorageProvider`. Cheap to clone; the inner
 /// `MicrosoftAzure` shares its HTTP client across clones.

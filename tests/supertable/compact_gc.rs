@@ -117,7 +117,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
         "one manifest per commit, plus create's empty manifest, before compact"
     );
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.n_superfiles(), n_commits);
     assert_eq!(r.n_docs_total(), (n_commits * 3) as u64);
 
@@ -138,7 +138,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     // Compact: all 10 superfiles merge into one (or a small number).
     st.optimize(&small_optimize_opts()).expect("optimize");
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let n_after_compact = r.n_superfiles();
     assert!(
         n_after_compact < n_commits,
@@ -175,7 +175,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     );
 
     // All markers still queryable after GC.
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     for m in &markers {
         assert_eq!(
             r.bm25_hits("title", m, TOP_K, BoolMode::Or)
@@ -250,7 +250,7 @@ fn gc_reaps_tombstone_sidecar_for_merged_away_superfile() {
         "orphaned tombstone sidecars reaped once their superfiles are gone from the manifest"
     );
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(
         r.bm25_hits("title", "alphatoken", TOP_K, BoolMode::Or)
             .expect("query alpha after gc")
@@ -350,7 +350,7 @@ fn optimize_honors_overridden_gc_safety_gap() {
     // them, even though compaction ran and left them orphaned.
     st.optimize(&small_optimize_opts())
         .expect("optimize with default gc_safety_gap");
-    let n_after_compact = st.reader().n_superfiles();
+    let n_after_compact = st.reader().expect("reader").n_superfiles();
     assert!(
         n_after_compact < n_commits,
         "compaction must have merged the ten commits into fewer superfiles"
@@ -372,7 +372,7 @@ fn optimize_honors_overridden_gc_safety_gap() {
     .with_gc(GcSettings::default().with_safety_gap(Duration::ZERO));
     st.optimize(&opts).expect("optimize with gc safety_gap=0");
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(
         count_dir(&data_dir),
         r.n_superfiles(),

@@ -20,3 +20,4 @@ infino-python/dist/
 infino-python/python/infino/*.so
 **/__pycache__/
 **/.pytest_cache/
+.infino/

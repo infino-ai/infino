@@ -246,21 +246,22 @@ async fn supertable_smoke_via_azure_wire_protocol() {
 
     assert_eq!(consumer.manifest_id(), 1, "recovered manifest_id mismatch");
     assert_eq!(
-        consumer.reader().n_docs_total(),
+        consumer.reader().expect("reader").n_docs_total(),
         2,
         "recovered n_docs_total mismatch"
     );
     eprintln!(
         "[azure] consumer open OK; manifest_id={} n_superfiles={} n_docs_total={}",
         consumer.manifest_id(),
-        consumer.reader().n_superfiles(),
-        consumer.reader().n_docs_total()
+        consumer.reader().expect("reader").n_superfiles(),
+        consumer.reader().expect("reader").n_docs_total()
     );
 
     let pre = cache.stats();
     assert_eq!(pre.n_cold_fetches, 0);
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query_sql via Azure");
     assert_eq!(batches.len(), 1);
@@ -498,20 +499,22 @@ async fn supertable_real_azure_round_trip() {
                 consumer.manifest_id()
             ));
         }
-        if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+        if consumer.reader().expect("reader").n_docs_total() != EXPECTED_N_DOCS {
             return Err(format!(
                 "recovered doc count mismatch: got {}",
-                consumer.reader().n_docs_total()
+                consumer.reader().expect("reader").n_docs_total()
             ));
         }
 
         let bm25_hits = consumer
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                infino::Bm25Stats::PerSuperfile,
                 None,
             )
             .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;
@@ -523,6 +526,7 @@ async fn supertable_real_azure_round_trip() {
         query[0] = 1.0;
         let vector_hits = consumer
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &query,
@@ -552,7 +556,7 @@ async fn supertable_real_azure_round_trip() {
             stats.n_cold_fetches, stats.current_bytes
         );
 
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         let manifest = reader.manifest();
         let mut cleanup_keys = vec![
             "_supertable/current".to_string(),
@@ -772,10 +776,10 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
             )
             .map_err(|e| format!("cold open: {e}"))?;
 
-            if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+            if consumer.reader().expect("reader").n_docs_total() != EXPECTED_N_DOCS {
                 return Err(format!(
                     "cold n_docs_total mismatch: {}",
-                    consumer.reader().n_docs_total()
+                    consumer.reader().expect("reader").n_docs_total()
                 ));
             }
             let cold_part_gets = counting.part_gets();
@@ -821,10 +825,10 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
             )
             .map_err(|e| format!("warm open: {e}"))?;
 
-            if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+            if consumer.reader().expect("reader").n_docs_total() != EXPECTED_N_DOCS {
                 return Err(format!(
                     "warm n_docs_total mismatch: {}",
-                    consumer.reader().n_docs_total()
+                    consumer.reader().expect("reader").n_docs_total()
                 ));
             }
             let warm_part_gets = counting.part_gets();
@@ -845,7 +849,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
             );
 
             // Collect cleanup keys from the warm consumer's manifest.
-            let reader = consumer.reader();
+            let reader = consumer.reader().expect("reader");
             let manifest = reader.manifest();
             let mut keys = vec![
                 "_supertable/current".to_string(),

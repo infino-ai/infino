@@ -26,8 +26,9 @@ use object_store::{
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry, usage::UsageMeter,
+    logical_list_key, options::apply, retry,
 };
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS
 /// sessions instead of re-handshaking on the cold tail.

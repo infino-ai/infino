@@ -84,12 +84,14 @@ impl TableResolver {
         {
             return Ok(t.clone());
         }
-        let table = self.conn.open_table(name).map_err(|e| {
+        let table = self.conn.open_table_handle(name).map_err(|e| {
             DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
         })?;
         table.ensure_fresh();
         let resolved = ResolvedTable {
-            reader: Arc::new(table.reader()),
+            reader: Arc::new(table.reader().map_err(|e| {
+                DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
+            })?),
             scalar_schema: table.options().scalar_schema(),
         };
         self.cache

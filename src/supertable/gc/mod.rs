@@ -9,11 +9,10 @@ use std::{
 use tracing::{debug, warn};
 
 use crate::{
-    Supertable,
     runtime_bridge::bridge_on_runtime,
     storage::StorageError,
     supertable::{
-        ManifestSnapshot,
+        ManifestSnapshot, Supertable,
         error::GcError,
         handle::SupertableInner,
         manifest::{
@@ -31,7 +30,7 @@ use crate::{
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// Outcome of a [`Supertable::gc`] sweep: what was reclaimed and what was
+/// Outcome of a [`crate::Supertable::gc`] sweep: what was reclaimed and what was
 /// intentionally kept.
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {

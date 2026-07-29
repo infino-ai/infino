@@ -45,7 +45,7 @@ use datafusion::{
 };
 
 use crate::{
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         handle::{SupertableReader, WeakReader},
         query::exec::common::{
@@ -376,7 +376,9 @@ impl ExecutionPlan for Bm25Exec {
         let fut = async move {
             let hits = match &query {
                 Bm25Query::Terms { query, mode } => {
-                    reader.bm25_search_async(&column, query, k, *mode).await
+                    reader
+                        .bm25_search_async(&column, query, k, *mode, Bm25Stats::PerSuperfile)
+                        .await
                 }
                 Bm25Query::Prefix { prefix } => {
                     reader.bm25_search_prefix_async(&column, prefix, k).await
@@ -527,6 +529,7 @@ mod tests {
         let st = demo_corpus();
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title, score FROM bm25_search('title', 'rust', 10)")
             .expect("query_sql");
         let titles = titles_of(&batches);
@@ -544,6 +547,7 @@ mod tests {
         // AND: only doc 4 has both `rust` and `systems`.
         let and_rows = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10, 'and')")
             .expect("query_sql");
         let and_titles = titles_of(&and_rows);
@@ -552,6 +556,7 @@ mod tests {
         // OR (default): docs 0 + 4 (union of `rust` and `systems`).
         let or_rows = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM bm25_search('title', 'rust systems', 10)")
             .expect("query_sql");
         assert_eq!(titles_of(&or_rows).len(), 2);
@@ -563,6 +568,7 @@ mod tests {
         // `-systems` drops doc 4; only doc 0 matches `rust` without it.
         let rows = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM bm25_search('title', 'rust -systems', 10)")
             .expect("query_sql");
         assert_eq!(titles_of(&rows), vec!["rust async runtime".to_string()]);
@@ -570,6 +576,7 @@ mod tests {
         // A negation-only query has nothing to rank → error.
         let res = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM bm25_search('title', '-rust', 10)");
         assert!(res.is_err(), "negation-only must error; got {res:?}");
     }
@@ -580,6 +587,7 @@ mod tests {
         // `rus` expands to `rust` → docs 0 + 4.
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM bm25_search_prefix('title', 'rus', 10)")
             .expect("query_sql");
         let titles = titles_of(&batches);
@@ -592,6 +600,7 @@ mod tests {
         let st = demo_corpus();
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT * FROM bm25_search('title', 'rust', 10)")
             .expect("query_sql");
         let b = &batches[0];
@@ -607,6 +616,7 @@ mod tests {
         let st = Supertable::create(options_title_fts()).expect("create");
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title, score FROM bm25_search('title', 'rust', 5)")
             .expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -619,6 +629,7 @@ mod tests {
         // 2 args (missing k) → planning error, surfaced as QueryError::Plan.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT title FROM bm25_search('title', 'rust')")
                 .is_err()
         );
@@ -630,6 +641,7 @@ mod tests {
         // prefix wants exactly 3 args; 2 → planning error.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT title FROM bm25_search_prefix('title', 'rus')")
                 .is_err()
         );
@@ -641,6 +653,7 @@ mod tests {
         // Non-integer k.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT title FROM bm25_search('title', 'rust', 'ten')")
                 .is_err(),
             "non-integer k must error"
@@ -648,6 +661,7 @@ mod tests {
         // Invalid mode literal.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT title FROM bm25_search('title', 'rust', 10, 'nand')")
                 .is_err(),
             "invalid mode must error"
@@ -659,6 +673,7 @@ mod tests {
     fn explain(st: &Supertable, sql: &str) -> String {
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!("EXPLAIN {sql}"))
             .expect("explain");
         let mut out = String::new();
@@ -685,7 +700,7 @@ mod tests {
     async fn bm25_table_and_exec_trait_methods() {
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo_corpus();
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         let func = Bm25SearchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("title"), lit("rust"), lit(10_i64)]).expect("bm25 table");

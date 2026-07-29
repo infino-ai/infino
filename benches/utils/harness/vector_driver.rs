@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{VectorEngine, VectorHit};
 use crate::{
-    corpus,
+    corpus, cpu,
     markdown::fmt_count,
     rss::{PeakSampler, RssStats},
 };
@@ -57,6 +57,9 @@ pub struct VectorBuildStat {
     pub writers: usize,
     pub wall: Duration,
     pub rss: RssStats,
+    /// Measured on-CPU seconds of the build (all-thread schedstat delta),
+    /// when sampled — prices the build compute instead of a NOT-METERED gap.
+    pub cpu_s: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,14 +104,13 @@ pub fn run_vector_with_index<E: VectorEngine>(
     );
     let mut index = E::open(cfg.column, cfg.dim, cfg.metric, n_cent);
     let sampler = PeakSampler::start_default();
-    let t0 = Instant::now();
-    E::write(&mut index, vectors);
-    let wall = t0.elapsed();
+    let ((), wall, cpu_s) = cpu::timed(|| E::write(&mut index, vectors));
     let rss = sampler.stop_stats();
     let mut builds = vec![VectorBuildStat {
         writers: 1,
         wall,
         rss,
+        cpu_s,
     }];
 
     if cfg.parallel > 1 {
@@ -118,14 +120,15 @@ pub fn run_vector_with_index<E: VectorEngine>(
             cfg.parallel,
         );
         let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        E::parallel_write(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel);
-        let wall = t0.elapsed();
+        let ((), wall, cpu_s) = cpu::timed(|| {
+            E::parallel_write(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel)
+        });
         let rss = sampler.stop_stats();
         builds.push(VectorBuildStat {
             writers: cfg.parallel,
             wall,
             rss,
+            cpu_s,
         });
     }
 

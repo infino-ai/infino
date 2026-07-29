@@ -161,7 +161,7 @@ fn row_count(batches: &[RecordBatch]) -> usize {
 /// failure message.
 fn assert_all_error(st: &Supertable, label: &str, queries: &[String]) {
     for q in queries {
-        let result = st.reader().query_sql(q);
+        let result = st.reader().expect("reader").query_sql(q);
         assert!(
             result.is_err(),
             "[{label}] expected an error, query unexpectedly succeeded: {q}"
@@ -411,7 +411,11 @@ fn varied_projections_succeed_for_ranked_tvfs() {
         format!("SELECT _id FROM bm25_search('title', 'rust', {SURFACE_TOP_K})"),
         format!("SELECT _id FROM vector_search('emb', '{qv}', {SURFACE_TOP_K})"),
     ] {
-        let b = st.reader().query_sql(&q).expect("id-only query");
+        let b = st
+            .reader()
+            .expect("reader")
+            .query_sql(&q)
+            .expect("id-only query");
         assert_eq!(b[0].schema().field(0).name(), "_id", "{q}");
         assert_eq!(
             b[0].num_columns(),
@@ -423,6 +427,7 @@ fn varied_projections_succeed_for_ranked_tvfs() {
     // Mixed scalar + score projection drives the scalar-decode path.
     let mixed = st
         .reader()
+        .expect("reader")
         .query_sql(&format!(
             "SELECT rating, score FROM bm25_search('title', 'rust', {SURFACE_TOP_K})"
         ))
@@ -433,6 +438,7 @@ fn varied_projections_succeed_for_ranked_tvfs() {
     // `SELECT *` materializes every scalar column plus score.
     let star = st
         .reader()
+        .expect("reader")
         .query_sql(&format!(
             "SELECT * FROM vector_search('emb', '{qv}', {SURFACE_TOP_K})"
         ))
@@ -457,7 +463,11 @@ fn zero_k_yields_empty_result() {
         format!("SELECT _id, score FROM vector_search('emb', '{qv}', 0)"),
         format!("SELECT * FROM hybrid_search('title', 'rust', 'emb', '{qv}', 0)"),
     ] {
-        let b = st.reader().query_sql(&q).expect("k=0 query");
+        let b = st
+            .reader()
+            .expect("reader")
+            .query_sql(&q)
+            .expect("k=0 query");
         assert_eq!(row_count(&b), 0, "k=0 must produce no rows: {q}");
     }
 }
@@ -474,7 +484,11 @@ fn empty_result_queries_return_no_rows() {
         // No title equals this exact value.
         "SELECT _id FROM exact_match('title', 'no such exact title')".to_string(),
     ] {
-        let b = st.reader().query_sql(&q).expect("empty-result query");
+        let b = st
+            .reader()
+            .expect("reader")
+            .query_sql(&q)
+            .expect("empty-result query");
         assert_eq!(row_count(&b), 0, "expected no matches: {q}");
     }
 }

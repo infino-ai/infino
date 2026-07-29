@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{BoolMode, FtsEngine, Hit};
 use crate::{
+    cpu,
     markdown::fmt_count,
     rss::{PeakSampler, RssStats},
 };
@@ -48,6 +49,9 @@ pub struct QueryStats {
 pub struct BuildStat {
     pub writers: usize,
     pub phase: PhaseStats,
+    /// Measured on-CPU seconds of the build (all-thread schedstat delta),
+    /// when sampled — prices the build compute instead of a NOT-METERED gap.
+    pub cpu_s: Option<f64>,
 }
 
 /// Everything one engine produced for the FTS modality. `builds` holds
@@ -102,9 +106,7 @@ pub fn run_fts_with_index<E: FtsEngine>(
     );
     let mut index = E::open(column);
     let sampler = PeakSampler::start_default();
-    let t0 = Instant::now();
-    E::write(&mut index, docs);
-    let build_wall = t0.elapsed();
+    let ((), build_wall, build_cpu) = cpu::timed(|| E::write(&mut index, docs));
     let build_rss = sampler.stop_stats();
     let mut builds = vec![BuildStat {
         writers: 1,
@@ -112,6 +114,7 @@ pub fn run_fts_with_index<E: FtsEngine>(
             wall: build_wall,
             rss: build_rss,
         },
+        cpu_s: build_cpu,
     }];
 
     // ── build-only throughput probe at N writers (no query index) ────
@@ -121,13 +124,12 @@ pub fn run_fts_with_index<E: FtsEngine>(
             E::name(),
         );
         let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        E::parallel_write(column, docs, parallel);
-        let wall = t0.elapsed();
+        let ((), wall, cpu_s) = cpu::timed(|| E::parallel_write(column, docs, parallel));
         let rss = sampler.stop_stats();
         builds.push(BuildStat {
             writers: parallel,
             phase: PhaseStats { wall, rss },
+            cpu_s,
         });
     }
 

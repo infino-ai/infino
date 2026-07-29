@@ -72,6 +72,7 @@ fn build_batch(idx: usize, schema: Arc<Schema>) -> RecordBatch {
 fn explain(st: &Supertable, sql: &str) -> String {
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql(&format!("EXPLAIN {sql}"))
         .expect("explain");
     let mut out = String::new();
@@ -92,7 +93,7 @@ fn explain(st: &Supertable, sql: &str) -> String {
 
 /// Single-cell i64 result of an aggregate query.
 fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
-    let batches = st.reader().query_sql(sql).expect("sql");
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     batch
         .column(0)
@@ -104,7 +105,7 @@ fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
 
 /// Single-cell string result of an aggregate query.
 fn scalar_string(st: &Supertable, sql: &str) -> String {
-    let batches = st.reader().query_sql(sql).expect("sql");
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     let column = batch.column(0);
     if let Some(s) = column.as_any().downcast_ref::<LargeStringArray>() {
@@ -272,7 +273,7 @@ fn build_day_batch(idx: usize, schema: Arc<Schema>) -> RecordBatch {
 
 /// Single-cell Date32 (days-since-epoch) result of an aggregate query.
 fn scalar_date32(st: &Supertable, sql: &str) -> i32 {
-    let batches = st.reader().query_sql(sql).expect("sql");
+    let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     batch
         .column(0)

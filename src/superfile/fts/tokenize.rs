@@ -5,12 +5,12 @@
 //! The parser lives here because the `+` / `-` clause sigils must be
 //! handled before tokenizing — the tokenizer splits on both.
 //!
-//! Ships one tokenizer: [`AsciiLowerTokenizer`]. The [`Tokenizer`]
-//! trait is the extension point for ICU / language-aware stemmers /
-//! custom char filters under the same trait without touching FTS
-//! code.
+//! Ships two tokenizers: [`AsciiLowerTokenizer`] (the default) and
+//! [`StandardTokenizer`]. The [`Tokenizer`] trait is the extension
+//! point for ICU / language-aware stemmers / custom char filters
+//! under the same trait without touching FTS code.
 //!
-//! Semantics:
+//! [`AsciiLowerTokenizer`] semantics:
 //!   - Split on any byte that isn't `[A-Za-z0-9]`.
 //!   - Lowercase each ASCII letter (bytes `b'A'..=b'Z'` → `b'a'..=b'z'`).
 //!   - Drop any token that contains a non-ASCII byte (high-bit set).
@@ -18,14 +18,32 @@
 //!     ASCII-only design is intentional; richer tokenizers can opt
 //!     into the trait without changing the FTS pipeline.
 //!   - Empty tokens are never emitted.
+//!
+//! [`StandardTokenizer`] semantics (Unicode-aware):
+//!   - Segment on Unicode text boundaries (UAX #29 word boundaries),
+//!     keeping runs that contain alphanumerics and discarding
+//!     whitespace/punctuation-only segments.
+//!   - Lowercase each token via full Unicode case folding.
+//!   - Non-ASCII letters and digits are preserved (not dropped), so
+//!     accented and non-Latin scripts remain searchable.
+//!   - **No Unicode normalization** (NFC/NFD): a token is emitted in its
+//!     input code-point encoding. This matches the `standard` analyzer in
+//!     Lucene / Elasticsearch, which applies normalization only through a
+//!     separate, opt-in ICU filter — never in the standard pipeline.
+//!     Canonicalizing equivalent encodings (e.g. precomposed `é` vs. the
+//!     base `e` + combining acute) is therefore a distinct analyzer's job:
+//!     a normalizing analyzer plugs in through the [`Tokenizer`] trait
+//!     rather than altering `standard`'s semantics.
 
 use std::{
     any::Any,
     borrow::Cow,
     collections::BTreeSet,
     str::{from_utf8, from_utf8_unchecked},
+    sync::Arc,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
 use super::reader::BoolMode;
@@ -68,7 +86,15 @@ const TOKEN_SCRATCH_INITIAL_CAP: usize = 32;
 ///     body straight into the tokenizer's per-byte scan. Custom
 ///     tokenizers don't need to opt in — they just return `self`
 ///     and never get downcast.
-pub trait Tokenizer: Send + Sync + 'static {
+pub trait Tokenizer: Send + Sync + std::fmt::Debug + 'static {
+    /// Stable registry name recorded in a column's stored FTS config
+    /// (the `tokenizer` field of `inf.fts.columns`) and used to
+    /// reconstruct the matching tokenizer at read time via
+    /// [`tokenizer_for_name`]. Must round-trip:
+    /// `tokenizer_for_name(t.name())` yields a tokenizer of the same
+    /// kind as `t`.
+    fn name(&self) -> &'static str;
+
     /// Yield each token as an owned `String` lower-cased per the
     /// implementation's rules.
     ///
@@ -533,6 +559,10 @@ impl<'q> ParsedQuery<'q> {
 }
 
 impl Tokenizer for AsciiLowerTokenizer {
+    fn name(&self) -> &'static str {
+        ASCII_LOWER_TOKENIZER
+    }
+
     fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
         Box::new(AsciiLowerIter::new(text.as_bytes()))
     }
@@ -650,6 +680,85 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
 
+/// Name of the default ASCII tokenizer in a column's FTS config.
+pub const ASCII_LOWER_TOKENIZER: &str = "ascii_lower";
+
+/// Name of the Unicode-aware standard tokenizer in a column's FTS config.
+pub const STANDARD_TOKENIZER: &str = "standard";
+
+/// Resolve a tokenizer name to an instance, or `None` for an
+/// unrecognized name. The single routing point shared by the build
+/// path (mapping a chosen analyzer to the tokenizer used at index
+/// time) and the read path (reconstructing a column's tokenizer from
+/// the name recorded in its stored config). Callers translate `None`
+/// into their own error — a malformed-superfile read error, or an
+/// invalid-argument error at table-create time.
+pub fn tokenizer_for_name(name: &str) -> Option<Arc<dyn Tokenizer>> {
+    match name {
+        ASCII_LOWER_TOKENIZER => Some(Arc::new(AsciiLowerTokenizer)),
+        STANDARD_TOKENIZER => Some(Arc::new(StandardTokenizer)),
+        _ => None,
+    }
+}
+
+/// Unicode-aware tokenizer: UAX #29 word segmentation followed by full
+/// Unicode lowercasing, preserving non-ASCII text. See the module-level
+/// docs for the exact semantics and how it differs from
+/// [`AsciiLowerTokenizer`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StandardTokenizer;
+
+impl StandardTokenizer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Tokenizer for StandardTokenizer {
+    fn name(&self) -> &'static str {
+        STANDARD_TOKENIZER
+    }
+
+    fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+        // `unicode_words` yields the UAX #29 word segments that contain
+        // alphanumerics — whitespace/punctuation-only segments are
+        // dropped. Lowercasing is full Unicode case folding, correct for
+        // non-ASCII letters, which are kept rather than dropped.
+        Box::new(text.unicode_words().map(str::to_lowercase))
+    }
+
+    fn tokenize_each(&self, text: &str, f: &mut dyn FnMut(&str)) {
+        let mut buf = String::new();
+        for word in text.unicode_words() {
+            // Borrow directly when every cased character is already
+            // lowercase (the common case for lowercased corpora); only
+            // allocate to case-fold a word carrying an upper/title-case
+            // letter. Non-alphabetic characters (digits, apostrophes)
+            // are unaffected by lowercasing, so they never force a copy.
+            if word.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
+                f(word);
+            } else {
+                buf.clear();
+                // Context-aware full-string lowercasing, matching
+                // `tokenize`. `str::to_lowercase` applies Unicode
+                // special-casing such as Final_Sigma (a word-final `Σ`
+                // lowercases to `ς`, but to `σ` elsewhere); a char-by-char
+                // fold has no word context and would emit `σ` in both
+                // spots. The two paths must agree — text is indexed
+                // through `tokenize_each` and queried through `tokenize`,
+                // so any divergence indexes a term under one form and
+                // searches it under another.
+                buf.push_str(&word.to_lowercase());
+                f(&buf);
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +773,121 @@ mod tests {
         AsciiLowerTokenizer
             .tokenize_each_inline_positioned(text, |tok, pos| out.push((tok.to_owned(), pos)));
         out
+    }
+
+    // ---- StandardTokenizer (Unicode-aware) ----
+
+    /// Tokens via the trait `tokenize` path.
+    fn std_tokens(text: &str) -> Vec<String> {
+        StandardTokenizer.tokenize(text).collect()
+    }
+
+    /// Tokens via the `tokenize_each` borrowing path — must agree with
+    /// `tokenize` on which tokens are emitted.
+    fn std_tokens_each(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        StandardTokenizer.tokenize_each(text, &mut |t| out.push(t.to_owned()));
+        out
+    }
+
+    #[test]
+    fn standard_lowercases_and_splits_ascii() {
+        assert_eq!(
+            std_tokens("Rust Async Runtime"),
+            vec!["rust", "async", "runtime"]
+        );
+        assert_eq!(
+            std_tokens_each("Rust Async Runtime"),
+            vec!["rust", "async", "runtime"]
+        );
+    }
+
+    #[test]
+    fn standard_keeps_non_ascii_lowercased() {
+        // The key divergence from AsciiLowerTokenizer, which drops these.
+        assert_eq!(std_tokens("Café RÉSUMÉ"), vec!["café", "résumé"]);
+        assert_eq!(std_tokens_each("Café RÉSUMÉ"), vec!["café", "résumé"]);
+        // AsciiLowerTokenizer drops the same tokens entirely.
+        assert_eq!(
+            AsciiLowerTokenizer
+                .tokenize("Café RÉSUMÉ")
+                .collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn standard_splits_cjk_per_ideograph() {
+        // UAX #29 treats each CJK ideograph as its own word.
+        assert_eq!(std_tokens("日本語"), vec!["日", "本", "語"]);
+    }
+
+    #[test]
+    fn standard_keeps_intra_word_numeric_and_apostrophe() {
+        // UAX #29 keeps a decimal number and a mid-word apostrophe together.
+        assert_eq!(std_tokens("pi is 3.14"), vec!["pi", "is", "3.14"]);
+        assert_eq!(std_tokens("don't stop"), vec!["don't", "stop"]);
+    }
+
+    #[test]
+    fn standard_splits_on_hyphen_and_drops_punctuation() {
+        assert_eq!(std_tokens("wi-fi, hello!"), vec!["wi", "fi", "hello"]);
+        assert_eq!(std_tokens("...   ???"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standard_borrow_and_copy_paths_agree() {
+        // Mixed already-lower, needs-fold, digit, and non-ASCII tokens:
+        // the borrow fast path and the copy path must emit the same set.
+        let text = "alpha Beta 42 gamma2 Δelta";
+        assert_eq!(std_tokens(text), std_tokens_each(text));
+    }
+
+    #[test]
+    fn standard_copy_path_lowercases_final_sigma_like_tokenize() {
+        // Regression: the copy path must lowercase with context-aware
+        // `str::to_lowercase`, not char-by-char. A word-final capital `Σ`
+        // folds to `ς` (final sigma) but to `σ` elsewhere; a char-by-char
+        // fold has no word context and would emit `σ` in both places. Text
+        // is indexed through `tokenize_each` and queried through
+        // `tokenize`, so any divergence stores a Greek term under one form
+        // and searches it under another — the document becomes unfindable.
+        let text = "ΟΔΟΣ"; // one Greek word; the final Σ must fold to ς
+        // Both tokenizer paths agree, and both equal Rust's context-aware
+        // folding (which the char-by-char version would not).
+        assert_eq!(std_tokens(text), std_tokens_each(text));
+        assert_eq!(std_tokens_each(text), vec![text.to_lowercase()]);
+        assert!(
+            std_tokens_each(text)[0].ends_with('ς'),
+            "word-final Σ must fold to final sigma ς, not σ"
+        );
+    }
+
+    #[test]
+    fn standard_empty_and_whitespace_yield_nothing() {
+        assert_eq!(std_tokens(""), Vec::<String>::new());
+        assert_eq!(std_tokens("   \t\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standard_query_parse_keeps_non_ascii_and_sigils() {
+        // Query-side tokenization (via the default `tokenize_each_query`
+        // → `parse`) must keep non-ASCII and honor +/- clause sigils.
+        let p = StandardTokenizer.parse("Café -Résumé +Ötzi");
+        assert_eq!(p.positives, vec!["café"]);
+        assert_eq!(p.negatives, vec!["résumé"]);
+        assert_eq!(p.musts, vec!["ötzi"]);
+    }
+
+    #[test]
+    fn tokenizer_for_name_resolves_known_and_rejects_unknown() {
+        assert!(tokenizer_for_name(ASCII_LOWER_TOKENIZER).is_some());
+        assert!(tokenizer_for_name(STANDARD_TOKENIZER).is_some());
+        assert!(tokenizer_for_name("nonesuch").is_none());
+        // The resolved standard tokenizer keeps non-ASCII through the
+        // trait object, confirming the right impl is wired.
+        let tok = tokenizer_for_name(STANDARD_TOKENIZER).expect("standard");
+        assert_eq!(tok.tokenize("Café").collect::<Vec<_>>(), vec!["café"]);
     }
 
     #[test]
@@ -839,8 +1063,12 @@ mod tests {
     fn parse_default_trait_impl_matches_override() {
         // A tokenizer that overrides nothing gets the same split via
         // the default `parse` impl (owned tokens).
+        #[derive(Debug)]
         struct PlainTok;
         impl Tokenizer for PlainTok {
+            fn name(&self) -> &'static str {
+                "plain_test"
+            }
             fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
                 AsciiLowerTokenizer.tokenize(text)
             }

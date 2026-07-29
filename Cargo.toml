@@ -1,6 +1,6 @@
 [package]
 name = "infino"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2024"
 # Pinned to the toolchain in rust-toolchain.toml. The vector SIMD path
 # uses AVX-512 intrinsics stabilized in 1.89 and std APIs from 1.87, so
@@ -82,6 +82,11 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # `test-helpers` across the whole dev-target graph (tests, benches,
 # AND examples), so no in-package example can build with it off.
 test-helpers = []
+# Exposes `infino::runtime_metrics` (`io` / `cpu` / `rss`) plus
+# `Connection::usage_snapshot` / `usage_meter` for dependents
+# (e.g. infino-platform Prometheus) without `test-helpers`.
+# Off the curated `public-api.txt` snapshot (default features only).
+metering = []
 # Opt-in diagnostic benches that are useful for storage/request-shape
 # work or release-profile recall gates, but should not run as part of a
 # plain `cargo bench`.
@@ -95,6 +100,11 @@ bench-diagnostics = []
 # / `info!` / …) are independent of this flag and stay compiled in
 # regardless. Not part of the public API surface.
 detailed-tracing = []
+# Remote (hosted-service) transport: a synchronous HTTP client so a
+# connection can target a hosted endpoint (`https://host/db`) instead of
+# local object storage. OFF by default — with the feature absent no
+# networking dependency is compiled and the engine is embedded-only.
+remote = ["dep:ureq"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
@@ -123,6 +133,10 @@ bumpalo = { version = "3", features = ["collections"] }
 rustc-hash = "2"
 static_assertions = "1"
 
+# Tokenization: UAX#29 word segmentation for the Unicode-aware standard
+# analyzer (keeps non-ASCII text), alongside the built-in ASCII tokenizer.
+unicode-segmentation = "1"
+
 # Numerics
 rand = "0.10"
 rand_distr = "0.6"
@@ -133,6 +147,12 @@ thiserror = "2"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Remote transport (hosted service): a synchronous HTTP client, compiled
+# only under the `remote` feature. Sync fits the engine's blocking public
+# API and needs no tokio runtime, so it can't nest a runtime inside a host
+# process (e.g. a language binding). rustls for a pure-Rust TLS stack.
+ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
 
 # Supertable: lock-free manifest swap + superfile ids + FTS bloom hash.
 # Manifest is held in ArcSwap<Manifest> for reader-writer isolation;
@@ -296,6 +316,18 @@ hdrhistogram = "7"
 # busy/idle timing output (`FmtSpan`). Dev-only; not part of the shipped
 # crate's dependency surface.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hermetic HTTP mock server for the remote-transport tests: asserts the
+# request shape (method/path/headers/body) the sync client emits and
+# returns canned Arrow/JSON. Test-only; not in the shipped surface.
+wiremock = "0.6"
+# The remote-transport integration test builds canned Arrow-IPC responses and
+# JSON request-matchers, and DataFusion `Expr` predicates for update/delete.
+# Same versions as the normal deps (no new surface); listed here so the separate
+# integration-test crate can name them directly.
+arrow = "58"
+serde_json = "1"
+datafusion = "54"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"

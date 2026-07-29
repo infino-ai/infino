@@ -100,6 +100,7 @@ use infino::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
     },
+    runtime_metrics::UsageMeter,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::reader::BoolMode,
@@ -906,7 +907,7 @@ pub(crate) mod diag {
             self.inner.object_store_handle(uri)
         }
 
-        fn usage_meter(&self) -> Arc<infino::storage::UsageMeter> {
+        fn usage_meter(&self) -> Arc<UsageMeter> {
             self.inner.usage_meter()
         }
     }
@@ -1711,7 +1712,7 @@ pub(crate) mod diag {
             )
             .expect("open unified supertable from real S3");
             let cold_open = open_t0.elapsed();
-            let reader = consumer.reader();
+            let reader = consumer.reader().expect("reader");
             eprintln!(
                 "[diag-real-s3-supertable] cold_open wall={:.1} ms manifest_id={} n_superfiles={} n_docs_total={}",
                 cold_open.as_secs_f64() * MS_PER_SEC,
@@ -1740,7 +1741,7 @@ pub(crate) mod diag {
             let query = query_vector().to_vec();
             let vec_t0 = Instant::now();
             let vec_hits = consumer
-                .reader()
+                .reader().expect("reader")
                 .vector_search(
                     VEC_COLUMN,
                     &query,
@@ -1759,7 +1760,7 @@ pub(crate) mod diag {
 
             let bm25_t0 = Instant::now();
             let bm25_hits = consumer
-                .reader()
+                .reader().expect("reader")
                 .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("cold BM25 over real S3 supertable");
             let cold_bm25 = bm25_t0.elapsed();
@@ -1773,7 +1774,7 @@ pub(crate) mod diag {
 
             let warm_vec_t0 = Instant::now();
             let warm_vec_hits = consumer
-                .reader()
+                .reader().expect("reader")
                 .vector_search(
                     VEC_COLUMN,
                     &query,
@@ -1786,7 +1787,7 @@ pub(crate) mod diag {
             let warm_vec = warm_vec_t0.elapsed();
             let warm_bm25_t0 = Instant::now();
             let warm_bm25_hits = consumer
-                .reader()
+                .reader().expect("reader")
                 .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("warm BM25 over real S3 supertable");
             let warm_bm25 = warm_bm25_t0.elapsed();
@@ -2103,7 +2104,7 @@ pub(crate) mod diag {
     }
 
     /// Times warm `reader.bm25_search` / `reader.vector_search`
-    /// (kernel-direct) vs `consumer.reader().query_sql("SELECT _id FROM
+    /// (kernel-direct) vs `consumer.reader().expect("reader").query_sql("SELECT _id FROM
     /// bm25_search(...)")` / `query_sql("... vector_search ...")`
     /// (DataFusion path) side-by-side on the same warm Supertable
     /// over an in-process `RustFS`. Prints min / p50 / p95 / mean
@@ -2189,10 +2190,12 @@ pub(crate) mod diag {
         let q = query_vector().to_vec();
         let _ = consumer
             .reader()
+            .expect("reader")
             .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
             .expect("warm-up bm25");
         let _ = consumer
             .reader()
+            .expect("reader")
             .vector_search(
                 VEC_COLUMN,
                 &q,
@@ -2225,10 +2228,12 @@ pub(crate) mod diag {
             format!("SELECT score FROM vector_search('{VEC_COLUMN}', '{q_csv}', {TOP_K})");
         let _ = consumer
             .reader()
+            .expect("reader")
             .query_sql(&bm25_sql)
             .expect("warm-up query_sql bm25");
         let _ = consumer
             .reader()
+            .expect("reader")
             .query_sql(&vec_sql)
             .expect("warm-up query_sql vector");
 
@@ -2240,6 +2245,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .bm25_hits(FTS_COLUMN, FTS_QUERY_TERM, TOP_K, BoolMode::Or)
                 .expect("kernel bm25");
             kernel_bm25.push(t.elapsed());
@@ -2249,6 +2255,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .query_sql(&bm25_sql)
                 .expect("query_sql bm25");
             qsql_bm25.push(t.elapsed());
@@ -2258,6 +2265,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .vector_search(VEC_COLUMN, &q, TOP_K, opts, None, None)
                 .expect("kernel vector");
             kernel_vec.push(t.elapsed());
@@ -2267,6 +2275,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .query_sql(&vec_sql)
                 .expect("query_sql vector");
             qsql_vec.push(t.elapsed());
@@ -2307,6 +2316,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .query_sql(&bm25_score_sql)
                 .expect("query_sql bm25 score");
             bm25_score_total.push(t.elapsed());
@@ -2316,6 +2326,7 @@ pub(crate) mod diag {
             let t = Instant::now();
             let _ = consumer
                 .reader()
+                .expect("reader")
                 .query_sql(&vec_score_sql)
                 .expect("query_sql vector score");
             vec_score_total.push(t.elapsed());

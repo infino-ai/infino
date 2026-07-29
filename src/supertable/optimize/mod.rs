@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 use crate::{
-    Supertable,
     config::OptimizeOptions,
     supertable::{
+        Supertable,
         error::{GcError, OptimizeError},
         wal::gc::GcError as WalGcError,
     },

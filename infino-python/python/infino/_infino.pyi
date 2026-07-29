@@ -5,6 +5,7 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
+Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -38,6 +39,7 @@ class ConnectionMemoryBudgetError(InfinoError):
     it and back off, e.g. narrow the query, split the ingest, or raise the budget."""
 
 class Connection:
+    def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
     def open_table(self, name: str) -> Table: ...
     def drop_table(self, name: str, purge: bool = ...) -> None: ...
@@ -46,7 +48,7 @@ class Connection:
 
 class IndexSpec:
     def __init__(self) -> None: ...
-    def fts(self, column: str) -> IndexSpec: ...
+    def fts(self, column: str, analyzer: str | None = None) -> IndexSpec: ...
     # `dim` must be in [16, 4096]; out-of-range raises at `create_table`.
     def vector(self, column: str, dim: int, n_cent: int, metric: Metric) -> IndexSpec: ...
 
@@ -59,6 +61,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
+        stats: Bm25Stats | None = ...,
     ) -> ArrowTable: ...
     def vector_search(
         self,
@@ -66,6 +69,7 @@ class Table:
         query: Sequence[float],
         k: int,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         filter_column: str | None = ...,
         filter_query: str | None = ...,
         filter_mode: BoolMode | None = ...,
@@ -99,6 +103,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         nprobe: int | None = ...,
+        rerank_mult: int | None = ...,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
     def delete(self, predicate: str) -> MutationStats: ...

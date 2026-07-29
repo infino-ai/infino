@@ -33,6 +33,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Never run in a fork: only this repo has the Pages site to deploy to.
+    if: github.repository == 'infino-ai/infino'
     steps:
       - name: Python reference (pdoc, from the published package)
         uses: actions/setup-python@v5

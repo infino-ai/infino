@@ -592,6 +592,24 @@ fn score_fine_candidates(
     Ok((candidates, deferred))
 }
 
+/// Union of the grid-ranked and fine-ranked cell selections, in probe
+/// priority order: grid picks first, then fine picks not already selected.
+///
+/// The two rankings fail in opposite regimes, so probing their union holds
+/// the coverage floor at every measured scale. Small cells make fine
+/// centroids noisy — grid ranking wins. Large cells make the single grid
+/// centroid a poor proxy — fine ranking wins. Used for filtered search and
+/// explicit caller `nprobe`; default unfiltered stays fine-first.
+fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
+    let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
+    for &cell in grid.iter().chain(fine) {
+        if !selected.contains(&cell) {
+            selected.push(cell);
+        }
+    }
+    selected
+}
+
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
 /// top cell only when its own fine score is a genuine near-tie of the fine
@@ -619,28 +637,6 @@ fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) 
         }
     }
     cells
-}
-
-/// Union of the grid-ranked and fine-ranked cell selections, in probe
-/// priority order: grid picks first, then fine picks not already selected.
-///
-/// The two rankings fail in opposite regimes, so probing their union holds
-/// the coverage floor at every measured scale. Small cells (100K/64c: ~1.5K
-/// rows, ~3 fine runs each) make fine centroids noisy — grid ranking wins
-/// (measured neighbor coverage 0.950 grid vs 0.700 fine). Large cells
-/// (10M/64c: ~230K rows, ~250 fine runs each) make the single grid centroid
-/// a poor proxy for the cell's extent — fine ranking wins (0.919 fine vs
-/// 0.629 grid; fine p2 = 0.997). Grid-only p=1 routing pinned 10M recall to
-/// the 0.63 ceiling; the union restores the better ranking at each scale for
-/// at most one extra probed cell per pick.
-fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
-    let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
-    for &cell in grid.iter().chain(fine) {
-        if !selected.contains(&cell) {
-            selected.push(cell);
-        }
-    }
-    selected
 }
 
 /// Map a per-superfile vector-search error to a query error. A budget refusal
@@ -1287,10 +1283,6 @@ impl SupertableReader {
             .map(|vc| (vc.metric, vc.rot_seed))
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
-        // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
-        // on this path cleared the lazily-built transposed cache every query
-        // and rebuilt it with the scalar `transpose_centroids_cluster_major`
-        // loop (~ms at dim=1024) before any SIMD scoring ran.
         let grid = manifest
             .global_vector_index()
             .filter(|g| g.column == column)
@@ -1355,17 +1347,27 @@ impl SupertableReader {
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if filtered && options.nprobe.is_some() {
-                    // Explicit caller `nprobe` on a FILTERED query pins the
-                    // hidden cell sweep — the width dial calibration and
-                    // the bench sweep turn (depth stays at the filtered
-                    // default so the sweep isolates width). Unfiltered
-                    // hidden routing keeps ignoring caller nprobe
-                    // (persisted params own it).
+                if options.nprobe.is_some() && (filtered || options.widen_unfiltered_hidden_cells) {
+                    // Explicit caller `nprobe` pins the hidden cell sweep. FILTERED
+                    // queries always honor it (the width-dial calibration and the
+                    // filtered sweep). UNFILTERED hidden queries honor it only when
+                    // `widen_unfiltered_hidden_cells` is set — a diagnostic whose
+                    // setter is `#[cfg(feature = "test-helpers")]`, so it is
+                    // unreachable from the production public API and used only by
+                    // the recall breadth-sweep bench. In production the flag is
+                    // always `false`, so an explicit `nprobe` on an unfiltered
+                    // hidden query keeps the persisted p=1 routing (the `else` arms
+                    // below) — `with_nprobe` does not change serving behavior.
+                    // Filtered queries additionally lift per-cell fine depth to the
+                    // filtered floor; unfiltered keeps the persisted fine depth.
                     CellRoutingParams {
                         nprobe_min: nprobe.max(1),
                         nprobe_max: nprobe.max(1),
-                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        fine_nprobe: if filtered {
+                            base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE)
+                        } else {
+                            base.fine_nprobe
+                        },
                         ..base
                     }
                 } else if filtered {
@@ -2845,7 +2847,7 @@ impl Supertable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        self.reader()
+        self.reader()?
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
             .map_err(|e| e.with_context("vector_search", None))
@@ -2932,6 +2934,17 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
+    /// Union keeps grid picks first (probe priority), appends fine picks
+    /// not already selected, and collapses to one cell when both rankings
+    /// agree. Filtered search uses this after the exact cell scan.
+    #[test]
+    fn union_cell_selection_dedups_with_grid_priority() {
+        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
+        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
+        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
+        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
+    }
+
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
@@ -2948,17 +2961,6 @@ mod tests {
         assert_eq!(ranked[2].0, 3);
     }
 
-    /// Union keeps grid picks first (probe priority), appends fine picks
-    /// not already selected, and collapses to one cell when both rankings
-    /// agree.
-    #[test]
-    fn union_cell_selection_dedups_with_grid_priority() {
-        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
-        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
-        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
-        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
-    }
-
     /// The inline stable-id fast path: hits carrying `stable_id` are resolved
     /// directly from the stamp, in hit order, without any manifest lookup or
     /// storage read (the superfile URIs below are random and absent from the
@@ -2967,7 +2969,7 @@ mod tests {
     fn hidden_hits_user_ids_uses_inline_stable_id_fast_path() {
         let dim = 16;
         let table = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
-        let reader = table.reader();
+        let reader = table.reader().expect("reader");
         let manifest = reader.manifest();
 
         let mk = |sid: i128| SuperfileHit {
@@ -2993,15 +2995,15 @@ mod tests {
         assert!(table.options().partition_strategy.is_none());
         let mut centroid = vec![0.0; dim];
         centroid[0] = 1.0;
-        let manifest =
-            table
-                .reader()
-                .manifest()
-                .with_partition_strategy(PartitionStrategy::VectorCell {
-                    column: "emb".into(),
-                    clusters: ClusterCentroids::from_fp32(1, dim as u32, &centroid, vec![1]),
-                    routing: Default::default(),
-                });
+        let manifest = table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .with_partition_strategy(PartitionStrategy::VectorCell {
+                column: "emb".into(),
+                clusters: ClusterCentroids::from_fp32(1, dim as u32, &centroid, vec![1]),
+                routing: Default::default(),
+            });
         assert!(is_hidden_vector_manifest(&manifest));
     }
 
@@ -3333,7 +3335,7 @@ mod tests {
     #[test]
     fn vector_search_empty_supertable_returns_empty() {
         let st = Supertable::create(options_one_superfile_per_commit(16)).expect("create");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
@@ -3348,7 +3350,7 @@ mod tests {
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, 16, schema)).expect("a");
         w.commit().expect("c");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let q = vec![0.1f32; 16];
         let hits = r
             .vector_hits("emb", &q, 0, VectorSearchOptions::new(), None)
@@ -3364,7 +3366,7 @@ mod tests {
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
         w.commit().expect("c");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // Query vector resembling row 0's pattern.
         let mut q = vec![0.0f32; dim];
         for (d, x) in q.iter_mut().enumerate() {
@@ -3396,7 +3398,7 @@ mod tests {
                 .expect("a");
             w.commit().expect("c");
         }
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
@@ -3423,13 +3425,14 @@ mod tests {
                 .expect("append");
             w.commit().expect("commit");
         }
-        assert_eq!(st.reader().n_superfiles(), n_seg as usize);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), n_seg as usize);
 
         let mut q = vec![0f32; dim];
         q[0] = 1.0;
         let opts = VectorSearchOptions::new().with_nprobe(1);
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 10, opts, None)
             .expect("query");
 
@@ -3452,7 +3455,7 @@ mod tests {
                 .expect("a");
             w.commit().expect("c");
         }
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let q = vec![0.1f32; dim];
         let hits = r
             .vector_hits("emb", &q, 24, VectorSearchOptions::new(), None)
@@ -3500,7 +3503,7 @@ mod tests {
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_globals, [0u32, 16].iter().copied().collect());
 
-        let st_reader = st.reader();
+        let st_reader = st.reader().expect("reader");
         let st_hits = st_reader
             .vector_hits("emb", &q, 2, opts, None)
             .expect("supertable query");
@@ -3528,7 +3531,7 @@ mod tests {
         let schema = st.options().schema.clone();
         w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
         w.commit().expect("c");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let q = vec![0.1f32; dim];
         let err = r
             .vector_hits("nope", &q, 5, VectorSearchOptions::new(), None)
@@ -3838,7 +3841,7 @@ mod tests {
             .expect("append");
         w.commit().expect("commit");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let user_uris: HashSet<_> = reader.manifest().superfiles.iter().map(|e| e.uri).collect();
         assert!(
             reader.vector_index_table().is_some(),
@@ -3887,6 +3890,7 @@ mod tests {
         q[0] = 1.0;
         let batches = st
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &q,
@@ -3932,6 +3936,7 @@ mod tests {
         q[0] = 1.0;
         let search = |st: &Supertable| {
             st.reader()
+                .expect("reader")
                 .vector_hits(
                     "emb",
                     &q,
@@ -3960,6 +3965,7 @@ mod tests {
             .expect("optimize after delete");
         assert!(
             !st.reader()
+                .expect("reader")
                 .vector_hits(
                     "emb",
                     &q,
@@ -4003,6 +4009,7 @@ mod tests {
         // Wide k + nprobe: rerank spans several probed cells.
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &q,
@@ -4020,6 +4027,7 @@ mod tests {
         // Filtered variant over the same corpus.
         let filtered = st
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &q,
@@ -4097,7 +4105,7 @@ mod tests {
         let allow: Arc<RoaringBitmap> = Arc::new([0u32, 1, 2].into_iter().collect());
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
-        let hits = block_on(st.reader().vector_hits_global_allow_async(
+        let hits = block_on(st.reader().expect("reader").vector_hits_global_allow_async(
             "emb",
             &q,
             16,
@@ -4140,6 +4148,7 @@ mod tests {
         q[0] = 1.0;
         let batches = st
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &q,
@@ -4161,6 +4170,7 @@ mod tests {
 
         let prepared = block_on(
             st.reader()
+                .expect("reader")
                 .prepare_vector_stable_allow_async(Arc::new(vec![id])),
         )
         .expect("valid drained id must map");
@@ -4200,6 +4210,7 @@ mod tests {
         q[0] = 1.0;
         let batches = st
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &q,
@@ -4260,6 +4271,7 @@ mod tests {
         q[0] = 1.0;
         let batches = st
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &q,
@@ -4333,12 +4345,13 @@ mod tests {
         drop(w);
         st.drain_vectors_to_cells_sync().expect("drain");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
-        let plan =
-            CandidatePlan::from_filters(&filters, &fts_cols, manifest.options.tokenizer.as_ref());
+        let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
+            manifest.options.fts_tokenizer_for(col)
+        });
 
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
@@ -4400,13 +4413,14 @@ mod tests {
         w.commit().expect("commit");
         st.drain_vectors_to_cells_sync().expect("drain");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let user_uris: HashSet<_> = reader.manifest().superfiles.iter().map(|e| e.uri).collect();
         let hidden = reader
             .vector_index_table()
             .expect("hidden index must exist");
         let hidden_uris: HashSet<_> = hidden
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -4512,6 +4526,7 @@ mod tests {
         q[0] = 1.0;
         let hits_before = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 32, VectorSearchOptions::new(), None)
             .expect("pre-delete search");
         assert!(!hits_before.is_empty(), "docs retrievable pre-delete");
@@ -4522,6 +4537,7 @@ mod tests {
 
         let hits_after = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 32, VectorSearchOptions::new(), None)
             .expect("post-delete search");
         assert_eq!(
@@ -4549,7 +4565,7 @@ mod tests {
             .expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let manifest = r.manifest();
         assert!(
             !manifest.superfiles.is_empty(),
@@ -4620,7 +4636,7 @@ mod tests {
             .expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let mut q = vec![0.0f32; dim];
         q[0] = 1.0;
         let k = 20usize;
@@ -4689,7 +4705,7 @@ mod tests {
             .expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let manifest = r.manifest();
         let mut checked_files = 0usize;
         for entry in manifest.superfiles.iter() {
@@ -4758,9 +4774,13 @@ mod tests {
         writer.commit().expect("commit delta");
         drop(writer);
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let hidden = reader.vector_index_table().expect("hidden index");
-        let drained = hidden.reader().manifest().get_drained_ranges();
+        let drained = hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_drained_ranges();
         let undrained: Vec<_> = reader
             .manifest()
             .superfiles

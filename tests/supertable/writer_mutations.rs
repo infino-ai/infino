@@ -14,7 +14,7 @@ use arrow_array::Array;
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         Supertable,
         mutations::MutationError,
@@ -100,6 +100,7 @@ async fn writer_delete_tombstones_matching_rows() {
     // Follow-up SQL query no longer returns the row.
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -123,7 +124,15 @@ async fn writer_delete_tombstones_matching_rows() {
     // batch, so assert on the row count, not the batch count.
     let hits = st
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("fts");
     let n_rows: usize = hits.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n_rows, 0, "expected zero hits for tombstoned token");
@@ -198,7 +207,15 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     // later assertion exercises invalidation, not a cold read.
     let n_rows: usize = reader_handle
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("pre-delete fts")
         .iter()
         .map(|b| b.num_rows())
@@ -219,7 +236,15 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     // The very next query on the other worker must drop the row.
     let n_rows: usize = reader_handle
         .reader()
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("post-delete fts")
         .iter()
         .map(|b| b.num_rows())
@@ -228,6 +253,7 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
 
     let batches = reader_handle
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("post-delete sql");
     let titles: Vec<String> = batches
@@ -294,6 +320,7 @@ async fn writer_update_replaces_matching_rows() {
 
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY title")
         .expect("sql");
     let titles: Vec<String> = batches
@@ -373,7 +400,7 @@ async fn update_emitted_superfile_carries_subsection_offsets() {
     w.commit().expect("commit update");
     drop(w);
 
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let manifest = reader.manifest();
     let emitted = manifest
         .get_all_superfiles()

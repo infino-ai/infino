@@ -16,7 +16,10 @@
 mod index_spec;
 mod manifest;
 mod options;
+#[cfg(feature = "remote")]
+mod remote;
 mod search_tvf;
+mod table;
 mod uri;
 
 use std::{
@@ -38,6 +41,7 @@ use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
+pub use table::Supertable;
 use tokio::runtime::Runtime;
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
@@ -47,17 +51,18 @@ use crate::{
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
+    runtime_metrics::io::{UsageMeter, UsageSnapshot},
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
-        StorageError, StorageProvider, UsageMeter, UsageSnapshot,
+        StorageError, StorageProvider,
     },
     superfile::{
         builder::FtsConfig,
-        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
+        fts::tokenize::{ASCII_LOWER_TOKENIZER, Tokenizer, tokenizer_for_name},
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
-        Supertable,
+        Supertable as SupertableHandle,
         options::{Consistency, SupertableOptions},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
@@ -98,6 +103,11 @@ pub fn connect_with(
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
     let backend = parse_uri(uri.as_ref())?;
+    // A hosted (remote) target forwards over the wire — it never touches the
+    // local storage path below.
+    if matches!(backend, Backend::Remote { .. }) {
+        return connect_remote(backend, options);
+    }
     let usage_meter = UsageMeter::new();
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
@@ -137,6 +147,46 @@ pub fn connect_with(
     })
 }
 
+/// Build a hosted (remote) connection from a `Backend::Remote` target. The API
+/// key comes from `ConnectOptions` or the `INFINO_API_KEY` env var.
+#[cfg(feature = "remote")]
+fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connection, InfinoError> {
+    let (base_url, database) = match &backend {
+        Backend::Remote { base_url, database } => (base_url.clone(), database.clone()),
+        _ => {
+            return Err(InfinoError::Backend(
+                "connect_remote requires a remote target".to_string(),
+            ));
+        }
+    };
+    let remote =
+        remote::RemoteCatalog::new(base_url, database, options.api_key().map(str::to_owned))?;
+    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+        options
+            .connection_memory_budget_bytes
+            .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+    );
+    debug!(backend = ?backend, "catalog connected (remote)");
+    Ok(Connection {
+        inner: Arc::new(ConnectionInner {
+            backend,
+            options,
+            store: CatalogStore::Remote(Arc::new(remote)),
+            connection_memory_budget,
+            usage_meter: UsageMeter::new(),
+        }),
+    })
+}
+
+/// Without the `remote` feature a hosted target cannot be served: report it
+/// clearly rather than silently falling through to the local path.
+#[cfg(not(feature = "remote"))]
+fn connect_remote(_backend: Backend, _options: ConnectOptions) -> Result<Connection, InfinoError> {
+    Err(InfinoError::Config(
+        "this build has no remote support; rebuild with the `remote` feature".to_string(),
+    ))
+}
+
 /// A catalog connection. Cheap to clone (one `Arc`); clones share the
 /// same catalog.
 #[derive(Clone)]
@@ -161,7 +211,7 @@ struct ConnectionInner {
 /// root storage under optimistic concurrency; `memory://` keeps it (and
 /// the tables themselves) in-process.
 enum CatalogStore {
-    Memory(Mutex<HashMap<String, Supertable>>),
+    Memory(Mutex<HashMap<String, SupertableHandle>>),
     /// Durable backend. `handles` is the warm cache (name → live `Supertable`);
     /// `building` is a per-name lock guarding the build or evict of an entry.
     /// Both, because the read must be lock-free but the build must be single:
@@ -183,7 +233,7 @@ enum CatalogStore {
         root: Arc<dyn StorageProvider>,
         /// Warm cache of live handles. Sharded so concurrent queries on one
         /// `Connection` don't serialize on a lock.
-        handles: DashMap<String, Supertable>,
+        handles: DashMap<String, SupertableHandle>,
         /// Per-name build/evict lock. Never removed once created: a concurrent
         /// opener may hold or await the `Arc`, so evicting it mid-use would let
         /// two builds proceed.
@@ -193,23 +243,60 @@ enum CatalogStore {
         /// one holds the `Arc`) later.
         building: DashMap<String, Arc<Mutex<()>>>,
     },
+    /// Hosted (remote) connection: catalog operations forward over the wire.
+    /// There is no local storage provider or handle cache — the endpoint owns
+    /// the tables.
+    #[cfg(feature = "remote")]
+    Remote(Arc<remote::RemoteCatalog>),
 }
 
 impl Connection {
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
-    /// Not part of the curated public API — unit tests / `test-helpers` only.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Visible under `test-helpers`, `metering`, or `cfg(test)` — not part
+    /// of the curated default public API.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn usage_snapshot(&self) -> UsageSnapshot {
         self.inner.usage_meter.snapshot()
     }
 
     /// Object-store usage ledger for this connection. Shared by every table
     /// provider; benches and diagnostics hold the `Arc` across phases.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Visible under `test-helpers`, `metering`, or `cfg(test)` — not part
+    /// of the curated default public API.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.inner.usage_meter)
+    }
+
+    /// Provision the database this connection targets.
+    ///
+    /// A connection is bound to a single database — the path segment of a
+    /// hosted URL (`https://host/<database>`), or the catalog root for a local
+    /// backend. This registers that database so tables can be created in it,
+    /// without a separate provisioning step outside the code.
+    ///
+    /// For a hosted connection it registers the database on the service and
+    /// fails with [`InfinoError::AlreadyExists`] if it is already registered.
+    /// For a local backend (`file://`, `s3://`, `memory://`, …) the catalog
+    /// root *is* the database and comes into being with the first table, so
+    /// this is a no-op success — kept on the surface so the same setup code
+    /// runs against either target.
+    ///
+    /// ```
+    /// # let db = infino::connect("memory://")?;
+    /// db.create_database()?; // no-op for a local backend
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_database(&self) -> Result<(), InfinoError> {
+        match &self.inner.store {
+            // A local catalog root is created lazily by the first table; there
+            // is no separate database to register.
+            CatalogStore::Memory(_) | CatalogStore::Storage { .. } => Ok(()),
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.create_database(),
+        }
     }
 
     /// Create a new table named `name` with the given Arrow `schema` and
@@ -236,7 +323,8 @@ impl Connection {
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
-        let tokenizer = table_tokenizer(&indexes);
+        let tokenizers =
+            table_tokenizers(&indexes).map_err(|e| e.with_context("create_table", Some(name)))?;
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -244,12 +332,12 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizer,
+                    tokenizers,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
-                let handle = Supertable::create(opts)
+                let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
@@ -258,7 +346,7 @@ impl Connection {
                 }
                 map.insert(name.to_string(), handle.clone());
                 info!(table = name, backend = "memory", "created table");
-                Ok(handle)
+                Ok(Supertable::from_local(handle))
             }
             CatalogStore::Storage {
                 root,
@@ -290,7 +378,8 @@ impl Connection {
                     location: location.clone(),
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
-                    fts: indexes.fts_columns().to_vec(),
+                    fts: indexes.fts_columns(),
+                    fts_analyzers: indexes.fts_analyzers(),
                     vectors,
                     created_at_unix: now_unix(),
                 };
@@ -312,7 +401,7 @@ impl Connection {
                     schema,
                     fts_cfg,
                     vec_cfg,
-                    tokenizer,
+                    tokenizers,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
@@ -329,7 +418,7 @@ impl Connection {
                 // register the name. A losing racer that also created a
                 // (distinct) location just orphans its empty subtree; the
                 // catalog OCC below decides the single name winner.
-                let handle = Supertable::create(opts)
+                let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
 
                 // Gate the commit + memo insert: else a racing `open_table`
@@ -352,8 +441,130 @@ impl Connection {
                 handles.insert(name.to_string(), handle.clone());
 
                 info!(table = name, location = %location, "created table");
+                Ok(Supertable::from_local(handle))
+            }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.create_table(name, schema, indexes),
+        }
+    }
+
+    /// Open the concrete engine handle for `name`, building and memoizing it on
+    /// first use. Internal: callers needing engine-only methods (`register_into`
+    /// for SQL, `reader` for the search TVFs) go through this; the public
+    /// [`open_table`](Self::open_table) wraps the result.
+    pub(crate) fn open_table_handle(&self, name: &str) -> Result<SupertableHandle, InfinoError> {
+        debug!(table = name, "opening table");
+        match &self.inner.store {
+            CatalogStore::Memory(map) => map
+                .lock()
+                .expect("catalog mutex poisoned")
+                .get(name)
+                .cloned()
+                .ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                }),
+
+            CatalogStore::Storage {
+                root,
+                handles,
+                building,
+            } => {
+                // Warm path: lock-free sharded lookup, no serialization. A
+                // handle purged elsewhere is dropped here, so the cold path
+                // re-resolves it against the catalog.
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
+                }
+
+                // Cold path: build once under the gate. Blocks here if a
+                // same-name peer is mid-build (same `Arc`, same mutex); the
+                // winner builds, the rest wake to find a warm `handles`.
+                let gate = single_flight_gate(building, name);
+                let _built = gate.lock().expect("catalog build gate poisoned");
+
+                // A peer may have built it while we waited on the gate.
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
+                }
+
+                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let entry = body.tables.get(name).ok_or_else(|| {
+                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
+                })?;
+
+                let schema = schema_from_ipc(&entry.schema_ipc)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                // Rebuild the index spec from the recorded declarations and
+                // lower it through the *same* path `create_table` used, so
+                // the defaults it applies (rotation seed, rerank codec) are
+                // identical and the table's options-hash check passes.
+                let mut spec = IndexSpec::new();
+                for (i, column) in entry.fts.iter().enumerate() {
+                    // Catalogs written before per-column analyzers omit
+                    // `fts_analyzers`; those columns default to ascii_lower.
+                    let analyzer = entry
+                        .fts_analyzers
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(ASCII_LOWER_TOKENIZER);
+                    spec = spec.fts_with_analyzer(column.clone(), analyzer);
+                }
+                for v in &entry.vectors {
+                    spec = spec.vector(
+                        v.column.clone(),
+                        v.dim,
+                        v.n_cent,
+                        metric_from_str(&v.metric)
+                            .map_err(|e| e.with_context("open_table", Some(name)))?,
+                    );
+                }
+                let (fts_cfg, vec_cfg) = spec.to_configs();
+                let tokenizers = table_tokenizers(&spec)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+
+                let table_storage = backend_to_provider(
+                    &self.inner.backend.join(&entry.location),
+                    &self.inner.options,
+                    Arc::clone(&self.inner.usage_meter),
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?
+                .expect("non-memory backend yields a storage provider");
+
+                // Cache directory is keyed on the stable name, matching
+                // `create_table` (the on-storage subtree is `entry.location`).
+                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizers,
+                    Some(table_storage),
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )
+                .map_err(|e| e.with_context("open_table", Some(name)))?;
+                if let Some(cache) = disk_cache {
+                    opts = opts.with_disk_cache(cache);
+                }
+                // Strong: re-check the manifest pointer per query (cheap,
+                // short-circuits when unchanged), matching the old rebuild's
+                // freshness without its cost.
+                opts = opts.with_read_consistency(Consistency::Strong);
+                let handle = SupertableHandle::open(opts)
+                    .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
+                handles.insert(name.to_string(), handle.clone());
+
                 Ok(handle)
             }
+            // The local handle backs the local SQL / search-TVF paths, which a
+            // remote connection never takes (it forwards `query_sql`). Reaching
+            // here on a remote connection is an internal invariant violation.
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(_) => Err(InfinoError::Backend(
+                "internal: no local table handle for a remote connection".to_string(),
+            )
+            .with_context("open_table", Some(name))),
         }
     }
 
@@ -372,101 +583,11 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
-        debug!(table = name, "opening table");
-        match &self.inner.store {
-            CatalogStore::Memory(map) => map
-                .lock()
-                .expect("catalog mutex poisoned")
-                .get(name)
-                .cloned()
-                .ok_or_else(|| {
-                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
-                }),
-
-            CatalogStore::Storage {
-                root,
-                handles,
-                building,
-            } => {
-                // Warm path: lock-free sharded lookup, no serialization.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
-                }
-
-                // Cold path: build once under the gate. Blocks here if a
-                // same-name peer is mid-build (same `Arc`, same mutex); the
-                // winner builds, the rest wake to find a warm `handles`.
-                let gate = single_flight_gate(building, name);
-                let _built = gate.lock().expect("catalog build gate poisoned");
-
-                // A peer may have built it while we waited on the gate.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
-                }
-
-                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                let entry = body.tables.get(name).ok_or_else(|| {
-                    InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
-                })?;
-
-                let schema = schema_from_ipc(&entry.schema_ipc)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                // Rebuild the index spec from the recorded declarations and
-                // lower it through the *same* path `create_table` used, so
-                // the defaults it applies (rotation seed, rerank codec) are
-                // identical and the table's options-hash check passes.
-                let mut spec = IndexSpec::new();
-                for column in &entry.fts {
-                    spec = spec.fts(column.clone());
-                }
-                for v in &entry.vectors {
-                    spec = spec.vector(
-                        v.column.clone(),
-                        v.dim,
-                        v.n_cent,
-                        metric_from_str(&v.metric)
-                            .map_err(|e| e.with_context("open_table", Some(name)))?,
-                    );
-                }
-                let (fts_cfg, vec_cfg) = spec.to_configs();
-                let tokenizer = table_tokenizer(&spec);
-
-                let table_storage = backend_to_provider(
-                    &self.inner.backend.join(&entry.location),
-                    &self.inner.options,
-                    Arc::clone(&self.inner.usage_meter),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?
-                .expect("non-memory backend yields a storage provider");
-
-                // Cache directory is keyed on the stable name, matching
-                // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                let mut opts = build_options(
-                    schema,
-                    fts_cfg,
-                    vec_cfg,
-                    tokenizer,
-                    Some(table_storage),
-                    Arc::clone(&self.inner.connection_memory_budget),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?;
-                if let Some(cache) = disk_cache {
-                    opts = opts.with_disk_cache(cache);
-                }
-                // Strong: re-check the manifest pointer per query (cheap,
-                // short-circuits when unchanged), matching the old rebuild's
-                // freshness without its cost.
-                opts = opts.with_read_consistency(Consistency::Strong);
-                let handle = Supertable::open(opts)
-                    .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
-                handles.insert(name.to_string(), handle.clone());
-
-                Ok(handle)
-            }
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c.open_table(name);
         }
+        Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
     /// Remove a table from the catalog. **Idempotent**: dropping a table that
@@ -552,7 +673,33 @@ impl Connection {
                 }
                 Ok(())
             }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.drop_table(name, purge),
         }
+    }
+
+    /// On-storage byte footprint for `name` (user + hidden vector index).
+    ///
+    /// Loads lazy manifest parts before summing so cold tables are not
+    /// under-counted. Visible under `metering` for platform billing / Grafana.
+    #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
+    pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
+        // `storage_bytes` is a local measurement of the on-storage superfile
+        // footprint; a hosted connection has no local storage to measure, so
+        // reject it there rather than reaching for a handle that doesn't exist.
+        #[cfg(feature = "remote")]
+        if matches!(self.inner.store, CatalogStore::Remote(_)) {
+            return Err(InfinoError::Backend(
+                "table_storage_bytes is a local measurement, not available over the remote transport"
+                    .to_string(),
+            )
+            .with_context("table_storage_bytes", Some(name)));
+        }
+        // The concrete engine handle carries `storage_bytes`; the public
+        // wrapper returned by `open_table` does not.
+        self.open_table_handle(name)?
+            .storage_bytes()
+            .map_err(|e| InfinoError::from(e).with_context("table_storage_bytes", Some(name)))
     }
 
     /// List the names of every table registered in this catalog,
@@ -580,6 +727,8 @@ impl Connection {
                 let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
                 Ok(body.tables.into_keys().collect())
             }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.list_tables(),
         }
     }
 
@@ -608,6 +757,13 @@ impl Connection {
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
 
+        // A hosted connection forwards the SQL to the endpoint; the local
+        // DataFusion path below runs only for local backends.
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c.query_sql(sql);
+        }
+
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
@@ -626,13 +782,13 @@ impl Connection {
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
-        let mut handles: Vec<Supertable> = Vec::new();
+        let mut handles: Vec<SupertableHandle> = Vec::new();
         for r in &refs {
             let name = r.table().to_string();
             if !seen.insert(name.clone()) {
                 continue;
             }
-            match self.open_table(&name) {
+            match self.open_table_handle(&name) {
                 Ok(table) => {
                     table.register_into(&ctx, &name).map_err(|e| {
                         InfinoError::Query(e.to_string()).with_context("query_sql", None)
@@ -699,11 +855,16 @@ fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
-    tokenizer: Option<Arc<dyn Tokenizer>>,
+    tokenizers: Vec<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
-    let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
+    // Seed the default tokenizer with the first column's analyzer (None
+    // when there are no FTS columns), then set the authoritative
+    // per-column tokenizers for per-field analysis.
+    let seed = tokenizers.first().cloned();
+    let mut opts =
+        SupertableOptions::new(schema, fts, vectors, seed)?.with_fts_tokenizers(tokenizers);
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -721,13 +882,18 @@ fn sql_exec_error(e: DataFusionError) -> InfinoError {
     }
 }
 
-/// The v1 default tokenizer, required iff the spec has FTS columns.
-fn table_tokenizer(indexes: &IndexSpec) -> Option<Arc<dyn Tokenizer>> {
-    if indexes.has_fts() {
-        Some(Arc::new(AsciiLowerTokenizer))
-    } else {
-        None
-    }
+/// Resolve each FTS column's analyzer name to a tokenizer instance,
+/// in declaration order (per-field analysis). Empty when there are no
+/// FTS columns. An unknown analyzer name is a configuration error.
+fn table_tokenizers(indexes: &IndexSpec) -> Result<Vec<Arc<dyn Tokenizer>>, InfinoError> {
+    indexes
+        .fts_analyzers()
+        .iter()
+        .map(|name| {
+            tokenizer_for_name(name)
+                .ok_or_else(|| InfinoError::Config(format!("unknown FTS analyzer: {name:?}")))
+        })
+        .collect()
 }
 
 /// Construct the storage provider for `backend` (None for `memory://`).
@@ -755,6 +921,14 @@ fn backend_to_provider(
             GcsStorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
                 .with_usage_meter(usage_meter),
         )),
+        // A remote (hosted) connection forwards operations over the wire and
+        // never opens a local storage provider; `connect_with` routes it away
+        // before reaching here.
+        Backend::Remote { .. } => {
+            return Err(InfinoError::Backend(
+                "remote backend has no storage provider".to_string(),
+            ));
+        }
     };
     Ok(provider)
 }
@@ -797,6 +971,22 @@ fn build_disk_cache(
         cache.mark_budget_auto_sized();
     }
     Ok(Some(cache))
+}
+
+/// The cached handle for `name`, or `None` (after evicting it) if its table was
+/// dropped and purged elsewhere — `handles` is per-process, so such a drop never
+/// reaches it. The `Ref` is dropped before `remove`, which would else deadlock.
+fn live_handle(
+    handles: &DashMap<String, SupertableHandle>,
+    name: &str,
+) -> Option<SupertableHandle> {
+    let entry = handles.get(name)?;
+    if !entry.pointer_vanished() {
+        return Some(entry.clone());
+    }
+    drop(entry);
+    handles.remove(name);
+    None
 }
 
 /// The per-name single-flight gate, created on first use. Returned as an owned
@@ -881,14 +1071,21 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, sync::Arc, thread};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+    };
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
 
     use super::*;
     use crate::{
-        BoolMode,
+        Bm25SearchOptions, BoolMode,
+        supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -897,6 +1094,28 @@ mod tests {
     /// Total rows across the materialized search batches.
     fn n_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// `create_database` is a no-op success on a local backend (the catalog
+    /// root is the database), so the same "provision then create a table" setup
+    /// code that a hosted target needs runs unchanged against a durable local
+    /// one — it doesn't error, and a table created afterward is queryable.
+    #[test]
+    fn local_create_database_is_a_noop_then_table_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        conn.create_database()
+            .expect("create_database is a no-op success for a local backend");
+        // Idempotent: a second call is still fine.
+        conn.create_database().expect("second create_database");
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table after create_database")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+        assert_eq!(count_rows(&conn, "docs"), 1);
     }
 
     #[test]
@@ -914,7 +1133,7 @@ mod tests {
         // Re-open by name and search.
         let reopened = conn.open_table("docs").expect("open_table");
         let hits = reopened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox'");
 
@@ -924,6 +1143,170 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn standard_analyzer_keeps_non_ascii_end_to_end() {
+        let conn = connect("memory://").expect("connect");
+
+        // Default (ascii_lower) drops non-ASCII, so "café" is unsearchable.
+        let ascii = conn
+            .create_table("ascii", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create ascii table");
+        ascii
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let ascii_hits = ascii
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
+
+        // The standard analyzer keeps non-ASCII, so "café" matches — the
+        // full create → append → search path honors the chosen analyzer
+        // at both index and query time.
+        let std_tbl = conn
+            .create_table(
+                "std",
+                schema_id_title(),
+                IndexSpec::new().fts_with_analyzer("title", "standard"),
+            )
+            .expect("create standard table");
+        std_tbl
+            .append(&build_title_batch(&["café latte"]))
+            .expect("append");
+        let hits = std_tbl
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("bm25_search");
+        assert_eq!(
+            n_rows(&hits),
+            1,
+            "standard analyzer matches the non-ASCII term"
+        );
+
+        // An unknown analyzer is a configuration error at create time.
+        let err = conn
+            .create_table(
+                "bad",
+                schema_id_title(),
+                IndexSpec::new().fts_with_analyzer("title", "nonesuch"),
+            )
+            .expect_err("unknown analyzer must be rejected");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+    }
+
+    /// Two text columns, different analyzers: `title` = standard,
+    /// `body` = ascii_lower. A non-ASCII term in BOTH columns is
+    /// searchable via `title` but not `body`, and an ASCII term is
+    /// searchable via `body` — proving each column is indexed AND
+    /// queried with its own tokenizer (not column 0's for all).
+    fn schema_title_body() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    fn title_body_batch(schema: Arc<Schema>, title: &str, body: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![title])),
+                Arc::new(LargeStringArray::from(vec![body])),
+            ],
+        )
+        .expect("batch shape matches schema")
+    }
+
+    #[test]
+    fn mixed_per_column_analyzers_index_and_query_independently() {
+        let conn = connect("memory://").expect("connect");
+        let schema = schema_title_body();
+        let table = conn
+            .create_table(
+                "docs",
+                schema.clone(),
+                IndexSpec::new()
+                    .fts_with_analyzer("title", "standard")
+                    .fts_with_analyzer("body", "ascii_lower"),
+            )
+            .expect("create_table");
+        table
+            .append(&title_body_batch(schema, "café latte", "café latte"))
+            .expect("append");
+
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column matches the non-ASCII term"
+        );
+
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
+
+        // The ascii_lower column is genuinely indexed (not empty): an
+        // ASCII term still matches there.
+        let body_latte = table
+            .bm25_search("body", "latte", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("body search");
+        assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
+    }
+
+    #[test]
+    fn mixed_analyzers_survive_reopen_on_storage() {
+        // Storage-backed: a fresh connection reopens the table by
+        // reconstructing the per-column analyzers from the catalog
+        // (TableEntry.fts_analyzers), so query tokenization still honors
+        // each column's tokenizer after reopen.
+        let dir = std::env::temp_dir().join(format!("infino-mixed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.display());
+        let schema = schema_title_body();
+        {
+            let conn = connect(&uri).expect("connect");
+            let table = conn
+                .create_table(
+                    "docs",
+                    schema.clone(),
+                    IndexSpec::new()
+                        .fts_with_analyzer("title", "standard")
+                        .fts_with_analyzer("body", "ascii_lower"),
+                )
+                .expect("create_table");
+            table
+                .append(&title_body_batch(
+                    schema.clone(),
+                    "café latte",
+                    "café latte",
+                ))
+                .expect("append");
+        }
+        // Fresh connection → open_table rebuilds the spec from the catalog.
+        let conn2 = connect(&uri).expect("reconnect");
+        let table = conn2.open_table("docs").expect("open_table");
+        let title_cafe = table
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("title search");
+        assert_eq!(
+            n_rows(&title_cafe),
+            1,
+            "standard column still matches non-ASCII after reopen"
+        );
+        let body_cafe = table
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
+            .map(|h| n_rows(&h))
+            .unwrap_or(0);
+        assert_eq!(
+            body_cafe, 0,
+            "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -985,7 +1368,7 @@ mod tests {
 
         // Starts empty.
         let before = opened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search on empty table");
         assert_eq!(n_rows(&before), 0, "freshly opened table starts empty");
 
@@ -995,7 +1378,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append via reopened handle");
         let hits = opened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search after append");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
     }
@@ -1045,7 +1428,7 @@ mod tests {
 
         reader.query_sql("SELECT title FROM docs").expect("scan q1");
         let cold_after_q1 = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1060,7 +1443,7 @@ mod tests {
         // again.
         reader.query_sql("SELECT title FROM docs").expect("scan q2");
         let cold_after_q2 = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1069,6 +1452,386 @@ mod tests {
             cold_after_q2, cold_after_q1,
             "second query must reuse the warm disk cache, not cold-fetch again"
         );
+    }
+
+    /// Every `_supertable/current` pointer file under `root`, recursively — the
+    /// on-storage evidence that a supertable exists.
+    fn pointer_files(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(pointer_files(&path));
+            } else if path.ends_with(POINTER_PATH) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// Two connections over one storage root, the shape of a database served by
+    /// more than one process. One drops and purges a table; the other has it warm
+    /// in its per-process handle cache, which the drop never reaches, and must
+    /// stop serving it rather than answer from deleted superfiles forever.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_peer_connections_warm_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Warm the peer's handle cache, and confirm it really is serving.
+        assert_eq!(count_rows(&peer, "docs"), 1, "peer reads the seeded row");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // The next freshness probe discovers the deletion, and it runs inside
+        // the query path after the cached handle was taken — so this call is the
+        // trigger and recovery lands on the one after it.
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .open_table("docs")
+            .expect_err("the purged table must not open");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        // `query_sql` reports the planner's failure to resolve the relation,
+        // not our typed `NotFound` — an unregistrable name is skipped during
+        // registration (it may be a CTE or a TVF argument), so the refusal
+        // surfaces one layer up. The typed assertion is on `open_table` above;
+        // what matters here is that the message is a missing *table* and not a
+        // fetch of a purged superfile off the stale manifest, which is exactly
+        // how this failed before.
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("docs") && !msg.contains(".sf.parquet"),
+            "expected a missing-table error naming docs, got {err:?}"
+        );
+    }
+
+    /// The purge seen from a table handle the caller is *holding*, rather than
+    /// re-resolving by name — and with a disk cache, which is what makes this
+    /// the sharpest case.
+    ///
+    /// Re-resolving recovers, because the catalog drops the dead handle and
+    /// rebuilds. A held handle has no name to re-resolve, and the freshness
+    /// probe inside it swallows errors by design, so nothing stops the read:
+    /// the pinned manifest still names the purged superfiles and the cache
+    /// still holds their bytes, so every search answers — correctly shaped,
+    /// from a table that no longer exists — for as long as the handle lives.
+    /// Storage never gets asked, so the deletion cannot surface on its own.
+    #[test]
+    fn storage_reads_on_a_purged_handle_refuse_instead_of_serving_cached_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect_with(&uri, ConnectOptions::new().with_cache_dir(cache.path()))
+            .expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Read once through the held handle so the superfile bytes are resident
+        // in the peer's disk cache — the state that lets a purged table keep
+        // answering without ever touching storage again.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        assert_eq!(
+            n_rows(
+                &peer_table
+                    .bm25_search("title", "quick", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("warm read")
+            ),
+            1,
+            "peer reads the seeded row, warming its cache"
+        );
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Every read verb, twice: the first trips the probe that discovers the
+        // purge, and the second proves the refusal is latched rather than a
+        // one-shot side effect of that discovery.
+        for attempt in 0..2 {
+            let err = peer_table
+                .bm25_search("title", "quick", TOP_K, Bm25SearchOptions::new(), None)
+                .expect_err("bm25_search on a purged table must not return rows");
+            assert!(
+                matches!(err, InfinoError::NotFound(_)),
+                "attempt {attempt}: expected NotFound, got {err:?}"
+            );
+            for err in [
+                peer_table
+                    .token_match("title", "quick", BoolMode::Or, None)
+                    .expect_err("token_match must refuse"),
+                peer_table
+                    .exact_match("title", "the quick brown fox", None)
+                    .expect_err("exact_match must refuse"),
+                peer_table
+                    .count("title", "quick", BoolMode::Or)
+                    .expect_err("count must refuse"),
+            ] {
+                assert!(
+                    matches!(err, InfinoError::NotFound(_)),
+                    "attempt {attempt}: expected NotFound, got {err:?}"
+                );
+            }
+        }
+
+        // Mutations refuse at predicate resolution, before writing any WAL
+        // state, and report the same missing table rather than a backend fault.
+        let err = peer_table
+            .delete(col("_id").eq(lit(1_i64)))
+            .expect_err("delete on a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// The same stale handle, written to rather than read from. A commit fences
+    /// on the pointer's etag, and an absent pointer used to mean "initial
+    /// commit" — republishing one from the stale manifest and resurrecting the
+    /// table under a name the catalog no longer lists. Hence the assertion on
+    /// storage state, not just on the error.
+    #[test]
+    fn storage_append_on_a_purged_handle_refuses_and_republishes_no_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Write once through the peer, so its handle carries real manifest state.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the purge should leave no pointer behind"
+        );
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must fail");
+        // The same answer the read path gives. It has to survive the commit →
+        // build → mutation-commit error hops the append path takes, or a caller
+        // sees an indistinguishable backend fault and retries — and every retry
+        // uploads another superfile before reaching the fence that refuses it.
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the refused append must not republish a pointer (resurrecting the \
+             dropped table as unreachable, unreclaimable data): {err:?}"
+        );
+        assert!(
+            writer.list_tables().expect("list").is_empty(),
+            "the table stays dropped"
+        );
+    }
+
+    /// The write-only twin of the read-path recovery. A handle that has never
+    /// served a read has never run a freshness probe, so the commit's pointer
+    /// fence is the only thing that can notice the purge — and unless that
+    /// observation latches, the catalog goes on serving the dead handle from
+    /// cache and every later append fences against a location a re-create has
+    /// already replaced. Correctly refusing forever is still broken.
+    #[test]
+    fn storage_appends_recover_after_a_peer_drop_and_recreate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["seeded"]))
+            .expect("append");
+
+        // The peer only ever writes — no query, so no freshness probe.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        // The name comes back at a fresh location. Re-resolving through the
+        // connection must rebuild rather than hand back the dead handle.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        peer.open_table("docs")
+            .expect("peer re-opens the re-created table")
+            .append(&build_title_batch(&["peer writes again"]))
+            .expect("a write-only peer must recover after the re-create");
+        assert_eq!(
+            count_rows(&writer, "docs"),
+            2,
+            "the new generation holds its own row plus the peer's"
+        );
+    }
+
+    /// Drop-then-recreate through different connections: the name is back, but at
+    /// a fresh location, so the peer must rebuild rather than serve the old rows.
+    #[test]
+    fn storage_recreated_table_after_a_peer_drop_reads_the_new_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+        assert_eq!(count_rows(&peer, "docs"), 3, "peer warms on the old table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        // Trip the peer's freshness probe (see the read-path test above).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table, not serve the \
+             dropped generation's rows"
+        );
+    }
+
+    /// The same purge, against a peer handle that has never served a read.
+    ///
+    /// Freshness is discovered by re-probing the pointer, and the probe carries
+    /// the etag of the last one read — which only a previous probe sets. So a
+    /// handle built but not yet queried has no etag, and neither does one on a
+    /// backend that omits them. Keying "did we have a pointer?" on that etag
+    /// therefore reads this deletion as "nothing newer to load", and since the
+    /// miss also leaves the etag unset, every later probe repeats it: the
+    /// handle serves the purged table off its in-memory manifest for as long
+    /// as the process lives, and a re-create never reaches it either. The
+    /// pointer's absence is what makes it fatal — not our record of it.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_handle_that_never_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+
+        // Warm the peer's handle cache *without* querying through it, so no
+        // freshness probe has run and no pointer etag has been recorded.
+        peer.open_table("docs").expect("peer opens the table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Trip the probe (it runs inside the query path, after the cached
+        // handle has been taken — so recovery lands on the call after it).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        assert!(
+            !err.to_string().contains(".sf.parquet"),
+            "the peer must report the table gone, not fail fetching a purged \
+             superfile off its stale manifest: {err:?}"
+        );
+
+        // And the handle is genuinely replaced, not just poisoned: a re-create
+        // under the same name is visible to this connection.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table"
+        );
+    }
+
+    /// The premise the read-path check rests on: `create` publishes a pointer
+    /// before any writer runs, so a table with nothing appended to it still has
+    /// one and reads as empty. That is what makes an *absent* pointer
+    /// unambiguous — never "not committed yet", always "deleted under us".
+    #[test]
+    fn storage_table_with_no_appends_still_reads_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        assert_eq!(
+            count_rows(&conn, "docs"),
+            0,
+            "an unwritten table reads empty"
+        );
+        conn.open_table("docs")
+            .expect("an unwritten table still opens");
+
+        // And from a second connection, which builds its handle from scratch.
+        let peer = connect(&uri).expect("connect peer");
+        assert_eq!(count_rows(&peer, "docs"), 0);
     }
 
     /// A server holds one `Connection` and fans out concurrent queries. Many
@@ -1109,7 +1872,7 @@ mod tests {
         // One store built (single-flight) and one superfile, so exactly one
         // cold fetch despite 8 concurrent queries. More would mean rival stores.
         let cold = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1373,11 +2136,11 @@ mod tests {
 
         // Every table sees the one budget the connection minted, not a copy.
         assert!(Arc::ptr_eq(
-            &a.options().connection_memory_budget,
-            &b.options().connection_memory_budget
+            &a.local_handle().options().connection_memory_budget,
+            &b.local_handle().options().connection_memory_budget
         ));
         assert!(Arc::ptr_eq(
-            &a.options().connection_memory_budget,
+            &a.local_handle().options().connection_memory_budget,
             &conn.inner.connection_memory_budget
         ));
     }
@@ -1395,7 +2158,7 @@ mod tests {
         let reopened = conn.open_table("docs").expect("open");
 
         assert!(Arc::ptr_eq(
-            &reopened.options().connection_memory_budget,
+            &reopened.local_handle().options().connection_memory_budget,
             &conn.inner.connection_memory_budget
         ));
     }
@@ -1458,7 +2221,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &first
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             1
@@ -1474,7 +2237,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &second
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -1511,7 +2274,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &docs
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -2099,7 +2862,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("search");
         assert_eq!(n_rows(&hits), 1);
         // The disk cache got a per-table subdirectory.
@@ -2308,7 +3071,7 @@ mod tests {
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
         let table = conn.open_table("docs").expect("open_table");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
@@ -2361,7 +3124,7 @@ mod tests {
         assert!(err.to_string().contains("update:"), "got: {err}");
 
         let err = posts
-            .bm25_search("title", "-onlyneg", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "-onlyneg", TOP_K, Bm25SearchOptions::new(), None)
             .expect_err("negation-only query");
         assert!(matches!(err, InfinoError::Query(_)));
         assert!(err.to_string().contains("bm25_search:"), "got: {err}");

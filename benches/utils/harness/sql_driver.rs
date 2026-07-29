@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use super::{SqlEngine, SqlRow};
 use crate::{
+    cpu,
     markdown::fmt_count,
     rss::{PeakSampler, RssStats},
 };
@@ -34,6 +35,9 @@ pub struct SqlBuildStat {
     pub writers: usize,
     pub wall: Duration,
     pub rss: RssStats,
+    /// Measured on-CPU seconds of the build (all-thread schedstat delta),
+    /// when sampled — prices the build compute instead of a NOT-METERED gap.
+    pub cpu_s: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,14 +78,13 @@ pub fn run_sql_with_index<E: SqlEngine>(
     );
     let mut index = E::open();
     let sampler = PeakSampler::start_default();
-    let t0 = Instant::now();
-    E::write(&mut index, rows);
-    let wall = t0.elapsed();
+    let ((), wall, cpu_s) = cpu::timed(|| E::write(&mut index, rows));
     let rss = sampler.stop_stats();
     let mut builds = vec![SqlBuildStat {
         writers: 1,
         wall,
         rss,
+        cpu_s,
     }];
 
     if cfg.parallel > 1 {
@@ -91,14 +94,13 @@ pub fn run_sql_with_index<E: SqlEngine>(
             cfg.parallel,
         );
         let sampler = PeakSampler::start_default();
-        let t0 = Instant::now();
-        E::parallel_write(rows, cfg.parallel);
-        let wall = t0.elapsed();
+        let ((), wall, cpu_s) = cpu::timed(|| E::parallel_write(rows, cfg.parallel));
         let rss = sampler.stop_stats();
         builds.push(SqlBuildStat {
             writers: cfg.parallel,
             wall,
             rss,
+            cpu_s,
         });
     }
 

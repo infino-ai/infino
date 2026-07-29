@@ -47,6 +47,9 @@ jobs:
   release:
     name: Detect release and kick off publish
     runs-on: ubuntu-latest
+    # Never run in a fork: syncing main replays the release commit, which
+    # would re-detect an already-published version.
+    if: github.repository == 'infino-ai/infino'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

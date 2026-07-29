@@ -42,7 +42,10 @@ use std::collections::HashSet;
 use std::{
     env,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -59,6 +62,7 @@ use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
     corpus::DIM,
     cost, cpu,
+    executors::p50,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
     report::{Better, Block, Cell, Report, Section, context, metric, text},
@@ -389,7 +393,7 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
 /// Visit committed superfiles through the flat eager view, or through manifest
 /// parts when the manifest is lazy and the flat view is empty.
 fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader();
+    let reader = table.reader().expect("reader");
     let manifest = reader.manifest();
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
@@ -448,7 +452,7 @@ fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
 fn live_stored_bytes(consumer: &Supertable) -> Option<u64> {
     /// Relative prefix of superfile data objects under a table root.
     const DATA_PREFIX: &str = "data/";
-    let user_reader = consumer.reader();
+    let user_reader = consumer.reader().expect("reader");
     let user_manifest = user_reader.manifest();
     let listing = listed_objects_under(consumer, "")?;
     let bucket_total: u64 = listing.iter().map(|(_, size)| *size).sum();
@@ -496,7 +500,15 @@ fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
 /// table's provider. Keys are provider-root-relative — the same
 /// convention as `SuperfileUri::storage_path`.
 fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String, u64)>> {
-    let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
+    let storage = Arc::clone(
+        table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .options
+            .storage
+            .as_ref()?,
+    );
     let prefix = prefix.to_owned();
     let objects = tiers::block_on(async move {
         storage
@@ -621,7 +633,7 @@ fn run_metered_optimize(
 ) -> CompactionStats {
     eprintln!(
         "[{label}] before optimize: {} superfiles",
-        consumer.reader().n_superfiles()
+        consumer.reader().expect("reader").n_superfiles()
     );
     eprintln!("[{label}] compacting (optimize)...");
     let before = meter.snapshot();
@@ -642,14 +654,22 @@ fn run_metered_optimize(
         rss::fmt_bytes(peak_rss),
         rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
         rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
     );
     (wall_s, io, peak_rss, cpu_s)
 }
 
-fn store_phases_with_compaction(
+/// Fill the cold + compaction slots on [`cost::StorePhases`], plus the
+/// per-state query ledger from the collected routing states. Populating
+/// `query_states` routes the I/O ledger through the per-state metered
+/// rows (one group per routing state) instead of the legacy pre/steady
+/// pair, so FTS/SQL render metered `pre-compact` / `post-compact` rows.
+/// The FTS/SQL lifecycle is compaction-only — no drain, no delta — so
+/// those slots stay empty and their ledger rows never render.
+fn store_phases_lifecycle(
     measured: Option<ColdStoreMeasurement>,
     compaction: Option<CompactionStats>,
+    routing_states: &[RoutingStateStat],
 ) -> cost::StorePhases {
     let mut store = store_phases_from_measurement(measured);
     if let Some((wall_s, io, peak_rss, cpu_s)) = compaction {
@@ -658,29 +678,62 @@ fn store_phases_with_compaction(
         store.compaction_cpu_s = cpu_s;
         store.compaction_peak_rss_bytes = Some(peak_rss);
     }
+    store.query_states = query_state_costs(routing_states);
     store
 }
 
-/// Open a metered consumer, run [`run_metered_optimize`], return stats.
-/// The table on `built.storage` is left in the compacted layout.
-fn optimize_built_table(
+/// Measure/emit hook points around the shared FTS/SQL compaction.
+#[derive(Clone, Copy)]
+enum TextLifecyclePhase {
+    /// Fired once the metered lifecycle consumer is open, before
+    /// compaction — the routing-state framework's pre-compact
+    /// measurement window (same consumer + meter as the post-compact
+    /// phase).
+    PreCompact,
+    /// Fired after `optimize` — the post-compact steady-state layout.
+    Compacted,
+}
+
+/// Steady-state cache-budget multiple of the user index for the shared
+/// lifecycle consumer, so evictions don't silently re-fetch inside the
+/// "warm" batteries at serving scale.
+const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
+
+/// Shared FTS/SQL mutation sequence: open a metered consumer, measure
+/// the pre-compact state, run `optimize`, then measure post-compact —
+/// invoking `on_phase` with the SAME consumer + meter so the
+/// routing-state framework measures both states on one warm cache.
+/// Text tables have no query-facing drain (the scalar/FTS path never
+/// touches a hidden index) and skip the undrained-delta commit, so the
+/// lifecycle is compaction-only: pre-compact → compact → post-compact.
+/// Vector keeps its own OPANN-aware drain/delta path.
+fn run_metered_text_lifecycle(
     label: &str,
     modality: Modality,
     built: &supertable::IngestResult,
+    mut on_phase: impl FnMut(TextLifecyclePhase, &Supertable, &storage_meter::MeteredStorage),
 ) -> CompactionStats {
     let meter = storage_meter::wrap(Arc::clone(&built.storage));
-    let (cache_dir, cache) =
-        tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+    let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+        meter.provider(),
+        Some(
+            built
+                .total_index_bytes
+                .saturating_mul(SHARED_CONSUMER_CACHE_INDEX_FACTOR),
+        ),
+    );
     let opts = tiers::consumer_options(
         supertable::options_for(modality, None),
         meter.provider(),
         cache,
     );
     let consumer = tiers::open_consumer(opts);
-    let stats = run_metered_optimize(label, &consumer, &meter);
+    on_phase(TextLifecyclePhase::PreCompact, &consumer, &meter);
+    let compaction = run_metered_optimize(label, &consumer, &meter);
+    on_phase(TextLifecyclePhase::Compacted, &consumer, &meter);
     drop(consumer);
     drop(cache_dir);
-    stats
+    compaction
 }
 
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
@@ -701,6 +754,7 @@ fn emit_cost_warm(
     vector_cell: bool,
     mut store: cost::StorePhases,
     stored_bytes_override: Option<u64>,
+    serving_groups: Option<&[(&str, &[&str])]>,
 ) {
     if warm.is_empty() && cold.is_none() {
         return;
@@ -738,6 +792,7 @@ fn emit_cost_warm(
             vector_cell,
             storage_months: None,
             cold_open_amortized: true,
+            serving_groups,
         },
     );
 }
@@ -857,25 +912,6 @@ fn build_measured(
     (built, metrics)
 }
 
-/// Obtain the search artifact for modalities that don't need the corpus after
-/// build (FTS, SQL): in dataset mode open the pre-uploaded dataset (no corpus,
-/// no ingest); otherwise generate the corpus and ingest it. Vector keeps its
-/// corpus for recall ground truth and calls [`build_measured`] directly.
-fn build_or_open(
-    modality: Modality,
-    phases: Phases,
-) -> (supertable::IngestResult, Option<ShapeMetrics>) {
-    // Dataset mode opens the pre-uploaded dataset only for read phases; a
-    // build phase is the prepare step, which still ingests (to the fixed
-    // prefix).
-    if crate::dataset::dataset_mode() && !phases.build {
-        return (supertable::open_dataset(modality), None);
-    }
-    // Corpus to disk + mmap BEFORE the sampler — engine-only window.
-    let corpus = supertable::prepare_corpus(modality);
-    build_measured(modality, &corpus, phases)
-}
-
 fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempDir, Supertable) {
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         Arc::clone(&built.storage),
@@ -889,7 +925,594 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
     (cache_dir, tiers::open_consumer(opts))
 }
 
+// ==== shared routing-state observability framework ====
+// Per-lifecycle-state measurement + rendering shared by the vector, FTS,
+// and SQL drivers (cold GET-class ceilings, tier attribution, the warm
+// window, and the routing/transition tables). Lives at file scope so all
+// three child modules reach it via `super::`.
+
+/// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
+/// query's DATA GETs for the vector modality (probe blocks; manifest
+/// GETs — parts, slow-CAS blob, centroid section — are classed
+/// separately). A cold probe reads the geometric-chain islands its
+/// selected runs span under the 8 MiB cold coalesce windows:
+/// whole-cell at <5M (cells ~6 MiB), 2–4 islands at 10M.
+const VECTOR_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
+    ("post-drain", 4, 8),
+    ("post-delta", 6, 10),
+    ("post-compact", 4, 8),
+];
+/// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
+/// (steady) cold query's data GETs for the vector modality. <5M: a
+/// probed cell spans ~6 MiB, the whole probe coalesces to ONE GET.
+/// 5–20M: 2–4 geometric-chain islands. Invariant across tiers:
+/// post-delta = post-drain + 1 (the undrained user tail is one extra
+/// coalesced GET); post-compact matches post-delta at mid scale (two
+/// shard generations after a budgeted optimize).
+const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
+    ("post-drain", 1, 4),
+    ("post-delta", 2, 5),
+    ("post-compact", 1, 5),
+];
+/// Doc-count cutoffs for the two ceiling columns (exclusive upper
+/// bounds). At and above [`COLD_GET_MID_MAX_DOCS`] the grid shape is
+/// still being calibrated, so no ceiling applies yet.
+const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+/// Upper doc bound for the mid-scale ceilings (exclusive).
+const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
+/// Ceiling for `label` + `n_docs` out of one of the two gate tables,
+/// when one applies to that state at this scale.
+fn cold_data_get_ceiling(table: &[(&str, u64, u64)], label: &str, n_docs: usize) -> Option<u64> {
+    let (_, small, mid) = table.iter().find(|(state, _, _)| *state == label)?;
+    if n_docs < COLD_GET_SMALL_MAX_DOCS {
+        Some(*small)
+    } else if n_docs < COLD_GET_MID_MAX_DOCS {
+        Some(*mid)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_routing_state_with(
+    modality_tag: &str,
+    label: &'static str,
+    expected: ExpectedTiers,
+    recall: Option<String>,
+    consumer_meter: &storage_meter::MeteredStorage,
+    hit_tiers: &dyn Fn() -> HitTierStats,
+    warm_query: &dyn Fn(),
+    settle_fills: &dyn Fn(),
+    cold_measure: &dyn Fn() -> Option<RoutingColdStat>,
+    include_warm: bool,
+    include_cold: bool,
+    // Cold-read tier + GET-ceiling assertions, with the modality's
+    // own calibrated ceiling tables; `None` measures and renders the
+    // split without gating — the right first posture for a new
+    // lifecycle (calibrate from rendered data, then arm).
+    cold_assert: Option<ColdReadAssert<'_>>,
+) -> RoutingStateStat {
+    // Settled-anon bracket for the cost model's pinned line: sample
+    // before this state's measurements and again after, so only what
+    // the engine retains ACROSS the battery counts — harness heap
+    // allocated between states (recall machinery, report rows) drops
+    // out, and freed query scratch is purged before both samples.
+    let settled_before = rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
+    let hits = hit_tiers();
+    let user_hits = hits.user_hits;
+    let hidden_hits = hits.hidden_hits;
+    assert_expected_tiers(label, expected, user_hits, hidden_hits);
+    // Modalities without a quality metric (recall) show the tier
+    // attribution itself in the metric column.
+    let recall = recall.or_else(|| Some(format!("{user_hits}u/{hidden_hits}h")));
+
+    let warm = include_warm.then(|| {
+        let sampler = PeakSampler::start_default();
+        let search = || warm_query();
+        // Settle the cache before timing: a freshly-opened
+        // consumer serves its first queries from the store (the
+        // lazy fill lags the query), which would meter as a
+        // "warm" window doing cold fetches. Force pending fills
+        // to completion first (a post-compact shard generation is
+        // hundreds of MB — the bounded probe below can't outwait
+        // it; measured 31 GET/query leaking into the timed
+        // window), then probe until one query runs at zero GETs.
+        search();
+        settle_fills();
+        for _ in 0..WARM_SETTLE_MAX_ITERS {
+            let before = consumer_meter.snapshot();
+            search();
+            let after = consumer_meter.snapshot();
+            if after.get_count == before.get_count {
+                break;
+            }
+        }
+        search();
+        let trace_enabled = cold_trace_enabled();
+        if trace_enabled {
+            consumer_meter.start_trace();
+        }
+        let before = consumer_meter.snapshot();
+        let mut samples = Vec::with_capacity(ROUTING_STATE_WARM_ITERS);
+        let cpu0 = cpu::process_cpu_ns();
+        for _ in 0..ROUTING_STATE_WARM_ITERS {
+            let started = Instant::now();
+            search();
+            samples.push(started.elapsed());
+        }
+        let warm_cpu_s =
+            cpu::cpu_seconds_since(cpu0).map(|seconds| seconds / ROUTING_STATE_WARM_ITERS as f64);
+        let warm_trace = trace_enabled.then(|| consumer_meter.take_trace());
+        let warm_io = consumer_meter.snapshot().since(&before);
+        if let Some(trace) = warm_trace
+            && !trace.is_empty()
+        {
+            log_query_read_trace(label, "warm measurement", &trace);
+        }
+        // Lower-median (n-1)/2 via the shared helper, matching every other
+        // warm p50 in the harness (per-shape search table, summarize) so the
+        // routing-state warm p50 uses one order-statistic definition.
+        let p50_ns = p50(&mut samples).as_secs_f64() * 1e9;
+        (
+            p50_ns,
+            warm_cpu_s,
+            warm_io,
+            sampler.stop_stats().peak_rss_bytes,
+        )
+    });
+    // Engine-pinned estimate, sampled after the warm battery but BEFORE
+    // the cold-store measurement: the cold guard opens a second consumer
+    // purely to time cold opens — harness, not serving state. Pinned =
+    // the shared consumer's open delta plus what this state's warm
+    // serving retained (settled-after minus settled-before, allocator
+    // purged at both samples so freed query scratch never counts).
+    let settled = rss::settled_rss_breakdown();
+    let engine_anon_bytes = settled.map(|(_, anon, _, _)| {
+        let retained = settled_before
+            .map(|before| anon.saturating_sub(before))
+            .unwrap_or(0);
+        CONSUMER_ENGINE_ANON_BYTES.load(AtomicOrdering::Relaxed) + retained
+    });
+    let settled_file_bytes = settled.map(|(_, _, file, _)| file);
+    let cold = include_cold.then(cold_measure).flatten();
+    if let (Some(cold), Some(gate)) = (&cold, cold_assert) {
+        assert_expected_cold_reads(
+            label,
+            gate.expected,
+            &cold.split,
+            supertable::n_docs(),
+            gate.ceilings_first,
+            gate.ceilings_second,
+        );
+    }
+    eprintln!(
+        "[{modality_tag}/{label}] expected {}; top-k {user_hits} user + {hidden_hits} hidden; warm {}; cold 1st {}; cold 2nd {}",
+        expected.label(),
+        warm.map(|(p50, _, _, _)| fmt_time(p50))
+            .unwrap_or_else(|| "not measured".into()),
+        cold.map(|value| fmt_get_class_breakdown(&value.split.first_query))
+            .unwrap_or_else(|| "not measured".into()),
+        cold.map(|value| fmt_get_class_breakdown(&value.split.second_query))
+            .unwrap_or_else(|| "not measured".into()),
+    );
+    RoutingStateStat {
+        label,
+        expected,
+        recall,
+        warm_p50_ns: warm.map(|(p50, _, _, _)| p50),
+        warm_cpu_s: warm.and_then(|(_, cpu_s, _, _)| cpu_s),
+        ram_bytes: warm.map(|(_, _, _, ram_bytes)| ram_bytes),
+        ram_anon_bytes: engine_anon_bytes,
+        ram_file_settled_bytes: settled_file_bytes,
+        warm_io: warm.map(|(_, _, io, _)| io),
+        cold,
+    }
+}
+
+/// Ceiling for forcing pending background fills to settle before a
+/// routing-state warm window is timed (the settle waiter pushes fills
+/// through held readers, so the wait is fill bandwidth, not politeness).
+const ROUTING_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Repeated warm probes per routing-state transition — sizes the p50
+/// sample and divides the accumulated warm GET count.
+const ROUTING_STATE_WARM_ITERS: usize = 20;
+
+/// Cap on pre-timing settle probes for a routing-state warm window:
+/// re-run the query until one completes with zero GETs, so the timed
+/// window measures serving, not cache fill.
+const WARM_SETTLE_MAX_ITERS: usize = 50;
+/// Settled-anon accounting for the cost model's pinned-residency line.
+/// The bench process carries harness state a real serving process never
+/// allocates (the ground-truth id map, corpus bookkeeping, report
+/// buffers), so pricing whole-process anon overstates the engine.
+/// `run()` stamps the consumer handle's own settled-anon open delta
+/// here; each routing state adds what its own battery retained
+/// (settled-after minus settled-before, allocator purged at both
+/// samples). Zero means "not captured".
+static CONSUMER_ENGINE_ANON_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Render the per-lifecycle-state routing table (shared by the
+/// vector, FTS, and SQL drivers): expected tier, quality metric,
+/// warm p50 + GET/query, and the cold GET/byte split by URI class.
+fn emit_routing_states_with(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    note: String,
+    metric_header: &str,
+    states: &[RoutingStateStat],
+) {
+    report.emit(&Section {
+        anchor: anchor.into(),
+        title,
+        note,
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec![
+                "State".into(),
+                "Expected data".into(),
+                metric_header.into(),
+                "Warm p50".into(),
+                "Warm GET/query".into(),
+                "Cold open GET/bytes".into(),
+                "User data GET/bytes".into(),
+                "Hidden data GET/bytes".into(),
+                "Manifest GET/bytes".into(),
+            ],
+            rows: states
+                .iter()
+                .map(|state| {
+                    let warm_gets = state
+                        .warm_io
+                        .map(|io| io.get_count as f64 / ROUTING_STATE_WARM_ITERS as f64)
+                        .map(|gets| format!("{gets:.2}"))
+                        .unwrap_or_else(|| "N/A".into());
+                    let cold_open = state
+                        .cold
+                        .map(|cold| {
+                            format!(
+                                "{} / {}",
+                                cold.split.open.get_count,
+                                rss::fmt_bytes(cold.split.open.get_bytes)
+                            )
+                        })
+                        .unwrap_or_else(|| "N/A".into());
+                    let cold_query = state.cold.map(|cold| cold.split.first_query);
+                    vec![
+                        text(state.label),
+                        text(state.expected.label()),
+                        text(state.recall.clone().unwrap_or_else(|| "N/A".into())),
+                        text(
+                            state
+                                .warm_p50_ns
+                                .map(fmt_time)
+                                .unwrap_or_else(|| "N/A".into()),
+                        ),
+                        text(warm_gets),
+                        text(cold_open),
+                        text(
+                            cold_query
+                                .map(|io| class_gets(io, storage_meter::UriClass::UserData))
+                                .unwrap_or_else(|| "N/A".into()),
+                        ),
+                        text(
+                            cold_query
+                                .map(|io| class_gets(io, storage_meter::UriClass::HiddenData))
+                                .unwrap_or_else(|| "N/A".into()),
+                        ),
+                        text(
+                            cold_query
+                                .map(manifest_gets)
+                                .unwrap_or_else(|| "N/A".into()),
+                        ),
+                    ]
+                })
+                .collect(),
+        }],
+    });
+}
+
+fn class_gets(io: storage_meter::ObjectStoreMeter, class: storage_meter::UriClass) -> String {
+    let class_io = io.class_io(class);
+    if class_io.get_count == 0 {
+        "0".into()
+    } else {
+        format!(
+            "{} / {}",
+            class_io.get_count,
+            rss::fmt_bytes(class_io.get_bytes)
+        )
+    }
+}
+
+fn manifest_gets(io: storage_meter::ObjectStoreMeter) -> String {
+    let user = io.class_io(storage_meter::UriClass::UserManifest);
+    let hidden = io.class_io(storage_meter::UriClass::HiddenManifest);
+    let count = user.get_count + hidden.get_count;
+    let bytes = user.get_bytes + hidden.get_bytes;
+    if count == 0 {
+        "0".into()
+    } else {
+        format!("{count} / {}", rss::fmt_bytes(bytes))
+    }
+}
+
+/// Render the lifecycle-transitions table (shared by the vector,
+/// FTS, and SQL drivers): wall + object-store I/O per mutation
+/// between query-state rows.
+fn emit_transitions_with(
+    report: &mut Report,
+    anchor: &str,
+    title: String,
+    transitions: &[TransitionStat],
+) {
+    report.emit(&Section {
+    anchor: anchor.into(),
+    title,
+        note: "Every mutation between query-state rows is reported here. Request and byte counts are measured over the transition itself; no query traffic is mixed into these windows.".into(),
+        blocks: vec![Block {
+            subtitle: String::new(),
+            headers: vec![
+                "Transition".into(),
+                "Wall".into(),
+                "PUT".into(),
+                "Uploaded".into(),
+                "GET".into(),
+                "Downloaded".into(),
+                "HEAD".into(),
+                "Peak RSS".into(),
+            ],
+            rows: transitions
+                .iter()
+                .map(|transition| {
+                    let io = transition.io;
+                    vec![
+                        text(transition.label),
+                        text(fmt_time(transition.wall_ns)),
+                        text(
+                            io.map(|value| value.put_count.to_string())
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                        text(
+                            io.map(|value| rss::fmt_bytes(value.put_bytes))
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                        text(
+                            io.map(|value| value.get_count.to_string())
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                        text(
+                            io.map(|value| rss::fmt_bytes(value.get_bytes))
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                        text(
+                            io.map(|value| value.head_count.to_string())
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                        text(
+                            transition
+                                .peak_rss_bytes
+                                .map(rss::fmt_bytes)
+                                .unwrap_or_else(|| "NOT METERED".into()),
+                        ),
+                    ]
+                })
+                .collect(),
+        }],
+    });
+}
+
+fn query_state_costs(states: &[RoutingStateStat]) -> [cost::QueryStateCost; 4] {
+    let mut out = [cost::QueryStateCost::default(); 4];
+    for (slot, state) in out.iter_mut().zip(states) {
+        let cold = state.cold;
+        *slot = cost::QueryStateCost {
+            // Vector states carry a numeric recall; FTS/SQL states carry a
+            // tier-attribution string that intentionally parses to None.
+            recall: state.recall.as_deref().and_then(|s| s.parse::<f32>().ok()),
+            io: cost::QueryStateIo {
+                label: Some(state.label),
+                cold_open: cold.map(|value| value.split.open),
+                cold_query: cold.map(|value| value.split.first_query),
+                cold_second: cold.map(|value| value.split.second_query),
+                cold_repeat: cold.map(|value| value.split.repeat_query),
+                warm: state.warm_io,
+                warm_iters: state
+                    .warm_io
+                    .map(|_| ROUTING_STATE_WARM_ITERS as u64)
+                    .unwrap_or(0),
+            },
+            warm_p50_s: state.warm_p50_ns.map(|ns| ns / 1e9),
+            warm_cpu_s: state.warm_cpu_s,
+            ram_bytes: state.ram_bytes,
+            ram_anon_bytes: state.ram_anon_bytes,
+            ram_file_settled_bytes: state.ram_file_settled_bytes,
+            cold_open_s: cold.map(|value| value.open_wall_s),
+            cold_open_cpu_s: cold.and_then(|value| value.open_cpu_s),
+            cold_query_s: cold.map(|value| value.query_wall_s),
+            cold_query_cpu_s: cold.and_then(|value| value.query_cpu_s),
+            cold_second_s: cold.map(|value| value.second_wall_s),
+            cold_second_cpu_s: cold.and_then(|value| value.second_cpu_s),
+        };
+    }
+    out
+}
+
+// ---- Shared routing-state observability framework (vector, FTS,
+// SQL lifecycles): per-state stats, tier expectations, and the
+// asserts that prove which tier served each query. Hoisted from
+// the vector driver so every modality renders the same transitions
+// tables. Child modules import via `super::`.
+
+/// A modality's cold-read gate: the tier expectation plus its OWN
+/// calibrated GET-ceiling tables (never another modality's).
+#[derive(Clone, Copy)]
+struct ColdReadAssert<'a> {
+    expected: ExpectedTiers,
+    ceilings_first: &'a [(&'a str, u64, u64)],
+    ceilings_second: &'a [(&'a str, u64, u64)],
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedTiers {
+    UserOnly,
+    HiddenOnly,
+    Both,
+}
+
+impl ExpectedTiers {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserOnly => "user data only",
+            Self::HiddenOnly => "hidden data only",
+            Self::Both => "user + hidden data",
+        }
+    }
+}
+
+struct RoutingStateStat {
+    label: &'static str,
+    expected: ExpectedTiers,
+    recall: Option<String>,
+    warm_p50_ns: Option<f64>,
+    warm_cpu_s: Option<f64>,
+    ram_bytes: Option<u64>,
+    /// Engine-only settled anon after this state's battery: the consumer
+    /// handle's open delta plus retained serving growth, with freed query
+    /// scratch purged and harness heap subtracted (see
+    /// [`CONSUMER_ENGINE_ANON_BYTES`]).
+    ram_anon_bytes: Option<u64>,
+    /// Settled file-backed resident bytes at the same sample — the mmap
+    /// page-cache working set actually held after serving this state.
+    ram_file_settled_bytes: Option<u64>,
+    warm_io: Option<storage_meter::ObjectStoreMeter>,
+    cold: Option<RoutingColdStat>,
+}
+
+#[derive(Clone, Copy)]
+struct RoutingColdStat {
+    split: storage_meter::ColdStoreSplit,
+    open_wall_s: f64,
+    open_cpu_s: Option<f64>,
+    query_wall_s: f64,
+    query_cpu_s: Option<f64>,
+    /// Wall/CPU of the second, distinct cold query — the steady cold
+    /// per-query cost once the first query's metadata warmup landed.
+    second_wall_s: f64,
+    second_cpu_s: Option<f64>,
+}
+
+/// Forward of [`vector::routing_cold_to_measurement`]: adapt a shared
+/// [`ColdStoreMeasurement`] into the routing-state cold split. Defined
+/// once at file scope so the FTS and SQL drivers share it instead of
+/// each inlining the field-by-field map (which would drift when a
+/// `RoutingColdStat` field is added).
+fn routing_cold_from_measurement(cold: ColdStoreMeasurement) -> RoutingColdStat {
+    RoutingColdStat {
+        split: cold.split,
+        open_wall_s: cold.open_wall_s,
+        open_cpu_s: cold.open_cpu_s,
+        query_wall_s: cold.first_wall_s,
+        query_cpu_s: cold.first_cpu_s,
+        second_wall_s: cold.second_wall_s,
+        second_cpu_s: cold.second_cpu_s,
+    }
+}
+
+struct TransitionStat {
+    label: &'static str,
+    wall_ns: f64,
+    io: Option<storage_meter::ObjectStoreMeter>,
+    peak_rss_bytes: Option<u64>,
+}
+
+struct HitTierStats {
+    user_hits: usize,
+    hidden_hits: usize,
+}
+
+fn assert_expected_tiers(
+    label: &str,
+    expected: ExpectedTiers,
+    user_hits: usize,
+    hidden_hits: usize,
+) {
+    let valid = match expected {
+        ExpectedTiers::UserOnly => user_hits > 0 && hidden_hits == 0,
+        ExpectedTiers::HiddenOnly => user_hits == 0 && hidden_hits > 0,
+        // Mixed routing is proven by per-class cold GETs below. A normal
+        // follow-up commit need not contribute a row to every top-k.
+        ExpectedTiers::Both => true,
+    };
+    assert!(
+        valid,
+        "{label}: unexpected tier coverage (user hits={user_hits}, hidden hits={hidden_hits})"
+    );
+}
+
+fn assert_expected_cold_reads(
+    label: &str,
+    expected: ExpectedTiers,
+    split: &storage_meter::ColdStoreSplit,
+    n_docs: usize,
+    // Per-modality GET ceilings: a vector cold probe reads a handful
+    // of cells, an FTS one reads dozens of posting blocks — numbers
+    // calibrated for one modality are meaningless for another, so
+    // the caller supplies its own tables (empty = tier check only).
+    ceilings_first: &[(&str, u64, u64)],
+    ceilings_second: &[(&str, u64, u64)],
+) {
+    let user_data = split
+        .first_query
+        .class_io(storage_meter::UriClass::UserData)
+        .get_count;
+    let hidden_data = split
+        .first_query
+        .class_io(storage_meter::UriClass::HiddenData)
+        .get_count;
+    let valid = match expected {
+        ExpectedTiers::UserOnly => user_data > 0 && hidden_data == 0,
+        ExpectedTiers::HiddenOnly => user_data == 0 && hidden_data > 0,
+        ExpectedTiers::Both => user_data > 0 && hidden_data > 0,
+    };
+    assert!(
+        valid,
+        "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
+    );
+    // Lock in the cold-probe gains, per window: the first query's
+    // one-time warmup fan and the second query's steady per-query fetch
+    // each stay within their per-scale ceilings.
+    if let Some(ceiling) = cold_data_get_ceiling(ceilings_first, label, n_docs) {
+        let total = user_data + hidden_data;
+        assert!(
+            total <= ceiling,
+            "{label}: first cold query (metadata warmup) regressed — {total} data GETs \
+             ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs \
+             (per-modality ceilings; provisional post-v1-open values)"
+        );
+    }
+    if let Some(ceiling) = cold_data_get_ceiling(ceilings_second, label, n_docs) {
+        let second_user = split
+            .second_query
+            .class_io(storage_meter::UriClass::UserData)
+            .get_count;
+        let second_hidden = split
+            .second_query
+            .class_io(storage_meter::UriClass::HiddenData)
+            .get_count;
+        let total = second_user + second_hidden;
+        assert!(
+            total <= ceiling,
+            "{label}: second (steady) cold query regressed — {total} data GETs \
+             ({second_user} user + {second_hidden} hidden), ceiling {ceiling} at {n_docs} \
+             docs (per-modality ceilings; provisional post-v1-open values)"
+        );
+    }
+}
+
 pub mod fts {
+    use std::hint::black_box;
+
     use super::*;
     use crate::{
         executors::{
@@ -937,35 +1560,46 @@ pub mod fts {
             return;
         }
 
-        let (built, ingest_metrics) = build_or_open(Modality::Fts, phases);
+        // Fresh ingest retains the text corpus for the undrained delta commit.
+        let (built, ingest_metrics, mut corpus) = if crate::dataset::dataset_mode() && !phases.build
+        {
+            (supertable::open_dataset(Modality::Fts), None, None)
+        } else {
+            let corpus = supertable::prepare_corpus(Modality::Fts);
+            let (built, metrics) = build_measured(Modality::Fts, &corpus, phases);
+            (built, metrics, Some(corpus))
+        };
         if let Some(metrics) = &ingest_metrics {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
-        // Optimize + post-compact only on a fresh ingest in this process —
-        // without drain/delta/OPANN.
-        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
+        // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
+        // → compact → post-compact) on a fresh ingest in this process —
+        // same gate as the vector cell. Drain is a no-op without a hidden
+        // vector index but is still metered for phase parity.
+        let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
-            let reader = consumer.reader();
+            let reader = consumer.reader().expect("reader");
             exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
             drop(consumer);
             drop(cache_dir);
         }
 
         // Pre-compact (or sole) search: fragmented post-ingest layout.
+        // (FTS has no drain step — the meaningful transition is compaction.)
         let (warm_pre, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
             Some((w, c, l)) => (Some(w), Some(c), Some(l)),
             None => (None, None, None),
         };
         let cold_pre = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
-            let (anchor, title, note) = if run_optimize {
+            let (anchor, title, note) = if run_lifecycle {
                 (
-                    "bench/fts/supertable/search-pre-compact",
+                    "bench/fts/supertable/search/pre-compact",
                     format!(
-                        "Supertable FTS — search pre-compact, multi-superfile / object-store ({} docs)",
+                        "Supertable FTS — queries + cost, pre-compact / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
                     "Pre-compact (post-ingest fanout): warm = shared consumer + disk cache; \
@@ -976,11 +1610,12 @@ pub mod fts {
                 (
                     "bench/fts/supertable/search",
                     format!(
-                        "Supertable FTS — search, multi-superfile / object-store ({} docs)",
+                        "Supertable FTS — queries + cost, multi-superfile / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Warm = shared consumer + disk cache; one prewarm + wait_until_warm, then p50 / p90 / p99 \
-                     over repeated bm25_search (Δ gates on `p50`). Cold open = fresh cache + consumer \
+                    "Warm = shared consumer + disk cache; every battery shape is prewarmed then \
+                     wait_until_warm settles all fills, so p50 / p90 / p99 over repeated bm25_search \
+                     time a fully hot cache (Δ gates on `p50`). Cold open = fresh cache + consumer \
                      construct only; cold search = first bm25_search (query-driven survivor opens + score) — \
                      same split as cost-model cold I/O. Δ is vs the previous run."
                         .to_string(),
@@ -1040,38 +1675,86 @@ pub mod fts {
             );
         }
 
-        let compaction_stats =
-            run_optimize.then(|| optimize_built_table("supertable_fts", Modality::Fts, &built));
-
-        // Post-compact search + cost-cold (steady serving layout).
-        let (warm_post, cold_post) = if run_optimize {
-            let warm_post = phases.warm.then(|| {
-                let (w, _, _) = measure_warm(&built);
-                w
-            });
-            let cold_post = phases.cold.then(|| measure_cold(&built));
-            if phases.warm || phases.cold {
-                exec_fts::emit_search(
-                    &mut report,
-                    "bench/fts/supertable/search-post-compact",
-                    format!(
-                        "Supertable FTS — search post-compact, multi-superfile / object-store ({} docs)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact (after optimize): fewer superfiles; warm/cold recipe unchanged. \
-                     This is the steady-state layout the cost model prices. Δ vs previous run.",
-                    warm_post.as_deref(),
-                    cold_post.as_ref(),
-                    None,
-                );
-            }
+        let mut compaction_stats = None;
+        let mut routing_states: Vec<RoutingStateStat> = Vec::new();
+        let (warm_post, cold_post) = if run_lifecycle {
+            let mut warm_post = None;
+            let mut cold_post = None;
+            // FTS is compaction-only: the user FTS index has no drain and
+            // no undrained-delta commit, so the lifecycle measures just
+            // two states — pre-compact and post-compact — and emits only
+            // the post-compact search battery (pre-compact already ran).
+            let compaction = run_metered_text_lifecycle(
+                "supertable_fts",
+                Modality::Fts,
+                &built,
+                |phase, lifecycle_consumer, lifecycle_meter| {
+                    let label = match phase {
+                        TextLifecyclePhase::PreCompact => "pre-compact",
+                        TextLifecyclePhase::Compacted => "post-compact",
+                    };
+                    routing_states.push(fts_routing_state(
+                        label,
+                        ExpectedTiers::UserOnly,
+                        lifecycle_consumer,
+                        lifecycle_meter,
+                        &built,
+                    ));
+                    if !matches!(phase, TextLifecyclePhase::Compacted) {
+                        return;
+                    }
+                    let warm = phases.warm.then(|| {
+                        let (w, _, _) = measure_warm(&built);
+                        w
+                    });
+                    let cold = phases.cold.then(|| measure_cold(&built));
+                    if phases.warm || phases.cold {
+                        exec_fts::emit_search(
+                            &mut report,
+                            "bench/fts/supertable/search/post-compact",
+                            format!(
+                                "Supertable FTS — queries + cost, post-compact / object-store ({} docs)",
+                                fmt_count(n_docs)
+                            ),
+                            "Post-compact (after optimize): fewer, larger user superfiles; same \
+                             warm/cold recipe as pre-compact. Steady-state layout the cost model \
+                             prices. Δ vs previous run.",
+                            warm.as_deref(),
+                            cold.as_ref(),
+                            None,
+                        );
+                    }
+                    warm_post = warm;
+                    cold_post = cold;
+                },
+            );
+            drop(corpus.take());
+            compaction_stats = Some(compaction);
             (warm_post, cold_post)
         } else {
+            drop(corpus.take());
             (None, None)
         };
+        if !routing_states.is_empty() {
+            emit_routing_states_with(
+                &mut report,
+                "bench/fts/supertable/routing-states",
+                format!(
+                    "Supertable FTS — pre-compact vs post-compact ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "One broad-OR shape (ten_term_or) measured pre-compact and post-compact on one warm \
+                 cache: warm p50, warm GET/query (0 when the working set fits the budget), and the \
+                 cold open / first-query GET+byte split. No hidden tier on main, so every hit is \
+                 user-tier."
+                    .into(),
+                "Hits (u/h)",
+                &routing_states,
+            );
+        }
 
         if phases.warm || phases.cold {
-            let (warm_for_cost, cold_for_cost, pre_latencies) = if run_optimize {
+            let (warm_for_cost, cold_for_cost, pre_latencies) = if run_lifecycle {
                 (
                     warm_post.as_deref().unwrap_or(&[]),
                     cold_post.as_ref(),
@@ -1082,7 +1765,7 @@ pub mod fts {
                             .unwrap_or_default(),
                         cold_pre
                             .as_ref()
-                            .map(cost::cold_from_timings)
+                            .map(cost::cold_from_fts_timings)
                             .unwrap_or_default(),
                     )),
                 )
@@ -1091,12 +1774,47 @@ pub mod fts {
             };
             let warm_vec = cost::warm_from_fts(warm_for_cost);
             let cold_vec = cold_for_cost
-                .map(cost::cold_from_timings)
+                .map(cost::cold_from_fts_timings)
                 .unwrap_or_default();
             let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
             let pre_refs = pre_latencies
                 .as_ref()
                 .map(|(w, c)| (w.as_slice(), c.as_slice()));
+            // Retrieval-class name lists: each family's shapes with the fetch
+            // suffix, matching the second entry `warm_from_fts` emits per
+            // shape (fetched p50 / CPU / payload). The un-suffixed families
+            // are the search class (id + score); cold rows exist only for
+            // search (the cold battery runs the query phase).
+            let fetch_names = |names: &[&str]| -> Vec<String> {
+                names
+                    .iter()
+                    .map(|n| format!("{n}{}", cost::FTS_FETCH_SUFFIX))
+                    .collect()
+            };
+            let or_fetch = fetch_names(exec_fts::OR_QUERIES);
+            let and_fetch = fetch_names(exec_fts::AND_QUERIES);
+            let clause_fetch = fetch_names(exec_fts::CLAUSE_QUERIES);
+            let phrase_fetch = fetch_names(exec_fts::PHRASE_QUERIES);
+            let or_fetch_refs: Vec<&str> = or_fetch.iter().map(String::as_str).collect();
+            let and_fetch_refs: Vec<&str> = and_fetch.iter().map(String::as_str).collect();
+            let clause_fetch_refs: Vec<&str> = clause_fetch.iter().map(String::as_str).collect();
+            let phrase_fetch_refs: Vec<&str> = phrase_fetch.iter().map(String::as_str).collect();
+            // Shape-first: OR / AND / must-should / phrase are the primary
+            // families; the two cost classes (search = id+score, retrieval =
+            // +text fetch) are adjacent rows within each.
+            let fts_groups: [(&str, &[&str]); 8] = [
+                ("OR — search (id+score)", exec_fts::OR_QUERIES),
+                ("OR — retrieval (+text)", or_fetch_refs.as_slice()),
+                ("AND — search (id+score)", exec_fts::AND_QUERIES),
+                ("AND — retrieval (+text)", and_fetch_refs.as_slice()),
+                ("Must/should — search (id+score)", exec_fts::CLAUSE_QUERIES),
+                (
+                    "Must/should — retrieval (+text)",
+                    clause_fetch_refs.as_slice(),
+                ),
+                ("Phrase — search (id+score)", exec_fts::PHRASE_QUERIES),
+                ("Phrase — retrieval (+text)", phrase_fetch_refs.as_slice()),
+            ];
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
@@ -1112,9 +1830,16 @@ pub mod fts {
                         Some(&cold_vec)
                     },
                     pre_refs,
+                    // Compaction-only text lifecycle: not a full-maintenance
+                    // (drain/delta) cell, so drain/delta ledger rows never render.
                     false,
-                    store_phases_with_compaction(cold_measured, compaction_stats),
+                    store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
                     None,
+                    // Serving/monthly priced per query-family from the same
+                    // battery the search table reports (reconciles by
+                    // construction), split into the two cost classes (search
+                    // vs retrieval); the drain/delta ledger rows never apply.
+                    Some(&fts_groups),
                 );
             }
         }
@@ -1145,6 +1870,82 @@ pub mod fts {
         });
     }
 
+    /// One routing-state measurement for the FTS lifecycle: tier
+    /// attribution via bm25 hit superfile provenance (the hidden
+    /// manifest URI set is empty on main → all hits user-tier), and a
+    /// metered warm window over the broad-OR representative. Cold
+    /// metering rendered without gating (no calibrated main ceilings).
+    fn fts_routing_state(
+        label: &'static str,
+        expected: ExpectedTiers,
+        consumer: &Supertable,
+        consumer_meter: &storage_meter::MeteredStorage,
+        built: &supertable::IngestResult,
+    ) -> RoutingStateStat {
+        let rep = FTS_BATTERY
+            .iter()
+            .find(|q| q.name == "ten_term_or")
+            .expect("battery keeps its broad-OR representative");
+        let query = rep.terms.join(" ");
+        let mode = exec_fts::to_infino_mode(rep.mode);
+        let reader = consumer.reader().expect("reader");
+        let hidden_uris: HashSet<_> = consumer
+            .vector_index_table()
+            .map(|hidden| {
+                hidden
+                    .pinned_reader()
+                    .manifest()
+                    .get_all_superfiles()
+                    .iter()
+                    .map(|entry| entry.uri)
+                    .collect()
+            })
+            .unwrap_or_default();
+        super::measure_routing_state_with(
+            "supertable_fts",
+            label,
+            expected,
+            None,
+            consumer_meter,
+            &|| {
+                let hits = reader
+                    .bm25_hits(supertable::TEXT_COLUMN, &query, TOP_K, mode)
+                    .expect("routing-state bm25 hits");
+                let hidden_hits = hits
+                    .iter()
+                    .filter(|hit| hidden_uris.contains(&hit.superfile))
+                    .count();
+                HitTierStats {
+                    user_hits: hits.len() - hidden_hits,
+                    hidden_hits,
+                }
+            },
+            &|| {
+                black_box(
+                    reader
+                        .bm25_search(
+                            supertable::TEXT_COLUMN,
+                            &query,
+                            TOP_K,
+                            mode,
+                            infino::Bm25Stats::PerSuperfile,
+                            None,
+                        )
+                        .expect("routing-state warm bm25 search"),
+                );
+            },
+            &|| {
+                consumer
+                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .expect("routing-state fill settle");
+            },
+            &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
+            true,
+            true,
+            None,
+        )
+    }
+
     fn measure_warm(
         built: &supertable::IngestResult,
     ) -> (
@@ -1162,23 +1963,28 @@ pub mod fts {
         // up as anonymous ≈ file_backed after warm-up.
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-        let reader = consumer.reader();
-        // Prewarm + wait: one query opens every pruned-in superfile so the
-        // background fills spawn, then wait_until_warm blocks until each is
-        // mmap-promoted. Warm numbers time a hot cache, not the fill race —
-        // same methodology as the cold split, which meters the fill
-        // explicitly.
-        let first = &FTS_BATTERY[0];
-        let first_query = first.terms.join(" ");
-        let _ = reader
-            .bm25_search(
-                supertable::TEXT_COLUMN,
-                &first_query,
-                TOP_K,
-                exec_fts::to_infino_mode(first.mode),
-                None,
-            )
-            .expect("warm prewarm bm25_search");
+        let reader = consumer.reader().expect("reader");
+        // Prewarm + wait: run EVERY battery shape once so each opens its
+        // pruned-in superfiles and spawns their background fills, then
+        // wait_until_warm blocks until all are mmap-promoted. A single-shape
+        // prewarm (e.g. a rare term pruning into one superfile) would leave
+        // broad shapes' (common terms, phrases — they prune into every
+        // superfile) working sets unsettled, so their warm p50 would race
+        // lagging fills. Warm numbers time a hot cache, not the fill race —
+        // same methodology as the cold split, which meters fill explicitly.
+        for q in FTS_BATTERY {
+            let query = q.terms.join(" ");
+            let _ = reader
+                .bm25_search(
+                    supertable::TEXT_COLUMN,
+                    &query,
+                    TOP_K,
+                    exec_fts::to_infino_mode(q.mode),
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
+                .expect("warm prewarm bm25_search");
+        }
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
@@ -1238,13 +2044,14 @@ pub mod fts {
 
     fn measure_cold(
         built: &supertable::IngestResult,
-    ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
+    ) -> std::collections::HashMap<&'static str, exec_fts::FtsColdStat> {
         exec_fts::measure_cold(
             || SupertableColdGuard::open(built),
             FTS_BATTERY,
             supertable::TEXT_COLUMN,
             TOP_K,
             COLD_ITERS,
+            true,
             "supertable_fts",
         )
     }
@@ -1285,7 +2092,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered cold bm25_search");
             },
             |(_cache, consumer), i| {
@@ -1294,7 +2109,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(q.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
@@ -1303,7 +2126,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered repeat cold bm25_search");
             },
         );
@@ -1340,7 +2171,15 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, None)
+                .expect("reader")
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -1356,11 +2195,32 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("reader")
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    Some(&["_id", column, "score"]),
+                )
                 .expect("cold bm25_search fetched")
                 .iter()
                 .map(|b| b.num_rows())
                 .sum()
+        }
+
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> ((u64, u64), (u64, u64)) {
+            self.consumer
+                .reader()
+                .expect("reader")
+                .bm25_payloads(column, query, k, mode)
         }
 
         fn count_matching(
@@ -1369,7 +2229,10 @@ pub mod fts {
             query: &str,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> u64 {
-            self.consumer.reader().count_matching(column, query, mode)
+            self.consumer
+                .reader()
+                .expect("reader")
+                .count_matching(column, query, mode)
         }
     }
 }
@@ -1379,16 +2242,16 @@ pub mod vector {
         cmp::Ordering,
         collections::{HashMap, HashSet},
         hint::black_box,
-        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+        sync::atomic::Ordering as AtomicOrdering,
     };
 
-    use infino::storage::io_counters;
+    use infino::{VectorFilter, roaring::RoaringBitmap, storage::io_counters};
 
     use super::*;
     use crate::{
         corpus,
         executors::{
-            vector as exec_vec,
+            fts as exec_fts, vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -1450,21 +2313,10 @@ pub mod vector {
     /// (a depth problem). The 256 row is the full 1M/256 grid: exact
     /// search over matching rows, the recall ceiling of the approach.
     const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[160, 192, 224, 256];
-    /// Repeated warm probes per routing-state transition.
-    const ROUTING_STATE_WARM_ITERS: usize = 20;
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
 
-    /// Settled-anon accounting for the cost model's pinned-residency line.
-    /// The bench process carries harness state a real serving process never
-    /// allocates (the ground-truth id map, corpus bookkeeping, report
-    /// buffers), so pricing whole-process anon overstates the engine.
-    /// `run()` stamps the consumer handle's own settled-anon open delta
-    /// here; each routing state adds what its own battery retained
-    /// (settled-after minus settled-before, allocator purged at both
-    /// samples). Zero means "not captured".
-    static CONSUMER_ENGINE_ANON_BYTES: AtomicU64 = AtomicU64::new(0);
     /// Skip the normal undrained-delta commit while retaining pre-drain,
     /// drain, post-drain, and optimize/compact measurements.
     const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
@@ -1497,80 +2349,6 @@ pub mod vector {
     /// pre-routing search path.
     const RUN_CALIBRATION_GRID: bool = false;
 
-    /// Regression gates on the cold consumer's **data** GET fan (user +
-    /// hidden classes together), by routing state and scale tier, with the
-    /// pinned <20M grid shape (512 user / 256 hidden cells). Two windows,
-    /// gated separately because they price differently:
-    ///
-    /// * **first cold query** — the one-time metadata warmup under the v1
-    ///   open discipline: the admit-window centroid regions (~20% of cells,
-    ///   one block GET each), Sq8 meta, and stable-id blocks ride in with
-    ///   the first probe (all concurrent). Measured at 1M/256: 53 GETs.
-    ///   Bounded loosely so a fan regression (e.g. the pre-drain 848-class
-    ///   blowup reaching a routed state) still trips.
-    /// * **second, distinct cold query** — the steady cold per-query fetch
-    ///   with the warmup resident: its own probe blocks plus any
-    ///   newly-touched cells. This is the number the cost model's cold
-    ///   read leg prices, so it gates tight.
-    ///
-    /// PROVISIONAL until the validation ladder re-measures both windows;
-    /// tighten to the recorded numbers. At and above
-    /// [`COLD_GET_MID_MAX_DOCS`] the grid shape is still being calibrated,
-    /// so no ceiling applies yet.
-    const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
-    /// Upper doc bound for the mid-scale ceilings (exclusive).
-    const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
-    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
-    /// query's DATA GETs (probe blocks; manifest GETs — parts, slow-CAS
-    /// blob, centroid section — are classed separately). A cold probe
-    /// reads the geometric-chain islands its selected runs span under the
-    /// 8 MiB cold coalesce windows: whole-cell at <5M (cells ~6 MiB), 2–4
-    /// islands at 10M (cells ~60 MiB; bridging 10–18 MiB inter-island
-    /// gaps would cost more wall time on one stream than parallel GETs).
-    const COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
-        ("post-drain", 4, 8),
-        ("post-delta", 6, 10),
-        ("post-compact", 4, 8),
-    ];
-    /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the SECOND
-    /// (steady) cold query's data GETs. <5M: a probed cell spans ~6 MiB,
-    /// the whole probe coalesces to ONE GET (measured 1 / 2 / 1 at 1M —
-    /// post-delta's extra GET is the undrained user tail). 5–20M: a
-    /// probed cell spans ~60 MiB and the selected runs occupy 2–4
-    /// geometric-chain islands with 10–18 MiB gaps that are cheaper to
-    /// fetch in parallel than to bridge (median 3–4 measured at 10M
-    /// under the 8 MiB cold windows). Invariant across tiers:
-    /// post-delta = post-drain + 1 (the undrained user tail is exactly
-    /// one extra coalesced GET). Post-compact matches post-delta at mid
-    /// scale — a budgeted optimize leaves the hidden table two shard
-    /// generations deep, so a probed cell's runs span two files
-    /// (measured 5 at 10M: 3–4 islands in the old shard + 1 in the
-    /// new); a full per-cell consolidation pass would earn post-drain's
-    /// ceiling back. The old 2-GET value at this tier was calibrated
-    /// against the fat-open era (727 MiB opens staging all cell
-    /// metadata) and is not reachable on the v1-open architecture.
-    const COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
-        ("post-drain", 1, 4),
-        ("post-delta", 2, 5),
-        ("post-compact", 1, 5),
-    ];
-    /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
-    /// when one applies to that state at this scale.
-    fn cold_data_get_ceiling(
-        table: &[(&str, u64, u64)],
-        label: &str,
-        n_docs: usize,
-    ) -> Option<u64> {
-        let (_, small, mid) = table.iter().find(|(state, _, _)| *state == label)?;
-        if n_docs < COLD_GET_SMALL_MAX_DOCS {
-            Some(*small)
-        } else if n_docs < COLD_GET_MID_MAX_DOCS {
-            Some(*mid)
-        } else {
-            None
-        }
-    }
-
     /// Calibration policy for supertable vector benches: the grid runs only
     /// when [`RUN_CALIBRATION_GRID`] is flipped on, and even then auto-offs
     /// above [`exec_vec::FULL_CALIBRATION_MAX_DOCS`]. Default and filtered
@@ -1592,74 +2370,13 @@ pub mod vector {
         exec_vec::ENGINE_DEFAULT
     }
 
-    #[derive(Clone, Copy)]
-    enum ExpectedTiers {
-        UserOnly,
-        HiddenOnly,
-        Both,
-    }
-
-    impl ExpectedTiers {
-        fn label(self) -> &'static str {
-            match self {
-                Self::UserOnly => "user data only",
-                Self::HiddenOnly => "hidden data only",
-                Self::Both => "user + hidden data",
-            }
-        }
-    }
-
-    struct RoutingStateStat {
-        label: &'static str,
-        expected: ExpectedTiers,
-        recall: Option<String>,
-        warm_p50_ns: Option<f64>,
-        warm_cpu_s: Option<f64>,
-        ram_bytes: Option<u64>,
-        /// Engine-only settled anon after this state's battery: the consumer
-        /// handle's open delta plus retained serving growth, with freed query
-        /// scratch purged and harness heap subtracted (see
-        /// [`CONSUMER_ENGINE_ANON_BYTES`]).
-        ram_anon_bytes: Option<u64>,
-        /// Settled file-backed resident bytes at the same sample — the mmap
-        /// page-cache working set actually held after serving this state.
-        ram_file_settled_bytes: Option<u64>,
-        warm_io: Option<storage_meter::ObjectStoreMeter>,
-        cold: Option<RoutingColdStat>,
-    }
-
-    #[derive(Clone, Copy)]
-    struct RoutingColdStat {
-        split: storage_meter::ColdStoreSplit,
-        open_wall_s: f64,
-        open_cpu_s: Option<f64>,
-        query_wall_s: f64,
-        query_cpu_s: Option<f64>,
-        /// Wall/CPU of the second, distinct cold query — the steady cold
-        /// per-query cost once the first query's metadata warmup landed.
-        second_wall_s: f64,
-        second_cpu_s: Option<f64>,
-    }
-
-    struct TransitionStat {
-        label: &'static str,
-        wall_ns: f64,
-        io: Option<storage_meter::ObjectStoreMeter>,
-        peak_rss_bytes: Option<u64>,
-    }
-
-    struct HitTierStats {
-        user_hits: usize,
-        hidden_hits: usize,
-    }
-
     fn hit_tier_counts(
         table: &Supertable,
         query: &[f32],
         nprobe: usize,
         rerank: usize,
     ) -> HitTierStats {
-        let reader = table.reader();
+        let reader = table.reader().expect("reader");
         let hidden_uris: HashSet<_> = table
             .vector_index_table()
             .map(|hidden| {
@@ -1695,108 +2412,10 @@ pub mod vector {
         }
     }
 
-    fn assert_expected_tiers(
-        label: &str,
-        expected: ExpectedTiers,
-        user_hits: usize,
-        hidden_hits: usize,
-    ) {
-        let valid = match expected {
-            ExpectedTiers::UserOnly => user_hits > 0 && hidden_hits == 0,
-            ExpectedTiers::HiddenOnly => user_hits == 0 && hidden_hits > 0,
-            // Mixed routing is proven by per-class cold GETs below. A normal
-            // follow-up commit need not contribute a row to every top-k.
-            ExpectedTiers::Both => true,
-        };
-        assert!(
-            valid,
-            "{label}: unexpected tier coverage (user hits={user_hits}, hidden hits={hidden_hits})"
-        );
-    }
-
-    fn assert_expected_cold_reads(
-        label: &str,
-        expected: ExpectedTiers,
-        split: &storage_meter::ColdStoreSplit,
-        n_docs: usize,
-    ) {
-        let user_data = split
-            .first_query
-            .class_io(storage_meter::UriClass::UserData)
-            .get_count;
-        let hidden_data = split
-            .first_query
-            .class_io(storage_meter::UriClass::HiddenData)
-            .get_count;
-        let valid = match expected {
-            ExpectedTiers::UserOnly => user_data > 0 && hidden_data == 0,
-            ExpectedTiers::HiddenOnly => user_data == 0 && hidden_data > 0,
-            ExpectedTiers::Both => user_data > 0 && hidden_data > 0,
-        };
-        assert!(
-            valid,
-            "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
-        );
-        // Lock in the cold-probe gains, per window: the first query's
-        // one-time warmup fan and the second query's steady per-query fetch
-        // each stay within their per-scale ceilings.
-        if let Some(ceiling) = cold_data_get_ceiling(COLD_GET_CEILINGS_FIRST, label, n_docs) {
-            let total = user_data + hidden_data;
-            assert!(
-                total <= ceiling,
-                "{label}: first cold query (metadata warmup) regressed — {total} data GETs \
-                 ({user_data} user + {hidden_data} hidden), ceiling {ceiling} at {n_docs} docs \
-                 (see COLD_GET_CEILINGS_FIRST; provisional post-v1-open values)"
-            );
-        }
-        if let Some(ceiling) = cold_data_get_ceiling(COLD_GET_CEILINGS_SECOND, label, n_docs) {
-            let second_user = split
-                .second_query
-                .class_io(storage_meter::UriClass::UserData)
-                .get_count;
-            let second_hidden = split
-                .second_query
-                .class_io(storage_meter::UriClass::HiddenData)
-                .get_count;
-            let total = second_user + second_hidden;
-            assert!(
-                total <= ceiling,
-                "{label}: second (steady) cold query regressed — {total} data GETs \
-                 ({second_user} user + {second_hidden} hidden), ceiling {ceiling} at {n_docs} \
-                 docs (see COLD_GET_CEILINGS_SECOND; provisional post-v1-open values)"
-            );
-        }
-    }
-
     fn default_recall(rows: &[exec_vec::RecallRow]) -> Option<String> {
         rows.iter()
             .find(|row| row.target == "default")
             .map(|row| row.recall.clone())
-    }
-
-    fn class_gets(io: storage_meter::ObjectStoreMeter, class: storage_meter::UriClass) -> String {
-        let class_io = io.class_io(class);
-        if class_io.get_count == 0 {
-            "0".into()
-        } else {
-            format!(
-                "{} / {}",
-                class_io.get_count,
-                rss::fmt_bytes(class_io.get_bytes)
-            )
-        }
-    }
-
-    fn manifest_gets(io: storage_meter::ObjectStoreMeter) -> String {
-        let user = io.class_io(storage_meter::UriClass::UserManifest);
-        let hidden = io.class_io(storage_meter::UriClass::HiddenManifest);
-        let count = user.get_count + hidden.get_count;
-        let bytes = user.get_bytes + hidden.get_bytes;
-        if count == 0 {
-            "0".into()
-        } else {
-            format!("{count} / {}", rss::fmt_bytes(bytes))
-        }
     }
 
     struct SupertableVecColdGuard {
@@ -1841,7 +2460,7 @@ pub mod vector {
         id_to_dense: &HashMap<i128, u32>,
         hits: &[infino::supertable::query::SuperfileHit],
     ) -> Vec<(u32, f32)> {
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
         for entry in manifest.get_all_superfiles() {
@@ -2341,6 +2960,7 @@ pub mod vector {
             sampled += 1;
             let batches = consumer
                 .reader()
+                .expect("reader")
                 .vector_search(
                     supertable::VEC_COLUMN,
                     &vectors[start..start + DIM],
@@ -2438,7 +3058,7 @@ pub mod vector {
             return "pre-drain";
         }
         let drained = hidden_manifest.get_drained_ranges();
-        let user_reader = consumer.reader();
+        let user_reader = consumer.reader().expect("reader");
         let user_manifest = user_reader.manifest();
         if user_manifest
             .get_all_superfiles()
@@ -2544,7 +3164,7 @@ pub mod vector {
             .vector_index_table()
             .expect("reset must recreate the hidden vector index");
         assert_eq!(
-            hidden.reader().n_superfiles(),
+            hidden.reader().expect("reader").n_superfiles(),
             0,
             "reset hidden index must reopen empty"
         );
@@ -2590,6 +3210,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -2610,6 +3231,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         q,
@@ -2627,6 +3249,7 @@ pub mod vector {
             |(_cache, consumer)| {
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -2672,79 +3295,32 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) -> RoutingStateStat {
-        // Settled-anon bracket for the cost model's pinned line: sample
-        // before this state's measurements and again after, so only what
-        // the engine retains ACROSS the battery counts — harness heap
-        // allocated between states (recall machinery, report rows) drops
-        // out, and freed query scratch is purged before both samples.
-        let settled_before = rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
-        let hits = hit_tier_counts(consumer, query, nprobe, rerank);
-        let user_hits = hits.user_hits;
-        let hidden_hits = hits.hidden_hits;
-        assert_expected_tiers(label, expected, user_hits, hidden_hits);
-
-        let warm = include_warm.then(|| {
-            let reader = consumer.reader();
-            let sampler = PeakSampler::start_default();
-            let search = || {
-                reader
-                    .vector_search(
-                        supertable::VEC_COLUMN,
-                        query,
-                        TOP_K,
-                        exec_vec::search_opts(nprobe, rerank),
-                        None,
-                        None,
-                    )
-                    .expect("routing-state warm vector search")
-            };
-            black_box(search());
-            let trace_enabled = cold_trace_enabled();
-            if trace_enabled {
-                consumer_meter.start_trace();
-            }
-            let before = consumer_meter.snapshot();
-            let mut samples = Vec::with_capacity(ROUTING_STATE_WARM_ITERS);
-            let cpu0 = cpu::process_cpu_ns();
-            for _ in 0..ROUTING_STATE_WARM_ITERS {
-                let started = Instant::now();
-                black_box(search());
-                samples.push(started.elapsed());
-            }
-            let warm_cpu_s = cpu::cpu_seconds_since(cpu0)
-                .map(|seconds| seconds / ROUTING_STATE_WARM_ITERS as f64);
-            let warm_trace = trace_enabled.then(|| consumer_meter.take_trace());
-            let warm_io = consumer_meter.snapshot().since(&before);
-            if let Some(trace) = warm_trace
-                && !trace.is_empty()
-            {
-                log_query_read_trace(label, "warm measurement", &trace);
-            }
-            samples.sort_unstable();
-            let p50_ns = samples[samples.len() / 2].as_secs_f64() * 1e9;
-            (
-                p50_ns,
-                warm_cpu_s,
-                warm_io,
-                sampler.stop_stats().peak_rss_bytes,
-            )
-        });
-        // Engine-pinned estimate, sampled after the warm battery but BEFORE
-        // the cold-store measurement: the cold guard opens a second consumer
-        // purely to time cold opens — harness, not serving state. Pinned =
-        // the shared consumer's open delta plus what this state's warm
-        // serving retained (settled-after minus settled-before, allocator
-        // purged at both samples so freed query scratch never counts).
-        let settled = rss::settled_rss_breakdown();
-        let engine_anon_bytes = settled.map(|(_, anon, _, _)| {
-            let retained = settled_before
-                .map(|before| anon.saturating_sub(before))
-                .unwrap_or(0);
-            CONSUMER_ENGINE_ANON_BYTES.load(AtomicOrdering::Relaxed) + retained
-        });
-        let settled_file_bytes = settled.map(|(_, _, file, _)| file);
-        let cold = include_cold
-            .then(|| {
+        let reader = consumer.reader().expect("reader");
+        super::measure_routing_state_with(
+            "supertable_vector",
+            label,
+            expected,
+            recall,
+            consumer_meter,
+            &|| hit_tier_counts(consumer, query, nprobe, rerank),
+            &|| {
+                black_box(
+                    reader
+                        .vector_search(
+                            supertable::VEC_COLUMN,
+                            query,
+                            TOP_K,
+                            exec_vec::search_opts(nprobe, rerank),
+                            None,
+                            None,
+                        )
+                        .expect("routing-state warm vector search"),
+                );
+            },
+            // Vector consumers open with allow_background_fill =
+            // false (block cache only) — no fills to settle.
+            &|| {},
+            &|| {
                 measure_cold_store(
                     label,
                     built,
@@ -2754,176 +3330,46 @@ pub mod vector {
                     rerank,
                     cache_budget_bytes,
                 )
-            })
-            .flatten();
-        if let Some(cold) = &cold {
-            assert_expected_cold_reads(label, expected, &cold.split, supertable::n_docs());
-        }
-        eprintln!(
-            "[supertable_vector/{label}] expected {}; top-k {user_hits} user + {hidden_hits} hidden; warm {}; cold 1st {}; cold 2nd {}",
-            expected.label(),
-            warm.map(|(p50, _, _, _)| fmt_time(p50))
-                .unwrap_or_else(|| "not measured".into()),
-            cold.map(|value| fmt_get_class_breakdown(&value.split.first_query))
-                .unwrap_or_else(|| "not measured".into()),
-            cold.map(|value| fmt_get_class_breakdown(&value.split.second_query))
-                .unwrap_or_else(|| "not measured".into()),
-        );
-        RoutingStateStat {
-            label,
-            expected,
-            recall,
-            warm_p50_ns: warm.map(|(p50, _, _, _)| p50),
-            warm_cpu_s: warm.and_then(|(_, cpu_s, _, _)| cpu_s),
-            ram_bytes: warm.map(|(_, _, _, ram_bytes)| ram_bytes),
-            ram_anon_bytes: engine_anon_bytes,
-            ram_file_settled_bytes: settled_file_bytes,
-            warm_io: warm.map(|(_, _, io, _)| io),
-            cold,
-        }
+            },
+            include_warm,
+            include_cold,
+            Some(super::ColdReadAssert {
+                expected,
+                ceilings_first: super::VECTOR_COLD_GET_CEILINGS_FIRST,
+                ceilings_second: super::VECTOR_COLD_GET_CEILINGS_SECOND,
+            }),
+        )
     }
 
     fn emit_routing_states(report: &mut Report, n_docs: usize, states: &[RoutingStateStat]) {
-        report.emit(&Section {
-            anchor: "bench/vector/supertable/routing-states".into(),
-            title: format!(
+        super::emit_routing_states_with(
+            report,
+            "bench/vector/supertable/routing-states",
+            format!(
                 "Supertable vector — routing state transitions ({} docs × dim={})",
                 fmt_count(n_docs),
                 DIM
             ),
-            note: format!(
-                "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same 20-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
+            format!(
+                "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same {N_CORRECTNESS_QUERIES}-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
                 supertable::docs_per_commit(),
             ),
-            blocks: vec![Block {
-                subtitle: String::new(),
-                headers: vec![
-                    "State".into(),
-                    "Expected data".into(),
-                    "Recall@10".into(),
-                    "Warm p50".into(),
-                    "Warm GET/query".into(),
-                    "Cold open GET/bytes".into(),
-                    "User data GET/bytes".into(),
-                    "Hidden data GET/bytes".into(),
-                    "Manifest GET/bytes".into(),
-                ],
-                rows: states
-                    .iter()
-                    .map(|state| {
-                        let warm_gets = state
-                            .warm_io
-                            .map(|io| io.get_count as f64 / ROUTING_STATE_WARM_ITERS as f64)
-                            .map(|gets| format!("{gets:.2}"))
-                            .unwrap_or_else(|| "N/A".into());
-                        let cold_open = state
-                            .cold
-                            .map(|cold| {
-                                format!(
-                                    "{} / {}",
-                                    cold.split.open.get_count,
-                                    rss::fmt_bytes(cold.split.open.get_bytes)
-                                )
-                            })
-                            .unwrap_or_else(|| "N/A".into());
-                        let cold_query = state.cold.map(|cold| cold.split.first_query);
-                        vec![
-                            text(state.label),
-                            text(state.expected.label()),
-                            text(state.recall.clone().unwrap_or_else(|| "N/A".into())),
-                            text(
-                                state
-                                    .warm_p50_ns
-                                    .map(fmt_time)
-                                    .unwrap_or_else(|| "N/A".into()),
-                            ),
-                            text(warm_gets),
-                            text(cold_open),
-                            text(
-                                cold_query
-                                    .map(|io| {
-                                        class_gets(io, storage_meter::UriClass::UserData)
-                                    })
-                                    .unwrap_or_else(|| "N/A".into()),
-                            ),
-                            text(
-                                cold_query
-                                    .map(|io| {
-                                        class_gets(io, storage_meter::UriClass::HiddenData)
-                                    })
-                                    .unwrap_or_else(|| "N/A".into()),
-                            ),
-                            text(
-                                cold_query
-                                    .map(manifest_gets)
-                                    .unwrap_or_else(|| "N/A".into()),
-                            ),
-                        ]
-                    })
-                    .collect(),
-            }],
-        });
+            "Recall@10",
+            states,
+        );
     }
 
     fn emit_transitions(report: &mut Report, n_docs: usize, transitions: &[TransitionStat]) {
-        report.emit(&Section {
-            anchor: "bench/vector/supertable/transitions".into(),
-            title: format!(
+        super::emit_transitions_with(
+            report,
+            "bench/vector/supertable/transitions",
+            format!(
                 "Supertable vector — lifecycle transitions ({} base docs × dim={})",
                 fmt_count(n_docs),
                 DIM
             ),
-            note: "Every mutation between query-state rows is reported here. Request and byte counts are measured over the transition itself; no query traffic is mixed into these windows.".into(),
-            blocks: vec![Block {
-                subtitle: String::new(),
-                headers: vec![
-                    "Transition".into(),
-                    "Wall".into(),
-                    "PUT".into(),
-                    "Uploaded".into(),
-                    "GET".into(),
-                    "Downloaded".into(),
-                    "HEAD".into(),
-                    "Peak RSS".into(),
-                ],
-                rows: transitions
-                    .iter()
-                    .map(|transition| {
-                        let io = transition.io;
-                        vec![
-                            text(transition.label),
-                            text(fmt_time(transition.wall_ns)),
-                            text(
-                                io.map(|value| value.put_count.to_string())
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                            text(
-                                io.map(|value| rss::fmt_bytes(value.put_bytes))
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                            text(
-                                io.map(|value| value.get_count.to_string())
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                            text(
-                                io.map(|value| rss::fmt_bytes(value.get_bytes))
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                            text(
-                                io.map(|value| value.head_count.to_string())
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                            text(
-                                transition
-                                    .peak_rss_bytes
-                                    .map(rss::fmt_bytes)
-                                    .unwrap_or_else(|| "NOT METERED".into()),
-                            ),
-                        ]
-                    })
-                    .collect(),
-            }],
-        });
+            transitions,
+        );
     }
 
     fn routing_cold_to_measurement(cold: RoutingColdStat) -> ColdStoreMeasurement {
@@ -2936,39 +3382,6 @@ pub mod vector {
             second_wall_s: cold.second_wall_s,
             second_cpu_s: cold.second_cpu_s,
         }
-    }
-
-    fn query_state_costs(states: &[RoutingStateStat]) -> [cost::QueryStateCost; 4] {
-        let mut out = [cost::QueryStateCost::default(); 4];
-        for (slot, state) in out.iter_mut().zip(states) {
-            let cold = state.cold;
-            *slot = cost::QueryStateCost {
-                io: cost::QueryStateIo {
-                    label: Some(state.label),
-                    cold_open: cold.map(|value| value.split.open),
-                    cold_query: cold.map(|value| value.split.first_query),
-                    cold_second: cold.map(|value| value.split.second_query),
-                    cold_repeat: cold.map(|value| value.split.repeat_query),
-                    warm: state.warm_io,
-                    warm_iters: state
-                        .warm_io
-                        .map(|_| ROUTING_STATE_WARM_ITERS as u64)
-                        .unwrap_or(0),
-                },
-                warm_p50_s: state.warm_p50_ns.map(|ns| ns / 1e9),
-                warm_cpu_s: state.warm_cpu_s,
-                ram_bytes: state.ram_bytes,
-                ram_anon_bytes: state.ram_anon_bytes,
-                ram_file_settled_bytes: state.ram_file_settled_bytes,
-                cold_open_s: cold.map(|value| value.open_wall_s),
-                cold_open_cpu_s: cold.and_then(|value| value.open_cpu_s),
-                cold_query_s: cold.map(|value| value.query_wall_s),
-                cold_query_cpu_s: cold.and_then(|value| value.query_cpu_s),
-                cold_second_s: cold.map(|value| value.second_wall_s),
-                cold_second_cpu_s: cold.and_then(|value| value.second_cpu_s),
-            };
-        }
-        out
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
@@ -2990,10 +3403,36 @@ pub mod vector {
         // gate are forced off below and queries are corpus-free.
         let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
 
-        // Always prepare the corpus for vector benches so recall is always
-        // measurable (including existing-prefix runs).
+        // On a reopen (existing prefix) with a persisted oracle bin, load the
+        // held-out queries + exact labels straight from the bin and skip the
+        // corpus entirely: the bin already holds both, so regenerating the
+        // (potentially ~400 GB) corpus solely to rebuild the query vectors is
+        // pure waste. Fresh ingest / dataset / bin-less reopen still prepare it.
+        let reopen_oracle = if existing.is_some() && (phases.warm || phases.cold) {
+            corpus::grading::oracle_path()
+                .filter(|path| path.exists())
+                .map(|path| {
+                    let oracle = corpus::grading::load_oracle(&path).unwrap_or_else(|error| {
+                        panic!("failed to load oracle bin {}: {error}", path.display())
+                    });
+                    eprintln!(
+                        "[vector reopen] loaded {} queries + labels from oracle bin {}; \
+                         skipping corpus regeneration",
+                        oracle.queries.len(),
+                        path.display()
+                    );
+                    oracle
+                })
+        } else {
+            None
+        };
+
         crate::rss::log_rss_breakdown("supertable_vector before corpus prepare");
-        let mut corpus = Some(supertable::prepare_corpus(Modality::Vector));
+        let mut corpus = if reopen_oracle.is_some() {
+            None
+        } else {
+            Some(supertable::prepare_corpus(Modality::Vector))
+        };
         crate::rss::log_rss_breakdown("supertable_vector after corpus prepare");
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
@@ -3038,69 +3477,97 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
-                let corpus = corpus
-                    .as_ref()
-                    .expect("vector benches always prepare a corpus");
-                // The ingested vectors are still mmapped from the prepared
-                // corpus — queries and ground truth come from them instead
-                // of a regeneration. Skip-calibration still computes
-                // correctness/default recall (and filtered recall); it only
-                // skips the recall-target calibration sweep.
-                let vslice = corpus
-                    .vectors()
-                    .expect("vector modality prepared a vector corpus")
-                    .as_slice();
-                let base_vectors = &vslice[..n_docs * DIM];
-                let q_correct = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CORRECTNESS_QUERIES,
-                    QUERY_CORRECTNESS_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let q_cal = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CALIBRATION_QUERIES,
-                    QUERY_CALIBRATION_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let augmented_docs = n_docs + supertable::docs_per_commit();
-                let all_queries: Vec<Vec<f32>> = if skip_cal {
-                    q_correct.clone()
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) =
+                if let Some(oracle) = reopen_oracle {
+                    // Reopen: queries + exact labels came straight from the
+                    // persisted oracle bin, so no corpus was prepared. Split the
+                    // combined query/label sets at the correctness boundary exactly
+                    // as the corpus path does below.
+                    let corpus::grading::CachedOracle {
+                        mut queries,
+                        mut labels,
+                        n_docs: oracle_docs,
+                        top_k: oracle_top_k,
+                        correctness_query_count,
+                    } = oracle;
+                    assert_eq!(
+                        oracle_docs, n_docs,
+                        "oracle bin n_docs does not match the reopened table"
+                    );
+                    assert_eq!(oracle_top_k, TOP_K, "oracle bin top_k mismatch");
+                    let q_cal = queries.split_off(correctness_query_count);
+                    let gt_cal = labels.base.split_off(correctness_query_count);
+                    (
+                        queries,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 } else {
-                    q_correct.iter().chain(&q_cal).cloned().collect()
-                };
-                let mut labels = corpus::grading::lifecycle_ground_truth_cached(
-                    corpus::grading::LifecycleGradingOptions {
-                        vectors: vslice,
+                    let corpus = corpus
+                        .as_ref()
+                        .expect("vector benches always prepare a corpus");
+                    // The ingested vectors are still mmapped from the prepared
+                    // corpus — queries and ground truth come from them instead
+                    // of a regeneration. Skip-calibration still computes
+                    // correctness/default recall (and filtered recall); it only
+                    // skips the recall-target calibration sweep.
+                    let vslice = corpus
+                        .vectors()
+                        .expect("vector modality prepared a vector corpus")
+                        .as_slice();
+                    let base_vectors = &vslice[..n_docs * DIM];
+                    let q_correct = corpus::generate_realistic_queries(
+                        base_vectors,
                         n_docs,
-                        augmented_docs,
-                        corpus_seed: supertable::CORPUS_VEC_SEED,
-                        normalized_vectors: true,
-                        filter_keep_every: FILTER_KEEP_EVERY,
-                        top_k: TOP_K,
-                        correctness_query_count: q_correct.len(),
-                        queries: &all_queries,
-                    },
-                );
-                let gt_cal = if skip_cal {
-                    Vec::new()
-                } else {
-                    labels.base.split_off(q_correct.len())
+                        N_CORRECTNESS_QUERIES,
+                        QUERY_CORRECTNESS_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let q_cal = corpus::generate_realistic_queries(
+                        base_vectors,
+                        n_docs,
+                        N_CALIBRATION_QUERIES,
+                        QUERY_CALIBRATION_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let augmented_docs = n_docs + supertable::docs_per_commit();
+                    let all_queries: Vec<Vec<f32>> = if skip_cal {
+                        q_correct.clone()
+                    } else {
+                        q_correct.iter().chain(&q_cal).cloned().collect()
+                    };
+                    let mut labels = corpus::grading::lifecycle_ground_truth_cached(
+                        corpus::grading::LifecycleGradingOptions {
+                            vectors: vslice,
+                            n_docs,
+                            augmented_docs,
+                            corpus_seed: supertable::CORPUS_VEC_SEED,
+                            normalized_vectors: true,
+                            filter_keep_every: FILTER_KEEP_EVERY,
+                            top_k: TOP_K,
+                            correctness_query_count: q_correct.len(),
+                            queries: &all_queries,
+                        },
+                    );
+                    let gt_cal = if skip_cal {
+                        Vec::new()
+                    } else {
+                        labels.base.split_off(q_correct.len())
+                    };
+                    (
+                        q_correct,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 };
-                (
-                    q_correct,
-                    q_cal,
-                    labels.base,
-                    gt_cal,
-                    Some(labels.filtered),
-                    labels.augmented,
-                )
-            };
             // Queries + ground truth extracted. Keep the mapping for the
             // normal follow-up commit, but evict its pages while measuring
             // pre/post-drain search.
@@ -3405,7 +3872,7 @@ pub mod vector {
             if phases.warm
                 && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                let consumer_reader = consumer.reader();
+                let consumer_reader = consumer.reader().expect("reader");
                 let mut allow_stable_ids: Vec<i128> = id_to_dense
                     .iter()
                     .filter_map(|(stable_id, dense_id)| {
@@ -3575,13 +4042,160 @@ pub mod vector {
                 }
             }
 
+            // The PUBLIC predicate-filtered path: `vector_search` with a real
+            // `VectorFilter`, which resolves the predicate (one `token_match`
+            // per surviving superfile) on EVERY call. The prepared-allow-set
+            // table above hoists exactly that step out of its timed window, so
+            // its p50 omits it; this measures the end-to-end cost a caller
+            // actually pays. Needs a table with both an FTS column and a
+            // vector column — `Modality::Combined` already is one (the
+            // vector-only table the rest of this file measures has no text
+            // column to filter on), so no new corpus or schema shape is
+            // introduced here.
+            if phases.warm {
+                let rep = exec_fts::FTS_BATTERY
+                    .iter()
+                    .find(|q| q.name == "single_rare")
+                    .expect("battery keeps its rare-term representative");
+                let filter_query = rep.terms.join(" ");
+                let filter_mode = exec_fts::to_infino_mode(rep.mode);
+
+                let combined_corpus = supertable::prepare_corpus(Modality::Combined);
+                let combined_built =
+                    supertable::build_on_storage(Modality::Combined, &combined_corpus);
+                let (_combined_cache_dir, combined_consumer) =
+                    open_consumer(Modality::Combined, &combined_built);
+                // Post-drain, matching every other search number in this file.
+                drain_hidden_incoming(&combined_consumer);
+                let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
+                let combined_reader = combined_consumer.reader().expect("reader");
+
+                // Allow-set = the ENGINE's own `token_match` over the same
+                // column/term/mode the filter carries — the identical
+                // resolution the filtered kNN runs internally, so the graded
+                // ground truth and the measured path agree by construction.
+                let matched_hits = combined_reader
+                    .token_match(supertable::TEXT_COLUMN, &filter_query, filter_mode)
+                    .expect("filter predicate token_match");
+                let mut allow = RoaringBitmap::new();
+                for (dense, _) in
+                    hits_to_dense_u32(&combined_consumer, &combined_ids, &matched_hits)
+                {
+                    allow.insert(dense);
+                }
+                let matched = allow.len();
+                let selectivity = matched as f64 / n_docs.max(1) as f64;
+
+                let combined_vectors = combined_corpus
+                    .vectors()
+                    .expect("combined corpus carries vectors");
+                let vslice = &combined_vectors.as_slice()[..n_docs * DIM];
+                let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
+
+                let filter = || VectorFilter {
+                    column: supertable::TEXT_COLUMN,
+                    query: filter_query.as_str(),
+                    mode: filter_mode,
+                };
+                let run_query = |q: &Vec<f32>| {
+                    combined_reader
+                        .vector_search(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::default_search_opts(),
+                            Some(filter()),
+                            None,
+                        )
+                        .expect("predicate-filtered vector_search")
+                };
+                // Untimed prewarm, matching the table above.
+                for q in q_correct.iter() {
+                    let _ = run_query(q);
+                }
+                let mut recalls = Vec::with_capacity(q_correct.len());
+                let mut latencies = Vec::with_capacity(q_correct.len());
+                for (q, truth) in q_correct.iter().zip(&gt) {
+                    let t0 = Instant::now();
+                    let batches = run_query(q);
+                    latencies.push(t0.elapsed());
+                    // Stable `_id`s straight off the public projection,
+                    // mapped through the engine's own id ordering.
+                    let hits: Vec<(u32, f32)> = corpus::id_scores_from_vector_search(&batches)
+                        .into_iter()
+                        .filter_map(|(id, score)| {
+                            combined_ids.get(&id).copied().map(|dense| (dense, score))
+                        })
+                        .collect();
+                    recalls.push(corpus::recall_at_k(&hits, truth));
+                }
+                if !recalls.is_empty() {
+                    let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+                    latencies.sort_unstable();
+                    let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                    eprintln!(
+                        "[supertable_vector] predicate-filtered ({}, {matched} of {} rows = \
+                         {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms",
+                        rep.name,
+                        fmt_count(n_docs),
+                        selectivity * 100.0,
+                        p50_ns / 1e6,
+                    );
+                    report.emit(&Section {
+                        anchor: "bench/vector/supertable/filtered-predicate".into(),
+                        title: format!(
+                            "Supertable vector — predicate-filtered search ({} docs × dim={})",
+                            fmt_count(n_docs),
+                            DIM
+                        ),
+                        note: format!(
+                            "The PUBLIC filtered path: `vector_search` with a real \
+                             `VectorFilter{{column,query,mode}}` over a `Modality::Combined` \
+                             table, resolved fresh on every call — so unlike the \
+                             prepared-allow-set table above, the timed window INCLUDES the \
+                             predicate resolution (`token_match` per surviving superfile) a \
+                             caller pays. Predicate is the `{}` battery term over `{}`, \
+                             matching {matched} of {} rows as measured (no target selectivity \
+                             is engineered). Δ is vs the previous run.",
+                            rep.name,
+                            supertable::TEXT_COLUMN,
+                            fmt_count(n_docs),
+                        ),
+                        blocks: vec![Block {
+                            subtitle: String::new(),
+                            headers: vec![
+                                "Filter".into(),
+                                "Requested".into(),
+                                "selectivity".into(),
+                                "recall@10".into(),
+                                "p50".into(),
+                            ],
+                            rows: vec![vec![
+                                text(format!(
+                                    "VectorFilter: {} = {filter_query:?}",
+                                    supertable::TEXT_COLUMN
+                                )),
+                                text("engine default"),
+                                text(format!("{:.2}%", selectivity * 100.0)),
+                                text(format!("{mean_recall:.3}")),
+                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                            ]],
+                        }],
+                    });
+                }
+                drop(combined_consumer);
+                if let Some(cleanup) = &combined_built.cleanup {
+                    tiers::cleanup_prefix(cleanup);
+                }
+            }
+
             if phases.warm || phases.cold {
                 // Steady-state warm I/O: replay the correctness queries on
                 // the shared, cache-hot consumer — the same consumer the
                 // warm latency battery timed — so the ledger's warm GET/query
                 // and the compute ledger's warm CPU describe one path.
                 let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
-                    let reader = consumer.reader();
+                    let reader = consumer.reader().expect("reader");
                     // Untimed prewarm: fault each query's routed cells into the
                     // resident cache first, so the metered pass below reflects
                     // steady-state warm I/O (0 GET when the working set fits the
@@ -3859,15 +4473,31 @@ pub mod vector {
                     phases
                         .cold
                         .then(|| {
+                            // Latency probe only (not graded); a skip-calibration
+                            // reopen loads no calibration queries, so q_cal is
+                            // empty there -- fall back to the correctness set.
+                            let (cold_probe, cold_rest): (&Vec<f32>, &[Vec<f32>]) =
+                                match q_cal.first() {
+                                    Some(first) => (
+                                        first,
+                                        if q_cal.len() > 1 {
+                                            &q_cal[1..]
+                                        } else {
+                                            &q_cal[..]
+                                        },
+                                    ),
+                                    None => (
+                                        q_correct
+                                            .first()
+                                            .expect("correctness query set is non-empty"),
+                                        &q_correct[1..],
+                                    ),
+                                };
                             measure_cold_store(
                                 "steady-state",
                                 &built,
-                                &q_cal[0],
-                                if q_cal.len() > 1 {
-                                    &q_cal[1..]
-                                } else {
-                                    &q_cal[..]
-                                },
+                                cold_probe,
+                                cold_rest,
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
@@ -3931,6 +4561,9 @@ pub mod vector {
                     true,
                     store,
                     Some(bucket_stored),
+                    // Vector keeps its single-config per-lifecycle-state
+                    // serving rows (one search config, not a query battery).
+                    None,
                 );
             }
 
@@ -3948,6 +4581,8 @@ pub mod vector {
 }
 
 pub mod sql {
+    use std::hint::black_box;
+
     use super::*;
     use crate::{
         executors::{sql as exec_sql, sql::SqlRead},
@@ -3964,7 +4599,16 @@ pub mod sql {
 
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_sql");
-        let (built, ingest_metrics) = build_or_open(Modality::Sql, phases);
+
+        // Fresh ingest retains the text corpus for the undrained delta commit.
+        let (built, ingest_metrics, mut corpus) = if crate::dataset::dataset_mode() && !phases.build
+        {
+            (supertable::open_dataset(Modality::Sql), None, None)
+        } else {
+            let corpus = supertable::prepare_corpus(Modality::Sql);
+            let (built, metrics) = build_measured(Modality::Sql, &corpus, phases);
+            (built, metrics, Some(corpus))
+        };
         if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/sql/supertable/ingest".into(),
@@ -3993,11 +4637,27 @@ pub mod sql {
                 .sql_sample_key
                 .clone()
                 .expect("sql ingest sets sample_key"),
+            n_docs,
         };
 
-        // Optimize + post-compact only on a fresh ingest in this process —
-        // same gate as FTS.
-        let run_optimize = ingest_metrics.is_some() && (phases.warm || phases.cold);
+        // Cold battery: realistic row-returning WHERE scans (shared with the
+        // warm scan block so warm/cold reconcile), two scan-backed aggregates
+        // (a full-scan metric and the boundary window — the real cold
+        // aggregation cost: column-chunk GETs), plus COUNT(*) kept as the
+        // explicit manifest-answered contrast (a fold, ~zero data GETs).
+        // Cold battery = the COMPLETE warm battery, so warm and cold sides of
+        // every shape land in one table. The manifest-answered aggregates are
+        // the labelled ~0-GET contrast rows; the scan-backed shapes pay real
+        // cold column-chunk fetches.
+        let full_qs = exec_sql::full_battery(&inputs);
+        let cold_battery: Vec<(&'static str, &str)> =
+            full_qs.iter().map(|(n, s)| (*n, s.as_str())).collect();
+
+        // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
+        // → compact → post-compact) on a fresh ingest in this process —
+        // same gate as FTS/vector. Drain is a no-op without a hidden
+        // vector index but is still metered for phase parity.
+        let run_lifecycle = ingest_metrics.is_some() && (phases.warm || phases.cold);
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
@@ -4007,6 +4667,8 @@ pub mod sql {
         }
 
         // Pre-compact (or sole) warm/cold on the post-ingest layout.
+        // (SQL scans never route to hidden data — the only meaningful
+        // layout transition for the scan path is compaction.)
         let warm_sets_pre = if phases.warm {
             eprintln!("[supertable_sql] warm (pre-compact): opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
@@ -4019,116 +4681,136 @@ pub mod sql {
             );
             drop(consumer);
             drop(cache_dir);
-            let (anchor, title, note) = if run_optimize {
-                (
-                    "bench/sql/supertable/warm-pre-compact",
-                    format!(
-                        "Supertable SQL — warm queries pre-compact, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Pre-compact (post-ingest fanout): each query once untimed (cache fill), then p50 / p90 / p99. Δ vs previous run.",
-                )
-            } else {
-                (
-                    "bench/sql/supertable/warm",
-                    format!(
-                        "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then p50 / p90 / p99 over repeated `query_sql` calls (Δ gates on `p50`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
-                )
-            };
-            exec_sql::emit_query(&mut report, anchor, title, note, &sets);
             Some(sets)
         } else {
             None
         };
 
-        let cold_pre = if phases.cold {
-            let cold = exec_sql::measure_cold(
+        let cold_pre = phases.cold.then(|| {
+            exec_sql::measure_cold(
                 || SupertableSqlColdGuard::open(&built),
+                &cold_battery,
                 COLD_ITERS,
                 "supertable_sql",
+            )
+        });
+        if let Some(sets) = &warm_sets_pre {
+            let (anchor, title, note) = if run_lifecycle {
+                (
+                    "bench/sql/supertable/queries/pre-compact",
+                    format!(
+                        "Supertable SQL — queries + cost, pre-compact / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Pre-compact (post-ingest fanout), warm + cold per shape in one table. Warm = warm cache, p50/p90/p99 over repeated `query_sql`; cold = fresh cache + consumer per iteration (open = construct only, search = first query). $/1M = compute + object-store requests + egress on the returned payload. Manifest-answered aggregates fold from statistics (~0 cold GETs) — the labelled fast-path contrast to the scan-backed shapes. Δ gates on warm/cold p50.",
+                )
+            } else {
+                (
+                    "bench/sql/supertable/queries",
+                    format!(
+                        "Supertable SQL — queries + cost / object-store ({} rows)",
+                        fmt_count(n_docs)
+                    ),
+                    "Warm + cold per shape in one table (warm cache p50/p90/p99; cold = fresh cache per iteration). $/1M = compute + requests + egress on the returned payload. Δ gates on warm/cold p50.",
+                )
+            };
+            exec_sql::emit_query(&mut report, anchor, title, note, sets, cold_pre.as_ref());
+        }
+
+        let mut compaction_stats = None;
+        let mut routing_states: Vec<RoutingStateStat> = Vec::new();
+        let (warm_sets_post, cold_post) = if run_lifecycle {
+            let mut warm_sets_post = None;
+            let mut cold_post = None;
+            // SQL scans never route to hidden data and the scalar/FTS path
+            // has no drain; the lifecycle is compaction-only, measuring just
+            // pre-compact and post-compact and emitting only the post-compact
+            // query battery (pre-compact already ran).
+            let compaction = run_metered_text_lifecycle(
+                "supertable_sql",
+                Modality::Sql,
+                &built,
+                |phase, lifecycle_consumer, lifecycle_meter| {
+                    let label = match phase {
+                        TextLifecyclePhase::PreCompact => "pre-compact",
+                        TextLifecyclePhase::Compacted => "post-compact",
+                    };
+                    routing_states.push(sql_routing_state(
+                        label,
+                        lifecycle_consumer,
+                        lifecycle_meter,
+                        &built,
+                    ));
+                    if !matches!(phase, TextLifecyclePhase::Compacted) {
+                        return;
+                    }
+                    let warm = if phases.warm {
+                        eprintln!("[supertable_sql] warm (post-compact): opening consumer...");
+                        let (cache_dir, c) = open_consumer(Modality::Sql, &built);
+                        let sets = exec_sql::measure_query_sets(
+                            &c,
+                            &inputs,
+                            exec_sql::ITERS,
+                            "supertable_sql",
+                            &[],
+                        );
+                        drop(c);
+                        drop(cache_dir);
+                        Some(sets)
+                    } else {
+                        None
+                    };
+                    let cold = phases.cold.then(|| {
+                        exec_sql::measure_cold(
+                            || SupertableSqlColdGuard::open(&built),
+                            &cold_battery,
+                            COLD_ITERS,
+                            "supertable_sql",
+                        )
+                    });
+                    if let Some(sets) = &warm {
+                        exec_sql::emit_query(
+                            &mut report,
+                            "bench/sql/supertable/queries/post-compact",
+                            format!(
+                                "Supertable SQL — queries + cost, post-compact / object-store ({} rows)",
+                                fmt_count(n_docs)
+                            ),
+                            "Post-compact (after optimize): fewer, larger user superfiles — the steady-state layout the cost model prices. Warm + cold per shape in one table; $/1M = compute + requests + egress on the returned payload. Δ vs previous run.",
+                            sets,
+                            cold.as_ref(),
+                        );
+                    }
+                    warm_sets_post = warm;
+                    cold_post = cold;
+                },
             );
-            let (anchor, title, note) = if run_optimize {
-                (
-                    "bench/sql/supertable/cold-pre-compact",
-                    format!(
-                        "Supertable SQL — cold queries pre-compact, fresh cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. Δ vs previous run.",
-                )
-            } else {
-                (
-                    "bench/sql/supertable/cold",
-                    format!(
-                        "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
-                )
-            };
-            exec_sql::emit_cold(&mut report, anchor, title, note, &cold);
-            Some(cold)
-        } else {
-            None
-        };
-
-        let compaction_stats =
-            run_optimize.then(|| optimize_built_table("supertable_sql", Modality::Sql, &built));
-
-        let (warm_sets_post, cold_post) = if run_optimize {
-            let warm_sets_post = if phases.warm {
-                eprintln!("[supertable_sql] warm (post-compact): opening consumer...");
-                let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-                let sets = exec_sql::measure_query_sets(
-                    &consumer,
-                    &inputs,
-                    exec_sql::ITERS,
-                    "supertable_sql",
-                    &[],
-                );
-                drop(consumer);
-                drop(cache_dir);
-                exec_sql::emit_query(
-                    &mut report,
-                    "bench/sql/supertable/warm-post-compact",
-                    format!(
-                        "Supertable SQL — warm queries post-compact, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact (after optimize): fewer superfiles; same warm recipe. Steady-state layout for the cost model. Δ vs previous run.",
-                    &sets,
-                );
-                Some(sets)
-            } else {
-                None
-            };
-            let cold_post = if phases.cold {
-                let cold = exec_sql::measure_cold(
-                    || SupertableSqlColdGuard::open(&built),
-                    COLD_ITERS,
-                    "supertable_sql",
-                );
-                exec_sql::emit_cold(
-                    &mut report,
-                    "bench/sql/supertable/cold-post-compact",
-                    format!(
-                        "Supertable SQL — cold queries post-compact, fresh cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
-                    &cold,
-                );
-                Some(cold)
-            } else {
-                None
-            };
+            drop(corpus.take());
+            compaction_stats = Some(compaction);
             (warm_sets_post, cold_post)
         } else {
+            drop(corpus.take());
             (None, None)
         };
+        if !routing_states.is_empty() {
+            emit_routing_states_with(
+                &mut report,
+                "bench/sql/supertable/routing-states",
+                format!(
+                    "Supertable SQL — pre-compact vs post-compact ({} rows)",
+                    fmt_count(n_docs)
+                ),
+                "Pre-compact vs post-compact on one warm cache. Warm p50 / warm GET/query are \
+                 the manifest-answered filter_category_count (0 GET when the working set fits the \
+                 budget); the cold open / first-query GET+byte split is measured over the \
+                 row-returning WHERE scans (scan_battery: by-key point lookup first), which \
+                 actually scan and fetch. SQL never routes to hidden data on main, so every state \
+                 is user-tier."
+                    .into(),
+                "Rows (u/h)",
+                &routing_states,
+            );
+        }
 
         let warm_pre_vec = warm_sets_pre
             .as_ref()
@@ -4146,7 +4828,7 @@ pub mod sql {
             .as_ref()
             .map(cost::cold_from_timings)
             .unwrap_or_default();
-        let (warm_vec, cold_vec, pre_latencies) = if run_optimize {
+        let (warm_vec, cold_vec, pre_latencies) = if run_lifecycle {
             (
                 warm_post_vec.as_slice(),
                 cold_post_vec.as_slice(),
@@ -4156,6 +4838,55 @@ pub mod sql {
             (warm_pre_vec.as_slice(), cold_pre_vec.as_slice(), None)
         };
         let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
+        // Per-query-family serving groups built from the exact battery the
+        // warm search table measured — names come straight from the measured
+        // `QuerySets`, so every warm shape is priced (no hand-written name
+        // list to drift or drop shapes). Cold rows render only for families
+        // the cold battery covers (scalar).
+        let active_sets = if run_lifecycle {
+            warm_sets_post.as_ref()
+        } else {
+            warm_sets_pre.as_ref()
+        };
+        let names_of = |pick: fn(&exec_sql::QuerySets) -> &[exec_sql::SqlQueryStat]| -> Vec<&str> {
+            active_sets
+                .map(|s| pick(s).iter().map(|q| q.name).collect())
+                .unwrap_or_default()
+        };
+        let scalar_names = names_of(|s| &s.scalar);
+        let tvf_names = names_of(|s| &s.tvf);
+        let pushdown_names = names_of(|s| &s.fts_pushdown);
+        let agg_names = names_of(|s| &s.agg_idx);
+        let agg_scan_names = names_of(|s| &s.agg_scan);
+        // Families are cost-homogeneous classes: bulk row-set shapes (results
+        // scale with the match set, so GB-returned dominates their cost) are
+        // split from the bounded-result families — otherwise one 100+ MiB
+        // result drags a family's mean payload/egress into meaninglessness.
+        // The pure aggregates are labelled as manifest-answered so their
+        // near-free cost isn't mistaken for a scan.
+        let (bulk_scans, lookup_names): (Vec<&str>, Vec<&str>) = pushdown_names
+            .iter()
+            .copied()
+            .partition(|n| exec_sql::is_bulk_shape(n));
+        let (bulk_tvfs, tvf_idscore_names): (Vec<&str>, Vec<&str>) = tvf_names
+            .iter()
+            .copied()
+            .partition(|n| exec_sql::is_bulk_shape(n));
+        let bulk_names: Vec<&str> = bulk_scans.into_iter().chain(bulk_tvfs).collect();
+        let sql_groups: [(&str, &[&str]); 6] = [
+            (
+                "Retrieval — point lookups (top-k rows)",
+                lookup_names.as_slice(),
+            ),
+            ("Aggregate over candidates", agg_names.as_slice()),
+            ("Aggregates — scan-backed", agg_scan_names.as_slice()),
+            ("Search TVFs (id+score)", tvf_idscore_names.as_slice()),
+            (
+                "Analytics — manifest-answered (no scan)",
+                scalar_names.as_slice(),
+            ),
+            ("Bulk row sets (GB-returned)", bulk_names.as_slice()),
+        ];
         if !warm_vec.is_empty() || !cold_vec.is_empty() {
             emit_cost_warm(
                 &mut report,
@@ -4167,9 +4898,14 @@ pub mod sql {
                 warm_vec,
                 (!cold_vec.is_empty()).then_some(cold_vec),
                 pre_latencies,
+                // Compaction-only text lifecycle: not a full-maintenance
+                // (drain/delta) cell, so drain/delta ledger rows never render.
                 false,
-                store_phases_with_compaction(cold_measured, compaction_stats),
+                store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
                 None,
+                // Serving/monthly priced per query-family from the full warm
+                // battery the search table reports (all shapes, not one).
+                Some(&sql_groups),
             );
         }
 
@@ -4179,6 +4915,56 @@ pub mod sql {
             eprintln!("[supertable_sql] cleaning up object-store prefix...");
             tiers::cleanup_prefix(cleanup);
         }
+    }
+
+    /// One routing-state measurement for the SQL lifecycle. SQL never
+    /// reads hidden data on main (`UserOnly` in every state); the warm
+    /// window and cold split come from the shared framework, and the
+    /// hit-tier stub reports the filtered-count cardinality as user
+    /// rows. Cold metering rendered without gating (no calibrated main
+    /// ceilings).
+    fn sql_routing_state(
+        label: &'static str,
+        consumer: &Supertable,
+        consumer_meter: &storage_meter::MeteredStorage,
+        built: &supertable::IngestResult,
+    ) -> RoutingStateStat {
+        let rep = exec_sql::SQL_BATTERY
+            .iter()
+            .find(|q| q.name == "filter_category_count")
+            .expect("battery keeps its filtered-count representative");
+        let reader = consumer.reader().expect("reader");
+        super::measure_routing_state_with(
+            "supertable_sql",
+            label,
+            ExpectedTiers::UserOnly,
+            None,
+            consumer_meter,
+            &|| {
+                let rows: usize = reader
+                    .query_sql(rep.sql)
+                    .expect("routing-state sql query")
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum();
+                HitTierStats {
+                    user_hits: rows.max(1),
+                    hidden_hits: 0,
+                }
+            },
+            &|| {
+                black_box(reader.query_sql(rep.sql).expect("routing-state warm sql"));
+            },
+            &|| {
+                consumer
+                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .expect("routing-state fill settle");
+            },
+            &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
+            true,
+            true,
+            None,
+        )
     }
 
     /// One metered cold `query_sql` consumer for the cost model: true cold
@@ -4194,20 +4980,14 @@ pub mod sql {
     fn measure_cold_store(built: &supertable::IngestResult) -> Option<ColdStoreMeasurement> {
         let sample_title = built.sql_sample_title.as_deref()?;
         let sample_key = built.sql_sample_key.as_deref()?;
-        // Ingest already escapes titles; escape again at the format site so a
-        // non-escaped caller cannot break the SQL string literal.
-        let sample_title = sample_title.replace('\'', "''");
-        let sample_key = sample_key.replace('\'', "''");
-        // Same shapes as warm `fts_pushdown` / filter projections: must
-        // scan row data, so first/steady cold windows accrue real GETs.
-        let first = format!("SELECT key FROM supertable WHERE key = '{sample_key}'");
-        // Steady predicates must hit the ingest sample row on every corpus;
-        // hard-coded category/rating filters can legitimately return zero.
-        let steady = [
-            format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
-            format!("SELECT key FROM supertable WHERE title = '{sample_title}'"),
-            format!("SELECT title FROM supertable WHERE key = '{sample_key}'"),
-        ];
+        // Probe the SAME realistic row-returning WHERE scans the cold battery
+        // and the serving cost use (`scan_battery`), so the I/O-ledger
+        // open/first/steady/repeat GET+fill rows describe the shapes the
+        // serving prices — not a separate point-lookup probe. `scan_battery`
+        // escapes the sample values itself; index 0 is the by-key point
+        // lookup, which returns the sample row.
+        let scan = exec_sql::scan_battery(sample_key, sample_title);
+        let first = scan[0].1.as_str();
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let measured = cold_store::measure_cold_store(
             &meter,
@@ -4224,25 +5004,28 @@ pub mod sql {
                 let consumer = tiers::open_consumer(opts);
                 (cache_dir, consumer)
             },
-            // `query_rows` already `.expect`s on plan/exec failure; require a
-            // non-empty hit so a wrong predicate cannot look like success.
+            // First/repeat probe the by-key point lookup, which returns the
+            // sample row — require a hit so a wrong predicate can't look like
+            // success (`query_rows` already `.expect`s on plan/exec failure).
             |(_cache, consumer)| {
                 assert!(
-                    consumer.query_rows(&first) > 0,
+                    consumer.query_rows(first) > 0,
                     "metered first cold SQL returned no rows: {first}"
                 );
             },
+            // Steady cycles the DISTINCT scans (skip scan[0], the first/repeat
+            // query) so every steady sample is a genuinely cold, distinct
+            // query — never a cache-warm re-run of the first that would drag
+            // the wall-median (and its GET count) down. The range predicate
+            // may legitimately match zero rows yet still scans row groups
+            // (real GETs), so it carries no non-empty assertion.
             |(_cache, consumer), i| {
-                let q = &steady[i % steady.len()];
-                assert!(
-                    consumer.query_rows(q) > 0,
-                    "metered steady cold SQL returned no rows: {q}"
-                );
+                let _ = consumer.query_rows(&scan[1 + (i % (scan.len() - 1))].1);
             },
-            steady.len().min(STEADY_COLD_SAMPLES),
+            (scan.len() - 1).min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
                 assert!(
-                    consumer.query_rows(&first) > 0,
+                    consumer.query_rows(first) > 0,
                     "metered repeat cold SQL returned no rows: {first}"
                 );
             },
@@ -4273,6 +5056,9 @@ pub mod sql {
     impl SqlRead for SupertableSqlColdGuard {
         fn query_rows(&self, sql: &str) -> usize {
             self.consumer.query_rows(sql)
+        }
+        fn query_payload(&self, sql: &str) -> (u64, u64) {
+            self.consumer.query_payload(sql)
         }
         fn query_count(&self, sql: &str) -> i64 {
             self.consumer.query_count(sql)

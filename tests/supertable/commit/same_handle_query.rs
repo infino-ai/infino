@@ -78,6 +78,7 @@ fn query_after_first_commit_on_same_handle_succeeds() {
 
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("same-handle query after first commit must resolve parts");
     assert_eq!(hits.len(), 1, "expected the one matching row");
@@ -113,6 +114,7 @@ fn query_after_second_commit_on_same_handle_succeeds() {
     // A term from the first commit (survives the part rewrite)...
     let old_hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("query for first-commit term");
     assert_eq!(
@@ -124,6 +126,7 @@ fn query_after_second_commit_on_same_handle_succeeds() {
     // ...and a term from the second commit.
     let new_hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "echo", BM25_TOP_K, BoolMode::Or)
         .expect("query for second-commit term");
     assert_eq!(new_hits.len(), 1, "second-commit row must be queryable");
@@ -155,6 +158,7 @@ fn same_handle_query_after_commit_refetches_no_manifest_parts() {
     let before = counter.part_gets();
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
         .expect("query");
     let after = counter.part_gets();
@@ -271,6 +275,7 @@ fn open_metadata_cost_is_fixed_and_reads_check_pointer_once_per_window() {
     for _ in 0..3 {
         let hits = st
             .reader()
+            .expect("reader")
             .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
             .expect("query");
         assert_eq!(hits.len(), 1);

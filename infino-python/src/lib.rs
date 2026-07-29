@@ -31,8 +31,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError, InfinoError as CoreError,
-    Metric, OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    VectorSearchOptions,
 };
 
 // Typed exception surface for the bindings. `InfinoError` is the base for every
@@ -64,6 +65,7 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::AlreadyExists(m)
         | CoreError::Schema(m)
         | CoreError::Cardinality(m)
+        | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
@@ -128,7 +130,8 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 // would just move the surface without simplifying the Python-facing signature.
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
-                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None))]
+                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None,
+                    api_key=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -138,6 +141,7 @@ fn connect(
     connection_memory_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
     validate: Option<bool>,
+    api_key: Option<String>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
@@ -170,6 +174,10 @@ fn connect(
             opts = opts.with_validate(v);
             has_options = true;
         }
+        if let Some(key) = api_key {
+            opts = opts.with_api_key(key);
+            has_options = true;
+        }
         // Preserve the plain `connect(uri)` path when no options are set.
         if has_options {
             infino::connect_with(uri, opts).map_err(py_err)
@@ -186,7 +194,8 @@ fn connect(
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    fts: Vec<String>,
+    /// `(column, analyzer)`; `analyzer` `None` means the default.
+    fts: Vec<(String, Option<String>)>,
     /// `(column, dim, n_cent, metric)`.
     vectors: Vec<(String, usize, usize, String)>,
 }
@@ -199,9 +208,13 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    fn fts(&self, column: String) -> Self {
+    /// `analyzer` selects the tokenizer: `"ascii_lower"` (default —
+    /// ASCII split + lowercase, non-ASCII dropped) or `"standard"` (the
+    /// Unicode-aware UAX #29 tokenizer that keeps non-ASCII text).
+    #[pyo3(signature = (column, analyzer = None))]
+    fn fts(&self, column: String, analyzer: Option<String>) -> Self {
         let mut next = self.clone();
-        next.fts.push(column);
+        next.fts.push((column, analyzer));
         next
     }
 
@@ -219,8 +232,11 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for column in &self.fts {
-            spec = spec.fts(column.clone());
+        for (column, analyzer) in &self.fts {
+            spec = match analyzer {
+                Some(a) => spec.fts_with_analyzer(column.clone(), a.clone()),
+                None => spec.fts(column.clone()),
+            };
         }
         for (column, dim, n_cent, metric) in &self.vectors {
             spec = spec.vector(column.clone(), *dim, *n_cent, metric_from_str(metric)?);
@@ -237,6 +253,14 @@ struct Connection {
 
 #[pymethods]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (raises if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    fn create_database(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.create_database()).map_err(py_err)
+    }
+
     /// Create a table from a pyarrow `Schema` and an `IndexSpec`.
     fn create_table(
         &self,
@@ -421,7 +445,15 @@ impl Table {
     ///
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vector_search`'s distance. Fuse with `hybrid_search`.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None))]
+    ///
+    /// `stats` selects the BM25 corpus statistics: `"per_superfile"`
+    /// (default) scores each segment against its own local document
+    /// count and term frequencies — fastest, but ranking drifts as the
+    /// table fragments across many segments. `"global"` scores against
+    /// table-wide statistics gathered across all segments, so a
+    /// fragmented table ranks like a single unified corpus (the accurate
+    /// choice) at the cost of an extra statistics-gathering pass.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None))]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -430,13 +462,16 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         projection: Option<Vec<String>>,
+        stats: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mode = parse_mode(mode)?;
+        let opts = Bm25SearchOptions::new()
+            .with_mode(parse_mode(mode)?)
+            .with_stats(parse_stats(stats)?);
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
                 self.inner
-                    .bm25_search(column, query, k, mode, names.as_deref())
+                    .bm25_search(column, query, k, opts, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -459,7 +494,11 @@ impl Table {
     /// query terms — a pushdown pre-filter, so kNN ranks only among the
     /// matching rows rather than post-filtering the global top-`k`.
     /// `filter_mode` is `"or"` (default) or `"and"`.
-    #[pyo3(signature = (column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
+    ///
+    /// `rerank_mult` sets how many coarse candidates are re-scored
+    /// exactly (`k * rerank_mult`) — the primary recall/latency lever.
+    /// Omitting it keeps the engine default.
+    #[pyo3(signature = (column, query, k, nprobe=None, rerank_mult=None, filter_column=None, filter_query=None, filter_mode=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn vector_search<'py>(
         &self,
@@ -468,6 +507,7 @@ impl Table {
         query: Vec<f32>,
         k: usize,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         filter_column: Option<String>,
         filter_query: Option<String>,
         filter_mode: Option<&str>,
@@ -476,6 +516,9 @@ impl Table {
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         // Optional text-predicate filter (pushdown). `filter_column` and
         // `filter_query` must be supplied together; `filter_mode` is only
@@ -575,12 +618,12 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
-    /// `vector_column` / `vector_query` (with optional `nprobe`) drive
-    /// vector kNN. `k` bounds each retriever and the fused result.
-    /// Returns a pyarrow `Table` like `bm25_search`, with `score` the
-    /// fused RRF score (higher is better); `projection` follows the same
-    /// rules.
-    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None))]
+    /// `vector_column` / `vector_query` (with optional `nprobe` and
+    /// `rerank_mult`) drive vector kNN. `k` bounds each retriever and the
+    /// fused result. Returns a pyarrow `Table` like `bm25_search`, with
+    /// `score` the fused RRF score (higher is better); `projection`
+    /// follows the same rules.
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, rerank_mult=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
     fn hybrid_search<'py>(
         &self,
@@ -592,12 +635,16 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         nprobe: Option<usize>,
+        rerank_mult: Option<usize>,
         projection: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mode = parse_mode(mode)?;
         let mut opts = VectorSearchOptions::new();
         if let Some(n) = nprobe {
             opts = opts.with_nprobe(n);
+        }
+        if let Some(n) = rerank_mult {
+            opts = opts.with_rerank_mult(n);
         }
         let batches = py
             .detach(|| {
@@ -732,6 +779,20 @@ fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
         "and" => Ok(BoolMode::And),
         other => Err(PyValueError::new_err(format!(
             "mode must be 'or' or 'and', got {other:?}"
+        ))),
+    }
+}
+
+fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
+    match stats
+        .unwrap_or("per_superfile")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
+        "global" => Ok(Bm25Stats::Global),
+        other => Err(PyValueError::new_err(format!(
+            "stats must be 'per_superfile' or 'global', got {other:?}"
         ))),
     }
 }

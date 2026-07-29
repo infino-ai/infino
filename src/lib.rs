@@ -146,9 +146,11 @@ pub use roaring;
 mod catalog;
 mod error;
 mod runtime_bridge;
-#[cfg(feature = "test-helpers")]
+// Process CPU / RSS samplers: benches use `test-helpers`; platform
+// Prometheus uses `metering`. Same module either way — no second copy.
+#[cfg(any(feature = "test-helpers", feature = "metering"))]
 pub mod runtime_metrics;
-#[cfg(not(feature = "test-helpers"))]
+#[cfg(not(any(feature = "test-helpers", feature = "metering")))]
 pub(crate) mod runtime_metrics;
 mod utils;
 
@@ -158,6 +160,12 @@ mod utils;
 /// Import as `infino::arrow_schema` and `infino::arrow_array`.
 pub use arrow_array;
 pub use arrow_schema;
+/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
+/// / `vector_search` / `schema`. The public handle is the catalog wrapper,
+/// which serves a local or a hosted table behind one type; the engine's
+/// concrete handle stays internal (reachable as `supertable::Supertable`
+/// only under `test-helpers`).
+pub use catalog::Supertable;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{ColdFetchMode, ConnectOptions, Connection, IndexSpec, connect, connect_with};
@@ -166,10 +174,10 @@ pub use config::{CompactionSettings, GcSettings, OptimizeOptions};
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
-pub use superfile::{fts::reader::BoolMode, vector::distance::Metric};
-/// Single-table handle: `append` / `update` / `delete` / `bm25_search`
-/// / `vector_search` / `schema`.
-pub use supertable::Supertable;
+pub use superfile::{
+    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+    vector::distance::Metric,
+};
 pub use supertable::{
     GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
 };

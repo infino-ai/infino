@@ -896,8 +896,8 @@ impl SuperfileReader {
 
     /// Single-column BM25 search across the unified FTS reader.
     ///
-    /// `query` is tokenized by the same v1 tokenizer used at build
-    /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
+    /// `query` is tokenized by the same tokenizer the column was built
+    /// with (its per-column analyzer). Returns `(local_doc_id, score)`
     /// hits ordered by descending score — this is the hit kernel, not a
     /// row-returning search; row materialization is `take_by_local_doc_ids`.
     ///
@@ -919,7 +919,15 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let tok = AsciiLowerTokenizer;
+        // Tokenize with the target column's configured tokenizer so
+        // query terms match how the column was indexed (ascii_lower /
+        // standard). Falls back to ascii_lower when there is no FTS
+        // index or column; the search then fails downstream as before.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
 
         // Split the query into clause lists and resolve the bare
         // tokens' polarity from the default operator. The parsed
@@ -946,6 +954,7 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
+                global_idf: None,
             },
             k,
             f32::NEG_INFINITY,
@@ -964,10 +973,10 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must be already lower-cased ASCII alphanumeric tokens
-    /// — the FST keys are stored in that form. Callers using the
-    /// v1 tokenizer can produce them via
-    /// `AsciiLowerTokenizer.tokenize(query)`.
+    /// Terms must already be tokenized to the column's FST key form —
+    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
+    /// column (already-lowercased ASCII alphanumerics) or
+    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
@@ -1075,6 +1084,17 @@ impl SuperfileReader {
         Ok(fts.term_df(column, token).await?)
     }
 
+    /// Document frequency of each of `tokens` in `column`, in input order
+    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
+    /// resolves the whole set with one FST parse and one coalesced header
+    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs(column, tokens).await?)
+    }
+
     /// Two-pass exact match of a **raw string** `value` against
     /// `column`'s stored values. The input is a raw string, **not**
     /// tokens — tokenization is used only to prune candidates, never as
@@ -1092,8 +1112,14 @@ impl SuperfileReader {
     /// only affects pruning, never the raw-string comparison.
     pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
-        // string's tokens (a superset of the exact matches).
-        let tokens: Vec<String> = AsciiLowerTokenizer.tokenize(value).collect();
+        // string's tokens (a superset of the exact matches). Tokenize
+        // with the column's configured tokenizer to match the index.
+        let tok: Arc<dyn Tokenizer> = self
+            .fts
+            .as_ref()
+            .and_then(|f| f.column_tokenizer(column).ok())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
+        let tokens: Vec<String> = tok.tokenize(value).collect();
         let candidates: Vec<u32> = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
             (0..self.n_docs() as u32).collect()
@@ -1218,6 +1244,7 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
+            None,
         )
         .await
     }
@@ -1232,6 +1259,7 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        global_idf: Option<&fts_reader::GlobalTermIdf>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
@@ -1244,6 +1272,7 @@ impl SuperfileReader {
                 doc_id_start,
                 doc_id_end,
                 floor,
+                global_idf,
             )
             .await?)
     }
@@ -1441,6 +1470,12 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
+    /// Diagnostic, bench/test builds only: when set, an explicit `nprobe`
+    /// widens the coarse cell probe on UNFILTERED hidden-indexed queries too.
+    /// Always `false` in production — the setter is `#[cfg(feature =
+    /// "test-helpers")]`, so it cannot be reached from the public API and the
+    /// serving path never sees it.
+    pub(crate) widen_unfiltered_hidden_cells: bool,
 }
 
 impl VectorSearchOptions {
@@ -1462,6 +1497,16 @@ impl VectorSearchOptions {
     /// the cost of more work.
     pub fn with_nprobe(mut self, n: usize) -> Self {
         self.nprobe = Some(n);
+        self
+    }
+
+    /// Diagnostic, bench/test builds only: let an explicit `nprobe` widen the
+    /// coarse cell probe on UNFILTERED hidden-indexed queries (used by the
+    /// recall breadth-sweep). Absent from production builds, so it never
+    /// affects the serving path.
+    #[cfg(feature = "test-helpers")]
+    pub fn widen_unfiltered_hidden_cells(mut self) -> Self {
+        self.widen_unfiltered_hidden_cells = true;
         self
     }
 
@@ -2220,6 +2265,7 @@ mod tests {
                 0,
                 4,
                 1e9,
+                None,
             )
             .await
             .expect("floored ranged search");

@@ -66,7 +66,7 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::tokenize::Tokenizer,
+        fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
         vector::layout::VectorLayout,
     },
     supertable::{
@@ -259,9 +259,14 @@ pub struct SupertableOptions {
     /// `FixedSizeList<Float32, dim>` with matching `list_size`.
     /// May be empty.
     pub vector_columns: Vec<VectorConfig>,
-    /// Shared tokenizer for all FTS columns. Required iff
-    /// `fts_columns` is non-empty.
+    /// Default tokenizer, required iff `fts_columns` is non-empty. Used
+    /// as the per-column default when `fts_tokenizers` is not overridden.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// Per-column tokenizers, aligned to `fts_columns` (one per FTS
+    /// column). Defaults in [`Self::new`] to `tokenizer` applied to
+    /// every column; [`Self::with_fts_tokenizers`] sets per-column
+    /// analyzers (per-field analysis).
+    pub fts_tokenizers: Vec<Arc<dyn Tokenizer>>,
     /// Pool used by reader fan-out (skip + per-superfile fan-out +
     /// top-k merge). Default: every logical core.
     pub reader_pool: Arc<ThreadPool>,
@@ -617,12 +622,21 @@ impl SupertableOptions {
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
+        // Default per-column tokenizers: the single tokenizer applied to
+        // every FTS column. `with_fts_tokenizers` overrides for per-field
+        // analyzers.
+        let fts_tokenizers = match &tokenizer {
+            Some(t) => fts_columns.iter().map(|_| Arc::clone(t)).collect(),
+            None => Vec::new(),
+        };
+
         Ok(Self {
             schema,
             id_column,
             fts_columns,
             vector_columns,
             tokenizer,
+            fts_tokenizers,
             reader_pool,
             writer_pool,
             store,
@@ -754,6 +768,27 @@ impl SupertableOptions {
     pub fn with_storage(mut self, storage: Arc<dyn StorageProvider>) -> Self {
         self.storage = Some(storage);
         self
+    }
+
+    /// Override the per-column FTS tokenizers (per-field analysis). The
+    /// vec must be aligned to `fts_columns` (one tokenizer per FTS
+    /// column, declaration order). Passing a differently-sized vec is a
+    /// caller bug; the builder indexes each column with its own entry.
+    pub fn with_fts_tokenizers(mut self, tokenizers: Vec<Arc<dyn Tokenizer>>) -> Self {
+        self.fts_tokenizers = tokenizers;
+        self
+    }
+
+    /// Tokenizer configured for `column`, for tokenizing query text so
+    /// it matches how the column was indexed. Falls back to the ASCII
+    /// default when `column` is not a registered FTS column (the query
+    /// then fails downstream on the unknown column).
+    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
+        self.fts_columns
+            .iter()
+            .position(|c| c.column == column)
+            .and_then(|i| self.fts_tokenizers.get(i).cloned())
+            .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
     }
 
     /// Attach a disk cache for storage-backed reads.
@@ -1111,6 +1146,7 @@ impl SupertableOptions {
             self.vector_columns.clone(),
             self.tokenizer.clone(),
         )
+        .with_fts_tokenizers(self.fts_tokenizers.clone())
         .with_vector_layout(self.vector_layout)
     }
 

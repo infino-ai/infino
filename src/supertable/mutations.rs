@@ -101,6 +101,19 @@ impl MutationStats {
     pub fn n_not_found(&self) -> usize {
         self.n_not_found
     }
+
+    /// Build stats from a hosted (remote) mutation response. `wal_id` is a
+    /// server-side recovery detail with no meaning — and no public accessor —
+    /// for a remote client, so it is left nil.
+    #[cfg(feature = "remote")]
+    pub(crate) fn from_remote(matched: usize, n_tombstoned: usize, n_not_found: usize) -> Self {
+        Self {
+            wal_id: WalId(0),
+            matched,
+            n_tombstoned,
+            n_not_found,
+        }
+    }
 }
 
 /// Cap on the number of rows one mutation call can target.
@@ -121,6 +134,13 @@ pub enum MutationError {
     /// type errors.
     #[error("predicate evaluation failed: {0}")]
     PredicateEval(#[from] QueryError),
+
+    /// The table was dropped and purged while this handle was open, so the
+    /// predicate has no manifest left to resolve against. Refused here rather
+    /// than at the closing commit, which would else write WAL sidecars for a
+    /// table that no longer exists.
+    #[error("table was dropped and purged while this handle was open")]
+    TableGone,
 
     /// Predicate matched more rows than [`MAX_TARGETS_PER_MUTATION`].
     /// Caller narrows the predicate and reissues.

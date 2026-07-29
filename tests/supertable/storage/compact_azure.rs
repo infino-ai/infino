@@ -72,7 +72,7 @@ use infino::{
     },
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::BoolMode,
+        fts::reader::{Bm25Stats, BoolMode},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -287,12 +287,19 @@ fn vec_to_csv(v: &[f32]) -> String {
 /// Run every query in `QUERIES` against a pinned snapshot of `st`.
 /// Returns one sorted `Vec<i128>` of `_id` values per query.
 fn run_bm25_queries(st: &Supertable) -> Vec<Vec<i128>> {
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     QUERIES
         .iter()
         .map(|q| {
             let batches = reader
-                .bm25_search("title", q, BM25_K, BoolMode::Or, None)
+                .bm25_search(
+                    "title",
+                    q,
+                    BM25_K,
+                    BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .unwrap_or_else(|e| panic!("bm25_search({q:?}) failed: {e}"));
             extract_sorted_ids(&batches)
         })
@@ -302,7 +309,7 @@ fn run_bm25_queries(st: &Supertable) -> Vec<Vec<i128>> {
 /// Run one `vector_search` call per entry in `VECTOR_PROBE_DOCS`.
 /// Returns sorted `_id` sets per query.
 fn run_vector_queries(st: &Supertable) -> Vec<Vec<i128>> {
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     VECTOR_PROBE_DOCS
         .iter()
         .map(|&idx| {
@@ -327,7 +334,7 @@ fn run_vector_queries(st: &Supertable) -> Vec<Vec<i128>> {
 /// vector queries), in the order of `SQL_FTS_QUERIES` followed by
 /// `SQL_VECTOR_PROBE_DOCS`.
 fn run_sql_queries(st: &Supertable) -> Vec<Vec<i128>> {
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let mut results = Vec::new();
     for q in SQL_FTS_QUERIES {
         let sql = format!("SELECT _id FROM bm25_search('title', '{q}', 1)");
@@ -424,7 +431,7 @@ async fn compact_azure_two_jobs_results_preserved() {
         w.commit().expect("commit");
     }
 
-    let reader_pre = st.reader();
+    let reader_pre = st.reader().expect("reader");
     assert_eq!(
         reader_pre.n_superfiles(),
         N_COMMITS,
@@ -500,7 +507,7 @@ async fn compact_azure_two_jobs_results_preserved() {
     st.optimize(&cfg).expect("optimize");
     eprintln!("[compact_azure] compact() done");
 
-    let reader_post = st.reader();
+    let reader_post = st.reader().expect("reader");
     assert_eq!(
         reader_post.n_superfiles(),
         N_COMPACTED_FILES,
@@ -623,7 +630,7 @@ async fn compact_real_azure_two_jobs_results_preserved() {
             w.commit().map_err(|e| format!("commit: {e}"))?;
         }
 
-        let reader_pre = st.reader();
+        let reader_pre = st.reader().expect("reader");
         if reader_pre.n_superfiles() != N_COMMITS {
             return Err(format!(
                 "expected {N_COMMITS} superfiles before compaction, got {}",
@@ -686,7 +693,7 @@ async fn compact_real_azure_two_jobs_results_preserved() {
             .map_err(|e| format!("optimize: {e}"))?;
         eprintln!("[real-azure-compact] compact() done");
 
-        let reader_post = st.reader();
+        let reader_post = st.reader().expect("reader");
         if reader_post.n_superfiles() != N_COMPACTED_FILES {
             return Err(format!(
                 "expected {N_COMPACTED_FILES} superfiles after compaction, got {}",

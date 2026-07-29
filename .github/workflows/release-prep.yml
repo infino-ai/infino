@@ -52,6 +52,8 @@ jobs:
   prep:
     name: Stamp versions and open the release PR
     runs-on: ubuntu-latest
+    # Never run in a fork: releases are cut from this repo only.
+    if: github.repository == 'infino-ai/infino'
     timeout-minutes: 10
     steps:
       # Fail fast, before touching anything, if the token is missing or

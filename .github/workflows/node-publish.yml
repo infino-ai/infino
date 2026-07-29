@@ -38,7 +38,8 @@ jobs:
     # Coordinated-release gate: on a tag push, run only when the tag is a
     # minor/major (patch == 0, tag ends in `.0`). A crate-only patch tag skips
     # the bindings. A manual run always proceeds (independent Node patch).
-    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
+    # Never run in a fork: only this repo publishes to the registry.
+    if: ${{ github.repository == 'infino-ai/infino' && (github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0')) }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

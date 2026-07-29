@@ -71,7 +71,7 @@ fn one_part_eager_fetches_under_default_threshold() {
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
 
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 1);
@@ -117,7 +117,7 @@ fn many_parts_skip_eager_fetch() {
             .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_BELOW_PARTS),
     )
     .expect("open");
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 5);
@@ -167,7 +167,7 @@ async fn manifest_part_lazy_loads_on_first_access() {
             .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_BELOW_PARTS),
     )
     .expect("open");
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     let target_pid = list_entries[LAZY_LOAD_TARGET_PART_INDEX].part_id;
@@ -239,7 +239,7 @@ fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
             .with_eager_load_threshold(EAGER_LOAD_THRESHOLD_FORCE_LAZY),
     )
     .expect("open");
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 1);

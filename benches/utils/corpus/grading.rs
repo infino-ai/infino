@@ -142,6 +142,72 @@ pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> Li
     labels
 }
 
+/// Held-out queries + exact labels loaded straight from a persisted oracle
+/// bin, without the corpus. Both the full-corpus vector bench (reopen /
+/// read-sweep) and the streaming recall bench (keep-table read-sweep) use this
+/// to skip their own ground-truth construction — the on-disk corpus brute
+/// force and the inline running heaps respectively — since the bin already
+/// holds both the queries and the labels.
+pub struct CachedOracle {
+    pub queries: Vec<Vec<f32>>,
+    pub labels: LifecycleGroundTruth,
+    pub n_docs: usize,
+    pub top_k: usize,
+    /// `queries[..correctness_query_count]` are the correctness queries; the
+    /// remainder (if any) are calibration queries. `labels.base` splits at the
+    /// same index.
+    pub correctness_query_count: usize,
+}
+
+/// The explicit oracle-bin path (`INFINO_BENCH_VECTOR_GROUND_TRUTH_PATH`), if set.
+pub fn oracle_path() -> Option<PathBuf> {
+    env::var_os(GROUND_TRUTH_PATH_ENV).map(PathBuf::from)
+}
+
+/// Read queries + exact labels from a persisted oracle bin (`INFLGT02`) without
+/// preparing the corpus. Row counts come from the embedded key, so no expected
+/// query set is needed (that is the whole point — the caller has no corpus to
+/// regenerate the queries from).
+pub fn load_oracle(path: &Path) -> Result<CachedOracle> {
+    let bytes = fs::read(path)?;
+    let mut cursor = bytes.as_slice();
+    let mut magic = [0u8; CACHE_MAGIC.len()];
+    read_exact(&mut cursor, &mut magic)?;
+    if &magic != CACHE_MAGIC {
+        return invalid_data("bad lifecycle ground-truth cache magic");
+    }
+    if read_u32(&mut cursor)? != CACHE_VERSION {
+        return invalid_data("lifecycle ground-truth cache version mismatch");
+    }
+    let key = pull_key(&mut cursor)?;
+    let queries = pull_queries(&mut cursor)?;
+    if queries.len() as u64 != key.query_count {
+        return invalid_data("lifecycle ground-truth cache query count mismatch");
+    }
+    let top_k = key.top_k as usize;
+    let base = pull_ground_truth(&mut cursor, key.query_count as usize, top_k)?;
+    let correctness = key.correctness_query_count as usize;
+    if correctness > queries.len() {
+        return invalid_data("lifecycle ground-truth cache correctness count exceeds query count");
+    }
+    let filtered = pull_ground_truth(&mut cursor, correctness, top_k)?;
+    let augmented = pull_ground_truth(&mut cursor, correctness, top_k)?;
+    if !cursor.is_empty() {
+        return invalid_data("lifecycle ground-truth cache has trailing bytes");
+    }
+    Ok(CachedOracle {
+        queries,
+        labels: LifecycleGroundTruth {
+            base,
+            filtered,
+            augmented,
+        },
+        n_docs: key.n_docs as usize,
+        top_k,
+        correctness_query_count: correctness,
+    })
+}
+
 fn validate_options(options: &LifecycleGradingOptions<'_>) {
     assert!(options.n_docs > 0);
     assert!(options.n_docs <= options.augmented_docs);
@@ -313,6 +379,33 @@ fn validate_queries(cursor: &mut &[u8], expected: &[Vec<f32>]) -> Result<()> {
     Ok(())
 }
 
+fn pull_queries(cursor: &mut &[u8]) -> Result<Vec<Vec<f32>>> {
+    let count = read_u64(cursor)? as usize;
+    let dim = read_u64(cursor)? as usize;
+    if dim != DIM {
+        return invalid_data("lifecycle ground-truth cache query dim mismatch");
+    }
+    // Bound the claimed count by the bytes actually present before allocating,
+    // so a corrupt count can't drive a huge Vec::with_capacity (mirrors the
+    // validate-before-allocate guard in pull_ground_truth).
+    if count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .is_none_or(|need| need > cursor.len())
+    {
+        return invalid_data("lifecycle ground-truth cache query count exceeds buffer");
+    }
+    let mut queries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut query = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            query.push(f32::from_bits(read_u32(cursor)?));
+        }
+        queries.push(query);
+    }
+    Ok(queries)
+}
+
 fn push_ground_truth(bytes: &mut Vec<u8>, labels: &[Vec<u32>], top_k: usize) {
     bytes.extend_from_slice(&(labels.len() as u64).to_le_bytes());
     for row in labels {
@@ -467,5 +560,38 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn load_oracle_recovers_queries_and_labels_without_corpus() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("grading.bin");
+        let (_vectors, queries, key, labels) = fixture();
+        write_cache(&path, key, &queries, &labels).expect("write");
+
+        // No expected query set, no corpus — everything comes from the bin.
+        let oracle = load_oracle(&path).expect("load");
+        assert_eq!(oracle.queries, queries);
+        assert_eq!(oracle.labels.base, labels.base);
+        assert_eq!(oracle.labels.filtered, labels.filtered);
+        assert_eq!(oracle.labels.augmented, labels.augmented);
+        assert_eq!(oracle.n_docs, TEST_N_DOCS);
+        assert_eq!(oracle.top_k, TEST_TOP_K);
+        assert_eq!(oracle.correctness_query_count, TEST_N_CORRECTNESS_QUERIES);
+
+        // The correctness split matches how the reopen path reconstructs
+        // q_correct / q_cal and their labels.
+        assert_eq!(
+            &oracle.queries[..oracle.correctness_query_count],
+            &queries[..TEST_N_CORRECTNESS_QUERIES]
+        );
+        assert_eq!(
+            oracle.queries.len() - oracle.correctness_query_count,
+            TEST_N_QUERIES - TEST_N_CORRECTNESS_QUERIES
+        );
+
+        let truncated = fs::read(&path).expect("bytes");
+        fs::write(&path, &truncated[..truncated.len() - 1]).expect("truncate");
+        assert!(load_oracle(&path).is_err(), "truncated bin must error");
     }
 }

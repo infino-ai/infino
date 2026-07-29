@@ -1,6 +1,6 @@
 [package]
 name = "infino-node"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 # a Node native addon must not install a second global allocator into the
 # Node process, so the module uses the system allocator (same reasoning as
 # the Python bindings).
-infino = { path = "..", default-features = false }
+infino = { path = "..", default-features = false, features = ["remote"] }
 
 # napi-rs — the Node-API bridge. `napi8` selects the Node-API version
 # floor (>= 8 gives `BigInt`, `TypedArray`, etc., which the surface needs).

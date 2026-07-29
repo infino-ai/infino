@@ -97,7 +97,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
-        let manifest = st.reader().manifest().clone();
+        let manifest = st.reader().expect("reader").manifest().clone();
         target_id = manifest
             .get_all_superfiles()
             .first()
@@ -129,6 +129,7 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     // against the same handle excludes the row.
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "alpha", 10, BoolMode::Or)
         .expect("fts");
     // The "alpha" row is local doc_id 0 — verify it's filtered.
@@ -173,13 +174,14 @@ fn create_with_existing_pointer_delegates_to_open() {
             .with_disk_cache(disk_cache),
     )
     .expect("create with existing pointer");
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     assert!(
         !manifest.get_all_superfiles().is_empty(),
         "create against existing pointer must load the committed manifest"
     );
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     let total = batches[0]
@@ -223,7 +225,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open for manifest");
-        let manifest = st.reader().manifest().clone();
+        let manifest = st.reader().expect("reader").manifest().clone();
         target_id = manifest
             .get_all_superfiles()
             .first()
@@ -271,6 +273,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     // FTS query no longer returns the tombstoned row.
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "foo", 10, BoolMode::Or)
         .expect("fts");
     for hit in &hits {

@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     OptimizeOptions,
     superfile::builder::FtsConfig,
-    supertable::{Supertable, SupertableOptions},
+    supertable::{OptimizeError, Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
 };
 use rayon::ThreadPoolBuilder;
@@ -33,6 +33,37 @@ use crate::corpus::{self, MmapTextCorpus};
 /// Rows per commit — matches the headline benches' `WRITE_CHUNK` so the
 /// diagnostic's superfile count mirrors production shapes.
 pub const WRITE_CHUNK: usize = 65_536;
+
+// ─── Shared env-knob parsers ────────────────────────────────────────────────
+// One definition for every diagnostic's numeric/boolean knobs (concurrent,
+// recall_while_ingest, …), so their parse semantics can't drift apart.
+
+/// Parse a `usize` from env `key` (whitespace-trimmed); falls back to
+/// `default` when unset or unparseable.
+pub(crate) fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parse a `u64` from env `key` (whitespace-trimmed); falls back to `default`
+/// when unset or unparseable.
+pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Boolean env knob defaulting to `true`: unset (or a truthy value) → true;
+/// `0` / `false` / `no` (case-insensitive) → false.
+pub(crate) fn env_bool_default_true(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => true,
+    }
+}
 
 /// Round-robin category labels (matches `superfile::sql::CATEGORIES`).
 pub const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
@@ -92,7 +123,7 @@ pub fn diag_options() -> SupertableOptions {
         diag_schema(),
         vec![FtsConfig {
             column: "title".into(),
-            positions: false,
+            positions: true,
         }],
         vec![],
         Some(default_tokenizer()),
@@ -179,9 +210,16 @@ pub fn build_supertable(cfg: &DiagConfig) -> (Supertable, Vec<RecordBatch>) {
     // Optimize with defaults — the maintenance step a real deployment runs.
     // (At small totals this leaves the per-commit superfiles as-is, since
     // optimize only merges once the total exceeds the target size.)
-    table
-        .optimize(&OptimizeOptions::default())
-        .expect("optimize diag supertable");
+    // Best-effort: this table is in-memory (no storage provider), so once
+    // the total crosses the merge target the compaction step returns
+    // `NoStorage` — the same class GC already tolerates in `optimize`. The
+    // diag's timed kernel/resolve split runs over the per-commit
+    // superfiles either way; tolerate it so the diag scales past the merge
+    // threshold instead of aborting.
+    match table.optimize(&OptimizeOptions::default()) {
+        Ok(_) | Err(OptimizeError::NoStorage) => {}
+        Err(other) => panic!("optimize diag supertable: {other}"),
+    }
     (table, batches)
 }
 

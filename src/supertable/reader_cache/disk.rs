@@ -40,7 +40,8 @@ use super::{
 };
 use crate::{
     config::global as global_config,
-    storage::{StorageError, StorageProvider, io_counters::scope_background},
+    runtime_metrics::io::scope_background,
+    storage::{StorageError, StorageProvider},
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
         format::{footer, kv},

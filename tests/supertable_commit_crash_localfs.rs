@@ -311,7 +311,7 @@ fn crash_post_superfile_no_prior_commit_yields_empty_table() {
         "no commit landed → recover create's empty id-0 manifest"
     );
     assert_eq!(
-        recovered.reader().n_superfiles(),
+        recovered.reader().expect("reader").n_superfiles(),
         0,
         "the orphan superfile is invisible without a committed manifest list"
     );
@@ -375,7 +375,7 @@ fn crash_post_superfile_on_second_commit_yields_v1() {
         Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1, "must recover at v1");
     assert_eq!(
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
         1,
         "v1 has exactly the first commit's superfile; v2's orphan superfile is invisible"
     );
@@ -393,7 +393,7 @@ fn crash_post_list_on_second_commit_yields_v1() {
     let consumer =
         Supertable::open(default_supertable_options().with_storage(storage)).expect("open at v1");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_superfiles(), 1);
+    assert_eq!(consumer.reader().expect("reader").n_superfiles(), 1);
 
     // Orphan v2 manifest list and v2 part are on disk —
     // tolerated here; compaction GCs them later.
@@ -427,7 +427,7 @@ fn crash_post_pointer_on_second_commit_yields_v2() {
         "pointer rename completed before crash → commit is durable"
     );
     assert_eq!(
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
         2,
         "v2 sees both commits' superfiles"
     );

@@ -87,23 +87,22 @@ pub(crate) enum CandidatePlan {
 impl CandidatePlan {
     /// Lower the conjunction of top-level `filters` (DataFusion ANDs the
     /// provider's filters together) into one plan. `fts_cols` is the set
-    /// of FTS-indexed column names; `tokenizer` is the index tokenizer
-    /// (absent ⇒ no FTS columns ⇒ always [`Unbounded`]).
+    /// of FTS-indexed column names; `resolve` maps an FTS column to the
+    /// tokenizer it was indexed with, so per-column analyzers lower query
+    /// text the same way the column was tokenized at ingest. Empty
+    /// `fts_cols` ⇒ no FTS columns ⇒ always [`Unbounded`].
     pub(crate) fn from_filters(
         filters: &[Expr],
         fts_cols: &HashSet<&str>,
-        tokenizer: Option<&Arc<dyn Tokenizer>>,
+        resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
     ) -> CandidatePlan {
-        let Some(tok) = tokenizer else {
-            return CandidatePlan::Unbounded;
-        };
         if fts_cols.is_empty() {
             return CandidatePlan::Unbounded;
         }
         and_combine(
             filters
                 .iter()
-                .map(|f| lower(f, fts_cols, tok.as_ref()))
+                .map(|f| lower(f, fts_cols, resolve))
                 .collect(),
         )
     }
@@ -261,11 +260,16 @@ impl CandidatePlan {
                     if tokens.is_empty() {
                         return Ok(n_docs);
                     }
-                    // Intersection ≤ the rarest token's df.
-                    let mut min_df = u64::MAX;
-                    for t in tokens {
-                        min_df = min_df.min(reader.term_df(column, t).await?);
-                    }
+                    // Intersection ≤ the rarest token's df — resolved with
+                    // one batched df lookup (single FST parse + coalesced
+                    // header fetch) rather than one parse + fetch per token.
+                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                    let min_df = reader
+                        .term_dfs(column, &refs)
+                        .await?
+                        .into_iter()
+                        .min()
+                        .unwrap_or(u64::MAX);
                     Ok(min_df.min(n_docs))
                 }
                 CandidatePlan::And(children) => {
@@ -288,23 +292,27 @@ impl CandidatePlan {
 }
 
 /// Lower one `Expr` node.
-fn lower(expr: &Expr, fts_cols: &HashSet<&str>, tok: &dyn Tokenizer) -> CandidatePlan {
+fn lower(
+    expr: &Expr,
+    fts_cols: &HashSet<&str>,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
+) -> CandidatePlan {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
             Operator::And => and_combine(vec![
-                lower(&be.left, fts_cols, tok),
-                lower(&be.right, fts_cols, tok),
+                lower(&be.left, fts_cols, resolve),
+                lower(&be.right, fts_cols, resolve),
             ]),
             Operator::Or => or_combine(vec![
-                lower(&be.left, fts_cols, tok),
-                lower(&be.right, fts_cols, tok),
+                lower(&be.left, fts_cols, resolve),
+                lower(&be.right, fts_cols, resolve),
             ]),
-            Operator::Eq => eq_leaf(&be.left, &be.right, fts_cols, tok),
+            Operator::Eq => eq_leaf(&be.left, &be.right, fts_cols, resolve),
             // Range / inequality / arithmetic ops aren't term-bounded.
             _ => CandidatePlan::Unbounded,
         },
         // `IN (a, b, …)` on an FTS column is an OR of equalities.
-        Expr::InList(il) if !il.negated => in_list_leaf(il, fts_cols, tok),
+        Expr::InList(il) if !il.negated => in_list_leaf(il, fts_cols, resolve),
         // NOT, LIKE, IS NULL, functions, etc. — not soundly term-bounded.
         _ => CandidatePlan::Unbounded,
     }
@@ -315,21 +323,21 @@ fn eq_leaf(
     left: &Expr,
     right: &Expr,
     fts_cols: &HashSet<&str>,
-    tok: &dyn Tokenizer,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
 ) -> CandidatePlan {
     let (column, value) = match (left, right) {
         (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, v),
         (Expr::Literal(v, _), Expr::Column(c)) => (&c.name, v),
         _ => return CandidatePlan::Unbounded,
     };
-    terms_all(column, value, fts_cols, tok)
+    terms_all(column, value, fts_cols, resolve)
 }
 
 /// Lower `col IN ('a', 'b', …)` on an FTS column to an OR of term-ANDs.
 fn in_list_leaf(
     il: &datafusion::logical_expr::expr::InList,
     fts_cols: &HashSet<&str>,
-    tok: &dyn Tokenizer,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
 ) -> CandidatePlan {
     let Expr::Column(c) = il.expr.as_ref() else {
         return CandidatePlan::Unbounded;
@@ -339,7 +347,7 @@ fn in_list_leaf(
         let Expr::Literal(v, _) = item else {
             return CandidatePlan::Unbounded;
         };
-        branches.push(terms_all(&c.name, v, fts_cols, tok));
+        branches.push(terms_all(&c.name, v, fts_cols, resolve));
     }
     or_combine(branches)
 }
@@ -351,7 +359,7 @@ fn terms_all(
     column: &str,
     value: &ScalarValue,
     fts_cols: &HashSet<&str>,
-    tok: &dyn Tokenizer,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
 ) -> CandidatePlan {
     if !fts_cols.contains(column) {
         return CandidatePlan::Unbounded;
@@ -359,6 +367,7 @@ fn terms_all(
     let Some(s) = scalar_str(value) else {
         return CandidatePlan::Unbounded;
     };
+    let tok = resolve(column);
     let tokens: Vec<String> = tok.tokenize(s).collect();
     if tokens.is_empty() {
         return CandidatePlan::Unbounded;
@@ -426,7 +435,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
+    use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer};
 
     fn fts_cols() -> HashSet<&'static str> {
         let mut s = HashSet::new();
@@ -434,12 +443,14 @@ mod tests {
         s
     }
 
-    fn tok() -> Arc<dyn Tokenizer> {
+    /// Resolver for the lowering tests: every column tokenizes with the
+    /// ASCII-lower analyzer.
+    fn ascii_resolver(_col: &str) -> Arc<dyn Tokenizer> {
         Arc::new(AsciiLowerTokenizer)
     }
 
     fn plan(expr: Expr) -> CandidatePlan {
-        CandidatePlan::from_filters(&[expr], &fts_cols(), Some(&tok()))
+        CandidatePlan::from_filters(&[expr], &fts_cols(), &ascii_resolver)
     }
 
     /// Bloom-survival flattening: an `AND` of term-alls collapses to one
@@ -643,8 +654,48 @@ mod tests {
     }
 
     #[test]
-    fn no_tokenizer_is_unbounded() {
-        let p = CandidatePlan::from_filters(&[col("title").eq(lit("rust"))], &fts_cols(), None);
+    fn no_fts_columns_is_unbounded() {
+        // With no FTS columns there is nothing to term-bound. (The old
+        // "FTS columns but no tokenizer" state is unrepresentable now
+        // that a per-column tokenizer always exists when FTS columns do.)
+        let p = CandidatePlan::from_filters(
+            &[col("title").eq(lit("rust"))],
+            &HashSet::new(),
+            &ascii_resolver,
+        );
         assert_eq!(p, CandidatePlan::Unbounded);
+    }
+
+    #[test]
+    fn lowering_uses_the_per_column_tokenizer() {
+        // `title` is analyzed with the Unicode-aware standard tokenizer,
+        // which keeps non-ASCII letters; ascii_lower drops the whole
+        // token. The lowering must pick the column's own analyzer.
+        let resolve = |col: &str| -> Arc<dyn Tokenizer> {
+            if col == "title" {
+                Arc::new(StandardTokenizer)
+            } else {
+                Arc::new(AsciiLowerTokenizer)
+            }
+        };
+        let bounded =
+            CandidatePlan::from_filters(&[col("title").eq(lit("Süd"))], &fts_cols(), &resolve);
+        assert_eq!(
+            bounded,
+            CandidatePlan::TermsAll {
+                column: "title".to_owned(),
+                tokens: vec!["süd".to_owned()],
+            }
+        );
+
+        // The same literal under ascii_lower drops the non-ASCII token,
+        // leaving nothing to bound with ⇒ Unbounded. Proves the result
+        // above came from the standard tokenizer, not a table-wide default.
+        let unbounded = CandidatePlan::from_filters(
+            &[col("title").eq(lit("Süd"))],
+            &fts_cols(),
+            &ascii_resolver,
+        );
+        assert_eq!(unbounded, CandidatePlan::Unbounded);
     }
 }

@@ -378,9 +378,11 @@ impl SupertableProvider {
         for pred in predicates {
             if pred.op == ScalarOp::Eq
                 && opts.fts_columns.iter().any(|c| c.column == pred.column)
-                && let Some(tok) = opts.tokenizer.as_ref()
                 && let Some(literal) = scalar_as_str(&pred.value)
             {
+                // Per-column analyzer: prune with the tokenizer this column
+                // was indexed with, not a single table-wide default.
+                let tok = opts.fts_tokenizer_for(&pred.column);
                 let terms: Vec<String> = tok.tokenize(literal).collect();
                 if !terms.is_empty() {
                     leaves.push(PruneLeaf::TermPresence {
@@ -405,11 +407,12 @@ impl SupertableProvider {
         let predicates = exprs_to_scalar_predicates(filters, &self.schema);
         let mut leaves = self.predicates_to_prune_leaves(predicates);
 
+        let opts = &self.manifest.options;
         leaves.extend(exprs_to_value_set_leaves(
             filters,
             &self.schema,
             &self.fts_cols_set(),
-            self.manifest.options.tokenizer.as_deref(),
+            &|col| opts.fts_tokenizer_for(col),
         ));
 
         leaves.extend(exprs_to_null_leaves(filters, &self.schema));
@@ -787,11 +790,10 @@ impl TableProvider for SupertableProvider {
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
-        let candidate_plan = CandidatePlan::from_filters(
-            filters,
-            &self.fts_cols_set(),
-            self.manifest.options.tokenizer.as_ref(),
-        );
+        let opts = &self.manifest.options;
+        let candidate_plan = CandidatePlan::from_filters(filters, &self.fts_cols_set(), &|col| {
+            opts.fts_tokenizer_for(col)
+        });
         let prepared_files =
             try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
 
@@ -1261,12 +1263,12 @@ pub(crate) fn exprs_to_value_set_leaves(
     filters: &[Expr],
     schema: &SchemaRef,
     fts_cols: &HashSet<&str>,
-    tokenizer: Option<&dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
 ) -> Vec<PruneLeaf> {
     let mut out = Vec::new();
 
     for filter in filters {
-        collect_value_set_leaves(filter, schema, fts_cols, tokenizer, &mut out);
+        collect_value_set_leaves(filter, schema, fts_cols, resolve, &mut out);
     }
 
     out
@@ -1279,24 +1281,24 @@ fn collect_value_set_leaves(
     expr: &Expr,
     schema: &SchemaRef,
     fts_cols: &HashSet<&str>,
-    tokenizer: Option<&dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
     out: &mut Vec<PruneLeaf>,
 ) {
     match expr {
         // Filters reach us alias-free (Filter::try_new runs unalias_nested),
         // but an alias is a pure rename; descend it so pruning is unaffected
         // if one ever survives (e.g. a metadata-carrying alias).
-        Expr::Alias(a) => collect_value_set_leaves(&a.expr, schema, fts_cols, tokenizer, out),
+        Expr::Alias(a) => collect_value_set_leaves(&a.expr, schema, fts_cols, resolve, out),
         // Descend AND; the predicate can sit on either side.
         Expr::BinaryExpr(be) if be.op == Operator::And => {
-            collect_value_set_leaves(&be.left, schema, fts_cols, tokenizer, out);
-            collect_value_set_leaves(&be.right, schema, fts_cols, tokenizer, out);
+            collect_value_set_leaves(&be.left, schema, fts_cols, resolve, out);
+            collect_value_set_leaves(&be.right, schema, fts_cols, resolve, out);
         }
         // A same-column `OR` of equalities is an `IN` in disguise; lower
         // it the same way. A mixed or non-equality `OR` flattens to None.
         Expr::BinaryExpr(be) if be.op == Operator::Or => {
             if let Some((column, values)) = flatten_or_eq(expr, schema) {
-                emit_value_set_leaves(column, values, fts_cols, tokenizer, out);
+                emit_value_set_leaves(column, values, fts_cols, resolve, out);
             }
         }
         Expr::InList(il) if !il.negated => {
@@ -1316,7 +1318,7 @@ fn collect_value_set_leaves(
                 values.push(v.clone());
             }
             if !values.is_empty() {
-                emit_value_set_leaves(c.name.clone(), values, fts_cols, tokenizer, out);
+                emit_value_set_leaves(c.name.clone(), values, fts_cols, resolve, out);
             }
         }
         _ => {}
@@ -1335,13 +1337,14 @@ fn emit_value_set_leaves(
     column: String,
     values: Vec<ScalarValue>,
     fts_cols: &HashSet<&str>,
-    tokenizer: Option<&dyn Tokenizer>,
+    resolve: &dyn Fn(&str) -> Arc<dyn Tokenizer>,
     out: &mut Vec<PruneLeaf>,
 ) {
-    if fts_cols.contains(column.as_str())
-        && let Some(tok) = tokenizer
-    {
-        let terms = unique_tokens(tok, values.iter().filter_map(scalar_as_str));
+    if fts_cols.contains(column.as_str()) {
+        // Per-column analyzer: tokenize the value set with this column's
+        // own tokenizer so the bloom probe matches how it was indexed.
+        let tok = resolve(&column);
+        let terms = unique_tokens(tok.as_ref(), values.iter().filter_map(scalar_as_str));
         if !terms.is_empty() {
             out.push(PruneLeaf::TermPresence {
                 column: column.clone(),
@@ -1539,13 +1542,23 @@ mod tests {
 
     use super::*;
     use crate::{
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::FtsConfig,
+            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
+            vector::layout::VectorLayout,
+        },
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri},
         },
         test_helpers::default_tokenizer,
     };
+
+    /// Per-column tokenizer resolver for the pruning-walker tests: every
+    /// column resolves to the default ASCII-lower analyzer.
+    fn ascii_resolver(_col: &str) -> Arc<dyn Tokenizer> {
+        default_tokenizer()
+    }
 
     /// `view_string_schema` views scalar `Utf8`/`LargeUtf8` columns as
     /// `Utf8View`, but leaves FTS columns as-is (their bloom / term-range
@@ -1806,7 +1819,7 @@ mod tests {
     /// extraction without matching on the full enum.
     fn value_set_leaves(filters: &[Expr], schema: &SchemaRef) -> Vec<(String, usize)> {
         // No FTS columns / tokenizer → only the scalar min/max leaf.
-        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), None)
+        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), &ascii_resolver)
             .into_iter()
             .map(|l| match l {
                 PruneLeaf::ScalarValueSet { column, values } => (column, values.len()),
@@ -1885,7 +1898,9 @@ mod tests {
         // `x = 1 OR y = 2` spans two columns — not one closed value set.
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("y").eq(lit(2_i64)));
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     #[test]
@@ -1894,7 +1909,9 @@ mod tests {
         // rows, so the whole OR declines.
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("x").gt(lit(5_i64)));
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     #[test]
@@ -1906,20 +1923,20 @@ mod tests {
             cast(col("x"), DataType::Int32)
                 .eq(lit(1_i32))
                 .or(cast(col("x"), DataType::Int32).eq(lit(2_i32)));
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     #[test]
     fn or_on_fts_column_also_emits_term_presence_bloom() {
-        use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
         let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
         let fts = HashSet::from(["title"]);
-        let tok = AsciiLowerTokenizer;
         // OR form of an FTS-column IN — same bloom + min/max as the IN arm.
         let expr = col("title")
             .eq(lit("Foo Bar"))
             .or(col("title").eq(lit("Bar Baz")));
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, Some(&tok));
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
 
         assert!(
             leaves
@@ -1945,7 +1962,9 @@ mod tests {
     fn negated_in_list_emits_no_leaf() {
         let s = schema_xy();
         let expr = col("x").in_list(vec![lit(1_i64)], true);
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     /// The `(column, want_null)` of the first `NullCheck` leaf, if any.
@@ -1997,26 +2016,28 @@ mod tests {
         let s = schema_xy();
         // `x IN (1, y)` — `y` is a column, not a literal; can't bound min/max.
         let expr = col("x").in_list(vec![lit(1_i64), col("y")], false);
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     #[test]
     fn in_list_on_unknown_column_emits_no_leaf() {
         let s = schema_xy();
         let expr = col("z").in_list(vec![lit(1_i64)], false);
-        assert!(exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None).is_empty());
+        assert!(
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+        );
     }
 
     #[test]
     fn in_list_on_fts_column_also_emits_term_presence_bloom() {
-        use crate::superfile::fts::tokenize::AsciiLowerTokenizer;
         let s = Arc::new(Schema::new(vec![Field::new("title", DataType::Utf8, true)]));
         let fts = HashSet::from(["title"]);
-        let tok = AsciiLowerTokenizer;
         // 'Foo Bar' → [foo, bar]; 'Bar Baz' → [bar, baz]. The shared `bar`
         // is deduped, and the terms come out sorted-unique.
         let expr = col("title").in_list(vec![lit("Foo Bar"), lit("Bar Baz")], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, Some(&tok));
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
 
         assert!(
             leaves
@@ -2045,12 +2066,63 @@ mod tests {
     }
 
     #[test]
+    fn value_set_bloom_uses_the_per_column_tokenizer() {
+        // `title` is analyzed with the Unicode-aware standard tokenizer
+        // (keeps non-ASCII); `body` with ascii_lower (drops it). Bloom
+        // pruning must probe each column with its own tokenizer, else a
+        // standard-analyzed column is pruned against ascii_lower tokens.
+        let s = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let fts = HashSet::from(["title", "body"]);
+        let resolve = |c: &str| -> Arc<dyn Tokenizer> {
+            if c == "title" {
+                Arc::new(StandardTokenizer)
+            } else {
+                Arc::new(AsciiLowerTokenizer)
+            }
+        };
+
+        // Standard column: the non-ASCII term survives tokenization, so a
+        // TermPresence bloom leaf is emitted carrying the folded token.
+        let title_leaves = exprs_to_value_set_leaves(
+            &[col("title").in_list(vec![lit("Süd")], false)],
+            &s,
+            &fts,
+            &resolve,
+        );
+        assert!(
+            title_leaves.iter().any(|l| matches!(
+                l,
+                PruneLeaf::TermPresence { column, terms, .. }
+                    if column == "title" && terms == &vec!["süd".to_string()]
+            )),
+            "standard-analyzed column keeps the non-ASCII token"
+        );
+
+        // ascii_lower column: the same literal drops to zero tokens, so no
+        // TermPresence leaf is emitted — only the scalar value-set leaf.
+        let body_leaves = exprs_to_value_set_leaves(
+            &[col("body").in_list(vec![lit("Süd")], false)],
+            &s,
+            &fts,
+            &resolve,
+        );
+        assert!(
+            !body_leaves
+                .iter()
+                .any(|l| matches!(l, PruneLeaf::TermPresence { .. })),
+            "ascii_lower column drops the non-ASCII token — no bloom leaf"
+        );
+    }
+
+    #[test]
     fn in_list_on_non_fts_column_emits_only_scalar_leaf() {
         let s = schema_xy();
         let fts = HashSet::from(["title"]); // "x" not in the set
-        let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
         let expr = col("x").in_list(vec![lit(1_i64), lit(2_i64), lit(3_i64), lit(4_i64)], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, Some(&tok));
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
         assert_eq!(leaves.len(), 1);
         assert!(matches!(leaves[0], PruneLeaf::ScalarValueSet { .. }));
     }
@@ -2134,9 +2206,9 @@ mod tests {
         w.append(&cat_title_batch(&["lang", "lang"], &["delta", "sigma"]))
             .expect("a3");
         w.commit().expect("c3");
-        assert_eq!(st.reader().n_superfiles(), 3);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),
@@ -2186,7 +2258,7 @@ mod tests {
         w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),
@@ -2363,7 +2435,7 @@ mod tests {
         w.append(&num_batch(&[Some(10), Some(20)])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
             st.options().scalar_schema(),
             reader.manifest().clone(),

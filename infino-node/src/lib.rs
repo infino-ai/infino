@@ -46,8 +46,9 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric, OptimizeError,
-    OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, GcError,
+    InfinoError, Metric, OptimizeError, OptimizeOptions as InfinoOptimizeOptions,
+    VectorSearchOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -199,6 +200,23 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
     }
 }
 
+/// Parse a BM25 statistics-scope string (`"per_superfile"` default, or
+/// `"global"` for corpus-wide IDF across superfiles).
+fn parse_stats(stats: Option<&str>) -> Result<Bm25Stats> {
+    match stats
+        .unwrap_or("per_superfile")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
+        "global" => Ok(Bm25Stats::Global),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("stats must be 'per_superfile' or 'global', got {other:?}"),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -225,6 +243,10 @@ pub struct ConnectOptions {
     /// Probe the object store at `connect` (default `false`). `true` fails
     /// fast on bad credentials instead of on first use.
     pub validate: Option<bool>,
+    /// API key for a hosted (`https://<host>/<db>`) connect target, sent as a
+    /// bearer credential. Ignored by local backends; falls back to the
+    /// `INFINO_API_KEY` environment variable when omitted.
+    pub api_key: Option<String>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -389,6 +411,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             if let Some(v) = o.validate {
                 opts = opts.with_validate(v);
             }
+            if let Some(key) = o.api_key {
+                opts = opts.with_api_key(key);
+            }
             infino::connect_with(&uri, opts)
         }
     }
@@ -411,6 +436,15 @@ pub struct Connection {
 
 #[napi]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (throws if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    #[napi]
+    pub fn create_database(&self) -> Result<()> {
+        self.inner.create_database().map_err(map_err)
+    }
+
     /// Create a table from an Arrow `Schema` (sent as an IPC `Buffer` —
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.
@@ -493,15 +527,18 @@ impl Table {
         query: String,
         k: u32,
         mode: Option<String>,
+        stats: Option<String>,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
-        let mode = parse_mode(mode.as_deref())?;
+        let opts = Bm25SearchOptions::new()
+            .with_mode(parse_mode(mode.as_deref())?)
+            .with_stats(parse_stats(stats.as_deref())?);
         let proj: Option<Vec<&str>> = projection
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .bm25_search(&column, &query, k as usize, mode, proj.as_deref())
+            .bm25_search(&column, &query, k as usize, opts, proj.as_deref())
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }

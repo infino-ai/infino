@@ -21,7 +21,7 @@
 use std::{sync::Arc, thread};
 
 use infino::{
-    BoolMode, ConnectOptions, Connection, IndexSpec, InfinoError, Supertable,
+    Bm25SearchOptions, ConnectOptions, Connection, IndexSpec, InfinoError, Supertable,
     arrow_array::RecordBatch,
     connect_with,
     test_helpers::{build_title_batch, schema_id_title},
@@ -107,7 +107,13 @@ fn concurrent_ingest_and_query_stay_within_one_connection_budget() {
                             Err(InfinoError::OverBudget(_)) => {}
                             Err(other) => panic!("append: non-budget error {other:?}"),
                         }
-                        match t.bm25_search("title", "budget", TOP_K, BoolMode::Or, None) {
+                        match t.bm25_search(
+                            "title",
+                            "budget",
+                            TOP_K,
+                            Bm25SearchOptions::new(),
+                            None,
+                        ) {
                             Ok(_) | Err(InfinoError::OverBudget(_)) => {}
                             Err(other) => panic!("query: non-budget error {other:?}"),
                         }
@@ -122,7 +128,7 @@ fn concurrent_ingest_and_query_stay_within_one_connection_budget() {
             .collect()
     });
 
-    let budget = tables[0].options().connection_budget();
+    let budget = tables[0].local_handle().options().connection_budget();
     let limit = budget.limit().expect("bounded budget has a gate");
     eprintln!(
         "[budget-concurrent] peak={} denials={} gate={limit}",
@@ -172,14 +178,14 @@ fn measured_budget_admits_the_same_concurrent_load() {
                 for _ in 0..APPENDS_PER_TABLE {
                     t.append(batch)
                         .expect("measured budget never refuses an append");
-                    t.bm25_search("title", "budget", TOP_K, BoolMode::Or, None)
+                    t.bm25_search("title", "budget", TOP_K, Bm25SearchOptions::new(), None)
                         .expect("measured budget never refuses a query");
                 }
             });
         }
     });
 
-    let budget = tables[0].options().connection_budget();
+    let budget = tables[0].local_handle().options().connection_budget();
     assert!(
         budget.limit().is_none(),
         "budget_bytes=0 is measured, not bounded"
@@ -216,9 +222,9 @@ fn budget_gate_is_shared_across_tables_on_one_connection() {
         "second table's append must be refused over budget",
     );
 
-    let budget = a.options().connection_budget();
+    let budget = a.local_handle().options().connection_budget();
     assert!(
-        Arc::ptr_eq(budget, b.options().connection_budget()),
+        Arc::ptr_eq(budget, b.local_handle().options().connection_budget()),
         "both tables must share one connection budget",
     );
     assert!(

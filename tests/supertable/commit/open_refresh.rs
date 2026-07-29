@@ -64,7 +64,7 @@ fn open_sees_writes_made_by_a_different_handle() {
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_superfiles(), 1);
+    assert_eq!(consumer.reader().expect("reader").n_superfiles(), 1);
     // Note: full query parity post-open requires the deferred
     // query-path integration through `DiskCacheStore` —
     // the reader sees the manifest's superfile list but
@@ -129,7 +129,7 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     )
     .expect("open");
     assert_eq!(consumer.manifest_id(), 1);
-    let pinned_reader = consumer.reader(); // snapshot pinned at v1
+    let pinned_reader = consumer.reader().expect("reader"); // snapshot pinned at v1
 
     // Producer commits v2.
     let mut w = producer.writer().expect("w2");
@@ -141,12 +141,13 @@ fn strong_consistency_query_sees_another_writers_new_commit() {
     // against the latest manifest — picking up the new commit.
     let hits = consumer
         .reader()
+        .expect("reader")
         .bm25_hits("title", "added", BM25_TOP_K, BoolMode::Or)
         .expect("query under strong consistency");
     assert!(!hits.is_empty(), "strong query must see the v2 row");
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
         2,
         "post-query reader sees both commits"
     );
@@ -185,6 +186,7 @@ fn strong_consistency_query_is_stable_when_pointer_unchanged() {
     // advanced, so the strongly-consistent query stays at v1.
     let _ = consumer
         .reader()
+        .expect("reader")
         .bm25_hits("title", "only", BM25_TOP_K, BoolMode::Or)
         .expect("query");
     assert_eq!(consumer.manifest_id(), 1);
@@ -207,6 +209,7 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
     .expect("create");
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits("title", "anything", BM25_TOP_K, BoolMode::Or)
         .expect("query on uncommitted table");
     assert!(hits.is_empty());

@@ -94,7 +94,7 @@ async fn seed_partial_state(
     let ws = WalStore::new(Arc::clone(&storage));
     let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
         .expect("open for ids");
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let id_min = manifest
         .get_all_superfiles()
         .first()

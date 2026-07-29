@@ -21,6 +21,9 @@ const STREAM = "stream";
 export type Metric = "cosine" | "l2sq" | "negdot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
+/** BM25 statistics scope: per-superfile IDF (default) or corpus-wide
+ * `"global"` IDF across superfiles. */
+export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
 /** A plain `{ column: type }` schema descriptor for `createTable`. */
@@ -97,6 +100,8 @@ export interface OptimizeOptions {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
+  /** BM25 statistics scope: `"per_superfile"` (default) or `"global"`. */
+  stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
   arrow?: boolean;
@@ -322,7 +327,7 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.projection);
+    const buf = this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection);
     return decode(buf, opts.arrow);
   }
 
@@ -401,6 +406,15 @@ export class Connection {
   private inner: any;
   constructor(inner: any) {
     this.inner = inner;
+  }
+
+  /**
+   * Provision the database this connection targets. On the hosted service this
+   * registers the database (throws if it already exists); on a local backend the
+   * catalog root is the database, so it is a no-op success.
+   */
+  createDatabase(): void {
+    this.inner.createDatabase();
   }
 
   /** Create a table from an apache-arrow `Schema` or `{ column: type }`. */
