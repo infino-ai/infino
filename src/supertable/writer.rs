@@ -3327,7 +3327,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // checkpointed batches never re-stream, so its sample would be partial
     // and the law would under-count. A resumed drain keeps whatever law
     // the manifest already carries.
-    let mut width_law = (local_checkpoint.batches_done == 0 && completed_shards.is_empty())
+    // `spills.is_empty()` is implied today — spills co-save with
+    // `batches_done` in one checkpoint write at each batch boundary — but
+    // checking it here makes the clean-run requirement locally visible:
+    // if a mid-batch checkpoint save is ever introduced, calibration
+    // disables safely instead of sampling a partial stream.
+    let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
+        && completed_shards.is_empty()
+        && local_checkpoint.spills.is_empty();
+    let mut width_law = clean_uncheckpointed_drain
         .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
 
     let mut cell_spills = HashMap::new();

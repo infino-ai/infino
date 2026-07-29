@@ -4180,6 +4180,7 @@ mod tests {
         // fine picks, so "narrow" means fewer cells than the law, not one.)
         let narrow_hits = st
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &q,
@@ -4198,6 +4199,7 @@ mod tests {
         // Wide override: recovers the full exact top-k across three cells.
         let wide_hits = st
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &q,
@@ -4227,6 +4229,7 @@ mod tests {
         let (_dir, st, q, k) = drained_three_direction_fixture();
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
             .expect("default search");
         let near = near_count(&hits);
@@ -4259,6 +4262,7 @@ mod tests {
 
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
             .expect("default search after incremental drain");
         let near = near_count(&hits);
