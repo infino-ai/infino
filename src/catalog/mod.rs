@@ -2225,6 +2225,16 @@ mod tests {
         assert!(err.to_string().contains("duplicate column name: a"));
     }
 
+    /// A single-column schema whose one column `emb` is a
+    /// `FixedSizeList<Float32, dim>` — the vector-column shape.
+    fn emb_schema(dim: i32) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        )]))
+    }
+
     #[test]
     fn vector_index_dim_out_of_range_rejected_at_create() {
         // A vector index's `dim` is validated when the table is created, not
@@ -2232,21 +2242,27 @@ mod tests {
         // rejected up front, so a caller can't create a table whose vector
         // column can never be built.
         let conn = connect("memory://").expect("connect");
-        let vector_col = |dim: i32| {
-            Arc::new(Schema::new(vec![Field::new(
-                "emb",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
-                false,
-            )]))
-        };
 
         // Zero (below the floor) and an oversized dim both fail at create time.
         for dim in [0_i32, 100_000] {
             let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
             let err = conn
-                .create_table(&format!("v{dim}"), vector_col(dim), spec)
+                .create_table(&format!("v{dim}"), emb_schema(dim), spec)
                 .expect_err("an out-of-range vector dim is rejected");
             assert!(matches!(err, InfinoError::Schema(_)), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn vector_index_dim_within_range_accepted_at_create() {
+        // The complement of the rejection test: both inclusive boundaries of
+        // the supported range (16 and 4096) are valid dims, so a table with a
+        // vector index at either bound is created successfully.
+        let conn = connect("memory://").expect("connect");
+        for dim in [16_i32, 4096] {
+            let spec = IndexSpec::new().vector("emb", dim as usize, 1, Metric::Cosine);
+            conn.create_table(&format!("v{dim}"), emb_schema(dim), spec)
+                .expect("an in-range vector dim is accepted");
         }
     }
 
