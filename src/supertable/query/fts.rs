@@ -566,10 +566,14 @@ impl SupertableReader {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
                 async move {
-                    let mut dfs = Vec::with_capacity(terms_arc.len());
-                    for t in terms_arc.iter() {
-                        dfs.push(r.term_df(&column_arc, t).await.map_err(fts_read_error)?);
-                    }
+                    // One FST parse + one coalesced header fetch for all
+                    // scored terms in this superfile, rather than a parse
+                    // and fetch per term.
+                    let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
+                    let dfs = r
+                        .term_dfs(&column_arc, &refs)
+                        .await
+                        .map_err(fts_read_error)?;
                     Ok::<Vec<u64>, QueryError>(dfs)
                 }
             },

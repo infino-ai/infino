@@ -1084,6 +1084,17 @@ impl SuperfileReader {
         Ok(fts.term_df(column, token).await?)
     }
 
+    /// Document frequency of each of `tokens` in `column`, in input order
+    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
+    /// resolves the whole set with one FST parse and one coalesced header
+    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs(column, tokens).await?)
+    }
+
     /// Two-pass exact match of a **raw string** `value` against
     /// `column`'s stored values. The input is a raw string, **not**
     /// tokens — tokenization is used only to prune candidates, never as

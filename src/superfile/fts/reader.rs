@@ -1729,17 +1729,25 @@ impl FtsReader {
         })
     }
 
-    /// Document frequency of `token` in `column` — the number of docs
-    /// containing it — read cheaply from the index **without** decoding
-    /// the posting list: an inline (df=1) term is known from the FST
-    /// value, and a PFOR term's `df` is the first 4 bytes of its 20-byte
-    /// metadata header. Returns `0` if the token isn't in the column's
-    /// dictionary. Used by the candidate planner to estimate a `WHERE`
-    /// predicate's match count *ahead of* running `token_match`, so a
-    /// predicate that would match a large fraction of the superfile can
-    /// fall back to a plain scan instead of a (losing) index pushdown.
-    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
+    /// Document frequency for each of `tokens` in `column` — the number
+    /// of docs containing each — in input order, read cheaply from the
+    /// index **without** decoding posting lists.
+    ///
+    /// The whole set resolves against **one** FST parse and **one**
+    /// coalesced header fetch, rather than one parse + one fetch per
+    /// token: the dictionary is opened once, every token is classified
+    /// by an in-memory FST lookup (absent → `0`; inline df=1 term → `1`;
+    /// PFOR term → its `df`, the first 4 bytes of its 20-byte metadata
+    /// header), and all the PFOR headers are pulled in a single batched
+    /// [`Self::fetch_term_postings`] call (which coalesces adjacent
+    /// ranges into a minimal set of parallel GETs). This matters on the
+    /// global-statistics path, where a superfile is probed for every
+    /// scored term of a query at once.
+    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1747,24 +1755,54 @@ impl FtsReader {
             )))
         })?;
         let col_meta = &self.columns[column_id as usize];
-        let key = make_key(&col_meta.name, token);
-        Ok(match dict.lookup(&key) {
-            None => 0,
-            Some(packed) => match FstValue::unpack(packed) {
-                FstValue::Inline { .. } => 1,
-                FstValue::Pfor {
-                    metadata_offset, ..
-                } => {
-                    // Fetch only the 20-byte header (TERM_META_SIZE);
-                    // `df` is its first 4 bytes — no posting-list decode.
-                    let fetched = self
-                        .fetch_term_postings(&[(metadata_offset as usize, TERM_META_SIZE)])
-                        .await?;
-                    let header = fetched.first().expect("one fetched header range");
-                    read_u32_le(&header.as_ref()[0..4]) as u64
-                }
-            },
-        })
+
+        // First pass — pure in-memory FST lookups. Absent and inline
+        // tokens get their df here; each PFOR token's header range is
+        // collected for the single batched fetch below, remembering
+        // which token slot it fills so results scatter back in order.
+        let mut dfs = vec![0u64; tokens.len()];
+        let mut header_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut pfor_slots: Vec<usize> = Vec::new();
+        for (i, token) in tokens.iter().enumerate() {
+            let key = make_key(&col_meta.name, token);
+            match dict.lookup(&key) {
+                None => {}
+                Some(packed) => match FstValue::unpack(packed) {
+                    FstValue::Inline { .. } => dfs[i] = 1,
+                    FstValue::Pfor {
+                        metadata_offset, ..
+                    } => {
+                        header_ranges.push((metadata_offset as usize, TERM_META_SIZE));
+                        pfor_slots.push(i);
+                    }
+                },
+            }
+        }
+
+        // One coalesced fetch for every PFOR header; `df` is its first 4 bytes.
+        if !header_ranges.is_empty() {
+            let fetched = self.fetch_term_postings(&header_ranges).await?;
+            for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
+                let header = fetched.get(fetched_idx).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "term_dfs: fetched fewer headers than requested".into(),
+                    ))
+                })?;
+                dfs[slot] = read_u32_le(&header.as_ref()[0..4]) as u64;
+            }
+        }
+        Ok(dfs)
+    }
+
+    /// Document frequency of a single `token` in `column`. Thin wrapper
+    /// over [`Self::term_dfs`]; see it for how `df` is read without
+    /// decoding the posting list. Returns `0` if the token isn't in the
+    /// column's dictionary. Used by the candidate planner to estimate a
+    /// `WHERE` predicate's match count *ahead of* running `token_match`,
+    /// so a predicate matching a large fraction of the superfile can
+    /// fall back to a plain scan instead of a (losing) index pushdown.
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
+        Ok(self.term_dfs(column, &[token]).await?.pop().unwrap_or(0))
     }
 
     /// Multi-term OR BM25 search constrained to a doc_id sub-range.
@@ -5895,6 +5933,32 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         let err = r.term_df("nope", "rust").await.expect_err("error");
         assert!(matches!(err, FtsError::UnknownColumn(_)));
+    }
+
+    #[tokio::test]
+    async fn term_dfs_matches_per_term_term_df() {
+        let (blob, json) = build_mixed_df_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        // Interleave the FST value kinds — PFOR (df>1), absent, inline
+        // (df=1), PFOR, absent — so a slot-mapping bug in the batched
+        // path (which fetches only the PFOR headers, then scatters the
+        // results back) would surface as a mismatch here.
+        let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
+        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs");
+        // Element-wise identical to resolving each token on its own.
+        let mut per_term = Vec::with_capacity(tokens.len());
+        for t in tokens {
+            per_term.push(r.term_df("body", t).await.expect("term_df"));
+        }
+        assert_eq!(
+            batched, per_term,
+            "batched term_dfs must equal per-term term_df"
+        );
+        // …and matches the planted ground truth (common=3, rust=2,
+        // uniqzero=1 inline, absent tokens=0).
+        assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
+        // Empty input short-circuits to empty output (no dict open, no fetch).
+        assert!(r.term_dfs("body", &[]).await.expect("empty").is_empty());
     }
 
     // ---- phrase atoms ----
