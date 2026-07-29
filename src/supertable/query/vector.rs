@@ -1411,41 +1411,14 @@ impl SupertableReader {
                 } else {
                     None
                 };
-            // Explicit caller `nprobe` pins the cell sweep width on every
-            // branch — an override is honored, never discarded. The
-            // persisted hidden routing (fine-first p=1) stays the
-            // no-override default, but measured on Cohere-1M/768d at k=100
-            // the single probed cell caps recall at 0.61 even scanned in
-            // full, so callers need the width dial to buy recall past that
-            // ceiling. Fine depth is untouched by the pin: the filtered
-            // floors above still apply, unfiltered keeps its branch's depth.
-            //
-            // `sweep_width` — the per-sweep rerank-budget divide and the
-            // per-fragment fine gating downstream — engages on UNFILTERED
-            // sweeps only: a filtered query keeps its pre-width budget and
-            // wave-pooled gating even under an explicit `nprobe`, because a
-            // sparse allow-set's shortlist divided across cells starves.
-            // The width is clamped to the cells that actually carry
-            // postings: the budget divide must split by what the sweep can
-            // read, not by an override larger than the populated grid.
             let populated_cells = postings_by_cell.len().max(1);
-            if options.nprobe.is_some() {
-                cell_routing.nprobe_min = nprobe.max(1);
-                cell_routing.nprobe_max = nprobe.max(1);
-                if !filtered {
-                    sweep_width = Some(nprobe.clamp(1, populated_cells));
-                }
-            } else if let Some(width) = law_width {
-                cell_routing.nprobe_min = width;
-                cell_routing.nprobe_max = width;
-                sweep_width = Some(width.min(populated_cells));
-                // The law was calibrated against exact top-k, so its
-                // coverage numbers assume a probed cell is read in full
-                // (measured: half-depth caps recall at 0.964 where full
-                // depth reaches 0.995). Depth rides with the law; the
-                // per-fragment gate clamps to each fragment's run count.
-                cell_routing.fine_nprobe = usize::MAX;
-            }
+            sweep_width = apply_width_pin(
+                &mut cell_routing,
+                options.nprobe.map(|n| n.max(1)),
+                law_width,
+                filtered,
+                populated_cells,
+            );
             // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
             // count)), so depth scales with cell size. Filtered queries keep
             // their own fixed fine floor (pct = 0); the proportional depth
@@ -2789,6 +2762,50 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
+/// One shared width override on top of the per-branch base routing:
+/// explicit caller `nprobe` pins the cell sweep width on every branch —
+/// an override is honored, never discarded — and with no override a
+/// drain-calibrated law width pins the same way. Returns the engaged
+/// `sweep_width` (drives the per-sweep rerank-budget divide and the
+/// per-fragment fine gating downstream), `None` when nothing pinned.
+///
+/// Depth rides the width on the UNFILTERED path, for the pin exactly as
+/// for the law: the law's coverage numbers assume a probed cell is read
+/// in full (measured: half-depth caps recall at 0.964 where full depth
+/// reaches 0.995), and a caller-widened sweep at the persisted
+/// fine-first depth contributes only each cell's first runs — measured
+/// ~0.83 recall@100 on Cohere-1M REGARDLESS of width, a dial that
+/// widened without deepening. The per-fragment gate still clamps to
+/// each fragment's real run count. FILTERED queries keep their own fine
+/// floors (already applied to `routing` by the base branch) and never
+/// engage `sweep_width`: a sparse allow-set's shortlist divided across
+/// cells starves. `populated_cells` clamps the width the budget divide
+/// splits by — never more than the cells that actually carry postings.
+fn apply_width_pin(
+    routing: &mut CellRoutingParams,
+    caller_nprobe: Option<usize>,
+    law_width: Option<usize>,
+    filtered: bool,
+    populated_cells: usize,
+) -> Option<usize> {
+    if let Some(nprobe) = caller_nprobe {
+        routing.nprobe_min = nprobe;
+        routing.nprobe_max = nprobe;
+        if filtered {
+            return None;
+        }
+        routing.fine_nprobe = usize::MAX;
+        Some(nprobe.clamp(1, populated_cells))
+    } else if let Some(width) = law_width {
+        routing.nprobe_min = width;
+        routing.nprobe_max = width;
+        routing.fine_nprobe = usize::MAX;
+        Some(width.min(populated_cells))
+    } else {
+        None
+    }
+}
+
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     // Total order over hits: distance ascending, then the unique
     // `(superfile, local_doc_id)` key. The tie-break makes the kept set
@@ -2947,10 +2964,10 @@ mod tests {
 
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
-        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, postings_by_cell_from_summaries,
-        projection_is_id_score_only, score_fine_candidates, union_cell_selection,
-        vector_read_query_error,
+        admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
+        postings_by_cell_from_summaries, projection_is_id_score_only, score_fine_candidates,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2963,7 +2980,10 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::{ClusterCentroids, list::PartitionStrategy},
+            manifest::{
+                ClusterCentroids,
+                list::{CellRoutingParams, PartitionStrategy},
+            },
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -4245,6 +4265,50 @@ mod tests {
              {k} exact neighbors across three cells — caller nprobe is an \
              override, never discarded"
         );
+    }
+
+    /// [`apply_width_pin`] semantics, all four arms. Depth MUST ride the
+    /// width on unfiltered pins — a widened sweep at the persisted
+    /// fine-first depth reads only each cell's first runs and caps recall
+    /// regardless of width (measured ~0.83 on Cohere-1M at any nprobe).
+    #[test]
+    fn width_pin_lifts_fine_depth_on_unfiltered_overrides() {
+        let base = CellRoutingParams {
+            nprobe_min: 1,
+            nprobe_max: 1,
+            fine_nprobe: 6,
+            ..CellRoutingParams::default()
+        };
+
+        // Unfiltered caller nprobe: width pinned, depth lifted, sweep
+        // engaged (clamped to populated cells).
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, Some(64), None, false, 40);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (64, 64));
+        assert_eq!(r.fine_nprobe, usize::MAX, "depth rides the pin");
+        assert_eq!(sweep, Some(40), "sweep width clamps to populated cells");
+
+        // Filtered caller nprobe: width pinned, but the filtered fine
+        // floor is preserved and the width machinery stays disengaged.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, Some(64), None, true, 40);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (64, 64));
+        assert_eq!(r.fine_nprobe, 6, "filtered floors untouched by the pin");
+        assert_eq!(sweep, None, "filtered sweeps keep pre-width budget");
+
+        // Law width (no caller override): same pin + depth as an explicit
+        // unfiltered nprobe.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, None, Some(45), false, 256);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (45, 45));
+        assert_eq!(r.fine_nprobe, usize::MAX, "depth rides the law");
+        assert_eq!(sweep, Some(45));
+
+        // Nothing pinned: routing untouched.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, None, None, false, 256);
+        assert_eq!(r, base);
+        assert_eq!(sweep, None);
     }
 
     /// A clean drain calibrates the probe-width law from the table's own
