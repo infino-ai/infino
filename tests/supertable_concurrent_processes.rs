@@ -105,7 +105,7 @@ async fn two_handles_concurrent_commits_both_succeed_via_occ_retry() {
             .expect("open");
     assert_eq!(consumer.manifest_id(), 2);
     assert_eq!(
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
         2,
         "post-open consumer sees both writers' superfiles"
     );
@@ -167,14 +167,14 @@ async fn three_handles_concurrent_commits_all_succeed() {
         3,
         "three concurrent commits must result in manifest_id = 3"
     );
-    assert_eq!(consumer.reader().n_superfiles(), 3);
+    assert_eq!(consumer.reader().expect("reader").n_superfiles(), 3);
 
     // Verify all three writers' superfiles are present by
     // counting distinct superfile URIs — the supertable injects
     // `_id` values via its monotonic generator, so we can't
     // assert specific id values across writer processes (each
     // gets its own random worker_id).
-    let reader = consumer.reader();
+    let reader = consumer.reader().expect("reader");
     let segs = reader.manifest().get_all_superfiles();
     let uris: std::collections::HashSet<_> = segs.iter().map(|s| s.uri.0).collect();
     assert_eq!(
@@ -232,7 +232,7 @@ async fn retry_winner_sees_loser_superfiles_in_final_manifest() {
     // at manifest_id = 1 only sees its own superfile (pre-retry
     // state, never refreshed).
     for st in [&st_a, &st_b] {
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         if r.manifest_id() == 2 {
             assert_eq!(
                 r.n_superfiles(),
@@ -285,7 +285,7 @@ fn sequential_commits_across_handles_no_retry_needed() {
     }
     assert_eq!(st_b.manifest_id(), 2);
     assert_eq!(
-        st_b.reader().n_superfiles(),
+        st_b.reader().expect("reader").n_superfiles(),
         2,
         "B sees both A's and B's superfiles"
     );

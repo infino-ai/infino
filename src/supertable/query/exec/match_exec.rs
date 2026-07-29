@@ -439,6 +439,7 @@ mod tests {
 
     fn rows(st: &Supertable, sql: &str) -> usize {
         st.reader()
+            .expect("reader")
             .query_sql(sql)
             .expect("query_sql")
             .iter()
@@ -496,6 +497,7 @@ mod tests {
         let st = demo();
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT * FROM token_match('title', 'rust')")
             .expect("query_sql");
         let b = &batches[0];
@@ -509,12 +511,14 @@ mod tests {
         let st = demo();
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM token_match('title')")
                 .is_err(),
             "token_match needs >= 2 args"
         );
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM exact_match('title')")
                 .is_err(),
             "exact_match needs 2 args"
@@ -524,7 +528,7 @@ mod tests {
     #[test]
     fn public_methods_agree_with_tvfs() {
         let st = demo();
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let method = reader
             .token_match("title", "rust systems", BoolMode::And)
             .expect("token_match");
@@ -540,6 +544,7 @@ mod tests {
     fn explain(st: &Supertable, sql: &str) -> String {
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(&format!("EXPLAIN {sql}"))
             .expect("explain");
         let mut out = String::new();
@@ -580,7 +585,7 @@ mod tests {
     /// schemas a `MatchExec` needs, from a committed demo table.
     fn reader_and_schemas() -> (Arc<SupertableReader>, Arc<Schema>, Arc<Schema>) {
         let st = demo();
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         (reader, scalar_schema, output_schema)
@@ -703,7 +708,7 @@ mod tests {
         // SQL layer. A live reader keeps the WeakReader upgrade-able.
         use crate::supertable::query::exec::common::test_support::call_tvf;
         let st = demo();
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         let tf = TokenMatchFunc::new(Arc::clone(&reader), Arc::clone(&scalar_schema));
         // 1 arg → error; 2 args → ok.
@@ -724,7 +729,7 @@ mod tests {
         use crate::supertable::query::exec::common::test_support::call_tvf;
 
         let st = demo();
-        let reader = Arc::new(st.reader());
+        let reader = Arc::new(st.reader().expect("reader"));
         let scalar_schema = reader.options().scalar_schema();
         let func = TokenMatchFunc::new(reader, scalar_schema);
         let table = call_tvf(&func, &[lit("title"), lit("rust")]).expect("match table");
@@ -744,6 +749,7 @@ mod tests {
         // Non-string column literal.
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM token_match(5, 'rust')")
                 .is_err(),
             "non-string column must error"
@@ -751,6 +757,7 @@ mod tests {
         // Bad mode value (third arg).
         assert!(
             st.reader()
+                .expect("reader")
                 .query_sql("SELECT _id FROM token_match('title', 'rust', 'xor')")
                 .is_err(),
             "invalid bool mode must error"

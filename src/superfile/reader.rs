@@ -954,6 +954,7 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
+                global_idf: None,
             },
             k,
             f32::NEG_INFINITY,
@@ -1081,6 +1082,17 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.term_df(column, token).await?)
+    }
+
+    /// Document frequency of each of `tokens` in `column`, in input order
+    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
+    /// resolves the whole set with one FST parse and one coalesced header
+    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_dfs(column, tokens).await?)
     }
 
     /// Two-pass exact match of a **raw string** `value` against
@@ -1232,6 +1244,7 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
+            None,
         )
         .await
     }
@@ -1246,6 +1259,7 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        global_idf: Option<&fts_reader::GlobalTermIdf>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
@@ -1258,6 +1272,7 @@ impl SuperfileReader {
                 doc_id_start,
                 doc_id_end,
                 floor,
+                global_idf,
             )
             .await?)
     }
@@ -2250,6 +2265,7 @@ mod tests {
                 0,
                 4,
                 1e9,
+                None,
             )
             .await
             .expect("floored ranged search");

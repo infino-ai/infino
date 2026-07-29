@@ -469,9 +469,11 @@ impl Connection {
                 handles,
                 building,
             } => {
-                // Warm path: lock-free sharded lookup, no serialization.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
+                // Warm path: lock-free sharded lookup, no serialization. A
+                // handle purged elsewhere is dropped here, so the cold path
+                // re-resolves it against the catalog.
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
                 }
 
                 // Cold path: build once under the gate. Blocks here if a
@@ -481,8 +483,8 @@ impl Connection {
                 let _built = gate.lock().expect("catalog build gate poisoned");
 
                 // A peer may have built it while we waited on the gate.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
                 }
 
                 let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
@@ -971,6 +973,22 @@ fn build_disk_cache(
     Ok(Some(cache))
 }
 
+/// The cached handle for `name`, or `None` (after evicting it) if its table was
+/// dropped and purged elsewhere — `handles` is per-process, so such a drop never
+/// reaches it. The `Ref` is dropped before `remove`, which would else deadlock.
+fn live_handle(
+    handles: &DashMap<String, SupertableHandle>,
+    name: &str,
+) -> Option<SupertableHandle> {
+    let entry = handles.get(name)?;
+    if !entry.pointer_vanished() {
+        return Some(entry.clone());
+    }
+    drop(entry);
+    handles.remove(name);
+    None
+}
+
 /// The per-name single-flight gate, created on first use. Returned as an owned
 /// `Arc` (not a `DashMap` reference) so the caller locks it *after* the map
 /// access returns, never holding a shard across the build's blocking I/O.
@@ -1053,14 +1071,21 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, sync::Arc, thread};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+    };
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
 
     use super::*;
     use crate::{
-        BoolMode,
+        Bm25SearchOptions, BoolMode,
+        supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -1108,7 +1133,7 @@ mod tests {
         // Re-open by name and search.
         let reopened = conn.open_table("docs").expect("open_table");
         let hits = reopened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox'");
 
@@ -1132,7 +1157,7 @@ mod tests {
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
         let ascii_hits = ascii
-            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
@@ -1151,7 +1176,7 @@ mod tests {
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
         let hits = std_tbl
-            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
@@ -1211,7 +1236,7 @@ mod tests {
             .expect("append");
 
         let title_cafe = table
-            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("title search");
         assert_eq!(
             n_rows(&title_cafe),
@@ -1220,7 +1245,7 @@ mod tests {
         );
 
         let body_cafe = table
-            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
@@ -1228,7 +1253,7 @@ mod tests {
         // The ascii_lower column is genuinely indexed (not empty): an
         // ASCII term still matches there.
         let body_latte = table
-            .bm25_search("body", "latte", TOP_K, BoolMode::Or, None)
+            .bm25_search("body", "latte", TOP_K, Bm25SearchOptions::new(), None)
             .expect("body search");
         assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
     }
@@ -1266,7 +1291,7 @@ mod tests {
         let conn2 = connect(&uri).expect("reconnect");
         let table = conn2.open_table("docs").expect("open_table");
         let title_cafe = table
-            .bm25_search("title", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("title search");
         assert_eq!(
             n_rows(&title_cafe),
@@ -1274,7 +1299,7 @@ mod tests {
             "standard column still matches non-ASCII after reopen"
         );
         let body_cafe = table
-            .bm25_search("body", "café", TOP_K, BoolMode::Or, None)
+            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
             .map(|h| n_rows(&h))
             .unwrap_or(0);
         assert_eq!(
@@ -1343,7 +1368,7 @@ mod tests {
 
         // Starts empty.
         let before = opened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search on empty table");
         assert_eq!(n_rows(&before), 0, "freshly opened table starts empty");
 
@@ -1353,7 +1378,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append via reopened handle");
         let hits = opened
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search after append");
         assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
     }
@@ -1427,6 +1452,386 @@ mod tests {
             cold_after_q2, cold_after_q1,
             "second query must reuse the warm disk cache, not cold-fetch again"
         );
+    }
+
+    /// Every `_supertable/current` pointer file under `root`, recursively — the
+    /// on-storage evidence that a supertable exists.
+    fn pointer_files(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(pointer_files(&path));
+            } else if path.ends_with(POINTER_PATH) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// Two connections over one storage root, the shape of a database served by
+    /// more than one process. One drops and purges a table; the other has it warm
+    /// in its per-process handle cache, which the drop never reaches, and must
+    /// stop serving it rather than answer from deleted superfiles forever.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_peer_connections_warm_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Warm the peer's handle cache, and confirm it really is serving.
+        assert_eq!(count_rows(&peer, "docs"), 1, "peer reads the seeded row");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // The next freshness probe discovers the deletion, and it runs inside
+        // the query path after the cached handle was taken — so this call is the
+        // trigger and recovery lands on the one after it.
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .open_table("docs")
+            .expect_err("the purged table must not open");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        // `query_sql` reports the planner's failure to resolve the relation,
+        // not our typed `NotFound` — an unregistrable name is skipped during
+        // registration (it may be a CTE or a TVF argument), so the refusal
+        // surfaces one layer up. The typed assertion is on `open_table` above;
+        // what matters here is that the message is a missing *table* and not a
+        // fetch of a purged superfile off the stale manifest, which is exactly
+        // how this failed before.
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("docs") && !msg.contains(".sf.parquet"),
+            "expected a missing-table error naming docs, got {err:?}"
+        );
+    }
+
+    /// The purge seen from a table handle the caller is *holding*, rather than
+    /// re-resolving by name — and with a disk cache, which is what makes this
+    /// the sharpest case.
+    ///
+    /// Re-resolving recovers, because the catalog drops the dead handle and
+    /// rebuilds. A held handle has no name to re-resolve, and the freshness
+    /// probe inside it swallows errors by design, so nothing stops the read:
+    /// the pinned manifest still names the purged superfiles and the cache
+    /// still holds their bytes, so every search answers — correctly shaped,
+    /// from a table that no longer exists — for as long as the handle lives.
+    /// Storage never gets asked, so the deletion cannot surface on its own.
+    #[test]
+    fn storage_reads_on_a_purged_handle_refuse_instead_of_serving_cached_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect_with(&uri, ConnectOptions::new().with_cache_dir(cache.path()))
+            .expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Read once through the held handle so the superfile bytes are resident
+        // in the peer's disk cache — the state that lets a purged table keep
+        // answering without ever touching storage again.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        assert_eq!(
+            n_rows(
+                &peer_table
+                    .bm25_search("title", "quick", TOP_K, Bm25SearchOptions::new(), None)
+                    .expect("warm read")
+            ),
+            1,
+            "peer reads the seeded row, warming its cache"
+        );
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Every read verb, twice: the first trips the probe that discovers the
+        // purge, and the second proves the refusal is latched rather than a
+        // one-shot side effect of that discovery.
+        for attempt in 0..2 {
+            let err = peer_table
+                .bm25_search("title", "quick", TOP_K, Bm25SearchOptions::new(), None)
+                .expect_err("bm25_search on a purged table must not return rows");
+            assert!(
+                matches!(err, InfinoError::NotFound(_)),
+                "attempt {attempt}: expected NotFound, got {err:?}"
+            );
+            for err in [
+                peer_table
+                    .token_match("title", "quick", BoolMode::Or, None)
+                    .expect_err("token_match must refuse"),
+                peer_table
+                    .exact_match("title", "the quick brown fox", None)
+                    .expect_err("exact_match must refuse"),
+                peer_table
+                    .count("title", "quick", BoolMode::Or)
+                    .expect_err("count must refuse"),
+            ] {
+                assert!(
+                    matches!(err, InfinoError::NotFound(_)),
+                    "attempt {attempt}: expected NotFound, got {err:?}"
+                );
+            }
+        }
+
+        // Mutations refuse at predicate resolution, before writing any WAL
+        // state, and report the same missing table rather than a backend fault.
+        let err = peer_table
+            .delete(col("_id").eq(lit(1_i64)))
+            .expect_err("delete on a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// The same stale handle, written to rather than read from. A commit fences
+    /// on the pointer's etag, and an absent pointer used to mean "initial
+    /// commit" — republishing one from the stale manifest and resurrecting the
+    /// table under a name the catalog no longer lists. Hence the assertion on
+    /// storage state, not just on the error.
+    #[test]
+    fn storage_append_on_a_purged_handle_refuses_and_republishes_no_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Write once through the peer, so its handle carries real manifest state.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the purge should leave no pointer behind"
+        );
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must fail");
+        // The same answer the read path gives. It has to survive the commit →
+        // build → mutation-commit error hops the append path takes, or a caller
+        // sees an indistinguishable backend fault and retries — and every retry
+        // uploads another superfile before reaching the fence that refuses it.
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the refused append must not republish a pointer (resurrecting the \
+             dropped table as unreachable, unreclaimable data): {err:?}"
+        );
+        assert!(
+            writer.list_tables().expect("list").is_empty(),
+            "the table stays dropped"
+        );
+    }
+
+    /// The write-only twin of the read-path recovery. A handle that has never
+    /// served a read has never run a freshness probe, so the commit's pointer
+    /// fence is the only thing that can notice the purge — and unless that
+    /// observation latches, the catalog goes on serving the dead handle from
+    /// cache and every later append fences against a location a re-create has
+    /// already replaced. Correctly refusing forever is still broken.
+    #[test]
+    fn storage_appends_recover_after_a_peer_drop_and_recreate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["seeded"]))
+            .expect("append");
+
+        // The peer only ever writes — no query, so no freshness probe.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        // The name comes back at a fresh location. Re-resolving through the
+        // connection must rebuild rather than hand back the dead handle.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        peer.open_table("docs")
+            .expect("peer re-opens the re-created table")
+            .append(&build_title_batch(&["peer writes again"]))
+            .expect("a write-only peer must recover after the re-create");
+        assert_eq!(
+            count_rows(&writer, "docs"),
+            2,
+            "the new generation holds its own row plus the peer's"
+        );
+    }
+
+    /// Drop-then-recreate through different connections: the name is back, but at
+    /// a fresh location, so the peer must rebuild rather than serve the old rows.
+    #[test]
+    fn storage_recreated_table_after_a_peer_drop_reads_the_new_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+        assert_eq!(count_rows(&peer, "docs"), 3, "peer warms on the old table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        // Trip the peer's freshness probe (see the read-path test above).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table, not serve the \
+             dropped generation's rows"
+        );
+    }
+
+    /// The same purge, against a peer handle that has never served a read.
+    ///
+    /// Freshness is discovered by re-probing the pointer, and the probe carries
+    /// the etag of the last one read — which only a previous probe sets. So a
+    /// handle built but not yet queried has no etag, and neither does one on a
+    /// backend that omits them. Keying "did we have a pointer?" on that etag
+    /// therefore reads this deletion as "nothing newer to load", and since the
+    /// miss also leaves the etag unset, every later probe repeats it: the
+    /// handle serves the purged table off its in-memory manifest for as long
+    /// as the process lives, and a re-create never reaches it either. The
+    /// pointer's absence is what makes it fatal — not our record of it.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_handle_that_never_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+
+        // Warm the peer's handle cache *without* querying through it, so no
+        // freshness probe has run and no pointer etag has been recorded.
+        peer.open_table("docs").expect("peer opens the table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Trip the probe (it runs inside the query path, after the cached
+        // handle has been taken — so recovery lands on the call after it).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        assert!(
+            !err.to_string().contains(".sf.parquet"),
+            "the peer must report the table gone, not fail fetching a purged \
+             superfile off its stale manifest: {err:?}"
+        );
+
+        // And the handle is genuinely replaced, not just poisoned: a re-create
+        // under the same name is visible to this connection.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table"
+        );
+    }
+
+    /// The premise the read-path check rests on: `create` publishes a pointer
+    /// before any writer runs, so a table with nothing appended to it still has
+    /// one and reads as empty. That is what makes an *absent* pointer
+    /// unambiguous — never "not committed yet", always "deleted under us".
+    #[test]
+    fn storage_table_with_no_appends_still_reads_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        assert_eq!(
+            count_rows(&conn, "docs"),
+            0,
+            "an unwritten table reads empty"
+        );
+        conn.open_table("docs")
+            .expect("an unwritten table still opens");
+
+        // And from a second connection, which builds its handle from scratch.
+        let peer = connect(&uri).expect("connect peer");
+        assert_eq!(count_rows(&peer, "docs"), 0);
     }
 
     /// A server holds one `Connection` and fans out concurrent queries. Many
@@ -1816,7 +2221,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &first
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             1
@@ -1832,7 +2237,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &second
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -1869,7 +2274,7 @@ mod tests {
         assert_eq!(
             n_rows(
                 &docs
-                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
                     .expect("search")
             ),
             0,
@@ -2457,7 +2862,7 @@ mod tests {
             .append(&build_title_batch(&["the quick brown fox"]))
             .expect("append");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("search");
         assert_eq!(n_rows(&hits), 1);
         // The disk cache got a per-table subdirectory.
@@ -2666,7 +3071,7 @@ mod tests {
         assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
         let table = conn.open_table("docs").expect("open_table");
         let hits = table
-            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
@@ -2719,7 +3124,7 @@ mod tests {
         assert!(err.to_string().contains("update:"), "got: {err}");
 
         let err = posts
-            .bm25_search("title", "-onlyneg", TOP_K, BoolMode::Or, None)
+            .bm25_search("title", "-onlyneg", TOP_K, Bm25SearchOptions::new(), None)
             .expect_err("negation-only query");
         assert!(matches!(err, InfinoError::Query(_)));
         assert!(err.to_string().contains("bm25_search:"), "got: {err}");

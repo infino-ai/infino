@@ -154,6 +154,7 @@ fn csv_one_hot(active: usize) -> String {
 fn explain_text(st: &Supertable, sql: &str) -> String {
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql(&format!("EXPLAIN {sql}"))
         .expect("explain");
     let mut out = String::new();
@@ -232,7 +233,11 @@ fn star_projection_materializes_scalar_columns_for_every_tvf() {
         format!("SELECT * FROM hybrid_search('title', 'rust', 'emb', '{qv}', {SURFACE_TOP_K})"),
     ];
     for q in &queries {
-        let batches = st.reader().query_sql(q).expect("star query");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(q)
+            .expect("star query");
         let b = &batches[0];
         // _id, title, rating, score — the vector column is never exposed.
         assert_eq!(b.schema().field(0).name(), "_id", "{q}");
@@ -254,6 +259,7 @@ fn order_by_and_limit_wrap_the_tvf_scan() {
     let st = demo_table();
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql(&format!(
             "SELECT _id, score FROM bm25_search('title', 'rust', {SURFACE_TOP_K}) \
              ORDER BY score DESC LIMIT 3"
@@ -270,6 +276,7 @@ fn filter_on_materialized_scalar_above_tvf() {
     let st = demo_table();
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql(&format!(
             "SELECT _id, rating FROM bm25_search('title', 'rust', {SURFACE_TOP_K}) \
              WHERE rating >= 8"
@@ -297,6 +304,7 @@ fn base_table_scan_supports_aggregates_and_projection() {
     let st = demo_table();
     let total = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("count");
     let n = total[0]
@@ -310,6 +318,7 @@ fn base_table_scan_supports_aggregates_and_projection() {
     // SUM over the full table equals the closed form 0+1+..+15.
     let sum = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT SUM(rating) AS s FROM supertable")
         .expect("sum");
     let s = sum[0]
@@ -324,6 +333,7 @@ fn base_table_scan_supports_aggregates_and_projection() {
     // Projection + ORDER BY + LIMIT over the base table.
     let top = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT title, rating FROM supertable ORDER BY rating DESC LIMIT 2")
         .expect("ordered projection");
     assert!(row_count(&top) <= 2, "LIMIT 2 caps the projection");

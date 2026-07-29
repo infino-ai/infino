@@ -6,7 +6,7 @@
 //! ## Public API
 //!
 //! ```ignore
-//! let reader = supertable.reader();
+//! let reader = supertable.reader().expect("reader");
 //! let batches: Vec<RecordBatch> =
 //!     reader.query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")?;
 //! ```
@@ -402,7 +402,7 @@ impl Supertable {
         name: &str,
     ) -> Result<Arc<SupertableReader>, QueryError> {
         self.ensure_fresh();
-        let reader = Arc::new(self.reader());
+        let reader = Arc::new(self.reader().map_err(QueryError::ManifestLoad)?);
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
@@ -582,7 +582,11 @@ mod tests {
     /// Convenience: run a query and pull a single `Int64` aggregate
     /// value from cell (0,0).
     fn run_count(st: &Supertable, sql: &str) -> i64 {
-        let batches = st.reader().query_sql(sql).expect("query_sql ok");
+        let batches = st
+            .reader()
+            .expect("reader")
+            .query_sql(sql)
+            .expect("query_sql ok");
         assert!(!batches.is_empty(), "expected at least one result batch");
         let n = batches[0]
             .column(0)
@@ -658,7 +662,7 @@ mod tests {
             .append(&build_cat_batch(0, &["rust"], &["searchable"]))
             .expect("append");
         writer.commit().expect("commit");
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let scalar_sql = "SELECT COUNT(*) FROM supertable";
 
         reader.query_sql(scalar_sql).expect("first scalar query");
@@ -792,6 +796,7 @@ mod tests {
 
         let err = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")
             .expect_err("0-byte gate refuses the aggregate");
 
@@ -807,6 +812,7 @@ mod tests {
 
         let rows: usize = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM supertable")
             .expect("a streaming scan is not gated")
             .iter()
@@ -830,6 +836,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(
                 "SELECT category, COUNT(*) AS n FROM supertable \
                  GROUP BY category ORDER BY category",
@@ -882,6 +889,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category FROM supertable GROUP BY category")
             .expect("group-by");
         let col = batches[0].column(0);
@@ -907,6 +915,7 @@ mod tests {
         let st = seeded(&["rust", "go", "python"], &["a", "b", "c"]);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category FROM supertable ORDER BY category")
             .expect("order-by");
         let col = batches[0]
@@ -925,6 +934,7 @@ mod tests {
         let st = seeded(&["rust", "rust", "go", "go"], &["b", "a", "d", "c"]);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(
                 "SELECT category, MIN(title) AS m FROM supertable \
                  GROUP BY category ORDER BY category",
@@ -953,6 +963,7 @@ mod tests {
         let st = seeded(&["rust", "go", "python"], &["a", "b", "c"]);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT MIN(category) AS m FROM supertable")
             .expect("ungrouped min");
         let col = batches[0]
@@ -1048,6 +1059,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category FROM supertable")
             .expect("select");
         let col = batches[0]
@@ -1100,6 +1112,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category FROM supertable GROUP BY category")
             .expect("group-by");
         assert_eq!(
@@ -1117,6 +1130,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category AS c FROM supertable GROUP BY c ORDER BY c")
             .expect("alias");
         let col = batches[0]
@@ -1136,6 +1150,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(
                 "WITH t AS (SELECT category FROM supertable) \
                  SELECT category FROM t GROUP BY category ORDER BY category",
@@ -1157,6 +1172,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(
                 "SELECT category FROM (SELECT category FROM supertable) sub \
                  GROUP BY category ORDER BY category",
@@ -1192,6 +1208,7 @@ mod tests {
         let st = seeded(&vals, &titles);
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT category FROM supertable GROUP BY category ORDER BY category")
             .expect("group-by over layout-stressing values");
         let col = batches[0]
@@ -1224,6 +1241,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT DISTINCT category FROM supertable ORDER BY category")
             .expect("distinct");
         let col = batches[0]
@@ -1243,6 +1261,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(
                 "SELECT a.category AS cat FROM supertable a \
                  JOIN supertable b ON a.category = b.category \
@@ -1276,6 +1295,7 @@ mod tests {
 
         let batches = table
             .reader()
+            .expect("reader")
             .query_sql(
                 "SELECT category, COUNT(*) AS n FROM supertable \
                  GROUP BY category ORDER BY category NULLS FIRST",
@@ -1313,7 +1333,7 @@ mod tests {
             .expect("a3");
         w.commit().expect("c3");
 
-        assert_eq!(st.reader().n_superfiles(), 3);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
         let n_total = run_count(&st, "SELECT COUNT(*) FROM supertable");
         assert_eq!(n_total, 5);
@@ -1343,7 +1363,7 @@ mod tests {
         w.append(&build_cat_batch(20, &["z"], &["charlie"]))
             .expect("a3");
         w.commit().expect("c3");
-        assert_eq!(st.reader().n_superfiles(), 3);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
         assert_eq!(
             run_count(&st, "SELECT COUNT(*) FROM supertable WHERE title = 'bravo'"),
@@ -1372,7 +1392,7 @@ mod tests {
         w.append(&build_cat_batch(10, &["lang"], &["python data science"]))
             .expect("a2");
         w.commit().expect("c2");
-        assert_eq!(st.reader().n_superfiles(), 2);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
 
         assert_eq!(
             run_count(
@@ -1419,6 +1439,7 @@ mod tests {
         );
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT title FROM supertable WHERE title = 'rust async'")
             .expect("query");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1571,6 +1592,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT _id FROM supertable ORDER BY _id")
             .expect("query");
         let ids: Vec<i128> = batches
@@ -1602,6 +1624,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
@@ -1634,6 +1657,7 @@ mod tests {
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let err = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT NOT_A_REAL_FN(*) FROM supertable")
             .expect_err("expected a plan error");
         assert!(
@@ -1724,6 +1748,7 @@ mod tests {
 
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT * FROM supertable LIMIT 1")
             .expect("query");
         let schema = batches[0].schema();
@@ -1743,6 +1768,7 @@ mod tests {
 
         let err = st
             .reader()
+            .expect("reader")
             .query_sql("SELECT emb FROM supertable")
             .expect_err("vector column should not be in the SQL schema");
         assert!(

@@ -21,7 +21,7 @@ mod remote_example {
     use std::{error::Error, sync::Arc};
 
     use infino::{
-        BoolMode, IndexSpec,
+        Bm25SearchOptions, IndexSpec,
         arrow_array::{Int32Array, LargeStringArray, RecordBatch},
         arrow_schema::{DataType, Field, Schema},
         connect,
@@ -58,7 +58,13 @@ mod remote_example {
         posts.append(&batch)?;
         println!("appended {} rows", batch.num_rows());
 
-        let hits = posts.bm25_search("body", "cancel", 10, BoolMode::Or, Some(&["_id", "body"]))?;
+        let hits = posts.bm25_search(
+            "body",
+            "cancel",
+            10,
+            Bm25SearchOptions::new(),
+            Some(&["_id", "body"]),
+        )?;
         let matched: usize = hits.iter().map(RecordBatch::num_rows).sum();
         println!("bm25_search('cancel') matched {matched} rows");
 

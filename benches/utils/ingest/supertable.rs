@@ -563,7 +563,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     }
     drop(w);
     crate::rss::log_rss_breakdown("ingest writer dropped");
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let n_superfiles = reader.n_superfiles();
     let total_index_bytes: u64 = reader
         .manifest()
@@ -699,7 +699,7 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
     let opts = options_for(modality, Some(Arc::clone(&fixture.storage))).with_disk_cache(cache);
     let st =
         Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let (n_superfiles, total_index_bytes) = reader
         .load_superfile_storage_stats()
         .expect("load existing supertable manifest entries");

@@ -86,7 +86,7 @@ fn default_strategy_is_ingestion_time_with_one_day_granularity() {
         w.commit().expect("commit");
     }
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(
@@ -126,7 +126,7 @@ fn rewrite_path_produces_fresh_part_id_per_commit() {
         w.append(&build_title_batch(&["x"])).expect("append");
         w.commit().expect("commit");
         let m_id = {
-            let r = st.reader();
+            let r = st.reader().expect("reader");
             let m = r.manifest();
             let list_entries = m.get_all_list_entries();
             list_entries[0].part_id
@@ -161,7 +161,7 @@ fn target_superfiles_per_partition_triggers_part_split() {
         w.commit().expect("commit");
     }
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(
@@ -307,7 +307,7 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
         w.commit()
             .expect("TimeRange commit must succeed for a single-bucket batch");
     }
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(

@@ -49,7 +49,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::BoolMode,
+        fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -206,6 +206,7 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
     .expect("open consumer");
     let _ = consumer
         .reader()
+        .expect("reader")
         .bm25_hits("title", "common", K, BoolMode::Or)
         .expect("prewarm");
     consumer
@@ -309,7 +310,7 @@ fn time_p50(mut f: impl FnMut()) -> (Duration, u64) {
 #[ignore = "perf microbench, not a correctness gate"]
 fn fanout_floor_decomposition() {
     let (st, _guards) = build_supertable();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     // The writer row-shards each commit (cpus/2 shards), so the real
     // segment count is a multiple of the commit count — report it.
     let n_segments = reader.n_superfiles();
@@ -384,7 +385,14 @@ fn fanout_floor_decomposition() {
         // arithmetic `_id` resolve, no Parquet involvement.
         let (ids_p50, ids_flt) = time_p50(|| {
             let b = reader
-                .bm25_search("title", term, K, BoolMode::Or, None)
+                .bm25_search(
+                    "title",
+                    term,
+                    K,
+                    BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("bm25_search");
             std::hint::black_box(b);
         });
@@ -398,6 +406,7 @@ fn fanout_floor_decomposition() {
                     term,
                     K,
                     BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
                     Some(&["_id", "title", "score"]),
                 )
                 .expect("bm25_search");

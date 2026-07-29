@@ -31,8 +31,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError, InfinoError as CoreError,
-    Metric, OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, Bm25Stats, BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions,
+    GcError, InfinoError as CoreError, Metric, OptimizeError, OptimizeOptions, VectorFilter,
+    VectorSearchOptions,
 };
 
 // Typed exception surface for the bindings. `InfinoError` is the base for every
@@ -444,7 +445,15 @@ impl Table {
     ///
     /// `score` is a similarity (higher is better) — opposite direction
     /// from `vector_search`'s distance. Fuse with `hybrid_search`.
-    #[pyo3(signature = (column, query, k, mode=None, projection=None))]
+    ///
+    /// `stats` selects the BM25 corpus statistics: `"per_superfile"`
+    /// (default) scores each segment against its own local document
+    /// count and term frequencies — fastest, but ranking drifts as the
+    /// table fragments across many segments. `"global"` scores against
+    /// table-wide statistics gathered across all segments, so a
+    /// fragmented table ranks like a single unified corpus (the accurate
+    /// choice) at the cost of an extra statistics-gathering pass.
+    #[pyo3(signature = (column, query, k, mode=None, projection=None, stats=None))]
     fn bm25_search<'py>(
         &self,
         py: Python<'py>,
@@ -453,13 +462,16 @@ impl Table {
         k: usize,
         mode: Option<&str>,
         projection: Option<Vec<String>>,
+        stats: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mode = parse_mode(mode)?;
+        let opts = Bm25SearchOptions::new()
+            .with_mode(parse_mode(mode)?)
+            .with_stats(parse_stats(stats)?);
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
                 self.inner
-                    .bm25_search(column, query, k, mode, names.as_deref())
+                    .bm25_search(column, query, k, opts, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -767,6 +779,20 @@ fn parse_mode(mode: Option<&str>) -> PyResult<BoolMode> {
         "and" => Ok(BoolMode::And),
         other => Err(PyValueError::new_err(format!(
             "mode must be 'or' or 'and', got {other:?}"
+        ))),
+    }
+}
+
+fn parse_stats(stats: Option<&str>) -> PyResult<Bm25Stats> {
+    match stats
+        .unwrap_or("per_superfile")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "per_superfile" => Ok(Bm25Stats::PerSuperfile),
+        "global" => Ok(Bm25Stats::Global),
+        other => Err(PyValueError::new_err(format!(
+            "stats must be 'per_superfile' or 'global', got {other:?}"
         ))),
     }
 }

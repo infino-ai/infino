@@ -758,7 +758,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BoolMode,
+        Bm25Stats, BoolMode,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         memory::ConnectionMemoryBudget,
         supertable::{
@@ -1058,7 +1058,7 @@ mod tests {
         commit_titles(&st, &["alpha first", "alpha second"]);
         commit_titles(&st, &["bravo first", "bravo second"]);
 
-        let entries = st.reader().manifest().superfiles.clone();
+        let entries = st.reader().expect("reader").manifest().superfiles.clone();
         assert_eq!(entries.len(), 2);
         let (entry_a, entry_b) = (&entries[0], &entries[1]);
 
@@ -1135,7 +1135,7 @@ mod tests {
         commit_titles(&st, &["india first", "india second"]);
         commit_titles(&st, &["juliet first", "juliet second"]);
 
-        let entries = st.reader().manifest().superfiles.clone();
+        let entries = st.reader().expect("reader").manifest().superfiles.clone();
         let crashed_entry = &entries[0];
 
         // Simulate a compactor that sealed this file and then died
@@ -1172,6 +1172,7 @@ mod tests {
         // 9 unsealed siblings merged around it.
         let still_stuck = st
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -1326,7 +1327,7 @@ mod tests {
         }
 
         // Get the superfiles to merge
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
             .get_all_superfiles()
@@ -1369,7 +1370,7 @@ mod tests {
             w.commit().expect("commit");
         }
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
             .get_all_superfiles()
@@ -1460,7 +1461,7 @@ mod tests {
             w.commit().expect("commit");
         }
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
             .get_all_superfiles()
@@ -1545,7 +1546,7 @@ mod tests {
         opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
         let st = Supertable::create(opts).expect("reopen supertable");
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
 
         match st.merge_superfiles(&superfiles).await {
@@ -1572,7 +1573,7 @@ mod tests {
             w.commit().expect("commit");
         }
 
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let superfiles: Vec<Arc<SuperfileEntry>> = reader
             .manifest()
             .get_all_superfiles()
@@ -1755,7 +1756,7 @@ mod tests {
             commit_titles(&st, title);
         }
 
-        let before_docs = st.reader().n_docs_total();
+        let before_docs = st.reader().expect("reader").n_docs_total();
         let st2 = st.clone();
 
         // Race a writer commit against compaction. The compactor will
@@ -1773,7 +1774,7 @@ mod tests {
 
         // All docs from both paths must be visible after refresh.
         st.refresh().await.expect("refresh");
-        let after_docs = st.reader().n_docs_total();
+        let after_docs = st.reader().expect("reader").n_docs_total();
         assert_eq!(
             after_docs,
             before_docs + 2,
@@ -1801,7 +1802,7 @@ mod tests {
         commit_titles(&st, &["romeo first", "romeo second"]);
         commit_titles(&st, &["sierra first", "sierra second"]);
 
-        let before = st.reader();
+        let before = st.reader().expect("reader");
         let before_manifest_id = before.manifest_id();
         let before_n_superfiles = before.n_superfiles();
         let input_ids: HashSet<Uuid> = before
@@ -1837,7 +1838,7 @@ mod tests {
             .await
             .expect("compact");
 
-        let after = st.reader();
+        let after = st.reader().expect("reader");
         let sfs = &after.manifest().superfiles;
 
         assert!(
@@ -1914,7 +1915,7 @@ mod tests {
         commit_titles(&st, &["only doc", "second doc"]);
 
         let before_manifest_id = st.manifest_id();
-        let before_n = st.reader().n_superfiles();
+        let before_n = st.reader().expect("reader").n_superfiles();
 
         st.compact_async(&small_compact_cfg())
             .await
@@ -1925,7 +1926,7 @@ mod tests {
             before_manifest_id,
             "manifest_id must not change: a single superfile cannot form a merge job"
         );
-        assert_eq!(st.reader().n_superfiles(), before_n);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), before_n);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1953,7 +1954,7 @@ mod tests {
             before_manifest_id,
             "manifest must not change when combined size is below the fill floor"
         );
-        assert_eq!(st.reader().n_superfiles(), 2);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1973,7 +1974,7 @@ mod tests {
         commit_titles(&st, &["juliet first", "juliet second"]);
 
         // Pin a snapshot before compaction.
-        let reader_before = st.reader();
+        let reader_before = st.reader().expect("reader");
         let before_n = reader_before.n_superfiles();
         let before_manifest_id = reader_before.manifest_id();
 
@@ -1981,7 +1982,7 @@ mod tests {
             .await
             .expect("compact");
 
-        let reader_after = st.reader();
+        let reader_after = st.reader().expect("reader");
 
         // The pinned snapshot must be frozen — it still sees the original superfiles.
         assert_eq!(reader_before.n_superfiles(), before_n);
@@ -2072,7 +2073,7 @@ mod tests {
             "compact must have run; adjust small_compact_cfg() if needed"
         );
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let sfs = &r.manifest().superfiles;
         assert!(sfs.len() < 10, "superfile count should have decreased");
 
@@ -2128,7 +2129,7 @@ mod tests {
         assert_eq!(st.inner().manifest.load_full().superfiles.len(), 1);
 
         let after_first_manifest_id = st.manifest_id();
-        let after_first_n = st.reader().n_superfiles();
+        let after_first_n = st.reader().expect("reader").n_superfiles();
 
         // Second compact on the same data: the merged superfile is the only
         // file in its partition, so pack_partition emits no job (needs ≥ 2 inputs).
@@ -2141,7 +2142,7 @@ mod tests {
             after_first_manifest_id,
             "second compact should produce no jobs"
         );
-        assert_eq!(st.reader().n_superfiles(), after_first_n);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), after_first_n);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2171,7 +2172,7 @@ mod tests {
         let manifest_id_after_first_compact = st.manifest_id();
         assert_eq!(manifest_id_after_first_compact, before_first_compact + 1);
         assert_eq!(
-            st.reader().n_docs_total(),
+            st.reader().expect("reader").n_docs_total(),
             20,
             "batch A should have 20 docs"
         );
@@ -2202,7 +2203,7 @@ mod tests {
         );
 
         // All 40 docs must be visible after both compaction rounds.
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_docs_total(), 40, "all docs must be preserved");
         assert!(
             r.n_superfiles() < 8,
@@ -2259,6 +2260,7 @@ mod tests {
 
         let old_uris: Vec<_> = st
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -2277,7 +2279,7 @@ mod tests {
             .await
             .expect("compact");
 
-        let merged_uri = st.reader().manifest().superfiles[0].uri;
+        let merged_uri = st.reader().expect("reader").manifest().superfiles[0].uri;
         assert!(
             st.inner().options.store.reader(&merged_uri).is_ok(),
             "merged superfile must be warmed into the in-memory cache right after compact"
@@ -2423,14 +2425,28 @@ mod tests {
         measured_iters: usize,
     ) -> u128 {
         for _ in 0..warmup_iters {
-            st.bm25_search("title", query, 10, BoolMode::Or, None)
-                .expect("bm25_search warmup");
+            st.bm25_search(
+                "title",
+                query,
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25_search warmup");
         }
         let mut samples = Vec::with_capacity(measured_iters);
         for _ in 0..measured_iters {
             let start = Instant::now();
-            st.bm25_search("title", query, 10, BoolMode::Or, None)
-                .expect("bm25_search measured");
+            st.bm25_search(
+                "title",
+                query,
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25_search measured");
             samples.push(start.elapsed().as_micros());
         }
         samples.sort_unstable();
@@ -2485,8 +2501,8 @@ mod tests {
             w.commit().expect("commit");
         }
 
-        let n_before = st.reader().n_superfiles();
-        let docs_before = st.reader().n_docs_total();
+        let n_before = st.reader().expect("reader").n_superfiles();
+        let docs_before = st.reader().expect("reader").n_docs_total();
         let narrow_hits_before = latency_bench_count_hits(&st, &narrow_term);
         let broad_hits_before = latency_bench_count_hits(&st, BROAD_TERM);
         let narrow_before =
@@ -2501,11 +2517,11 @@ mod tests {
         .await
         .expect("compact");
 
-        let n_after = st.reader().n_superfiles();
+        let n_after = st.reader().expect("reader").n_superfiles();
         assert!(n_after < n_before, "compact should reduce superfile count");
 
         // No old-file double-counting: doc/hit counts must be identical.
-        assert_eq!(st.reader().n_docs_total(), docs_before);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), docs_before);
         assert_eq!(
             latency_bench_count_hits(&st, &narrow_term),
             narrow_hits_before
@@ -2563,7 +2579,7 @@ mod tests {
             commit_titles(&st, &titles);
         }
 
-        let before_n_superfiles = st.reader().n_superfiles();
+        let before_n_superfiles = st.reader().expect("reader").n_superfiles();
         let before_data_objects = storage
             .list_with_prefix_metadata("data")
             .await
@@ -2575,7 +2591,7 @@ mod tests {
             .await
             .expect("compact");
 
-        let after_n_superfiles = st.reader().n_superfiles();
+        let after_n_superfiles = st.reader().expect("reader").n_superfiles();
         assert!(
             after_n_superfiles < before_n_superfiles,
             "manifest superfile count must drop right after compact"
@@ -2635,6 +2651,7 @@ mod tests {
 
         let stranded_ids: Vec<Uuid> = st
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -2684,6 +2701,7 @@ mod tests {
         // they can never be merged, so they leak permanently.
         let remaining_ids: HashSet<Uuid> = st
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -2749,7 +2767,7 @@ mod tests {
         );
 
         // All 245760 docs must be visible after compaction.
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_docs_total(), 245760, "all docs must be preserved");
         assert!(
             r.n_superfiles() == 2,

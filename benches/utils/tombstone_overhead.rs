@@ -47,7 +47,7 @@ use arrow_array::RecordBatch;
 use chrono::Utc;
 use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         Supertable,
         wal::{
@@ -178,7 +178,7 @@ impl WorkloadState {
 /// sidecar bitmap is hit twice (idempotent union; bitmap stays
 /// the same shape but the cache's last-written etag advances).
 fn drive_tombstones(st: &Supertable, ws: &WalStore, fraction: f64, churn: bool) {
-    let manifest = st.reader().manifest().clone();
+    let manifest = st.reader().expect("reader").manifest().clone();
     let mut targets: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles().iter() {
         let n = (entry.n_docs as f64 * fraction).ceil() as i64;
@@ -244,7 +244,15 @@ fn p50(samples: &mut [Duration]) -> Duration {
 fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
         .reader()
-        .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            QUERY_TERM,
+            TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("fts");
     black_box(warm);
     let mut samples = Vec::with_capacity(ITERS);
@@ -252,11 +260,13 @@ fn measure_fts(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let hits = st
             .reader()
+            .expect("reader")
             .bm25_search(
                 black_box("title"),
                 black_box(QUERY_TERM),
                 black_box(TOP_K),
                 BoolMode::Or,
+                Bm25Stats::PerSuperfile,
                 None,
             )
             .expect("fts");
@@ -270,6 +280,7 @@ fn measure_fts(st: &Supertable) -> Duration {
 fn measure_sql(st: &Supertable) -> Duration {
     let warm = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) FROM supertable")
         .expect("sql");
     black_box(warm);
@@ -278,6 +289,7 @@ fn measure_sql(st: &Supertable) -> Duration {
         let t0 = Instant::now();
         let batches = st
             .reader()
+            .expect("reader")
             .query_sql(black_box("SELECT COUNT(*) FROM supertable"))
             .expect("sql");
         samples.push(t0.elapsed());

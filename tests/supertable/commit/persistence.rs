@@ -88,7 +88,7 @@ fn commit_persists_pointer_list_part_and_superfile() {
     );
 
     // In-memory manifest reflects the commit.
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.manifest_id(), 1);
     assert_eq!(r.n_superfiles(), 1);
 }
@@ -144,7 +144,7 @@ fn two_successive_commits_both_publish() {
     assert_eq!(n_parts, 2);
 
     // In-memory manifest reflects both commits.
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.manifest_id(), 2);
     assert_eq!(
         r.n_superfiles(),
@@ -202,7 +202,7 @@ fn multipart_threshold_forces_superfile_through_put_multipart() {
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open after multipart commit");
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     assert_eq!(r.manifest_id(), 1);
     assert_eq!(r.n_superfiles(), 1);
 }
@@ -231,7 +231,7 @@ fn no_storage_attached_takes_in_memory_path() {
     );
 
     // In-memory manifest still updates.
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.manifest_id(), 1);
     assert_eq!(r.n_superfiles(), 1);
 }
@@ -258,6 +258,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
 
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits(
             "title",
             "nimblefox",

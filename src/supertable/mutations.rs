@@ -135,6 +135,13 @@ pub enum MutationError {
     #[error("predicate evaluation failed: {0}")]
     PredicateEval(#[from] QueryError),
 
+    /// The table was dropped and purged while this handle was open, so the
+    /// predicate has no manifest left to resolve against. Refused here rather
+    /// than at the closing commit, which would else write WAL sidecars for a
+    /// table that no longer exists.
+    #[error("table was dropped and purged while this handle was open")]
+    TableGone,
+
     /// Predicate matched more rows than [`MAX_TARGETS_PER_MUTATION`].
     /// Caller narrows the predicate and reissues.
     #[error("predicate matched {matched} rows; mutation cap is {cap}")]

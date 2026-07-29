@@ -1,6 +1,29 @@
 pub mod infino
 pub use infino::arrow_array
 pub use infino::arrow_schema
+pub enum infino::Bm25Stats
+pub infino::Bm25Stats::Global
+pub infino::Bm25Stats::PerSuperfile
+impl core::clone::Clone for infino::Bm25Stats
+pub fn infino::Bm25Stats::clone(&self) -> infino::Bm25Stats
+impl core::cmp::Eq for infino::Bm25Stats
+impl core::cmp::PartialEq for infino::Bm25Stats
+pub fn infino::Bm25Stats::eq(&self, &infino::Bm25Stats) -> bool
+impl core::convert::From<&str> for infino::Bm25Stats
+pub fn infino::Bm25Stats::from(&str) -> Self
+impl core::default::Default for infino::Bm25Stats
+pub fn infino::Bm25Stats::default() -> infino::Bm25Stats
+impl core::fmt::Debug for infino::Bm25Stats
+pub fn infino::Bm25Stats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Bm25Stats
+impl core::marker::StructuralPartialEq for infino::Bm25Stats
+impl core::marker::Freeze for infino::Bm25Stats
+impl core::marker::Send for infino::Bm25Stats
+impl core::marker::Sync for infino::Bm25Stats
+impl core::marker::Unpin for infino::Bm25Stats
+impl core::marker::UnsafeUnpin for infino::Bm25Stats
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25Stats
+impl core::panic::unwind_safe::UnwindSafe for infino::Bm25Stats
 pub enum infino::BoolMode
 pub infino::BoolMode::And
 pub infino::BoolMode::Or
@@ -11,6 +34,8 @@ impl core::cmp::PartialEq for infino::BoolMode
 pub fn infino::BoolMode::eq(&self, &infino::BoolMode) -> bool
 impl core::convert::From<&str> for infino::BoolMode
 pub fn infino::BoolMode::from(&str) -> Self
+impl core::default::Default for infino::BoolMode
+pub fn infino::BoolMode::default() -> infino::BoolMode
 impl core::fmt::Debug for infino::BoolMode
 pub fn infino::BoolMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::BoolMode
@@ -133,6 +158,31 @@ impl core::marker::Unpin for infino::OptimizeError
 impl core::marker::UnsafeUnpin for infino::OptimizeError
 impl !core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeError
 impl !core::panic::unwind_safe::UnwindSafe for infino::OptimizeError
+pub struct infino::Bm25SearchOptions
+pub infino::Bm25SearchOptions::mode: infino::BoolMode
+pub infino::Bm25SearchOptions::stats: infino::Bm25Stats
+impl infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::new() -> Self
+pub fn infino::Bm25SearchOptions::with_mode(self, infino::BoolMode) -> Self
+pub fn infino::Bm25SearchOptions::with_stats(self, infino::Bm25Stats) -> Self
+impl core::clone::Clone for infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::clone(&self) -> infino::Bm25SearchOptions
+impl core::cmp::Eq for infino::Bm25SearchOptions
+impl core::cmp::PartialEq for infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::eq(&self, &infino::Bm25SearchOptions) -> bool
+impl core::default::Default for infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::default() -> infino::Bm25SearchOptions
+impl core::fmt::Debug for infino::Bm25SearchOptions
+pub fn infino::Bm25SearchOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::Bm25SearchOptions
+impl core::marker::StructuralPartialEq for infino::Bm25SearchOptions
+impl core::marker::Freeze for infino::Bm25SearchOptions
+impl core::marker::Send for infino::Bm25SearchOptions
+impl core::marker::Sync for infino::Bm25SearchOptions
+impl core::marker::Unpin for infino::Bm25SearchOptions
+impl core::marker::UnsafeUnpin for infino::Bm25SearchOptions
+impl core::panic::unwind_safe::RefUnwindSafe for infino::Bm25SearchOptions
+impl core::panic::unwind_safe::UnwindSafe for infino::Bm25SearchOptions
 pub struct infino::CompactionSettings
 pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
@@ -298,7 +348,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
 pub struct infino::Supertable
 impl infino::Supertable
 pub fn infino::Supertable::append(&self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), infino::InfinoError>
-pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::BoolMode, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::bm25_search(&self, &str, &str, usize, infino::Bm25SearchOptions, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>

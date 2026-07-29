@@ -238,20 +238,22 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
                 consumer.manifest_id()
             ));
         }
-        if consumer.reader().n_docs_total() != EXPECTED_N_DOCS {
+        if consumer.reader().expect("reader").n_docs_total() != EXPECTED_N_DOCS {
             return Err(format!(
                 "recovered doc count mismatch: got {}",
-                consumer.reader().n_docs_total()
+                consumer.reader().expect("reader").n_docs_total()
             ));
         }
 
         let bm25_hits = consumer
             .reader()
+            .expect("reader")
             .bm25_search(
                 "title",
                 "alpha",
                 10,
                 infino::superfile::fts::reader::BoolMode::Or,
+                infino::Bm25Stats::PerSuperfile,
                 None,
             )
             .map_err(|e| format!("cold BM25 over real S3: {e}"))?;
@@ -263,6 +265,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         query[0] = 1.0;
         let vector_hits = consumer
             .reader()
+            .expect("reader")
             .vector_search(
                 "emb",
                 &query,
@@ -292,7 +295,7 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
             stats.n_cold_fetches, stats.current_bytes
         );
 
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         let manifest = reader.manifest();
         let mut cleanup_keys = vec![
             "_supertable/current".to_string(),

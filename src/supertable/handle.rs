@@ -173,6 +173,10 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Set once this handle's pointer is seen deleted — its table was dropped
+    /// and purged elsewhere. Latched: the handle can only be discarded, and
+    /// `Connection::open_table` checks this before serving it from cache.
+    pub(super) pointer_vanished: OnceLock<()>,
     /// Cached SQL schemas, built once from the immutable `options` (lock-free
     /// lazy init). A pure function of the schema, so no snapshot invalidation
     /// (unlike `sql_session_cache`). See [`SqlSchemas`].
@@ -193,6 +197,23 @@ impl SupertableInner {
     /// [`shared_query_runtime`].
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         shared_io_runtime()
+    }
+
+    /// Latch the purged observation when a commit's pointer fence finds the
+    /// pointer gone, so this handle reads as dead to
+    /// [`Supertable::pointer_vanished`] no matter which path noticed first.
+    ///
+    /// The read path's freshness probe is otherwise the only writer of that
+    /// latch, which leaves a handle that has only ever *written* permanently
+    /// stuck: the commit refuses correctly, but nothing marks the handle, so
+    /// the catalog keeps serving it from cache and every later commit fences
+    /// against a location a re-create has already replaced. Non-vanish errors
+    /// are left alone — contention and storage faults are recoverable, and
+    /// this latch never clears.
+    pub(super) fn note_commit_error(&self, err: &CommitError) {
+        if matches!(err, CommitError::PointerVanished) {
+            let _ = self.pointer_vanished.set(());
+        }
     }
 
     /// The table's cached SQL schemas, built once from the immutable options.
@@ -473,7 +494,19 @@ impl Supertable {
             .await
             .map_err(OpenError::ManifestLoadError)?;
         let (pointer, meta) = match probe {
-            PointerProbe::Absent | PointerProbe::NotModified => return Ok(false),
+            // Absent means the pointer was deleted — the table was
+            // dropped and purged. It is never "not committed yet": this handle
+            // exists, and every path that builds one over storage has a
+            // pointer by then (`open` fails with `PointerNotFound` without
+            // one; `create` publishes an empty manifest first). A handle with
+            // no storage never reaches here — `refresh` requires it above.
+            PointerProbe::Absent => {
+                let _ = self.inner.pointer_vanished.set(());
+                return Err(OpenError::ManifestLoadError(
+                    ManifestLoadError::PointerVanished,
+                ));
+            }
+            PointerProbe::NotModified => return Ok(false),
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
         *self
@@ -526,9 +559,21 @@ impl Supertable {
     /// the configured
     /// [`Consistency`](crate::supertable::options::Consistency) allows.
     /// No-op for an in-memory supertable and under `Snapshot`.
-    fn reader(&self) -> SupertableReader {
+    ///
+    /// Fails with [`ManifestLoadError::PointerVanished`] once the freshness
+    /// check above finds this handle's table dropped and purged. Pinning past
+    /// that point serves rows of a table that no longer exists: the snapshot
+    /// still names the deleted superfiles, and a warm disk cache answers from
+    /// bytes the purge removed, so the reads succeed silently for as long as
+    /// the handle is held. Callers that resolve by name recover on their next
+    /// lookup; one holding this handle has nothing to re-resolve, so refusing
+    /// is the only correct answer.
+    fn reader(&self) -> Result<SupertableReader, ManifestLoadError> {
         self.ensure_fresh();
-        self.pinned_reader()
+        if self.pointer_vanished() {
+            return Err(ManifestLoadError::PointerVanished);
+        }
+        Ok(self.pinned_reader())
     }
     }
 
@@ -619,6 +664,13 @@ impl Supertable {
         {
             debug!(error = %e, "manifest refresh failed; serving current snapshot");
         }
+    }
+
+    /// Whether this handle's table was dropped and purged elsewhere, seen as
+    /// its pointer disappearing during a freshness check. [`Self::ensure_fresh`]
+    /// swallows errors by design, so this latch is how that fact escapes.
+    pub(crate) fn pointer_vanished(&self) -> bool {
+        self.inner.pointer_vanished.get().is_some()
     }
 
     test_visible! {
@@ -890,7 +942,7 @@ impl Supertable {
     /// pinned snapshot — the cold-open phase before a timed search.
     /// Hidden IVF superfiles use their prefixed storage provider.
     fn open_all_superfiles(&self) {
-        let reader = self.reader();
+        let reader = self.reader().expect("reader");
         let manifest = reader.manifest();
         let store = manifest.options.store.clone();
         let disk_cache = manifest.options.disk_cache.clone();
@@ -1020,7 +1072,7 @@ impl Supertable {
     /// Used by benches to observe how compacted the hidden cell index is.
     fn hidden_vector_superfile_stats(&self) -> Option<(usize, usize)> {
         let hidden = self.inner.vector_index_table.as_ref()?;
-        let reader = hidden.reader();
+        let reader = hidden.reader().expect("reader");
         let manifest = reader.manifest();
         // Parts are table-level size buckets; per-cell identity lives on each
         // superfile entry's partition key.
@@ -1073,7 +1125,10 @@ impl Supertable {
     pub fn __debug_cached_session(&self) -> SessionContext {
         // Reuses the same fast path as `query_sql` — see the
         // doc-comment on `sql_session_cache` for invalidation.
-        self.reader().query_sql("SELECT 1 WHERE 1=0").ok();
+        self.reader()
+            .expect("reader")
+            .query_sql("SELECT 1 WHERE 1=0")
+            .ok();
         let guard = self
             .sql_session_cache()
             .lock()
@@ -1365,6 +1420,7 @@ async fn build_handle(
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
+        pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
     });
@@ -1798,7 +1854,10 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
-            manifest::{SuperfileEntry, SuperfileUri},
+            manifest::{
+                SuperfileEntry, SuperfileUri,
+                commit::{POINTER_PATH, get_current_manifest_etag},
+            },
             options::Consistency,
             query::dispatch::open_reader,
         },
@@ -1806,7 +1865,7 @@ mod tests {
     };
 
     fn rerank_payloads_by_stable_id(table: &Supertable) -> HashMap<i128, Vec<u8>> {
-        let table_reader = table.reader();
+        let table_reader = table.reader().expect("reader");
         let manifest = table_reader.manifest();
         let entries = bridge_sync_to_async(manifest.get_all_superfiles_loaded())
             .expect("load superfile entries");
@@ -1890,7 +1949,7 @@ mod tests {
     fn create_returns_handle_with_empty_initial_manifest() {
         let st = Supertable::create(opts()).expect("create");
         assert_eq!(st.manifest_id(), 0);
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.manifest_id(), 0);
         assert_eq!(r.n_superfiles(), 0);
         assert_eq!(r.n_docs_total(), 0);
@@ -1923,7 +1982,7 @@ mod tests {
         let st = Supertable::create(opts()).expect("create");
 
         // Pin reader at manifest_id = 0.
-        let pinned = st.reader();
+        let pinned = st.reader().expect("reader");
         assert_eq!(pinned.manifest_id(), 0);
         assert_eq!(pinned.n_superfiles(), 0);
 
@@ -1936,7 +1995,7 @@ mod tests {
         assert_eq!(pinned.n_superfiles(), 0);
 
         // Fresh reader sees the NEW manifest.
-        let fresh = st.reader();
+        let fresh = st.reader().expect("reader");
         assert_eq!(fresh.manifest_id(), 1);
         assert_eq!(fresh.n_superfiles(), 2);
         assert_eq!(fresh.n_docs_total(), 30);
@@ -1950,13 +2009,13 @@ mod tests {
         // construction-time state, not the latest.
         let st = Supertable::create(opts()).expect("create");
 
-        let r0 = st.reader();
+        let r0 = st.reader().expect("reader");
         publish_appended(&st, vec![entry(1)]);
-        let r1 = st.reader();
+        let r1 = st.reader().expect("reader");
         publish_appended(&st, vec![entry(2)]);
-        let r2 = st.reader();
+        let r2 = st.reader().expect("reader");
         publish_appended(&st, vec![entry(3)]);
-        let r3 = st.reader();
+        let r3 = st.reader().expect("reader");
 
         // Each reader's manifest_id matches the one published at
         // its capture time.
@@ -1987,7 +2046,7 @@ mod tests {
         let r = {
             let st = Supertable::create(opts()).expect("create");
             publish_appended(&st, vec![entry(5)]);
-            st.reader()
+            st.reader().expect("reader")
             // st dropped here; reader survives.
         };
         assert_eq!(r.manifest_id(), 1);
@@ -2002,8 +2061,8 @@ mod tests {
         // concurrent readers" cheap: one allocation, N+1 ref count.
         let st = Supertable::create(opts()).expect("create");
         publish_appended(&st, vec![entry(7)]);
-        let r1 = st.reader();
-        let r2 = st.reader();
+        let r1 = st.reader().expect("reader");
+        let r2 = st.reader().expect("reader");
         assert!(Arc::ptr_eq(r1.manifest(), r2.manifest()));
     }
 
@@ -2013,7 +2072,7 @@ mod tests {
         let s = format!("{:?}", st);
         assert!(s.contains("Supertable"));
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let s = format!("{:?}", r);
         assert!(s.contains("SupertableReader"));
     }
@@ -2036,7 +2095,7 @@ mod tests {
         // The handle-level `manifest_id` advances with the swap, and a
         // fresh reader pins the same value.
         assert_eq!(st.manifest_id(), 1);
-        assert_eq!(st.reader().manifest_id(), 1);
+        assert_eq!(st.reader().expect("reader").manifest_id(), 1);
     }
 
     #[test]
@@ -2104,7 +2163,7 @@ mod tests {
     fn weak_reader_round_trips_and_debug() {
         let st = Supertable::create(opts()).expect("create");
         publish_appended(&st, vec![entry(4)]);
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let weak = WeakReader::from_reader(&reader);
         // Debug is non-exhaustive but must not explode.
         assert!(format!("{weak:?}").contains("WeakReader"));
@@ -2119,7 +2178,7 @@ mod tests {
     fn weak_reader_upgrade_fails_after_inner_dropped() {
         let weak = {
             let st = Supertable::create(opts()).expect("create");
-            let reader = st.reader();
+            let reader = st.reader().expect("reader");
             let weak = WeakReader::from_reader(&reader);
             drop(reader);
             drop(st);
@@ -2132,7 +2191,7 @@ mod tests {
     #[test]
     fn reader_options_match_handle_options() {
         let st = Supertable::create(opts()).expect("create");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // The reader's options accessor reaches the same validated
         // options the handle exposes.
         assert_eq!(r.options().id_column, st.options().id_column);
@@ -2195,7 +2254,7 @@ mod tests {
         };
         let st = Supertable::create(make_options()).expect("create");
         assert!(
-            st.reader().vector_index_table().is_some(),
+            st.reader().expect("reader").vector_index_table().is_some(),
             "vector columns + storage must create hidden index sibling"
         );
 
@@ -2215,10 +2274,11 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
 
-        assert!(st.reader().n_superfiles() > 0);
+        assert!(st.reader().expect("reader").n_superfiles() > 0);
         let user_payloads = rerank_payloads_by_stable_id(&st);
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
@@ -2231,12 +2291,13 @@ mod tests {
         // bootstraps the global cell grid into the hidden manifest; the cell
         // superfiles are drained from the user superfiles on demand.
         assert_eq!(
-            hidden.reader().n_superfiles(),
+            hidden.reader().expect("reader").n_superfiles(),
             0,
             "commit must not dual-write into the hidden table"
         );
         assert!(
             st.reader()
+                .expect("reader")
                 .manifest()
                 .get_global_vector_index()
                 .is_some_and(|g| g.grid.n_cent > 0 && g.grid.dim > 0),
@@ -2248,6 +2309,7 @@ mod tests {
         // to `grid` via `into_user_grid`.
         let user_grid_trained = st
             .reader()
+            .expect("reader")
             .manifest()
             .get_global_vector_index()
             .is_some_and(|g| {
@@ -2261,7 +2323,7 @@ mod tests {
             "user-side grid must be trained exactly when the cell counts differ"
         );
         assert_eq!(
-            st.reader().manifest().superfiles[0].vector_layout,
+            st.reader().expect("reader").manifest().superfiles[0].vector_layout,
             VectorLayout::MultiCellIvf,
             "grid commit must emit packed user MultiCellIvf superfiles"
         );
@@ -2271,6 +2333,7 @@ mod tests {
         // Pre-drain: with empty cells the query falls back to the user superfiles.
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(
@@ -2287,6 +2350,7 @@ mod tests {
         let st = Supertable::open(make_options()).expect("reopen before drain");
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index after reopen")
             .clone();
@@ -2300,11 +2364,12 @@ mod tests {
             "fixed residual payloads must survive default k-means drain"
         );
         assert!(
-            hidden.reader().n_superfiles() > 0,
+            hidden.reader().expect("reader").n_superfiles() > 0,
             "drain must populate the hidden cell index"
         );
         let hits2 = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
             .expect("post-drain vector search");
         assert!(
@@ -2314,14 +2379,20 @@ mod tests {
 
         let user_uris: HashSet<_> = st
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
             .map(|entry| entry.uri)
             .collect();
-        let in_process_drained = hidden.reader().manifest().get_drained_ranges();
+        let in_process_drained = hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_drained_ranges();
         assert!(
             st.reader()
+                .expect("reader")
                 .manifest()
                 .superfiles
                 .iter()
@@ -2337,13 +2408,19 @@ mod tests {
         let reopened = Supertable::open(make_options()).expect("reopen after drain");
         let reopened_hidden = reopened
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index after drained reopen")
             .clone();
-        let reopened_drained = reopened_hidden.reader().manifest().get_drained_ranges();
+        let reopened_drained = reopened_hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_drained_ranges();
         assert!(
             reopened
                 .reader()
+                .expect("reader")
                 .manifest()
                 .superfiles
                 .iter()
@@ -2352,6 +2429,7 @@ mod tests {
         );
         let cold_hits = reopened
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
             .expect("cold post-drain vector search");
         assert!(
@@ -2367,6 +2445,7 @@ mod tests {
             .expect("drain fixed delta");
         let hidden = reopened
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden after second drain")
             .clone();
@@ -2513,12 +2592,13 @@ mod tests {
         let pre_baseline = Supertable::open(make_options(false)).expect("pre-drain mode-off");
         let pre_base_hits = pre_baseline
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
             .expect("pre-drain baseline hits");
         assert!(!pre_base_hits.is_empty(), "pre-drain baseline returns hits");
         drop(pre_baseline);
         let pre_stripped = Supertable::open(make_options(true)).expect("pre-drain mode-on");
-        let pre_stripped_reader = pre_stripped.reader();
+        let pre_stripped_reader = pre_stripped.reader().expect("reader");
         let user_manifest = pre_stripped_reader.manifest();
         let user_part_entries = user_manifest.get_all_list_entries();
         assert!(
@@ -2546,6 +2626,7 @@ mod tests {
         );
         let pre_stripped_hits = pre_stripped
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
             .expect("pre-drain stripped hits");
         assert_eq!(
@@ -2561,6 +2642,7 @@ mod tests {
         let baseline = Supertable::open(make_options(false)).expect("reopen mode-off");
         let base_hits = baseline
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
             .expect("baseline hits");
         assert!(!base_hits.is_empty(), "baseline must return hits");
@@ -2569,10 +2651,11 @@ mod tests {
         let stripped = Supertable::open(make_options(true)).expect("reopen mode-on");
         let hidden = stripped
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
-        let hidden_reader = hidden.reader();
+        let hidden_reader = hidden.reader().expect("reader");
         let hidden_manifest = hidden_reader.manifest();
         assert!(
             hidden_manifest.slow_vector_state_blob().is_some(),
@@ -2603,6 +2686,7 @@ mod tests {
 
         let stripped_hits = stripped
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, TOP_K, VectorSearchOptions::new(), None)
             .expect("stripped-mode hits");
         assert_eq!(
@@ -2707,11 +2791,12 @@ mod tests {
         st.drain_vectors_to_cells_sync().expect("splice drain");
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         assert!(
-            hidden.reader().n_superfiles() > 0,
+            hidden.reader().expect("reader").n_superfiles() > 0,
             "splice drain must populate hidden cells"
         );
         let hidden_payloads = rerank_payloads_by_stable_id(&hidden);
@@ -2809,11 +2894,12 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         assert!(
-            hidden.reader().n_superfiles() > 0,
+            hidden.reader().expect("reader").n_superfiles() > 0,
             "kmeans drain must populate hidden cells"
         );
         let hidden_payloads = rerank_payloads_by_stable_id(&hidden);
@@ -3036,6 +3122,7 @@ mod tests {
         // The user superfiles load and report real per-superfile index bytes.
         let (n_superfiles, index_bytes) = st
             .reader()
+            .expect("reader")
             .load_superfile_storage_stats()
             .expect("load superfile storage stats");
         assert!(n_superfiles > 0, "user table has committed superfiles");
@@ -3248,7 +3335,11 @@ mod tests {
             w.commit().expect("commit");
             producer.drain_vectors_to_cells_sync().expect("drain");
             assert!(
-                producer.reader().vector_index_table().is_some(),
+                producer
+                    .reader()
+                    .expect("reader")
+                    .vector_index_table()
+                    .is_some(),
                 "drain must leave a hidden vector-index table"
             );
             producer.storage_bytes().expect("warm storage_bytes")
@@ -3409,10 +3500,11 @@ mod tests {
             Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
 
         // Collect the hidden IVF superfile URIs.
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let hidden = reader.vector_index_table().expect("hidden index");
         let hidden_uris: Vec<SuperfileUri> = hidden
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()
@@ -3436,6 +3528,7 @@ mod tests {
         q[0] = 1.0;
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(!hits.is_empty(), "search should find committed vectors");
@@ -3462,6 +3555,7 @@ mod tests {
         let cold_before = cache.stats().n_cold_fetches;
         let hits2 = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
             .expect("warm vector search");
         assert!(!hits2.is_empty());
@@ -3597,11 +3691,12 @@ mod tests {
 
         let hidden = consumer
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         let mut per_cell: HashMap<Vec<u8>, usize> = HashMap::new();
-        for entry in &hidden.reader().manifest().superfiles {
+        for entry in &hidden.reader().expect("reader").manifest().superfiles {
             *per_cell.entry(entry.partition_key.clone()).or_insert(0) += 1;
         }
         assert!(
@@ -3613,6 +3708,7 @@ mod tests {
         let query = vec![1.0f32; DIM];
         let hits = consumer
             .reader()
+            .expect("reader")
             .vector_hits("emb", &query, 10, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(!hits.is_empty(), "hidden index should return vector hits");
@@ -3637,6 +3733,7 @@ mod tests {
         let query = vec![1.0f32; DIM];
         let hits = consumer
             .reader()
+            .expect("reader")
             .vector_hits("emb", &query, 10, VectorSearchOptions::new(), None)
             .expect("vector search");
         assert!(!hits.is_empty(), "pre-drain user search should return hits");
@@ -3791,9 +3888,16 @@ mod tests {
 
         // Exercise the lazy FTS path before optimize (mirrors the SQL bench's
         // pre-compact warm/cold queries against a disk-cache consumer).
-        use crate::superfile::fts::reader::BoolMode;
+        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
         let hits = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
             .expect("bm25 pre-optimize");
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
@@ -3802,7 +3906,14 @@ mod tests {
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
-            .bm25_search("title", "doc", 5, BoolMode::Or, None)
+            .bm25_search(
+                "title",
+                "doc",
+                5,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
             .expect("bm25 post-optimize");
         assert!(
             !hits_after.is_empty(),
@@ -3889,10 +4000,11 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
-        let hidden_reader = hidden.reader();
+        let hidden_reader = hidden.reader().expect("reader");
         let hidden_manifest = hidden_reader.manifest();
         let mut by_cell = HashMap::<Vec<u8>, usize>::new();
         for entry in hidden_manifest.superfiles.iter() {
@@ -4081,34 +4193,39 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         // Two populated cells (the two directions). Split the busiest; the
         // other populated cell is the neighbour whose count must survive.
-        let (busiest, neighbour, neighbour_count, n_cent_before) =
-            match hidden.reader().manifest().get_partition_strategy() {
-                PartitionStrategy::VectorCell { clusters, .. } => {
-                    let mut populated: Vec<u32> = (0..clusters.n_cent)
-                        .filter(|&c| clusters.counts[c as usize] > 0)
-                        .collect();
-                    assert!(
-                        populated.len() >= 2,
-                        "two directions must drain into two cells, got {:?}",
-                        clusters.counts
-                    );
-                    populated.sort_by_key(|&c| std::cmp::Reverse(clusters.counts[c as usize]));
-                    let busiest = populated[0];
-                    let neighbour = populated[1];
-                    (
-                        busiest,
-                        neighbour,
-                        clusters.counts[neighbour as usize],
-                        clusters.n_cent,
-                    )
-                }
-                other => panic!("hidden must be VectorCell after drain, got {other:?}"),
-            };
+        let (busiest, neighbour, neighbour_count, n_cent_before) = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                let mut populated: Vec<u32> = (0..clusters.n_cent)
+                    .filter(|&c| clusters.counts[c as usize] > 0)
+                    .collect();
+                assert!(
+                    populated.len() >= 2,
+                    "two directions must drain into two cells, got {:?}",
+                    clusters.counts
+                );
+                populated.sort_by_key(|&c| std::cmp::Reverse(clusters.counts[c as usize]));
+                let busiest = populated[0];
+                let neighbour = populated[1];
+                (
+                    busiest,
+                    neighbour,
+                    clusters.counts[neighbour as usize],
+                    clusters.n_cent,
+                )
+            }
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
 
         hidden
             .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest))
@@ -4116,7 +4233,12 @@ mod tests {
 
         // The split grows the grid by one sub-cell and republishes the
         // neighbour cell untouched — its doc count is unchanged.
-        match hidden.reader().manifest().get_partition_strategy() {
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
             PartitionStrategy::VectorCell { clusters, .. } => {
                 assert_eq!(
                     clusters.n_cent,
@@ -4215,27 +4337,33 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
 
         // The most-populated cell in the hidden grid holds all N docs.
-        let (split_cell, n_cent_before, docs_in_cell) =
-            match hidden.reader().manifest().get_partition_strategy() {
-                PartitionStrategy::VectorCell { clusters, .. } => {
-                    let cell = (0..clusters.n_cent)
-                        .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
-                        .expect("at least one cell");
-                    (cell, clusters.n_cent, clusters.counts[cell as usize])
-                }
-                other => panic!("hidden index must be VectorCell after drain, got {other:?}"),
-            };
+        let (split_cell, n_cent_before, docs_in_cell) = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                let cell = (0..clusters.n_cent)
+                    .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                    .expect("at least one cell");
+                (cell, clusters.n_cent, clusters.counts[cell as usize])
+            }
+            other => panic!("hidden index must be VectorCell after drain, got {other:?}"),
+        };
         assert!(docs_in_cell >= 2, "the split cell needs at least two docs");
 
         // Sanity: the drained docs are retrievable before the split.
         let q = vec![1.0f32; dim];
         let hits_before = st
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, N, VectorSearchOptions::new(), None)
             .expect("pre-split search");
         assert!(!hits_before.is_empty(), "docs retrievable before split");
@@ -4254,7 +4382,12 @@ mod tests {
         // appended at the old `n_cent`). Routing-independent — it reads the
         // counts the split re-derives from the actual live rows, which also
         // corrects the pre-split grid count (that count can lag the true total).
-        match hidden.reader().manifest().get_partition_strategy() {
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
             PartitionStrategy::VectorCell { clusters, .. } => {
                 assert_eq!(
                     clusters.n_cent,
@@ -4354,13 +4487,18 @@ mod tests {
         w.commit().expect("commit");
         st.drain_vectors_to_cells_sync().expect("drain");
 
-        let hidden = st.reader().vector_index_table().expect("hidden").clone();
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden")
+            .clone();
         assert_eq!(
             hidden.options().writer_pool.current_num_threads(),
             POOL,
             "hidden drain must inherit the user table's configured writer pool"
         );
-        let hidden_reader = hidden.reader();
+        let hidden_reader = hidden.reader().expect("reader");
         let manifest = hidden_reader.manifest();
         let n_objects = manifest.superfiles.len();
         assert_eq!(
@@ -4472,16 +4610,19 @@ mod tests {
             }
             // ONE drain call — the batching happens inside it.
             st.drain_vectors_to_cells_sync().expect("drain");
-            st
+            // Hand the TempDir back: it owns the storage root, and dropping it
+            // here would delete the table out from under the returned handle.
+            (st, dir)
         };
 
         let max_files_per_cell = |st: &Supertable| -> usize {
             let hidden = st
                 .reader()
+                .expect("reader")
                 .vector_index_table()
                 .expect("hidden index")
                 .clone();
-            let reader = hidden.reader();
+            let reader = hidden.reader().expect("reader");
             let manifest = reader.manifest();
             let mut by_cell = HashMap::<Vec<u8>, usize>::new();
             for entry in manifest.superfiles.iter() {
@@ -4492,7 +4633,7 @@ mod tests {
 
         // batch=1: 3 user superfiles -> 3 memory batches, but still one packed
         // shard object (writer_pool=1 ⇒ N=1; identical vectors ⇒ one cell).
-        let st1 = make(1);
+        let (st1, _dir) = make(1);
         assert_eq!(
             max_files_per_cell(&st1),
             1,
@@ -4500,7 +4641,7 @@ mod tests {
         );
 
         // batch=-1 (unbounded): all 3 in one merge -> identical layout.
-        let st_unb = make(-1);
+        let (st_unb, _dir) = make(-1);
         assert_eq!(
             max_files_per_cell(&st_unb),
             1,
@@ -4508,12 +4649,14 @@ mod tests {
         );
 
         // batch=0: drain skipped → hidden index stays empty.
-        let st0 = make(0);
+        let (st0, _dir) = make(0);
         assert_eq!(
             st0.reader()
+                .expect("reader")
                 .vector_index_table()
                 .expect("hidden index")
                 .reader()
+                .expect("reader")
                 .n_superfiles(),
             0,
             "batch=0 must skip the drain"
@@ -4598,10 +4741,11 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
-        let reader = hidden.reader();
+        let reader = hidden.reader().expect("reader");
         let manifest = reader.manifest();
         let mut per_cell = HashMap::<Vec<u8>, usize>::new();
         let mut total_rows = 0u64;
@@ -4642,10 +4786,11 @@ mod tests {
         st.drain_vectors_to_cells_sync().expect("re-drain no-op");
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
-        let n_after = hidden.reader().manifest().superfiles.len();
+        let n_after = hidden.reader().expect("reader").manifest().superfiles.len();
         assert_eq!(
             n_after,
             per_cell.len(),
@@ -4735,10 +4880,11 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
-        let manifest_a = Arc::clone(hidden.reader().manifest());
+        let manifest_a = Arc::clone(hidden.reader().expect("reader").manifest());
         let (uri_a, _) = manifest_a
             .slow_vector_state_blob()
             .expect("drain must publish + stamp the slow-CAS ref");
@@ -4749,7 +4895,7 @@ mod tests {
         // on the HIDDEN manifest (linked manifests). Ref + entries survive.
         let stats = st.delete(col("title").eq(lit("alpha"))).expect("delete");
         assert_eq!(stats.n_tombstoned(), 1, "delete must tombstone one row");
-        let manifest_b = Arc::clone(hidden.reader().manifest());
+        let manifest_b = Arc::clone(hidden.reader().expect("reader").manifest());
         assert!(
             manifest_b.get_manifest_id() > manifest_a.get_manifest_id(),
             "user delete must bump the hidden manifest (deleted-ids stamp)"
@@ -4778,7 +4924,7 @@ mod tests {
         // the ONLY invalidation the slow state accepts.
         append_one("gamma");
         st.drain_vectors_to_cells_sync().expect("second drain");
-        let manifest_c = Arc::clone(hidden.reader().manifest());
+        let manifest_c = Arc::clone(hidden.reader().expect("reader").manifest());
         let (uri_c, _) = manifest_c
             .slow_vector_state_blob()
             .expect("drain must restamp the ref");
@@ -4867,14 +5013,23 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
 
         // No deletes yet: the resident set is empty, and two reads on the
         // same manifest version return the SAME cached `Arc` (decoded once).
-        let empty_a = hidden.reader().hidden_deleted_ids().expect("decode");
-        let empty_b = hidden.reader().hidden_deleted_ids().expect("cached");
+        let empty_a = hidden
+            .reader()
+            .expect("reader")
+            .hidden_deleted_ids()
+            .expect("decode");
+        let empty_b = hidden
+            .reader()
+            .expect("reader")
+            .hidden_deleted_ids()
+            .expect("cached");
         assert!(empty_a.is_empty(), "no deletes ⇒ empty resident set");
         assert!(
             Arc::ptr_eq(&empty_a, &empty_b),
@@ -4888,10 +5043,12 @@ mod tests {
         // New manifest version ⇒ re-decode the updated set; then cached again.
         let ids_a = hidden
             .reader()
+            .expect("reader")
             .hidden_deleted_ids()
             .expect("decode after delete");
         let ids_b = hidden
             .reader()
+            .expect("reader")
             .hidden_deleted_ids()
             .expect("cached after delete");
         assert_eq!(ids_a.len(), 1, "one deleted id resident after delete");
@@ -4986,10 +5143,11 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
-        let manifest = Arc::clone(hidden.reader().manifest());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
         assert!(!manifest.superfiles.is_empty(), "drain built cell files");
         for entry in manifest.superfiles.iter() {
             let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
@@ -5108,11 +5266,13 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
         let hidden_storage = hidden
             .reader()
+            .expect("reader")
             .manifest()
             .options
             .storage
@@ -5124,6 +5284,7 @@ mod tests {
         // non-empty.
         let (uri_a, _) = hidden
             .reader()
+            .expect("reader")
             .manifest()
             .slow_vector_state_blob()
             .map(|(u, h)| (u.to_owned(), h))
@@ -5144,7 +5305,7 @@ mod tests {
         // (2) optimize (drain no-op + compaction membership updates clear the
         // ref) must END re-stamped, thin-pointered, with a durable blob.
         st.optimize(&OptimizeOptions::default()).expect("optimize");
-        let manifest_after = Arc::clone(hidden.reader().manifest());
+        let manifest_after = Arc::clone(hidden.reader().expect("reader").manifest());
         let (uri_b, _) = manifest_after
             .slow_vector_state_blob()
             .map(|(u, h)| (u.to_owned(), h))
@@ -5179,11 +5340,17 @@ mod tests {
         let st2 = Supertable::open(make_options()).expect("reopen");
         let hidden2 = st2
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index on reopen")
             .clone();
         assert_eq!(
-            hidden2.reader().manifest().superfiles.len(),
+            hidden2
+                .reader()
+                .expect("reader")
+                .manifest()
+                .superfiles
+                .len(),
             n_entries,
             "fresh open hydrated the flat view from the blob (parts deleted)"
         );
@@ -5191,6 +5358,7 @@ mod tests {
         q[0] = 1.0;
         let hits = st2
             .reader()
+            .expect("reader")
             .vector_hits("emb", &q, 2, VectorSearchOptions::new(), None)
             .expect("vector search on blob-hydrated manifest");
         assert!(!hits.is_empty(), "search serves from the hydrated view");
@@ -5273,10 +5441,11 @@ mod tests {
         let cell_files = || -> usize {
             let hidden = st
                 .reader()
+                .expect("reader")
                 .vector_index_table()
                 .expect("hidden index")
                 .clone();
-            let reader = hidden.reader();
+            let reader = hidden.reader().expect("reader");
             let manifest = reader.manifest();
             let mut by_cell = HashMap::<Vec<u8>, usize>::new();
             for e in manifest.superfiles.iter() {
@@ -5291,11 +5460,17 @@ mod tests {
         assert_eq!(cell_files(), 1, "first drain populates the cell");
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         assert!(
-            !hidden.reader().manifest().get_drained_ranges().is_empty(),
+            !hidden
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_drained_ranges()
+                .is_empty(),
             "drain must record progress in drained_ranges"
         );
 
@@ -5314,12 +5489,14 @@ mod tests {
         // Watermark stays a single genesis-anchored interval (contiguous commits).
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden index")
             .clone();
         assert_eq!(
             hidden
                 .reader()
+                .expect("reader")
                 .manifest()
                 .get_drained_ranges()
                 .intervals()
@@ -5413,6 +5590,7 @@ mod tests {
 
         let hidden = st
             .reader()
+            .expect("reader")
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
@@ -5428,7 +5606,7 @@ mod tests {
             }
             by_shard.values().copied().max().unwrap_or(0)
         };
-        let before = count_by_shard(hidden.reader().manifest());
+        let before = count_by_shard(hidden.reader().expect("reader").manifest());
         assert!(
             before >= 2,
             "need multiple drained packed shards before compaction, got {before}"
@@ -5441,7 +5619,7 @@ mod tests {
         };
         hidden.compact(&cfg).expect("hidden compact");
 
-        let after_reader = hidden.reader();
+        let after_reader = hidden.reader().expect("reader");
         let after_manifest = after_reader.manifest();
         let after = count_by_shard(after_manifest);
         assert!(
@@ -5467,6 +5645,7 @@ mod tests {
         }
         let hits = st
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &vec![1.0f32; dim],
@@ -5490,14 +5669,80 @@ mod tests {
             .with_storage(storage)
             .with_read_consistency(Consistency::Strong);
         let st = Supertable::create(options).expect("create storage-backed handle");
-        // `reader()` calls `ensure_fresh`, which under Strong drives a
-        // blocking `refresh` against the storage pointer. No pointer is
-        // published yet, so the pinned snapshot remains the empty
-        // manifest.
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 0);
         // A direct refresh likewise reports no newer manifest.
         let advanced = bridge_sync_to_async(st.refresh()).expect("refresh against empty store");
         assert!(!advanced, "no commit yet ⇒ refresh finds nothing newer");
+    }
+
+    /// The typed shape of a deleted pointer on the read path, pinned at the
+    /// layer that produces it. Both the error and the latch matter: callers
+    /// above match the variant, and the catalog keys handle eviction on the
+    /// latch, so a refactor that reclassified either would break recovery
+    /// while every end-to-end assertion still passed.
+    #[test]
+    fn refresh_reports_pointer_vanished_once_the_pointer_is_deleted() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = opts()
+            .with_storage(Arc::clone(&storage))
+            .with_read_consistency(Consistency::Strong);
+        let st = Supertable::create(options).expect("create storage-backed handle");
+        assert!(!st.pointer_vanished(), "a live table has its pointer");
+
+        // Exactly what a purge leaves behind for a handle that stays open.
+        bridge_sync_to_async(storage.delete(POINTER_PATH)).expect("delete pointer");
+
+        let err = bridge_sync_to_async(st.refresh()).expect_err("refresh must refuse");
+        assert!(
+            matches!(
+                err,
+                OpenError::ManifestLoadError(ManifestLoadError::PointerVanished)
+            ),
+            "expected PointerVanished, got {err:?}"
+        );
+        assert!(
+            st.pointer_vanished(),
+            "the observation must latch, so the catalog can evict this handle"
+        );
+        // And it stays refused rather than being a one-shot side effect of the
+        // probe that discovered it.
+        for attempt in 0..2 {
+            let err = st.reader().expect_err("reader must refuse");
+            assert!(
+                matches!(err, ManifestLoadError::PointerVanished),
+                "attempt {attempt}: expected PointerVanished, got {err:?}"
+            );
+        }
+    }
+
+    /// The same condition on the commit path. `Ok(None)` here would read as
+    /// "initial commit" and republish a pointer from this handle's stale
+    /// manifest, so the variant — not just the failure — is the contract.
+    #[test]
+    fn get_current_manifest_etag_refuses_a_deleted_pointer() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = opts().with_storage(Arc::clone(&storage));
+        let st = Supertable::create(options).expect("create storage-backed handle");
+
+        // Capture the snapshot while the table is still whole: this is the
+        // stale state a commit would otherwise republish from.
+        let manifest = Arc::clone(st.reader().expect("reader").manifest());
+        let etag = bridge_sync_to_async(get_current_manifest_etag(&storage, Arc::clone(&manifest)))
+            .expect("a live pointer yields its etag");
+        assert!(etag.is_some(), "localfs reports etags");
+
+        bridge_sync_to_async(storage.delete(POINTER_PATH)).expect("delete pointer");
+
+        let err = bridge_sync_to_async(get_current_manifest_etag(&storage, manifest))
+            .expect_err("an absent pointer must not read as an initial commit");
+        assert!(
+            matches!(err, CommitError::PointerVanished),
+            "expected PointerVanished, got {err:?}"
+        );
     }
 }

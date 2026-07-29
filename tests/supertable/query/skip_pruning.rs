@@ -171,7 +171,7 @@ fn bm25_exact_term_skip_opens_only_matching_superfile() {
     w.commit().expect("commit");
     drop(w);
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.n_superfiles(), EXACT_TERM_SUPERFILE_COUNT);
 
     // Identify the URI of superfile 0 (the planted superfile).
@@ -235,7 +235,7 @@ fn bm25_prefix_skip_opens_only_superfiles_overlapping_prefix_range() {
     w.commit().expect("commit");
     drop(w);
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     assert_eq!(r.n_superfiles(), EXACT_TERM_SUPERFILE_COUNT);
 
     let manifest = r.manifest();
@@ -280,6 +280,7 @@ fn bm25_search_with_no_matching_superfiles_opens_no_superfiles_at_all() {
     let before = store.snapshot();
     let hits = st
         .reader()
+        .expect("reader")
         .bm25_hits(
             "title",
             "definitelynotpresent",
@@ -317,7 +318,7 @@ fn bm25_and_mode_skip_requires_all_terms_present_in_superfile() {
     w.commit().expect("commit");
     drop(w);
 
-    let r = st.reader();
+    let r = st.reader().expect("reader");
     let manifest = r.manifest();
     let kept_uri = manifest.superfiles[0].uri;
 

@@ -5,6 +5,7 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
+Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -60,6 +61,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
+        stats: Bm25Stats | None = ...,
     ) -> ArrowTable: ...
     def vector_search(
         self,

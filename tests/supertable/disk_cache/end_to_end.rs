@@ -84,6 +84,7 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     // disk cache → cold-fetch from storage.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY _id")
         .expect("first query");
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
@@ -108,6 +109,7 @@ fn cross_process_consumer_routes_reads_through_disk_cache() {
     // Second query against the same superfile — warm hit.
     let _batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT title FROM supertable ORDER BY _id")
         .expect("second query");
     let post_stats = cache.stats();
@@ -153,6 +155,7 @@ fn producer_with_cache_reads_through_cache_path() {
 
     let batches = producer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
@@ -213,6 +216,7 @@ fn writer_warms_cache_on_commit_so_producer_query_skips_cold_fetch() {
     // Producer's query hits the warm cache — no cold-fetch.
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
@@ -296,7 +300,7 @@ fn manifest_superfiles_are_not_pinned_by_supertable_create() {
     // manifest set.
     let post = cache.current_pinned_uris();
     assert!(post.is_empty(), "expected empty pinned set; got {post:?}");
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     assert_eq!(reader.manifest().get_all_superfiles().len(), 1);
 }
 
@@ -336,7 +340,12 @@ fn manifest_superfiles_are_not_pinned_by_supertable_open() {
         pinned.is_empty(),
         "expected empty pinned set; got {pinned:?}"
     );
-    let n_superfiles = consumer.reader().manifest().get_all_superfiles().len();
+    let n_superfiles = consumer
+        .reader()
+        .expect("reader")
+        .manifest()
+        .get_all_superfiles()
+        .len();
     assert_eq!(n_superfiles, 1);
 }
 
@@ -471,6 +480,7 @@ fn no_cache_path_still_uses_in_memory_store() {
 
     let batches = st
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);

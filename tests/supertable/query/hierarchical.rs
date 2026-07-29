@@ -36,7 +36,10 @@ use std::sync::Arc;
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{
+        builder::FtsConfig,
+        fts::reader::{Bm25Stats, BoolMode},
+    },
     supertable::{
         Supertable, SupertableOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -111,7 +114,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
 
     // Pre-condition: nothing loaded.
     {
-        let r = consumer.reader();
+        let r = consumer.reader().expect("reader");
         let m = r.manifest();
         let list_entries = m.get_all_list_entries();
         assert_eq!(list_entries.len(), HIERARCHICAL_PART_COUNT);
@@ -128,7 +131,15 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // query.
     let hits = consumer
         .reader()
-        .bm25_search("title", "echo", BM25_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "echo",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     assert!(
         !hits.is_empty(),
@@ -136,7 +147,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     );
 
     // Post-condition: exactly one OnceCell populated.
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     let n_loaded = list_entries
@@ -172,7 +183,15 @@ fn bm25_term_in_no_part_loads_nothing() {
     // already rejected without needing the part bytes).
     let hits = consumer
         .reader()
-        .bm25_search("title", "zoo", BM25_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "zoo",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     // False positives are tolerated. So `hits` might end
     // up non-empty if any bloom collides on 'zoo' — but
@@ -180,7 +199,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     // is selective. The load-bearing assertion is the
     // n_loaded count: if the union pruned everything, no
     // part was ever loaded.
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     let n_loaded = list_entries
@@ -219,6 +238,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     // union should route the prefix to one part.
     let hits = consumer
         .reader()
+        .expect("reader")
         .bm25_search_prefix("title", "ech", BM25_TOP_K)
         .expect("prefix");
     assert!(
@@ -226,7 +246,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
         "prefix search must find 'echo'-rooted terms"
     );
 
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     let n_loaded = list_entries
@@ -270,6 +290,7 @@ fn sql_loads_all_parts_returns_correct_count() {
     // 5 commits × 2 rows/commit = 10 rows total.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query");
     assert_eq!(batches.len(), 1);
@@ -282,7 +303,7 @@ fn sql_loads_all_parts_returns_correct_count() {
     assert_eq!(arr.value(0), HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
 
     // Post: all 5 parts loaded (SQL doesn't list-prune).
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     let n_loaded = list_entries
@@ -330,7 +351,7 @@ fn open_lazy_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path
 /// How many parts are currently resident (loaded) in the consumer's
 /// manifest — the observable behind "did the prune skip parts?".
 fn parts_loaded(consumer: &Supertable) -> (usize, usize) {
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let entries = m.get_all_list_entries();
     let loaded = entries
@@ -363,6 +384,7 @@ fn sql_single_value_in_prunes_parts_via_equality_rewrite() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title IN ('Fig Roll')")
         .expect("query");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -400,6 +422,7 @@ fn sql_multi_value_in_returns_exact_rows_across_parts() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title IN ('Straw Berry', 'Orange Juice')")
         .expect("query");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -416,6 +439,7 @@ fn sql_multi_value_in_returns_exact_rows_across_parts() {
     // exact title; the other literal exists nowhere.
     let none = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title IN ('Straw', 'Iced Coffee Blend')")
         .expect("query");
     assert_eq!(
@@ -450,6 +474,7 @@ fn sql_between_returns_exact_rows_across_parts() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title BETWEEN 'C' AND 'G'")
         .expect("query");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -490,6 +515,7 @@ fn fts_in_bloom_prunes_parts_min_max_cannot() {
     // the other three exist nowhere.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title IN ('bravo', 'qx', 'qy', 'qz')")
         .expect("query");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -528,6 +554,7 @@ fn sql_or_on_fts_column_bloom_prunes_parts_min_max_cannot() {
     // 2 values → arrives as `title = 'bravo' OR title = 'qx'`.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title = 'bravo' OR title = 'qx'")
         .expect("query");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -634,6 +661,7 @@ fn sql_is_null_prunes_no_null_parts() {
 
     let rows: usize = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE tag IS NULL")
         .expect("query")
         .iter()
@@ -658,6 +686,7 @@ fn sql_is_not_null_prunes_all_null_parts() {
 
     let rows: usize = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE tag IS NOT NULL")
         .expect("query")
         .iter()
@@ -695,6 +724,7 @@ fn fts_in_multitoken_bloom_spans_parts_and_skips_the_unmatched() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql(
             "SELECT _id FROM supertable \
              WHERE title IN ('new york', 'los angeles', 'qx', 'qy')",
@@ -731,6 +761,7 @@ fn fts_in_all_values_absent_prunes_every_part() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT _id FROM supertable WHERE title IN ('qx', 'qy', 'qz', 'qw')")
         .expect("query");
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
@@ -766,6 +797,7 @@ fn fts_in_multiword_mixedcase_value_bloom_and_exact_filter() {
     //  - FilterExec keeps only the exact "lives in Mumbai" row.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql(
             "SELECT _id FROM supertable \
              WHERE title IN ('lives in Mumbai', 'qx', 'qy', 'qz')",
@@ -789,6 +821,7 @@ fn fts_in_multiword_mixedcase_value_bloom_and_exact_filter() {
     // So the bloom is a presence superset; the exact filter is correctness.
     let none = consumer
         .reader()
+        .expect("reader")
         .query_sql(
             "SELECT _id FROM supertable \
              WHERE title IN ('lives in MUMBAI', 'qx', 'qy', 'qz')",
@@ -830,7 +863,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
     .expect("open");
 
     // Eager: 1 part loaded at open.
-    let r = consumer.reader();
+    let r = consumer.reader().expect("reader");
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 1);
@@ -843,13 +876,22 @@ fn eager_mode_query_paths_observationally_unchanged() {
     // BM25 hits.
     let hits = consumer
         .reader()
-        .bm25_search("title", "alpha", BM25_TOP_K, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "alpha",
+            BM25_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25");
     assert!(!hits.is_empty());
 
     // SQL.
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("sql");
     assert_eq!(batches.len(), 1);

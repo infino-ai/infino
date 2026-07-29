@@ -9,7 +9,7 @@
 //! SQL table-valued functions and the RRF math on a single superfile.
 //! This file exercises the published
 //! `SupertableReader::{token_match, exact_match, hybrid_search}` surface
-//! the way a Rust consumer calls it — `st.reader().token_match(..)` —
+//! the way a Rust consumer calls it — `st.reader().expect("reader").token_match(..)` —
 //! over a committed **multi-superfile** corpus so the per-superfile work
 //! fans out and merges across superfiles.
 //!
@@ -171,7 +171,7 @@ fn stable_ids(hits: &[SuperfileHit]) -> HashSet<i128> {
 #[test]
 fn token_match_or_is_the_unranked_bm25_candidate_set() {
     let st = demo_two_superfiles();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let token = reader
         .token_match("title", "rust", BoolMode::Or)
         .expect("token_match OR");
@@ -197,7 +197,7 @@ fn token_match_or_is_the_unranked_bm25_candidate_set() {
 #[test]
 fn token_match_and_intersects_tokens() {
     let st = demo_two_superfiles();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     // Only "rust systems" carries both tokens.
     let token = reader
         .token_match("title", "rust systems", BoolMode::And)
@@ -217,7 +217,7 @@ fn token_match_and_intersects_tokens() {
 #[test]
 fn exact_match_is_raw_value_equality_not_token() {
     let st = demo_two_superfiles();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     // The raw title "rust async" equals exactly the docs that the
     // token-AND prune leaves (only doc 0 has both `rust` and `async`).
     let exact = reader
@@ -252,7 +252,7 @@ fn exact_match_is_raw_value_equality_not_token() {
 #[test]
 fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
     let st = demo_two_superfiles();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let q = one_hot(QUERY_DIM);
 
     let hybrid = reader
@@ -300,7 +300,7 @@ fn hybrid_search_unions_bm25_and_vector_and_orders_by_score() {
 #[test]
 fn hybrid_search_doc_top_in_both_retrievers_ranks_first() {
     let st = demo_two_superfiles();
-    let reader = st.reader();
+    let reader = st.reader().expect("reader");
     let q = one_hot(QUERY_DIM);
 
     // `async` is unique to doc 0 (BM25 #1); the one-hot query at

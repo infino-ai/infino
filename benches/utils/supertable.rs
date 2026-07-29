@@ -393,7 +393,7 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
 /// Visit committed superfiles through the flat eager view, or through manifest
 /// parts when the manifest is lazy and the flat view is empty.
 fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader();
+    let reader = table.reader().expect("reader");
     let manifest = reader.manifest();
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
@@ -452,7 +452,7 @@ fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
 fn live_stored_bytes(consumer: &Supertable) -> Option<u64> {
     /// Relative prefix of superfile data objects under a table root.
     const DATA_PREFIX: &str = "data/";
-    let user_reader = consumer.reader();
+    let user_reader = consumer.reader().expect("reader");
     let user_manifest = user_reader.manifest();
     let listing = listed_objects_under(consumer, "")?;
     let bucket_total: u64 = listing.iter().map(|(_, size)| *size).sum();
@@ -500,7 +500,15 @@ fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
 /// table's provider. Keys are provider-root-relative — the same
 /// convention as `SuperfileUri::storage_path`.
 fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String, u64)>> {
-    let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
+    let storage = Arc::clone(
+        table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .options
+            .storage
+            .as_ref()?,
+    );
     let prefix = prefix.to_owned();
     let objects = tiers::block_on(async move {
         storage
@@ -625,7 +633,7 @@ fn run_metered_optimize(
 ) -> CompactionStats {
     eprintln!(
         "[{label}] before optimize: {} superfiles",
-        consumer.reader().n_superfiles()
+        consumer.reader().expect("reader").n_superfiles()
     );
     eprintln!("[{label}] compacting (optimize)...");
     let before = meter.snapshot();
@@ -646,7 +654,7 @@ fn run_metered_optimize(
         rss::fmt_bytes(peak_rss),
         rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
         rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
     );
     (wall_s, io, peak_rss, cpu_s)
 }
@@ -1573,7 +1581,7 @@ pub mod fts {
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
-            let reader = consumer.reader();
+            let reader = consumer.reader().expect("reader");
             exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
             drop(consumer);
             drop(cache_dir);
@@ -1880,7 +1888,7 @@ pub mod fts {
             .expect("battery keeps its broad-OR representative");
         let query = rep.terms.join(" ");
         let mode = exec_fts::to_infino_mode(rep.mode);
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         let hidden_uris: HashSet<_> = consumer
             .vector_index_table()
             .map(|hidden| {
@@ -1915,7 +1923,14 @@ pub mod fts {
             &|| {
                 black_box(
                     reader
-                        .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode, None)
+                        .bm25_search(
+                            supertable::TEXT_COLUMN,
+                            &query,
+                            TOP_K,
+                            mode,
+                            infino::Bm25Stats::PerSuperfile,
+                            None,
+                        )
                         .expect("routing-state warm bm25 search"),
                 );
             },
@@ -1948,7 +1963,7 @@ pub mod fts {
         // up as anonymous ≈ file_backed after warm-up.
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         // Prewarm + wait: run EVERY battery shape once so each opens its
         // pruned-in superfiles and spawns their background fills, then
         // wait_until_warm blocks until all are mmap-promoted. A single-shape
@@ -1965,6 +1980,7 @@ pub mod fts {
                     &query,
                     TOP_K,
                     exec_fts::to_infino_mode(q.mode),
+                    infino::Bm25Stats::PerSuperfile,
                     None,
                 )
                 .expect("warm prewarm bm25_search");
@@ -2076,7 +2092,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered cold bm25_search");
             },
             |(_cache, consumer), i| {
@@ -2085,7 +2109,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(q.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered steady cold bm25_search");
             },
             steady.len().min(STEADY_COLD_SAMPLES),
@@ -2094,7 +2126,15 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
-                    .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+                    .expect("reader")
+                    .bm25_search(
+                        supertable::TEXT_COLUMN,
+                        &terms,
+                        TOP_K,
+                        mode,
+                        infino::Bm25Stats::PerSuperfile,
+                        None,
+                    )
                     .expect("metered repeat cold bm25_search");
             },
         );
@@ -2131,7 +2171,15 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, None)
+                .expect("reader")
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2147,7 +2195,15 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
-                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("reader")
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    Some(&["_id", column, "score"]),
+                )
                 .expect("cold bm25_search fetched")
                 .iter()
                 .map(|b| b.num_rows())
@@ -2161,7 +2217,10 @@ pub mod fts {
             k: usize,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> ((u64, u64), (u64, u64)) {
-            self.consumer.reader().bm25_payloads(column, query, k, mode)
+            self.consumer
+                .reader()
+                .expect("reader")
+                .bm25_payloads(column, query, k, mode)
         }
 
         fn count_matching(
@@ -2170,7 +2229,10 @@ pub mod fts {
             query: &str,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> u64 {
-            self.consumer.reader().count_matching(column, query, mode)
+            self.consumer
+                .reader()
+                .expect("reader")
+                .count_matching(column, query, mode)
         }
     }
 }
@@ -2314,7 +2376,7 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> HitTierStats {
-        let reader = table.reader();
+        let reader = table.reader().expect("reader");
         let hidden_uris: HashSet<_> = table
             .vector_index_table()
             .map(|hidden| {
@@ -2398,7 +2460,7 @@ pub mod vector {
         id_to_dense: &HashMap<i128, u32>,
         hits: &[infino::supertable::query::SuperfileHit],
     ) -> Vec<(u32, f32)> {
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
         for entry in manifest.get_all_superfiles() {
@@ -2898,6 +2960,7 @@ pub mod vector {
             sampled += 1;
             let batches = consumer
                 .reader()
+                .expect("reader")
                 .vector_search(
                     supertable::VEC_COLUMN,
                     &vectors[start..start + DIM],
@@ -2995,7 +3058,7 @@ pub mod vector {
             return "pre-drain";
         }
         let drained = hidden_manifest.get_drained_ranges();
-        let user_reader = consumer.reader();
+        let user_reader = consumer.reader().expect("reader");
         let user_manifest = user_reader.manifest();
         if user_manifest
             .get_all_superfiles()
@@ -3101,7 +3164,7 @@ pub mod vector {
             .vector_index_table()
             .expect("reset must recreate the hidden vector index");
         assert_eq!(
-            hidden.reader().n_superfiles(),
+            hidden.reader().expect("reader").n_superfiles(),
             0,
             "reset hidden index must reopen empty"
         );
@@ -3147,6 +3210,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -3167,6 +3231,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         q,
@@ -3184,6 +3249,7 @@ pub mod vector {
             |(_cache, consumer)| {
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -3229,7 +3295,7 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) -> RoutingStateStat {
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         super::measure_routing_state_with(
             "supertable_vector",
             label,
@@ -3337,10 +3403,36 @@ pub mod vector {
         // gate are forced off below and queries are corpus-free.
         let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
 
-        // Always prepare the corpus for vector benches so recall is always
-        // measurable (including existing-prefix runs).
+        // On a reopen (existing prefix) with a persisted oracle bin, load the
+        // held-out queries + exact labels straight from the bin and skip the
+        // corpus entirely: the bin already holds both, so regenerating the
+        // (potentially ~400 GB) corpus solely to rebuild the query vectors is
+        // pure waste. Fresh ingest / dataset / bin-less reopen still prepare it.
+        let reopen_oracle = if existing.is_some() && (phases.warm || phases.cold) {
+            corpus::grading::oracle_path()
+                .filter(|path| path.exists())
+                .map(|path| {
+                    let oracle = corpus::grading::load_oracle(&path).unwrap_or_else(|error| {
+                        panic!("failed to load oracle bin {}: {error}", path.display())
+                    });
+                    eprintln!(
+                        "[vector reopen] loaded {} queries + labels from oracle bin {}; \
+                         skipping corpus regeneration",
+                        oracle.queries.len(),
+                        path.display()
+                    );
+                    oracle
+                })
+        } else {
+            None
+        };
+
         crate::rss::log_rss_breakdown("supertable_vector before corpus prepare");
-        let mut corpus = Some(supertable::prepare_corpus(Modality::Vector));
+        let mut corpus = if reopen_oracle.is_some() {
+            None
+        } else {
+            Some(supertable::prepare_corpus(Modality::Vector))
+        };
         crate::rss::log_rss_breakdown("supertable_vector after corpus prepare");
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
@@ -3385,69 +3477,97 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
-                let corpus = corpus
-                    .as_ref()
-                    .expect("vector benches always prepare a corpus");
-                // The ingested vectors are still mmapped from the prepared
-                // corpus — queries and ground truth come from them instead
-                // of a regeneration. Skip-calibration still computes
-                // correctness/default recall (and filtered recall); it only
-                // skips the recall-target calibration sweep.
-                let vslice = corpus
-                    .vectors()
-                    .expect("vector modality prepared a vector corpus")
-                    .as_slice();
-                let base_vectors = &vslice[..n_docs * DIM];
-                let q_correct = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CORRECTNESS_QUERIES,
-                    QUERY_CORRECTNESS_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let q_cal = corpus::generate_realistic_queries(
-                    base_vectors,
-                    n_docs,
-                    N_CALIBRATION_QUERIES,
-                    QUERY_CALIBRATION_SEED,
-                    true,
-                    QUERY_SIGMA,
-                );
-                let augmented_docs = n_docs + supertable::docs_per_commit();
-                let all_queries: Vec<Vec<f32>> = if skip_cal {
-                    q_correct.clone()
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) =
+                if let Some(oracle) = reopen_oracle {
+                    // Reopen: queries + exact labels came straight from the
+                    // persisted oracle bin, so no corpus was prepared. Split the
+                    // combined query/label sets at the correctness boundary exactly
+                    // as the corpus path does below.
+                    let corpus::grading::CachedOracle {
+                        mut queries,
+                        mut labels,
+                        n_docs: oracle_docs,
+                        top_k: oracle_top_k,
+                        correctness_query_count,
+                    } = oracle;
+                    assert_eq!(
+                        oracle_docs, n_docs,
+                        "oracle bin n_docs does not match the reopened table"
+                    );
+                    assert_eq!(oracle_top_k, TOP_K, "oracle bin top_k mismatch");
+                    let q_cal = queries.split_off(correctness_query_count);
+                    let gt_cal = labels.base.split_off(correctness_query_count);
+                    (
+                        queries,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 } else {
-                    q_correct.iter().chain(&q_cal).cloned().collect()
-                };
-                let mut labels = corpus::grading::lifecycle_ground_truth_cached(
-                    corpus::grading::LifecycleGradingOptions {
-                        vectors: vslice,
+                    let corpus = corpus
+                        .as_ref()
+                        .expect("vector benches always prepare a corpus");
+                    // The ingested vectors are still mmapped from the prepared
+                    // corpus — queries and ground truth come from them instead
+                    // of a regeneration. Skip-calibration still computes
+                    // correctness/default recall (and filtered recall); it only
+                    // skips the recall-target calibration sweep.
+                    let vslice = corpus
+                        .vectors()
+                        .expect("vector modality prepared a vector corpus")
+                        .as_slice();
+                    let base_vectors = &vslice[..n_docs * DIM];
+                    let q_correct = corpus::generate_realistic_queries(
+                        base_vectors,
                         n_docs,
-                        augmented_docs,
-                        corpus_seed: supertable::CORPUS_VEC_SEED,
-                        normalized_vectors: true,
-                        filter_keep_every: FILTER_KEEP_EVERY,
-                        top_k: TOP_K,
-                        correctness_query_count: q_correct.len(),
-                        queries: &all_queries,
-                    },
-                );
-                let gt_cal = if skip_cal {
-                    Vec::new()
-                } else {
-                    labels.base.split_off(q_correct.len())
+                        N_CORRECTNESS_QUERIES,
+                        QUERY_CORRECTNESS_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let q_cal = corpus::generate_realistic_queries(
+                        base_vectors,
+                        n_docs,
+                        N_CALIBRATION_QUERIES,
+                        QUERY_CALIBRATION_SEED,
+                        true,
+                        QUERY_SIGMA,
+                    );
+                    let augmented_docs = n_docs + supertable::docs_per_commit();
+                    let all_queries: Vec<Vec<f32>> = if skip_cal {
+                        q_correct.clone()
+                    } else {
+                        q_correct.iter().chain(&q_cal).cloned().collect()
+                    };
+                    let mut labels = corpus::grading::lifecycle_ground_truth_cached(
+                        corpus::grading::LifecycleGradingOptions {
+                            vectors: vslice,
+                            n_docs,
+                            augmented_docs,
+                            corpus_seed: supertable::CORPUS_VEC_SEED,
+                            normalized_vectors: true,
+                            filter_keep_every: FILTER_KEEP_EVERY,
+                            top_k: TOP_K,
+                            correctness_query_count: q_correct.len(),
+                            queries: &all_queries,
+                        },
+                    );
+                    let gt_cal = if skip_cal {
+                        Vec::new()
+                    } else {
+                        labels.base.split_off(q_correct.len())
+                    };
+                    (
+                        q_correct,
+                        q_cal,
+                        labels.base,
+                        gt_cal,
+                        Some(labels.filtered),
+                        labels.augmented,
+                    )
                 };
-                (
-                    q_correct,
-                    q_cal,
-                    labels.base,
-                    gt_cal,
-                    Some(labels.filtered),
-                    labels.augmented,
-                )
-            };
             // Queries + ground truth extracted. Keep the mapping for the
             // normal follow-up commit, but evict its pages while measuring
             // pre/post-drain search.
@@ -3752,7 +3872,7 @@ pub mod vector {
             if phases.warm
                 && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                let consumer_reader = consumer.reader();
+                let consumer_reader = consumer.reader().expect("reader");
                 let mut allow_stable_ids: Vec<i128> = id_to_dense
                     .iter()
                     .filter_map(|(stable_id, dense_id)| {
@@ -3948,7 +4068,7 @@ pub mod vector {
                 // Post-drain, matching every other search number in this file.
                 drain_hidden_incoming(&combined_consumer);
                 let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
-                let combined_reader = combined_consumer.reader();
+                let combined_reader = combined_consumer.reader().expect("reader");
 
                 // Allow-set = the ENGINE's own `token_match` over the same
                 // column/term/mode the filter carries — the identical
@@ -4075,7 +4195,7 @@ pub mod vector {
                 // warm latency battery timed — so the ledger's warm GET/query
                 // and the compute ledger's warm CPU describe one path.
                 let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
-                    let reader = consumer.reader();
+                    let reader = consumer.reader().expect("reader");
                     // Untimed prewarm: fault each query's routed cells into the
                     // resident cache first, so the metered pass below reflects
                     // steady-state warm I/O (0 GET when the working set fits the
@@ -4353,15 +4473,31 @@ pub mod vector {
                     phases
                         .cold
                         .then(|| {
+                            // Latency probe only (not graded); a skip-calibration
+                            // reopen loads no calibration queries, so q_cal is
+                            // empty there -- fall back to the correctness set.
+                            let (cold_probe, cold_rest): (&Vec<f32>, &[Vec<f32>]) =
+                                match q_cal.first() {
+                                    Some(first) => (
+                                        first,
+                                        if q_cal.len() > 1 {
+                                            &q_cal[1..]
+                                        } else {
+                                            &q_cal[..]
+                                        },
+                                    ),
+                                    None => (
+                                        q_correct
+                                            .first()
+                                            .expect("correctness query set is non-empty"),
+                                        &q_correct[1..],
+                                    ),
+                                };
                             measure_cold_store(
                                 "steady-state",
                                 &built,
-                                &q_cal[0],
-                                if q_cal.len() > 1 {
-                                    &q_cal[1..]
-                                } else {
-                                    &q_cal[..]
-                                },
+                                cold_probe,
+                                cold_rest,
                                 nprobe,
                                 rerank,
                                 post_drain_stored,
@@ -4797,7 +4933,7 @@ pub mod sql {
             .iter()
             .find(|q| q.name == "filter_category_count")
             .expect("battery keeps its filtered-count representative");
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         super::measure_routing_state_with(
             "supertable_sql",
             label,

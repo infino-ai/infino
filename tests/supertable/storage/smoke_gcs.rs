@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 use infino::{
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::BoolMode,
+        fts::reader::{Bm25Stats, BoolMode},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -189,11 +189,22 @@ async fn supertable_real_gcs_round_trip() {
     )
     .expect("open real gcs supertable");
     assert_eq!(consumer.manifest_id(), 1);
-    assert_eq!(consumer.reader().n_docs_total(), EXPECTED_N_DOCS);
+    assert_eq!(
+        consumer.reader().expect("reader").n_docs_total(),
+        EXPECTED_N_DOCS
+    );
 
     let bm25 = consumer
         .reader()
-        .bm25_search("title", "alpha", 10, BoolMode::Or, None)
+        .expect("reader")
+        .bm25_search(
+            "title",
+            "alpha",
+            10,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("bm25 over real gcs");
     assert!(!bm25.is_empty(), "cold BM25 must find the alpha docs");
 
@@ -201,6 +212,7 @@ async fn supertable_real_gcs_round_trip() {
     query[0] = 1.0;
     let vectors = consumer
         .reader()
+        .expect("reader")
         .vector_search(
             "emb",
             &query,
@@ -214,6 +226,7 @@ async fn supertable_real_gcs_round_trip() {
 
     let batches = consumer
         .reader()
+        .expect("reader")
         .query_sql("SELECT COUNT(*) AS n FROM supertable")
         .expect("query real gcs");
     assert_eq!(batches.len(), 1);

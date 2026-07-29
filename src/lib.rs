@@ -174,7 +174,10 @@ pub use config::{CompactionSettings, GcSettings, OptimizeOptions};
 pub use error::InfinoError;
 /// Value types named by the public method signatures.
 pub use superfile::VectorSearchOptions;
-pub use superfile::{fts::reader::BoolMode, vector::distance::Metric};
+pub use superfile::{
+    fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+    vector::distance::Metric,
+};
 pub use supertable::{
     GcError, GcReport, MutationStats, OptimizeError, query::vector::VectorFilter,
 };
