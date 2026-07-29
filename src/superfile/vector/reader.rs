@@ -20,7 +20,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
@@ -3158,11 +3158,20 @@ impl VectorReader {
                 )
             })
         });
-        let mut merged: Vec<(u32, f32)> = try_join_all(cell_probes)
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
+        // Wave-cap the concurrent probes to the pool width (the same
+        // bound every other fan-out here uses): a wide sweep over a
+        // many-celled shard must not open unbounded simultaneous
+        // range reads / cold fetches.
+        let max_in_flight = pool
+            .as_deref()
+            .map(ThreadPool::current_num_threads)
+            .unwrap_or_else(rayon::current_num_threads)
+            .max(1);
+        let per_cell: Vec<Vec<(u32, f32)>> = stream::iter(cell_probes)
+            .buffer_unordered(max_in_flight)
+            .try_collect()
+            .await?;
+        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flatten().collect();
         // Distance ascending (smaller = closer), matching every other vector
         // search path. Descending here kept the farthest k hits and collapsed
         // packed-shard recall to ~0.

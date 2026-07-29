@@ -26,7 +26,11 @@
 //! manifest centroids and rows to fp32 before [`distance`]; rows are
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
-use std::{cmp::Ordering, collections::HashMap, sync::Mutex};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+};
 
 use crate::{
     config,
@@ -756,7 +760,13 @@ pub(crate) struct WidthLawCalibration {
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
     /// Per-query `(score, cell)` candidates, truncated to the largest law
-    /// `k` as cells merge in.
+    /// `k` as cells merge in. Lock poisoning is recovered, not propagated:
+    /// each merge is an atomic append+truncate, so a panicked pack worker
+    /// leaves the held data usable. NOTE: candidates are not deduplicated
+    /// by stable id — boundary replicas (drain replica factor > 1.0) could
+    /// let one neighbor occupy several top-k slots and narrow the law;
+    /// inert while replication is off, to be resolved with the replication
+    /// repair.
     tops: Mutex<Vec<Vec<(f32, u32)>>>,
 }
 
@@ -791,7 +801,7 @@ impl WidthLawCalibration {
     pub(crate) fn freeze(&mut self) {
         let queries = self.reservoir.sample().to_vec();
         let ids = self.slot_ids.clone();
-        *self.tops.lock().expect("width-law tops lock") = vec![Vec::new(); ids.len()];
+        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); ids.len()];
         self.frozen = Some(WidthLawQueries { queries, ids });
     }
 
@@ -839,7 +849,7 @@ impl WidthLawCalibration {
                 truncate_ascending(cand, k_max);
             }
         }
-        let mut tops = self.tops.lock().expect("width-law tops lock");
+        let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
         for (qi, mut cand) in partial.into_iter().enumerate() {
             tops[qi].append(&mut cand);
             truncate_ascending(&mut tops[qi], k_max);
@@ -859,7 +869,10 @@ impl WidthLawCalibration {
             return None;
         }
         let n_cells = grid.n_cent as usize;
-        let tops = self.tops.into_inner().expect("width-law tops lock");
+        let tops = self
+            .tops
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
         // Superseded or empty cells inflate ranks slightly (routing skips
         // them, this count does not) — an over-probe, never an under-probe;
         // fresh drains, the normal calibration moment, have neither.

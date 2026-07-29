@@ -4237,6 +4237,40 @@ mod tests {
         );
     }
 
+    /// An incremental drain calibrates only the newly spilled tail; its
+    /// measurement must never NARROW the stamped law (element-wise max
+    /// merge), or a small tightly-clustered append would under-probe all
+    /// older data. The delta here spans few directions, so its own law is
+    /// far narrower than the fixture's — the default search must still
+    /// recover the full three-cell top-k afterward.
+    #[test]
+    fn incremental_drain_never_narrows_the_width_law() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            (FIXTURE_COMMITS * FIXTURE_ROWS_PER_COMMIT as u64) + 1,
+            DOCS_PER_DIRECTION,
+            FIXTURE_DIM,
+            schema_with_vector(FIXTURE_DIM),
+        ))
+        .expect("append delta");
+        w.commit().expect("commit delta");
+        st.drain_vectors_to_cells_sync().expect("incremental drain");
+
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search after incremental drain");
+        let near = near_count(&hits);
+        assert_eq!(
+            near,
+            k,
+            "the delta-only calibration must not narrow the stamped law: \
+             default search lost {} of {k} planted neighbors",
+            k - near
+        );
+    }
+
     /// The `Supertable::vector_search` handle wrapper (tests normally call
     /// `reader().vector_search`) delegates to the reader and returns rows.
     #[test]

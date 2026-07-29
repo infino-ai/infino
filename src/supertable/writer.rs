@@ -3953,13 +3953,23 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // Stamp the measured probe-width law into the routing this commit
         // already persists; ranked against the same live grid queries route
         // on. `None` (resumed drain / empty sample) keeps the prior law.
+        //
+        // Element-wise MAX with the previously stamped law: an incremental
+        // drain samples and scores only the newly spilled tail, so its
+        // measurement alone could narrow the law for the whole table (a
+        // small tightly-clustered append would under-probe older data).
+        // Widening on new evidence is always recall-safe; the law narrows
+        // only when a full rebuild re-measures everything.
         if let Some(cal) = width_law.take()
             && let Some(law) = cal.finish(&running_clusters)
         {
+            for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
+                *slot = (*slot).max(measured);
+            }
             eprintln!(
-                "[supertable drain] probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): {law:?}"
+                "[supertable drain] probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
+                routing.width_for_k
             );
-            routing.width_for_k = law;
         }
         let list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
