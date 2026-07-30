@@ -2856,7 +2856,7 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             &ctx,
         )
-        .await
+        .await?
         {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
@@ -3058,6 +3058,33 @@ impl VectorReader {
             .await
     }
 
+    /// Map flat cluster ids to per-cell probe work on a multi-cell
+    /// reader: `(cell index, doc-id base, cell-local cluster ids)`.
+    /// Doc-id bases follow parquet row order (cells concatenated in
+    /// directory order). The single shared resolution step of the
+    /// immediate probe ([`Self::search_clusters_async_multi_cell`]) and
+    /// the deferred scan ([`Self::search_clusters_scan_async`]), so the
+    /// two paths cannot drift.
+    fn resolve_cells_for_clusters(&self, clusters: &[u32]) -> Vec<(usize, u32, Vec<usize>)> {
+        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &flat in clusters {
+            let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
+                continue;
+            };
+            by_cell.entry(cell_idx).or_default().push(local as usize);
+        }
+        let mut doc_base = vec![0u32; self.columns.len()];
+        let mut running = 0u32;
+        for (i, col) in self.columns.iter().enumerate() {
+            doc_base[i] = running;
+            running = running.saturating_add(col.n_docs);
+        }
+        by_cell
+            .into_iter()
+            .map(|(cell_idx, locals)| (cell_idx, doc_base[cell_idx], locals))
+            .collect()
+    }
+
     /// Multi-cell probe: map flat cluster ids → (cell, local), probe each
     /// touched cell, merge hits. Local doc ids are unique within a cell
     /// subsection; across cells they may collide, so hits are tagged with
@@ -3095,24 +3122,9 @@ impl VectorReader {
             return Ok(Vec::new());
         }
 
-        // Group flat cluster ids by cell index.
-        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &flat in clusters {
-            let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
-                continue;
-            };
-            by_cell.entry(cell_idx).or_default().push(local as usize);
-        }
-        if by_cell.is_empty() {
+        let per_cell = self.resolve_cells_for_clusters(clusters);
+        if per_cell.is_empty() {
             return Ok(Vec::new());
-        }
-
-        // Doc-id bases: parquet rows are concatenated in cell-directory order.
-        let mut doc_base = vec![0u32; self.columns.len()];
-        let mut running = 0u32;
-        for (i, col) in self.columns.iter().enumerate() {
-            doc_base[i] = running;
-            running = running.saturating_add(col.n_docs);
         }
 
         // Probe the selected cells CONCURRENTLY — the same wave shape the
@@ -3122,12 +3134,11 @@ impl VectorReader {
         // walls (measured ~1.2 ms x width per query at w=54 on Cohere-1M).
         // Each cell's probe is independent: own ProbeCtx, own blocks, own
         // rerank; the merge below is order-independent (re-sorted).
-        let cell_probes = by_cell.into_iter().filter_map(|(cell_idx, locals)| {
+        let cell_probes = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
             let col = &self.columns[cell_idx];
             if col.n_docs == 0 {
                 return None;
             }
-            let base = doc_base[cell_idx];
             // Allow/deny are file-local; each cell IVF checks cell-local ids.
             let cell_allow = self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
             let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
@@ -3248,23 +3259,7 @@ impl VectorReader {
                     got: query.len(),
                 });
             }
-            let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
-            for &flat in clusters {
-                let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
-                    continue;
-                };
-                by_cell.entry(cell_idx).or_default().push(local as usize);
-            }
-            let mut doc_base = vec![0u32; self.columns.len()];
-            let mut running = 0u32;
-            for (i, col) in self.columns.iter().enumerate() {
-                doc_base[i] = running;
-                running = running.saturating_add(col.n_docs);
-            }
-            per_cell = by_cell
-                .into_iter()
-                .map(|(cell_idx, locals)| (cell_idx, doc_base[cell_idx], locals))
-                .collect();
+            per_cell = self.resolve_cells_for_clusters(clusters);
         } else {
             let (_, validated) = self.resolve_column(column, query, k)?;
             if !validated {
@@ -3342,7 +3337,7 @@ impl VectorReader {
                     let coarse_limit = k.saturating_mul(rerank_mult);
                     let shortlist =
                         scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
-                            .await;
+                            .await?;
                     let cands = shortlist
                         .into_iter()
                         .map(|(did, estimate, pos, cluster_id)| ScanCandidate {
@@ -3655,7 +3650,7 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             ctx,
         )
-        .await
+        .await?
         {
             ShortlistOutcome::Done(out) => {
                 if let Some(t0) = shortlist_t0 {
@@ -4076,7 +4071,7 @@ async fn scan_shortlist(
     survivor_only_rerank_fetch: bool,
     coarse_limit: usize,
     ctx: &ProbeCtx<'_>,
-) -> Vec<(u32, f32, u32, u32)> {
+) -> Result<Vec<(u32, f32, u32, u32)>, VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
     // Collect every scored row, then keep the top `coarse_limit` with one
@@ -4224,7 +4219,7 @@ async fn scan_shortlist(
                 });
             let _ = tx.send(acc);
         });
-        rx.await.expect("vector scan rayon task dropped result")
+        rx.await.map_err(|_| VectorError::TaskDropped("scan"))?
     } else {
         let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
         let mut acc = Vec::with_capacity(total_candidates.min(cap));
@@ -4237,7 +4232,7 @@ async fn scan_shortlist(
         acc
     };
     truncate_to_top_estimates(&mut acc, coarse_limit);
-    acc
+    Ok(acc)
 }
 
 /// Keep the `limit` highest-estimate survivors of one cell scan via a
@@ -4299,7 +4294,7 @@ async fn build_shortlist(
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
     ctx: &ProbeCtx<'_>,
-) -> ShortlistOutcome {
+) -> Result<ShortlistOutcome, VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     // Score each probed cluster's 1-bit codes into the shortlist.
     // The per-cluster slices are zero-copy `Bytes` views; the actual
@@ -4314,7 +4309,7 @@ async fn build_shortlist(
         ctx.k.saturating_mul(ctx.rerank_mult)
     };
     if coarse_limit == 0 {
-        return ShortlistOutcome::Done(Vec::new());
+        return Ok(ShortlistOutcome::Done(Vec::new()));
     }
     let mut shortlist = scan_shortlist(
         col,
@@ -4325,10 +4320,10 @@ async fn build_shortlist(
         coarse_limit,
         ctx,
     )
-    .await;
+    .await?;
 
     if shortlist.is_empty() {
-        return ShortlistOutcome::Done(Vec::new());
+        return Ok(ShortlistOutcome::Done(Vec::new()));
     }
 
     // `RabitqOnly` short-circuit: the 1-bit shortlist *is* the final
@@ -4346,12 +4341,12 @@ async fn build_shortlist(
         // merge path — otherwise the two paths diverge on top-k for a
         // corrupt/degenerate score.
         shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        return ShortlistOutcome::Done(
+        return Ok(ShortlistOutcome::Done(
             shortlist
                 .into_iter()
                 .map(|(did, est, _pos, _c)| (did, -est))
                 .collect(),
-        );
+        ));
     }
 
     // Build lightweight rerank references into the cluster blocks
@@ -4391,10 +4386,10 @@ async fn build_shortlist(
             full_idx,
         });
     }
-    ShortlistOutcome::Rerank {
+    Ok(ShortlistOutcome::Rerank {
         candidates,
         survivor_full_ranges,
-    }
+    })
 }
 
 /// Maximum multiplier applied to filtered-search probe breadth and
@@ -4548,21 +4543,25 @@ fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
 /// the async caller via a oneshot, so no tokio worker blocks under it.
 /// `f` and the items must be `'static` so the work can move onto rayon.
-async fn par_map<T, R, F>(items: Vec<T>, f: F, pool: Option<Arc<ThreadPool>>) -> Vec<R>
+async fn par_map<T, R, F>(
+    items: Vec<T>,
+    f: F,
+    pool: Option<Arc<ThreadPool>>,
+) -> Result<Vec<R>, VectorError>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
     F: Fn(&T) -> R + Send + Sync + 'static,
 {
     if parallel_chunks(items.len()) <= 1 {
-        return items.iter().map(&f).collect();
+        return Ok(items.iter().map(&f).collect());
     }
     let (tx, rx) = oneshot::channel();
     spawn_on(pool.as_deref(), move || {
         let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
     });
-    rx.await.expect("rerank rayon task dropped result")
+    rx.await.map_err(|_| VectorError::TaskDropped("rerank"))
 }
 
 /// The 1-bit scan loop over one cluster's codes, generic over the
@@ -4723,7 +4722,7 @@ async fn rerank_candidates_from_blocks(
                     },
                     pool.clone(),
                 )
-                .await
+                .await?
             } else {
                 candidates
                     .iter()
@@ -4771,7 +4770,7 @@ async fn rerank_candidates_from_blocks(
                         pool.clone(),
                         stride,
                     )
-                    .await
+                    .await?
                 }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
@@ -4810,7 +4809,7 @@ async fn rerank_candidates_from_blocks(
                                 pool.clone(),
                                 stride,
                             )
-                            .await,
+                            .await?,
                             k,
                         ));
                     }
@@ -4957,7 +4956,7 @@ async fn score_sq8_residual_candidates(
     residual_divisor: f32,
     pool: Option<Arc<ThreadPool>>,
     stride: usize,
-) -> Vec<(u32, f32)> {
+) -> Result<Vec<(u32, f32)>, VectorError> {
     let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     cids.sort_unstable();
     cids.dedup();
@@ -5014,7 +5013,7 @@ async fn score_sq8_residual_candidates(
         )
         .await
     } else {
-        candidates.iter().map(score_one).collect()
+        Ok(candidates.iter().map(score_one).collect())
     }
 }
 
@@ -5497,7 +5496,8 @@ mod tests {
             None,
             2,
         )
-        .await;
+        .await
+        .expect("sq8 scorer");
         assert_eq!(scored.len(), candidates.len());
         scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         assert_eq!(
@@ -9070,6 +9070,66 @@ mod tests {
         assert!(hits[0].1 < 1e-4, "self distance ~0, got {}", hits[0].1);
     }
 
+    /// Deferred-vs-immediate parity (review follow-up): nothing else
+    /// asserts the deferred pipeline (1-bit scan -> selection ->
+    /// selected-candidate rerank) agrees with the proven immediate
+    /// probe. Same reader, same clusters, untruncated budget
+    /// (`k * rerank_mult >= corpus`, so selection drops nothing and
+    /// both paths exact-rerank identical candidate sets): the top-k
+    /// must match exactly — ids and scores — since both ends run the
+    /// same rerank kernel over the same bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_scan_rerank_matches_immediate_probe_top_k() {
+        let (blob, json, all) =
+            build_large_corpus(16, 4, 2600, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let clusters: Vec<u32> = (0..4).collect();
+        let k = 25usize;
+        let rerank_mult = 128usize; // 25 * 128 = 3200 >= 2600 rows
+        let immediate = r
+            .search_clusters_async(
+                "v",
+                &all[7],
+                k,
+                &clusters,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("immediate probe");
+        let scan = r
+            .search_clusters_scan_async(
+                "v",
+                &all[7],
+                k,
+                &clusters,
+                rerank_mult,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("deferred scan");
+        assert!(
+            scan.hits.is_empty(),
+            "a fully-resident reader defers every cell (no cold hits)"
+        );
+        assert!(!scan.candidates.is_empty(), "deferred candidates surface");
+        let deferred = r
+            .rerank_selected_async("v", &all[7], k, scan.candidates, None)
+            .await
+            .expect("selected rerank");
+        assert_eq!(
+            immediate, deferred,
+            "deferred scan+select+rerank must equal the immediate probe's top-k"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parallel_scan_untruncated_pool_matches_brute_force() {
         // 2600 docs across 4 clusters puts the probed scan over
@@ -9141,7 +9201,9 @@ mod tests {
     #[tokio::test]
     async fn par_map_serial_fallback_for_small_input() {
         // parallel_chunks(items) <= 1 takes the serial map arm.
-        let out = par_map(vec![1u32, 2, 3], |x| x * 10, None).await;
+        let out = par_map(vec![1u32, 2, 3], |x| x * 10, None)
+            .await
+            .expect("serial par_map cannot drop");
         assert_eq!(out, vec![10, 20, 30]);
     }
 

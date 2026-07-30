@@ -234,6 +234,13 @@ pub enum VectorError {
     /// `InfinoError::OverBudget` via [`VectorError::over_budget`].
     #[error("{0}")]
     OverBudget(String),
+
+    /// A rayon-bridged compute task dropped its result channel without
+    /// sending — the worker panicked or was cancelled mid-query. Surfaced
+    /// as an error so a lost scan/rerank fails the one query instead of
+    /// panicking the process.
+    #[error("vector compute task dropped its result during {0}")]
+    TaskDropped(&'static str),
 }
 
 impl VectorError {
