@@ -1367,7 +1367,9 @@ impl SupertableReader {
             // Base routing shape first (per branch), then one shared caller
             // override on top.
             let mut cell_routing = if hidden_vector_index {
-                let base = hidden_routing.expect("hidden manifest carries routing");
+                let base = hidden_routing.ok_or_else(|| {
+                    QueryError::Execute("hidden manifest missing cell routing".into())
+                })?;
                 if filtered {
                     // Allow-set queries widen to the filtered floor and
                     // probe DEEPER fine runs per cell — the matching
@@ -1788,7 +1790,7 @@ impl SupertableReader {
         // and are applied after remapping to user `_id`s.
         // Warm-cell estimate survivors from every scanned unit, pooled for
         // the global selection: (unit index, rot seed, candidates).
-        let scan_pool: Arc<Mutex<Vec<(usize, u64, Vec<ScanCandidate>)>>> =
+        let scan_pool: Arc<Mutex<Vec<(usize, u64, usize, Vec<ScanCandidate>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let scan_pool_body = Arc::clone(&scan_pool);
         let body =
@@ -1850,7 +1852,7 @@ impl SupertableReader {
                             scan_pool
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner)
-                                .push((si, scan.rot_seed, scan.candidates));
+                                .push((si, scan.rot_seed, replica_overhead, scan.candidates));
                         }
                         scan.hits
                     } else {
@@ -1919,16 +1921,32 @@ impl SupertableReader {
                 mem::take(&mut *guard)
             };
             if !pooled.is_empty() {
-                debug_assert!(
-                    pooled.windows(2).all(|w| w[0].1 == w[1].1),
-                    "pooled 1-bit estimates require one rotation seed per column"
-                );
+                // Hard error, not debug_assert: this is the one site where
+                // estimates from different superfiles are pooled and ranked
+                // against each other. Backstopped by the open-time seed
+                // check today, but if a future path ever admits a
+                // differently-seeded unit, fail the query loudly instead of
+                // silently ranking incomparable estimates.
+                if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
+                    return Err(QueryError::Execute(
+                        "pooled 1-bit estimates require one rotation seed per column".into(),
+                    ));
+                }
                 let (_, rerank_mult) = options.resolve(filtered);
+                // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
+                // global cut so boundary replicas (dormant today: overhead
+                // is 0 with replication off) cannot take shortlist slots
+                // from distinct rows before the stable-id dedup.
+                let replica_overhead = pooled.iter().map(|(_, _, o, _)| *o).max().unwrap_or(0);
                 let mut flat: Vec<(usize, ScanCandidate)> = pooled
                     .into_iter()
-                    .flat_map(|(si, _, cands)| cands.into_iter().map(move |c| (si, c)))
+                    .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
                     .collect();
-                flat = select_global_shortlist(flat, k.saturating_mul(rerank_mult));
+                flat = select_global_shortlist(
+                    flat,
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult),
+                );
                 let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
                 for (si, cand) in flat {
                     winners_by_seg.entry(si).or_default().push(cand);

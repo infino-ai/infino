@@ -3283,6 +3283,11 @@ impl VectorReader {
         if per_cell.is_empty() {
             return Ok(outcome);
         }
+        // Estimates pool cross-superfile keyed by this seed; report the
+        // REQUESTED column's seed (every cell of one column shares it),
+        // not `columns[0]`'s — a multi-column file's first column can be
+        // a different column with a different rotation.
+        outcome.rot_seed = self.columns[per_cell[0].0].rot_seed;
         // Rotate the query once per superfile: every cell of a column
         // shares the table-wide rotation seed (cross-cell estimate pooling
         // depends on it), so per-cell re-rotation is duplicate work — at a
@@ -3442,6 +3447,15 @@ impl VectorReader {
                 let mut rerank_cands = Vec::with_capacity(cands.len());
                 for cand in &cands {
                     let (off, cnt) = extent_by_cid[&cand.cluster_id];
+                    // `pos = off + i` was captured from the same immutable
+                    // superfile this rerank reads, so the subtraction cannot
+                    // wrap — make any future layout drift loud instead of a
+                    // ~4e9 "local" and an out-of-range byte range.
+                    debug_assert!(
+                        cand.pos >= off && cand.pos - off < cnt,
+                        "candidate pos {} outside cluster extent (off {off}, cnt {cnt})",
+                        cand.pos
+                    );
                     let local = (cand.pos - off) as usize;
                     let full_idx = Some(ranges.len());
                     ranges.push(col.cluster_rerank_row_range(off, cnt, local));
@@ -4152,9 +4166,10 @@ async fn scan_shortlist(
                 .par_chunks(chunk)
                 .zip(blocks_owned.par_chunks(chunk))
                 .map(|(meta_chunk, block_chunk)| {
-                    let mut acc = Vec::with_capacity(
-                        meta_chunk.iter().map(|&(_, _, cnt)| cnt as usize).sum(),
-                    );
+                    let chunk_rows: usize =
+                        meta_chunk.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+                    let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
+                    let mut acc = Vec::with_capacity(chunk_rows.min(cap));
                     for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
                         let codes_len = (cnt as usize) * cb;
                         let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
@@ -4194,20 +4209,30 @@ async fn scan_shortlist(
                                 acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id))
                             },
                         );
+                        if acc.len() >= cap {
+                            truncate_to_top_estimates(&mut acc, coarse_limit);
+                        }
                     }
                     acc
                 })
                 .reduce(Vec::new, |mut a, mut b| {
                     a.append(&mut b);
+                    if a.len() >= coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK) {
+                        truncate_to_top_estimates(&mut a, coarse_limit);
+                    }
                     a
                 });
             let _ = tx.send(acc);
         });
         rx.await.expect("vector scan rayon task dropped result")
     } else {
-        let mut acc = Vec::with_capacity(total_candidates);
+        let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
+        let mut acc = Vec::with_capacity(total_candidates.min(cap));
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
             scan_vec(&mut acc, item);
+            if acc.len() >= cap {
+                truncate_to_top_estimates(&mut acc, coarse_limit);
+            }
         }
         acc
     };
@@ -4488,6 +4513,16 @@ fn score_centroids(
 /// superfile nprobe=1 hot path — stay serial, while the 10M
 /// supertable's `nprobe × superfiles` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
+
+/// Amortized shortlist-truncation slack: scan accumulators may grow to
+/// this multiple of `coarse_limit` before being partitioned back down.
+/// At real cell shapes (~9K rows vs a 6.4K cap) the guard never fires;
+/// at the 500K-row cell backstop it bounds per-task growth to
+/// `2 x coarse_limit` entries instead of every scanned row. Early
+/// truncation keeps the final set exact: the kept set is the top
+/// `coarse_limit` under a total order, so any row dropped early is
+/// dominated by rows that stay until the final partition.
+const SHORTLIST_TRUNCATE_SLACK: usize = 2;
 
 /// Number of chunks to split a parallel rayon scan into — the machine's
 /// logical parallelism, capped by the item count so we never make more
