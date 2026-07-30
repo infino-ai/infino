@@ -3445,9 +3445,25 @@ impl VectorReader {
                     None
                 };
                 let survivor_t0 = io_counters::phase_start();
-                let survivor_rows = get_survivor_ranges_coalesced_async(&self.source, &ranges)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                // Residency-aware gather: the globally selected winners are
+                // FEW and SCATTERED (~k x rerank_mult / width per cell), so
+                // the coalesce plan's gap window — correct for remote
+                // fetches, where round trips dominate — merges them into
+                // ~whole-cell spans that a resident cache then materializes
+                // (measured: ~300 MB touched per query to deliver ~10 MB of
+                // rows, 60% of warm query wall). When every row resolves
+                // synchronously from resident bytes, read the exact ranges
+                // instead; fall back to the coalesced remote plan otherwise.
+                let sync_rows: Option<Vec<Bytes>> = ranges
+                    .iter()
+                    .map(|range| self.source.try_get_range_sync(range.clone()))
+                    .collect();
+                let survivor_rows = match sync_rows {
+                    Some(rows) => rows,
+                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?,
+                };
                 if let Some(t0) = survivor_t0 {
                     io_counters::phase_record(
                         "vec.survivor_fetch",
