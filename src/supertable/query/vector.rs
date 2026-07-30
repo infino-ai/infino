@@ -4260,6 +4260,87 @@ mod tests {
         );
     }
 
+    /// Warm-vs-cold parity for the width sweep — the review's "cold
+    /// fixture". The warm arm defers survivors to the global shortlist;
+    /// a cell with non-resident prefixes reranks in-probe under the
+    /// divided cold budget and never enters global selection. At an
+    /// untruncated budget both arms exact-rerank every candidate, so
+    /// the same query on the same committed table must return identical
+    /// hits regardless of cache state. (The replica variant stays
+    /// blocked on the drain_replica_target_factor crash filed
+    /// separately.)
+    #[test]
+    fn vector_cold_arm_matches_warm_top_k() {
+        use crate::test_helpers::lazy_foreground_disk_cache;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+
+        // Warm: default in-memory reader cache — every prefix resident,
+        // the sweep defers to the global shortlist.
+        let warm_hits = {
+            let st = Supertable::create(
+                options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+            )
+            .expect("create");
+            for c in 0..4u64 {
+                let mut w = st.writer().expect("writer");
+                w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                    .expect("append");
+                w.commit().expect("commit");
+            }
+            st.drain_vectors_to_cells_sync().expect("drain");
+            st.reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    20,
+                    VectorSearchOptions::new().with_nprobe(4),
+                    None,
+                )
+                .expect("warm search")
+        };
+
+        // Cold: a fresh handle reading through a lazy disk-cache source —
+        // nothing resident, every probed cell takes the cold arm.
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st_cold = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open cold");
+        let cold_hits = st_cold
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                20,
+                VectorSearchOptions::new().with_nprobe(4),
+                None,
+            )
+            .expect("cold search");
+        assert!(
+            cache.stats().n_cold_fetches >= 1,
+            "the cold handle must actually read through the lazy cache \
+             (otherwise this fixture proves nothing)"
+        );
+
+        assert_eq!(
+            warm_hits, cold_hits,
+            "cache state must not change the top-k (warm deferred-global vs \
+             cold divided in-probe, both exact at an untruncated budget)"
+        );
+    }
+
     /// A larger post-drain corpus (many docs across several commits, drained
     /// into multiple cells) searched with a wider `k` and `nprobe`, so the
     /// query reranks candidates spanning multiple clusters — the multi-cluster
