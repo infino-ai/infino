@@ -41,9 +41,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use memmap2::Mmap;
 use roaring::RoaringBitmap;
 
-use super::disk::DiskCacheStore;
+use super::disk::{ArcMmapOwner, DiskCacheStore};
 use crate::{
     superfile::{LazyByteSource, LazyByteSourceError},
     supertable::manifest::SuperfileUri,
@@ -65,6 +66,9 @@ const CACHE_BLOCK_BYTES: u64 = 512 * 1024;
 struct BlockFile {
     file: fs::File,
     size: u64,
+    /// Lazily-created read-only mapping for zero-copy hit service.
+    /// Inner `None` = mapping failed once; keep serving via pread.
+    mmap: OnceLock<Option<Arc<Mmap>>>,
 }
 
 /// Block-caching wrapper around a network-backed [`LazyByteSource`].
@@ -180,7 +184,11 @@ impl BlockCachedSource {
                     .open(&self.path)
                     .ok()?;
                 file.set_len(size).ok()?;
-                Some(BlockFile { file, size })
+                Some(BlockFile {
+                    file,
+                    size,
+                    mmap: OnceLock::new(),
+                })
             })
             .as_ref()
     }
@@ -239,6 +247,31 @@ impl BlockCachedSource {
     /// Serve `[start, start+len)` from the sparse file. `None` on a read
     /// error (caller degrades to passthrough).
     fn read_local(&self, bf: &BlockFile, start: u64, len: u64) -> Option<Bytes> {
+        // Zero-copy hit service: filled ranges are handed out as slices of
+        // one shared read-only mapping instead of alloc+pread per range. At
+        // law width a warm vector query reads ~20 MB through here; the
+        // per-range alloc+zero+pread copies were the measured ~6-7 ms
+        // prefix-service floor of phase A (and the residual copy cost in
+        // the deferred rerank's exact-range gather). Slices keep the
+        // mapping alive after eviction, exactly like the promoted
+        // parquet/FTS mmaps.
+        let mapped = bf.mmap.get_or_init(|| {
+            // SAFETY: the blocks file is pre-sized at creation
+            // (`file.set_len(size)`) and only ever written through
+            // `write_all_at` within that size, so a mapping of the full
+            // file never outruns it (no SIGBUS); the read-only shared
+            // mapping stays page-cache-coherent with those writes, and
+            // reads of not-yet-filled blocks are gated by `all_filled`
+            // before this method runs.
+            unsafe { Mmap::map(&bf.file) }.ok().map(Arc::new)
+        });
+        if let Some(m) = mapped.as_ref() {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            if e <= m.len() {
+                return Some(Bytes::from_owner(ArcMmapOwner(Arc::clone(m))).slice(s..e));
+            }
+        }
         let mut out = vec![0u8; len as usize];
         bf.file.read_exact_at(&mut out, start).ok()?;
         Some(Bytes::from(out))

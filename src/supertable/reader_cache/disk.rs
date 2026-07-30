@@ -2551,7 +2551,7 @@ impl LazyByteSource for HoleFallbackSource {
 /// same `Arc<Mmap>` — both refer to the same OS mapping, so
 /// `madvise` on the cache's handle affects the reader's
 /// resident pages (the idle-threshold sweep relies on this).
-struct ArcMmapOwner(Arc<Mmap>);
+pub(crate) struct ArcMmapOwner(pub(crate) Arc<Mmap>);
 
 impl AsRef<[u8]> for ArcMmapOwner {
     fn as_ref(&self) -> &[u8] {
