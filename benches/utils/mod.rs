@@ -31,6 +31,8 @@ pub mod supertable;
 
 pub mod concurrent;
 pub mod diag_common;
+/// Linux-only relies on `/proc/self/io` and `posix_fadvise`
+#[cfg(target_os = "linux")]
 pub mod disk_warm;
 pub mod fts_diag;
 pub mod recall_while_ingest;

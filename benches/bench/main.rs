@@ -98,7 +98,15 @@ impl Diagnostic {
             Diagnostic::FtsDiag => infino_bench_utils::fts_diag::run(),
             Diagnostic::ObjectStore => infino_bench_utils::unified_object_store::run(),
             Diagnostic::Concurrent => infino_bench_utils::concurrent::run(),
-            Diagnostic::DiskWarm => infino_bench_utils::disk_warm::run(),
+            Diagnostic::DiskWarm => {
+                #[cfg(target_os = "linux")]
+                infino_bench_utils::disk_warm::run();
+                #[cfg(not(target_os = "linux"))]
+                eprintln!(
+                    "disk-warm diagnostic needs /proc/self/io and posix_fadvise \
+                     (Linux-only); skipping on this platform"
+                );
+            }
             Diagnostic::RecallWhileIngest => infino_bench_utils::recall_while_ingest::run(),
         }
     }
