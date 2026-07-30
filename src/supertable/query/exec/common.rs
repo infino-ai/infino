@@ -41,9 +41,9 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use rayon::prelude::*;
-use tokio::sync::oneshot;
 
 use crate::{
+    runtime_bridge::run_on_pool,
     superfile::{
         SuperfileReader,
         lazy_source::Source,
@@ -517,23 +517,24 @@ async fn resolve_columns(
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let pool = Arc::clone(&manifest.options.reader_pool);
         let inputs = warm_inputs;
-        let (tx, rx) = oneshot::channel();
-        pool.spawn(move || {
-            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-            let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
-                .into_par_iter()
-                .map(|(i, sf, locals)| {
-                    sf.take_by_local_doc_ids(&locals, &name_refs)
-                        .map(|batch| (i, batch))
-                })
-                .collect();
-            let _ = tx.send(result);
-        });
-        rx.await
-            .map_err(|_| {
-                DataFusionError::Execution("resolve decode: reader pool dropped result".into())
-            })?
-            .map_err(|e| DataFusionError::Execution(e.to_string()))
+        run_on_pool(
+            Some(&pool),
+            "resolve decode: reader pool dropped result",
+            move || {
+                let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+                let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
+                    .into_par_iter()
+                    .map(|(i, sf, locals)| {
+                        sf.take_by_local_doc_ids(&locals, &name_refs)
+                            .map(|batch| (i, batch))
+                    })
+                    .collect();
+                result
+            },
+        )
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
     };
 
     let cold_wave = try_join_all(

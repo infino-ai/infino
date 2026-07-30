@@ -184,6 +184,63 @@ impl ClauseLists<'_> {
     }
 }
 
+/// Output of [`FtsReader::prepare_clauses`], consumed by
+/// [`FtsReader::run_prepared`]. Either an already-final result or the
+/// cursors for one clause shape still to score. Owns its `ExcludeFilter`
+/// rather than borrowing it, so it can move into a `'static` closure.
+pub(crate) enum PreparedClauses {
+    /// Already final — nothing left for `run_prepared` to do.
+    Done(Vec<(u32, f32)>),
+    /// AND-only: intersect `must_cursors`.
+    Must {
+        column_id: u32,
+        must_cursors: Vec<TermCursor>,
+        filter: Option<ExcludeFilter>,
+        k: usize,
+        floor_eff: f32,
+    },
+    /// AND with should-boosted scoring.
+    MustShould {
+        column_id: u32,
+        must_cursors: Vec<TermCursor>,
+        should_cursors: Vec<TermCursor>,
+        filter: Option<ExcludeFilter>,
+        k: usize,
+        floor_eff: f32,
+    },
+    /// Plain multi-term OR (no musts) — algorithm choice resolved in
+    /// `run_prepared`.
+    Or {
+        column_id: u32,
+        cursors: Vec<TermCursor>,
+        filter: Option<ExcludeFilter>,
+        k: usize,
+        floor_eff: f32,
+    },
+}
+
+impl PreparedClauses {
+    /// Sum of term document frequencies across the held cursors — the
+    /// scan-cost proxy callers gate reader-pool dispatch on. `Done` has
+    /// nothing left to scan, so it's zero.
+    pub(crate) fn posting_mass(&self) -> u64 {
+        match self {
+            PreparedClauses::Done(_) => 0,
+            PreparedClauses::Must { must_cursors, .. } => must_cursors.iter().map(|c| c.df).sum(),
+            PreparedClauses::MustShould {
+                must_cursors,
+                should_cursors,
+                ..
+            } => must_cursors
+                .iter()
+                .chain(should_cursors)
+                .map(|c| c.df)
+                .sum(),
+            PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
+        }
+    }
+}
+
 impl From<&str> for BoolMode {
     fn from(s: &str) -> Self {
         match s {
@@ -196,7 +253,7 @@ impl From<&str> for BoolMode {
 
 /// Multi-term OR algorithm selector for the bench harness's
 /// `search_with_algo_for_bench` entry point. Production code routes
-/// through `FtsReader::dispatch_multi_term_or`, which picks
+/// through `FtsReader::dispatch_or_algo`, which picks
 /// automatically; this enum exists so head-to-head bench runs can
 /// compare all three under identical inputs.
 #[doc(hidden)]
@@ -1521,23 +1578,29 @@ impl FtsReader {
         mode: BoolMode,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let column_id = self.resolve_column_id(column)?;
-        if terms.is_empty() || k == 0 {
-            return Ok(Vec::new());
-        }
-        // Every kernel prunes with `<= threshold` / `> threshold`
-        // comparisons; seeding them with the largest f32 strictly
-        // below `floor` makes those comparisons exactly "strictly
-        // below floor is dead, equal-to-floor survives".
-        let floor_eff = floor.next_down();
         // A flat term list under one mode is the degenerate clause
         // shape: `And` makes every term a must, `Or` a should.
+        // `prepare_clauses` resolves the column and, on the `<= threshold`
+        // pruning comparisons every kernel uses, seeds them with the
+        // largest f32 strictly below `floor` ("strictly below floor is
+        // dead, equal-to-floor survives") via `floor.next_down()`.
         let (musts, shoulds): (&[&str], &[&str]) = match mode {
             BoolMode::And => (terms, &[]),
             BoolMode::Or => (&[], terms),
         };
-        self.search_clauses(column_id, musts, shoulds, k, None, floor_eff, None)
-            .await
+        let prep = self
+            .prepare_clauses(
+                column,
+                ClauseLists {
+                    musts,
+                    shoulds,
+                    ..ClauseLists::default()
+                },
+                k,
+                floor,
+            )
+            .await?;
+        self.run_prepared(prep)
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -1561,13 +1624,29 @@ impl FtsReader {
         k: usize,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let prep = self.prepare_clauses(column, lists, k, floor).await?;
+        self.run_prepared(prep)
+    }
+
+    /// I/O half of an un-ranged clause search: resolve the column,
+    /// classify the query shape, and fetch every cursor
+    /// [`Self::run_prepared`] needs to score. The single-atom and
+    /// phrase-atom shapes finish here instead, since each is cheap
+    /// enough that handing it off isn't worth it.
+    pub(crate) async fn prepare_clauses(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+        floor: f32,
+    ) -> Result<PreparedClauses, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok(PreparedClauses::Done(Vec::new()));
         }
         if lists.no_positive_atoms() {
             if lists.no_negative_atoms() {
-                return Ok(Vec::new());
+                return Ok(PreparedClauses::Done(Vec::new()));
             }
             return Err(FtsError::NegationOnly);
         }
@@ -1580,7 +1659,7 @@ impl FtsReader {
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile.
-                return Ok(Vec::new());
+                return Ok(PreparedClauses::Done(Vec::new()));
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
             let should_atoms: Vec<AnyCursor> = self
@@ -1606,17 +1685,12 @@ impl FtsReader {
                 true => None,
                 false => Some(AtomExcludeFilter::new(negative_atoms)),
             };
-            return self.run_atoms_search(
-                column_id,
-                must_atoms,
-                should_atoms,
-                k,
-                filter,
-                floor_eff,
-            );
+            let result =
+                self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
+            return Ok(PreparedClauses::Done(result));
         }
 
-        let mut filter = match lists.negatives {
+        let neg_filter = match lists.negatives {
             [] => None,
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them with local stats.
@@ -1625,33 +1699,7 @@ impl FtsReader {
                     .await?,
             )),
         };
-        self.search_clauses(
-            column_id,
-            lists.musts,
-            lists.shoulds,
-            k,
-            filter.as_mut(),
-            floor_eff,
-            lists.global_idf,
-        )
-        .await
-    }
 
-    /// Shared dispatch for [`Self::search_with_floor`] and
-    /// [`Self::search_excluding`]: routes the clause lists to the
-    /// single-term / OR / AND / must+should kernel, threading `filter`
-    /// to the heap-admission sites and `floor_eff` (already
-    /// `next_down`-adjusted) to every pruning structure.
-    async fn search_clauses(
-        &self,
-        column_id: u32,
-        musts: &[&str],
-        shoulds: &[&str],
-        k: usize,
-        filter: Option<&mut ExcludeFilter>,
-        floor_eff: f32,
-        global_idf: Option<&GlobalTermIdf>,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
         // in (a lone must and a lone should both rank that term's
@@ -1659,44 +1707,111 @@ impl FtsReader {
         // — the bespoke single-term BMW does not take an idf override,
         // so route a lone term through the general cursor path (which
         // does) instead; correctness over the single-term micro-opt.
-        if global_idf.is_none() && musts.len() + shoulds.len() == 1 {
-            let term = musts.iter().chain(shoulds).next().expect("one atom");
-            return self
-                .search_single_term_bmw(column_id, term, k, filter, floor_eff)
-                .await;
+        if lists.global_idf.is_none() && lists.musts.len() + lists.shoulds.len() == 1 {
+            let term = lists
+                .musts
+                .iter()
+                .chain(lists.shoulds)
+                .next()
+                .expect("one atom");
+            let mut filter = neg_filter;
+            let result = self
+                .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
+                .await?;
+            return Ok(PreparedClauses::Done(result));
         }
-        if musts.is_empty() {
-            return self
-                .dispatch_multi_term_or(column_id, shoulds, k, filter, floor_eff, global_idf)
-                .await;
+
+        if lists.musts.is_empty() {
+            let cursors = self
+                .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
+                .await?;
+            if cursors.is_empty() {
+                return Ok(PreparedClauses::Done(Vec::new()));
+            }
+            return Ok(PreparedClauses::Or {
+                column_id,
+                cursors,
+                filter: neg_filter,
+                k,
+                floor_eff,
+            });
         }
         // Build must cursors; if any must is missing, the
         // intersection is empty.
         let must_cursors = self
-            .build_term_cursors(column_id, musts, global_idf)
+            .build_term_cursors(column_id, lists.musts, lists.global_idf)
             .await?;
-        if must_cursors.len() != musts.len() {
-            return Ok(Vec::new());
+        if must_cursors.len() != lists.musts.len() {
+            return Ok(PreparedClauses::Done(Vec::new()));
         }
-        if shoulds.is_empty() {
-            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+        if lists.shoulds.is_empty() {
+            return Ok(PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                filter: neg_filter,
+                k,
+                floor_eff,
+            });
         }
         // Shoulds absent from this superfile contribute nothing;
         // when none survive, the walk is a plain must intersection.
         let should_cursors = self
-            .build_term_cursors(column_id, shoulds, global_idf)
+            .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
             .await?;
         if should_cursors.is_empty() {
-            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+            return Ok(PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                filter: neg_filter,
+                k,
+                floor_eff,
+            });
         }
-        self.run_must_should(
+        Ok(PreparedClauses::MustShould {
             column_id,
             must_cursors,
             should_cursors,
+            filter: neg_filter,
             k,
-            filter,
             floor_eff,
-        )
+        })
+    }
+
+    /// CPU half paired with [`Self::prepare_clauses`] — scores the
+    /// cursors it fetched. No I/O, so it can run on the reader pool.
+    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
+        match prep {
+            PreparedClauses::Done(result) => Ok(result),
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                mut filter,
+                k,
+                floor_eff,
+            } => self.run_and_intersect(column_id, must_cursors, k, filter.as_mut(), floor_eff),
+            PreparedClauses::MustShould {
+                column_id,
+                must_cursors,
+                should_cursors,
+                mut filter,
+                k,
+                floor_eff,
+            } => self.run_must_should(
+                column_id,
+                must_cursors,
+                should_cursors,
+                k,
+                filter.as_mut(),
+                floor_eff,
+            ),
+            PreparedClauses::Or {
+                column_id,
+                cursors,
+                mut filter,
+                k,
+                floor_eff,
+            } => self.dispatch_or_algo(column_id, cursors, k, filter.as_mut(), floor_eff),
+        }
     }
 
     /// Unranked token match over a **token list** — the no-scoring
@@ -1930,7 +2045,7 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice mirrors `dispatch_multi_term_or` instead of
+    /// Kernel choice mirrors `dispatch_or_algo` instead of
     /// hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
     /// terms BMM cannot prune (every block max ties), so it degrades to
     /// per-doc min-scan bookkeeping over ~the whole union — the exact
@@ -2268,7 +2383,7 @@ impl FtsReader {
     /// by ascending doc_id.
     ///
     /// Production path for small-`k`, **floor-free** 2-term ORs (see
-    /// `dispatch_multi_term_or`), and the `search_with_algo_for_bench`
+    /// `dispatch_or_algo`), and the `search_with_algo_for_bench`
     /// entry point. Cursor construction is shared with the BMM path.
     ///
     /// Carries **no cross-segment floor and no exclude filter** — the
@@ -2497,7 +2612,7 @@ impl FtsReader {
     /// (rare + common); the partition collapses to a single
     /// essential cursor anyway and WAND's pivot is tighter.
     ///
-    /// The router [`Self::dispatch_multi_term_or`] picks between
+    /// The router [`Self::dispatch_or_algo`] picks between
     /// the two using a UB-spread heuristic. Both algorithms share
     /// cursor construction via [`Self::build_term_cursors`] so the
     /// router doesn't pay for cursor work twice.
@@ -3479,7 +3594,7 @@ impl FtsReader {
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
     ///
-    /// **Not on the production path.** `dispatch_multi_term_or` routes
+    /// **Not on the production path.** `dispatch_or_algo` routes
     /// to MaxScore+BMM or the windowed union; this function is reachable
     /// only via `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
     /// because the supertable bench surfaced one specific shape where
@@ -3630,21 +3745,14 @@ impl FtsReader {
     /// the one shape (prefix-of-very-rare-terms in parallel mode)
     /// where it narrowly wins. WAND+BMW remains in the codebase
     /// for the same reason — bench-harness comparison only.
-    async fn dispatch_multi_term_or(
+    fn dispatch_or_algo(
         &self,
         column_id: u32,
-        terms: &[&str],
+        cursors: Vec<TermCursor>,
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-        global_idf: Option<&GlobalTermIdf>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let cursors = self
-            .build_term_cursors(column_id, terms, global_idf)
-            .await?;
-        if cursors.is_empty() {
-            return Ok(Vec::new());
-        }
         // Route on upper-bound *spread*, not term count: when no single
         // term dominates, MaxScore's essential set never shrinks and it
         // degrades to scoring the whole union with per-doc f-way merge
@@ -3689,7 +3797,7 @@ impl FtsReader {
     /// thresholds are validated against measured numbers every run.
     ///
     /// **Not part of the stable API** — production code should use
-    /// `search`, which routes through `dispatch_multi_term_or`.
+    /// `search`, which routes through `dispatch_or_algo`.
     #[doc(hidden)]
     pub async fn search_with_algo_for_bench(
         &self,
@@ -3725,6 +3833,15 @@ impl FtsReader {
 pub(crate) struct OrCursorSet {
     column_id: u32,
     cursors: Vec<TermCursor>,
+}
+
+impl OrCursorSet {
+    /// Number of expanded terms this set was built from — used to gate
+    /// ranged-kernel pool dispatch by scan cost, the same signal the
+    /// plain multi-should path gates on.
+    pub(crate) fn len(&self) -> usize {
+        self.cursors.len()
+    }
 }
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
@@ -4221,7 +4338,7 @@ impl AtomExcludeFilter {
 /// rather than a generic filter parameter: monomorphizing the OR kernel
 /// measured 25-30% slower even with a no-op filter, while the `None`
 /// branch is constant per query, perfectly predicted, and free.
-struct ExcludeFilter {
+pub(crate) struct ExcludeFilter {
     cursors: Vec<TermCursor>,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     last_doc: u32,
@@ -4803,7 +4920,7 @@ struct BlockMeta {
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
 #[derive(Clone)]
-struct TermCursor {
+pub(crate) struct TermCursor {
     /// Precomputed `idf * (K1 + 1)` — the score numerator's
     /// per-cursor constant. Computed once at cursor build so the
     /// hot inner loop fits one multiply + add + divide per call.

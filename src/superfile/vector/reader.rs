@@ -32,6 +32,7 @@ use tokio::sync::oneshot;
 pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
+    runtime_bridge::{run_on_pool, spawn_on},
     storage::io_counters,
     superfile::{
         BuildError, ReadError,
@@ -4530,14 +4531,6 @@ fn parallel_chunks(n_items: usize) -> usize {
         .max(1)
 }
 
-/// Dispatch `f` onto `pool` if provided, or the global rayon pool otherwise.
-fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
-    match pool {
-        Some(pool) => pool.spawn(f),
-        None => rayon::spawn(f),
-    }
-}
-
 /// Map `f` over `items` on the configured rayon pool, preserving input
 /// order. The order-independent vector scans (rerank) use this; the
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
@@ -4556,12 +4549,13 @@ where
     if parallel_chunks(items.len()) <= 1 {
         return Ok(items.iter().map(&f).collect());
     }
-    let (tx, rx) = oneshot::channel();
-    spawn_on(pool.as_deref(), move || {
-        let out: Vec<R> = items.par_iter().map(f).collect();
-        let _ = tx.send(out);
-    });
-    rx.await.map_err(|_| VectorError::TaskDropped("rerank"))
+    run_on_pool(
+        pool.as_deref(),
+        "rerank rayon task dropped result",
+        move || items.par_iter().map(f).collect(),
+    )
+    .await
+    .map_err(|_| VectorError::TaskDropped("rerank"))
 }
 
 /// The 1-bit scan loop over one cluster's codes, generic over the
