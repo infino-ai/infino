@@ -172,11 +172,18 @@ impl BlockCachedSource {
         }
         self.state
             .get_or_init(|| {
+                // Publish a FRESH inode rather than truncating in place. Remove
+                // the old name first: a reader still holding the previous
+                // `.blocks` inode keeps its bytes (POSIX unlink-while-open),
+                // while this source gets its own inode to fill. `create_new`
+                // then refuses to reopen an existing inode, so a concurrent
+                // same-path source fails cleanly (degrading to a passthrough
+                // read) instead of truncating a live reader's blocks.
+                let _ = fs::remove_file(&self.path);
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .open(&self.path)
                     .ok()?;
                 file.set_len(size).ok()?;
@@ -563,6 +570,75 @@ mod tests {
         drop(src);
         assert_eq!(store.stats().current_bytes, 0);
         assert!(!path.exists());
+    }
+
+    /// Regression for the transient `Required field type_ is missing` decode
+    /// crash: two sources for the same superfile share a deterministic
+    /// `.blocks` path. The second source's `block_file()` opens with
+    /// `truncate(true)`, zeroing the sparse file the first still holds open —
+    /// so the first, still trusting its "filled" bitmap, reads zeros where it
+    /// had cached real bytes. (In production the second source is a
+    /// post-eviction cold refetch of a superfile a long scan still holds; the
+    /// zeros land where a Parquet Thrift tag belongs and the decode panics.)
+    ///
+    /// The second source reads a DISJOINT range so its truncate does not
+    /// coincidentally refill the first source's blocks. Fails today (the first
+    /// reader reads zeros); passes once eviction unlinks the `.blocks` file so
+    /// the refetch gets a fresh inode and the live reader keeps its own.
+    #[tokio::test]
+    async fn stale_shared_blocks_file_must_not_corrupt_live_reader() {
+        const OBJ: usize = 4 * CACHE_BLOCK_BYTES as usize + 1000;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        // Both sources map to the same per-URI scratch path (the bug).
+        let path = dir.path().join("shared.blocks");
+
+        // Reader A becomes the current entry, fills blocks 0..=2 onto the
+        // shared file, and stays alive (a long scan holding it).
+        let inner_a = Arc::new(CountingSource::new(OBJ));
+        let a = BlockCachedSource::new(
+            Arc::clone(&inner_a) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, a.filled_bytes_handle(), a.entry_token());
+        let start = 100u64;
+        let len = 2 * CACHE_BLOCK_BYTES + 500;
+        let want = inner_a.blob.slice(start as usize..(start + len) as usize);
+        let a_first = a.range(start, len).await.expect("A first read");
+        assert_eq!(a_first, want, "A reads correct bytes before the collision");
+        assert_eq!(inner_a.calls(), 1, "A's blocks are on the shared file");
+
+        // Eviction removes the catalog entry but leaves the `.blocks` file on
+        // disk (today's bug); reader A is still held by its long scan.
+        store.remove_block_entry_for_test(&uri);
+
+        // Reader B is the post-eviction refetch: same uri, same path, becomes
+        // current, and fills only the trailing block — but its `block_file()`
+        // truncates the shared inode A still holds open first.
+        let inner_b = Arc::new(CountingSource::new(OBJ));
+        let b = BlockCachedSource::new(
+            Arc::clone(&inner_b) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            path.clone(),
+        );
+        store.install_block_entry_for_test(uri, b.filled_bytes_handle(), b.entry_token());
+        let tail = 3 * CACHE_BLOCK_BYTES + 10;
+        let _ = b
+            .range(tail, 50)
+            .await
+            .expect("B read (truncates shared file)");
+
+        // A re-reads the range it already cached. Its bitmap still says filled,
+        // so it serves from the now-truncated shared file.
+        let a_again = a.range(start, len).await.expect("A re-read");
+        assert_eq!(
+            a_again, want,
+            "live reader A must still serve its cached bytes, not zeros"
+        );
     }
 
     /// Two disjoint missing runs in one request → one GET per run.
