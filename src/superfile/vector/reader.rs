@@ -3906,6 +3906,84 @@ async fn scan_shortlist(
 ) -> Vec<(u32, f32, u32, u32)> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+    // Fits-path: when every scanned row fits the cap, admission can never
+    // evict — the bounded heap (sift per push, heap-merge per rayon
+    // chunk) is pure overhead. Score straight into a vec; parallel chunks
+    // append instead of re-pushing through a merge. The deferred-rerank
+    // scan lives here almost always (cell rows < k x undivided mult).
+    if total_candidates <= coarse_limit {
+        let scan_vec =
+            |acc: &mut Vec<(u32, f32, u32, u32)>,
+             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+                let codes_len = (cnt as usize) * cb;
+                let codes = block.slice(0..codes_len);
+                let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
+                score_cluster_codes_with(
+                    &codes,
+                    &doc_ids,
+                    cnt,
+                    off,
+                    c as u32,
+                    &col.quant,
+                    ctx.q_rot,
+                    ctx.allow.as_deref(),
+                    ctx.deny.as_deref(),
+                    &mut |cand| acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id)),
+                );
+            };
+        if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+            let n_tasks = parallel_chunks(cluster_meta.len());
+            let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
+            let quant = col.quant.clone();
+            let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
+            let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
+            let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
+            let allow_owned = ctx.allow.clone();
+            let deny_owned = ctx.deny.clone();
+            let (tx, rx) = oneshot::channel();
+            spawn_on(ctx.pool.as_deref(), move || {
+                let acc = meta_owned
+                    .par_chunks(chunk)
+                    .zip(blocks_owned.par_chunks(chunk))
+                    .map(|(meta_chunk, block_chunk)| {
+                        let mut acc = Vec::with_capacity(
+                            meta_chunk.iter().map(|&(_, _, cnt)| cnt as usize).sum(),
+                        );
+                        for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
+                            let codes_len = (cnt as usize) * cb;
+                            let codes = block.slice(0..codes_len);
+                            let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
+                            score_cluster_codes_with(
+                                &codes,
+                                &doc_ids,
+                                cnt,
+                                off,
+                                c as u32,
+                                &quant,
+                                &q_rot_v,
+                                allow_owned.as_deref(),
+                                deny_owned.as_deref(),
+                                &mut |cand| {
+                                    acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id))
+                                },
+                            );
+                        }
+                        acc
+                    })
+                    .reduce(Vec::new, |mut a, mut b| {
+                        a.append(&mut b);
+                        a
+                    });
+                let _ = tx.send(acc);
+            });
+            return rx.await.expect("vector scan rayon task dropped result");
+        }
+        let mut acc = Vec::with_capacity(total_candidates);
+        for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+            scan_vec(&mut acc, item);
+        }
+        return acc;
+    }
     let score_block =
         |heap: &mut BoundedCoarseHeap, (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
             let codes_len = (cnt as usize) * cb;
@@ -4308,6 +4386,39 @@ fn score_cluster_codes_into_heap(
     deny: Option<&roaring::RoaringBitmap>,
     out: &mut BoundedCoarseHeap,
 ) {
+    score_cluster_codes_with(
+        cluster_codes,
+        cluster_doc_ids,
+        cnt,
+        off,
+        cluster_id,
+        quant,
+        q_rot,
+        allow,
+        deny,
+        &mut |cand| out.push(cand),
+    );
+}
+
+/// The 1-bit scan loop over one cluster's codes, generic over the
+/// candidate sink: the bounded heap when admission must evict
+/// ([`score_cluster_codes_into_heap`]), a plain vec when every scanned
+/// row fits the cap anyway and heap maintenance is pure overhead
+/// ([`scan_shortlist`]'s fits-path).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn score_cluster_codes_with(
+    cluster_codes: &[u8],
+    cluster_doc_ids: &[u8],
+    cnt: u32,
+    off: u32,
+    cluster_id: u32,
+    quant: &BitQuantizer,
+    q_rot: &[f32],
+    allow: Option<&roaring::RoaringBitmap>,
+    deny: Option<&roaring::RoaringBitmap>,
+    sink: &mut impl FnMut(CoarseCandidate),
+) {
     let cb = quant.code_bytes();
     let q_total: f32 = sum_f32(q_rot);
     for i in 0..cnt as usize {
@@ -4334,7 +4445,7 @@ fn score_cluster_codes_into_heap(
         }
         let code = &cluster_codes[i * cb..(i + 1) * cb];
         let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
-        out.push(CoarseCandidate {
+        sink(CoarseCandidate {
             did,
             estimate: est,
             pos: off + i as u32,
