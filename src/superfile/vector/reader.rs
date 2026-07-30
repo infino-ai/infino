@@ -13,8 +13,12 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     thread,
 };
 
@@ -48,7 +52,10 @@ use crate::{
                 nearest_k_centroids_bytes, sum_f32,
             },
             ivf_merge::Sq8IvfMergeInput,
-            quant::BitQuantizer,
+            quant::{
+                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, build_transposed_code_cache,
+                for_each_code_block_scores, lut_scan_supported,
+            },
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             rotation::RandomRotation,
         },
@@ -95,6 +102,10 @@ struct Sq8ParsedMeta {
 /// Per-column reader state; cached at open time.
 #[derive(Debug)]
 pub struct ColumnReader {
+    /// Lazily built transposed code blocks for the FastScan LUT scan
+    /// (shared `Arc` so rayon scan tasks can hold it past the reader
+    /// borrow). See [`TransposedCodeCache`].
+    transposed_codes: Arc<TransposedCodeCache>,
     pub name: String,
     pub dim: usize,
     pub n_cent: u32,
@@ -1156,6 +1167,7 @@ impl VectorReader {
             }
 
             columns.push(ColumnReader {
+                transposed_codes: Arc::new(TransposedCodeCache::default()),
                 name: cfg.column.clone(),
                 dim,
                 n_cent,
@@ -1726,6 +1738,7 @@ impl VectorReader {
         };
 
         Ok(ColumnReader {
+            transposed_codes: Arc::new(TransposedCodeCache::default()),
             name: cfg.column.clone(),
             dim,
             n_cent: n_cent_u32,
@@ -3914,7 +3927,128 @@ fn pool_wave_cap(pool: Option<&ThreadPool>) -> usize {
         .max(1)
 }
 
-/// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
+/// Per-cell cache of cluster codes in transposed (position-major)
+/// layout for the FastScan LUT scan — the codes counterpart of the
+/// routing layer's transposed centroid cache. Built lazily per cluster
+/// on the first scan that touches it (every later query reuses the
+/// blocks) and dropped with the reader, so its lifetime and footprint
+/// ride the reader cache. Each entry holds the RAII budget reservation
+/// that admitted it; a denied reservation keeps that cluster on the
+/// row-major estimator instead of evicting anything.
+#[derive(Default)]
+pub(super) struct TransposedCodeCache {
+    clusters: Mutex<HashMap<u32, TransposedCluster>>,
+    /// Sticky once the budget declines a build: warm queries must not
+    /// keep knocking on the gate (the budget's denial counter is an
+    /// operator diagnostic, and warm search's contract is to reserve
+    /// nothing at steady state). Already-built entries keep serving;
+    /// a reader-cache reopen retries naturally.
+    budget_denied: AtomicBool,
+}
+
+impl fmt::Debug for TransposedCodeCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let clusters = self
+            .clusters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("TransposedCodeCache")
+            .field("clusters", &clusters)
+            .finish()
+    }
+}
+
+struct TransposedCluster {
+    bytes: Arc<Vec<u8>>,
+    /// Held for the entry's lifetime; releases when the reader drops.
+    _reservation: Option<Reservation>,
+}
+
+impl TransposedCodeCache {
+    /// Return the cluster's transposed code blocks, building them on
+    /// first touch. `None` = the memory budget declined the bytes; the
+    /// caller falls back to the row-major scan for this cluster.
+    fn get_or_build(
+        &self,
+        off: u32,
+        codes: &[u8],
+        cnt: usize,
+        cb: usize,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Option<Arc<Vec<u8>>> {
+        {
+            let map = self.clusters.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(hit) = map.get(&off) {
+                return Some(Arc::clone(&hit.bytes));
+            }
+        }
+        if self.budget_denied.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        // Build outside the lock: concurrent chunks of one cell may race
+        // to build the same cluster; the first insert wins and the
+        // loser's work (and reservation) is discarded — bounded waste,
+        // no lock held across the transpose.
+        let transposed_len = cnt.div_ceil(LUT_BLOCK_ROWS) * cb * LUT_BLOCK_ROWS;
+        let reservation = match budget {
+            Some(b) => match b.try_reserve(transposed_len) {
+                Ok(r) => Some(r),
+                Err(_) => {
+                    self.budget_denied.store(true, AtomicOrdering::Relaxed);
+                    tracing::warn!(
+                        transposed_len,
+                        "vector scan: connection memory budget declined the \
+                         transposed-code cache; this reader keeps the exact \
+                         row-major estimator"
+                    );
+                    return None;
+                }
+            },
+            // No budget attached: measure-only, same as the cold path.
+            None => None,
+        };
+        let bytes = Arc::new(build_transposed_code_cache(codes, cnt, cb));
+        let mut map = self.clusters.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = map.entry(off).or_insert(TransposedCluster {
+            bytes,
+            _reservation: reservation,
+        });
+        Some(Arc::clone(&entry.bytes))
+    }
+}
+
+/// Scan one cluster through the transposed LUT kernels, pushing
+/// `(did, estimate, pos, cluster_id)` for every row — the fast-path
+/// body of [`scan_shortlist`]'s per-cluster loop (unfiltered scans
+/// only; filtered scans keep the row-major estimator, whose per-row
+/// allow/deny checks precede scoring).
+#[allow(clippy::too_many_arguments)]
+fn scan_cluster_transposed(
+    transposed: &[u8],
+    doc_ids: &[u8],
+    cnt: usize,
+    off: u32,
+    cluster_id: u32,
+    cb: usize,
+    lut: &LutQuery,
+    acc: &mut Vec<(u32, f32, u32, u32)>,
+) {
+    for_each_code_block_scores(transposed, cb, lut, |base_r, scores| {
+        let live = cnt.saturating_sub(base_r).min(LUT_BLOCK_ROWS);
+        for (lane, &est) in scores.iter().enumerate().take(live) {
+            let rr = base_r + lane;
+            let did = u32::from_le_bytes(
+                doc_ids[rr * 4..rr * 4 + 4]
+                    .try_into()
+                    .expect("4-byte doc id"),
+            );
+            acc.push((did, est, off + rr as u32, cluster_id));
+        }
+    });
+}
+
+/// The pure-CPU half of [`build_shortlist`]/// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
 /// 1-bit codes into one bounded heap of `coarse_limit` survivors, rayon-
 /// parallel when the candidate pool amortizes the hand-off. Shared by the
 /// immediate-rerank path ([`build_shortlist`]) and the deferred-rerank
@@ -3936,6 +4070,15 @@ async fn scan_shortlist(
     // to retain the same set `select_nth` finds in a single pass — at the
     // 1M width-sweep shape (~9K-row cells against a k*rerank_mult cap)
     // the heap admission machinery alone measured ~15% of scan CPU.
+    // FastScan LUT fast path: unfiltered scans score whole cells, so
+    // the transposed-block kernels apply. The per-query i16 bound
+    // (`fits_i16`) closes the accumulator-overflow hole exactly; when
+    // it declines, the exact row-major estimator below is the (more
+    // precise) fallback.
+    let lut_query = (ctx.allow.is_none() && ctx.deny.is_none() && lut_scan_supported())
+        .then(|| LutQuery::new(ctx.q_rot))
+        .filter(|lut| lut.fits_i16())
+        .map(Arc::new);
     let scan_vec = |acc: &mut Vec<(u32, f32, u32, u32)>,
                     (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
         let codes_len = (cnt as usize) * cb;
@@ -3950,6 +4093,27 @@ async fn scan_shortlist(
         );
         let codes = block.slice(0..codes_len);
         let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+        if let Some(lut) = lut_query.as_deref()
+            && let Some(transposed) = col.transposed_codes.get_or_build(
+                off,
+                &codes,
+                cnt as usize,
+                cb,
+                ctx.budget.as_ref(),
+            )
+        {
+            scan_cluster_transposed(
+                &transposed,
+                &doc_ids,
+                cnt as usize,
+                off,
+                c as u32,
+                cb,
+                lut,
+                acc,
+            );
+            return;
+        }
         score_cluster_codes_with(
             &codes,
             &doc_ids,
@@ -3972,6 +4136,9 @@ async fn scan_shortlist(
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
+        let transposed_cache = Arc::clone(&col.transposed_codes);
+        let budget_owned = ctx.budget.clone();
+        let lut_owned = lut_query.clone();
         let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
@@ -3992,6 +4159,27 @@ async fn scan_shortlist(
                         let codes_len = (cnt as usize) * cb;
                         let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
                         let codes = block.slice(0..codes_len);
+                        if let Some(lut) = lut_owned.as_deref()
+                            && let Some(transposed) = transposed_cache.get_or_build(
+                                off,
+                                &codes,
+                                cnt as usize,
+                                cb,
+                                budget_owned.as_ref(),
+                            )
+                        {
+                            scan_cluster_transposed(
+                                &transposed,
+                                &doc_ids,
+                                cnt as usize,
+                                off,
+                                c as u32,
+                                cb,
+                                lut,
+                                &mut acc,
+                            );
+                            continue;
+                        }
                         score_cluster_codes_with(
                             &codes,
                             &doc_ids,
@@ -9204,10 +9392,39 @@ mod tests {
             "warm search returns hits under a tiny budget"
         );
 
-        // Resident slices reserve nothing: no denial, and peak stays 0 even
-        // under a 0-byte gate. This is what keeps warm queries off the gate.
-        assert_eq!(budget.denials(), 0, "warm search reserves nothing");
+        // Resident slices reserve nothing for the scan itself. The one
+        // permitted knock on the gate is the transposed-code cache's
+        // single opportunistic reservation attempt: denied here (sticky
+        // per reader), after which warm search reserves nothing again —
+        // peak stays 0 under the tiny gate either way.
+        assert!(
+            budget.denials() <= 1,
+            "at most the cache's one sticky attempt, got {}",
+            budget.denials()
+        );
         assert_eq!(budget.peak(), 0, "warm search commits no bytes");
+        let denials_after_first = budget.denials();
+        let hits = r_eager
+            .search_async(
+                "v",
+                &all[0],
+                5,
+                4,
+                20,
+                None,
+                None,
+                None,
+                Some(budget.clone()),
+            )
+            .await
+            .expect("second warm search");
+        assert!(!hits.is_empty());
+        assert_eq!(
+            budget.denials(),
+            denials_after_first,
+            "denied cache stays off the gate on later queries"
+        );
+        assert_eq!(budget.peak(), 0);
     }
 
     #[tokio::test]
@@ -9607,6 +9824,60 @@ mod tests {
     // -----------------------------------------------------------------
     // truncate_to_top_estimates (per-cell shortlist truncation)
     // -----------------------------------------------------------------
+
+    /// The transposed code cache builds a cluster once (later scans get
+    /// the same shared buffer), and a budget denial falls back cleanly
+    /// (`None`) instead of evicting or failing the scan.
+    #[test]
+    fn transposed_code_cache_reuses_entries_and_respects_budget() {
+        let cache = TransposedCodeCache::default();
+        let cnt = 70usize;
+        let cb = 12usize;
+        let codes: Vec<u8> = (0..cnt * cb).map(|i| i as u8).collect();
+
+        let unbudgeted = cache
+            .get_or_build(3, &codes, cnt, cb, None)
+            .expect("no budget attached never declines");
+        let again = cache.get_or_build(3, &codes, cnt, cb, None).expect("hit");
+        assert!(
+            Arc::ptr_eq(&unbudgeted, &again),
+            "second touch reuses the built buffer"
+        );
+
+        // A budget too small for the transposed buffer declines the
+        // build — and the denial is sticky for the cache's lifetime:
+        // even a roomier budget on a later query is not consulted (a
+        // reader keeps one budget in production; the reopen cycle is
+        // the retry). A separate cache with room admits the build and
+        // holds the reservation for the entry's lifetime.
+        let denied = TransposedCodeCache::default();
+        let tiny = ConnectionMemoryBudget::with_limit(64);
+        assert!(
+            denied
+                .get_or_build(9, &codes, cnt, cb, Some(&tiny))
+                .is_none()
+        );
+        assert_eq!(tiny.denials(), 1);
+        let roomy = ConnectionMemoryBudget::with_limit(1 << 20);
+        assert!(
+            denied
+                .get_or_build(9, &codes, cnt, cb, Some(&roomy))
+                .is_none(),
+            "denial is sticky per cache"
+        );
+        assert_eq!(roomy.denials(), 0, "sticky path never touches the gate");
+
+        let admitted = TransposedCodeCache::default();
+        assert!(
+            admitted
+                .get_or_build(9, &codes, cnt, cb, Some(&roomy))
+                .is_some()
+        );
+        assert!(
+            roomy.used() > 0,
+            "admitted bytes stay reserved by the entry"
+        );
+    }
 
     /// Keeps the `limit` highest-estimate rows; the survivor set matches
     /// what the old bounded-heap admission retained.

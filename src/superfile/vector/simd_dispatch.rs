@@ -93,6 +93,33 @@ pub(crate) fn has_vpopcntdq() -> bool {
     })
 }
 
+/// True iff the host supports AVX-512 VBMI (byte-granular
+/// `_mm512_permutexvar_epi8`). Required by `quant`'s FastScan LUT
+/// block scanner: its nibble lookups permute a register-resident
+/// 16-entry i8 table across all 64 byte lanes in one instruction.
+///
+/// Also implies [`avx512_enabled`] (we never enable a specialized
+/// kernel on a host without the foundation), so callers should
+/// check this gate alone.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+pub(crate) fn has_vbmi() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if !avx512_enabled() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512vbmi")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
 /// True iff this binary should use AVX2 fast-path kernels in the
 /// "wide" tier. Checks `is_x86_feature_detected!("avx2")` at
 /// runtime; near-universally true on production x86_64 hosts (Intel
@@ -165,6 +192,12 @@ mod tests {
             assert!(
                 avx512_enabled(),
                 "has_vpopcntdq() returned true but avx512_enabled() is false"
+            );
+        }
+        if has_vbmi() {
+            assert!(
+                avx512_enabled(),
+                "has_vbmi() returned true but avx512_enabled() is false"
             );
         }
     }

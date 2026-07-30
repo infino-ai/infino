@@ -41,13 +41,29 @@ use wide::f32x8;
 
 use crate::superfile::vector::distance::sum_f32;
 #[cfg(target_arch = "x86_64")]
-use crate::superfile::vector::simd_dispatch::avx512_enabled;
+use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled, has_vbmi};
 
 /// Number of sign bits packed into one code byte (1-bit RaBitQ packs
 /// one sign per dimension, eight per byte). One `f32x8` SIMD block
 /// also covers exactly this many dimensions, so the same constant
 /// drives both the bit-packing and the per-block SIMD stride.
 const BITS_PER_CODE_BYTE: usize = 8;
+
+/// Rows per packed FastScan block: one AVX-512 byte register's worth of
+/// lanes. The packed layout groups the same code-byte position of
+/// [`LUT_BLOCK_ROWS`] consecutive rows so one register load feeds one
+/// table lookup for all of them.
+pub(crate) const LUT_BLOCK_ROWS: usize = 64;
+
+/// Dimensions folded into one nibble group: each 4 query dims collapse
+/// into a 16-entry signed-i8 lookup table indexed by 4 code bits.
+const LUT_GROUP_DIMS: usize = 4;
+
+/// Entries per nibble table (2^[`LUT_GROUP_DIMS`]).
+const LUT_ENTRIES_PER_GROUP: usize = 16;
+
+/// The i8 quantization ceiling for LUT entries.
+const LUT_I8_MAX: f32 = 127.0;
 
 /// Number of distinct byte values a code byte can take (`2^8`). The
 /// sign table holds one [`BITS_PER_CODE_BYTE`]-wide `±1` expansion
@@ -199,6 +215,427 @@ impl BitQuantizer {
         estimate_dot_rotated_wide(&self.sign_table, q_rot, code, self.dim)
     }
 }
+
+// ---------------- FastScan LUT transposed code scan ----------------
+//
+// The warm 1-bit scan's fast path: the codes equivalent of the routing
+// layer's transposed centroid cache (`build_transposed_centroid_cache`
+// + `for_each_centroid_block_scores` in `distance`). The query folds
+// once into per-group nibble tables (4 dims -> 16 signed-i8 entries);
+// cluster codes — transposed position-major in [`LUT_BLOCK_ROWS`]-row
+// blocks — are then scored 64 rows per table permute. Estimates come
+// back i8-quantized (bounded by [`LutQuery::quantization_bound`]); the
+// exact rerank downstream consumes them exactly as it consumes the
+// full-precision estimator's output.
+
+/// A query folded into FastScan nibble tables. Build once per query
+/// per column (pure function of the rotated query); share across every
+/// cluster scanned with it.
+pub(crate) struct LutQuery {
+    /// `groups * `[`LUT_ENTRIES_PER_GROUP`] signed entries; group `g`
+    /// covers query dims `[g*4, g*4+4)`.
+    luts: Vec<i8>,
+    /// Undoes the i8 quantization: multiply summed table entries by
+    /// this to get back to estimate scale.
+    inv_scale: f32,
+    pub(crate) groups: usize,
+    /// Exact worst-case |accumulator| for THIS query: the sum over
+    /// groups of each group's max |entry|. The i16 kernels are safe
+    /// iff this fits i16 — see [`LutQuery::fits_i16`].
+    worst_abs: u32,
+}
+
+impl LutQuery {
+    pub(crate) fn new(q_rot: &[f32]) -> LutQuery {
+        let dim = q_rot.len();
+        let groups = dim.div_ceil(LUT_GROUP_DIMS);
+        // Scale so the largest-magnitude group sum maps to i8 range.
+        let mut max_abs = 1e-12f32;
+        for g in 0..groups {
+            let d0 = g * LUT_GROUP_DIMS;
+            let s: f32 = q_rot[d0..(d0 + LUT_GROUP_DIMS).min(dim)]
+                .iter()
+                .map(|v| v.abs())
+                .sum();
+            max_abs = max_abs.max(s);
+        }
+        let scale = LUT_I8_MAX / max_abs;
+        let mut luts = vec![0i8; groups * LUT_ENTRIES_PER_GROUP];
+        let mut worst_abs = 0u32;
+        for g in 0..groups {
+            let d0 = g * LUT_GROUP_DIMS;
+            let mut group_max = 0u32;
+            for nib in 0..LUT_ENTRIES_PER_GROUP as u32 {
+                let mut s = 0f32;
+                for (bit, d) in (d0..(d0 + LUT_GROUP_DIMS).min(dim)).enumerate() {
+                    let sign = if (nib >> bit) & 1 == 1 { 1.0 } else { -1.0 };
+                    s += sign * q_rot[d];
+                }
+                let entry = (s * scale).round().clamp(-LUT_I8_MAX, LUT_I8_MAX) as i8;
+                luts[g * LUT_ENTRIES_PER_GROUP + nib as usize] = entry;
+                group_max = group_max.max(entry.unsigned_abs() as u32);
+            }
+            worst_abs += group_max;
+        }
+        LutQuery {
+            luts,
+            inv_scale: 1.0 / scale,
+            groups,
+            worst_abs,
+        }
+    }
+
+    /// Whether the i16 block accumulators can represent every possible
+    /// row sum for this query — the exact per-query bound, not a dim
+    /// heuristic (768d always fits; 1536d fits for real queries; only
+    /// pathological shapes fall back). When false the caller keeps the
+    /// exact row-major estimator, which is the MORE precise path — the
+    /// fallback costs speed, never correctness.
+    #[inline]
+    pub(crate) fn fits_i16(&self) -> bool {
+        let fits = self.worst_abs <= i16::MAX as u32;
+        if !fits {
+            lut_overflow_fallback_warn_once(self.groups);
+        }
+        fits
+    }
+
+    /// Worst-case absolute error of the LUT estimate vs the exact
+    /// estimator: one rounding half-step per group.
+    #[cfg(test)]
+    pub(crate) fn quantization_bound(&self) -> f32 {
+        self.groups as f32 * 0.5 * self.inv_scale
+    }
+}
+
+/// One-time visibility for the (rare) i16-bound fallback, so a corpus
+/// running on the exact estimator is diagnosable rather than silent.
+fn lut_overflow_fallback_warn_once(groups: usize) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            groups,
+            "vector scan: FastScan LUT path disabled for this query shape \
+             (i16 accumulator bound); using the exact row-major estimator"
+        );
+    });
+}
+
+/// Whether the transposed LUT scan path exists on this host. ISA gate
+/// only — the per-query accumulator bound is [`LutQuery::fits_i16`].
+#[inline]
+pub(crate) fn lut_scan_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_vbmi() || avx2_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Build the block-transposed code cache for one cluster: `cnt`
+/// row-major rows of `cb` code bytes become position-major
+/// [`LUT_BLOCK_ROWS`]-row blocks —
+/// `out[block*cb*64 + pos*64 + lane] = codes[(block*64+lane)*cb + pos]`.
+/// The tail block zero-pads missing rows (a zero code scores the
+/// constant `sum(-|q|)` per group; callers slice results to `cnt`).
+///
+/// Same role as [`distance`]'s `build_transposed_centroid_cache`, but
+/// byte-granular and hot at first touch (once per cluster per cache
+/// lifetime), so the interior is a word-parallel 8x8 byte-tile
+/// transpose (three shift/mask exchange rounds per tile, Hacker's
+/// Delight 7-3) with scalar edges; safe Rust throughout.
+pub(crate) fn build_transposed_code_cache(codes: &[u8], cnt: usize, cb: usize) -> Vec<u8> {
+    /// One 8x8 byte tile held in 8 little-endian u64 rows.
+    #[inline]
+    fn transpose_8x8(rows: &mut [u64; 8]) {
+        /// Byte lanes exchanged in round 1 (adjacent bytes).
+        const M1: u64 = 0x00FF_00FF_00FF_00FF;
+        /// Byte lanes exchanged in round 2 (byte pairs).
+        const M2: u64 = 0x0000_FFFF_0000_FFFF;
+        /// Byte lanes exchanged in round 3 (byte quads).
+        const M4: u64 = 0x0000_0000_FFFF_FFFF;
+        for i in [0usize, 2, 4, 6] {
+            let t = ((rows[i] >> 8) ^ rows[i + 1]) & M1;
+            rows[i + 1] ^= t;
+            rows[i] ^= t << 8;
+        }
+        for i in [0usize, 1, 4, 5] {
+            let t = ((rows[i] >> 16) ^ rows[i + 2]) & M2;
+            rows[i + 2] ^= t;
+            rows[i] ^= t << 16;
+        }
+        for i in [0usize, 1, 2, 3] {
+            let t = ((rows[i] >> 32) ^ rows[i + 4]) & M4;
+            rows[i + 4] ^= t;
+            rows[i] ^= t << 32;
+        }
+    }
+    /// Square byte-tile edge for the word-parallel transpose.
+    const TILE: usize = 8;
+    let blocks = cnt.div_ceil(LUT_BLOCK_ROWS);
+    let mut out = vec![0u8; blocks * cb * LUT_BLOCK_ROWS];
+    let full_row_tiles = cnt / TILE;
+    let full_col_tiles = cb / TILE;
+    for rt in 0..full_row_tiles {
+        let r0 = rt * TILE;
+        let block = r0 / LUT_BLOCK_ROWS;
+        let lane0 = r0 % LUT_BLOCK_ROWS;
+        let base = block * cb * LUT_BLOCK_ROWS;
+        for ct in 0..full_col_tiles {
+            let p0 = ct * TILE;
+            let mut tile = [0u64; TILE];
+            for (i, row) in tile.iter_mut().enumerate() {
+                let src = (r0 + i) * cb + p0;
+                *row = u64::from_le_bytes(
+                    codes[src..src + TILE].try_into().expect("8-byte row slice"),
+                );
+            }
+            transpose_8x8(&mut tile);
+            for (j, row) in tile.iter().enumerate() {
+                let dst = base + (p0 + j) * LUT_BLOCK_ROWS + lane0;
+                out[dst..dst + TILE].copy_from_slice(&row.to_le_bytes());
+            }
+        }
+        // Column tail (cb not a multiple of 8).
+        for p in full_col_tiles * TILE..cb {
+            for i in 0..TILE {
+                out[base + p * LUT_BLOCK_ROWS + lane0 + i] = codes[(r0 + i) * cb + p];
+            }
+        }
+    }
+    // Row tail (cnt not a multiple of 8).
+    for r in full_row_tiles * TILE..cnt {
+        let block = r / LUT_BLOCK_ROWS;
+        let lane = r % LUT_BLOCK_ROWS;
+        let base = block * cb * LUT_BLOCK_ROWS;
+        for p in 0..cb {
+            out[base + p * LUT_BLOCK_ROWS + lane] = codes[r * cb + p];
+        }
+    }
+    out
+}
+
+/// Drive the block scorers over every [`LUT_BLOCK_ROWS`]-row block of
+/// a transposed code cache, handing each block's 64 estimates to
+/// `reduce(base_row, scores)`. Tier dispatch is hoisted outside the
+/// block loop (same shape as [`distance`]'s
+/// `for_each_centroid_block_scores`); all tiers produce bit-identical
+/// scores (integer accumulation in one order, one f32 scale at the
+/// end). Callers gate the *path* on [`lut_scan_supported`] +
+/// [`LutQuery::fits_i16`]; the scalar tier closes the dispatch.
+pub(crate) fn for_each_code_block_scores(
+    cache: &[u8],
+    cb: usize,
+    lut: &LutQuery,
+    mut reduce: impl FnMut(usize, &[f32; LUT_BLOCK_ROWS]),
+) {
+    debug_assert_eq!(cache.len() % (cb * LUT_BLOCK_ROWS), 0);
+    debug_assert!(lut.worst_abs <= i16::MAX as u32);
+    let n_blocks = cache.len() / (cb * LUT_BLOCK_ROWS);
+    let mut scores = [0f32; LUT_BLOCK_ROWS];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_vbmi() {
+            for block in 0..n_blocks {
+                let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
+                // SAFETY: gated on `has_vbmi()` which implies `avx512f` +
+                // `avx512bw` and checks `avx512vbmi`.
+                unsafe { score_code_block64_transposed_avx512(span, cb, lut, &mut scores) };
+                reduce(block * LUT_BLOCK_ROWS, &scores);
+            }
+            return;
+        }
+        if avx2_enabled() {
+            for block in 0..n_blocks {
+                let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
+                // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
+                unsafe { score_code_block64_transposed_avx2(span, cb, lut, &mut scores) };
+                reduce(block * LUT_BLOCK_ROWS, &scores);
+            }
+            return;
+        }
+    }
+    for block in 0..n_blocks {
+        let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
+        score_code_block64_transposed_scalar(span, cb, lut, &mut scores);
+        reduce(block * LUT_BLOCK_ROWS, &scores);
+    }
+}
+
+/// Portable reference tier: same i16 accumulation as the SIMD kernels,
+/// lane by lane. `wide` offers no byte-table permute, so the portable
+/// form stays scalar — reachable only when both x86 tiers are disabled
+/// (or off-x86, where [`lut_scan_supported`] never selects this path).
+fn score_code_block64_transposed_scalar(
+    block: &[u8],
+    cb: usize,
+    lut: &LutQuery,
+    est_out: &mut [f32; LUT_BLOCK_ROWS],
+) {
+    let mut acc = [0i16; LUT_BLOCK_ROWS];
+    for p in 0..cb {
+        let g_lo = 2 * p;
+        let g_hi = 2 * p + 1;
+        let bytes = &block[p * LUT_BLOCK_ROWS..(p + 1) * LUT_BLOCK_ROWS];
+        for (lane, &b) in bytes.iter().enumerate() {
+            let lo = (b & 0x0F) as usize;
+            acc[lane] += i16::from(lut.luts[g_lo * LUT_ENTRIES_PER_GROUP + lo]);
+            if g_hi < lut.groups {
+                let hi = (b >> 4) as usize;
+                acc[lane] += i16::from(lut.luts[g_hi * LUT_ENTRIES_PER_GROUP + hi]);
+            }
+        }
+    }
+    for (lane, &a) in acc.iter().enumerate() {
+        est_out[lane] = f32::from(a) * lut.inv_scale;
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx512f`, `avx512bw`, and
+/// `avx512vbmi`. [`has_vbmi`] guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn score_code_block64_transposed_avx512(
+    block: &[u8],
+    cb: usize,
+    lut: &LutQuery,
+    est_out: &mut [f32; LUT_BLOCK_ROWS],
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: `block.len() == cb * 64` (the driver slices exactly that
+    // span), so every 64-byte load at `p * 64` for `p < cb` is in
+    // bounds. Each 16-byte LUT load at `g * 16` is in bounds because
+    // `g_lo, g_hi < lut.groups` are checked and
+    // `luts.len() == groups * 16`. `_mm512_permutexvar_epi8` requires
+    // `avx512vbmi`, guaranteed by the caller per the `# Safety`
+    // contract. i16 accumulators cannot overflow: the driver
+    // debug-asserts `lut.worst_abs <= i16::MAX` (exact per-query bound).
+    unsafe {
+        let mut acc_lo = _mm512_setzero_si512();
+        let mut acc_hi = _mm512_setzero_si512();
+        let nib_mask = _mm512_set1_epi8(0x0F);
+        for p in 0..cb {
+            let bytes = _mm512_loadu_si512(block.as_ptr().add(p * LUT_BLOCK_ROWS) as *const _);
+            let g_lo = 2 * p;
+            let g_hi = 2 * p + 1;
+            let lut_lo = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                lut.luts.as_ptr().add(g_lo * LUT_ENTRIES_PER_GROUP) as *const _,
+            ));
+            let idx_lo = _mm512_and_si512(bytes, nib_mask);
+            let val_lo = _mm512_permutexvar_epi8(idx_lo, lut_lo);
+            acc_lo = _mm512_add_epi16(acc_lo, _mm512_cvtepi8_epi16(_mm512_castsi512_si256(val_lo)));
+            acc_hi = _mm512_add_epi16(
+                acc_hi,
+                _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(val_lo, 1)),
+            );
+            if g_hi < lut.groups {
+                let lut_hi = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    lut.luts.as_ptr().add(g_hi * LUT_ENTRIES_PER_GROUP) as *const _,
+                ));
+                let idx_hi = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), nib_mask);
+                let val_hi = _mm512_permutexvar_epi8(idx_hi, lut_hi);
+                acc_lo =
+                    _mm512_add_epi16(acc_lo, _mm512_cvtepi8_epi16(_mm512_castsi512_si256(val_hi)));
+                acc_hi = _mm512_add_epi16(
+                    acc_hi,
+                    _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(val_hi, 1)),
+                );
+            }
+        }
+        let mut tmp = [0i16; LUT_BLOCK_ROWS];
+        _mm512_storeu_si512(tmp.as_mut_ptr() as *mut _, acc_lo);
+        _mm512_storeu_si512(tmp.as_mut_ptr().add(32) as *mut _, acc_hi);
+        for r in 0..LUT_BLOCK_ROWS {
+            est_out[r] = f32::from(tmp[r]) * lut.inv_scale;
+        }
+    }
+}
+
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`. [`avx2_enabled`]
+/// guarantees this at the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn score_code_block64_transposed_avx2(
+    block: &[u8],
+    cb: usize,
+    lut: &LutQuery,
+    est_out: &mut [f32; LUT_BLOCK_ROWS],
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: `block.len() == cb * 64` (the driver slices exactly that
+    // span), so the two 32-byte loads at `p * 64` and `p * 64 + 32` are
+    // in bounds for `p < cb`. Each 16-byte LUT load at `g * 16` is in
+    // bounds because `g_lo, g_hi < lut.groups` and
+    // `luts.len() == groups * 16`. `_mm256_shuffle_epi8` looks up
+    // within 128-bit halves; the table is broadcast to both halves and
+    // indices are masked to 0..15 with the high bit clear, so both
+    // halves index the same 16-entry table. i16 accumulators cannot
+    // overflow: the driver debug-asserts `lut.worst_abs <= i16::MAX`.
+    unsafe {
+        // 64 i16 lanes = four 256-bit accumulators: [0..16), [16..32)
+        // for the low 32 rows, [32..48), [48..64) for the high 32.
+        let mut acc = [_mm256_setzero_si256(); 4];
+        let nib_mask = _mm256_set1_epi8(0x0F);
+        for p in 0..cb {
+            let lo32 = _mm256_loadu_si256(block.as_ptr().add(p * LUT_BLOCK_ROWS) as *const _);
+            let hi32 = _mm256_loadu_si256(block.as_ptr().add(p * LUT_BLOCK_ROWS + 32) as *const _);
+            let g_lo = 2 * p;
+            let g_hi = 2 * p + 1;
+            let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                lut.luts.as_ptr().add(g_lo * LUT_ENTRIES_PER_GROUP) as *const _,
+            ));
+            let val_a = _mm256_shuffle_epi8(lut_lo, _mm256_and_si256(lo32, nib_mask));
+            acc[0] = _mm256_add_epi16(acc[0], _mm256_cvtepi8_epi16(_mm256_castsi256_si128(val_a)));
+            acc[1] = _mm256_add_epi16(
+                acc[1],
+                _mm256_cvtepi8_epi16(_mm256_extracti128_si256(val_a, 1)),
+            );
+            let val_b = _mm256_shuffle_epi8(lut_lo, _mm256_and_si256(hi32, nib_mask));
+            acc[2] = _mm256_add_epi16(acc[2], _mm256_cvtepi8_epi16(_mm256_castsi256_si128(val_b)));
+            acc[3] = _mm256_add_epi16(
+                acc[3],
+                _mm256_cvtepi8_epi16(_mm256_extracti128_si256(val_b, 1)),
+            );
+            if g_hi < lut.groups {
+                let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lut.luts.as_ptr().add(g_hi * LUT_ENTRIES_PER_GROUP) as *const _,
+                ));
+                let idx_a = _mm256_and_si256(_mm256_srli_epi16(lo32, 4), nib_mask);
+                let val_a = _mm256_shuffle_epi8(lut_hi, idx_a);
+                acc[0] =
+                    _mm256_add_epi16(acc[0], _mm256_cvtepi8_epi16(_mm256_castsi256_si128(val_a)));
+                acc[1] = _mm256_add_epi16(
+                    acc[1],
+                    _mm256_cvtepi8_epi16(_mm256_extracti128_si256(val_a, 1)),
+                );
+                let idx_b = _mm256_and_si256(_mm256_srli_epi16(hi32, 4), nib_mask);
+                let val_b = _mm256_shuffle_epi8(lut_hi, idx_b);
+                acc[2] =
+                    _mm256_add_epi16(acc[2], _mm256_cvtepi8_epi16(_mm256_castsi256_si128(val_b)));
+                acc[3] = _mm256_add_epi16(
+                    acc[3],
+                    _mm256_cvtepi8_epi16(_mm256_extracti128_si256(val_b, 1)),
+                );
+            }
+        }
+        let mut tmp = [0i16; LUT_BLOCK_ROWS];
+        for (i, a) in acc.iter().enumerate() {
+            _mm256_storeu_si256(tmp.as_mut_ptr().add(i * 16) as *mut _, *a);
+        }
+        for r in 0..LUT_BLOCK_ROWS {
+            est_out[r] = f32::from(tmp[r]) * lut.inv_scale;
+        }
+    }
+}
+// -------------- END FastScan LUT transposed code scan --------------
 
 /// Portable `wide::f32x8` (256-bit) RaBitQ estimator via the 8KB
 /// sign-table lookup. The kernel that has shipped since the
@@ -516,6 +953,157 @@ mod tests {
         let mut code = vec![0u8; quant.code_bytes()];
         quant.encode_rotated_into(&d_vec, &mut code);
         code
+    }
+
+    /// The word-parallel transposed code cache builder vs a plain
+    /// nested-loop reference, across row counts that cross the 64-row
+    /// block boundary and code widths that exercise the 8-byte tile
+    /// edges (odd `cb` = column tail; odd `cnt` = row tail).
+    #[test]
+    fn build_transposed_code_cache_matches_reference() {
+        for &(cnt, cb) in &[
+            (1usize, 12usize),
+            (7, 12),
+            (8, 12),
+            (63, 96),
+            (64, 96),
+            (65, 96),
+            (100, 13),
+            (129, 96),
+            (200, 8),
+        ] {
+            let codes: Vec<u8> = (0..cnt * cb)
+                .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+                .collect();
+            let blocks = cnt.div_ceil(LUT_BLOCK_ROWS);
+            let mut want = vec![0u8; blocks * cb * LUT_BLOCK_ROWS];
+            for r in 0..cnt {
+                let block = r / LUT_BLOCK_ROWS;
+                let lane = r % LUT_BLOCK_ROWS;
+                for p in 0..cb {
+                    want[block * cb * LUT_BLOCK_ROWS + p * LUT_BLOCK_ROWS + lane] =
+                        codes[r * cb + p];
+                }
+            }
+            let got = build_transposed_code_cache(&codes, cnt, cb);
+            assert_eq!(got, want, "cnt {cnt} cb {cb}");
+        }
+    }
+
+    /// Every LUT scan tier must produce bit-identical scores: the
+    /// accumulation is integer (order-free) and the only float op is
+    /// one final scale. Mirrors `sq8_simd`'s exact-equality tier
+    /// tests, including the raw feature probes that bypass the config
+    /// gates so a diagnostics toggle cannot skip a tier here.
+    #[test]
+    fn code_block_scores_transposed_match_scalar_reference() {
+        for &dim in &[12usize, 60, 764, 768, 1024] {
+            let quant = BitQuantizer::new(dim);
+            let cb = quant.code_bytes();
+            let cnt = 130;
+            let mut codes = Vec::with_capacity(cnt * cb);
+            for row in 0..cnt {
+                codes.extend_from_slice(&fake_code(&quant, 0x1234 + row as u32));
+            }
+            let cache = build_transposed_code_cache(&codes, cnt, cb);
+            let lut = LutQuery::new(&fake_vec(dim, 0xBEEF));
+            assert!(lut.fits_i16(), "dim {dim} must fit i16");
+            let n_blocks = cache.len() / (cb * LUT_BLOCK_ROWS);
+            let mut want = vec![[0f32; LUT_BLOCK_ROWS]; n_blocks];
+            for (block, out) in want.iter_mut().enumerate() {
+                score_code_block64_transposed_scalar(
+                    &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS],
+                    cb,
+                    &lut,
+                    out,
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            for tier in ["avx2", "avx512"] {
+                let mut got = [0f32; LUT_BLOCK_ROWS];
+                for (block, want_block) in want.iter().enumerate() {
+                    let span =
+                        &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
+                    match tier {
+                        "avx2" if std::arch::is_x86_feature_detected!("avx2") => {
+                            // SAFETY: gated on the raw avx2 probe above.
+                            unsafe { score_code_block64_transposed_avx2(span, cb, &lut, &mut got) }
+                        }
+                        "avx512"
+                            if std::arch::is_x86_feature_detected!("avx512f")
+                                && std::arch::is_x86_feature_detected!("avx512bw")
+                                && std::arch::is_x86_feature_detected!("avx512vbmi") =>
+                        {
+                            // SAFETY: gated on the raw avx512f/bw/vbmi probes above.
+                            unsafe {
+                                score_code_block64_transposed_avx512(span, cb, &lut, &mut got)
+                            }
+                        }
+                        _ => continue,
+                    }
+                    assert_eq!(
+                        &got[..],
+                        &want_block[..],
+                        "tier {tier} dim {dim} block {block}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The i8-quantized LUT estimate must sit within its analytic
+    /// rounding bound of the exact estimator on every row: half a
+    /// quantization step per nibble group.
+    #[test]
+    fn lut_estimate_within_quantization_bound() {
+        for &dim in &[60usize, 768, 1024] {
+            let quant = BitQuantizer::new(dim);
+            let cb = quant.code_bytes();
+            let q_rot = fake_vec(dim, 0xC0FFEE);
+            let lut = LutQuery::new(&q_rot);
+            let bound = lut.quantization_bound() + 1e-3;
+            let cnt = 96;
+            let mut codes = Vec::with_capacity(cnt * cb);
+            for row in 0..cnt {
+                codes.extend_from_slice(&fake_code(&quant, 0x77 + row as u32));
+            }
+            let cache = build_transposed_code_cache(&codes, cnt, cb);
+            let mut checked = 0usize;
+            for_each_code_block_scores(&cache, cb, &lut, |base_r, scores| {
+                for (lane, &est) in scores.iter().enumerate() {
+                    let r = base_r + lane;
+                    if r >= cnt {
+                        continue;
+                    }
+                    let exact = quant.estimate_dot_rotated(&q_rot, &codes[r * cb..(r + 1) * cb]);
+                    assert!(
+                        (est - exact).abs() <= bound,
+                        "dim {dim} row {r}: lut {est} vs exact {exact} (bound {bound})"
+                    );
+                    checked += 1;
+                }
+            });
+            assert_eq!(checked, cnt);
+        }
+    }
+
+    /// `fits_i16` is the exact per-query accumulator bound: an
+    /// adversarial equal-magnitude query saturates every group to the
+    /// i8 ceiling, so past 258 groups (1,032 dims) it must decline —
+    /// and a realistic 768-dim query must pass.
+    #[test]
+    fn lut_query_i16_bound_is_exact_per_query() {
+        assert!(LutQuery::new(&fake_vec(768, 0xAB)).fits_i16());
+        // Equal |q| per dim -> every group's max entry is 127 ->
+        // worst_abs = groups * 127 = 512 * 127 > i16::MAX.
+        let adversarial = vec![1.0f32; 2048];
+        assert!(!LutQuery::new(&adversarial).fits_i16());
+        // The same 2048 dims with mass concentrated in one group keeps
+        // the other groups' entries tiny: the exact bound admits it
+        // where a dim heuristic would have declined.
+        let mut concentrated = vec![1e-4f32; 2048];
+        concentrated[0] = 1.0;
+        assert!(LutQuery::new(&concentrated).fits_i16());
     }
 
     /// AVX-512 RaBitQ estimator vs the wide sign-table kernel
