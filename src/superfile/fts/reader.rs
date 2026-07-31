@@ -2112,10 +2112,10 @@ impl FtsReader {
             }
             FstValue::Pfor {
                 metadata_offset,
-                postings_length,
+                postings_length_hint,
             } => (
                 metadata_offset as usize,
-                postings_length.map(|len| len as usize),
+                postings_length_hint.map(|len| len as usize),
             ),
         };
         // Fetch only this term's byte range (metadata header + skip
@@ -2250,11 +2250,11 @@ impl FtsReader {
                 }
                 FstValue::Pfor {
                     metadata_offset,
-                    postings_length,
+                    postings_length_hint,
                 } => {
                     pfor_offsets.push((
                         metadata_offset as usize,
-                        postings_length.map(|len| len as usize),
+                        postings_length_hint.map(|len| len as usize),
                     ));
                     resolved.push(Resolved::Pfor { gidf });
                 }

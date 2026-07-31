@@ -58,7 +58,7 @@ pub(crate) enum FstValue {
         /// `None` when the slot held [`PFOR_LENGTH_UNKNOWN`]: the term
         /// is too large for the slot and its length must be read from
         /// the metadata header at `metadata_offset`.
-        postings_length: Option<u32>,
+        postings_length_hint: Option<u32>,
     },
     /// df = 1 — the entire posting is right here. No postings-region
     /// read required.
@@ -72,7 +72,7 @@ impl FstValue {
             let slot = ((packed >> PFOR_LENGTH_SHIFT) as u32) & PFOR_LENGTH_MAX;
             Self::Pfor {
                 metadata_offset: (packed >> PFOR_OFFSET_SHIFT) & PFOR_OFFSET_MAX,
-                postings_length: match slot {
+                postings_length_hint: match slot {
                     PFOR_LENGTH_UNKNOWN => None,
                     len => Some(len),
                 },
@@ -133,7 +133,7 @@ mod tests {
                 FstValue::unpack(packed),
                 FstValue::Pfor {
                     metadata_offset: offset,
-                    postings_length: Some(len)
+                    postings_length_hint: Some(len)
                 }
             );
         }
@@ -149,7 +149,7 @@ mod tests {
                 FstValue::unpack(packed),
                 FstValue::Pfor {
                     metadata_offset: 4096,
-                    postings_length: None
+                    postings_length_hint: None
                 },
                 "length {len} must degrade to the header-probe sentinel"
             );
@@ -163,7 +163,7 @@ mod tests {
             FstValue::unpack(packed),
             FstValue::Pfor {
                 metadata_offset: 4096,
-                postings_length: Some(PFOR_LENGTH_UNKNOWN - 1)
+                postings_length_hint: Some(PFOR_LENGTH_UNKNOWN - 1)
             }
         );
     }
