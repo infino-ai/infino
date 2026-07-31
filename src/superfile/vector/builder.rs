@@ -140,8 +140,8 @@ const MATERIALIZED_ASSIGN_BYTES_PER_DIM: usize = 2 + size_of::<f32>();
 
 /// Superfile-local document thresholds for capping the physical IVF centroid
 /// count. On the streaming global build (the user-table superfile path,
-/// where `cfg.n_cent` is a corpus-scale config knob — e.g. 1024/4096 —
-/// hitting one commit-sized superfile) the cap always applies. Cell packs
+/// where the centroid count is derived from the corpus size — e.g. 1024/4096
+/// — hitting one commit-sized superfile) the cap always applies. Cell packs
 /// apply it only below `CONSOLIDATED_CELL_ROWS_THRESHOLD` — there it is
 /// part of the measured 1M/10M layouts — and drop it above, where its
 /// 100K-row step sits mid drain-cell range at 100M and clamping the
@@ -192,7 +192,6 @@ pub struct VectorConfig {
     /// JSON key in `inf.vec.columns`.
     pub column: String,
     pub dim: usize,
-    pub n_cent: usize,
     pub rot_seed: u64,
     pub metric: Metric,
     /// On-disk rerank codec for this column. See [`RerankCodec`]
@@ -202,8 +201,8 @@ pub struct VectorConfig {
     /// against these caller-supplied centroids (cluster-major fp32,
     /// `n_cent * dim`). Used by the hidden-index incoming build so every
     /// shard shares the global cell ordinals and the drain can splice
-    /// cluster `c` → cell `c` without re-clustering. `n_cent` is taken
-    /// from the supplied centroids (`len / dim`), overriding the field.
+    /// cluster `c` → cell `c` without re-clustering. The centroid count is
+    /// taken from the supplied centroids (`len / dim`).
     pub provided_centroids: Option<std::sync::Arc<[f32]>>,
 }
 
@@ -212,11 +211,10 @@ impl VectorConfig {
     /// ([`crate::config::VectorSettings::rerank_codec`], usually
     /// [`RerankCodec::Sq8FixedResidual`]) and locally fitted residual
     /// encoding for metrics whose values are not bounded to [-1, 1].
-    pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
+    pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
             dim,
-            n_cent,
             rot_seed,
             metric,
             rerank_codec: if metric == Metric::Cosine {
@@ -441,7 +439,12 @@ impl VectorBuilder {
             )));
         }
         let column_id = self.columns.len() as u32;
-        let sample_size = default_kmeans_sample_size(config.n_cent);
+        // The build's centroid count is derived from the row count at finish
+        // (`n_cent_row_count_cap`), which isn't known here. Size the training
+        // reservoir for the largest centroid count any build could reach so
+        // k-means always has an adequate sample; the reservoir only grows to
+        // the rows actually seen, so small builds don't pay for the headroom.
+        let sample_size = default_kmeans_sample_size(N_CENT_LARGE);
         // Seed the reservoir RNG from `rot_seed ^ 0x5a5a` so it
         // stays deterministic with the column config but uses a
         // distinct stream from `RandomRotation` (which seeds from
@@ -1125,7 +1128,12 @@ pub(crate) mod build_phase_timers {
     }
 }
 
-fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> (usize, Vec<f32>) {
+fn materialized_centroids(
+    cfg: &VectorConfig,
+    requested_n_cent: usize,
+    n_docs: usize,
+    sample: &[f32],
+) -> (usize, Vec<f32>) {
     let dim = cfg.dim;
     if let Some(global) = cfg.provided_centroids.as_ref() {
         // Global-aligned build: cluster index == cell id is a routing
@@ -1145,9 +1153,9 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
     // flatten fine-first p=1 recall below 0.99.
     let consolidated = n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD;
     let requested = if consolidated {
-        cfg.n_cent.max(1).min(n_docs.max(1))
+        requested_n_cent.max(1).min(n_docs.max(1))
     } else {
-        cfg.n_cent
+        requested_n_cent
             .max(1)
             .min(n_cent_row_count_cap(n_docs))
             .min(n_docs.max(1))
@@ -1306,10 +1314,12 @@ fn order_centroids_geometrically(centroids: &mut [f32], dim: usize, n_cent: usiz
 /// sorted-dense input keeps ids stable).
 fn build_subsection_from_materialized(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     mut rows: Vec<MaterializedIvfRow>,
 ) -> Result<SubsectionBytes, BuildError> {
     rows.sort_by_key(|r| r.local_doc_id);
-    let merged = build_cell_subsection_in_memory(cfg, CellPackSource::Rows(rows))?;
+    let merged =
+        build_cell_subsection_in_memory(cfg, requested_n_cent, CellPackSource::Rows(rows))?;
     Ok(SubsectionBytes {
         bytes: merged.bytes,
         n_cent: merged.n_cent,
@@ -1323,11 +1333,12 @@ fn build_subsection_from_materialized(
 /// returned as a [`MergedIvfSubsection`] ready for multi-cell packing.
 pub(crate) fn build_merged_subsection_from_materialized(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     rows: Vec<MaterializedIvfRow>,
 ) -> Result<MergedIvfSubsection, BuildError> {
     let n_docs = rows.len() as u32;
     let rerank_codec = cfg.rerank_codec;
-    let sub = build_subsection_from_materialized(cfg, rows)?;
+    let sub = build_subsection_from_materialized(cfg, requested_n_cent, rows)?;
     Ok(MergedIvfSubsection {
         bytes: sub.bytes,
         n_cent: sub.n_cent,
@@ -1937,6 +1948,7 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
 /// encoded rows).
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     source: CellPackSource<'_>,
     subsection_path: &Path,
     stable_ids_path: &Path,
@@ -2000,10 +2012,10 @@ pub(crate) fn build_cell_subsection_from_source(
     // Mirrors the `materialized_centroids` `n_cent` cap switch so the
     // sample is sized for the runs actually trained: consolidated cells
     // uncapped, sub-threshold cells under the legacy row-count cap.
-    let requested_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
-        cfg.n_cent.max(1).min(n_docs)
+    let effective_n_cent = if n_docs > CONSOLIDATED_CELL_ROWS_THRESHOLD {
+        requested_n_cent.max(1).min(n_docs)
     } else {
-        cfg.n_cent
+        requested_n_cent
             .max(1)
             .min(n_cent_row_count_cap(n_docs))
             .min(n_docs)
@@ -2011,7 +2023,7 @@ pub(crate) fn build_cell_subsection_from_source(
     let sample_size = if cfg.provided_centroids.is_some() {
         0
     } else {
-        partition_kmeans_sample_size(requested_n_cent, n_docs).min(n_docs)
+        partition_kmeans_sample_size(effective_n_cent, n_docs).min(n_docs)
     };
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
     let sample = match &source {
@@ -2026,7 +2038,7 @@ pub(crate) fn build_cell_subsection_from_source(
         }
     };
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
-        materialized_centroids(&cfg, n_docs, &sample)
+        materialized_centroids(&cfg, requested_n_cent, n_docs, &sample)
     });
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
     let code_bytes = dim.div_ceil(u8::BITS as usize);
@@ -2234,6 +2246,7 @@ pub(crate) fn build_cell_subsection_from_source(
 /// wrapper over the shared cell-pack core.
 pub(crate) fn build_merged_subsection_from_spilled_materialized(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     spill: &SpilledCellRows,
     subsection_path: &Path,
     stable_ids_path: &Path,
@@ -2241,6 +2254,7 @@ pub(crate) fn build_merged_subsection_from_spilled_materialized(
 ) -> Result<StreamedIvfSubsection, BuildError> {
     build_cell_subsection_from_source(
         cfg,
+        requested_n_cent,
         CellPackSource::Spilled(spill),
         subsection_path,
         stable_ids_path,
@@ -2253,6 +2267,7 @@ pub(crate) fn build_merged_subsection_from_spilled_materialized(
 /// superfile assembly and the maintenance merge paths consume.
 fn build_cell_subsection_in_memory(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     source: CellPackSource<'_>,
 ) -> Result<MergedIvfSubsection, BuildError> {
     let scratch = tempdir()?;
@@ -2260,6 +2275,7 @@ fn build_cell_subsection_in_memory(
     let stable_ids_path = scratch.path().join("cell.ids");
     let built = build_cell_subsection_from_source(
         cfg,
+        requested_n_cent,
         source,
         &subsection_path,
         &stable_ids_path,
@@ -2294,11 +2310,13 @@ fn build_cell_subsection_in_memory(
 /// `vectors` is row-major (`n_docs × dim`); length must be a multiple of `cfg.dim`.
 pub(crate) fn build_merged_subsection_from_fp32(
     cfg: VectorConfig,
+    requested_n_cent: usize,
     vectors: Arc<Vec<f32>>,
     stable_ids: &[i128],
 ) -> Result<MergedIvfSubsection, BuildError> {
     build_cell_subsection_in_memory(
         cfg,
+        requested_n_cent,
         CellPackSource::Fp32 {
             vectors: &vectors,
             stable_ids,
@@ -2326,7 +2344,11 @@ fn build_subsection_streaming(
     if let Some(rows) = materialized_rows {
         drop(reservoir);
         drop(inline_stable_ids);
-        return build_subsection_from_materialized(cfg, rows);
+        // Derive the centroid count from this build's row count — the
+        // maintenance rebuild sizes its IVF to the rows it is fed.
+        let rows_len = rows.len();
+        let requested_n_cent = n_cent_row_count_cap(rows_len).min(rows_len).max(1);
+        return build_subsection_from_materialized(cfg, requested_n_cent, rows);
     }
 
     let dim = cfg.dim;
@@ -2345,18 +2367,17 @@ fn build_subsection_streaming(
         drop(reservoir);
         (nc, global.to_vec())
     } else {
-        // n_cent must be in `[1, min(n_docs, sample_rows)]`. Both bounds
-        // are required: `n_cent > n_docs` makes the IVF degenerate;
+        // n_cent is derived from the rows targeted for this superfile and
+        // must land in `[1, min(n_docs, sample_rows)]`. Both bounds are
+        // required: `n_cent > n_docs` makes the IVF degenerate;
         // `n_cent > sample_rows` would crash k-means (`k > n` is asserted
         // by the trainer). At steady-state shapes (`n_docs > sample_size`,
         // `sample_size ≥ 100_000`) the sample_rows bound is the active
-        // one and is comfortably above any sane n_cent.
-        let n_cent = cfg
-            .n_cent
-            .max(1)
-            .min(n_cent_row_count_cap(n_docs))
+        // one and is comfortably above the row-count cap.
+        let n_cent = n_cent_row_count_cap(n_docs)
             .min(n_docs.max(1))
-            .min(sample_rows.max(1));
+            .min(sample_rows.max(1))
+            .max(1);
         let centroids = if sample_rows == 0 || n_docs == 0 {
             vec![0.0f32; n_cent * dim]
         } else {
@@ -3152,7 +3173,6 @@ mod tests {
         VectorConfig {
             column: name.to_string(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -3291,7 +3311,6 @@ mod tests {
         let cfg = || VectorConfig {
             column: "v".into(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -3371,7 +3390,6 @@ mod tests {
         let cfg = || VectorConfig {
             column: "v".into(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -3404,7 +3422,9 @@ mod tests {
             Bytes::from(mb.finish().expect("finish materialized"))
         };
 
-        let (na, nb) = (10usize, 8usize);
+        // Equal row counts so both cells derive the same fine centroid count
+        // (sized from the row count), a precondition for the byte-splice merge.
+        let (na, nb) = (10usize, 10usize);
         let blob_a = build_cell(na, 5_000);
         let blob_b = build_cell(nb, 9_000);
         let reader_a = VectorReader::open(blob_a, &json).expect("open A");
@@ -3451,7 +3471,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent: configured_n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -3665,13 +3684,12 @@ mod tests {
             let cfg = VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: requested,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             };
-            materialized_centroids(&cfg, n_docs, &sample).0
+            materialized_centroids(&cfg, requested, n_docs, &sample).0
         };
         let below = mk(CONSOLIDATED_CELL_ROWS_THRESHOLD);
         let above = mk(CONSOLIDATED_CELL_ROWS_THRESHOLD + 1);
@@ -3700,14 +3718,17 @@ mod tests {
         let cfg = VectorConfig {
             column: "emb".into(),
             dim: SPLIT_DIM,
-            n_cent: SPLIT_REQUESTED,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let (n_cent, centroids) =
-            materialized_centroids(&cfg, CONSOLIDATED_CELL_ROWS_THRESHOLD, &sample);
+        let (n_cent, centroids) = materialized_centroids(
+            &cfg,
+            SPLIT_REQUESTED,
+            CONSOLIDATED_CELL_ROWS_THRESHOLD,
+            &sample,
+        );
         assert!(
             n_cent >= SPLIT_REQUESTED,
             "split may grow past the request, never shrink it"
@@ -3760,14 +3781,13 @@ mod tests {
         let cfg = VectorConfig {
             column: "v".into(),
             dim,
-            n_cent: 64,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let ids: Vec<i128> = (0..n as i128).map(|i| 9_000 + i).collect();
-        let sub = build_merged_subsection_from_fp32(cfg.clone(), Arc::new(corpus), &ids)
+        let sub = build_merged_subsection_from_fp32(cfg.clone(), 64, Arc::new(corpus), &ids)
             .expect("fp32 build");
         assert_eq!(sub.n_docs, n as u32);
         assert!(sub.n_cent >= 1);
@@ -3825,13 +3845,12 @@ mod tests {
     fn build_via_forced_spill_path_round_trips() {
         let dim = 16;
         let n_docs = 64usize;
-        let n_cent = 4usize;
+        let _n_cent = 4usize;
         let mut b = VectorBuilder::new();
         b.set_spill_threshold_bytes(0);
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -3890,7 +3909,6 @@ mod tests {
             b.register_column(VectorConfig {
                 column: "v".into(),
                 dim,
-                n_cent,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Fp32,
@@ -4035,7 +4053,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -4075,12 +4092,10 @@ mod tests {
     #[test]
     fn vector_config_new_and_with_rerank_codec() {
         let dim = 16usize;
-        let n_cent = 4usize;
         let rot_seed = 7u64;
-        let base = VectorConfig::new("v".into(), dim, n_cent, rot_seed, Metric::Cosine);
+        let base = VectorConfig::new("v".into(), dim, rot_seed, Metric::Cosine);
         assert_eq!(base.column, "v");
         assert_eq!(base.dim, dim);
-        assert_eq!(base.n_cent, n_cent);
         assert_eq!(base.rot_seed, rot_seed);
         assert_eq!(base.metric, Metric::Cosine);
         assert_eq!(base.rerank_codec, RerankCodec::default());
@@ -4176,18 +4191,17 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = |_n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
+        let sub0 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4))
             .expect("cell 0 subsection");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3))
             .expect("cell 1 subsection");
         let cells = vec![(0, sub0), (1, sub1)];
         let blob = finish_multi_cell_blob(&cells).expect("pack");
@@ -4271,17 +4285,16 @@ mod tests {
         let config = VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 2,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
         };
         let source_rows: Vec<MaterializedIvfRow> = [make_rows(0), make_rows(1)].concat();
-        let sub0 = build_merged_subsection_from_materialized(config.clone(), make_rows(0))
+        let sub0 = build_merged_subsection_from_materialized(config.clone(), 2, make_rows(0))
             .expect("fixed cell 0");
-        let sub1 =
-            build_merged_subsection_from_materialized(config, make_rows(1)).expect("fixed cell 1");
+        let sub1 = build_merged_subsection_from_materialized(config, 2, make_rows(1))
+            .expect("fixed cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack fixed cells");
         let json = r#"[{"column":"emb","dim":16,"n_cent":2,"rot_seed":7,"metric":"cosine"}]"#;
         let reader = VectorReader::open(Bytes::from(blob), json).expect("open fixed multi-cell");
@@ -4331,13 +4344,12 @@ mod tests {
         let config = VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
         };
-        let expected = build_merged_subsection_from_materialized(config.clone(), rows.clone())
+        let expected = build_merged_subsection_from_materialized(config.clone(), 4, rows.clone())
             .expect("in-memory materialized build");
         let directory = tempdir().expect("tempdir");
         let mut spill_writer =
@@ -4351,6 +4363,7 @@ mod tests {
         let stable_ids_path = directory.path().join("streamed.ids");
         let built = build_merged_subsection_from_spilled_materialized(
             config,
+            4,
             &spill,
             &subsection_path,
             &stable_ids_path,
@@ -4415,19 +4428,18 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = |_n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4488,10 +4500,9 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = |_n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -4499,9 +4510,9 @@ mod tests {
         };
         // cell0 → file-local 0..3; cell1 → file-local 4..6.
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4578,19 +4589,18 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = |_n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3)).expect("cell 7");
-        let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2)).expect("cell 15");
+            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(7, 3)).expect("cell 7");
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(15, 2))
+            .expect("cell 15");
         let blob = finish_multi_cell_blob(&[(7, sub0), (15, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4636,7 +4646,7 @@ mod tests {
         let packed_summary = reader.summary("emb").expect("packed summary");
         assert_eq!(packed_summary.len(), dim);
         let cell7_only = {
-            let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3))
+            let sub0 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(7, 3))
                 .expect("cell 7 alone");
             let blob0 = finish_multi_cell_blob(&[(7, sub0)]).expect("pack one");
             VectorReader::open(Bytes::from(blob0), &json)
@@ -4645,7 +4655,7 @@ mod tests {
                 .expect("cell7 summary")
         };
         let cell15_only = {
-            let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2))
+            let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(15, 2))
                 .expect("cell 15 alone");
             let blob1 = finish_multi_cell_blob(&[(15, sub1)]).expect("pack one");
             VectorReader::open(Bytes::from(blob1), &json)

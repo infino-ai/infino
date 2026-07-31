@@ -339,14 +339,8 @@ impl BuilderOptions {
                     .expect("multi-cell reader has at least one cell ColumnReader");
                 (
                     vec![
-                        VectorConfig::new(
-                            v.name.clone(),
-                            v.dim,
-                            v.n_cent as usize,
-                            v.rot_seed,
-                            v.metric,
-                        )
-                        .with_rerank_codec(v.rerank_codec),
+                        VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
+                            .with_rerank_codec(v.rerank_codec),
                     ],
                     VectorLayout::MultiCellIvf,
                 )
@@ -354,14 +348,8 @@ impl BuilderOptions {
                 (
                     vec.vector_columns_config()
                         .map(|v| {
-                            VectorConfig::new(
-                                v.name.clone(),
-                                v.dim,
-                                v.n_cent as usize,
-                                v.rot_seed,
-                                v.metric,
-                            )
-                            .with_rerank_codec(v.rerank_codec)
+                            VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
+                                .with_rerank_codec(v.rerank_codec)
                         })
                         .collect::<Vec<_>>(),
                     VectorLayout::Ivf,
@@ -948,9 +936,11 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let mut cfg = vec_cfg.clone();
-                cfg.n_cent = n_cent.max(1);
-                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                let merged = build_merged_subsection_from_materialized(
+                    vec_cfg.clone(),
+                    n_cent.max(1),
+                    rows,
+                )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
                         "cell {cell_id}: stable_ids len {} != merged n_docs {}",
@@ -1030,9 +1020,11 @@ impl SuperfileBuilder {
                     row.local_doc_id = i as u32;
                 }
                 let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
-                let mut cfg = vec_cfg.clone();
-                cfg.n_cent = n_cent.max(1);
-                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                let merged = build_merged_subsection_from_materialized(
+                    vec_cfg.clone(),
+                    n_cent.max(1),
+                    rows,
+                )?;
                 if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
                         "cell {cell_id}: stable_ids len {} != merged n_docs {}",
@@ -1592,9 +1584,10 @@ fn fts_columns_json(cols: &[FtsConfig], tokenizers: &[Arc<dyn Tokenizer>]) -> St
 /// `Serialize` needed.
 ///
 /// Output shape per column:
-/// `{"column":"<escaped>","dim":<u>,"n_cent":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
-/// The reader at open time parses this back into
-/// `VectorConfig` to drive distance kernels + IVF probing.
+/// `{"column":"<escaped>","dim":<u>,"rot_seed":<u>,"metric":"<l2sq|cosine|negdot>"}`.
+/// The reader at open time parses this back for the column name, dim, rot_seed,
+/// and metric; the physical centroid count comes from each subsection's own
+/// on-disk directory, not from this record.
 fn vec_columns_json(cols: &[VectorConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
@@ -1605,8 +1598,6 @@ fn vec_columns_json(cols: &[VectorConfig]) -> String {
         s.push_str(&escape_json(&c.column));
         s.push_str(r#"","dim":"#);
         s.push_str(&c.dim.to_string());
-        s.push_str(r#","n_cent":"#);
-        s.push_str(&c.n_cent.to_string());
         s.push_str(r#","rot_seed":"#);
         s.push_str(&c.rot_seed.to_string());
         s.push_str(r#","metric":""#);
@@ -2082,7 +2073,6 @@ mod tests {
         let cols = vec![VectorConfig {
             column: "emb".into(),
             dim: 384,
-            n_cent: 64,
             rot_seed: 99,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -2091,7 +2081,10 @@ mod tests {
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
         assert!(s.contains(r#""dim":384"#));
-        assert!(s.contains(r#""n_cent":64"#));
+        assert!(
+            !s.contains("n_cent"),
+            "n_cent is no longer part of the record: {s}"
+        );
         assert!(s.contains(r#""rot_seed":99"#));
         assert!(s.contains(r#""metric":"l2sq""#));
     }
@@ -2542,7 +2535,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -3613,10 +3605,9 @@ mod tests {
                 })
                 .collect()
         };
-        let make_cfg = |n_cent: usize| VectorConfig {
+        let make_cfg = |_n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: if rerank_codec == RerankCodec::Sq8FixedResidual {
                 Metric::Cosine
@@ -3631,7 +3622,7 @@ mod tests {
         for &(cell_id, n_rows, n_cent) in cells {
             let rows = make_rows(cell_id, n_rows);
             ids.extend(rows.iter().map(|r| r.stable_id));
-            let sub = build_merged_subsection_from_materialized(make_cfg(n_cent), rows)
+            let sub = build_merged_subsection_from_materialized(make_cfg(n_cent), n_cent, rows)
                 .expect("cell subsection");
             packed.push((cell_id, sub));
         }

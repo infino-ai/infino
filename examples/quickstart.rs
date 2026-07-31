@@ -26,8 +26,6 @@ use infino::{
 /// Embedding width for the demo vector column. Small on purpose (the
 /// engine's minimum is 16) — the point is the API shape, not recall.
 const EMB_DIM: usize = 16;
-/// IVF centroid count. A handful of rows is one cluster.
-const DEMO_N_CENT: usize = 1;
 /// Top-K for every search in this tour.
 const SEARCH_TOP_K: usize = 10;
 
@@ -48,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         IndexSpec::new()
             .fts("title")
-            .vector("emb", EMB_DIM, DEMO_N_CENT, Metric::Cosine),
+            .vector("emb", EMB_DIM, Metric::Cosine),
     )?;
 
     // One `append` == one commit == one sealed, immutable superfile.

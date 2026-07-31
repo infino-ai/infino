@@ -198,14 +198,14 @@ fn connect(
 
 /// Declares which columns are full-text (BM25) and which are vector
 /// (IVF kNN) indexed. Built fluently:
-/// `IndexSpec().fts("body").vector("emb", 384, 256, "cosine")`.
+/// `IndexSpec().fts("body").vector("emb", 384, "cosine")`.
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
     /// `(column, analyzer)`; `analyzer` `None` means the default.
     fts: Vec<(String, Option<String>)>,
-    /// `(column, dim, n_cent, metric)`.
-    vectors: Vec<(String, usize, usize, String)>,
+    /// `(column, dim, metric)`.
+    vectors: Vec<(String, usize, String)>,
 }
 
 #[pymethods]
@@ -227,11 +227,11 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a `fixed_size_list<float32, dim>`) as vector
-    /// indexed. `n_cent` is the IVF centroid count (size it to the
-    /// table's scale); `metric` is `"cosine"` / `"l2sq"` / `"negdot"`.
-    fn vector(&self, column: String, dim: usize, n_cent: usize, metric: String) -> Self {
+    /// indexed. `metric` is `"cosine"` / `"l2sq"` / `"negdot"`. The IVF
+    /// centroid count is derived from the data at build time.
+    fn vector(&self, column: String, dim: usize, metric: String) -> Self {
         let mut next = self.clone();
-        next.vectors.push((column, dim, n_cent, metric));
+        next.vectors.push((column, dim, metric));
         next
     }
 }
@@ -246,8 +246,8 @@ impl IndexSpec {
                 None => spec.fts(column.clone()),
             };
         }
-        for (column, dim, n_cent, metric) in &self.vectors {
-            spec = spec.vector(column.clone(), *dim, *n_cent, metric_from_str(metric)?);
+        for (column, dim, metric) in &self.vectors {
+            spec = spec.vector(column.clone(), *dim, metric_from_str(metric)?);
         }
         Ok(spec)
     }

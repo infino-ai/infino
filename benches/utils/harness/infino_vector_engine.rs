@@ -41,7 +41,7 @@ fn build_superfile(
     vectors: &[f32],
     dim: usize,
     metric: VectorMetric,
-    n_cent: usize,
+    _n_cent: usize,
     id_base: usize,
 ) -> Vec<u8> {
     let n_docs = vectors.len() / dim;
@@ -59,7 +59,6 @@ fn build_superfile(
             provided_centroids: None,
             column: column.into(),
             dim,
-            n_cent,
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: corpus::bench_rerank_codec(metric),

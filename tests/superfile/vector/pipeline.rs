@@ -20,8 +20,6 @@ const TEXT_EMB_ROT_SEED: u64 = 11;
 /// `image_emb` column shape (L2Sq).
 const IMAGE_EMB_DIM: usize = 24;
 const IMAGE_EMB_ROT_SEED: u64 = 22;
-/// IVF centroid count for both columns.
-const TWO_COL_N_CENT: usize = 4;
 /// Deterministic per-doc vector hash recipe (shared by build + query
 /// reconstruction): `((i*MUL + j*AXIS_MUL) % MOD) * SCALE [+ BIAS]`.
 const TEXT_HASH_MUL: u32 = 31;
@@ -61,7 +59,6 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
     b.register_column(VectorConfig {
         column: "text_emb".into(),
         dim: TEXT_EMB_DIM,
-        n_cent: TWO_COL_N_CENT,
         rot_seed: TEXT_EMB_ROT_SEED,
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
@@ -71,7 +68,6 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
     b.register_column(VectorConfig {
         column: "image_emb".into(),
         dim: IMAGE_EMB_DIM,
-        n_cent: TWO_COL_N_CENT,
         rot_seed: IMAGE_EMB_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
@@ -250,7 +246,6 @@ async fn end_to_end_planted_clusters_recovered() {
     b.register_column(VectorConfig {
         column: "v".into(),
         dim,
-        n_cent: CLUSTER_TEST_N_CENT,
         rot_seed: CLUSTER_TEST_ROT_SEED,
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,

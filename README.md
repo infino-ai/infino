@@ -91,7 +91,7 @@ schema = pa.schema([
 ])
 docs = db.create_table(
     "docs", schema,
-    infino.IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+    infino.IndexSpec().fts("body").vector("embedding", 16, "cosine"),
 )
 
 docs.append([
@@ -124,7 +124,7 @@ const embed = (topic) => { const v = Array(16).fill(0.0); v[topic] = 1.0; return
 const docs = db.createTable(
   "docs",
   { source: "large_utf8", body: "large_utf8", embedding: { vector: 16 } },
-  new IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+  new IndexSpec().fts("body").vector("embedding", 16, "cosine"),
 );
 
 docs.append([
@@ -172,7 +172,7 @@ let schema = Arc::new(Schema::new(vec![
 let docs = db.create_table(
     "docs",
     schema.clone(),
-    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+    IndexSpec::new().fts("body").vector("embedding", 16, Metric::Cosine),
 )?;
 
 let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
@@ -367,7 +367,7 @@ let docs_schema = Arc::new(Schema::new(vec![
 let docs = db.create_table(
     "docs",
     docs_schema.clone(),
-    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+    IndexSpec::new().fts("body").vector("embedding", 16, Metric::Cosine),
 )?;
 let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();
 docs.append(&RecordBatch::try_new(
@@ -431,7 +431,7 @@ assert!(context.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
 ```
 
 **Making it real.** `embed()` here is a 16-dim toy so the example runs as
-written; swap in your embedding model and raise `dim` / `n_cent` to match
+written; swap in your embedding model and raise `dim` to match
 (e.g. 1536 / 256). The vector TVF takes the query vector as a
 comma-separated string — that's the only reason the query is built with
 `format!`. The SQL itself is identical from Python and Node; only table

@@ -4362,9 +4362,10 @@ fn build_spilled_packed_cell_from_rows(
     let subsection_temp = scratch.join(format!("cell-{cell_id}.ivf.tmp"));
     let stable_ids_path = scratch.join(format!("cell-{cell_id}.ids"));
     let stable_ids_temp = scratch.join(format!("cell-{cell_id}.ids.tmp"));
-    let cell_config = drain_cell_vector_config(vector_config, spill.n_rows());
+    let (cell_config, cell_n_cent) = drain_cell_vector_config(vector_config, spill.n_rows());
     let built = build_merged_subsection_from_spilled_materialized(
         cell_config,
+        cell_n_cent,
         spill,
         &subsection_temp,
         &stable_ids_temp,
@@ -4702,7 +4703,11 @@ fn assign_cells<'a>(
 /// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
 /// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
 /// inline stable id, and the conservative norm word.
-fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> VectorConfig {
+/// Per-cell drain config plus the centroid count derived for that cell. The
+/// count sizes each fine run to ~`DRAIN_FINE_RUN_TARGET_BYTES` of encoded
+/// rows against the cell's row count (independent of any caller knob), and is
+/// passed alongside the config into the cell-pack build.
+fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig, usize) {
     debug_assert!(n_rows > 0);
     let dim = cfg.dim;
     let rerank_codec = if cfg.rerank_codec.is_sq8_residual_family() {
@@ -4716,12 +4721,12 @@ fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> VectorConfig {
         rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
     let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
     let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
-    VectorConfig {
-        n_cent,
+    let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,
         ..cfg.clone()
-    }
+    };
+    (cell_cfg, n_cent)
 }
 
 fn drain_pack_assigned_cell(
@@ -4735,7 +4740,7 @@ fn drain_pack_assigned_cell(
         )));
     }
     let dim = cfg.dim;
-    let cell_cfg = drain_cell_vector_config(cfg, members.len());
+    let (cell_cfg, cell_n_cent) = drain_cell_vector_config(cfg, members.len());
     let stable_ids: Vec<i128> = members.iter().map(|(stable_id, _, _)| *stable_id).collect();
     let mut corpus = Vec::with_capacity(members.len() * dim);
     for (_, _, row) in &members {
@@ -4744,7 +4749,8 @@ fn drain_pack_assigned_cell(
         }
     }
     // Drain's fp32 in-memory stream pack (why fp32 support exists).
-    let subsection = build_merged_subsection_from_fp32(cell_cfg, Arc::new(corpus), &stable_ids)?;
+    let subsection =
+        build_merged_subsection_from_fp32(cell_cfg, cell_n_cent, Arc::new(corpus), &stable_ids)?;
     Ok(PackedCellGroup {
         cell_id,
         subsection,
@@ -5415,8 +5421,8 @@ pub(in crate::supertable) async fn split_overflow_cell(
         // policy, rather than inheriting the parent's fine-cluster count: a
         // ~13K-row child carrying a ~126K-row parent's `n_cent` over-fragments
         // its fine routing.
-        let cfg = drain_cell_vector_config(&base_cfg, rows.len());
-        let sub = build_merged_subsection_from_materialized(cfg, rows)?;
+        let (cfg, cell_n_cent) = drain_cell_vector_config(&base_cfg, rows.len());
+        let sub = build_merged_subsection_from_materialized(cfg, cell_n_cent, rows)?;
         let shard_id = packed_cell_shard(cell_id, packed_cell_shard_count(&inner.options)) as u32;
         build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)])
             .map(Some)
@@ -7135,14 +7141,13 @@ mod tests {
         out
     }
 
-    fn options_title_emb_serial(dim: usize, n_cent: usize) -> SupertableOptions {
+    fn options_title_emb_serial(dim: usize, _n_cent: usize) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_title_emb(dim),
             vec![],
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Fp32,
@@ -7596,7 +7601,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
@@ -7764,7 +7768,6 @@ mod tests {
         let cfg = VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 2,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -7787,19 +7790,18 @@ mod tests {
         let cfg = VectorConfig {
             column: "emb".into(),
             dim: DIM,
-            n_cent: 64,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         assert_eq!(
-            drain_cell_vector_config(&cfg, COMMIT_CELL_ROWS).n_cent,
+            drain_cell_vector_config(&cfg, COMMIT_CELL_ROWS).1,
             1,
             "a small commit delta fits one ~2 MiB fine run"
         );
         assert_eq!(
-            drain_cell_vector_config(&cfg, DRAINED_CELL_ROWS).n_cent,
+            drain_cell_vector_config(&cfg, DRAINED_CELL_ROWS).1,
             2,
             "a fully drained cell needs two ~2 MiB fine runs"
         );

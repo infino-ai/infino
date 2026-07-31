@@ -69,8 +69,6 @@ const MANIFEST_PART_URI_MARKER: &str = "manifest-parts/part-";
 
 /// Single-thread rayon pool for deterministic Azure smoke runs.
 const RAYON_POOL_THREADS: usize = 1;
-/// Vector index shape for the Azure smoke fixture.
-const VECTOR_N_CENT: usize = 4;
 const VECTOR_ROT_SEED: u64 = 17;
 /// Embedding dimension for the vector smoke fixture.
 const EMB_DIM: usize = 16;
@@ -110,7 +108,6 @@ fn real_azure_options(dim: usize) -> infino::supertable::SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
             rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,

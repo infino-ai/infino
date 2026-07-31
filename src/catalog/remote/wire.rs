@@ -83,8 +83,8 @@ pub(crate) fn metric_str(metric: Metric) -> &'static str {
 }
 
 /// An [`IndexSpec`] as the `indexes` object of a create-table request:
-/// `{fts: [col, …], vector: [{column, dim, n_centroids, metric}, …]}`. Absent
-/// index kinds are omitted (the server treats a missing key as "none").
+/// `{fts: [col, …], vector: [{column, dim, metric}, …]}`. Absent index kinds
+/// are omitted (the server treats a missing key as "none").
 pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     let mut indexes = serde_json::Map::new();
     let fts = spec.fts_columns();
@@ -93,11 +93,10 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     }
     let vectors: Vec<Value> = spec
         .vector_indexes()
-        .map(|(column, dim, n_centroids, metric)| {
+        .map(|(column, dim, metric)| {
             json!({
                 "column": column,
                 "dim": dim,
-                "n_centroids": n_centroids,
                 "metric": metric_str(metric),
             })
         })
@@ -276,12 +275,12 @@ mod tests {
     fn index_spec_json_shape() {
         let spec = IndexSpec::new()
             .fts("body")
-            .vector("embedding", 384, 256, Metric::Cosine);
+            .vector("embedding", 384, Metric::Cosine);
         let json = index_spec_to_json(&spec);
         assert_eq!(json["fts"], json!(["body"]));
         assert_eq!(
             json["vector"][0],
-            json!({"column": "embedding", "dim": 384, "n_centroids": 256, "metric": "cosine"})
+            json!({"column": "embedding", "dim": 384, "metric": "cosine"})
         );
     }
 

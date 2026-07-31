@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2163,6 +2163,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "unicode-segmentation",
  "ureq",
  "uuid",
  "wide",
@@ -2172,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "infino-node"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "arrow-array",

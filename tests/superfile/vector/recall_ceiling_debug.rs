@@ -106,12 +106,11 @@ fn parse_ivf_layout_from_fp32_blob(blob: &[u8]) -> IvfLayout {
 }
 
 fn build_blob(vectors: &[f32], codec: RerankCodec) -> Vec<u8> {
-    let n_cent = corpus::n_cent(N_DOCS);
+    let _n_cent = corpus::n_cent(N_DOCS);
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         column: "v".into(),
         dim: corpus::DIM,
-        n_cent,
         rot_seed: 7,
         metric: Metric::Cosine,
         rerank_codec: codec,
