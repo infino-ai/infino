@@ -115,7 +115,7 @@ pub fn sample_query_csv() -> String {
 }
 
 /// Options for the SQL benchmark table shape.
-pub fn sql_options(_n_rows: usize) -> SupertableOptions {
+pub fn sql_options() -> SupertableOptions {
     SupertableOptions::new(
         schema(),
         vec![
@@ -151,7 +151,7 @@ pub fn sql_options(_n_rows: usize) -> SupertableOptions {
 
 /// Build one in-memory supertable from `rows` via the public writer API.
 fn build_supertable(rows: &[SqlRow<'_>]) -> Supertable {
-    build_supertable_with_options(rows, sql_options(rows.len()), WRITE_CHUNK)
+    build_supertable_with_options(rows, sql_options(), WRITE_CHUNK)
 }
 
 /// Build one supertable from `rows` via the public writer API with caller

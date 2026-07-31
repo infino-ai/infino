@@ -3845,7 +3845,6 @@ mod tests {
     fn build_via_forced_spill_path_round_trips() {
         let dim = 16;
         let n_docs = 64usize;
-        let _n_cent = 4usize;
         let mut b = VectorBuilder::new();
         b.set_spill_threshold_bytes(0);
         b.register_column(VectorConfig {
@@ -4191,7 +4190,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -4199,9 +4198,9 @@ mod tests {
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let sub0 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4))
+        let sub0 = build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4))
             .expect("cell 0 subsection");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3))
+        let sub1 = build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3))
             .expect("cell 1 subsection");
         let cells = vec![(0, sub0), (1, sub1)];
         let blob = finish_multi_cell_blob(&cells).expect("pack");
@@ -4428,7 +4427,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -4437,9 +4436,9 @@ mod tests {
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4500,7 +4499,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -4510,9 +4509,9 @@ mod tests {
         };
         // cell0 → file-local 0..3; cell1 → file-local 4..6.
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4589,7 +4588,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -4598,9 +4597,9 @@ mod tests {
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(7, 3)).expect("cell 7");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(15, 2))
-            .expect("cell 15");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(7, 3)).expect("cell 7");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(15, 2)).expect("cell 15");
         let blob = finish_multi_cell_blob(&[(7, sub0), (15, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -4646,7 +4645,7 @@ mod tests {
         let packed_summary = reader.summary("emb").expect("packed summary");
         assert_eq!(packed_summary.len(), dim);
         let cell7_only = {
-            let sub0 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(7, 3))
+            let sub0 = build_merged_subsection_from_materialized(cfg(), 2, make_rows(7, 3))
                 .expect("cell 7 alone");
             let blob0 = finish_multi_cell_blob(&[(7, sub0)]).expect("pack one");
             VectorReader::open(Bytes::from(blob0), &json)
@@ -4655,7 +4654,7 @@ mod tests {
                 .expect("cell7 summary")
         };
         let cell15_only = {
-            let sub1 = build_merged_subsection_from_materialized(cfg(2), 2, make_rows(15, 2))
+            let sub1 = build_merged_subsection_from_materialized(cfg(), 2, make_rows(15, 2))
                 .expect("cell 15 alone");
             let blob1 = finish_multi_cell_blob(&[(15, sub1)]).expect("pack one");
             VectorReader::open(Bytes::from(blob1), &json)

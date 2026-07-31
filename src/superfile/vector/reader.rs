@@ -6034,7 +6034,6 @@ mod tests {
     #[test]
     fn open_round_trips_sq8_codec_discriminator_l2sq() {
         let dim = 32usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -6102,7 +6101,6 @@ mod tests {
     #[test]
     fn open_round_trips_sq8_fixed_residual_codec_default() {
         let dim = 32usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         // Register via the struct default for rerank_codec to pin
@@ -6331,7 +6329,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -6340,9 +6338,9 @@ mod tests {
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6411,7 +6409,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -6420,9 +6418,9 @@ mod tests {
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6483,7 +6481,7 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |_n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -6492,9 +6490,9 @@ mod tests {
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), 2, make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6747,7 +6745,6 @@ mod tests {
     #[tokio::test]
     async fn sq8_self_query_round_trips_top1_l2sq() {
         let dim = 32usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -6812,7 +6809,6 @@ mod tests {
     #[tokio::test]
     async fn sq8_self_query_round_trips_top1_cosine() {
         let dim = 32usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -6878,7 +6874,6 @@ mod tests {
     #[test]
     fn open_round_trips_none_codec_discriminator() {
         let dim = 16usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -7389,7 +7384,6 @@ mod tests {
     /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
     fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
         let dim = 16usize;
-        let _n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {

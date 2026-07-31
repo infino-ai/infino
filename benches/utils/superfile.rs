@@ -2002,7 +2002,6 @@ pub mod sql {
 
     struct ColdSqlArtifact {
         fixture: tiers::StorageFixture,
-        n_rows: usize,
         total_index_bytes: u64,
     }
 
@@ -2019,7 +2018,7 @@ pub mod sql {
         );
         let fixture = tiers::block_on(tiers::superfile_storage_fixture());
         let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&fixture.storage));
-        let opts = sql_options(rows.len())
+        let opts = sql_options()
             .with_storage(std::sync::Arc::clone(&fixture.storage))
             .with_disk_cache(cache.clone())
             .with_cache_prepopulation(false);
@@ -2038,7 +2037,6 @@ pub mod sql {
         drop(cache_dir);
         ColdSqlArtifact {
             fixture,
-            n_rows: rows.len(),
             total_index_bytes,
         }
     }
@@ -2048,7 +2046,7 @@ pub mod sql {
             std::sync::Arc::clone(&artifact.fixture.storage),
             Some(artifact.total_index_bytes),
         );
-        let opts = sql_options(artifact.n_rows)
+        let opts = sql_options()
             .with_storage(std::sync::Arc::clone(&artifact.fixture.storage))
             .with_disk_cache(cache);
         (cache_dir, tiers::open_consumer(opts))

@@ -6647,8 +6647,7 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
         let table = Supertable::create(
-            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
-                .with_storage(storage),
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM).with_storage(storage),
         )
         .expect("create");
         let writer = table.writer().expect("writer");
@@ -6826,7 +6825,7 @@ mod tests {
         let directory = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
-        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
             .with_storage(storage)
             .with_drain_batch_superfiles(1);
         let table = Supertable::create(options).expect("create");
@@ -6877,7 +6876,7 @@ mod tests {
         let directory = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
-        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
             .with_storage(storage)
             .with_writer_pool(writer_pool_with(2))
             .with_drain_batch_superfiles(1);
@@ -7023,7 +7022,7 @@ mod tests {
         let directory = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
-        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
             .with_storage(storage)
             .with_drain_consolidate(DrainConsolidate::Splice)
             .with_drain_batch_superfiles(1);
@@ -7091,10 +7090,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let st = Supertable::create(
-            options_title_emb_serial(dim, COMMIT_AS_DRAIN_TEST_ROWS).with_storage(storage),
-        )
-        .expect("create");
+        let st = Supertable::create(options_title_emb_serial(dim).with_storage(storage))
+            .expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_axis_vector_batch(OPEN_RANGES_FIXTURE_ROWS, dim))
             .expect("append");
@@ -7141,7 +7138,7 @@ mod tests {
         out
     }
 
-    fn options_title_emb_serial(dim: usize, _n_cent: usize) -> SupertableOptions {
+    fn options_title_emb_serial(dim: usize) -> SupertableOptions {
         SupertableOptions::new(
             schema_id_title_emb(dim),
             vec![],
@@ -7665,8 +7662,7 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
-            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
-                .with_storage(storage),
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM).with_storage(storage),
         )
         .expect("create");
         assert!(

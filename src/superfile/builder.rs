@@ -3605,7 +3605,7 @@ mod tests {
                 })
                 .collect()
         };
-        let make_cfg = |_n_cent: usize| VectorConfig {
+        let make_cfg = || VectorConfig {
             column: "emb".into(),
             dim,
             rot_seed: 1,
@@ -3622,7 +3622,7 @@ mod tests {
         for &(cell_id, n_rows, n_cent) in cells {
             let rows = make_rows(cell_id, n_rows);
             ids.extend(rows.iter().map(|r| r.stable_id));
-            let sub = build_merged_subsection_from_materialized(make_cfg(n_cent), n_cent, rows)
+            let sub = build_merged_subsection_from_materialized(make_cfg(), n_cent, rows)
                 .expect("cell subsection");
             packed.push((cell_id, sub));
         }
@@ -3638,10 +3638,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
                 .expect("batch");
-        let first_n_cent = cells.first().map(|&(_, _, n)| n).unwrap_or(1);
-        let opts =
-            BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg(first_n_cent)], None)
-                .with_vector_layout(VectorLayout::MultiCellIvf);
+        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg()], None)
+            .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         b.add_batch_ids_only(&batch).expect("ids");
         b.set_prebuilt_multi_cell_ivfs(packed).expect("pack");
