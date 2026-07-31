@@ -220,22 +220,18 @@ pub(crate) enum PreparedClauses {
 }
 
 impl PreparedClauses {
-    /// Sum of term document frequencies across the held cursors — the
-    /// scan-cost proxy callers gate reader-pool dispatch on. `Done` has
-    /// nothing left to scan, so it's zero.
+    /// Scan-cost proxy callers gate reader-pool dispatch on: the driving
+    /// (smallest) posting list for the AND-intersect shapes, the full
+    /// union for OR. `Done` has nothing left to scan, so it's zero.
     pub(crate) fn posting_mass(&self) -> u64 {
         match self {
             PreparedClauses::Done(_) => 0,
-            PreparedClauses::Must { must_cursors, .. } => must_cursors.iter().map(|c| c.df).sum(),
-            PreparedClauses::MustShould {
-                must_cursors,
-                should_cursors,
-                ..
-            } => must_cursors
-                .iter()
-                .chain(should_cursors)
-                .map(|c| c.df)
-                .sum(),
+            PreparedClauses::Must { must_cursors, .. } => {
+                must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
+            }
+            PreparedClauses::MustShould { must_cursors, .. } => {
+                must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
+            }
             PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
         }
     }
@@ -1630,9 +1626,10 @@ impl FtsReader {
 
     /// I/O half of an un-ranged clause search: resolve the column,
     /// classify the query shape, and fetch every cursor
-    /// [`Self::run_prepared`] needs to score. The single-atom and
-    /// phrase-atom shapes finish here instead, since each is cheap
-    /// enough that handing it off isn't worth it.
+    /// [`Self::run_prepared`] needs to score. The single-atom shape
+    /// finishes here since it's cheap; the phrase-atom shape also
+    /// finishes here, but only because it isn't wired to the reader
+    /// pool yet, not because it's cheap.
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
