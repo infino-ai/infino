@@ -351,7 +351,9 @@ impl Connection {
             }
             CatalogStore::Storage {
                 root,
-                handles,
+                // The create handle is intentionally not memoized (see below), so
+                // the read memo is untouched here.
+                handles: _,
                 building,
             } => {
                 // Record what was actually used to build the table, so
@@ -437,10 +439,15 @@ impl Connection {
                 }))
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
 
-                // Seed the memo: `query_sql` reads back through this same
-                // handle, so in-process writes are visible at once.
-                handles.insert(name.to_string(), handle.clone());
-
+                // Deliberately do NOT put the create handle in the read memo.
+                // A create handle pins the empty manifest it just wrote and does
+                // not advance to commits another process makes to the same
+                // table, so serving reads from it can return an empty result for
+                // rows a different writer has already committed against the same
+                // location. The next `open_table` builds a regular opened handle,
+                // which re-checks the manifest pointer and converges;
+                // read-your-writes is unaffected because appends are durable and
+                // the reopened handle reads them back through the pointer.
                 info!(table = name, location = %location, "created table");
                 Ok(Supertable::from_local(handle))
             }
@@ -1324,6 +1331,59 @@ mod tests {
         assert_eq!(
             body_cafe, 0,
             "ascii_lower column still drops non-ASCII after reopen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_opened_handle_converges_to_another_connections_commit() {
+        // Two independent connections share one object-store location but keep
+        // separate on-disk caches, as two processes would. A handle obtained
+        // through open_table re-checks the manifest pointer on each query, so a
+        // commit made through one connection becomes visible to the other.
+        let dir = std::env::temp_dir().join(format!("infino-open-conv-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let uri = format!("file://{}", dir.join("store").display());
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(dir.join("writer-cache")),
+        )
+        .expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        let reader = connect_with(
+            &uri,
+            ConnectOptions::new().with_cache_dir(dir.join("reader-cache")),
+        )
+        .expect("connect reader");
+        // The reader opens the still-empty table.
+        let empty = reader
+            .open_table("docs")
+            .expect("open_table")
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(n_rows(&empty), 0, "table is empty before any append");
+
+        // The writer commits a row through its own connection.
+        writer
+            .open_table("docs")
+            .expect("open_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // The reader's next query, over its opened handle, converges to the
+        // writer's commit.
+        let seen = reader
+            .open_table("docs")
+            .expect("open_table")
+            .bm25_search("title", "fox", TOP_K, Bm25SearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(
+            n_rows(&seen),
+            1,
+            "an opened handle re-checks the pointer and sees the other connection's commit",
         );
         let _ = fs::remove_dir_all(&dir);
     }
