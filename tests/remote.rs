@@ -138,6 +138,7 @@ async fn bm25_search_sends_json_and_decodes_arrow() {
             "query": "hello",
             "k": 10,
             "mode": "or",
+            "stats": "per_superfile",
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ipc_bytes(&id_batch(vec![1, 2, 3])), ARROW_CT),
