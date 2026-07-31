@@ -205,9 +205,9 @@ impl FinishProfile {
 ///   off  4 .. 12 : postings_offset (u64) — equals the term's metadata_offset;
 ///                  self-describing. u64 supports superfiles past 4 GiB
 ///                  (e.g. the 16 GB target).
-///   off 12 .. 16 : postings_length (u32) — single term's bytes, well under
-///                  4 G even at high df (≤ ~1 MB for the most common term in
-///                  a 16 GB superfile).
+///   off 12 .. 16 : postings_length (u32) — this term's byte length; the
+///                  authority on it, since the FST value's own length
+///                  slot is narrower (see `fst_value::PFOR_LENGTH_UNKNOWN`).
 ///   off 16 .. 20 : num_blocks (u32)
 ///
 /// `df`, `postings_length`, and `num_blocks` stay u32; only the absolute
@@ -3429,10 +3429,18 @@ fn encode_and_emit_term<W: Write>(
         }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");
-        debug_assert!(
-            postings_length <= u32::MAX as u64,
-            "single-term posting > 4 GiB"
-        );
+        // The header's postings_length field is a stored u32; a
+        // silent truncation on cast would write a file whose header
+        // understates its own postings length.
+        if postings_length > u32::MAX as u64 {
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "single term's postings are {postings_length} bytes, past the 4 GiB \
+                     limit of the metadata header's postings_length field"
+                ),
+            )));
+        }
 
         // Reuse `scratch.term_buf` across every dense term. `clear`
         // keeps the existing allocation; only a true grow (a term

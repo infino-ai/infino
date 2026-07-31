@@ -972,10 +972,56 @@ impl FtsReader {
     /// ranges are coalesced under one async bridge and returned in
     /// input order.
     ///
-    /// Because the FST value carries the length, this is a single
+    /// Whenever the FST value carries the length, this is a single
     /// range batch. The metadata header remains in the returned bytes
     /// for validation and cursor construction.
-    async fn fetch_term_postings(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
+    ///
+    /// A `None` length means the FST value held `PFOR_LENGTH_UNKNOWN`;
+    /// its real length is read from the header first.
+    async fn fetch_term_postings(
+        &self,
+        terms: &[(usize, Option<usize>)],
+    ) -> Result<Vec<Bytes>, FtsError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Recover the lengths the FST could not express. `postings_length`
+        // sits at offset 12 in both header strides, so 20 bytes covers it.
+        let probe_ranges: Vec<(usize, usize)> = terms
+            .iter()
+            .filter(|(_, len)| len.is_none())
+            .map(|&(metadata_offset, _)| (metadata_offset, TERM_META_SIZE))
+            .collect();
+        let probed = self.fetch_ranges(&probe_ranges).await?;
+
+        let mut resolved: Vec<(usize, usize)> = Vec::with_capacity(terms.len());
+        let mut next_probe = 0usize;
+        for &(metadata_offset, slot_length) in terms {
+            let postings_length = match slot_length {
+                Some(length) => length,
+                None => {
+                    let header = probed.get(next_probe).ok_or_else(|| {
+                        FtsError::Read(ReadError::MalformedVersion(
+                            "fetched fewer term metadata headers than probed".into(),
+                        ))
+                    })?;
+                    next_probe += 1;
+                    header_postings_length(header.as_ref())?
+                }
+            };
+            resolved.push((metadata_offset, postings_length));
+        }
+
+        self.fetch_ranges(&resolved).await
+    }
+
+    /// Fetch each `(metadata_offset, length)` range from the postings
+    /// region in parallel, coalescing adjacent ranges, and return the
+    /// per-request slices in input order. The byte-level half of
+    /// [`Self::fetch_term_postings`]; every length here is already
+    /// known to be real.
+    async fn fetch_ranges(&self, terms: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -1796,7 +1842,7 @@ impl FtsReader {
         // collected for the single batched fetch below, remembering
         // which token slot it fills so results scatter back in order.
         let mut dfs = vec![0u64; tokens.len()];
-        let mut header_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut header_ranges: Vec<(usize, Option<usize>)> = Vec::new();
         let mut pfor_slots: Vec<usize> = Vec::new();
         for (i, token) in tokens.iter().enumerate() {
             let key = make_key(&col_meta.name, token);
@@ -1807,7 +1853,7 @@ impl FtsReader {
                     FstValue::Pfor {
                         metadata_offset, ..
                     } => {
-                        header_ranges.push((metadata_offset as usize, TERM_META_SIZE));
+                        header_ranges.push((metadata_offset as usize, Some(TERM_META_SIZE)));
                         pfor_slots.push(i);
                     }
                 },
@@ -2067,7 +2113,10 @@ impl FtsReader {
             FstValue::Pfor {
                 metadata_offset,
                 postings_length,
-            } => (metadata_offset as usize, postings_length as usize),
+            } => (
+                metadata_offset as usize,
+                postings_length.map(|len| len as usize),
+            ),
         };
         // Fetch only this term's byte range (metadata header + skip
         // table + blocks). The returned buffer starts at the metadata
@@ -2188,7 +2237,7 @@ impl FtsReader {
             },
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(terms.len());
-        let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
+        let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let Some(packed) = dict.lookup(&key) else {
@@ -2203,7 +2252,10 @@ impl FtsReader {
                     metadata_offset,
                     postings_length,
                 } => {
-                    pfor_offsets.push((metadata_offset as usize, postings_length as usize));
+                    pfor_offsets.push((
+                        metadata_offset as usize,
+                        postings_length.map(|len| len as usize),
+                    ));
                     resolved.push(Resolved::Pfor { gidf });
                 }
             }
@@ -4607,6 +4659,18 @@ fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     n
 }
 
+/// Read `postings_length` out of a term metadata header, given only
+/// enough bytes to cover that field.
+fn header_postings_length(header: &[u8]) -> Result<usize, FtsError> {
+    let field_end = term_meta::POSTINGS_LENGTH_OFF + U32_BYTES;
+    if header.len() < field_end {
+        return Err(FtsError::Read(ReadError::MalformedVersion(
+            "term metadata header shorter than its postings_length field".into(),
+        )));
+    }
+    Ok(read_u32_le(&header[term_meta::POSTINGS_LENGTH_OFF..field_end]) as usize)
+}
+
 /// Parsed per-(column, term) metadata header from the postings
 /// region. The byte layout is documented once, on the writer side —
 /// see [`TERM_META_SIZE`] in `builder.rs` — this struct is its
@@ -4686,6 +4750,13 @@ impl TermMeta {
             false => (0, 0),
         };
 
+        // The last block's end offset comes straight from
+        // `postings_length`; bound it now instead of slicing OOB later.
+        if metadata_offset + postings_length > postings.len() {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "term postings length exceeds the fetched term range".into(),
+            )));
+        }
         let skip_start = metadata_offset + term_meta_size;
         let skip_end = skip_start + num_blocks * SKIP_ENTRY_SIZE;
         if skip_end > postings.len() {

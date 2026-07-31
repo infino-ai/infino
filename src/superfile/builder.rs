@@ -2857,6 +2857,64 @@ mod tests {
         assert_eq!(results_merged.len(), 2);
     }
 
+    /// Merged `df` for a shared term here is well past the point
+    /// where its postings outgrow the FST value's 21-bit length slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_from_readers_merges_common_term_past_pfor_length_slot() {
+        const NUM_FILES: usize = 12;
+        const DOCS_PER_FILE: usize = 450_000;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+
+        let mut readers = Vec::with_capacity(NUM_FILES);
+        for file_idx in 0..NUM_FILES {
+            let base_id = (file_idx * DOCS_PER_FILE) as u64;
+            let ids = decimal128_ids(base_id..base_id + DOCS_PER_FILE as u64);
+            let title = LargeStringArray::from(vec!["common"; DOCS_PER_FILE]);
+            let body = LargeStringArray::from(vec!["x"; DOCS_PER_FILE]);
+            let batch = RecordBatch::try_new(
+                opts.schema.clone(),
+                vec![Arc::new(ids), Arc::new(title), Arc::new(body)],
+            )
+            .expect("build RecordBatch");
+
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            b.add_batch(&batch, &[]).expect("add_batch");
+            let bytes = b.finish().expect("finish builder");
+            readers.push((
+                Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open reader")),
+                empty_bitmap(),
+            ));
+        }
+
+        let total_docs = (NUM_FILES * DOCS_PER_FILE) as u64;
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_readers(&readers).expect("build_from_readers");
+        assert_eq!(stats.n_docs, total_docs);
+
+        let merged_reader =
+            SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        let fts_reader_merged = merged_reader.fts().expect("get fts reader from merged");
+        let hits = fts_reader_merged
+            .token_match("title", &["common"], BoolMode::Or)
+            .await
+            .expect("token_match on merged");
+        assert_eq!(
+            hits.len() as u64,
+            total_docs,
+            "every doc matches \"common\""
+        );
+    }
+
     #[test]
     fn build_from_readers_three_superfiles() {
         let opts = BuilderOptions::new(
