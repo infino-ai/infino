@@ -467,17 +467,16 @@ impl Supertable {
     /// via [`Supertable::ensure_fresh`] on the read path, governed by
     /// [`crate::supertable::options::Consistency`]. This is the
     /// mechanism that drives the pointer re-check.
-    pub(crate) async fn refresh(&self) -> Result<bool, OpenError> {
+    pub(crate) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
         let storage = self
             .inner
             .options
             .storage
             .as_ref()
-            .ok_or_else(|| {
-                OpenError::Build(BuildError::Store(
-                    "Supertable::refresh requires options.storage".into(),
-                ))
-            })?
+            // No storage attached ⇒ nothing to refresh against. The read path
+            // never reaches here (`pointer_refresh_due` returns false without
+            // storage); surfaced for direct callers.
+            .ok_or(ManifestLoadError::NoLoaderAttached)?
             .clone();
 
         // Conditional pointer probe: with the last-seen etag in hand,
@@ -490,9 +489,7 @@ impl Supertable {
             .lock()
             .expect("last_pointer_etag mutex poisoned")
             .clone();
-        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref())
-            .await
-            .map_err(OpenError::ManifestLoadError)?;
+        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref()).await?;
         let (pointer, meta) = match probe {
             // Absent means the pointer was deleted — the table was
             // dropped and purged. It is never "not committed yet": this handle
@@ -502,9 +499,7 @@ impl Supertable {
             // no storage never reaches here — `refresh` requires it above.
             PointerProbe::Absent => {
                 let _ = self.inner.pointer_vanished.set(());
-                return Err(OpenError::ManifestLoadError(
-                    ManifestLoadError::PointerVanished,
-                ));
+                return Err(ManifestLoadError::PointerVanished);
             }
             PointerProbe::NotModified => return Ok(false),
             PointerProbe::Read(pointer, meta) => (pointer, meta),
@@ -530,7 +525,7 @@ impl Supertable {
             // the pointer) — nothing newer to load, and the etag
             // captured above makes the next probe a 304.
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
-            Err(err) => return Err(OpenError::ManifestLoadError(err)),
+            Err(err) => return Err(err),
         };
         self.inner.manifest.store(manifest);
         self.inner.reconcile_tombstone_seqs();
@@ -569,7 +564,7 @@ impl Supertable {
     /// lookup; one holding this handle has nothing to re-resolve, so refusing
     /// is the only correct answer.
     fn reader(&self) -> Result<SupertableReader, ManifestLoadError> {
-        self.ensure_fresh();
+        self.ensure_fresh()?;
         if self.pointer_vanished() {
             return Err(ManifestLoadError::PointerVanished);
         }
@@ -656,14 +651,28 @@ impl Supertable {
     /// Called at the head of every public query method. No-op for an
     /// in-memory supertable (no storage pointer) and for
     /// [`Consistency::Snapshot`](crate::supertable::options::Consistency::Snapshot).
-    /// Best-effort: a failed pointer read leaves the current snapshot
-    /// in place rather than failing the query.
-    pub(crate) fn ensure_fresh(&self) {
-        if self.pointer_refresh_due()
-            && let Err(e) = bridge_sync_to_async(self.refresh())
-        {
+    ///
+    /// Failure handling is governed by the consistency level. Under
+    /// [`Consistency::Strong`](crate::supertable::options::Consistency::Strong)
+    /// a failed pointer re-check is surfaced as an error: Strong promises a
+    /// fresh manifest on every query, so if that check can't complete the
+    /// caller must be told rather than silently served a pinned older
+    /// snapshot — which, for a handle pinned before a commit it hasn't yet
+    /// observed, would return that commit's rows as an empty result. Under
+    /// [`Consistency::BoundedStaleness`](crate::supertable::options::Consistency::BoundedStaleness)
+    /// and `Snapshot`, staleness is acceptable by contract, so a failed probe
+    /// leaves the current snapshot in place and only logs.
+    pub(crate) fn ensure_fresh(&self) -> Result<(), ManifestLoadError> {
+        if !self.pointer_refresh_due() {
+            return Ok(());
+        }
+        if let Err(e) = bridge_sync_to_async(self.refresh()) {
+            if self.inner.options.read_consistency == Consistency::Strong {
+                return Err(e);
+            }
             debug!(error = %e, "manifest refresh failed; serving current snapshot");
         }
+        Ok(())
     }
 
     /// Whether this handle's table was dropped and purged elsewhere, seen as
@@ -1841,17 +1850,26 @@ impl fmt::Debug for SupertableReader {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        sync::Arc,
+        ops::Range,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
     };
 
+    use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use object_store::MultipartUpload;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
         config::OptimizeOptions,
-        storage::{LocalFsStorageProvider, StorageProvider},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             manifest::{
@@ -5877,6 +5895,226 @@ mod tests {
         assert!(!advanced, "no commit yet ⇒ refresh finds nothing newer");
     }
 
+    /// A [`StorageProvider`] that fails the manifest-pointer probe on demand and
+    /// delegates everything else. Models a transient object-store read error
+    /// landing on exactly the per-query freshness check, so a test can pin down
+    /// how the read path reacts to it.
+    #[derive(Debug)]
+    struct FailPointerProbe {
+        inner: Arc<dyn StorageProvider>,
+        fail: AtomicBool,
+    }
+
+    impl FailPointerProbe {
+        fn new(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail: AtomicBool::new(false),
+            })
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::SeqCst);
+        }
+
+        fn should_fail(&self, uri: &str) -> bool {
+            self.fail.load(Ordering::SeqCst) && uri.ends_with(POINTER_PATH)
+        }
+
+        fn injected(uri: &str) -> StorageError {
+            StorageError::TransientExhausted {
+                uri: uri.to_string(),
+                source: "injected pointer-probe fault".into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for FailPointerProbe {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            if self.should_fail(uri) {
+                return Err(Self::injected(uri));
+            }
+            self.inner.get(uri).await
+        }
+
+        async fn get_if_none_match(
+            &self,
+            uri: &str,
+            etag: &str,
+        ) -> Result<Option<(Bytes, ObjectMeta)>, StorageError> {
+            if self.should_fail(uri) {
+                return Err(Self::injected(uri));
+            }
+            self.inner.get_if_none_match(uri, etag).await
+        }
+
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+
+        async fn tail(&self, uri: &str, len: u64) -> Result<(Bytes, u64), StorageError> {
+            self.inner.tail(uri, len).await
+        }
+
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+            self.inner.list_with_prefix_metadata(prefix).await
+        }
+    }
+
+    fn title_batch(titles: &[&str]) -> RecordBatch {
+        use arrow_array::LargeStringArray;
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(LargeStringArray::from(titles.to_vec()))],
+        )
+        .expect("title batch")
+    }
+
+    fn bm25_title_hits(table: &Supertable, query: &str) -> usize {
+        use crate::superfile::fts::reader::{Bm25Stats, BoolMode};
+        table
+            .bm25_search(
+                "title",
+                query,
+                10,
+                BoolMode::Or,
+                Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("bm25 search")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
+
+    /// Regression: under `Strong`, a read whose per-query pointer re-check fails
+    /// must error rather than silently serve a snapshot pinned before a commit
+    /// it hasn't observed — which would return that commit's rows as an empty
+    /// result. Mirrors one handle pinned at an older manifest while another
+    /// writer commits, then hitting a transient object-store error on its next
+    /// refresh probe.
+    #[test]
+    fn strong_read_fails_closed_when_the_pointer_probe_fails() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // A separate writer commits v1.
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["initial"])).expect("append v1");
+        w.commit().expect("commit v1");
+        drop(w);
+
+        // The consumer reads the same table through the fault wrapper, Strong.
+        let fault = FailPointerProbe::new(Arc::clone(&inner));
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&fault) as Arc<dyn StorageProvider>)
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("open");
+        // A first read pins v1 and captures its pointer etag.
+        assert_eq!(bm25_title_hits(&consumer, "initial"), 1, "sees v1");
+
+        // The producer commits v2 with a row the consumer hasn't observed.
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["added"])).expect("append v2");
+        w.commit().expect("commit v2");
+        drop(w);
+
+        // The consumer's next Strong read has its pointer probe fail. It must
+        // NOT serve the pinned v1 snapshot (which misses "added"); it must
+        // surface the failure so the caller can retry rather than receive
+        // stale data.
+        fault.set_failing(true);
+        let err = consumer
+            .reader()
+            .expect_err("a Strong read must fail closed when its refresh cannot complete");
+        assert!(
+            matches!(err, ManifestLoadError::Storage(_)),
+            "expected a storage error from the failed probe, got {err:?}"
+        );
+
+        // Once the probe recovers, the same read refreshes to v2 and sees it —
+        // the failure was transient, not a poisoned handle.
+        fault.set_failing(false);
+        assert_eq!(
+            bm25_title_hits(&consumer, "added"),
+            1,
+            "recovers to v2 after the probe heals"
+        );
+    }
+
+    /// The mirror under `BoundedStaleness`: a failed probe is tolerated by
+    /// contract, so the read still succeeds, serving the last good snapshot.
+    /// Confirms the fail-closed change is scoped to `Strong` and did not turn
+    /// best-effort freshness into a hard failure.
+    #[test]
+    fn bounded_staleness_read_tolerates_a_failing_pointer_probe() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let producer = Supertable::create(opts().with_storage(Arc::clone(&inner))).expect("create");
+        let mut w = producer.writer().expect("writer");
+        w.append(&title_batch(&["initial"])).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        // Window 0 ⇒ every query re-checks the pointer, just like Strong — the
+        // only difference under test is how a failed check is handled.
+        let fault = FailPointerProbe::new(Arc::clone(&inner));
+        let consumer = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&fault) as Arc<dyn StorageProvider>)
+                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(0))),
+        )
+        .expect("open");
+        assert_eq!(bm25_title_hits(&consumer, "initial"), 1);
+
+        // With the probe failing, the bounded-staleness read still succeeds:
+        // staleness is acceptable, so it serves the pinned snapshot.
+        fault.set_failing(true);
+        assert_eq!(
+            bm25_title_hits(&consumer, "initial"),
+            1,
+            "bounded staleness serves the last good snapshot when the probe fails"
+        );
+    }
+
     /// The typed shape of a deleted pointer on the read path, pinned at the
     /// layer that produces it. Both the error and the latch matter: callers
     /// above match the variant, and the catalog keys handle eviction on the
@@ -5898,10 +6136,7 @@ mod tests {
 
         let err = bridge_sync_to_async(st.refresh()).expect_err("refresh must refuse");
         assert!(
-            matches!(
-                err,
-                OpenError::ManifestLoadError(ManifestLoadError::PointerVanished)
-            ),
+            matches!(err, ManifestLoadError::PointerVanished),
             "expected PointerVanished, got {err:?}"
         );
         assert!(

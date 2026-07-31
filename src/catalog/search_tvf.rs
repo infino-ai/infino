@@ -87,7 +87,9 @@ impl TableResolver {
         let table = self.conn.open_table_handle(name).map_err(|e| {
             DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
         })?;
-        table.ensure_fresh();
+        // `reader()` applies the read-consistency freshness check itself (and,
+        // under Strong, fails rather than serving a stale snapshot), so there
+        // is no separate `ensure_fresh` call here.
         let resolved = ResolvedTable {
             reader: Arc::new(table.reader().map_err(|e| {
                 DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
