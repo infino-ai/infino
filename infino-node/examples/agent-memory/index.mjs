@@ -79,7 +79,7 @@ const db = connect(DIR);
 const mem = db.createTable(
   "memory",
   { id: "large_utf8", text: "large_utf8", speaker: "large_utf8", session: "float64", date: "large_utf8", vector: { vector: DIM } },
-  new IndexSpec().fts("text").vector("vector", DIM, 1, "cosine"),
+  new IndexSpec().fts("text").vector("vector", DIM, "cosine"),
 );
 
 process.stderr.write(`indexing ${memories.length} memories …\n`);

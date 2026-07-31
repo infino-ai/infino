@@ -36,7 +36,7 @@ def _write_corpus(uri: str):
     docs = db.create_table(
         "docs",
         schema,
-        infino.IndexSpec().fts("body").vector("embedding", DIM, 1, "cosine"),
+        infino.IndexSpec().fts("body").vector("embedding", DIM, "cosine"),
     )
     docs.append(
         [

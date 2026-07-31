@@ -105,7 +105,7 @@ const db = connect(DIR);
 const catalog = db.createTable(
   "catalog",
   { id: "large_utf8", title: "large_utf8", text: "large_utf8", category: "large_utf8", price: "float64", rating: "float64", vector: { vector: DIM } },
-  new IndexSpec().fts("text").vector("vector", DIM, 1, "cosine"),
+  new IndexSpec().fts("text").vector("vector", DIM, "cosine"),
 );
 
 // Interactive runs index a live sample from the Hub, falling back to the bundled
