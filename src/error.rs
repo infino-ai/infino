@@ -143,6 +143,11 @@ impl From<ManifestLoadError> for InfinoError {
             // the name it was opened under no longer resolves to anything —
             // `NotFound`, not a backend fault, is what a caller must react to.
             ManifestLoadError::PointerVanished => InfinoError::NotFound(msg),
+            // A storage fault reading the manifest — the pointer probe or a
+            // part load — is a transient I/O hiccup, not a permanent failure.
+            // Surface it as `Io` so a caller can retry (e.g. against another
+            // copy of the data) rather than treat it as a hard backend fault.
+            ManifestLoadError::Storage(_) => InfinoError::Io(msg),
             _ => InfinoError::Backend(msg),
         }
     }
@@ -327,6 +332,27 @@ mod tests {
         assert!(matches!(
             InfinoError::from(OpenError::ManifestListParse("m".into())),
             InfinoError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn manifest_pointer_vanished_is_not_found_but_a_storage_fault_is_retryable_io() {
+        // A dropped-and-purged pointer is a hard "gone" — NotFound.
+        assert!(matches!(
+            InfinoError::from(ManifestLoadError::PointerVanished),
+            InfinoError::NotFound(_)
+        ));
+        // A storage fault reading the manifest is transient I/O, so a caller
+        // can retry — Io (a retryable status at the serving layer), not a hard
+        // backend fault.
+        assert!(matches!(
+            InfinoError::from(ManifestLoadError::Storage(
+                StorageError::TransientExhausted {
+                    uri: "p".into(),
+                    source: "blip".into(),
+                }
+            )),
+            InfinoError::Io(_)
         ));
     }
 
