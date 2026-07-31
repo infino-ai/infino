@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
-    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats,
-    OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions, catalog::table::Table,
+    Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
+    OptimizeOptions, VectorFilter, VectorSearchOptions, catalog::table::Table,
 };
 
 /// A hosted table handle. Holds its `RemoteCatalog`, the table name, and the
