@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 pub mod basic;
+pub mod cold_projection;
 pub mod end_to_end;
 pub mod hybrid;
 pub mod lazy_foreground;
