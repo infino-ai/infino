@@ -5805,6 +5805,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 let result = loaded
                     .par_iter()
                     .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
+                // Release the shared handle BEFORE signalling completion:
+                // the awaiting side unwraps the Arc right after the recv,
+                // and a send-then-drop order races it (observed as a
+                // \"state still shared\" failure under test parallelism).
+                drop(chunk_cal);
                 let _ = done_tx.send(result);
             });
             done_rx
