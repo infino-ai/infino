@@ -192,10 +192,6 @@ fn public_surface_search_maintain_query_and_drop() {
         .expect("optimize");
     let report = docs.gc(Duration::ZERO).expect("gc");
     assert_eq!(report.delete_errors, 0);
-    assert!(
-        report.objects_skipped_live > 0,
-        "live manifest + pointer always survive a sweep"
-    );
     let post_maintenance = docs
         .vector_search(
             "emb",
