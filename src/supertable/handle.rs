@@ -1234,30 +1234,9 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
-/// Train global VectorCell centroids from the user manifest and queue them
-/// on the hidden index table for its next commit.
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
-/// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
-///
-/// Options-keyed, so it is STALE for a hidden handle built at table create
-/// time: with no user manifest to train a grid from,
-/// [`build_vector_index_options`] leaves `partition_strategy: None`, and the
-/// options never catch up after the first drain locks VectorCell into the
-/// manifest. Gates deciding whether hidden maintenance must run should key on
-/// the manifest's locked strategy (`ManifestSnapshot::partition_strategy`)
-/// instead; this predicate answers "was this handle BUILT as the hidden
-/// sibling", which is only true for open-era handles.
-pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
-    !opts.vector_columns.is_empty()
-        && opts.fts_columns.is_empty()
-        && matches!(
-            opts.partition_strategy,
-            Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
-        )
-}
-
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     let vector = &crate::config::global().vector;
     crate::config::CompactionSettings {
