@@ -187,9 +187,87 @@ impl MultipartUpload for CountingMultipart {
 
 #[cfg(test)]
 mod tests {
+    use futures::{StreamExt, TryStreamExt, stream};
     use object_store::{ObjectStoreExt, memory::InMemory};
 
     use super::*;
+
+    #[tokio::test]
+    async fn object_store_wrapper_counts_lists_and_multipart_lifecycle() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let meter = UsageMeter::new();
+        let counted = wrap_object_store(store, Arc::clone(&meter));
+
+        // Debug/Display render without touching the inner store — these
+        // strings end up in provider log lines.
+        assert!(format!("{counted:?}").contains("CountingObjectStore"));
+        assert!(format!("{counted}").contains("CountingObjectStore"));
+
+        let a = ObjPath::from("seg/a.bin");
+        counted
+            .put(&a, PutPayload::from_static(b"abc"))
+            .await
+            .expect("put");
+
+        // A streaming LIST bills once at stream creation;
+        // list_with_delimiter bills a second request.
+        let before = meter.snapshot();
+        let listed: Vec<_> = counted.list(None).try_collect().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        let flat = counted
+            .list_with_delimiter(None)
+            .await
+            .expect("list_with_delimiter");
+        // Delimiter semantics: `seg/a.bin` groups under the `seg`
+        // common prefix rather than appearing as a top-level object.
+        assert_eq!(flat.common_prefixes.len(), 1);
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.list_count, 2);
+
+        // copy is an unbilled passthrough — no read or write we meter.
+        let b = ObjPath::from("seg/b.bin");
+        let before = meter.snapshot();
+        counted.copy(&a, &b).await.expect("copy");
+        assert!(meter.snapshot().since(&before).is_zero());
+
+        // delete_stream passes through unbilled but must still delete.
+        let victims = stream::iter(vec![Ok(b.clone())]).boxed();
+        let deleted: Vec<_> = counted
+            .delete_stream(victims)
+            .try_collect()
+            .await
+            .expect("delete_stream");
+        assert_eq!(deleted, vec![b.clone()]);
+        assert!(counted.get(&b).await.is_err(), "b must be gone");
+
+        // Multipart lifecycle: create bills a zero-byte PUT (the
+        // CreateMultipartUpload request), each part bills its bytes, and
+        // complete bills the finalize request.
+        let m = ObjPath::from("seg/m.bin");
+        let before = meter.snapshot();
+        let mut upload = counted.put_multipart(&m).await.expect("create multipart");
+        assert!(format!("{upload:?}").contains("CountingMultipart"));
+        upload
+            .put_part(PutPayload::from_static(b"0123456789"))
+            .await
+            .expect("part");
+        upload.complete().await.expect("complete");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(
+            delta.put_count, 3,
+            "create + part + complete each bill one PUT"
+        );
+        assert_eq!(delta.put_bytes, 10, "only part bytes carry payload");
+
+        // abort is an unbilled passthrough.
+        let mut aborted = counted
+            .put_multipart(&ObjPath::from("seg/n.bin"))
+            .await
+            .expect("create multipart");
+        let before = meter.snapshot();
+        aborted.abort().await.expect("abort");
+        assert!(meter.snapshot().since(&before).is_zero());
+    }
 
     #[tokio::test]
     async fn object_store_wrapper_counts_get() {

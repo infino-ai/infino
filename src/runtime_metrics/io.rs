@@ -377,6 +377,76 @@ mod tests {
         );
     }
 
+    /// Every class round-trips through its slot index (the `get_by_class`
+    /// array layout), carries a distinct dashboard label, and splits
+    /// user/hidden the way the COGS tables expect.
+    #[test]
+    fn uri_class_index_label_and_hidden_split_are_consistent() {
+        let all = [
+            UriClass::UserData,
+            UriClass::UserManifest,
+            UriClass::HiddenData,
+            UriClass::HiddenManifest,
+        ];
+        for (slot, class) in all.into_iter().enumerate() {
+            assert_eq!(class.index(), slot);
+            assert_eq!(UriClass::from_index(slot), class);
+            assert_eq!(
+                class.is_hidden(),
+                matches!(class, UriClass::HiddenData | UriClass::HiddenManifest)
+            );
+        }
+        let mut labels: Vec<&str> = all.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), all.len(), "labels must stay distinct");
+    }
+
+    /// `read_requests` is the billing-side read count: HEAD probes plus
+    /// foreground GETs, background fills excluded.
+    #[tokio::test]
+    async fn read_requests_sums_heads_and_foreground_gets_only() {
+        let m = UsageMeter::new();
+        m.record_head();
+        m.record_head();
+        m.record_get("superfiles/a.parquet", None, 10);
+        scope_background(async {
+            m.record_get("superfiles/b.parquet", Some((0, 5)), 5);
+        })
+        .await;
+        let s = m.snapshot();
+        assert_eq!(s.read_requests(), 3, "2 HEAD + 1 foreground GET");
+        assert_eq!(
+            s.class_io(UriClass::UserData).get_count,
+            1,
+            "background fills stay out of the per-class (billing) counters"
+        );
+    }
+
+    /// A trace window captures reads only while armed, drains exactly
+    /// once, and an unarmed take yields nothing.
+    #[test]
+    fn trace_window_arms_captures_and_drains_once() {
+        let m = UsageMeter::new();
+        assert!(m.take_trace().is_empty(), "no window armed yet");
+
+        m.record_get("superfiles/before.parquet", None, 1);
+        m.start_trace();
+        m.record_get("superfiles/traced.parquet", Some((4, 8)), 4);
+        let trace = m.take_trace();
+        assert_eq!(trace.len(), 1, "only reads inside the window are traced");
+        assert_eq!(trace[0].uri, "superfiles/traced.parquet");
+        assert_eq!(trace[0].range, Some((4, 8)));
+        assert_eq!(trace[0].bytes, 4);
+
+        assert!(m.take_trace().is_empty(), "take drains the window");
+        m.record_get("superfiles/after.parquet", None, 2);
+        assert!(
+            m.take_trace().is_empty(),
+            "window stays disarmed after take"
+        );
+    }
+
     #[test]
     fn since_subtracts_fieldwise() {
         let mut earlier = UsageSnapshot {

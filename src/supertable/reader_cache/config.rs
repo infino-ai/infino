@@ -268,3 +268,97 @@ impl CacheEvictionPolicy for LruPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte size shared by every candidate in these tests — victim
+    /// selection is then a pure function of access order and count.
+    const CANDIDATE_BYTES: u64 = 100;
+
+    fn candidate(last_access_us: u64) -> EvictionCandidate {
+        EvictionCandidate {
+            uri: SuperfileUri::new_v4(),
+            size_bytes: CANDIDATE_BYTES,
+            last_access_us,
+        }
+    }
+
+    #[test]
+    fn lru_evicts_oldest_first_and_stops_once_freed() {
+        // Three entries, arbitrary declaration order; asking for two
+        // entries' worth of bytes must evict exactly the two oldest,
+        // oldest first — the store unlinks in the returned order.
+        let policy = LruPolicy::new();
+        let (old, mid, new) = (candidate(10), candidate(20), candidate(30));
+        let victims = policy.select_for_eviction(
+            &[mid.clone(), new.clone(), old.clone()],
+            &HashSet::new(),
+            2 * CANDIDATE_BYTES,
+        );
+        assert_eq!(victims, vec![old.uri, mid.uri]);
+    }
+
+    #[test]
+    fn lru_never_selects_pinned_entries() {
+        // The oldest entry is pinned (a cold fetch holds it), so the
+        // policy must skip it and free from the next-oldest instead.
+        let policy = LruPolicy::new();
+        let (old, mid, new) = (candidate(10), candidate(20), candidate(30));
+        let pinned: HashSet<SuperfileUri> = [old.uri].into_iter().collect();
+        let victims = policy.select_for_eviction(
+            &[old.clone(), mid.clone(), new.clone()],
+            &pinned,
+            CANDIDATE_BYTES,
+        );
+        assert_eq!(victims, vec![mid.uri]);
+    }
+
+    #[test]
+    fn lru_returns_empty_when_eligible_bytes_cannot_cover_request() {
+        // The contract the disk store relies on: an empty Vec — not a
+        // partial victim list — signals "can't free enough", which the
+        // caller surfaces as CacheBudgetExceeded and the query layer
+        // folds into the RangeOnly fallback. Partial eviction here
+        // would unlink cache entries without unblocking the reservation.
+        let policy = LruPolicy::new();
+        let (old, new) = (candidate(10), candidate(20));
+        let pinned: HashSet<SuperfileUri> = [new.uri].into_iter().collect();
+        let victims =
+            policy.select_for_eviction(&[old.clone(), new.clone()], &pinned, 2 * CANDIDATE_BYTES);
+        assert!(victims.is_empty(), "partial frees must select nothing");
+    }
+
+    #[test]
+    fn default_config_matches_documented_defaults() {
+        let config = DiskCacheConfig::default();
+        assert_eq!(config.disk_budget_bytes, DEFAULT_DISK_BUDGET_BYTES);
+        assert_eq!(
+            config.cold_fetch_mode,
+            ColdFetchMode::LazyForegroundWithBackgroundFill
+        );
+        assert_eq!(config.cold_fetch_streams, DEFAULT_COLD_FETCH_STREAMS);
+        assert_eq!(
+            config.cold_fetch_chunk_bytes,
+            DEFAULT_COLD_FETCH_CHUNK_BYTES
+        );
+        assert_eq!(config.prefetch_concurrency, DEFAULT_PREFETCH_CONCURRENCY);
+        assert_eq!(
+            config.mmap_cold_threshold_secs,
+            DEFAULT_MMAP_COLD_THRESHOLD_SECS
+        );
+        assert_eq!(
+            config.mmap_sweep_interval_secs,
+            DEFAULT_MMAP_SWEEP_INTERVAL_SECS
+        );
+        assert!(config.verify_crc_on_open);
+
+        // The Debug impl elides the boxed policy but must keep the
+        // tuning knobs readable for log lines.
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("disk_budget_bytes"));
+        assert!(rendered.contains("cold_fetch_mode"));
+        assert!(rendered.contains("<dyn CacheEvictionPolicy>"));
+    }
+}
