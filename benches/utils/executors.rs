@@ -1647,8 +1647,7 @@ pub mod vector {
             lat.push(started.elapsed());
             sum += corpus::recall_at_k(&hits, t);
         }
-        lat.sort_unstable();
-        let p50 = lat[lat.len() / 2];
+        let p50 = p50(&mut lat);
         (sum / queries.len() as f32, p50)
     }
 

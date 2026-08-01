@@ -3202,7 +3202,7 @@ pub mod vector {
                     "unfiltered width-sweep ({state}): recall fell from \
                      {prev_recall:.3} at nprobe={prev_width} to {recall:.3} at \
                      nprobe={width} — a widening probe may not cost more than \
-                     {WIDTH_SWEEP_MONOTONICITY_SLACK} recall (the #494 \
+                     {WIDTH_SWEEP_MONOTONICITY_SLACK} recall (the #479 \
                      inversion signature)"
                 );
             }
