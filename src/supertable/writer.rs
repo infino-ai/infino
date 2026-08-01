@@ -6433,11 +6433,13 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
 ///   Its writer either died between its list PUT and its pointer CAS (a
 ///   crash orphan), or is mid-commit. Lists are conditional-create and
 ///   never overwritten, so re-deriving the same id can never publish;
-///   return `attempted_id + 1` so the retry skips past it. The object is
-///   left untouched — an orphan stays unreferenced and ages into the GC
-///   sweep, while a live mid-commit writer keeps its candidate: its pointer
-///   CAS and ours are fenced on the same prior etag, so exactly one wins
-///   and the loser retries as usual.
+///   walk the contiguous occupied run and return the first free id, so a
+///   single retry escapes the whole run (skipping one id per retry would
+///   still exhaust `max_commit_retries` on a run longer than the budget).
+///   The occupants are left untouched — an orphan stays unreferenced and
+///   ages into the GC sweep, while a live mid-commit writer keeps its
+///   candidate: its pointer CAS and ours are fenced on the same prior
+///   etag, so exactly one wins and the loser retries as usual.
 ///
 /// Both conditions are required. The pointer sitting short of
 /// `attempted_id` alone is not proof of an occupant: a loser's refresh can
@@ -6454,11 +6456,23 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     if refreshed_id >= attempted_id {
         return Ok(0);
     }
-    match storage.head(&manifest_uri(attempted_id)).await {
-        Ok(_) => Ok(attempted_id + 1),
-        Err(StorageError::NotFound { .. }) => Ok(0),
-        Err(e) => Err(SupertableCommitError::Storage(e)),
+    // Ids above the pointer are only ever held by unpublished lists, and
+    // every write below the pointer has already happened, so the run of
+    // occupied ids starting at `attempted_id` is finite and the walk
+    // terminates at the first free id.
+    let mut next_free_id = attempted_id;
+    loop {
+        match storage.head(&manifest_uri(next_free_id)).await {
+            Ok(_) => next_free_id += 1,
+            Err(StorageError::NotFound { .. }) => break,
+            Err(e) => return Err(SupertableCommitError::Storage(e)),
+        }
     }
+    Ok(if next_free_id > attempted_id {
+        next_free_id
+    } else {
+        0
+    })
 }
 
 /// CAS-publish a successor manifest whose tombstone seq for every

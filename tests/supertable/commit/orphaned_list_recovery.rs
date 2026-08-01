@@ -43,6 +43,16 @@ const ORPHANED_MANIFEST_ID: u64 = 2;
 const ORPHANED_LIST_BYTES: &[u8] =
     b"manifest list left by a writer that died before its pointer CAS";
 
+/// Length of the contiguous orphan run in the consecutive-orphans test.
+/// Deliberately longer than [`TIGHT_COMMIT_RETRIES`]: recovery must escape
+/// the whole run in a single retry (one forward probe to the first free
+/// id), not one id per retry — the latter would exhaust the budget here.
+const N_CONSECUTIVE_ORPHANS: u64 = 4;
+
+/// Commit-retry budget for the consecutive-orphans test — smaller than the
+/// orphan run so per-id skipping cannot pass.
+const TIGHT_COMMIT_RETRIES: u32 = 2;
+
 fn commit_titles(st: &Supertable, titles: &[&str]) {
     let mut w = st.writer().expect("writer");
     w.append(&build_title_batch(titles)).expect("append");
@@ -99,24 +109,31 @@ fn commit_skips_past_orphaned_manifest_list() {
 
 #[test]
 fn commit_skips_past_consecutive_orphaned_manifest_lists() {
-    // Two writers crashing back-to-back (the second recovered past the
-    // first, then died the same way) occupy two consecutive ids. Each
-    // occupied id costs one OCC retry; the commit still publishes.
+    // Writers crashing back-to-back (each recovered past the previous run,
+    // then died the same way) leave a contiguous run of occupied ids. The
+    // run is longer than the retry budget, so recovery must escape it in a
+    // single retry — one forward probe to the first free id — rather than
+    // skipping one id per retry.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .expect("create");
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_max_commit_retries(TIGHT_COMMIT_RETRIES)
+            .with_storage(Arc::clone(&storage)),
+    )
+    .expect("create");
     commit_titles(&st, &["first commit alpha"]);
 
-    put_orphan(&storage, ORPHANED_MANIFEST_ID);
-    put_orphan(&storage, ORPHANED_MANIFEST_ID + 1);
+    for i in 0..N_CONSECUTIVE_ORPHANS {
+        put_orphan(&storage, ORPHANED_MANIFEST_ID + i);
+    }
 
     commit_titles(&st, &["second commit beta"]);
     assert_eq!(
         st.manifest_id(),
-        ORPHANED_MANIFEST_ID + 2,
-        "commit publishes at the first id past both orphans"
+        ORPHANED_MANIFEST_ID + N_CONSECUTIVE_ORPHANS,
+        "commit publishes at the first id past the whole orphan run"
     );
     assert_eq!(st.reader().expect("reader").n_superfiles(), 2);
 }
