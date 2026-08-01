@@ -83,7 +83,7 @@ use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tokio::{sync::oneshot, time::sleep};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -5764,6 +5764,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         }
     }
     cal.freeze(&clusters, rot_seed);
+    // Shared handle for the scoring sweep: chunks are MOVED onto the
+    // maintenance pool and awaited over a oneshot, so the tokio worker
+    // keeps driving the next chunk's loads instead of blocking under the
+    // compute (the standing rayon/tokio bridge contract).
+    let cal = Arc::new(cal);
 
     // Single full sweep: score every live cell against the frozen queries,
     // then observe fine ranks from each superfile's own bytes (mirrors the
@@ -5788,11 +5793,17 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 .await?;
                 loaded.push((cell, rows));
             }
-            pool.install(|| {
-                loaded
+            let (done_tx, done_rx) = oneshot::channel();
+            let chunk_cal = Arc::clone(&cal);
+            pool.spawn(move || {
+                let result = loaded
                     .par_iter()
-                    .try_for_each(|(cell, rows)| cal.score_rows(*cell, rows))
-            })?;
+                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
+                let _ = done_tx.send(result);
+            });
+            done_rx
+                .await
+                .map_err(|_| BuildError::Store("recalibration score task dropped".into()))??;
         }
         let (reader, _bitmap) = open_ivf_reader_with_tombstones(inner, entry, now).await?;
         // Resident-only read: `None` (cold bytes, or a legacy single-cell
@@ -5806,6 +5817,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             cal.observe_shard_views(&views);
         }
     }
+    // Every chunk's oneshot was awaited, so this is the last reference.
+    let cal = Arc::into_inner(cal)
+        .ok_or_else(|| BuildError::Store("recalibration state still shared".into()))?;
     let Some(laws) = cal.finish(&clusters) else {
         return Ok(false);
     };
@@ -5833,15 +5847,38 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         return Ok(false);
     }
 
-    // Reload the freshest grid for the stamp commit: the split pass this
-    // recalibration follows has already swapped the strategy, and OCC
-    // re-applies this metadata verbatim on retries, so it must carry the
-    // current clusters rather than this function's entry snapshot.
+    // Reload the freshest STRATEGY for the stamp commit — both halves.
+    // Clusters: the split pass this recalibration follows has already
+    // swapped the grid, and OCC re-applies this metadata verbatim on
+    // retries, so the stamp must carry the current grid, not this
+    // function's entry snapshot. Routing: a concurrent commit (another
+    // drain's max-merge stamp, a split porting routing forward) may have
+    // written routing since our snapshot — re-apply the measured deltas
+    // onto the FRESH routing so the stamp cannot clobber a newer law
+    // with our stale snapshot's other fields.
     let manifest = inner.manifest.load_full();
-    let clusters = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell { clusters, .. } => clusters,
+    let (clusters, fresh_routing) = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell {
+            clusters, routing, ..
+        } => (clusters, routing),
         _ => return Ok(false),
     };
+    let mut routing = fresh_routing;
+    for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+        if measured > 0 {
+            *slot = measured;
+        }
+    }
+    for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+        if measured > 0 {
+            *slot = measured;
+        }
+    }
+    for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+        if measured > 0 {
+            *slot = measured;
+        }
+    }
     let list_metadata = CommitListMetadata {
         partition_strategy: Some(PartitionStrategy::VectorCell {
             column: column.clone(),

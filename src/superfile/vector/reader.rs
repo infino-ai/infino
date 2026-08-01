@@ -2003,12 +2003,11 @@ impl VectorReader {
     /// referred to this helper before it existed); `None` past the region
     /// end.
     pub(crate) fn stable_id_at(region: &[u8], local: usize) -> Option<i128> {
-        let start = local * STABLE_ID_BYTES;
-        let end = start + STABLE_ID_BYTES;
-        if end > region.len() {
-            return None;
-        }
-        Some(i128::from_le_bytes(region[start..end].try_into().ok()?))
+        let start = local.checked_mul(STABLE_ID_BYTES)?;
+        let end = start.checked_add(STABLE_ID_BYTES)?;
+        Some(i128::from_le_bytes(
+            region.get(start..end)?.try_into().ok()?,
+        ))
     }
 
     /// Per-cell view for depth calibration: the raw fp32 centroid-region
@@ -2036,16 +2035,26 @@ impl VectorReader {
                 .source
                 .try_get_range_sync(col.subsection_range.clone())?;
             let n_fine = col.n_cent as usize;
-            let centroids_len = n_fine * col.dim * F32_BYTES;
-            let fine_centroids_bytes =
-                sub.slice(col.centroids_off..col.centroids_off + centroids_len);
+            // Corrupt-offset hardening: every region bound is validated
+            // before slicing — observation degrades to `None` (the caller's
+            // documented keep-previous-law fallback) instead of panicking
+            // on a malformed subsection.
+            let centroids_len = n_fine.checked_mul(col.dim)?.checked_mul(F32_BYTES)?;
+            let centroids_end = col.centroids_off.checked_add(centroids_len)?;
+            if centroids_end > sub.len() {
+                return None;
+            }
+            let fine_centroids_bytes = sub.slice(col.centroids_off..centroids_end);
             // Stable ids are indexed by cell-local doc id; each cluster's
             // doc-id block names its member rows' cell-local ids — walking
             // both yields stable id -> fine cluster for every row.
             let region = self
                 .source
                 .try_get_range_sync(col.stable_ids_region_range()?)?;
-            let idx_slice = &sub[col.cluster_idx_off..];
+            let idx_end = col
+                .cluster_idx_off
+                .checked_add(n_fine.checked_mul(CLUSTER_IDX_ENTRY_BYTES)?)?;
+            let idx_slice = sub.get(col.cluster_idx_off..idx_end)?;
             let mut cluster_of_stable = HashMap::with_capacity(col.n_docs as usize);
             for cluster in 0..n_fine {
                 let (off, cnt) = read_cluster_entry(idx_slice, cluster);

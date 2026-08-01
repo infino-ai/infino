@@ -36,7 +36,7 @@ use crate::{
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, Supertable,
         error::CompactionError,
-        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        handle::hidden_vector_index_compaction_settings,
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
         query::dispatch::open_compaction_input,
         wal::{
@@ -276,7 +276,15 @@ impl Supertable {
         // merged just to be re-split (the merge output would be discarded), and
         // the split runs as its own snapshot-consistent phase, so it can't remove
         // a superfile a later merge job in this pass planned to use.
-        let hidden_ivf = is_hidden_vector_index_table(&inner.options);
+        // Gate on the MANIFEST's locked strategy, not the handle options:
+        // hidden-index handles built in the creating process carry no
+        // marker in their immutable options (the create-era gap #500 fixes
+        // for the split phase the same way), and `recalibrate_probe_laws`
+        // self-guards on the strategy — trigger and pass on one signal.
+        let hidden_ivf = matches!(
+            inner.manifest.load().get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        );
         // Superfile-id snapshot for the recalibration trigger below: splits
         // and merges both change the id set, and both invalidate a stamped
         // probe law (splits change the cell geometry, merges rebuild the
