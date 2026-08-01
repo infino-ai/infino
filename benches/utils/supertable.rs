@@ -2356,8 +2356,17 @@ pub mod vector {
     /// budget the curve INVERTS (0.994 at nprobe=2 -> 0.388 at all cells),
     /// while the pre-#479 per-cell budget held flat (0.976) at unbounded
     /// cost. The all-cells row is appended at runtime from the live grid.
-    /// Diagnostic print only - recall gates stay on the engine default.
+    /// Each consecutive pair is asserted monotone within
+    /// [`WIDTH_SWEEP_MONOTONICITY_SLACK`]; recall gates stay on the
+    /// engine default.
     const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
+    /// Recall a wider sweep point may lose vs the previous one before the
+    /// width-sweep assert trips. The floored core cannot lose recall by
+    /// construction; the slack absorbs the residual eviction band above
+    /// the floor (candidates riding only the global pool) plus tie-break
+    /// jitter. A width-blind selection regression falls far beyond it
+    /// (0.994 -> 0.388 measured at 10M pre-floor).
+    const WIDTH_SWEEP_MONOTONICITY_SLACK: f32 = 0.01;
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
@@ -3149,8 +3158,18 @@ pub mod vector {
         if all_cells > widths.last().copied().unwrap_or(0) {
             widths.push(all_cells);
         }
+        // The monotonicity assert below is a tripwire, not the contract's
+        // proof: the floored core is monotone by construction, but the
+        // residual eviction band above the floor keeps the pooled
+        // selection's width-blind behavior — and THIS planted corpus reads
+        // flat even without the floor (its 1-bit estimates are too clean
+        // to swamp the pool), so the assert catches gross regressions (a
+        // reintroduced width-blind cap, a floor that stops engaging) while
+        // the contract's real evidence stays the real-embedding A/B at 1M
+        // and 10M on the fix PR.
+        let mut prev: Option<(usize, f32)> = None;
         for width in widths {
-            let recall = exec_vec::mean_recall(
+            let (recall, p50) = exec_vec::mean_recall_timed(
                 reader,
                 supertable::VEC_COLUMN,
                 queries,
@@ -3167,10 +3186,27 @@ pub mod vector {
             } else {
                 ""
             };
+            // `floor<=` is the worst-case pricing of the rescue: the
+            // per-cell floor admits at most `width x k` extra
+            // exact-rerank rows beyond the pooled budget.
             eprintln!(
                 "[supertable_vector] unfiltered width-sweep ({state}): \
-                 nprobe={width}{all_tag} recall@{TOP_K}={recall:.3}"
+                 nprobe={width}{all_tag} recall@{TOP_K}={recall:.3} \
+                 p50={} floor<={} rerank rows",
+                fmt_time(p50.as_nanos() as f64),
+                width * TOP_K,
             );
+            if let Some((prev_width, prev_recall)) = prev {
+                assert!(
+                    recall >= prev_recall - WIDTH_SWEEP_MONOTONICITY_SLACK,
+                    "unfiltered width-sweep ({state}): recall fell from \
+                     {prev_recall:.3} at nprobe={prev_width} to {recall:.3} at \
+                     nprobe={width} — a widening probe may not cost more than \
+                     {WIDTH_SWEEP_MONOTONICITY_SLACK} recall (the #494 \
+                     inversion signature)"
+                );
+            }
+            prev = Some((width, recall));
         }
     }
 

@@ -1612,12 +1612,32 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> f32 {
+        mean_recall_timed(reader, column, queries, truths, k, nprobe, rerank).0
+    }
+
+    /// [`mean_recall`] plus the p50 query latency of the same pass, so a
+    /// probe sweep can price a setting on the same line that reports its
+    /// recall.
+    pub fn mean_recall_timed<R: VectorRead>(
+        reader: &R,
+        column: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        k: usize,
+        nprobe: usize,
+        rerank: usize,
+    ) -> (f32, Duration) {
         let mut sum = 0f32;
+        let mut lat: Vec<Duration> = Vec::with_capacity(queries.len());
         for (q, t) in queries.iter().zip(truths) {
+            let started = Instant::now();
             let hits = reader.topk_global(column, q, k, nprobe, rerank);
+            lat.push(started.elapsed());
             sum += corpus::recall_at_k(&hits, t);
         }
-        sum / queries.len() as f32
+        lat.sort_unstable();
+        let p50 = lat.get(lat.len() / 2).copied().unwrap_or_default();
+        (sum / queries.len() as f32, p50)
     }
 
     /// Largest doc count that still calibrates with the exhaustive

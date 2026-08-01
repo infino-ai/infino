@@ -2998,17 +2998,19 @@ fn select_global_shortlist(
         return pooled;
     }
     // Per-cell floor: every scanned (unit, cell) keeps its `cell_floor`
-    // best candidates REGARDLESS of the global competition. This is what
-    // makes probe width monotone in recall by construction — a candidate
-    // admitted by its own cell's floor cannot be evicted by far cells'
-    // 1-bit false positives, so widening the sweep only ever ADDS
-    // survivors. Without it the fixed pooled cap is width-blind and
-    // recall INVERTS as nprobe grows (measured at 10M on the post-split
-    // grid: 0.994 at nprobe=2 falling to 0.388 at all cells). The floor
-    // is `k` at the call site: even if the entire true top-k lives in
-    // one cell, that cell's floor carries it. Cost is bounded and
-    // linear: at most `cells x cell_floor` extra survivors for the
-    // exact rerank.
+    // best candidates REGARDLESS of the global competition. The floored
+    // core is monotone by construction — a candidate admitted by its own
+    // cell's floor cannot be evicted by far cells' 1-bit false positives —
+    // which FLOORS the worst case rather than proving end-to-end
+    // monotonicity: a candidate ranked below its cell's floor but inside
+    // the global pool (a band that grows with `rerank_mult`) keeps the
+    // pooled selection's width-blind behavior. Without the floor that
+    // band is the WHOLE selection, and recall inverts as nprobe grows
+    // (measured at 10M on the post-split grid: 0.994 at nprobe=2 falling
+    // to 0.388 at all cells). The floor is `k` at the call site: even if
+    // the entire true top-k lives in one cell, that cell's floor carries
+    // it. Cost is bounded and linear: at most `cells x cell_floor` extra
+    // survivors for the exact rerank.
     let mut by_cell: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (idx, (si, cand)) in pooled.iter().enumerate().skip(limit) {
         by_cell.entry((*si, cand.cell_idx)).or_default().push(idx);
