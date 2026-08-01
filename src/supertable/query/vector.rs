@@ -4890,7 +4890,8 @@ mod tests {
                  be immune to added cells (kept narrow {narrow_kept:?} vs \
                  wide {wide_kept:?})"
             );
-        }    }
+        }
+    }
 
     /// A clean drain calibrates the probe-width law from the table's own
     /// rows and stamps it into the manifest routing; a DEFAULT search (no

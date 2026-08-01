@@ -53,7 +53,7 @@ use infino::{
     OptimizeOptions,
     supertable::{
         Supertable,
-        manifest::{ClusterCentroids, SuperfileEntry, list::PartitionStrategy},
+        manifest::{ClusterCentroids, SuperfileEntry},
         writer::maintenance_pool_width,
     },
 };
