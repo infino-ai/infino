@@ -2377,6 +2377,10 @@ pub mod vector {
     /// cost. The all-cells row is appended at runtime from the live grid.
     /// Diagnostic print only - recall gates stay on the engine default.
     const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
+    /// Doc id whose bucket term the predicate battery filters on —
+    /// arbitrary, stable across runs; taken modulo the corpus size so
+    /// the bucket exists even on tiny debug corpora.
+    const FILTER_BUCKET_PICK: usize = 42;
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
@@ -4223,7 +4227,13 @@ pub mod vector {
                 // like every other search number in this file — a second
                 // full table just to host a text predicate doubled ingest
                 // and was untenable at 100M/1B.
-                let filter_query = supertable::vector_filter_bucket_term(42);
+                // Pick a bucket that exists at ANY corpus size: bucket
+                // ids are `doc_id % VECTOR_FILTER_BUCKET_TERMS`, so passing
+                // a live doc id guarantees at least that doc matches (a
+                // fixed id larger than a tiny debug corpus would resolve
+                // to an empty allow-set and grade recall against nothing).
+                let filter_query =
+                    supertable::vector_filter_bucket_term(FILTER_BUCKET_PICK % n_docs.max(1));
                 let filter_mode = infino::BoolMode::And;
                 let primary_reader = consumer.reader().expect("reader");
 
@@ -4244,6 +4254,11 @@ pub mod vector {
                     allow.insert(dense);
                 }
                 let matched = allow.len();
+                assert!(
+                    matched > 0,
+                    "predicate-filtered battery resolved an empty allow-set — \
+                     the graded numbers would be meaningless"
+                );
                 let selectivity = matched as f64 / n_docs.max(1) as f64;
 
                 let primary_vectors = corpus
