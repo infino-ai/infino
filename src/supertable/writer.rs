@@ -3833,9 +3833,28 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // fan-out below can score cells against a stable query set. The
         // grid is final here — every spill is already assigned to its
         // cells — so the rerank-law pools rank against what queries will
-        // actually sweep.
-        if let Some(cal) = width_law.as_mut() {
-            cal.freeze(&running_clusters, vector_config.rot_seed);
+        // actually sweep. Freezing rotates every sampled query and ranks
+        // it against the full grid — CPU work, bridged onto the drain's
+        // own writer pool behind a oneshot so this tokio worker keeps
+        // driving I/O (the standing rayon/tokio contract). The WRITER
+        // pool, deliberately not the maintenance pool: the drain rides
+        // the ingest commit path, and the maintenance pool's contract is
+        // optimize/hidden-compaction only. The grid MOVES into the task
+        // and comes back with the frozen state — no clone of the
+        // centroid bytes.
+        if let Some(mut cal) = width_law.take() {
+            let rot_seed = vector_config.rot_seed;
+            let (freeze_tx, freeze_rx) = oneshot::channel();
+            let clusters_for_freeze = running_clusters;
+            hidden_inner.options.writer_pool.spawn(move || {
+                cal.freeze(&clusters_for_freeze, rot_seed);
+                let _ = freeze_tx.send((cal, clusters_for_freeze));
+            });
+            let (frozen, clusters_back) = freeze_rx
+                .await
+                .map_err(|_| BuildError::Store("width-law freeze task dropped".into()))?;
+            width_law = Some(frozen);
+            running_clusters = clusters_back;
         }
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
@@ -7111,7 +7130,21 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             .vec()
             .and_then(|v| v.cell_fine_calibration_views(&column))
         {
-            cal.observe_shard_views(&views);
+            // Depth ranking is CPU work — ride the maintenance pool
+            // behind a oneshot exactly like the scoring chunks above.
+            // Release the shared handle BEFORE signalling completion:
+            // the awaiting side unwraps the Arc after the final recv,
+            // and a send-then-drop order races it.
+            let (observe_tx, observe_rx) = oneshot::channel();
+            let observe_cal = Arc::clone(&cal);
+            pool.spawn(move || {
+                observe_cal.observe_shard_views(&views);
+                drop(observe_cal);
+                let _ = observe_tx.send(());
+            });
+            observe_rx.await.map_err(|_| {
+                BuildError::Store("recalibration depth observation task dropped".into())
+            })?;
         }
     }
     // Every chunk's oneshot was awaited, so this is the last reference.

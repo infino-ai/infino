@@ -4314,6 +4314,12 @@ pub mod vector {
                         rss::fmt_bytes(io.get_bytes),
                         q_correct.len(),
                     );
+                    assert_eq!(
+                        io.get_count, 0,
+                        "predicate-filtered warm battery issued object-store GETs — \
+                         an undersized or unwarmed cache turned the warm window into \
+                         silent round-trips (see the PROVE-0-GET note above)"
+                    );
                     report.emit(&Section {
                         anchor: "bench/vector/supertable/filtered-predicate".into(),
                         title: format!(
