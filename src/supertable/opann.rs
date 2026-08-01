@@ -1440,6 +1440,12 @@ fn merge_candidates(
         a.2.cmp(&b.2)
             .then_with(|| a.0.total_cmp(&b.0))
             .then_with(|| b.3.is_finite().cmp(&a.3.is_finite()))
+            // Total order: two equally-rankable equal-distance replicas
+            // tie-break on cell, or the kept copy would depend on merge
+            // order — and the fine-rank lookup is keyed by the SURVIVING
+            // copy's cell, so an arbitrary keep would make the stamped
+            // depth law nondeterministic across runs.
+            .then_with(|| a.1.cmp(&b.1))
     });
     acc.dedup_by_key(|c| c.2);
     truncate_ascending(acc, cap);

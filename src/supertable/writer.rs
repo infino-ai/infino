@@ -7015,8 +7015,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // physical (tombstones included); each picked ordinal is mapped
     // proportionally onto the cell's live rows below.
     let sample_count = total_docs.min(opann::WIDTH_LAW_QUERY_SAMPLE as u64);
+    // u128 intermediates: the products are provably in-range today only
+    // because doc counts are u32-bounded — widening makes the sampler
+    // correct unconditionally, at zero cost on this once-per-pass path.
     let sample_ordinals: Vec<u64> = (0..sample_count)
-        .map(|i| i * total_docs / sample_count)
+        .map(|i| ((u128::from(i) * u128::from(total_docs)) / u128::from(sample_count)) as u64)
         .collect();
     let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
     let mut base = 0u64;
@@ -7061,7 +7064,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             .max(1);
         let mut last_idx = usize::MAX;
         for &ordinal in ordinals {
-            let idx = ((u64::from(ordinal) * rows.len() as u64) / phys) as usize;
+            let idx = ((u128::from(ordinal) * rows.len() as u128) / u128::from(phys)) as usize;
             let idx = idx.min(rows.len() - 1);
             if idx == last_idx {
                 continue;
