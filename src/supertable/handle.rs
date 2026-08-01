@@ -4780,6 +4780,238 @@ mod tests {
         );
     }
 
+    /// Storage wrapper for split failure-path tests: delegates to LocalFS
+    /// but fails superfile-data PUTs once armed, so a split's upload phase
+    /// errors after its pin stamp has landed.
+    #[derive(Debug)]
+    struct FailingDataPutStorage {
+        inner: crate::storage::LocalFsStorageProvider,
+        fail_data_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingDataPutStorage {
+        fn arm(&self) {
+            self.fail_data_puts
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for FailingDataPutStorage {
+        async fn head(
+            &self,
+            uri: &str,
+        ) -> Result<crate::storage::ObjectMeta, crate::storage::StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(
+            &self,
+            uri: &str,
+        ) -> Result<(bytes::Bytes, crate::storage::ObjectMeta), crate::storage::StorageError>
+        {
+            self.inner.get(uri).await
+        }
+        async fn get_range(
+            &self,
+            uri: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, crate::storage::StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<Option<String>, crate::storage::StorageError> {
+            if self
+                .fail_data_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && uri.contains("data/")
+            {
+                return Err(crate::storage::StorageError::NotFound {
+                    uri: format!("injected data PUT failure: {uri}"),
+                });
+            }
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, crate::storage::StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, crate::storage::StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), crate::storage::StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// A publish that fails AFTER the pre-upload pin stamp must release the
+    /// pin on the way out — otherwise an idle table keeps the aborted
+    /// output in gc's live set forever.
+    #[test]
+    fn failed_split_publish_releases_upload_pin() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{slow_vector_state, writer::split_overflow_cell},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let failing = Arc::new(FailingDataPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            fail_data_puts: std::sync::atomic::AtomicBool::new(false),
+        });
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&failing) as Arc<dyn StorageProvider>;
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let superfiles_before = hidden.reader().expect("reader").manifest().superfiles.len();
+
+        // Child uploads fail from here on; the pin stamp and its unpin go
+        // to non-data prefixes and still succeed.
+        failing.arm();
+        let busiest = 0u32; // any populated cell works; 0 always exists
+        let result =
+            hidden.block_on_query(split_overflow_cell(hidden.inner().clone(), busiest, 0.0));
+        // Cell 0 may be unpopulated (defensive no-op) on some grids; make
+        // the test deterministic by trying every cell until one attempts a
+        // publish and fails.
+        let mut publish_failed = result.is_err();
+        if !publish_failed {
+            let n_cent = match hidden
+                .reader()
+                .expect("reader")
+                .manifest()
+                .get_partition_strategy()
+            {
+                crate::supertable::manifest::list::PartitionStrategy::VectorCell {
+                    clusters,
+                    ..
+                } => clusters.n_cent,
+                _ => 0,
+            };
+            for cell in 1..n_cent {
+                if hidden
+                    .block_on_query(split_overflow_cell(hidden.inner().clone(), cell, 0.0))
+                    .is_err()
+                {
+                    publish_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(publish_failed, "injected data-PUT failure must surface");
+
+        let reader = hidden.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.superfiles.len(),
+            superfiles_before,
+            "no membership published by the failed split"
+        );
+        // The pin was released on the failure path: pending state is clear.
+        let (uri, hash) = manifest
+            .slow_vector_state_blob()
+            .expect("hidden manifest carries a slow-state ref");
+        let hidden_storage = hidden
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("hidden table has storage");
+        let state = hidden
+            .block_on_query(slow_vector_state::load_full_state(
+                hidden_storage.as_ref(),
+                uri,
+                &hash,
+            ))
+            .expect("slow state loads");
+        assert!(
+            state.pending_drain.is_none(),
+            "the failed publish released its upload pin"
+        );
+    }
+
     /// A stale repack upload pin in the slow-CAS pending state must not
     /// brick the drain: the checkpoint loader recognizes the foreign schema
     /// and ignores it (pre-fix this failed with a checkpoint decode error).
@@ -4878,6 +5110,126 @@ mod tests {
         // stamp then supersedes it, releasing any pinned orphans).
         st.drain_vectors_to_cells_sync()
             .expect("drain proceeds past a foreign repack pin");
+    }
+
+    /// The reverse direction of the pin/checkpoint coexistence: a split
+    /// whose pin stamp finds a stale DRAIN checkpoint in the pending slot
+    /// replaces it (with a warning) and proceeds — inside optimize the
+    /// drain phase precedes the split pass, so a surviving drain pin is
+    /// unconsumable by construction.
+    #[test]
+    fn split_pin_replaces_stale_drain_checkpoint() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{
+                manifest::list::PartitionStrategy,
+                slow_vector_state::PendingDrainState,
+                writer::{DRAIN_CHECKPOINT_SCHEMA, split_overflow_cell, stamp_slow_vector_state},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Plant a stale DRAIN-schema checkpoint, as a crashed drain would
+        // leave behind if the next drain had nothing to resume.
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schema": DRAIN_CHECKPOINT_SCHEMA
+        }))
+        .expect("pin metadata");
+        hidden
+            .block_on_query(stamp_slow_vector_state(
+                hidden.inner(),
+                Some(PendingDrainState {
+                    metadata,
+                    entries: Vec::new(),
+                }),
+            ))
+            .expect("plant stale drain checkpoint");
+
+        let split_cell = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("cell"),
+            other => panic!("not VectorCell: {other:?}"),
+        };
+        let outcome = hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split proceeds over the stale drain checkpoint");
+        assert!(outcome.is_some(), "split must commit");
     }
 
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The

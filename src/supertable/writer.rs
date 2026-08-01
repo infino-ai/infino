@@ -183,7 +183,7 @@ const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
 /// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
 const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
-const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
+pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
 
@@ -5294,18 +5294,22 @@ const SPLIT_RESIDENT_BYTES_PER_ROW_DIM: u64 = 7;
 /// same knob, so "hidden maintenance may hold this many MiB" stays one
 /// operator-facing story. `0` degenerates to one split per batch.
 fn split_batch_memory_budget_bytes() -> u64 {
+    split_batch_window_bytes(config::global().vector.compaction_max_memory_mb)
+}
+
+/// Split-window bytes for a configured `vector.compaction_max_memory_mb`.
+/// The merge phase reads 0 as "no byte ceiling", but a zero SPLIT window
+/// would silently collapse batching to one split per commit — reintroducing
+/// the per-commit fixed costs batching exists to amortize — so 0 falls back
+/// to the knob's shipped default.
+fn split_batch_window_bytes(configured_mib: u64) -> u64 {
     const MIB: u64 = 1024 * 1024;
-    /// Window used when `vector.compaction_max_memory_mb` is 0: the merge
-    /// phase reads 0 as "no byte ceiling", but a zero SPLIT window would
-    /// silently collapse batching to one split per commit — reintroducing
-    /// the per-commit fixed costs batching exists to amortize. Same value
-    /// as that knob's shipped default.
+    /// Same value as the knob's shipped default.
     const SPLIT_BATCH_FALLBACK_BUDGET_MIB: u64 = 4096;
-    let configured = config::global().vector.compaction_max_memory_mb;
-    let budget_mib = if configured == 0 {
+    let budget_mib = if configured_mib == 0 {
         SPLIT_BATCH_FALLBACK_BUDGET_MIB
     } else {
-        configured
+        configured_mib
     };
     budget_mib.saturating_mul(MIB)
 }
@@ -9443,6 +9447,55 @@ supertable:
             batch,
             vec![3, 6],
             "id-order ties, unsplittable 1 dropped, capped at 2"
+        );
+    }
+
+    /// The pending-metadata schema probe recognizes both stamp producers
+    /// and rejects garbage — the drain's checkpoint loader keys its
+    /// ignore-foreign-pin behavior on it.
+    #[test]
+    fn pending_metadata_schema_probes_both_producers() {
+        let repack = serde_json::to_vec(&RepackCheckpoint {
+            schema: REPACK_CHECKPOINT_SCHEMA,
+        })
+        .expect("encode");
+        assert_eq!(
+            pending_metadata_schema(&repack),
+            Some(REPACK_CHECKPOINT_SCHEMA)
+        );
+        let drain = serde_json::to_vec(&serde_json::json!({
+            "schema": DRAIN_CHECKPOINT_SCHEMA,
+            "unrelated": true
+        }))
+        .expect("encode");
+        assert_eq!(
+            pending_metadata_schema(&drain),
+            Some(DRAIN_CHECKPOINT_SCHEMA)
+        );
+        assert_eq!(pending_metadata_schema(b"not json"), None);
+        assert_eq!(pending_metadata_schema(b"{}"), None);
+    }
+
+    /// `vector.compaction_max_memory_mb = 0` disables the MERGE byte
+    /// ceiling; the split window must not degenerate to zero with it (that
+    /// would silently collapse batching to one split per commit).
+    #[test]
+    fn split_batch_window_survives_disabled_merge_ceiling() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            split_batch_window_bytes(0),
+            4096 * MIB,
+            "0 falls back to the default"
+        );
+        assert_eq!(
+            split_batch_window_bytes(512),
+            512 * MIB,
+            "nonzero passes through"
+        );
+        assert_eq!(
+            split_batch_window_bytes(u64::MAX),
+            u64::MAX,
+            "saturates instead of overflowing"
         );
     }
 
