@@ -60,7 +60,7 @@ let schema = Arc::new(Schema::new(vec![
 let docs = db.create_table(
     "docs",
     schema.clone(),
-    IndexSpec::new().fts("body").vector("embedding", 16, 1, Metric::Cosine),
+    IndexSpec::new().fts("body").vector("embedding", 16, Metric::Cosine),
 )?;
 
 let flat: Vec<f32> = [0usize, 0, 1].iter().flat_map(|&t| embed(t)).collect();

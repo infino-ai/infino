@@ -419,7 +419,6 @@ impl ManifestSnapshot {
                 .map(|v| list::VectorColumnInfo {
                     column: v.column.clone(),
                     dim: v.dim,
-                    n_cent: v.n_cent,
                     rot_seed: v.rot_seed,
                     metric: format!("{:?}", v.metric).to_lowercase(),
                 })
@@ -1795,7 +1794,6 @@ impl ManifestSnapshot {
             .map(|v| list::VectorColumnInfo {
                 column: v.column.clone(),
                 dim: v.dim,
-                n_cent: v.n_cent,
                 rot_seed: v.rot_seed,
                 metric: format!("{:?}", v.metric).to_lowercase(),
             })
@@ -1825,7 +1823,6 @@ impl ManifestSnapshot {
                 .map(|v| list::VectorColumnInfo {
                     column: v.column.clone(),
                     dim: v.dim,
-                    n_cent: v.n_cent,
                     rot_seed: v.rot_seed,
                     metric: format!("{:?}", v.metric).to_lowercase(),
                 })

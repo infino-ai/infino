@@ -32,7 +32,7 @@ def quickstart() -> None:
 def vectors() -> None:
     db = infino.connect("memory://")
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 16), nullable=False)])
-    spec = infino.IndexSpec().vector("emb", 16, 1, "cosine")
+    spec = infino.IndexSpec().vector("emb", 16, "cosine")
     vecs: infino.Table = db.create_table("vecs", schema, spec)
     vecs.vector_search("emb", [0.0] * 16, k=5, nprobe=8)
     vecs.vector_search(
@@ -61,13 +61,13 @@ def rejects_invalid_literals() -> None:
     db.create_table(
         "vecs",
         schema,
-        infino.IndexSpec().vector("emb", 16, 1, "euclidean"),  # type: ignore[arg-type]
+        infino.IndexSpec().vector("emb", 16, "euclidean"),  # type: ignore[arg-type]
     )
     db.create_table("docs", schema, infino.IndexSpec()).bm25_search(
         "emb", "q", k=1, mode="xor"  # type: ignore[arg-type]
     )
     db.create_table(
-        "vecs2", schema, infino.IndexSpec().vector("emb", 16, 1, "cosine")
+        "vecs2", schema, infino.IndexSpec().vector("emb", 16, "cosine")
     ).vector_search(
         "emb",
         [0.0] * 16,

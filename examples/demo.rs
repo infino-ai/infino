@@ -46,8 +46,6 @@ const EMB_DIM: usize = 16;
 const DOC_ID_DECIMAL_PRECISION: u8 = 38;
 /// Decimal128 scale for `doc_id` — integer ids, no fractional part.
 const DOC_ID_DECIMAL_SCALE: i8 = 0;
-/// IVF centroids for a one-document superfile superfile (one cluster).
-const DEMO_N_CENT: usize = 1;
 /// Rotation-matrix RNG seed (matches the test/bench convention).
 const DEMO_ROT_SEED: u64 = 7;
 /// Non-zero component before unit-normalizing the demo embedding.
@@ -78,7 +76,8 @@ fn demo_superfile() -> Bytes {
 
     // `emb` is a vector column: a logical name only — its f32s are
     // passed to add_batch separately and never enter the Parquet
-    // schema. n_cent=1 because a single doc yields one IVF cluster.
+    // schema. The IVF centroid count is derived from the row count at
+    // build time (a single doc yields one cluster).
     let opts = BuilderOptions::new(
         schema.clone(),
         "doc_id",
@@ -89,7 +88,6 @@ fn demo_superfile() -> Bytes {
         vec![VectorConfig::new(
             "emb".into(),
             EMB_DIM,
-            DEMO_N_CENT,
             DEMO_ROT_SEED,
             Metric::Cosine,
         )],

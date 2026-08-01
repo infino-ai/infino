@@ -36,7 +36,7 @@ use crate::{
     supertable::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri, Supertable,
         error::CompactionError,
-        handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        handle::hidden_vector_index_compaction_settings,
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
         query::dispatch::open_compaction_input,
         wal::{
@@ -276,7 +276,18 @@ impl Supertable {
         // merged just to be re-split (the merge output would be discarded), and
         // the split runs as its own snapshot-consistent phase, so it can't remove
         // a superfile a later merge job in this pass planned to use.
-        if is_hidden_vector_index_table(&inner.options) {
+        //
+        // Keyed on the manifest's LOCKED strategy, not the handle options: a
+        // hidden handle built at table create time has no user manifest to
+        // train a grid from, so its options never carry VectorCell — only the
+        // first drain locks the strategy into the manifest. An options-keyed
+        // gate silently skips every split until the table is reopened.
+        // `split_overflow_cells` re-checks the manifest strategy itself, so
+        // user tables (never VectorCell-locked) cannot reach the split.
+        if matches!(
+            inner.manifest.load().partition_strategy(),
+            Some(PartitionStrategy::VectorCell { .. })
+        ) {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;

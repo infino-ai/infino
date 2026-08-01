@@ -805,6 +805,9 @@
           "mode"
         ],
         "properties": {
+          "stats": {
+            "$ref": "#/components/schemas/Bm25Stats"
+          },
           "field_name": {
             "type": "string"
           },
@@ -1107,6 +1110,14 @@
         "enum": [
           "or",
           "and"
+        ]
+      },
+      "Bm25Stats": {
+        "type": "string",
+        "description": "BM25 corpus-statistics scope for scoring: per-superfile (default) or global across superfiles.",
+        "enum": [
+          "per_superfile",
+          "global"
         ]
       },
       "SchemaField": {

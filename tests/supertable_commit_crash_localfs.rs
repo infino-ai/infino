@@ -51,7 +51,7 @@
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
 //! | `crash_post_hidden_child_superfile_yields_pre_split_index`     | Batched cell split: first child superfile PUT (pre-commit) | Hidden index at drained state; orphan children GC'd |
 //! | `crash_post_hidden_list_yields_pre_split_index`                | Batched cell split: hidden list PUT, before its pointer | Hidden index at drained state; orphans GC'd |
-//! | `crash_post_hidden_pointer_yields_split_index`                 | Batched cell split: hidden pointer CAS AFTER it lands | Split durable; post-crash `optimize` + `gc` run clean (see the KNOWN GAP note in `verify_hidden_split_crash`) |
+//! | `crash_post_hidden_pointer_yields_split_index`                 | Batched cell split: hidden pointer CAS AFTER it lands | Split durable + immediately queryable (regression tripwire for the pre-#498 window); post-crash `optimize` + `gc` run clean |
 //! | `crash_post_hidden_repack_shard_yields_pre_split_index`        | Bulk repack: first packed-shard PUT (pre-pin, pre-commit) | Hidden index at drained state; orphan shard GC'd |
 //!
 //! LocalFS-only. The atomic-rename semantics hinge on local
@@ -273,9 +273,6 @@ const CRASH_EMB_DIM: usize = 16;
 /// Rows per planted direction; two directions → two populated hidden cells,
 /// and the busiest cell has enough rows to split k-ways.
 const CRASH_ROWS_PER_DIRECTION: usize = 8;
-/// Hidden grid size for the crash fixture (parity with the in-crate split
-/// unit tests).
-const CRASH_N_CENT: usize = 4;
 /// Rotation seed for the crash fixture's vector column.
 const CRASH_ROT_SEED: u64 = 7;
 /// Probe width covering every cell of the tiny fixture grid, pre- and
@@ -317,7 +314,6 @@ fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
         vec![VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: CRASH_N_CENT,
             rot_seed: CRASH_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -528,62 +524,54 @@ fn verify_hidden_split_crash(dir: &PathBuf, expect_split_generation: bool) -> u6
 
     if expect_split_generation {
         // The crash interrupted maintenance BETWEEN the split commit and the
-        // pass-final in-process `refresh_slow_vector_state`. The durable
-        // state is coherent (generation advanced atomically, nothing
-        // dangling — gc below must run clean) and the next maintenance
-        // cycle must complete without error.
-        //
-        // KNOWN GAP (pre-existing, reproduced on unmodified main with the
-        // singleton split, two populated cells): vector queries against
-        // this state under-serve — post-split 0/16 hits in-process, after
-        // reopen, and even after a full post-reopen `optimize()`; only the
-        // in-process refresh immediately after the split restores 16/16.
-        // Completed optimizes are unaffected (the pass always ends with
-        // that refresh in the same process); the crash window is what
-        // exposes it. Retrieval is asserted below only for the pre-split
-        // generations until that visibility bug is fixed — its fix should
-        // flip this branch to fall through to the retrieval check.
+        // pass-final in-process refresh. The durable state must be coherent
+        // AND immediately queryable (the split commit's own slow-state
+        // restamp — keyed on the manifest strategy since #498 — publishes
+        // complete hidden membership), and the next maintenance cycle must
+        // complete without error. Before #498 this state under-served
+        // queries unrecoverably; the retrieval assertion below is the
+        // regression tripwire for that window.
         recovered
             .optimize(&OptimizeOptions::default())
             .expect("post-crash optimize completes the interrupted maintenance");
-    } else {
-        // Doc conservation: one exhaustive-width query per planted
-        // direction must retrieve its full half from the intact pre-split
-        // generation.
-        let reader = recovered.reader().expect("reader");
-        let mut seen_ids: Vec<i128> = Vec::new();
-        for direction in 0..2usize {
-            let mut query = vec![0.0f32; CRASH_EMB_DIM];
-            query[direction] = 1.0;
-            let batches = reader
-                .vector_search(
-                    "emb",
-                    &query,
-                    CRASH_ROWS_PER_DIRECTION,
-                    VectorSearchOptions::new().with_nprobe(CRASH_NPROBE),
-                    None,
-                    None,
-                )
-                .expect("vector search");
-            for batch in &batches {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .expect("_id column");
-                for i in 0..ids.len() {
-                    seen_ids.push(ids.value(i));
-                }
+    }
+
+    // Doc conservation: one exhaustive-width query per planted direction
+    // must retrieve its full half, whichever side of the crash the hidden
+    // generation landed on.
+    let reader = recovered.reader().expect("reader");
+    let mut seen_ids: Vec<i128> = Vec::new();
+    for direction in 0..2usize {
+        let mut query = vec![0.0f32; CRASH_EMB_DIM];
+        query[direction] = 1.0;
+        let batches = reader
+            .vector_search(
+                "emb",
+                &query,
+                CRASH_ROWS_PER_DIRECTION,
+                VectorSearchOptions::new().with_nprobe(CRASH_NPROBE),
+                None,
+                None,
+            )
+            .expect("vector search");
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id column");
+            for i in 0..ids.len() {
+                seen_ids.push(ids.value(i));
             }
         }
-        seen_ids.sort_unstable();
-        seen_ids.dedup();
-        assert_eq!(
-            seen_ids.len(),
-            CRASH_ROWS_PER_DIRECTION * 2,
-            "every planted doc is retrievable after the crash"
-        );
     }
+    seen_ids.sort_unstable();
+    seen_ids.dedup();
+    assert_eq!(
+        seen_ids.len(),
+        CRASH_ROWS_PER_DIRECTION * 2,
+        "every planted doc is retrievable after the crash"
+    );
 
     let report = hidden.gc(Duration::ZERO).expect("hidden gc");
     report.objects_deleted
@@ -771,10 +759,10 @@ fn crash_post_hidden_repack_shard_yields_pre_split_index() {
 }
 
 /// Crash immediately AFTER the batch's hidden pointer CAS lands: the split
-/// is durable (the reopened hidden index is the post-split generation), and
-/// the next `optimize` + `gc` complete cleanly. Retrieval against this
-/// generation is blocked on a pre-existing visibility bug — see the KNOWN
-/// GAP note in `verify_hidden_split_crash`.
+/// is durable (the reopened hidden index is the post-split generation),
+/// immediately queryable with no docs lost (the pre-#498 unrecoverable
+/// window's regression tripwire), and the next `optimize` + `gc` complete
+/// cleanly.
 #[test]
 fn crash_post_hidden_pointer_yields_split_index() {
     if dispatch_child_if_set().is_some() {

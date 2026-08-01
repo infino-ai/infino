@@ -1290,21 +1290,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
-/// Train global VectorCell centroids from the user manifest and queue them
-/// on the hidden index table for its next commit.
-/// Aggressive compaction profile for the hidden vector-index table: keep
-/// ~one compact packed shard object per partition key instead of many
-/// small delta files.
-/// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
-pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
-    !opts.vector_columns.is_empty()
-        && opts.fts_columns.is_empty()
-        && matches!(
-            opts.partition_strategy,
-            Some(crate::supertable::manifest::list::PartitionStrategy::VectorCell { .. })
-        )
-}
-
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     let vector = &crate::config::global().vector;
     crate::config::CompactionSettings {
@@ -1929,7 +1914,7 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -1941,12 +1926,17 @@ mod tests {
     use crate::{
         config::OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+        },
         supertable::{
             manifest::{
                 SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
+                list::PartitionStrategy,
             },
+            opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
         },
@@ -2329,7 +2319,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2623,7 +2612,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2839,7 +2827,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -2942,7 +2929,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -3047,7 +3033,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -3149,7 +3134,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -3262,7 +3246,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3386,7 +3369,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3512,7 +3494,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3702,7 +3683,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -3901,7 +3881,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim: DIM,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -4054,7 +4033,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4149,7 +4127,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4242,7 +4219,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4415,7 +4391,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4614,7 +4589,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4668,7 +4642,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4857,7 +4830,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -4958,7 +4930,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5061,6 +5032,183 @@ mod tests {
         }
     }
 
+    /// A committed cell split ALONE — without the pass-final in-process
+    /// `refresh_slow_vector_state` that production maintenance tacks onto the
+    /// end of the hidden pass — must leave every doc retrievable, both
+    /// in-process and after a reopen from storage. The split's own commit
+    /// (`try_commit_attempt` step 2b) publishes the slow-state blob + centroid
+    /// section for the post-split membership; if that publication disagrees
+    /// with what the refresh composes, a crash between the split commit and
+    /// the refresh leaves the table durably under-serving (0 hits from every
+    /// cell, including cells the split never touched) with no recovery path —
+    /// reopen re-hydrates the broken state and a post-reopen `optimize`
+    /// republishes it unchanged. Two populated cells are required to expose
+    /// the mismatch.
+    #[test]
+    fn split_commit_without_refresh_keeps_docs_retrievable() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{manifest::list::PartitionStrategy, writer::split_overflow_cell},
+        };
+
+        /// Docs planted per orthogonal direction (two directions → the two
+        /// populated cells the repro needs).
+        const ROWS_PER_DIRECTION: usize = 8;
+        /// Total planted docs.
+        const N_TOTAL: usize = 2 * ROWS_PER_DIRECTION;
+        /// Probe width covering every cell before and after the split.
+        const SPLIT_NPROBE: usize = 64;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let make_options = || {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+        };
+        let st = Supertable::create(make_options()).expect("create");
+
+        // Two orthogonal directions, ROWS_PER_DIRECTION docs each, in ONE
+        // commit so the grid trains on both and the drain populates two cells.
+        let titles =
+            LargeStringArray::from((0..N_TOTAL).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut vectors = vec![0.0f32; N_TOTAL * dim];
+        for i in 0..N_TOTAL {
+            vectors[i * dim + i / ROWS_PER_DIRECTION] = 1.0;
+        }
+        let flat = Float32Array::from(vectors);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // Exhaustive-width retrieval per planted direction: with k = N_TOTAL
+        // and every cell probed, each query must surface every live doc, so
+        // the count reads as true retrievability rather than ranking.
+        let live_hit_count = |table: &Supertable, direction: usize| {
+            let mut q = vec![0.0f32; dim];
+            q[direction] = 1.0;
+            table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    N_TOTAL,
+                    VectorSearchOptions::new().with_nprobe(SPLIT_NPROBE),
+                    None,
+                )
+                .expect("vector search")
+                .len()
+        };
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve before the split (direction {direction})"
+            );
+        }
+
+        let split_cell = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("a populated cell"),
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split")
+            .expect("live rows present, split commits");
+
+        // Deliberately NO refresh_slow_vector_state here: the split commit's
+        // own slow-state publication is the durable state a crash right after
+        // the commit leaves behind, and it must serve on its own.
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve after the split commit alone (direction {direction})"
+            );
+        }
+
+        // The same durable state must serve a fresh process: reopen from
+        // storage and retrieve every doc again.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen");
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&reopened, direction),
+                N_TOTAL,
+                "all docs resolve after reopen from post-split state (direction {direction})"
+            );
+        }
+    }
+
     /// End-to-end reclaim loop: a cell split appends its children and marks the
     /// parent cell superseded (no removal); a later merge drops those superseded
     /// blocks and reclaims the parent. Every doc must resolve exactly once at
@@ -5113,7 +5261,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5241,6 +5388,145 @@ mod tests {
         );
     }
 
+    /// Regression: `optimize` must run the hidden cell-split phase on a handle
+    /// built at table CREATE time, in the same process, with no reopen. The
+    /// split gate in `compact_one_table` once keyed on the handle's options —
+    /// but a create-era hidden handle has no user manifest to train a grid
+    /// from, so its options never carry a VectorCell strategy (only the first
+    /// drain locks it into the manifest), and the options-keyed gate silently
+    /// skipped every split until the table was reopened elsewhere. This pins
+    /// the manifest-keyed gate through the public `optimize()` entry.
+    #[test]
+    fn optimize_runs_split_phase_on_create_era_handle() {
+        // The 500k `cell_split_doc_cap` is out of unit-test reach and config is
+        // process-global, so the fixture leans on the default modality trigger
+        // instead: a cell holding >= MODALITY_MIN_CELL_DOCS rows in MORE than
+        // the whole-mode grouping factor (4 modes, `opann::cell_split_plan`)
+        // of well-separated modes splits under `optimize`.
+        const DIM: usize = 16;
+        /// One-hot modes e_0..e_7 — more than the 4-modes-per-cell grouping
+        /// stop, so the modality plan must split the cell.
+        const MODES: usize = 8;
+        const DOCS_PER_MODE: usize = 64;
+        const N: usize = MODES * DOCS_PER_MODE;
+        assert!(
+            N as u64 >= MODALITY_MIN_CELL_DOCS,
+            "fixture must reach the modality trigger's minimum cell size"
+        );
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        // A single hidden cell: every mode drains into cell 0, making it the
+        // one over-populated multimodal cell the split phase must act on.
+        .with_vector_cell_counts(1, 1);
+        // The handle under test comes from CREATE and is never reopened.
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            let mode = r / DOCS_PER_MODE;
+            flat[r * DIM + mode] = 1.0;
+            // Tiny deterministic jitter on a component no mode occupies keeps
+            // within-mode variance non-zero (no 0/0 Ashman-D corner) while the
+            // modes stay maximally separated.
+            flat[r * DIM + MODES + mode] = ((r % 5) as f32 - 2.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(clusters.n_cent, 1, "single-cell grid before optimize");
+                // Grid counts are maintenance bookkeeping (they tally the
+                // incoming region as well as the drained cells), so only the
+                // populated/empty distinction is asserted here.
+                assert!(clusters.counts[0] > 0, "the one cell is populated");
+            }
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        }
+
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+
+        // No reopen: the same create-era handles observe the split. The grid
+        // must have grown past one cell (doc preservation across a split is
+        // pinned by the dedicated `split_overflow_cell_*` tests).
+        let reader = hidden.reader().expect("reader");
+        match reader.manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert!(
+                    clusters.n_cent > 1,
+                    "optimize on a create-era handle must run the split phase; \
+                     grid stayed at {} cell(s)",
+                    clusters.n_cent
+                );
+            }
+            other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
+        }
+    }
+
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
     /// N packed shard objects and stamps partition_hint = shard_id (cell % N).
     #[test]
@@ -5284,7 +5570,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5412,7 +5697,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -5540,7 +5824,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5680,7 +5963,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5813,7 +6095,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -5942,7 +6223,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -6065,7 +6345,6 @@ mod tests {
                 vec![VectorConfig {
                     column: "emb".into(),
                     dim,
-                    n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
@@ -6244,7 +6523,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -6384,7 +6662,6 @@ mod tests {
             vec![VectorConfig {
                 column: "emb".into(),
                 dim,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,

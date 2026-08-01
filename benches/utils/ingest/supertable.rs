@@ -243,7 +243,7 @@ pub fn options_for(
                 .build()
                 .expect("pool"),
         );
-        let mut opts = sql_options(n_docs())
+        let mut opts = sql_options()
             .with_commit_threshold_size_mb(COMMIT_THRESHOLD_SIZE_MB)
             .with_reader_pool(Arc::clone(&pool))
             .with_writer_pool(pool);
@@ -255,8 +255,6 @@ pub fn options_for(
         }
         return opts;
     }
-    let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
@@ -277,7 +275,6 @@ pub fn options_for(
             provided_centroids: None,
             column: VEC_COLUMN.into(),
             dim: DIM,
-            n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
             rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC),

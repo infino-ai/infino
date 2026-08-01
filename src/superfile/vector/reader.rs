@@ -73,7 +73,6 @@ const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 pub struct VectorColumnConfig {
     pub column: String,
     pub dim: usize,
-    pub n_cent: usize,
     pub rot_seed: u64,
     /// `"l2sq"`, `"cosine"`, or `"negdot"`.
     pub metric: String,
@@ -5365,7 +5364,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric,
             rerank_codec: RerankCodec::Fp32,
@@ -5423,15 +5421,14 @@ mod tests {
         let config = VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent: 2,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let first = build_merged_subsection_from_materialized(config.clone(), make_rows(7, 3))
+        let first = build_merged_subsection_from_materialized(config.clone(), 2, make_rows(7, 3))
             .expect("first cell subsection");
-        let second = build_merged_subsection_from_materialized(config, make_rows(15, 2))
+        let second = build_merged_subsection_from_materialized(config, 2, make_rows(15, 2))
             .expect("second cell subsection");
         let blob = finish_multi_cell_blob(&[(7, first), (15, second)]).expect("multi-cell blob");
         let json = r#"[{"column":"embedding","dim":16,"n_cent":2,"rot_seed":7,"metric":"l2sq"}]"#
@@ -5691,7 +5688,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -5719,7 +5715,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -5821,7 +5816,7 @@ mod tests {
             build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let q = &all[0];
-        let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
+        let (k, rerank, n_cent) = (5usize, 5usize, 64u32);
 
         let full = r
             .search_async("v", q, k, n_cent as usize, rerank, None, None, None, None)
@@ -6010,7 +6005,6 @@ mod tests {
             b.register_column(VectorConfig {
                 column: "v".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: if codec == RerankCodec::Sq8FixedResidual {
                     Metric::Cosine
@@ -6034,13 +6028,11 @@ mod tests {
     #[test]
     fn open_round_trips_sq8_codec_discriminator_l2sq() {
         let dim = 32usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6103,7 +6095,6 @@ mod tests {
     #[test]
     fn open_round_trips_sq8_fixed_residual_codec_default() {
         let dim = 32usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         // Register via the struct default for rerank_codec to pin
@@ -6111,7 +6102,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::default(),
@@ -6154,7 +6144,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 29,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6204,7 +6193,6 @@ mod tests {
             .register_column(VectorConfig {
                 column: "v".into(),
                 dim,
-                n_cent,
                 rot_seed: 29,
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -6335,19 +6323,18 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6416,19 +6403,18 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6489,19 +6475,18 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = |n_cent: usize| VectorConfig {
+        let cfg = || VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let sub0 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
         let sub1 =
-            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+            build_merged_subsection_from_materialized(cfg(), 2, make_rows(1, 3)).expect("cell 1");
         let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -6545,7 +6530,6 @@ mod tests {
             .register_column(VectorConfig {
                 column: "v".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
@@ -6564,13 +6548,12 @@ mod tests {
     #[test]
     fn open_sq8_cosine_carries_per_doc_norms() {
         let dim = 16usize;
-        let n_cent = 4usize;
+        let n_cent = 32usize;
         let n_docs = 32u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 11,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6661,7 +6644,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 23,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6757,13 +6739,11 @@ mod tests {
     #[tokio::test]
     async fn sq8_self_query_round_trips_top1_l2sq() {
         let dim = 32usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 13,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6823,13 +6803,11 @@ mod tests {
     #[tokio::test]
     async fn sq8_self_query_round_trips_top1_cosine() {
         let dim = 32usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 19,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
@@ -6890,13 +6868,11 @@ mod tests {
     #[test]
     fn open_round_trips_none_codec_discriminator() {
         let dim = 16usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
@@ -6954,7 +6930,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 11,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
@@ -7042,7 +7017,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 13,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
@@ -7275,7 +7249,6 @@ mod tests {
             b.register_column(VectorConfig {
                 column: "v".into(),
                 dim,
-                n_cent: n_cent_ivf,
                 rot_seed: 7,
                 metric: Metric::Cosine,
                 rerank_codec: codec,
@@ -7405,13 +7378,11 @@ mod tests {
     /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
     fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
         let dim = 16usize;
-        let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -7877,7 +7848,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -8369,7 +8339,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 41,
             metric,
             rerank_codec: codec,
@@ -8792,7 +8761,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -8849,7 +8817,6 @@ mod tests {
             .register_column(VectorConfig {
                 column: "embedding".into(),
                 dim: 16,
-                n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
@@ -8893,7 +8860,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim: 16,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -8924,7 +8890,7 @@ mod tests {
     #[test]
     fn cluster_centroids_returns_n_cent_dim_and_counts() {
         let dim = 16usize;
-        let n_cent = 4usize;
+        let n_cent = 64usize;
         let n_docs = 64u32;
         let (blob, json) = build_blob(n_docs, dim, n_cent, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
@@ -8958,7 +8924,7 @@ mod tests {
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "embedding");
         assert_eq!(cols[0].dim, 16);
-        assert_eq!(cols[0].n_cent, 4);
+        assert_eq!(cols[0].n_cent, 32);
         assert_eq!(cols[0].metric, Metric::L2Sq);
     }
 
@@ -8991,7 +8957,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
-            n_cent,
             rot_seed: 101,
             metric,
             rerank_codec: codec,
@@ -9437,11 +9402,13 @@ mod tests {
 
         // A non-zero peak proves the cold fetch actually reserved against the
         // budget (the reservation ran on the query path); a measured budget
-        // never denies. The cold cluster-block fetch for this fixture (32 docs,
-        // 4 clusters, 64-dim, Sq8 rerank) is a deterministic 4608 B; assert a
-        // band around it, wide enough to survive minor codec / layout drift.
-        const MEASURED_PEAK_LOW_BYTES: usize = 3_000;
-        const MEASURED_PEAK_HIGH_BYTES: usize = 8_000;
+        // never denies. This fixture (64 docs, 32-dim, Sq8 rerank) sizes its
+        // IVF from the row count, so every doc lands in its own cluster;
+        // nprobe=4 fetches four of those single-doc cluster blocks — a
+        // deterministic 288 B. Assert a band around it, wide enough to survive
+        // minor codec / layout drift.
+        const MEASURED_PEAK_LOW_BYTES: usize = 150;
+        const MEASURED_PEAK_HIGH_BYTES: usize = 1_500;
 
         assert_eq!(budget.denials(), 0, "measured budget never denies");
 
@@ -9618,7 +9585,6 @@ mod tests {
         b.register_column(VectorConfig {
             column: "embedding".into(),
             dim,
-            n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
@@ -9674,7 +9640,7 @@ mod tests {
         let (blob, json, all) = build_small_superfile(16, 4, 64, RerankCodec::Fp32, Metric::NegDot);
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
-            .search("v", &all[23], 5, 4, 10)
+            .search("v", &all[23], 5, 64, 10)
             .await
             .expect("negdot search");
         assert_eq!(hits.len(), 5, "k hits returned");
@@ -9694,7 +9660,7 @@ mod tests {
     #[test]
     fn cluster_centroids_returns_well_shaped_centroids_and_counts() {
         let dim = 16usize;
-        let n_cent = 4u32;
+        let n_cent = 64u32;
         let n_docs = 64u32;
         let (blob, json) = build_blob(n_docs, dim, n_cent as usize, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
@@ -9792,7 +9758,7 @@ mod tests {
     #[test]
     fn score_centroids_truncates_and_sorts() {
         let dim = 16usize;
-        let n_cent = 4u32;
+        let n_cent = 64u32;
         let (blob, json) = build_blob(64, dim, n_cent as usize, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];

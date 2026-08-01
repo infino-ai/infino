@@ -1190,7 +1190,6 @@ mod tests {
         let cfg = VectorConfig {
             column: "emb".into(),
             dim: 4,
-            n_cent: 1,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,

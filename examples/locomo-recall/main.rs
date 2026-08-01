@@ -58,10 +58,6 @@ const CUTOFFS: [usize; 4] = [1, 3, 5, 10];
 /// baseline is recall@10, so the floor only means anything when at least this
 /// many rows were retrieved (we require `k >= GATE_CUTOFF` when a floor is set).
 const GATE_CUTOFF: usize = 10;
-/// IVF centroid count. The canonical slice is one ~400-row conversation — a
-/// single list searches it exhaustively, so vector recall isn't itself lossy
-/// and a miss is attributable to ranking/fusion, not ANN approximation.
-const N_CENTROIDS: usize = 1;
 /// The three retrieval modes, hybrid first (the default a memory product uses).
 const MODES: [&str; 3] = ["hybrid", "vector", "keyword"];
 /// Truncate resolved memory text to this many chars when printing.
@@ -225,7 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         schema.clone(),
         IndexSpec::new()
             .fts("text")
-            .vector("vector", dim, N_CENTROIDS, Metric::Cosine),
+            .vector("vector", dim, Metric::Cosine),
     )?;
     let ids = LargeStringArray::from(fx.corpus.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
     let texts = LargeStringArray::from(

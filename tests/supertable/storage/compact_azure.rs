@@ -214,7 +214,6 @@ fn options_title_emb() -> SupertableOptions {
         vec![VectorConfig {
             column: "emb".into(),
             dim: EMB_DIM,
-            n_cent: N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,

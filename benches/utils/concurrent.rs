@@ -71,7 +71,6 @@ const VEC_COLUMN: &str = "emb";
 /// dim=128 is large enough for the shortlist+rerank CPU to show pool-routing
 /// impact under contention, but small enough for fast fixture builds.
 const VEC_DIM: usize = 128;
-const VEC_N_CENT: usize = 32;
 const VEC_ROT_SEED: u64 = 7;
 const TOP_K: usize = 10;
 const WRITER_BATCH: usize = 1_024;
@@ -249,7 +248,6 @@ fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOpti
         vec![VectorConfig {
             column: VEC_COLUMN.into(),
             dim: VEC_DIM,
-            n_cent: VEC_N_CENT,
             rot_seed: VEC_ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,

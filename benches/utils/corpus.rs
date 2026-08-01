@@ -1506,18 +1506,12 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
 /// real embeddings). Callers measuring the Fp32 baseline (recall
 /// oracles, bit-exact regression tests) construct their own
 /// `VectorConfig` with `RerankCodec::Fp32`.
-pub fn build_vector_index(
-    vectors: &[f32],
-    n_docs: usize,
-    n_cent: usize,
-    metric: Metric,
-) -> VectorBuilder {
+pub fn build_vector_index(vectors: &[f32], n_docs: usize, metric: Metric) -> VectorBuilder {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         provided_centroids: None,
         column: "v".into(),
         dim: DIM,
-        n_cent,
         rot_seed: ROT_SEED,
         metric,
         rerank_codec: bench_rerank_codec(metric),
@@ -1533,21 +1527,19 @@ pub fn build_vector_index(
 
 /// Open a built vector blob as a reader. Encodes the directory JSON
 /// inline so callers don't reinvent it.
-pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> VectorReader {
+pub fn open_vector_reader(blob: Vec<u8>, metric: Metric) -> VectorReader {
     let metric_str = match metric {
         Metric::L2Sq => "l2sq",
         Metric::Cosine => "cosine",
         Metric::NegDot => "negdot",
     };
-    let json = format!(
-        r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_str}"}}]"#
-    );
+    let json = format!(r#"[{{"column":"v","dim":{DIM},"rot_seed":7,"metric":"{metric_str}"}}]"#);
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
         .expect("open VectorReader")
 }
 
 /// Build a full superfile (FTS + vector) for end-to-end benches.
-pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u8> {
+pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
     let n = docs.len();
     // `SuperfileBuilder` requires the id column to be
     // `Decimal128(38, 0)` (the supertable's snowflake id type), not
@@ -1571,7 +1563,6 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
-            n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: bench_rerank_codec(Metric::Cosine),
@@ -1593,12 +1584,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
 }
 
 /// Build a full superfile (FTS + vector) with an explicit metric.
-pub fn build_superfile_with_metric(
-    docs: &[String],
-    vectors: &[f32],
-    n_cent: usize,
-    metric: Metric,
-) -> Vec<u8> {
+pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Metric) -> Vec<u8> {
     let n = docs.len();
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -1619,7 +1605,6 @@ pub fn build_superfile_with_metric(
             provided_centroids: None,
             column: "emb".into(),
             dim: DIM,
-            n_cent,
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: bench_rerank_codec(metric),

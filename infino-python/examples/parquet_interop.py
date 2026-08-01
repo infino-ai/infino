@@ -52,7 +52,7 @@ def main() -> None:
     docs = db.create_table(
         "docs",
         schema,
-        infino.IndexSpec().fts("body").vector("embedding", DIM, 1, "cosine"),
+        infino.IndexSpec().fts("body").vector("embedding", DIM, "cosine"),
     )
     docs.append([
         {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing.", "embedding": embed(0)},

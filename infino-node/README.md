@@ -54,7 +54,7 @@ const embed = (topic) => { const v = Array(16).fill(0.0); v[topic] = 1.0; return
 const docs = db.createTable(
   "docs",
   { source: "large_utf8", body: "large_utf8", embedding: { vector: 16 } },
-  new IndexSpec().fts("body").vector("embedding", 16, 1, "cosine"),
+  new IndexSpec().fts("body").vector("embedding", 16, "cosine"),
 );
 
 // Append rows. One append is one atomic commit.

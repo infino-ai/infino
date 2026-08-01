@@ -114,14 +114,8 @@ pub fn sample_query_csv() -> String {
         .join(",")
 }
 
-/// `n_cent` for the vector index, clamped so tiny inputs (unit tests)
-/// don't request more clusters than rows.
-fn n_cent_for(n_rows: usize) -> usize {
-    crate::corpus::n_cent(n_rows).min(n_rows.max(1))
-}
-
 /// Options for the SQL benchmark table shape.
-pub fn sql_options(n_rows: usize) -> SupertableOptions {
+pub fn sql_options() -> SupertableOptions {
     SupertableOptions::new(
         schema(),
         vec![
@@ -146,7 +140,6 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
             provided_centroids: None,
             column: VECTOR_COLUMN.into(),
             dim: SQL_DIM,
-            n_cent: n_cent_for(n_rows),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
@@ -158,7 +151,7 @@ pub fn sql_options(n_rows: usize) -> SupertableOptions {
 
 /// Build one in-memory supertable from `rows` via the public writer API.
 fn build_supertable(rows: &[SqlRow<'_>]) -> Supertable {
-    build_supertable_with_options(rows, sql_options(rows.len()), WRITE_CHUNK)
+    build_supertable_with_options(rows, sql_options(), WRITE_CHUNK)
 }
 
 /// Build one supertable from `rows` via the public writer API with caller
