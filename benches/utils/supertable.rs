@@ -3129,15 +3129,22 @@ pub mod vector {
         truths: &[Vec<u32>],
         rerank: usize,
     ) {
-        let all_cells = consumer
-            .vector_index_table()
-            .map(
-                |hidden| match hidden.pinned_reader().manifest().get_partition_strategy() {
-                    PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent as usize,
-                    _ => 0,
-                },
-            )
-            .unwrap_or(0);
+        // Resolve the live grid explicitly: without the "all cells" endpoint
+        // this sweep cannot see the tail where the inversion lives, so an
+        // unresolvable grid (no hidden index, or a non-vector-cell strategy)
+        // must skip LOUDLY rather than quietly sweep the fixed widths only.
+        let Some(all_cells) = consumer.vector_index_table().and_then(|hidden| {
+            match hidden.pinned_reader().manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => Some(clusters.n_cent as usize),
+                _ => None,
+            }
+        }) else {
+            eprintln!(
+                "[supertable_vector] skipping unfiltered width-sweep ({state}): \
+                 hidden vector index is not vector-cell partitioned"
+            );
+            return;
+        };
         let mut widths: Vec<usize> = UNFILTERED_SWEEP_WIDTHS.to_vec();
         if all_cells > widths.last().copied().unwrap_or(0) {
             widths.push(all_cells);
@@ -3152,7 +3159,10 @@ pub mod vector {
                 width,
                 rerank,
             );
-            let all_tag = if width == all_cells {
+            // `>=`: on a grid smaller than the largest fixed width, the
+            // engine clamps the sweep to the grid — that row IS the
+            // exhaustive endpoint and must be labeled as such.
+            let all_tag = if width >= all_cells {
                 " (all cells)"
             } else {
                 ""
