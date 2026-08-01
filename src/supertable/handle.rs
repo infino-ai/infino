@@ -1315,6 +1315,9 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
+/// Aggressive compaction profile for the hidden vector-index table: keep
+/// ~one compact packed shard object per partition key instead of many
+/// small delta files.
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
     let vector = &crate::config::global().vector;
     crate::config::CompactionSettings {
