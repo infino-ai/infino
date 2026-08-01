@@ -243,6 +243,8 @@ pub fn fmt_bytes(b: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+
     use super::*;
 
     const TEST_SAMPLER_INTERVAL_MS: u64 = 1_000;
@@ -253,6 +255,13 @@ mod tests {
     const TEST_GROWTH_SAMPLER_INTERVAL: Duration = Duration::from_millis(5);
     /// Hold the allocation long enough for at least one sampler tick.
     const TEST_GROWTH_HOLD: Duration = Duration::from_millis(50);
+    /// Retry budget for the growth test. RSS is process-global, so a
+    /// concurrent test in the same binary freeing memory between the
+    /// baseline snapshot and the sampler's peak window shrinks the
+    /// observed delta and can mask the faulted allocation. Each attempt
+    /// takes a fresh baseline, so a false failure requires that
+    /// interference to recur on every attempt.
+    const TEST_GROWTH_ATTEMPTS: usize = 5;
 
     #[test]
     fn current_rss_is_nonzero_on_linux() {
@@ -274,25 +283,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sampler_observes_allocation_growth() {
+    /// One growth-test attempt: snapshot a fresh baseline, fault
+    /// [`TEST_ALLOC_SIZE_BYTES`] under a running sampler, and return
+    /// `(baseline, peak)`. `None` when VmRSS is unavailable (no procfs).
+    fn fault_alloc_and_sample_peak() -> Option<(u64, u64)> {
         purge_allocator();
-        let baseline = match current_rss_bytes() {
-            Some(b) => b,
-            None => return,
-        };
+        let baseline = current_rss_bytes()?;
         let s = PeakSampler::start(TEST_GROWTH_SAMPLER_INTERVAL);
         let mut v: Vec<u8> = vec![0; TEST_ALLOC_SIZE_BYTES];
         for chunk in v.chunks_mut(TEST_PAGE_STRIDE_BYTES) {
             chunk[0] = 1;
         }
         thread::sleep(TEST_GROWTH_HOLD);
-        std::hint::black_box(&v);
-        let peak = s.stop();
-        assert!(
-            peak >= baseline + TEST_MIN_RSS_GROWTH_BYTES,
-            "sampler missed the 32 MiB faulted allocation: \
-             baseline={baseline}, peak={peak}"
+        black_box(&v);
+        Some((baseline, s.stop()))
+    }
+
+    #[test]
+    fn sampler_observes_allocation_growth() {
+        let mut last = (0, 0);
+        for _ in 0..TEST_GROWTH_ATTEMPTS {
+            let Some((baseline, peak)) = fault_alloc_and_sample_peak() else {
+                return;
+            };
+            if peak >= baseline + TEST_MIN_RSS_GROWTH_BYTES {
+                return;
+            }
+            last = (baseline, peak);
+        }
+        let (baseline, peak) = last;
+        panic!(
+            "sampler missed the 32 MiB faulted allocation in \
+             {TEST_GROWTH_ATTEMPTS} attempts: last baseline={baseline}, \
+             last peak={peak}"
         );
     }
 

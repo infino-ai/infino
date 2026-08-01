@@ -2298,7 +2298,10 @@ pub mod vector {
         sync::atomic::Ordering as AtomicOrdering,
     };
 
-    use infino::{VectorFilter, roaring::RoaringBitmap, storage::io_counters};
+    use infino::{
+        VectorFilter, roaring::RoaringBitmap, storage::io_counters,
+        supertable::manifest::list::PartitionStrategy,
+    };
 
     use super::*;
     use crate::{
@@ -2366,6 +2369,14 @@ pub mod vector {
     /// (a depth problem). The 256 row is the full 1M/256 grid: exact
     /// search over matching rows, the recall ceiling of the approach.
     const FILTERED_DIAG_PROBE_WIDTHS: &[usize] = &[160, 192, 224, 256];
+    /// Explicit UNFILTERED cell-probe widths for the inversion diagnostic:
+    /// a widening probe knob must never lower recall. Measured 2026-07-31
+    /// at 10M on the post-split geometry: with a fixed global survivor
+    /// budget the curve INVERTS (0.994 at nprobe=2 -> 0.388 at all cells),
+    /// while the pre-#479 per-cell budget held flat (0.976) at unbounded
+    /// cost. The all-cells row is appended at runtime from the live grid.
+    /// Diagnostic print only - recall gates stay on the engine default.
+    const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
@@ -3154,6 +3165,64 @@ pub mod vector {
         }
     }
 
+    /// Unfiltered nprobe sweep at a lifecycle state: recall at fixed
+    /// widths plus the full live grid ("all cells") - the probe-width
+    /// monotonicity diagnostic. Recall falling as width rises means the
+    /// survivor budget is width-blind (candidates from added cells evict
+    /// nearer ones from a fixed shortlist) - the #479 inversion signature.
+    fn unfiltered_width_sweep(
+        reader: &SupertableVectorRead,
+        consumer: &Supertable,
+        state: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        rerank: usize,
+    ) {
+        // Resolve the live grid explicitly: without the "all cells" endpoint
+        // this sweep cannot see the tail where the inversion lives, so an
+        // unresolvable grid (no hidden index, or a non-vector-cell strategy)
+        // must skip LOUDLY rather than quietly sweep the fixed widths only.
+        let Some(all_cells) = consumer.vector_index_table().and_then(|hidden| {
+            match hidden.pinned_reader().manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => Some(clusters.n_cent as usize),
+                _ => None,
+            }
+        }) else {
+            eprintln!(
+                "[supertable_vector] skipping unfiltered width-sweep ({state}): \
+                 hidden vector index is not vector-cell partitioned"
+            );
+            return;
+        };
+        let mut widths: Vec<usize> = UNFILTERED_SWEEP_WIDTHS.to_vec();
+        if all_cells > widths.last().copied().unwrap_or(0) {
+            widths.push(all_cells);
+        }
+        for width in widths {
+            let recall = exec_vec::mean_recall(
+                reader,
+                supertable::VEC_COLUMN,
+                queries,
+                truths,
+                TOP_K,
+                width,
+                rerank,
+            );
+            // `>=`: on a grid smaller than the largest fixed width, the
+            // engine clamps the sweep to the grid — that row IS the
+            // exhaustive endpoint and must be labeled as such.
+            let all_tag = if width >= all_cells {
+                " (all cells)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "[supertable_vector] unfiltered width-sweep ({state}): \
+                 nprobe={width}{all_tag} recall@{TOP_K}={recall:.3}"
+            );
+        }
+    }
+
     fn log_hidden_open_stats(hidden: &Supertable, label: &str) {
         let reader = hidden.pinned_reader();
         let manifest = reader.manifest();
@@ -3876,6 +3945,16 @@ pub mod vector {
                     POST_DRAIN_NOTE,
                 );
                 let post_drain_recall = default_recall(&post_drain_rows);
+                if phases.warm {
+                    unfiltered_width_sweep(
+                        &warm_reader,
+                        &consumer,
+                        "post-drain",
+                        &q_correct,
+                        &gt_correct,
+                        rerank,
+                    );
+                }
                 routing_states.push(measure_routing_state(
                     "post-drain",
                     ExpectedTiers::HiddenOnly,
@@ -4467,6 +4546,16 @@ pub mod vector {
                         nprobe,
                         rerank,
                     );
+                    if phases.warm {
+                        unfiltered_width_sweep(
+                            &compact_reader,
+                            &consumer,
+                            "post-compact",
+                            &q_correct,
+                            compact_truth,
+                            rerank,
+                        );
+                    }
                     let post_compact = measure_routing_state(
                         "post-compact",
                         ExpectedTiers::HiddenOnly,

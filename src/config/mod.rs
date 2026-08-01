@@ -383,7 +383,7 @@ pub struct VectorSettings {
     /// background-fill default and capped at 64.
     pub drain_read_concurrency: ThreadCount,
     /// CPU threads for maintenance-compaction compute (cell splits'
-    /// k-means and the probe-law recalibration scan — the `optimize()` /
+    /// k-means, child builds, and the probe-law recalibration scan — the `optimize()` /
     /// hidden-compaction path; nothing on the ingest commit path rides
     /// this pool). `auto` (default) resolves to all hardware threads: an
     /// explicit optimize owns the machine it runs on. Cap it when

@@ -229,7 +229,7 @@ vector:
   drain_read_concurrency: auto
 
   # CPU threads for maintenance-compaction compute (cell splits'
-  # k-means, probe-law recalibration) — the `optimize()` path; the
+  # k-means and child builds, probe-law recalibration) — the `optimize()` path; the
   # ingest commit path does not ride this pool. `auto` = all hardware
   # threads (an explicit optimize owns its machine). Set an integer to
   # cap it when optimize runs concurrently with latency-critical

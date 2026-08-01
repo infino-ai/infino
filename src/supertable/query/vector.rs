@@ -1974,10 +1974,15 @@ impl SupertableReader {
                     .into_iter()
                     .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
                     .collect();
+                // Floor = k: even if the entire true top-k concentrates in
+                // one probed cell, that cell's floor carries it into the
+                // exact rerank (replicas never collide inside one cell, so
+                // the floor needs no replica overhead).
                 flat = select_global_shortlist(
                     flat,
                     k.saturating_add(replica_overhead)
                         .saturating_mul(rerank_mult),
+                    k,
                 );
                 let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
                 for (si, cand) in flat {
@@ -3030,17 +3035,78 @@ fn apply_width_pin(
 fn select_global_shortlist(
     mut pooled: Vec<(usize, ScanCandidate)>,
     limit: usize,
+    cell_floor: usize,
 ) -> Vec<(usize, ScanCandidate)> {
     let cmp = |a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)| {
         b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
             (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
         })
     };
-    if pooled.len() > limit {
-        pooled.select_nth_unstable_by(limit, cmp);
-        pooled.truncate(limit);
+    if pooled.len() <= limit {
+        return pooled;
     }
-    pooled
+    // Global cut: O(n) partition puts the pooled top-`limit` in the
+    // prefix (unordered — phase C regroups by unit and the rerank is
+    // exact, so the winners need no internal order).
+    pooled.select_nth_unstable_by(limit, cmp);
+    if cell_floor == 0 {
+        pooled.truncate(limit);
+        return pooled;
+    }
+    // Per-cell floor: every scanned (unit, cell) keeps its `cell_floor`
+    // best candidates REGARDLESS of the global competition. This is what
+    // makes probe width monotone in recall by construction — a candidate
+    // admitted by its own cell's floor cannot be evicted by far cells'
+    // 1-bit false positives, so widening the sweep only ever ADDS
+    // survivors. Without it the fixed pooled cap is width-blind and
+    // recall INVERTS as nprobe grows (measured at 10M on the post-split
+    // grid: 0.994 at nprobe=2 falling to 0.388 at all cells). The floor
+    // is `k` at the call site: even if the entire true top-k lives in
+    // one cell, that cell's floor carries it. Cost is bounded and
+    // linear: at most `cells x cell_floor` extra survivors for the
+    // exact rerank.
+    let mut by_cell: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (idx, (si, cand)) in pooled.iter().enumerate().skip(limit) {
+        by_cell.entry((*si, cand.cell_idx)).or_default().push(idx);
+    }
+    // A tail candidate survives when it ranks within its cell's
+    // `cell_floor` best across the WHOLE pool (kept + tail): count the
+    // cell's kept-prefix occupants against the floor first.
+    let mut kept_per_cell: HashMap<(usize, usize), usize> = HashMap::new();
+    for (si, cand) in pooled.iter().take(limit) {
+        *kept_per_cell.entry((*si, cand.cell_idx)).or_default() += 1;
+    }
+    let mut rescued: Vec<usize> = Vec::new();
+    for (cell, mut tail_idxs) in by_cell {
+        let already = kept_per_cell.get(&cell).copied().unwrap_or(0);
+        let want = cell_floor.saturating_sub(already);
+        if want == 0 {
+            continue;
+        }
+        if tail_idxs.len() > want {
+            tail_idxs.select_nth_unstable_by(want, |&a, &b| cmp(&pooled[a], &pooled[b]));
+            tail_idxs.truncate(want);
+        }
+        rescued.extend(tail_idxs);
+    }
+    // Keep set = the global prefix plus the rescued tail entries, each
+    // exactly once (prefix and tail index sets are disjoint by
+    // construction).
+    let mut keep = vec![false; pooled.len()];
+    for slot in keep.iter_mut().take(limit) {
+        *slot = true;
+    }
+    let rescued_len = rescued.len();
+    for idx in rescued {
+        keep[idx] = true;
+    }
+    let mut out = Vec::with_capacity(limit + rescued_len);
+    for (idx, item) in pooled.into_iter().enumerate() {
+        if keep[idx] {
+            out.push(item);
+        }
+    }
+    out
 }
 
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
@@ -4682,7 +4748,7 @@ mod tests {
         let mut b = a.clone();
         b.reverse();
         let pick = |v: Vec<(usize, ScanCandidate)>| {
-            select_global_shortlist(v, 3)
+            select_global_shortlist(v, 3, 0)
                 .into_iter()
                 .map(|(si, c)| (si, c.cell_idx, c.pos, c.did))
                 .collect::<Vec<_>>()
@@ -4734,6 +4800,97 @@ mod tests {
         // No routing at all (user table, undrained): default fallback.
         assert_eq!(rerank_mult_from_law(true, false, None, None, 10), None);
     }
+
+    /// The per-cell floor rescues each scanned cell's best candidates from
+    /// global eviction: a cell whose candidates all rank below the global
+    /// cut still lands its `cell_floor` best in the kept set, counting any
+    /// of its candidates already kept globally against the floor.
+    #[test]
+    fn select_global_shortlist_cell_floor_rescues_swamped_cells() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        // Cell 0 floods the pool with high estimates; cell 1 holds the
+        // (lower-estimate) true neighbors the fixed cut would evict.
+        let mut pooled: Vec<(usize, ScanCandidate)> =
+            (0..10).map(|i| (0usize, cand(0.9, 0, i, i))).collect();
+        pooled.push((0, cand(0.30, 1, 100, 100)));
+        pooled.push((0, cand(0.20, 1, 101, 101)));
+        pooled.push((0, cand(0.10, 1, 102, 102)));
+
+        let kept = select_global_shortlist(pooled.clone(), 4, 0);
+        assert!(
+            kept.iter().all(|(_, c)| c.cell_idx == 0),
+            "without a floor the flooded cell evicts cell 1 entirely"
+        );
+
+        let kept = select_global_shortlist(pooled, 4, 2);
+        let cell1: Vec<u32> = kept
+            .iter()
+            .filter(|(_, c)| c.cell_idx == 1)
+            .map(|(_, c)| c.did)
+            .collect();
+        assert_eq!(
+            cell1,
+            vec![100, 101],
+            "the floor keeps cell 1's two best despite global eviction"
+        );
+        assert_eq!(
+            kept.iter().filter(|(_, c)| c.cell_idx == 0).count(),
+            4,
+            "the global prefix is untouched by the rescue"
+        );
+    }
+
+    /// Monotonicity by construction: widening the sweep (adding a new
+    /// cell's candidates to the pool) never evicts another cell's floored
+    /// survivors — the exact property whose absence inverts recall as
+    /// nprobe grows.
+    #[test]
+    fn select_global_shortlist_widening_never_evicts_floored() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        const FLOOR: usize = 2;
+        const LIMIT: usize = 4;
+        // Narrow sweep: cells 0 and 1.
+        let narrow: Vec<(usize, ScanCandidate)> = vec![
+            (0, cand(0.9, 0, 0, 0)),
+            (0, cand(0.8, 0, 1, 1)),
+            (0, cand(0.4, 1, 2, 2)),
+            (0, cand(0.3, 1, 3, 3)),
+        ];
+        // Wide sweep: cell 2 floods with better estimates than cell 1's.
+        let mut wide = narrow.clone();
+        for i in 0..8u32 {
+            wide.push((0, cand(0.7, 2, 10 + i, 10 + i)));
+        }
+        let keep_ids = |v: Vec<(usize, ScanCandidate)>| {
+            let mut ids: Vec<u32> = select_global_shortlist(v, LIMIT, FLOOR)
+                .into_iter()
+                .map(|(_, c)| c.did)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let narrow_kept = keep_ids(narrow);
+        let wide_kept = keep_ids(wide);
+        for id in &narrow_kept {
+            assert!(
+                wide_kept.contains(id),
+                "widening dropped candidate {id}: floored survivors must \
+                 be immune to added cells (kept narrow {narrow_kept:?} vs \
+                 wide {wide_kept:?})"
+            );
+        }    }
 
     /// A clean drain calibrates the probe-width law from the table's own
     /// rows and stamps it into the manifest routing; a DEFAULT search (no
